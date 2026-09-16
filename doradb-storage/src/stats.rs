@@ -1,5 +1,7 @@
 //! Public storage-engine runtime statistics.
 
+use std::time::Duration;
+
 use crate::file::fs::StorageServiceStats as InternalStorageServiceStats;
 use crate::io::BackendStats as InternalIoBackendStats;
 use crate::trx::sys::TrxSysStats as InternalTrxSysStats;
@@ -239,6 +241,209 @@ impl BufferPoolCounters {
     }
 }
 
+/// Immutable diagnostics for one successful engine bootstrap.
+///
+/// The outer intervals partition bootstrap wall time. Redo metrics are nested
+/// attribution within transaction bootstrap, not additional elapsed time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Internal startup envelope through ready owner assembly.
+    pub bootstrap_elapsed: Duration,
+    /// Configuration, root setup, and components preceding the catalog.
+    pub engine_setup_elapsed: Duration,
+    /// Complete catalog construction, including checkpoint loading.
+    pub catalog_bootstrap_elapsed: Duration,
+    /// Complete transaction-system component construction.
+    pub transaction_bootstrap_elapsed: Duration,
+    /// Remaining workers, header durability, layout handling, and owner assembly.
+    pub runtime_startup_elapsed: Duration,
+    /// Intervals nested within transaction-system construction.
+    pub phases: RecoveryPhaseTimings,
+    /// Observed replay and reconstruction work.
+    pub work: RecoveryWorkCounts,
+    /// Consumer-side redo stream attribution.
+    pub redo: RecoveryRedoMetrics,
+    /// At least one diagnostic overflow or invalid subtraction occurred.
+    pub saturated: bool,
+}
+
+impl RecoveryReport {
+    /// Completes derived intervals and counts without changing recovery success.
+    pub(crate) fn finish_transaction(&mut self, elapsed: Duration) {
+        self.transaction_bootstrap_elapsed = elapsed;
+        let mut accounted = Duration::ZERO;
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.preparation_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.user_table_bootstrap_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.redo_planning_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.redo_replay_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.validation_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.absent_file_cleanup_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.hot_index_rebuild_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.redo_repair_planning_elapsed,
+            &mut self.saturated,
+        );
+        recovery_add_duration(
+            &mut accounted,
+            self.phases.redo_finalize_elapsed,
+            &mut self.saturated,
+        );
+        self.phases.other_elapsed = recovery_sub_duration(elapsed, accounted, &mut self.saturated);
+        let work = &mut self.work;
+        for count in [
+            work.hot_inserts,
+            work.hot_updates,
+            work.hot_deletes,
+            work.cold_deletes,
+        ] {
+            recovery_add_count(&mut work.user_row_ops_applied, count, &mut self.saturated);
+        }
+        work.catalog_row_ops_skipped = recovery_sub_count(
+            work.catalog_row_ops_seen,
+            work.catalog_row_ops_applied,
+            &mut self.saturated,
+        );
+        work.user_row_ops_skipped = recovery_sub_count(
+            work.user_row_ops_seen,
+            work.user_row_ops_applied,
+            &mut self.saturated,
+        );
+        let redo = &mut self.redo;
+        let mut nested = redo.receive_wait_elapsed;
+        recovery_add_duration(&mut nested, redo.group_decode_elapsed, &mut self.saturated);
+        recovery_add_duration(
+            &mut nested,
+            redo.reader_shutdown_elapsed,
+            &mut self.saturated,
+        );
+        redo.stream_other_elapsed =
+            recovery_sub_duration(redo.stream_refill_elapsed, nested, &mut self.saturated);
+        redo.apply_and_dispatch_elapsed = recovery_sub_duration(
+            self.phases.redo_replay_elapsed,
+            redo.stream_refill_elapsed,
+            &mut self.saturated,
+        );
+    }
+}
+
+/// Elapsed intervals within transaction-system bootstrap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryPhaseTimings {
+    /// Recovery resources, redo discovery, and coordinator construction.
+    pub preparation_elapsed: Duration,
+    /// Checkpointed user tables, cleanup, and replay-bound seeding.
+    pub user_table_bootstrap_elapsed: Duration,
+    /// Replay-suffix planning and read-ahead launch.
+    pub redo_planning_elapsed: Duration,
+    /// Redo stream consumption, application, and termination.
+    pub redo_replay_elapsed: Duration,
+    /// Catalog, descriptor, table-root, and index lifecycle validation.
+    pub validation_elapsed: Duration,
+    /// Post-replay provisional-file cleanup.
+    pub absent_file_cleanup_elapsed: Duration,
+    /// Replay-sidecar consumption and final hot-index reconstruction.
+    pub hot_index_rebuild_elapsed: Duration,
+    /// Accepted-prefix repair and startup-file policy selection; excludes later repair IO.
+    pub redo_repair_planning_elapsed: Duration,
+    /// Construction of writable redo startup resources.
+    pub redo_finalize_elapsed: Duration,
+    /// Remaining transaction-component construction time.
+    pub other_elapsed: Duration,
+}
+
+/// Integral work observed during recovery; excluded segments have no invented row counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryWorkCounts {
+    /// Redo segment filenames discovered at startup.
+    pub redo_segments_discovered: u64,
+    /// Segments selected for body replay.
+    pub redo_segments_selected: u64,
+    /// Decoded catalog RowRedo entries, before filtering.
+    pub catalog_row_ops_seen: u64,
+    /// Successfully applied catalog RowRedo entries, including DDL payloads.
+    pub catalog_row_ops_applied: u64,
+    /// Decoded catalog RowRedo entries excluded by replay boundaries.
+    pub catalog_row_ops_skipped: u64,
+    /// Decoded user RowRedo entries, before filtering.
+    pub user_row_ops_seen: u64,
+    /// Successfully applied user RowRedo entries.
+    pub user_row_ops_applied: u64,
+    /// Decoded user RowRedo entries excluded by replay boundaries.
+    pub user_row_ops_skipped: u64,
+    /// Successfully replayed hot inserts.
+    pub hot_inserts: u64,
+    /// Successfully replayed hot updates.
+    pub hot_updates: u64,
+    /// Successfully replayed hot deletes.
+    pub hot_deletes: u64,
+    /// Successfully replayed cold deletes.
+    pub cold_deletes: u64,
+    /// User tables loaded from the catalog checkpoint.
+    pub checkpoint_user_tables: u64,
+    /// Successfully allocated replay pages, including pages later dropped.
+    pub hot_pages_reconstructed: u64,
+    /// Final hot pages visited by index reconstruction.
+    pub index_rebuild_pages: u64,
+    /// Successful insertions across all active hot indexes.
+    pub index_entries_inserted: u64,
+}
+
+/// Nested consumer-side stream measurements; worker execution overlaps replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryRedoMetrics {
+    /// Complete consumer refill calls, including waits, decoding, and reader termination.
+    pub stream_refill_elapsed: Duration,
+    /// Channel receive time, including scheduling and immediate receive overhead.
+    pub receive_wait_elapsed: Duration,
+    /// Transaction-frame deserialization, timed once per validated group.
+    pub group_decode_elapsed: Duration,
+    /// Reader stop and join time inside stream termination.
+    pub reader_shutdown_elapsed: Duration,
+    /// Refill time excluding receives, decoding, and reader shutdown.
+    pub stream_other_elapsed: Duration,
+    /// Replay time excluding refill; includes application, dispatch, and filtering.
+    pub apply_and_dispatch_elapsed: Duration,
+    /// Complete validated groups decoded.
+    pub groups_decoded: u64,
+    /// Decoded transactions, including those later filtered.
+    pub transactions_decoded: u64,
+    /// Data blocks received by the consumer, including terminal/tail blocks.
+    pub data_blocks_consumed: u64,
+    /// Full buffer bytes consumed, excluding metadata and unused read-ahead.
+    pub consumed_bytes: u64,
+    /// Logical payload bytes in complete validated groups.
+    pub validated_payload_bytes: u64,
+}
+
 /// Convert internal transaction-system counters into a public snapshot.
 #[inline]
 pub(crate) fn transaction_system_stats_snapshot(
@@ -290,6 +495,26 @@ pub(crate) fn buffer_pool_runtime_stats_snapshot(
     }
 }
 
+/// Accumulates a diagnostic count and flags overflow.
+pub(crate) fn recovery_add_count(value: &mut u64, increment: u64, saturated: &mut bool) {
+    *value = value.checked_add(increment).unwrap_or_else(|| {
+        *saturated = true;
+        u64::MAX
+    });
+}
+
+/// Accumulates diagnostic elapsed time and flags overflow.
+pub(crate) fn recovery_add_duration(
+    value: &mut Duration,
+    increment: Duration,
+    saturated: &mut bool,
+) {
+    *value = value.checked_add(increment).unwrap_or_else(|| {
+        *saturated = true;
+        Duration::MAX
+    });
+}
+
 #[inline]
 fn io_backend_stats_snapshot(stats: InternalIoBackendStats) -> IoBackendStats {
     IoBackendStats {
@@ -297,5 +522,52 @@ fn io_backend_stats_snapshot(stats: InternalIoBackendStats) -> IoBackendStats {
         submitted_ops: stats.submitted_ops,
         submit_and_wait_nanos: stats.submit_and_wait_nanos,
         wait_completions: stats.wait_completions,
+    }
+}
+
+fn recovery_sub_count(value: u64, decrement: u64, saturated: &mut bool) -> u64 {
+    value.checked_sub(decrement).unwrap_or_else(|| {
+        *saturated = true;
+        0
+    })
+}
+
+fn recovery_sub_duration(value: Duration, decrement: Duration, saturated: &mut bool) -> Duration {
+    value.checked_sub(decrement).unwrap_or_else(|| {
+        *saturated = true;
+        Duration::ZERO
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_diagnostic_arithmetic_saturates_without_panicking() {
+        let mut saturated = false;
+        let mut count = u64::MAX;
+        recovery_add_count(&mut count, 1, &mut saturated);
+        assert_eq!(count, u64::MAX);
+        assert!(saturated);
+        saturated = false;
+        let mut duration = Duration::MAX;
+        recovery_add_duration(&mut duration, Duration::from_nanos(1), &mut saturated);
+        assert_eq!(duration, Duration::MAX);
+        assert!(saturated);
+        saturated = false;
+        assert_eq!(recovery_sub_count(0, 1, &mut saturated), 0);
+        assert!(saturated);
+        saturated = false;
+        assert_eq!(
+            recovery_sub_duration(Duration::ZERO, Duration::from_nanos(1), &mut saturated),
+            Duration::ZERO
+        );
+        assert!(saturated);
+        let mut report = RecoveryReport::default();
+        report.phases.redo_replay_elapsed = Duration::from_nanos(1);
+        report.finish_transaction(Duration::ZERO);
+        assert!(report.saturated);
+        assert_eq!(report.phases.other_elapsed, Duration::ZERO);
     }
 }

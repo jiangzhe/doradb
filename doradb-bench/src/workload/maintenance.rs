@@ -245,9 +245,9 @@ impl SessionOutcome for CheckpointSessionOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CheckpointBreakdown {
     attempt_count: u64,
-    attempt_elapsed_nanos: u128,
+    attempt_elapsed_nanos: u64,
     retry_wait_count: u64,
-    retry_wait_elapsed_nanos: u128,
+    retry_wait_elapsed_nanos: u64,
 }
 
 impl CheckpointBreakdown {
@@ -507,9 +507,9 @@ fn increment(value: u64, label: &str) -> Result<u64> {
         .ok_or_else(|| BenchError::message(format!("{label} overflow")))
 }
 
-fn accumulate_elapsed(total: u128, elapsed: u64, label: &str) -> Result<u128> {
+fn accumulate_elapsed(total: u64, elapsed: u64, label: &str) -> Result<u64> {
     total
-        .checked_add(u128::from(elapsed))
+        .checked_add(elapsed)
         .ok_or_else(|| BenchError::message(format!("{label} overflow")))
 }
 
@@ -598,6 +598,22 @@ mod tests {
                 effective_ts: TrxID::new(effective_ts),
                 min_active_sts: TrxID::new(effective_ts - 1),
             },
+        }
+    }
+
+    #[test]
+    fn checkpoint_elapsed_accumulation_checks_overflow() {
+        for label in [
+            "checkpoint attempt duration",
+            "checkpoint retry wait duration",
+        ] {
+            assert_eq!(accumulate_elapsed(0, 0, label).unwrap(), 0);
+            assert_eq!(
+                accumulate_elapsed(u64::MAX - 1, 1, label).unwrap(),
+                u64::MAX
+            );
+            let error = accumulate_elapsed(u64::MAX, 1, label).unwrap_err();
+            assert_eq!(error.to_string(), format!("{label} overflow"));
         }
     }
 

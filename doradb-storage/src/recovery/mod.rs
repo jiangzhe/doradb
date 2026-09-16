@@ -33,8 +33,10 @@ use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::recovery::stream::PlannedRedoRecovery;
+use crate::stats::{RecoveryReport, recovery_add_count};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
+use std::time::Instant;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::{Report, ResultExt};
@@ -52,8 +54,19 @@ enum UserTableRedoAction {
     SkipCheckpointCoveredUnknownTable,
 }
 
+/// Value-only outcome of successful recovery, before writable redo construction.
+pub(crate) struct RecoveryOutcome {
+    /// Highest recovered commit timestamp.
+    pub(crate) max_recovered_cts: TrxID,
+    /// Value-only writable redo startup policy.
+    pub(crate) finalizer: RedoLogFinalizer,
+    /// Completed coordinator measurements.
+    pub(crate) report: RecoveryReport,
+}
+
 /// Recovery coordinator for checkpoint bootstrap, redo replay, final repair, and redo startup.
 pub(crate) struct RecoveryCoordinator<'a> {
+    report: RecoveryReport,
     /// Catalog, table files, and buffer-pool resources used by recovery.
     resources: RecoveryResources<'a>,
     /// Planner for the ordered redo-log stream.
@@ -83,6 +96,7 @@ impl<'a> RecoveryCoordinator<'a> {
         finalizer: RedoLogFinalizer,
     ) -> Self {
         RecoveryCoordinator {
+            report: RecoveryReport::default(),
             resources,
             redo_planner,
             redo_read_depth,
@@ -96,14 +110,14 @@ impl<'a> RecoveryCoordinator<'a> {
 
     /// Replay redo, rebuild indexes, and return recovery outcomes plus redo startup.
     #[inline]
-    pub(crate) async fn recover_all(self) -> RuntimeOrFatalResult<(TrxID, RedoLogFinalizer)> {
+    pub(crate) async fn recover_all(self) -> RuntimeOrFatalResult<RecoveryOutcome> {
         obs::info!("event=recovery_lifecycle component=recovery action=start result=ok");
         self.recover_all_inner()
             .await
-            .inspect(|(max_recovered_cts, _)| {
+            .inspect(|outcome| {
                 obs::info!(
                     "event=recovery_lifecycle component=recovery action=finish result=ok max_recovered_cts={}",
-                    max_recovered_cts
+                    outcome.max_recovered_cts
                 );
             })
             .inspect_err(|err| {
@@ -114,7 +128,8 @@ impl<'a> RecoveryCoordinator<'a> {
             })
     }
 
-    async fn recover_all_inner(mut self) -> RuntimeOrFatalResult<(TrxID, RedoLogFinalizer)> {
+    async fn recover_all_inner(mut self) -> RuntimeOrFatalResult<RecoveryOutcome> {
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=checkpoint_bootstrap action=start result=ok"
         );
@@ -130,6 +145,8 @@ impl<'a> RecoveryCoordinator<'a> {
                 );
             })?;
 
+        self.report.phases.user_table_bootstrap_elapsed = started.elapsed();
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_planning action=start result=ok"
         );
@@ -137,6 +154,8 @@ impl<'a> RecoveryCoordinator<'a> {
             skipped_max_recovered_cts,
             mut stream,
             repair_policy,
+            segments_discovered,
+            segments_selected,
         } = self
             .redo_planner
             .plan_recovery(self.timeline.replay_floor, self.redo_read_depth)
@@ -151,11 +170,15 @@ impl<'a> RecoveryCoordinator<'a> {
                     err
                 );
             })?;
+        self.report.work.redo_segments_discovered = segments_discovered;
+        self.report.work.redo_segments_selected = segments_selected;
         if let Some(skipped_max_cts) = skipped_max_recovered_cts {
             self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
+        self.report.phases.redo_planning_elapsed = started.elapsed();
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_replay action=start result=ok"
         );
@@ -183,12 +206,17 @@ impl<'a> RecoveryCoordinator<'a> {
                         err
                     );
                 })?;
-            replayed_logs += 1;
+            replayed_logs = replayed_logs.saturating_add(1);
         }
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_replay action=finish result=ok replayed_logs={}",
             replayed_logs
         );
+        self.report.phases.redo_replay_elapsed = started.elapsed();
+        let (metrics, saturated) = stream.recovery_metrics();
+        self.report.redo = metrics;
+        self.report.saturated |= saturated;
+        let started = Instant::now();
         let unsealed_terminals = stream.take_unsealed_terminals();
         // 2. Validate every final catalog satellite against catalog.tables.
         obs::info!(
@@ -240,6 +268,8 @@ impl<'a> RecoveryCoordinator<'a> {
             .attach("operation=recovery, phase=hydrate_managed_definitions")?;
         // 4. Remove create-table provisional files whose catalog redo never
         //    became durable.
+        self.report.phases.validation_elapsed = started.elapsed();
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=absent_file_cleanup action=start result=ok"
         );
@@ -255,6 +285,8 @@ impl<'a> RecoveryCoordinator<'a> {
             })
             .change_context(RuntimeError::Recovery)?;
         // 5. Rebuild hot secondary-index state from recovered RowStore pages.
+        self.report.phases.absent_file_cleanup_elapsed = started.elapsed();
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=index_rebuild action=start result=ok"
         );
@@ -271,6 +303,8 @@ impl<'a> RecoveryCoordinator<'a> {
             })?;
         // 5. Repair accepted unsealed redo prefixes and select the runtime
         //    active file only after replay has succeeded.
+        self.report.phases.hot_index_rebuild_elapsed = started.elapsed();
+        let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_repair_startup action=start result=ok"
         );
@@ -286,7 +320,12 @@ impl<'a> RecoveryCoordinator<'a> {
             })
             .change_context(RuntimeError::Recovery)?;
 
-        Ok((self.timeline.max_recovered_cts, self.finalizer))
+        self.report.phases.redo_repair_planning_elapsed = started.elapsed();
+        Ok(RecoveryOutcome {
+            max_recovered_cts: self.timeline.max_recovered_cts,
+            finalizer: self.finalizer,
+            report: self.report,
+        })
     }
 
     #[inline]
@@ -398,6 +437,11 @@ impl<'a> RecoveryCoordinator<'a> {
                     .insert(table.table_id);
             }
             self.timeline.seed_table_bounds(state);
+            recovery_add_count(
+                &mut self.report.work.checkpoint_user_tables,
+                1,
+                &mut self.report.saturated,
+            );
         }
         Ok(())
     }
@@ -526,6 +570,18 @@ impl<'a> RecoveryCoordinator<'a> {
     async fn replay_log(&mut self, log: TrxLog) -> RuntimeOrFatalResult<()> {
         // sequentially replay redo log.
         let (header, RedoLogs { ddl, dml }) = log.into_inner();
+        for (table_id, table_dml) in &dml {
+            let count = if table_id.is_catalog() {
+                &mut self.report.work.catalog_row_ops_seen
+            } else {
+                &mut self.report.work.user_row_ops_seen
+            };
+            recovery_add_count(
+                count,
+                table_dml.rows.len() as u64,
+                &mut self.report.saturated,
+            );
+        }
         self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(header.cts);
         if header.cts < self.timeline.replay_floor {
             return Ok(());
@@ -556,9 +612,20 @@ impl<'a> RecoveryCoordinator<'a> {
             for replay in pages.into_values() {
                 let page_id = replay.page_id();
                 drop(replay);
-                table
+                let (entries, saturated) = table
                     .populate_index_via_row_page(&self.resources.pool_guards, page_id)
                     .await?;
+                self.report.saturated |= saturated;
+                recovery_add_count(
+                    &mut self.report.work.index_rebuild_pages,
+                    1,
+                    &mut self.report.saturated,
+                );
+                recovery_add_count(
+                    &mut self.report.work.index_entries_inserted,
+                    entries,
+                    &mut self.report.saturated,
+                );
             }
         }
         Ok(())
@@ -949,6 +1016,11 @@ impl<'a> RecoveryCoordinator<'a> {
             .row_store
             .allocate_row_page_at(&self.resources.pool_guards, count as usize, page_id)
             .await?;
+        recovery_add_count(
+            &mut self.report.work.hot_pages_reconstructed,
+            1,
+            &mut self.report.saturated,
+        );
         page_guard.unwrap_vmap().set_create_cts(cts);
         entry.insert(RowReplayState::new(
             page_guard.page_id(),
@@ -1157,6 +1229,11 @@ impl<'a> RecoveryCoordinator<'a> {
                     unreachable!()
                 }
             }
+            recovery_add_count(
+                &mut self.report.work.catalog_row_ops_applied,
+                1,
+                &mut self.report.saturated,
+            );
         }
         Ok(())
     }
@@ -1200,6 +1277,11 @@ impl<'a> RecoveryCoordinator<'a> {
                             self.recovery_disable_dml_validation,
                         )
                         .await?;
+                    recovery_add_count(
+                        &mut self.report.work.hot_inserts,
+                        1,
+                        &mut self.report.saturated,
+                    );
                 }
                 RowRedoKind::Update(page_id, vals) => {
                     if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
@@ -1220,6 +1302,11 @@ impl<'a> RecoveryCoordinator<'a> {
                             self.recovery_disable_dml_validation,
                         )
                         .await?;
+                    recovery_add_count(
+                        &mut self.report.work.hot_updates,
+                        1,
+                        &mut self.report.saturated,
+                    );
                 }
                 RowRedoKind::Delete(page_id) => {
                     if row.row_id < pivot_row_id {
@@ -1229,6 +1316,11 @@ impl<'a> RecoveryCoordinator<'a> {
                         table.recover_cold_row_delete(row.row_id, cts)
                             .change_context(RuntimeError::Recovery)
                             .attach_with(|| format!("operation=recover_cold_row_delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id))?;
+                        recovery_add_count(
+                            &mut self.report.work.cold_deletes,
+                            1,
+                            &mut self.report.saturated,
+                        );
                         continue;
                     }
                     if cts < heap_redo_start_ts {
@@ -1245,6 +1337,11 @@ impl<'a> RecoveryCoordinator<'a> {
                     table
                         .recover_row_delete(&self.resources.pool_guards, replay, row.row_id, cts)
                         .await?;
+                    recovery_add_count(
+                        &mut self.report.work.hot_deletes,
+                        1,
+                        &mut self.report.saturated,
+                    );
                 }
                 RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
                     return Err(invalid_user_table_keyed_redo(table_id, row, cts)
@@ -1329,15 +1426,14 @@ mod tests {
         RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
         validate_create_table_reloaded_root_ts,
     };
-    use crate::CallbackResult;
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
-        ActiveIndexSpec, CatalogIndexNo, CatalogSelectKey, ColumnID, ColumnOrdinal, IndexID,
-        IndexObject, IndexOrder, IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot,
-        StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
-        StorageIndexSpec, StorageTableSpec, TableIndexKeySpec, TableMetadata, TableObject,
-        USER_TABLE_ID_START,
+        ActiveIndexSpec, CATALOG_TABLE_ID_START, CatalogIndexNo, CatalogSelectKey, ColumnID,
+        ColumnOrdinal, IndexID, IndexObject, IndexOrder, IndexRef, IndexSlot, SecondaryIndexRoot,
+        SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
+        StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableIndexKeySpec, TableMetadata,
+        TableObject, USER_TABLE_ID_START,
     };
     use crate::component::EnginePools;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
@@ -1377,6 +1473,8 @@ mod tests {
     use crate::trx::ver_map::RowPageState;
     use crate::value::Val;
     use crate::value::ValKind;
+    use crate::{CallbackResult, RecoveryReport, RecoveryWorkCounts};
+    use std::time::Duration;
 
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
@@ -1443,6 +1541,57 @@ mod tests {
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains(block_kind), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
+    }
+
+    fn assert_report_accounting(report: &RecoveryReport) {
+        assert!(!report.saturated, "{report:?}");
+        assert_eq!(
+            report.bootstrap_elapsed,
+            report.engine_setup_elapsed
+                + report.catalog_bootstrap_elapsed
+                + report.transaction_bootstrap_elapsed
+                + report.runtime_startup_elapsed
+        );
+        let phases = &report.phases;
+        assert_eq!(
+            report.transaction_bootstrap_elapsed,
+            phases.preparation_elapsed
+                + phases.user_table_bootstrap_elapsed
+                + phases.redo_planning_elapsed
+                + phases.redo_replay_elapsed
+                + phases.validation_elapsed
+                + phases.absent_file_cleanup_elapsed
+                + phases.hot_index_rebuild_elapsed
+                + phases.redo_repair_planning_elapsed
+                + phases.redo_finalize_elapsed
+                + phases.other_elapsed
+        );
+        let redo = &report.redo;
+        assert_eq!(
+            phases.redo_replay_elapsed,
+            redo.stream_refill_elapsed + redo.apply_and_dispatch_elapsed
+        );
+        assert_eq!(
+            redo.stream_refill_elapsed,
+            redo.receive_wait_elapsed
+                + redo.group_decode_elapsed
+                + redo.reader_shutdown_elapsed
+                + redo.stream_other_elapsed
+        );
+        let work = &report.work;
+        assert_eq!(
+            work.user_row_ops_seen,
+            work.user_row_ops_applied + work.user_row_ops_skipped
+        );
+        assert_eq!(
+            work.user_row_ops_applied,
+            work.hot_inserts + work.hot_updates + work.hot_deletes + work.cold_deletes
+        );
+        assert_eq!(
+            work.catalog_row_ops_seen,
+            work.catalog_row_ops_applied + work.catalog_row_ops_skipped
+        );
+        assert!(redo.consumed_bytes >= redo.validated_payload_bytes);
     }
 
     fn lightweight_recovery_engine_config(
@@ -2485,6 +2634,11 @@ mod tests {
                 assert_eq!(recovery.recovered_tables[&table_id].len(), 3);
                 recovery.rebuild_hot_indexes().await.unwrap();
                 assert!(recovery.recovered_tables.is_empty());
+                assert_eq!(recovery.report.work.hot_pages_reconstructed, 3);
+                assert_eq!(recovery.report.work.index_rebuild_pages, 3);
+                assert_eq!(recovery.report.work.index_entries_inserted, 4);
+                assert_eq!(recovery.report.work.hot_inserts, 3);
+                assert_eq!(recovery.report.work.hot_deletes, 1);
                 for (page_id, address, create_cts) in maps {
                     let page = table
                         .row_store
@@ -2595,6 +2749,9 @@ mod tests {
             .unwrap();
             recovery.rebuild_hot_indexes().await.unwrap();
             assert!(recovery.recovered_tables.is_empty());
+            assert_eq!(recovery.report.work.hot_pages_reconstructed, 2);
+            assert_eq!(recovery.report.work.index_rebuild_pages, 1);
+            assert_eq!(recovery.report.work.index_entries_inserted, 0);
         });
     }
 
@@ -2694,6 +2851,32 @@ mod tests {
                 .await
                 .unwrap();
 
+            assert_eq!(recovery.report.work.user_row_ops_seen, 1);
+            // The coarse floor still counts decoded row maps, including DML carried by DDL.
+            recovery.timeline.replay_floor = TrxID::new(10);
+            let mut redo = RedoLogs::default();
+            for (table_id, count) in [(CATALOG_TABLE_ID_START, 2), (unknown_table_id, 3)] {
+                for row in 0..count {
+                    redo.insert_dml(
+                        table_id,
+                        RowRedo {
+                            row_id: RowID::new(row),
+                            kind: RowRedoKind::Delete(None),
+                        },
+                    );
+                }
+            }
+            redo.ddl = Some(Box::new(DDLRedo::DropTable(unknown_table_id)));
+            recovery
+                .replay_log(TrxLog::new(redo_header(TrxID::new(9)), redo))
+                .await
+                .unwrap();
+            recovery.report.finish_transaction(Duration::ZERO);
+            assert!(!recovery.report.saturated);
+            assert_eq!(recovery.report.work.catalog_row_ops_seen, 2);
+            assert_eq!(recovery.report.work.catalog_row_ops_skipped, 2);
+            assert_eq!(recovery.report.work.user_row_ops_seen, 4);
+            assert_eq!(recovery.report.work.user_row_ops_skipped, 4);
             drop(recovery);
             drop(engine);
         });
@@ -3163,6 +3346,12 @@ mod tests {
                 Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
                     .await
                     .unwrap();
+            let report = recovered.recovery_report();
+            assert_report_accounting(report);
+            assert_eq!(report.work.redo_segments_discovered, 1);
+            assert_eq!(report.work.redo_segments_selected, 0);
+            assert_eq!(report.redo.transactions_decoded, 0);
+            assert_eq!(report.work.user_row_ops_seen, 0);
             let mut session = recovered.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert!(
@@ -3327,6 +3516,12 @@ mod tests {
             .await
             .unwrap();
 
+            let report = *engine.recovery_report();
+            assert_report_accounting(&report);
+            assert_eq!(report.work, RecoveryWorkCounts::default());
+            assert_eq!(report.redo.transactions_decoded, 0);
+            engine.shutdown();
+            assert_eq!(engine.recovery_report(), &report);
             drop(engine);
         })
     }
@@ -3496,6 +3691,21 @@ mod tests {
             .await
             .unwrap();
 
+            let report = engine.recovery_report();
+            assert_report_accounting(report);
+            assert_eq!(report.work.hot_inserts, DML_SIZE as u64);
+            assert_eq!(report.work.hot_updates, DML_SIZE.div_ceil(UPD_STEP) as u64);
+            assert_eq!(report.work.hot_deletes, DML_SIZE.div_ceil(DEL_STEP) as u64);
+            assert_eq!(report.work.user_row_ops_skipped, 0);
+            assert_eq!(
+                report.work.index_entries_inserted,
+                (DML_SIZE - DML_SIZE.div_ceil(DEL_STEP)) as u64
+            );
+            assert!(report.work.catalog_row_ops_applied > 0);
+            assert_eq!(
+                report.work.catalog_row_ops_seen,
+                report.work.catalog_row_ops_applied
+            );
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let session = engine.new_session().unwrap();
             let mut rows = 0usize;
@@ -3542,6 +3752,7 @@ mod tests {
             .await
             .unwrap();
 
+            let initial_report = *engine.recovery_report();
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(
@@ -3563,6 +3774,7 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
+            assert_eq!(engine.recovery_report(), &initial_report);
             let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
 
@@ -3582,6 +3794,9 @@ mod tests {
             .await
             .unwrap();
 
+            assert_report_accounting(engine.recovery_report());
+            assert_eq!(engine.recovery_report().work.checkpoint_user_tables, 1);
+            assert_eq!(engine.recovery_report().work.catalog_row_ops_applied, 0);
             assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             drop(engine);
         })
@@ -4695,6 +4910,11 @@ mod tests {
             .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let report = engine.recovery_report();
+            assert_report_accounting(report);
+            assert_eq!(report.work.cold_deletes, 1);
+            assert_eq!(report.work.hot_inserts, 1);
+            assert!(report.work.user_row_ops_skipped >= 11);
             assert_eq!(
                 table.file().active_root_unchecked().deletion_cutoff_ts,
                 checkpointed_cutoff

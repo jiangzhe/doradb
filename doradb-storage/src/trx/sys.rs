@@ -23,10 +23,11 @@ use crate::notify::MonotonicU64;
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
-use crate::recovery::RecoveryResources;
 use crate::recovery::stream::CatalogSafeRedoSegment;
+use crate::recovery::{RecoveryOutcome, RecoveryResources};
 use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
+use crate::stats::RecoveryReport;
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 #[cfg(test)]
@@ -55,6 +56,7 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// In-memory catalog-safe redo segment progress from a published catalog checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,6 +552,8 @@ pub(crate) struct TrxSysStats {
 /// As undo logs are maintained purely in memory, we can use shared pointer with atomic variable
 /// to perform very fast CTS backfill.
 pub(crate) struct TransactionSystem {
+    /// Value-only completed recovery measurements for engine assembly.
+    pub(crate) recovery_report: RecoveryReport,
     /// A sequence to generate snapshot timestamp(abbr. sts) and commit timestamp(abbr. cts).
     /// They share the same sequence and start from 1.
     /// The two timestamps are used to identify which version of data a transaction should see.
@@ -645,15 +649,24 @@ impl TransactionSystem {
 
         let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
+        let preparation_started = Instant::now();
         let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
         let coordinator = recovery_resources.prepare(&config, file_prefix.clone())?;
-        let (max_recovered_cts, finalizer) = coordinator.recover_all().await?;
+        let preparation_elapsed = preparation_started.elapsed();
+        let RecoveryOutcome {
+            max_recovered_cts,
+            finalizer,
+            mut report,
+        } = coordinator.recover_all().await?;
+        report.phases.preparation_elapsed = preparation_elapsed;
         let initial_trx_ts =
             recovery_initial_trx_ts(max_recovered_cts).change_context(RuntimeError::Recovery)?;
+        let finalize_started = Instant::now();
         let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
+        report.phases.redo_finalize_elapsed = finalize_started.elapsed();
         let redo_log = CachePadded::new(redo_log);
 
-        let trx_sys = Self::new(
+        let mut trx_sys = Self::new(
             config,
             file_prefix,
             poisoner,
@@ -666,6 +679,7 @@ impl TransactionSystem {
                 purge_tx: purge_tx.clone(),
             },
         );
+        trx_sys.recovery_report = report;
         Ok((
             trx_sys,
             PendingTransactionWorkerStartups {
@@ -707,6 +721,7 @@ impl TransactionSystem {
             catalog.snapshot_dropped_table_file_cleanups(),
         );
         TransactionSystem {
+            recovery_report: RecoveryReport::default(),
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
             published_gc_horizon: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),

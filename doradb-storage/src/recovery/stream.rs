@@ -1,3 +1,6 @@
+use crate::stats::{RecoveryRedoMetrics, recovery_add_count, recovery_add_duration};
+use std::time::Instant;
+
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, IoError, IoResult, RuntimeError, RuntimeResult,
 };
@@ -310,9 +313,13 @@ impl RedoReplayPlanner {
         let suffix = self.load_replay_suffix(floor)?;
         let planned = self.plan_replay_segments(&suffix, floor)?;
 
-        let stream = RedoLogStream::from_planned_segments(planned.stream_segments, read_depth)
+        let segments_selected = planned.stream_segments.len() as u64;
+        let mut stream = RedoLogStream::from_planned_segments(planned.stream_segments, read_depth)
             .attach("phase=plan_recovery_redo_read_ahead")?;
+        stream.metrics = Some(StreamMetrics::default());
         Ok(PlannedRedoRecovery {
+            segments_discovered: self.discovered.len() as u64,
+            segments_selected,
             skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
             stream,
             repair_policy: planned.repair_policy,
@@ -480,6 +487,10 @@ struct PlannedReplaySegments {
 
 /// Complete redo startup plan: stream plus post-replay repair policy.
 pub(crate) struct PlannedRedoRecovery {
+    /// Segment filenames discovered, including excluded segments.
+    pub(crate) segments_discovered: u64,
+    /// Segments selected for body replay.
+    pub(crate) segments_selected: u64,
     /// Highest CTS from sealed skipped segments below the replay floor.
     pub(crate) skipped_max_recovered_cts: Option<TrxID>,
     /// Stream over the planned durable redo prefix.
@@ -517,8 +528,15 @@ enum RedoLogStreamState {
     Failed,
 }
 
+#[derive(Default)]
+struct StreamMetrics {
+    redo: RecoveryRedoMetrics,
+    saturated: bool,
+}
+
 /// Buffered stream of transaction redo records across a sequence of redo files.
 pub(crate) struct RedoLogStream {
+    metrics: Option<StreamMetrics>,
     /// Direct-IO read-ahead worker for the planned logical stream.
     reader: Option<RedoReadAheadHandle>,
     /// Parser state for the current redo segment.
@@ -554,18 +572,35 @@ impl RedoLogStream {
             buffer: VecDeque::new(),
             state,
             unsealed_terminals: Vec::new(),
+            metrics: None,
         })
     }
 
     /// Refill the in-memory queue from the direct-IO stream.
     #[inline]
     async fn fill_buffer(&mut self) -> RuntimeResult<()> {
+        let started = self.metrics.as_ref().map(|_| Instant::now());
+        let result = self.fill_buffer_inner().await;
+        if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+            recovery_add_duration(
+                &mut metrics.redo.stream_refill_elapsed,
+                started.elapsed(),
+                &mut metrics.saturated,
+            );
+        }
+        result
+    }
+
+    async fn fill_buffer_inner(&mut self) -> RuntimeResult<()> {
         while self.state == RedoLogStreamState::Active {
             if let Some(mut iter) = self.read_next_group().await? {
+                let started = self.metrics.as_ref().map(|_| Instant::now());
+                let payload_bytes = iter.data.len() as u64;
+                let before = self.buffer.len();
                 loop {
                     match iter.try_next() {
                         Ok(Some(res)) => self.buffer.push_back(res),
-                        Ok(None) => return Ok(()),
+                        Ok(None) => break,
                         Err(err) => {
                             return Err(self.fail_stream(
                                 err.change_context(RuntimeError::RedoLogAccess)
@@ -574,6 +609,25 @@ impl RedoLogStream {
                         }
                     }
                 }
+                if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+                    recovery_add_duration(
+                        &mut metrics.redo.group_decode_elapsed,
+                        started.elapsed(),
+                        &mut metrics.saturated,
+                    );
+                    recovery_add_count(&mut metrics.redo.groups_decoded, 1, &mut metrics.saturated);
+                    recovery_add_count(
+                        &mut metrics.redo.transactions_decoded,
+                        (self.buffer.len() - before) as u64,
+                        &mut metrics.saturated,
+                    );
+                    recovery_add_count(
+                        &mut metrics.redo.validated_payload_bytes,
+                        payload_bytes,
+                        &mut metrics.saturated,
+                    );
+                }
+                return Ok(());
             }
         }
         Ok(())
@@ -819,11 +873,32 @@ impl RedoLogStream {
         let reader = self.reader.as_ref().unwrap_or_else(|| {
             panic!("redo read-protocol invariant violated: receive before worker start")
         });
-        Ok(reader.items.recv_async().await.unwrap_or_else(|_| {
+        let started = self.metrics.as_ref().map(|_| Instant::now());
+        let item = reader.items.recv_async().await.unwrap_or_else(|_| {
             panic!(
                 "redo read-protocol invariant violated: worker channel closed without terminal item"
             )
-        }))
+        });
+        if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+            recovery_add_duration(
+                &mut metrics.redo.receive_wait_elapsed,
+                started.elapsed(),
+                &mut metrics.saturated,
+            );
+            if let RedoReadItem::Block { buf, .. } = &item {
+                recovery_add_count(
+                    &mut metrics.redo.data_blocks_consumed,
+                    1,
+                    &mut metrics.saturated,
+                );
+                recovery_add_count(
+                    &mut metrics.redo.consumed_bytes,
+                    buf.as_bytes().len() as u64,
+                    &mut metrics.saturated,
+                );
+            }
+        }
+        Ok(item)
     }
 
     #[inline]
@@ -835,10 +910,18 @@ impl RedoLogStream {
 
     #[inline]
     fn stop_reader(&mut self) {
+        let started = self.metrics.as_ref().map(|_| Instant::now());
         if let Some(reader) = &self.reader {
             reader.stop();
         }
         self.reader.take();
+        if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+            recovery_add_duration(
+                &mut metrics.redo.reader_shutdown_elapsed,
+                started.elapsed(),
+                &mut metrics.saturated,
+            );
+        }
     }
 
     #[inline]
@@ -855,6 +938,14 @@ impl RedoLogStream {
         self.current_segment = None;
         self.stop_reader();
         self.state = RedoLogStreamState::Ended;
+    }
+
+    /// Returns startup-only consumer measurements after stream termination.
+    pub(crate) fn recovery_metrics(&self) -> (RecoveryRedoMetrics, bool) {
+        self.metrics.as_ref().map_or_else(
+            || (RecoveryRedoMetrics::default(), false),
+            |metrics| (metrics.redo, metrics.saturated),
+        )
     }
 
     /// Take accepted-prefix metadata for unsealed segments observed by this stream.
@@ -1809,6 +1900,7 @@ mod tests {
     };
     use crate::serde::Ser;
     use crate::thread::fail_spawn_named;
+    use crate::value::Val;
     use futures::FutureExt;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
@@ -2017,6 +2109,7 @@ mod tests {
             buffer: VecDeque::new(),
             state: RedoLogStreamState::Active,
             unsealed_terminals: Vec::new(),
+            metrics: None,
         }
     }
 
@@ -2496,6 +2589,7 @@ mod tests {
 
         let planned = planner.plan_catalog_scan(TrxID::new(5), 1).unwrap();
 
+        assert!(planned.stream.metrics.is_none());
         assert_eq!(
             planned.sealed_segments,
             vec![
@@ -2547,6 +2641,8 @@ mod tests {
                     newest_file_seq: 1
                 }
             );
+            assert_eq!(planned.segments_discovered, 2);
+            assert_eq!(planned.segments_selected, 1);
             let mut stream = planned.stream;
 
             let recovered = stream.try_next().await.unwrap().unwrap();
@@ -2558,6 +2654,16 @@ mod tests {
                 Some((TrxID::new(5), TrxID::new(5))),
             )
             .await;
+            let (metrics, saturated) = stream.recovery_metrics();
+            assert!(!saturated);
+            assert_eq!(metrics.groups_decoded, 1);
+            assert_eq!(metrics.transactions_decoded, 1);
+            assert_eq!(metrics.data_blocks_consumed, 2);
+            assert_eq!(metrics.consumed_bytes, 2 * STORAGE_SECTOR_SIZE as u64);
+            assert_eq!(
+                metrics.validated_payload_bytes,
+                simple_trx_log(TrxID::new(5)).ser_len() as u64
+            );
         });
     }
 
@@ -2927,6 +3033,66 @@ mod tests {
     }
 
     #[test]
+    fn test_recovery_metrics_count_multiblock_payload_and_consumed_tail_only() {
+        smol::block_on(async {
+            let mut redo = RedoLogs::default();
+            redo.insert_dml(
+                TableID::new(100),
+                RowRedo {
+                    row_id: RowID::new(0),
+                    kind: RowRedoKind::Insert(
+                        test_page_id(1),
+                        vec![Val::from(vec![7u8; STORAGE_SECTOR_SIZE * 3])],
+                    ),
+                },
+            );
+            let log = TrxLog::new(
+                RedoHeader {
+                    cts: TrxID::new(5),
+                    trx_kind: RedoTrxKind::User,
+                },
+                redo,
+            );
+            let payload_bytes = log.ser_len() as u64;
+            let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+            let blocks = group
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                        .collect()
+                })
+                .unwrap();
+            assert!(blocks.len() > 1);
+            let dir = tempfile::tempdir().unwrap();
+            let mut stream = stream_for_test_file(
+                &dir.path().join("redo"),
+                STORAGE_SECTOR_SIZE,
+                blocks.len() + 10,
+                &blocks,
+                TestSegmentSeal::Open,
+            );
+            assert!(stream.try_next().await.unwrap().is_some());
+            assert!(stream.try_next().await.unwrap().is_none());
+            let (metrics, saturated) = stream.recovery_metrics();
+            assert!(!saturated);
+            assert_eq!(metrics.groups_decoded, 1);
+            assert_eq!(metrics.transactions_decoded, 1);
+            assert_eq!(metrics.data_blocks_consumed, blocks.len() as u64 + 1);
+            assert_eq!(
+                metrics.consumed_bytes,
+                (blocks.len() as u64 + 1) * STORAGE_SECTOR_SIZE as u64
+            );
+            assert_eq!(metrics.validated_payload_bytes, payload_bytes);
+            assert!(
+                metrics.stream_refill_elapsed
+                    >= metrics.receive_wait_elapsed
+                        + metrics.group_decode_elapsed
+                        + metrics.reader_shutdown_elapsed
+            );
+        });
+    }
+
+    #[test]
     fn test_direct_stream_reads_multi_trx_log_in_one_group() {
         smol::block_on(async {
             let log1 = TrxLog::new(
@@ -2987,6 +3153,14 @@ mod tests {
             let log2 = stream.try_next().await.unwrap().unwrap();
             assert!(log2.header.trx_kind == RedoTrxKind::User);
             assert!(stream.try_next().await.unwrap().is_none());
+            let (metrics, saturated) = stream.recovery_metrics();
+            assert!(!saturated);
+            assert_eq!(metrics.transactions_decoded, 2);
+            assert_eq!(metrics.groups_decoded, 1);
+            assert_eq!(
+                metrics.validated_payload_bytes,
+                (log1.ser_len() + log2.ser_len()) as u64
+            );
         });
     }
 
@@ -3042,6 +3216,19 @@ mod tests {
             assert_eq!(first.header.cts, TrxID::new(1));
             assert_eq!(second.header.cts, TrxID::new(2));
             assert!(stream.try_next().await.unwrap().is_none());
+            let (metrics, saturated) = stream.recovery_metrics();
+            assert!(!saturated);
+            assert_eq!(metrics.transactions_decoded, 2);
+            assert_eq!(metrics.groups_decoded, 2);
+            assert_eq!(metrics.data_blocks_consumed, 2);
+            assert_eq!(
+                metrics.consumed_bytes,
+                (STORAGE_SECTOR_SIZE + second_block_size) as u64
+            );
+            assert_eq!(
+                metrics.validated_payload_bytes,
+                (first.ser_len() + second.ser_len()) as u64
+            );
         });
     }
 }

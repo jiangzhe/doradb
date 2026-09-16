@@ -1,5 +1,7 @@
 use crate::cli::{validate_batch_size, validate_value_size, validate_workers};
-use crate::engine_config::{EngineConfigOverlay, ResolvedEngineConfig, resolve_engine_config};
+use crate::engine_config::{
+    EngineConfigOverlay, LogSyncValue, ResolvedEngineConfig, resolve_engine_config,
+};
 use crate::error::{BenchError, Result};
 use crate::fixture::{
     FixturePlanEffect, FixturePlanState, FixtureRequirement, IndexMode, IndexRequirement, KeyRange,
@@ -170,6 +172,8 @@ impl fmt::Display for CatalogCheckpointCase {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WorkloadSpec {
+    /// Measure one clean engine reopen.
+    Recovery(RecoverySpec),
     /// Create the invocation's implicit homogeneous table pool.
     CreateTable(CreateTableSpec),
     /// Prepare deterministic managed table bindings.
@@ -212,6 +216,22 @@ pub enum WorkloadSpec {
     CatalogCheckpointPrepare(CatalogCheckpointSpec),
     /// Measure one pending deterministic managed-catalog checkpoint.
     CatalogCheckpoint(CatalogCheckpointSpec),
+}
+
+/// Strict clean-reopen controls. Preparation sizing is deliberately excluded.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySpec {
+    /// Optional cumulative fresh-engine diagnostics; recovery metrics are mandatory.
+    pub include_stats: Option<bool>,
+}
+
+/// Resolved coordinator-owned clean-reopen controls.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryConfig {
+    /// Capture cumulative fresh-engine diagnostics before verification.
+    pub include_stats: bool,
 }
 
 /// Strict managed-binding fixture controls.
@@ -868,6 +888,8 @@ pub struct LockTableConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ResolvedWorkload {
+    /// Single coordinator-owned engine reopen.
+    Recovery(RecoveryConfig),
     /// Table-pool creation workload.
     CreateTable(CreateTableConfig),
     /// Deterministic managed-binding fixture preparation.
@@ -916,6 +938,7 @@ impl ResolvedWorkload {
     /// Stable workload identity.
     pub fn identity(&self) -> &'static str {
         match self {
+            Self::Recovery(_) => "recovery",
             Self::CreateTable(_) => "create-table",
             Self::ManagedBindingsPrepare(_) => "managed-bindings-prepare",
             Self::ResolveTableBinding(_) => "resolve-table-binding",
@@ -943,6 +966,7 @@ impl ResolvedWorkload {
     /// Return the fixture capability consumed by this workload.
     pub(crate) fn fixture_requirement(&self) -> FixtureRequirement {
         match self {
+            Self::Recovery(_) => FixtureRequirement::Recoverable,
             Self::CreateTable(_) => FixtureRequirement::AbsentPrimary,
             Self::ManagedBindingsPrepare(_) => FixtureRequirement::AbsentManagedBindings,
             Self::ResolveTableBinding(_) => FixtureRequirement::ManagedBindings,
@@ -989,6 +1013,7 @@ impl ResolvedWorkload {
     /// Return whether repeated execution against one fixture is safe.
     pub fn replay_policy(&self) -> ReplayPolicy {
         match self {
+            Self::Recovery(_) => ReplayPolicy::SingleRun,
             Self::StmtNoop(_)
             | Self::TrxNoop(_)
             | Self::LookupSeq(_)
@@ -1016,6 +1041,7 @@ impl ResolvedWorkload {
     /// Return the resolved worker/session counts.
     pub fn worker_counts(&self) -> (usize, usize) {
         match self {
+            Self::Recovery(_) => (0, 0),
             Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => (1, 1),
             Self::ResolveTableBinding(config) => (config.threads, config.sessions),
             Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
@@ -1039,6 +1065,7 @@ impl ResolvedWorkload {
     /// Return whether engine diagnostics are requested.
     pub fn include_stats(&self) -> bool {
         match self {
+            Self::Recovery(config) => config.include_stats,
             Self::CreateTable(config) => config.include_stats,
             Self::ManagedBindingsPrepare(_) => false,
             Self::ResolveTableBinding(config) => config.include_stats,
@@ -1064,6 +1091,7 @@ impl ResolvedWorkload {
     /// Return the semantic latency unit for sampled executions.
     pub fn latency_unit(&self) -> LatencyUnit {
         match self {
+            Self::Recovery(_) => LatencyUnit::EngineRecovery,
             Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => LatencyUnit::TableCreation,
             Self::ResolveTableBinding(_) => LatencyUnit::TableBindingResolution,
             Self::StmtNoop(_) => LatencyUnit::StatementExecution,
@@ -1098,6 +1126,7 @@ impl ResolvedWorkload {
     /// Return the exact successful sampled-run latency count.
     pub fn expected_samples(&self) -> Result<u64> {
         match self {
+            Self::Recovery(_) => Ok(1),
             Self::CreateTable(config) => u64::try_from(config.table_count)
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
@@ -1183,6 +1212,15 @@ pub fn load_plan(source: &Path, storage_root: &Path) -> Result<LoadedPlan> {
     let (engine_config, engine) = resolve_engine_config(storage_root, &overlay)?;
     let workload_defaults = raw.workload_defaults.resolve()?;
     let phases = validate_and_resolve_phases(raw.phases, workload_defaults)?;
+    if phases
+        .iter()
+        .any(|phase| matches!(phase.workload(), ResolvedWorkload::Recovery(_)))
+        && engine.transaction.log_sync == LogSyncValue::None
+    {
+        return Err(BenchError::message(
+            "recovery requires engine.transaction.log_sync = fsync or fdatasync",
+        ));
+    }
     Ok(LoadedPlan {
         plan: Plan {
             name: raw.name,
@@ -1205,10 +1243,16 @@ fn validate_and_resolve_phases(
     for (index, raw) in raw_phases.into_iter().enumerate() {
         let (workload, fixture_effect) = resolve_workload(raw.workload, defaults, &fixture)?;
         fixture.validate(workload.fixture_requirement())?;
-        if raw.kind == PhaseKind::Prepare && matches!(workload, ResolvedWorkload::UpdateRand(_)) {
+        if raw.kind == PhaseKind::Prepare
+            && matches!(
+                workload,
+                ResolvedWorkload::UpdateRand(_) | ResolvedWorkload::Recovery(_)
+            )
+        {
             return Err(BenchError::message(format!(
-                "phase {} workload update-rand is allowed only as the final benchmark",
-                index + 1
+                "phase {} workload {} is allowed only as the final benchmark",
+                index + 1,
+                workload.identity()
             )));
         }
         if raw.kind == PhaseKind::Benchmark
@@ -1307,6 +1351,9 @@ fn resolve_workload(
 ) -> Result<(ResolvedWorkload, FixturePlanEffect)> {
     let no_effect = |workload| Ok((workload, FixturePlanEffect::None));
     match spec {
+        WorkloadSpec::Recovery(spec) => no_effect(ResolvedWorkload::Recovery(RecoveryConfig {
+            include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+        })),
         WorkloadSpec::CreateTable(spec) => {
             let shape = PrimaryTableShape { index: spec.index };
             let table_count = spec.tables.map_or(1, NonZeroUsize::get);
@@ -1790,7 +1837,7 @@ mod tests {
 
     fn resolve(raw: &str) -> Result<Vec<Phase>> {
         let raw = parse(raw).unwrap();
-        validate_and_resolve_phases(raw.phases, WorkloadDefaults::default().resolve().unwrap())
+        validate_and_resolve_phases(raw.phases, raw.workload_defaults.resolve().unwrap())
     }
 
     #[test]
@@ -2215,9 +2262,83 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
     }
 
     #[test]
+    fn recovery_plan_is_strict_single_run_and_coordinator_owned() {
+        let suffix = "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"recovery\" }\n";
+        for prepare in [
+            "",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n",
+            "[[phase]]\nworkload = { type = \"create-table\", index = \"non-unique\" }\n",
+        ] {
+            let phases = resolve(&format!("[workload_defaults]\nthreads = 4\nsessions = 8\ninclude_stats = true\n{prepare}{suffix}")).unwrap();
+            let workload = phases.last().unwrap().workload();
+            assert_eq!(workload.worker_counts(), (0, 0));
+            assert_eq!(workload.expected_samples().unwrap(), 1);
+            assert_eq!(workload.latency_unit(), LatencyUnit::EngineRecovery);
+            assert_eq!(workload.replay_policy(), ReplayPolicy::SingleRun);
+            assert!(workload.include_stats());
+        }
+        for field in [
+            "threads = 1",
+            "sessions = 1",
+            "num = 1",
+            "batch_size = 1",
+            "value_size = '128 B'",
+            "seed = 1",
+            "unexpected = true",
+        ] {
+            assert!(
+                parse(&format!(
+                    "[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'recovery', {field} }}"
+                ))
+                .is_err(),
+                "{field}"
+            );
+        }
+        for prefix in ["warmup_runs = 1", "measured_runs = 2"] {
+            assert!(
+                resolve(&format!(
+                    "[[phase]]\nkind = 'benchmark'\n{prefix}\nworkload = {{ type = 'recovery' }}"
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            resolve(&format!(
+                "[[phase]]\nworkload = {{ type = 'recovery' }}\n{suffix}"
+            ))
+            .is_err()
+        );
+        for prepare in [
+            "[[phase]]\nworkload = { type = 'create-table', index = 'none', tables = 2 }\n",
+            "[[phase]]\nworkload = { type = 'managed-bindings-prepare', tables = 1 }\n",
+            "[[phase]]\nworkload = { type = 'catalog-checkpoint-prepare', profile = 'small', case = 'managed-create' }\n",
+            "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 100 }\n[[phase]]\nworkload = { type = 'freeze-table', max_rows = 50 }\n",
+        ] {
+            assert!(resolve(&format!("{prepare}{suffix}")).is_err(), "{prepare}");
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("recovery.toml");
+        for sync in ["none", "fsync", "fdatasync"] {
+            fs::write(
+                &source,
+                format!("[engine.transaction]\nlog_sync = '{sync}'\n{suffix}"),
+            )
+            .unwrap();
+            let root = temp.path().join(sync);
+            assert_eq!(load_plan(&source, &root).is_ok(), sync != "none");
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
     fn checked_in_templates_are_the_exact_complete_workload_inventory() {
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         let cases = [
+            ("recovery-empty.toml", "recovery"),
+            ("recovery.toml", "recovery"),
+            ("recovery-indexed.toml", "recovery"),
+            ("recovery-checkpoint.toml", "recovery"),
             ("trx-noop.toml", "trx-noop"),
             ("stmt-noop.toml", "stmt-noop"),
             ("insert-seq.toml", "insert-seq"),

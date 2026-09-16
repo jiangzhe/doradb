@@ -11,6 +11,7 @@ mod lock;
 mod maintenance;
 mod noop;
 mod read;
+mod recovery;
 mod table_scan;
 mod update;
 mod util;
@@ -25,6 +26,7 @@ pub(crate) use noop::{StmtNoopExecutor, TrxNoopExecutor};
 pub(crate) use read::{
     IndexScanExecutor, IndexStreamExecutor, LookupRandExecutor, LookupSeqExecutor,
 };
+pub(crate) use recovery::run_recovery;
 pub(crate) use table_scan::{
     ParallelTableScanExecutor, ParallelTableScanExecutorConfig, TableScanExecutor,
 };

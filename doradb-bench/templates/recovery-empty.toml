@@ -1,0 +1,8 @@
+name = "recovery-empty clean reopen"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "recovery", include_stats = true }

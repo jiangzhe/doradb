@@ -19,9 +19,9 @@ use crate::workload::{
     LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
     ParallelTableScanExecutor, ParallelTableScanExecutorConfig, ResolveTableBindingExecutor,
     RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor, TableScanExecutor,
-    TrxNoopExecutor, UpdateRandExecutor,
+    TrxNoopExecutor, UpdateRandExecutor, run_recovery,
 };
-use doradb_storage::{Engine, Session};
+use doradb_storage::{Engine, EngineConfig, Session};
 use easy_parallel::Parallel;
 use rustix::process::{Signal, getpid, kill_process};
 use smol::{Executor, channel};
@@ -147,7 +147,7 @@ pub(crate) trait SessionExecutor: Clone + Send + Sync + Sized {
 }
 
 struct RunOutcome {
-    elapsed_nanos: u128,
+    elapsed_nanos: u64,
     counters: WorkloadCounters,
     latency: LatencyDistribution,
     internal_metrics: Vec<InternalMetric>,
@@ -167,9 +167,13 @@ pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result
     let clock = MeasurementClock::new();
     prepare_plan_root(&storage_root)?;
 
-    let engine = Engine::bootstrap(loaded.engine_config).await?;
-    let operation_result = execute_phases(&engine, &clock, &loaded.plan).await;
-    engine.shutdown();
+    let reopen_config = loaded.engine_config.clone();
+    let mut owner = Some(Engine::bootstrap(loaded.engine_config).await?);
+    let operation_result = execute_phases(&mut owner, &reopen_config, &clock, &loaded.plan).await;
+    if let Some(engine) = owner.take() {
+        engine.shutdown();
+        drop(engine);
+    }
     let results = operation_result?;
     let report = InvocationReport {
         root: storage_root.clone(),
@@ -187,7 +191,8 @@ pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result
 }
 
 async fn execute_phases(
-    engine: &Engine,
+    owner: &mut Option<Engine>,
+    reopen_config: &EngineConfig,
     clock: &MeasurementClock,
     plan: &Plan,
 ) -> Result<InvocationResults> {
@@ -204,9 +209,16 @@ async fn execute_phases(
                 fixture_effect,
             } => {
                 let binding = fixture.bind(workload.fixture_requirement())?;
-                let outcome =
-                    dispatch_workload(engine, clock, workload, binding, fixture_effect, false, 0)
-                        .await?;
+                let outcome = dispatch_workload(
+                    current_engine(owner.as_ref())?,
+                    clock,
+                    workload,
+                    binding,
+                    fixture_effect,
+                    false,
+                    0,
+                )
+                .await?;
                 fixture.apply(outcome.effect)?;
                 prepare_phases.push(PreparePhaseResult {
                     phase_index,
@@ -222,13 +234,13 @@ async fn execute_phases(
                 workload,
                 fixture_effect,
             } => {
-                if measurement.pause {
+                if measurement.pause && !matches!(workload, ResolvedWorkload::Recovery(_)) {
                     pause_for_profiler(phase_index, workload.identity())?;
                 }
                 for execution_ordinal in 0..measurement.warmup_runs {
                     let binding = fixture.bind(workload.fixture_requirement())?;
                     dispatch_workload(
-                        engine,
+                        current_engine(owner.as_ref())?,
                         clock,
                         workload,
                         binding,
@@ -249,16 +261,55 @@ async fn execute_phases(
                             BenchError::message("benchmark execution ordinal overflow")
                         })?;
                     let binding = fixture.bind(workload.fixture_requirement())?;
-                    let outcome = dispatch_workload(
-                        engine,
-                        clock,
-                        workload,
-                        binding,
-                        fixture_effect,
-                        true,
-                        execution_ordinal,
-                    )
-                    .await?;
+                    let outcome = if let ResolvedWorkload::Recovery(config) = workload {
+                        let FixtureBinding::Recoverable(table) = binding else {
+                            return Err(BenchError::message(
+                                "recovery requires a recoverable fixture binding",
+                            ));
+                        };
+                        let run = run_recovery(
+                            owner,
+                            reopen_config.clone(),
+                            clock,
+                            table,
+                            config.include_stats,
+                            || {
+                                if measurement.pause {
+                                    pause_for_profiler(phase_index, workload.identity())
+                                } else {
+                                    Ok(())
+                                }
+                            },
+                        )
+                        .await?;
+                        let mut latency = LatencyDistribution::new()?;
+                        latency.record(run.elapsed_nanos)?;
+                        RunOutcome {
+                            elapsed_nanos: run.elapsed_nanos,
+                            counters: WorkloadCounters {
+                                operations: 1,
+                                ..WorkloadCounters::default()
+                            },
+                            latency,
+                            internal_metrics: run.internal_metrics,
+                            workload_metrics: Some(WorkloadMetrics::Recovery {
+                                report: Box::new(run.report),
+                                verification: run.verification,
+                            }),
+                            effect: FixtureRuntimeEffect::None,
+                        }
+                    } else {
+                        dispatch_workload(
+                            current_engine(owner.as_ref())?,
+                            clock,
+                            workload,
+                            binding,
+                            fixture_effect,
+                            true,
+                            execution_ordinal,
+                        )
+                        .await?
+                    };
                     let latency = outcome.latency.summary(workload.latency_unit())?;
                     aggregate.add_run(outcome.elapsed_nanos, outcome.counters, &outcome.latency)?;
                     measured_runs.push(MeasuredRunResult {
@@ -295,6 +346,10 @@ async fn execute_phases(
         aggregate: final_aggregate
             .ok_or_else(|| BenchError::message("plan completed without a benchmark aggregate"))?,
     })
+}
+
+fn current_engine(owner: Option<&Engine>) -> Result<&Engine> {
+    owner.ok_or_else(|| BenchError::message("phase requires an occupied engine owner"))
 }
 
 fn pause_for_profiler(phase_index: usize, workload: &str) -> Result<()> {
@@ -378,6 +433,9 @@ async fn dispatch_workload(
     execution_ordinal: u32,
 ) -> Result<RunOutcome> {
     match workload {
+        ResolvedWorkload::Recovery(_) => Err(BenchError::message(
+            "recovery must execute at the coordinator lifecycle boundary",
+        )),
         ResolvedWorkload::CreateTable(config) => {
             run_executor::<CreateTableExecutor>(
                 engine,

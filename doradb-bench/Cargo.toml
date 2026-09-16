@@ -14,6 +14,7 @@ path = "src/bin/doradb_bench.rs"
 workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 byte-unit = { workspace = true }
 clap = { workspace = true }
 doradb-storage = { path = "../doradb-storage" }

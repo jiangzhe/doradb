@@ -5,7 +5,7 @@ use doradb_storage::{
     MandatoryRuntimeStats, MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct InternalStatsSnapshot {
     trx: TransactionSystemStats,
     storage: StorageIoStats,
@@ -28,7 +28,7 @@ impl InternalStatsSnapshot {
 
 struct Metric {
     name: String,
-    value: u128,
+    value: u64,
 }
 
 /// Capture the public engine diagnostics used by plan mode.
@@ -72,6 +72,17 @@ pub(crate) fn plan_internal_metrics(
             }
         })
         .collect()
+}
+
+/// Capture fresh-engine counters without comparing different engine instances.
+pub(crate) fn cumulative_internal_metrics(snapshot: &InternalStatsSnapshot) -> Vec<InternalMetric> {
+    let mut metrics = plan_internal_metrics(&InternalStatsSnapshot::default(), snapshot);
+    for metric in &mut metrics {
+        if metric.kind == InternalMetricKind::CounterDelta {
+            metric.kind = InternalMetricKind::CumulativeCounter;
+        }
+    }
+    metrics
 }
 
 fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapshot) -> Vec<Metric> {
@@ -121,42 +132,42 @@ fn push_logical_lock_metrics(
     push_metric(
         metrics,
         "logical_lock.current_physical_resources",
-        u128::from(after.current_physical_resources),
+        after.current_physical_resources,
     );
     push_metric(
         metrics,
         "logical_lock.peak_physical_resources",
-        u128::from(after.peak_physical_resources),
+        after.peak_physical_resources,
     );
     push_metric(
         metrics,
         "logical_lock.current_physical_families",
-        u128::from(after.current_physical_families),
+        after.current_physical_families,
     );
     push_metric(
         metrics,
         "logical_lock.peak_physical_families",
-        u128::from(after.peak_physical_families),
+        after.peak_physical_families,
     );
     push_metric(
         metrics,
         "logical_lock.current_linked_waiters",
-        u128::from(after.current_linked_waiters),
+        after.current_linked_waiters,
     );
     push_metric(
         metrics,
         "logical_lock.peak_linked_waiters",
-        u128::from(after.peak_linked_waiters),
+        after.peak_linked_waiters,
     );
     push_metric(
         metrics,
         "logical_lock.current_live_waiter_nodes",
-        u128::from(after.current_live_waiter_nodes),
+        after.current_live_waiter_nodes,
     );
     push_metric(
         metrics,
         "logical_lock.peak_live_waiter_nodes",
-        u128::from(after.peak_live_waiter_nodes),
+        after.peak_live_waiter_nodes,
     );
 }
 
@@ -338,7 +349,7 @@ fn push_mandatory_task_metrics(
                 before.detached_observer_count,
             ),
         ),
-        ("active_count", after.active_count as u128),
+        ("active_count", after.active_count as u64),
         (
             "admission_wait_nanos",
             delta(after.admission_wait_nanos, before.admission_wait_nanos),
@@ -365,12 +376,12 @@ fn push_one_buffer_pool(
     push_metric(
         metrics,
         &format!("{prefix}.capacity"),
-        after.capacity as u128,
+        after.capacity as u64,
     );
     push_metric(
         metrics,
         &format!("{prefix}.allocated"),
-        after.allocated as u128,
+        after.allocated as u64,
     );
     push_buffer_counters(metrics, prefix, before.counters, after.counters);
 }
@@ -422,17 +433,17 @@ fn push_buffer_counters(
     }
 }
 
-fn push_metric(metrics: &mut Vec<Metric>, name: &str, value: u128) {
+fn push_metric(metrics: &mut Vec<Metric>, name: &str, value: u64) {
     metrics.push(Metric {
         name: name.to_owned(),
         value,
     });
 }
 
-fn delta(after: usize, before: usize) -> u128 {
-    after.saturating_sub(before) as u128
+fn delta(after: usize, before: usize) -> u64 {
+    after.saturating_sub(before) as u64
 }
 
-fn delta_u64(after: u64, before: u64) -> u128 {
-    u128::from(after.saturating_sub(before))
+fn delta_u64(after: u64, before: u64) -> u64 {
+    after.saturating_sub(before)
 }

@@ -131,9 +131,14 @@ mod tests {
 
     fn execute_plan(temp: &TempDir, name: &str, phases: &str) -> (PathBuf, InvocationReport) {
         let source = temp.path().join(format!("{name}.toml"));
+        let log_sync = if phases.contains("\"recovery\"") {
+            "fsync"
+        } else {
+            "none"
+        };
         fs::write(
             &source,
-            format!("name = \"{name}\"\n[engine.transaction]\nlog_sync = \"none\"\n{phases}"),
+            format!("name = \"{name}\"\n[engine.transaction]\nlog_sync = \"{log_sync}\"\n{phases}"),
         )
         .unwrap();
         let root = temp.path().join(format!("{name}-root"));
@@ -181,6 +186,71 @@ mod tests {
         assert_eq!(counters.rows_returned, 0);
         assert_eq!(counters.expected_outcomes.duplicate_key, 0);
         assert_eq!(counters.expected_outcomes.write_conflict, 0);
+    }
+
+    fn recovery_profiler_case(corrupt_reopen: bool) {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("pause.toml");
+        fs::write(&source, "[engine.transaction]\nlog_sync = 'fsync'\n[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 512, batch_size = 100 }\n[[phase]]\nkind = 'benchmark'\npause = true\nworkload = { type = 'recovery' }").unwrap();
+        let root = temp.path().join("root");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_doradb-bench"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--plan")
+            .arg(&source)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let (stdout_lines, stdout_handle) = capture_lines(child.stdout.take().unwrap());
+        let (stderr_lines, stderr_handle) = capture_lines(child.stderr.take().unwrap());
+        let mut child = ChildGuard::new(child);
+        let deadline = Instant::now() + SUBPROCESS_TIMEOUT;
+        assert_eq!(
+            stderr_lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap(),
+            format!("DORADB_BENCH_PAUSING pid={pid} phase=3 workload=recovery resume=SIGCONT")
+        );
+        wait_for_stopped(pid, deadline);
+        assert!(root.join("storage-layout.toml").exists());
+        assert!(!root.join("benchmark-result.toml").exists());
+        assert!(stdout_lines.try_recv().is_err());
+        // Owner teardown must release every storage descriptor, including root lease and swap files.
+        for entry in fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+            if let Ok(target) = fs::read_link(entry.unwrap().path()) {
+                assert!(
+                    !target.starts_with(&root),
+                    "storage descriptor survived pause: {}",
+                    target.display()
+                );
+            }
+        }
+        if corrupt_reopen {
+            fs::write(root.join("storage-layout.toml"), "invalid marker").unwrap();
+        }
+        child.resume();
+        let status = child.wait_until(deadline);
+        let stdout = stdout_handle.join().unwrap();
+        let stderr = stderr_handle.join().unwrap();
+        assert_eq!(stderr.matches("DORADB_BENCH_PAUSING").count(), 1);
+        assert_eq!(stderr.matches("DORADB_BENCH_RESUMED").count(), 1);
+        assert_eq!(status.success(), !corrupt_reopen, "{stderr}");
+        assert_eq!(stdout.contains("DoraDB benchmark summary"), !corrupt_reopen);
+        assert_eq!(root.join("benchmark-result.toml").exists(), !corrupt_reopen);
+        assert!(root.exists());
+        if !corrupt_reopen {
+            let result: InvocationReport =
+                toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
+                    .unwrap();
+            let Some(WorkloadMetrics::Recovery { verification, .. }) =
+                &result.measured_runs[0].workload_metrics
+            else {
+                panic!("recovery metrics missing");
+            };
+            assert_eq!(verification.verified_rows, 512);
+        }
     }
 
     #[test]
@@ -607,6 +677,145 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(assert_failure(output).contains("did not install a nonempty proper prefix"));
         assert!(root.exists());
         assert!(!root.join("benchmark-result.toml").exists());
+    }
+
+    #[test]
+    fn recovery_verifies_empty_loaded_indexed_random_and_checkpoint_fixtures() {
+        use doradb_bench::measurement::InternalMetricKind;
+        let temp = TempDir::new().unwrap();
+        for (name, index, insert, checkpoint, stats) in [
+            ("empty", None, None, false, false),
+            ("empty-table", Some("none"), None, false, true),
+            ("empty-index", Some("unique"), None, false, false),
+            ("heap", Some("none"), Some("insert-seq"), false, true),
+            ("unique", Some("unique"), Some("insert-seq"), false, true),
+            (
+                "duplicates",
+                Some("non-unique"),
+                Some("insert-rand"),
+                false,
+                true,
+            ),
+            (
+                "random-unique",
+                Some("unique"),
+                Some("insert-rand"),
+                false,
+                false,
+            ),
+            ("checkpoint", Some("none"), Some("insert-seq"), true, true),
+        ] {
+            let mut phases = String::new();
+            if let Some(index) = index {
+                phases.push_str(&format!(
+                    "[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n"
+                ));
+            }
+            if let Some(insert) = insert {
+                phases.push_str(&format!("[[phase]]\nworkload = {{ type = '{insert}', num = 4096, threads = 1, sessions = 1, batch_size = 100, value_size = '128 B' }}\n"));
+            }
+            if checkpoint {
+                phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', max_rows = 2048 }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
+            }
+            // Double quotes also select durable configuration in the shared invocation helper.
+            phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = \"recovery\", include_stats = {stats} }}\n"));
+            let (root, result) = execute_plan(&temp, name, &phases);
+            let run = &result.measured_runs[0];
+            let Some(WorkloadMetrics::Recovery {
+                report,
+                verification,
+            }) = &run.workload_metrics
+            else {
+                panic!("missing recovery metrics");
+            };
+            assert_eq!(
+                run.counters,
+                WorkloadCounters {
+                    operations: 1,
+                    ..WorkloadCounters::default()
+                }
+            );
+            assert_eq!(run.latency.sample_count, 1);
+            assert_eq!(run.latency.sum_nanos, run.elapsed_nanos);
+            assert_eq!(run.latency.unit, LatencyUnit::EngineRecovery);
+            assert_eq!(verification.table_count, u64::from(index.is_some()));
+            let inserted = result
+                .prepare_phases
+                .iter()
+                .map(|phase| phase.counters.inserted_rows)
+                .sum::<u64>();
+            assert_eq!(verification.verified_rows, inserted);
+            assert_eq!(
+                verification.index_verified,
+                index.is_some_and(|index| index != "none")
+            );
+            assert_eq!(verification.fingerprint.len(), 64);
+            assert!(!report.saturated);
+            assert!(report.redo.consumed_bytes >= report.redo.validated_payload_bytes);
+            if insert.is_some() {
+                assert_eq!(report.work.user_row_ops_seen, inserted);
+                assert_eq!(
+                    report.work.user_row_ops_seen,
+                    report.work.user_row_ops_applied + report.work.user_row_ops_skipped
+                );
+                assert!(report.work.hot_inserts > 0);
+                assert!(report.redo.transactions_decoded > 0);
+                if checkpoint {
+                    assert!(report.work.user_row_ops_skipped > 0);
+                    assert!(report.work.hot_inserts < inserted);
+                } else {
+                    assert_eq!(report.work.hot_inserts, inserted);
+                    assert_eq!(report.work.user_row_ops_skipped, 0);
+                }
+                assert_eq!(
+                    report.work.index_entries_inserted,
+                    if verification.index_verified {
+                        inserted
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert_eq!(run.internal_metrics.is_empty(), !stats);
+            assert!(
+                !run.internal_metrics
+                    .iter()
+                    .any(|metric| metric.kind == InternalMetricKind::CounterDelta)
+            );
+            if stats {
+                assert!(
+                    run.internal_metrics
+                        .iter()
+                        .any(|metric| metric.kind == InternalMetricKind::CumulativeCounter)
+                );
+            }
+            let encoded = toml::to_string_pretty(&result).unwrap();
+            let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded, result);
+            assert!(root.exists());
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_nondurable_plans_before_creating_root() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("invalid.toml");
+        fs::write(&source, "[engine.transaction]\nlog_sync = 'none'\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'recovery' }").unwrap();
+        let root = temp.path().join("retained");
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
+        assert!(assert_failure(output).contains("fsync or fdatasync"));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn recovery_profiler_pause_follows_old_engine_teardown() {
+        recovery_profiler_case(false);
+    }
+
+    #[test]
+    fn recovery_reopen_failure_retains_root_without_success_output() {
+        recovery_profiler_case(true);
     }
 
     #[test]
