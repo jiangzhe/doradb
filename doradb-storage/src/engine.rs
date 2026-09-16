@@ -30,6 +30,7 @@ use crate::runtime::block_on;
 use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
 use crate::runtime::thread_pool::{ThreadPool, ThreadPoolWorkers};
 use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
+use crate::stats::RecoveryReport;
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
 #[cfg(test)]
@@ -44,6 +45,7 @@ use std::ops::Deref;
 use std::result;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 const FIRST_SESSION_ID: SessionID = SessionID::new(1);
 // Engine lifecycle admission uses one packed atomic word so admission and
@@ -270,6 +272,7 @@ impl Drop for EngineAdmission<'_> {
 /// operations acquire strong runtime access internally only for the duration of
 /// the operation. Runtime internals are not exposed through the public facade.
 pub struct Engine {
+    recovery_report: RecoveryReport,
     // Field order is part of owner teardown: shared runtime reachability is
     // released before component owners are dropped.
     inner: Arc<EngineInner>,
@@ -292,6 +295,11 @@ impl Engine {
                     err
                 );
             })
+    }
+
+    /// Returns immutable startup diagnostics, also readable after explicit shutdown.
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        &self.recovery_report
     }
 
     /// Returns the shared engine runtime state.
@@ -638,6 +646,7 @@ impl Deref for EngineInner {
 }
 
 async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
+    let started = Instant::now();
     let config = config.validate_inner().disclose()?;
     let table_scan_config = config.table_scan;
     let resolved = config
@@ -739,11 +748,14 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     // guards for row/index/readonly access. Register catalog after the pools it
     // can pin so reverse shutdown/drop order releases table guards before pool
     // owners are torn down.
+    let catalog_started = Instant::now();
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
+    let transaction_started = Instant::now();
     builder
         .build::<TransactionSystem>(trx_cfg)
         .await
         .disclose()?;
+    let runtime_started = Instant::now();
     builder
         .build::<TransactionPurgeWorkers>(())
         .await
@@ -814,10 +826,19 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         lifecycle,
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
     };
-    Ok(Engine {
+    let mut report = engine_inner.core.trx_sys.recovery_report;
+    report.finish_transaction(runtime_started - transaction_started);
+    let mut engine = Engine {
+        recovery_report: report,
         inner: Arc::new(engine_inner),
         components: Some(registry),
-    })
+    };
+    let completed = Instant::now();
+    engine.recovery_report.bootstrap_elapsed = completed - started;
+    engine.recovery_report.engine_setup_elapsed = catalog_started - started;
+    engine.recovery_report.catalog_bootstrap_elapsed = transaction_started - catalog_started;
+    engine.recovery_report.runtime_startup_elapsed = completed - runtime_started;
+    Ok(engine)
 }
 
 #[cfg(test)]

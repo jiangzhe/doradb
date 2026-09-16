@@ -88,6 +88,8 @@ pub enum LoadRequirement {
 /// Closed fixture capability requested by a resolved workload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FixtureRequirement {
+    /// Empty root or one ordinary table with no active frozen batch.
+    Recoverable,
     /// No fixture state is consumed.
     None,
     /// The implicit table pool must not exist.
@@ -193,6 +195,13 @@ impl FixturePlanState {
     /// Validate one typed requirement against the logical fixture.
     pub(crate) fn validate(&self, requirement: FixtureRequirement) -> Result<()> {
         match requirement {
+            FixtureRequirement::Recoverable => validate_recoverable_fixture(
+                self.primary.map_or(0, |primary| primary.table_count),
+                self.primary
+                    .is_some_and(|primary| primary.frozen_max_rows.is_some()),
+                self.managed_bindings.is_some(),
+                self.catalog_checkpoint.is_some(),
+            ),
             FixtureRequirement::None => Ok(()),
             FixtureRequirement::AbsentPrimary => {
                 if self.primary.is_some() {
@@ -546,9 +555,24 @@ pub(crate) struct PrimaryBinding {
     pub(crate) frozen: Option<FrozenFixtureSummary>,
 }
 
+/// Value-only ordinary table identity and committed content accounting for reopening.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecoverableTable {
+    /// Public identity that must survive reopening.
+    pub(crate) table_id: TableID,
+    /// Prepared secondary-index shape.
+    pub(crate) shape: PrimaryTableShape,
+    /// Candidate range allocated by prepare inserts.
+    pub(crate) loaded_range: Option<KeyRange>,
+    /// Successful committed preparation inserts.
+    pub(crate) inserted_rows: u64,
+}
+
 /// Typed runtime binding returned after requirement validation.
 #[derive(Clone, Debug)]
 pub(crate) enum FixtureBinding {
+    /// Verified empty or single-table recovery capability.
+    Recoverable(Option<RecoverableTable>),
     /// Workload consumes no fixture state.
     None,
     /// Workload consumes the implicit primary table.
@@ -584,6 +608,26 @@ impl FixtureRuntimeState {
     /// Validate and bind one typed runtime requirement.
     pub(crate) fn bind(&self, requirement: FixtureRequirement) -> Result<FixtureBinding> {
         match requirement {
+            FixtureRequirement::Recoverable => {
+                validate_recoverable_fixture(
+                    self.primary
+                        .as_ref()
+                        .map_or(0, |primary| primary.table_ids.len()),
+                    self.primary
+                        .as_ref()
+                        .is_some_and(|primary| primary.frozen.is_some()),
+                    self.managed_bindings.is_some(),
+                    self.catalog_checkpoint.is_some(),
+                )?;
+                Ok(FixtureBinding::Recoverable(self.primary.as_ref().map(
+                    |primary| RecoverableTable {
+                        table_id: primary.table_ids[0],
+                        shape: primary.shape,
+                        loaded_range: primary.attempted_range,
+                        inserted_rows: primary.inserted_rows,
+                    },
+                )))
+            }
             FixtureRequirement::None | FixtureRequirement::AbsentPrimary => {
                 if requirement == FixtureRequirement::AbsentPrimary && self.primary.is_some() {
                     return Err(BenchError::message(
@@ -919,6 +963,20 @@ fn extend_range(current: Option<KeyRange>, next: KeyRange, label: &str) -> Resul
             .checked_add(next.len)
             .ok_or_else(|| BenchError::message(format!("{label} length overflow")))?,
     })
+}
+
+fn validate_recoverable_fixture(
+    tables: usize,
+    frozen: bool,
+    managed: bool,
+    catalog_pending: bool,
+) -> Result<()> {
+    if tables > 1 || frozen || managed || catalog_pending {
+        return Err(BenchError::message(
+            "recovery requires an empty or single ordinary table fixture, without managed bindings, a pending catalog checkpoint, or an active frozen batch",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

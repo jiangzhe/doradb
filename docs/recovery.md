@@ -277,3 +277,14 @@ The resulting ownership is clear: LWC, persistent delete metadata, and
 `DiskTree` are checkpointed cold state; RowStore, newer cold-delete markers,
 and `MemIndex` are reconstructed runtime state. The engine can then admit
 traffic.
+
+## Immutable startup report
+
+Successful bootstrap exposes immutable diagnostics for startup timing, redo
+work, and hot-index reconstruction. Later engine activity does not change the
+report. Diagnostics do not affect recovery ordering, durability, or success.
+Timings describe elapsed wall time; overlapping read-ahead work is not additive.
+
+See [public diagnostics](public-api.md#diagnostics-and-statistics) for access and
+[the recovery benchmark](benchmark-tool.md#clean-reopen-recovery) for measurement
+and verification boundaries.

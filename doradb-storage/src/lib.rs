@@ -71,7 +71,8 @@ pub use session::{
 };
 pub use stats::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, LogicalLockStats,
-    MandatoryRuntimeStats, MandatoryTaskStats, StorageIoStats, TransactionSystemStats,
+    MandatoryRuntimeStats, MandatoryTaskStats, RecoveryPhaseTimings, RecoveryRedoMetrics,
+    RecoveryReport, RecoveryWorkCounts, StorageIoStats, TransactionSystemStats,
 };
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, FreezeOutcome,

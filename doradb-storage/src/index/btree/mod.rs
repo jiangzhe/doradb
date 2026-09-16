@@ -993,6 +993,9 @@ impl<P: BufferPool> GenericBTree<P> {
         drop(tmp_l);
         // Insert right node into parent.
         p_node.insert(sep_key, BTreeU64::from(right_page_id));
+        // Inserting a separator shifts slots and can change the hint window.
+        // Refresh before releasing the parent latch so searches route correctly.
+        p_node.update_hints();
     }
 
     /// Find leaf by given key.
@@ -2675,6 +2678,75 @@ mod tests {
     fn test_btree_lookup_enable_hints() {
         smol::block_on(async {
             run_lookup_against_map(true).await;
+        })
+    }
+
+    #[test]
+    fn test_btree_split_refreshes_parent_hints() {
+        smol::block_on(async {
+            const ROWS: u64 = 4096;
+            let key_for = |i: u64| {
+                let mut key = wide_test_key(i);
+                // Vary the key heads and keep leaves wide enough to make the
+                // parent cross the search-hint threshold with a small fixture.
+                key[..size_of::<u64>()].copy_from_slice(&(i << 32).to_be_bytes());
+                key
+            };
+            for hints_enabled in [false, true] {
+                for stride in [1, 2053] {
+                    let pool = owned_index_pool(16 * 1024 * 1024);
+                    let pool_guard = (*pool).create_base_guard();
+                    let tree =
+                        BTree::new(pool.guard(), &pool_guard, hints_enabled, TrxID::new(200))
+                            .await
+                            .unwrap();
+                    for n in 0..ROWS {
+                        let i = n * stride % ROWS;
+                        assert!(
+                            tree.insert(
+                                &pool_guard,
+                                &key_for(i),
+                                BTreeU64::from(i),
+                                false,
+                                TrxID::new(201),
+                            )
+                            .await
+                            .unwrap()
+                            .is_ok()
+                        );
+                    }
+                    assert_eq!(tree.height(), 1);
+                    {
+                        let mut cursor = tree.cursor(&pool_guard, 1);
+                        cursor.seek(&[]).await.unwrap();
+                        let root = cursor.next().await.unwrap().unwrap();
+                        assert!(root.page().count() >= BTREE_HINTS_LEN * 8);
+                        assert!(root.page().validate_persisted_layout::<BTreeU64>());
+                    }
+                    for i in 0..ROWS {
+                        assert_eq!(
+                            tree.lookup_optimistic::<BTreeU64>(&pool_guard, &key_for(i))
+                                .await
+                                .unwrap(),
+                            Some(BTreeU64::from(i)),
+                            "hints_enabled={hints_enabled}, stride={stride}, key={i}"
+                        );
+                    }
+                    let mut cursor = tree.cursor(&pool_guard, 0);
+                    cursor.seek(&[]).await.unwrap();
+                    let mut next = 0;
+                    while let Some(guard) = cursor.next().await.unwrap() {
+                        let node = guard.page();
+                        assert!(node.validate_persisted_layout::<BTreeU64>());
+                        for slot in 0..node.count() {
+                            assert_eq!(&*node.key(slot), key_for(next).as_slice());
+                            assert_eq!(node.value::<BTreeU64>(slot), BTreeU64::from(next));
+                            next += 1;
+                        }
+                    }
+                    assert_eq!(next, ROWS);
+                }
+            }
         })
     }
 

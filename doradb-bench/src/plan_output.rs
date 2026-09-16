@@ -1,7 +1,7 @@
 use crate::error::{BenchError, Result};
 use crate::measurement::{
     BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
-    operations_per_second, u128_decimal,
+    operations_per_second,
 };
 use crate::plan::Plan;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,7 @@ pub struct PreparePhaseResult {
     /// Stable workload identity.
     pub workload: String,
     /// Full session/worker wall envelope.
-    #[serde(with = "u128_decimal")]
-    pub elapsed_nanos: u128,
+    pub elapsed_nanos: u64,
     /// Successful logical workload counters.
     pub counters: WorkloadCounters,
     /// Optional workload-specific metrics from the prepare execution.
@@ -229,6 +228,139 @@ pub(crate) fn render_stdout_summary(
             checkpoint.metadata_bytes_written,
         ));
     }
+    if workload.identity() == "recovery" {
+        let Some(WorkloadMetrics::Recovery {
+            report: recovery,
+            verification,
+        }) = report
+            .measured_runs
+            .first()
+            .and_then(|run| run.workload_metrics.as_ref())
+        else {
+            return Err(BenchError::message(
+                "recovery report has no recovery metrics",
+            ));
+        };
+        summary
+            .push_str("\nrecovery_scenario: clean-reopen-same-process\ncache_state: uncontrolled");
+        summary.push_str(&format!(
+            "\npublic_bootstrap_elapsed_nanos: {}",
+            aggregate.elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nbootstrap_elapsed_nanos: {}",
+            recovery.bootstrap_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nengine_setup_elapsed_nanos: {}",
+            recovery.engine_setup_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\ncatalog_bootstrap_elapsed_nanos: {}",
+            recovery.catalog_bootstrap_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\ntransaction_bootstrap_elapsed_nanos: {}",
+            recovery.transaction_bootstrap_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nruntime_startup_elapsed_nanos: {}",
+            recovery.runtime_startup_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\npreparation_elapsed_nanos: {}",
+            recovery.phases.preparation_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nuser_table_bootstrap_elapsed_nanos: {}",
+            recovery.phases.user_table_bootstrap_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nredo_planning_elapsed_nanos: {}",
+            recovery.phases.redo_planning_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nredo_replay_elapsed_nanos: {}",
+            recovery.phases.redo_replay_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nvalidation_elapsed_nanos: {}",
+            recovery.phases.validation_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nabsent_file_cleanup_elapsed_nanos: {}",
+            recovery.phases.absent_file_cleanup_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nhot_index_rebuild_elapsed_nanos: {}",
+            recovery.phases.hot_index_rebuild_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nredo_repair_planning_elapsed_nanos: {}",
+            recovery.phases.redo_repair_planning_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nredo_finalize_elapsed_nanos: {}",
+            recovery.phases.redo_finalize_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\nother_elapsed_nanos: {}",
+            recovery.phases.other_elapsed_nanos
+        ));
+        summary.push_str(&format!(
+            "\ntransactions_decoded: {}",
+            recovery.redo.transactions_decoded
+        ));
+        summary.push_str(&format!(
+            "\nconsumed_bytes: {}",
+            recovery.redo.consumed_bytes
+        ));
+        summary.push_str(&format!(
+            "\nvalidated_payload_bytes: {}",
+            recovery.redo.validated_payload_bytes
+        ));
+        summary.push_str(&format!(
+            "\ncatalog_row_ops_applied: {}",
+            recovery.work.catalog_row_ops_applied
+        ));
+        summary.push_str(&format!(
+            "\ncatalog_row_ops_skipped: {}",
+            recovery.work.catalog_row_ops_skipped
+        ));
+        summary.push_str(&format!(
+            "\nuser_row_ops_applied: {}",
+            recovery.work.user_row_ops_applied
+        ));
+        summary.push_str(&format!(
+            "\nuser_row_ops_skipped: {}",
+            recovery.work.user_row_ops_skipped
+        ));
+        summary.push_str(&format!(
+            "\nindex_entries_inserted: {}",
+            recovery.work.index_entries_inserted
+        ));
+        summary.push_str(&format!(
+            "\nverified_rows: {}\nverified_tables: {}",
+            verification.verified_rows, verification.table_count
+        ));
+        for (name, count) in [
+            (
+                "decoded_transactions_per_redo_replay_second",
+                recovery.redo.transactions_decoded,
+            ),
+            (
+                "validated_payload_bytes_per_redo_replay_second",
+                recovery.redo.validated_payload_bytes,
+            ),
+        ] {
+            if count != 0 && recovery.phases.redo_replay_elapsed_nanos != 0 {
+                summary.push_str(&format!(
+                    "\n{name}: {:.3}",
+                    operations_per_second(count, recovery.phases.redo_replay_elapsed_nanos)
+                ));
+            }
+        }
+    }
     summary.push_str(&format!("\ndetailed_result: {}", detailed_result.display()));
     Ok(summary)
 }
@@ -351,6 +483,13 @@ mod tests {
         let encoded = fs::read_to_string(result_toml_path(temp.path())).unwrap();
         let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded, report);
+        assert!(encoded.contains("elapsed_nanos = 10\n"));
+        assert!(encoded.contains("sum_nanos = 10\n"));
+        for value in ["-1", "18446744073709551616", "\"10\""] {
+            let invalid =
+                encoded.replace("elapsed_nanos = 10", &format!("elapsed_nanos = {value}"));
+            assert!(toml::from_str::<InvocationReport>(&invalid).is_err());
+        }
         assert!(encoded.contains("pause = false"));
         assert!(!encoded.contains("status ="));
         assert!(!encoded.contains("failure"));

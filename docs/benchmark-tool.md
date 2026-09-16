@@ -96,6 +96,11 @@ therefore outside workload timers, latency samples, internal-stat deltas, and
 aggregate calculations. The normalized boolean is retained in the resolved
 plan inside `benchmark-result.toml`.
 
+For `recovery`, this boundary additionally follows the pre-shutdown content
+verification, shutdown, and complete drop of the old engine. Its storage-root
+lease, pools, and swap owners are gone before the pause; reopening starts only
+after resume. Other workloads retain the ordinary pre-run pause boundary.
+
 Before sending `SIGSTOP`, the benchmark flushes this stable record to standard
 error, followed by human-readable attachment and resume instructions:
 
@@ -234,6 +239,7 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `lock-table` | required `num`; lock controls below | ordered table pool | safe |
 | `freeze-table` | required `max_rows` | one loaded, unfrozen, index-free primary | single run |
 | `checkpoint-table` | none | one frozen index-free primary | single run |
+| `recovery` | only `include_stats`; no worker fields | empty or one ordinary unfrozen primary | single run, benchmark only |
 
 Sequential lookups wrap over the candidate range. Random lookups use seeded
 selection with replacement. Materialized index scans and streams choose seeded
@@ -331,6 +337,49 @@ blocker release, waiter cancellation/join, and participant close. After every
 lock run, exclusive acquisition on every pool table verifies that no claim
 leaked.
 
+## Clean-reopen recovery
+
+`recovery` measures one public `Engine::bootstrap` of a prepared root. It is
+benchmark-only, requires zero warm-ups and one measured run, and accepts only
+`include_stats`. Worker and sizing controls are rejected. Redo durability must
+be `fsync` or `fdatasync`.
+
+```toml
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "recovery", include_stats = true }
+```
+
+The fixture may be empty or contain one ordinary benchmark table, optionally
+indexed. Multiple tables, managed bindings, pending catalog checkpoints, and
+active freezes are rejected. Completed index-free checkpoints are supported.
+
+Preparation, content verification, shutdown, engine teardown, and profiler
+attachment are outside the timer. The profiler pause occurs after the original
+engine has been dropped and before bootstrap with the same configuration.
+
+Success requires matching table identities, row counts, and content fingerprints
+before and after recovery. Indexed fixtures also require a complete index scan
+matching the recovered table. Verification preserves duplicate multiplicity and
+is outside the sample. A failure retains the root and emits no success result.
+
+The result always includes the startup report and verification outcome, even
+when `include_stats = false`. Duration fields use `_nanos` names and `u64`
+integers. Out-of-range durations, saturated reports, and inconsistent accounting
+are rejected. Generic counters contain only `operations = 1`; verification
+counts are reported separately. The latency unit is `engine-recovery`.
+
+Optional generic statistics are captured from the fresh engine before
+verification. Counters use `cumulative-counter`; gauges and peaks retain their
+usual kinds. Redo rates use actual observed work divided by replay time and
+are omitted for zero work or duration.
+
+Each independent sample requires a fresh prepared root because reopening may
+advance redo files. These are clean in-process reopen measurements with
+uncontrolled caches; one sample does not establish a latency distribution.
+
 ## Measurement and counters
 
 | Workload shape | Latency unit | Samples per successful measured run |
@@ -352,6 +401,7 @@ leaked.
 | paired/specialized lock | `table-lock-operation-lifecycle` | `num` |
 | `freeze-table` | `table-freeze` | 1 |
 | `checkpoint-table` | `table-checkpoint` | 1 |
+| `recovery` | `engine-recovery` | 1 |
 
 Read batch samples start immediately before transaction begin and end after
 successful commit. Stream samples include begin, full exhaustion, drop, and
@@ -381,12 +431,14 @@ Counter equations are verified before phase state advances:
 - Index scan: `operations = found + not_found`; returned rows are actual.
 - DDL: `operations = 2 * num`.
 - Locks: `operations = num`; unrelated counters are zero.
-- Freeze and checkpoint: `operations = 1`; unrelated counters are zero.
+- Freeze, checkpoint, and recovery: `operations = 1`; unrelated counters are zero.
 
-Each session owns an HDR histogram. Results merge exact distributions rather
+Each session owns an HDR histogram; recovery owns its histogram in the coordinator.
+Results merge exact distributions rather
 than averaging percentiles. Aggregate throughput is total operations divided
 by total wall duration. Optional internal metrics are typed as counter deltas,
 end gauges, or lifetime peaks with explicit count/byte/nanosecond/frame units.
+Recovery uses cumulative counters from its fresh engine as described above.
 For `update-rand`, throughput therefore means actual updated rows per wall
 second, while every successfully committed range transaction contributes one
 latency sample even when its range matches no row.
@@ -558,8 +610,11 @@ Success installs only:
 
 The result records the fully resolved plan, prepare outcomes, individual
 measured runs, aggregate counters, wall durations, throughput, latency unit,
-sample count, mean, p95, p99, and optional diagnostics. Exact `u128` values are
-decimal strings.
+sample count, mean, p95, p99, and optional diagnostics. Integral timing fields,
+latency sums, and diagnostic values are `u64` integers; timing units are
+nanoseconds. Duration conversions and timing sums fail on overflow. Means and
+throughput remain floating point. The strict result types reject older reports
+with quoted decimal timing or diagnostic values.
 
 The first unexpected error cooperatively cancels peers at workload-safe
 boundaries. All declared tasks and auxiliary lock participants drain, active
@@ -572,8 +627,8 @@ the coordinator returns the first partition, orchestration, or close failure.
 
 ## Templates
 
-`doradb-bench/templates/` contains one complete directly executable plan for
-each of the fifteen workloads:
+`doradb-bench/templates/` contains complete directly executable plans, including
+four fixture shapes for the single recovery workload:
 
 ```text
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
@@ -581,8 +636,17 @@ insert-rand.toml     table-ddl.toml       lookup-seq.toml
 update-rand.toml     lookup-rand.toml     table-scan.toml
 parallel-table-scan.toml                  index-scan.toml
 index-stream.toml    index-ddl.toml       lock-table.toml
-checkpoint-table.toml
+checkpoint-table.toml                     catalog-checkpoint.toml
+resolve-table-binding.toml
+recovery-empty.toml  recovery.toml        recovery-indexed.toml
+recovery-checkpoint.toml
 ```
 
 Every plan includes the colocated `engine-defaults.toml`, contains all required
-fixture preparation, and ends with the workload named by the file.
+fixture preparation, and ends with its benchmark workload. All recovery templates
+use `recovery`: empty, one-million-row index-free, one-million-row unique-indexed,
+and one-million-row index-free with a 500,000-row requested freeze followed by a
+completed checkpoint. Nonempty recovery fixtures use 128-byte values, batch size
+100, and four preparation threads with sixteen sessions. Page-granular checkpoint
+results remain in the prepare metrics. All four use one measured reopen, zero warm-ups, and
+`include_stats = true`.

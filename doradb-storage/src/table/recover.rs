@@ -9,6 +9,7 @@ use crate::index::IndexInsert;
 use crate::recovery::RowReplayState;
 use crate::row::RowRead;
 use crate::row::ops::{ReadRow, UpdateCol};
+use crate::stats::recovery_add_count;
 use crate::table::{DeletionError, DmlValidator, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::value::Val;
@@ -151,12 +152,15 @@ impl Table {
             })
     }
 
-    /// Populate index using data on row page.
+    /// Populate active indexes from one row page and return successful entry count
+    /// plus an arithmetic saturation flag.
     pub(crate) async fn populate_index_via_row_page(
         &self,
         guards: &PoolGuards,
         page_id: PageID,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<(u64, bool)> {
+        let mut entries = 0;
+        let mut saturated = false;
         let page_guard = self
             .row_store
             .must_get_row_page_shared(guards, page_id)
@@ -220,13 +224,14 @@ impl Table {
                                     )
                                 })?;
                         }
+                        recovery_add_count(&mut entries, 1, &mut saturated);
                     }
                     ReadRow::NotFound => (),
                     ReadRow::InvalidIndex => unreachable!(),
                 }
             }
         }
-        Ok(())
+        Ok((entries, saturated))
     }
 }
 

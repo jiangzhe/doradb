@@ -919,6 +919,12 @@ cleanup completion matters.
 
 ## Diagnostics and statistics
 
+`Engine::recovery_report() -> &RecoveryReport` returns immutable diagnostics for
+successful bootstrap, without a session, including after explicit shutdown.
+It reports elapsed stages (`Duration`), observed work (`u64`), and a `saturated`
+flag for inexact arithmetic. Failed bootstrap produces no report. Field meanings
+are documented on the [report types](../doradb-storage/src/stats.rs).
+
 Sessions expose point-in-time or cumulative snapshots:
 
 | Method | Snapshot |
@@ -1069,7 +1075,7 @@ Most application-facing types are re-exported from the crate root:
 | Locks | `TableLockMode` |
 | Maintenance | `FreezeOutcome`, `FrozenPageBatchInfo`, `CheckpointOutcome`, `CheckpointDelayReason`, `CheckpointCancelReason`, `CatalogCheckpointOutcome`, `RedoTruncationOutcome`, `RedoTruncationBlockerInfo`, `CatalogRedoMaintenanceOutcome`, `MemIndexCleanupOutcome`, `MemIndexCleanupStats`, `MemIndexCleanupDelay`, `SecondaryMemIndexCleanupIndexStats` |
 | Errors | `Result`, `Error`, `ErrorKind`, `OperationError`, `CallbackResult`, `CallbackError` |
-| Diagnostics | `BufferPoolStats`, `BufferPoolRuntimeStats`, `BufferPoolCounters`, `StorageIoStats`, `IoBackendStats`, `TransactionSystemStats`, `MandatoryRuntimeStats`, `MandatoryTaskStats`, `LogicalLockStats` |
+| Diagnostics | `RecoveryReport`, `RecoveryPhaseTimings`, `RecoveryWorkCounts`, `RecoveryRedoMetrics`, `BufferPoolStats`, `BufferPoolRuntimeStats`, `BufferPoolCounters`, `StorageIoStats`, `IoBackendStats`, `TransactionSystemStats`, `MandatoryRuntimeStats`, `MandatoryTaskStats`, `LogicalLockStats` |
 
 The public modules provide the same domains with additional specialized items:
 
