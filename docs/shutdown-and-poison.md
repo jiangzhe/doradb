@@ -101,8 +101,8 @@ continued normal execution was unsafe:
 | `PurgeAccess` | purge could not access state required for safe reclamation |
 | `RollbackAccess` | rollback could not access state required to undo or release ownership safely |
 | `MandatoryTaskPanic` | accepted mandatory execution panicked under its supervisor |
-| `ThreadPoolTaskPanic` | an accepted finite CPU task panicked under its worker supervisor |
-| `ThreadPoolUnavailable` | CPU-task workers were unexpectedly unavailable before acceptance |
+| `ThreadPoolTaskPanic` | an accepted synchronous or asynchronous pool job panicked |
+| `ThreadPoolUnavailable` | internal work was submitted while the thread pool was unavailable |
 
 Fatal is a policy decision, not a synonym for I/O failure. The owning policy
 boundary stacks the appropriate `FatalError` over the initiating I/O,
@@ -231,7 +231,7 @@ are:
 - consuming a mandatory caller permit and transferring the prepared owner;
 - enqueueing a prepared transaction into ordered group commit;
 - submitting I/O with an owner and completion path;
-- successfully enqueueing a finite CPU task with its completion path;
+- transferring responsibility for a finite job to the thread pool;
 - entering an irreversible checkpoint or DDL publication section; and
 - claiming a transaction for terminal rollback.
 
@@ -492,7 +492,8 @@ one row or add a new documented category.
 | Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt and its statement owner |
 | GC/purge progress and checkpoint retry | monotonic progress, transaction terminal state, or table lifecycle change | poison terminates observation as Fatal | shutdown listener terminates observation | detached listeners and `SessionObserverPin` |
 | Mandatory caller capacity | permit release or admission close | capacity wait races poison; a won permit is acceptance | admission close wakes with Lifecycle shutdown | prepared caller owner before acceptance; mandatory supervisor after it |
-| I/O, page-I/O, redo, group-commit, mandatory-result, and CPU-task completions | owning service publishes success or a typed completion failure; a successful CPU-pool send is acceptance | CPU submission uses the poisoner's atomic fast check and returns cached poison when observed; a racing poison may admit bounded extra work, and accepted ownership is still drained | after outer mandatory drain, private FIFO stop messages follow accepted CPU work and the component owner joins every worker | request owner, completion bridge, and service-specific quarantine/retention; CPU job plus checkpoint queue own encode cleanup |
+| I/O, page-I/O, redo, group-commit, mandatory-result, and pool-job completions | the owning service publishes the authoritative success or failure result; pool acceptance transfers responsibility before execution begins | pool submission rejects observed poison; accepted work follows its service's completion or retention policy | enclosing operations drain their children; pool jobs finish before eviction and storage stop | the accepted request or job owns its resources; the enclosing operation owns combined cleanup and publication |
+| Thread-pool drain | workers finish accepted jobs with storage and buffer services supplying awaited progress; completion of all accepted work and cleanup establishes drain, while notifications only request reassessment | poison does not cancel accepted work or release resources still owned by a service | close admission and finish all accepted work, including jobs not yet running or waiting for I/O, before stopping workers and their dependencies | accepted jobs own execution and cleanup independently of observers; enclosing operations retain responsibility for combined cleanup and publication |
 | DDL/maintenance table/catalog gates and table-drop publish drain | active prepared or accepted scope releases its lease and notifies gate/lifecycle change | do not preempt; failure follows compensation, poison, or retention policy | shutdown waits for the voluntary session operation or accepted mandatory owner | prepared/accepted scope and RAII pending/lease guards |
 | Rollback, abandoned, terminal, and failed-precommit cleanup | mandatory internal task completes or retains terminal state | never cancelled by poison; cleanup may publish poison itself | internal admission drains before runner stop | exact cleanup job, terminal claim, and fatal-retention owner |
 | Buffer allocation, residency, and eviction progress | deallocation, load completion, or evictor progress; poison alone does not stop these producers | unrelated poison does not replace local progress/completion policy | foreground drain is graceful; pool flags wake any remaining service waiters once component teardown starts | reservation/page guards and pool worker owner |
@@ -631,6 +632,8 @@ TransactionRedoWorkers
 -> TransactionSystem
 -> Catalog
 -> LockManager
+-> ThreadPoolWorkers
+-> ThreadPool
 -> SharedPoolEvictorWorkers
 -> FileSystemWorkers
 -> MemPool
@@ -639,16 +642,15 @@ TransactionRedoWorkers
 -> DiskPool
 -> FileSystem
 -> MandatoryRuntime
--> ThreadPoolWorkers
--> ThreadPool
 -> EnginePoisoner
 -> StorageRootLease
 ```
 
 The ordering keeps the poisoner available to every earlier component that may
-report fatal state and releases the storage-root lease only after all
-subordinate activity has stopped. The detailed dependency and per-component
-authority audit lives in [Engine Component Lifetime](engine-component-lifetime.md).
+report fatal state, keeps eviction and storage I/O live until finite pool jobs
+drain, and releases the storage-root lease only after all subordinate activity
+has stopped. The dependency and shutdown responsibilities are described in
+[Engine Component Lifetime](engine-component-lifetime.md).
 
 Required rotated-file redo seals remain part of live ordered durability and
 poison on write or sync failure. Final sealing of the active redo file after a

@@ -532,7 +532,7 @@ pub(crate) struct EngineCore {
     table_scan_config: TableScanConfig,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
-    /// Engine-owned executor for finite synchronous CPU computations.
+    /// Engine-owned executor for finite synchronous and asynchronous jobs.
     pub(crate) thread_pool: QuiescentGuard<ThreadPool>,
     /// Engine-owned scheduler for accepted caller and internal obligations.
     pub(crate) mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
@@ -706,11 +706,6 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         .await
         .unwrap_or_else(|never| match never {});
     builder
-        .build::<ThreadPool>(config.thread_pool.clone())
-        .await
-        .disclose()?;
-    builder.build::<ThreadPoolWorkers>(()).await.disclose()?;
-    builder
         .build::<MandatoryRuntime>(config.mandatory_runtime.clone())
         .await
         .disclose()?;
@@ -740,6 +735,12 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         .build::<SharedPoolEvictorWorkers>(())
         .await
         .disclose()?;
+    // Pool jobs may await storage and eviction through their final drain.
+    builder
+        .build::<ThreadPool>(config.thread_pool.clone())
+        .await
+        .disclose()?;
+    builder.build::<ThreadPoolWorkers>(()).await.disclose()?;
     builder
         .build::<LockManager>(())
         .await
@@ -847,9 +848,12 @@ mod tests {
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-    use crate::error::{ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError};
+    use crate::error::{
+        ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
+        RuntimeOrFatalError,
+    };
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
-    use crate::id::{TableID, TrxID};
+    use crate::id::{BlockID, TableID, TrxID};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
@@ -875,6 +879,44 @@ mod tests {
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 1024;
+
+    struct PoolReadCompletionHook {
+        file: StorageBackendFileIdentity,
+        pending: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        fail: bool,
+    }
+
+    impl StorageBackendTestHook for PoolReadCompletionHook {
+        fn on_submit(&self, op: StorageBackendOp) {
+            if op.kind() == IOKind::Read && op.matches_file_identity(self.file) {
+                assert_eq!(thread::current().name(), Some("IO-Thread"));
+            }
+        }
+
+        fn on_complete(&self, op: StorageBackendOp, result: &mut StdIoResult<usize>) {
+            if op.kind() != IOKind::Read || !op.matches_file_identity(self.file) {
+                return;
+            }
+            assert_eq!(thread::current().name(), Some("IO-Thread"));
+            self.pending.send(()).unwrap();
+            // Test-only gate after kernel completion, before the storage service
+            // publishes the result to its pending pool job.
+            self.release.recv().unwrap();
+            if self.fail {
+                *result = Err(StdIoError::from_raw_os_error(libc::EIO));
+            }
+        }
+    }
+
+    // Records execution-resource release before a pool worker can exit.
+    struct PoolJobCleanup(Arc<AtomicBool>);
+
+    impl Drop for PoolJobCleanup {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     struct FailInitialRedoHeaderWriteHook {
         redo_path: PathBuf,
@@ -1061,9 +1103,10 @@ mod tests {
                 "worker={worker}, report={output}"
             );
 
+            let events: Vec<_> = event_rx.try_iter().collect();
             let mut started = Vec::new();
             let mut finished = Vec::new();
-            for event in event_rx.try_iter() {
+            for event in events.iter().cloned() {
                 match event {
                     SpawnTestEvent::Started(name) => started.push(name),
                     SpawnTestEvent::Finished(name) => finished.push(name),
@@ -1085,6 +1128,22 @@ mod tests {
                     !started.iter().any(|name| name == "Log-Thread"),
                     "redo started after mandatory worker startup failed: started={started:?}"
                 );
+            }
+            if worker.starts_with("ThreadPoolWorker-") {
+                assert!(started.iter().any(|name| name == "IO-Thread"));
+                assert!(started.iter().any(|name| name == "Shared-Pool-Evictor"));
+                assert!(!started.iter().any(|name| name == "Purge-Dispatcher"));
+                assert!(!started.iter().any(|name| name == "Log-Thread"));
+                if worker == "ThreadPoolWorker-2" {
+                    let position = |name: &str| {
+                        events
+                            .iter()
+                            .position(|event| event == &SpawnTestEvent::Finished(name.to_owned()))
+                            .unwrap()
+                    };
+                    assert!(position("ThreadPoolWorker-1") < position("Shared-Pool-Evictor"));
+                    assert!(position("Shared-Pool-Evictor") < position("IO-Thread"));
+                }
             }
             if worker == "ThreadPoolWorker-2" {
                 assert!(
@@ -1662,6 +1721,125 @@ mod tests {
     }
 
     #[test]
+    fn test_thread_pool_drains_pending_storage_before_eviction_and_io_shutdown() {
+        for fail in [false, true] {
+            smol::block_on(async {
+                let root = TempDir::new().unwrap();
+                let cleaned = Arc::new(AtomicBool::new(false));
+                let cleanup = PoolJobCleanup(Arc::clone(&cleaned));
+                let resumed = Arc::new(AtomicBool::new(false));
+                let job_resumed = Arc::clone(&resumed);
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let observed = Arc::clone(&events);
+                let observed_cleaned = Arc::clone(&cleaned);
+                let observed_resumed = Arc::clone(&resumed);
+                let (purged_tx, purged_rx) = flume::bounded(1);
+                let _observer = observe_spawn_named(move |event| {
+                    if let SpawnTestEvent::Finished(name) = event {
+                        observed.lock().push(name.clone());
+                        if name == "Purge-Dispatcher" {
+                            purged_tx.send(()).unwrap();
+                        }
+                        if name.starts_with("ThreadPoolWorker-") {
+                            assert!(observed_cleaned.load(Ordering::Acquire));
+                            assert!(observed_resumed.load(Ordering::Acquire));
+                        }
+                    }
+                });
+                let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+                    .await
+                    .unwrap();
+                let table_id = table1(&engine).await;
+                let disk_pool = engine.inner().pools.disk.clone();
+                let disk_guard = disk_pool.create_base_guard();
+                let file = engine
+                    .inner()
+                    .table_fs
+                    .open_table_file(table_id, disk_pool.clone(), &disk_guard)
+                    .await
+                    .unwrap();
+                let identity = StorageBackendFileIdentity::from_path(
+                    engine.inner().table_fs.user_table_file_path(table_id),
+                )
+                .unwrap();
+                let (pending_tx, pending_rx) = flume::bounded(1);
+                let (release_tx, release_rx) = flume::bounded(1);
+                let hook = Arc::new(PoolReadCompletionHook {
+                    file: identity,
+                    pending: pending_tx,
+                    release: release_rx,
+                    fail,
+                });
+                let _hook = install_storage_backend_test_hook(hook);
+                let completion = engine.inner().thread_pool.submit_async(async move {
+                    let _cleanup = cleanup;
+                    assert!(
+                        thread::current()
+                            .name()
+                            .unwrap()
+                            .starts_with("ThreadPoolWorker-")
+                    );
+                    let offset = (1..=3).sum::<usize>() + 1;
+                    let result = disk_pool
+                        .read_raw_block(
+                            file.file_kind(),
+                            file.sparse_file(),
+                            &disk_guard,
+                            BlockID::from(offset),
+                        )
+                        .await;
+                    assert!(
+                        thread::current()
+                            .name()
+                            .unwrap()
+                            .starts_with("ThreadPoolWorker-")
+                    );
+                    job_resumed.store(true, Ordering::Release);
+                    result.map(|page| {
+                        page.page()
+                            .iter()
+                            .map(|byte| usize::from(*byte))
+                            .sum::<usize>()
+                            + 17
+                    })
+                });
+                pending_rx.recv_async().await.unwrap();
+                thread::scope(|scope| {
+                    let shutdown = scope.spawn(|| engine.shutdown());
+                    purged_rx.recv().unwrap();
+                    assert!(!events.lock().iter().any(
+                        |name| name.starts_with("ThreadPoolWorker-")
+                            || name == "Shared-Pool-Evictor"
+                            || name == "IO-Thread"
+                    ));
+                    assert!(!resumed.load(Ordering::Acquire));
+                    assert!(!cleaned.load(Ordering::Acquire));
+                    release_tx.send(()).unwrap();
+                    shutdown.join().unwrap();
+                });
+                let result = completion.wait_take_result().await.unwrap();
+                if fail {
+                    assert!(matches!(result, Err(RuntimeOrFatalError::Runtime(_))));
+                } else {
+                    assert_eq!(result.unwrap(), 17);
+                }
+                assert!(resumed.load(Ordering::Acquire));
+                assert!(cleaned.load(Ordering::Acquire));
+                engine.inner().poisoner.ensure_healthy().unwrap();
+                engine.shutdown();
+                let events = events.lock();
+                let position = |name: &str| events.iter().position(|event| event == name).unwrap();
+                for worker in ["ThreadPoolWorker-1", "ThreadPoolWorker-2"] {
+                    assert!(position("Purge-Dispatcher") < position(worker));
+                    assert!(position("Purge-Executor-1") < position(worker));
+                    assert!(position(worker) < position("Shared-Pool-Evictor"));
+                }
+                assert!(position("Shared-Pool-Evictor") < position("IO-Thread"));
+            });
+        }
+    }
+
+    #[test]
     fn test_engine_shutdown_is_idempotent_and_rejects_new_work() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -1734,8 +1912,10 @@ mod tests {
         assert!(purge_dispatcher_finished < evictor_finished);
         assert!(purge_executor_finished < evictor_finished);
         assert!(evictor_finished < io_finished);
-        assert!(io_finished < thread_pool_1_finished);
-        assert!(io_finished < thread_pool_2_finished);
+        assert!(purge_dispatcher_finished < thread_pool_1_finished);
+        assert!(thread_pool_1_finished < evictor_finished);
+        assert!(purge_dispatcher_finished < thread_pool_2_finished);
+        assert!(thread_pool_2_finished < evictor_finished);
         drop(events);
         drop(observer);
 

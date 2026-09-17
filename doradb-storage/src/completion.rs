@@ -1,7 +1,7 @@
 //! One-shot completion cells for asynchronous engine flows.
 //!
 //! `Completion<T>` stores a `CompletionResult<T>` so IO, redo, commit,
-//! CPU-task, and mandatory-runtime paths can move detailed domain reports
+//! pool-job, and mandatory-runtime paths can move detailed domain reports
 //! across thread boundaries without promoting them to the public `Error` type
 //! too early. A completion failure stores one cloneable bridge. Fanout clones
 //! only its inner `Arc`; final error owners reconstruct independent reports
@@ -28,7 +28,7 @@ pub(crate) enum CompletionTake<T> {
     Consumed,
 }
 
-/// Shared terminal-status cell for one asynchronous IO flow.
+/// Shared terminal-status cell for one accepted job or asynchronous I/O flow.
 ///
 /// Producers call [`Self::complete`] exactly once to publish the final result.
 /// Waiters can either poll [`Self::completed_result`] or await

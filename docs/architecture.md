@@ -93,9 +93,11 @@ they can safely move to the new one.
 Preparation and admission for background operations remain caller-owned and
 cancellable until the engine accepts the obligation. Once accepted,
 maintenance and cleanup work is owned and supervised by the engine through
-completion or a reported fatal failure. CPU-bound finite work and asynchronous
-effectful work use separate execution resources. Engine shutdown closes new
-admission and drains accepted obligations in ownership order.
+completion or a reported fatal failure. Finite synchronous and asynchronous
+subtasks share worker resources, while their enclosing operations retain cleanup
+and publication responsibility. Engine shutdown closes new admission and drains
+accepted obligations in ownership order, keeping storage and eviction available
+until the work that depends on them finishes.
 
 ## Storage And Identity Model
 

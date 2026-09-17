@@ -85,7 +85,7 @@ One checkpoint attempt follows these conceptual phases:
    row images and cold-row delete selection, then allocate `checkpoint_ts`.
 4. Convert a ready frozen-page prefix into LWC blocks and collect matching
    secondary-index entries from the same visible rows. Owned LWC encoding and
-   checksum work runs on the engine CPU thread pool. One checkpoint-local
+   checksum work runs on the engine thread pool. One checkpoint-local
    logical-order list moves each block from encoding to accepted shared-storage
    write to written, so CPU work overlaps CoW data writes. Page access,
    logical CoW allocation, write submission, and sidecar collection remain on
