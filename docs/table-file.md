@@ -7,7 +7,7 @@ The **Table File** is the physical persistence unit for one user table.
 It stores:
 
 - checkpointed LWC data blocks
-- block-index metadata
+- `ColumnBlockIndex` nodes, including cold-row identity and delete metadata
 - persistent delete state for cold rows
 - persistent secondary-index `DiskTree` roots
 
@@ -15,29 +15,37 @@ The file follows a Copy-on-Write design:
 
 - new checkpoints write new blocks and a new metadata root
 - the super block atomically switches to that new root
-- old pages are reclaimed later
+- old blocks are reclaimed later
 
 ## 2. Physical Layout
 
-The file is divided into fixed-size 64KB pages.
+The file is divided into fixed-size 64-KiB blocks addressed by `BlockID`.
+Block 0 contains two 32-KiB super-block slots. All other block ids are assigned
+by the CoW allocator; block kinds do not occupy fixed regions or positions.
 
 ```text
-+-------------------------------------------------------+
-| Page 0: SuperBlock (double-buffered root anchors)     |
-+-------------------------------------------------------+
-| Page 1: MetaBlock (snapshot V100)                     |
-+-------------------------------------------------------+
-| Page 2: SpaceMap Page                                 |
-+-------------------------------------------------------+
-| Page 3: LWC Data Block                                |
-+-------------------------------------------------------+
-| Page 4: DiskTree Node / delete payload / misc CoW     |
-+-------------------------------------------------------+
-| ...                                                   |
-+-------------------------------------------------------+
-| Page N: MetaBlock (snapshot V101)                     |
-+-------------------------------------------------------+
++---------------------------------------------------------+
+| Block 0: SuperBlock (two root-anchor slots)             |
++---------------------------------------------------------+
+| Allocator-managed blocks, in any physical order:        |
+|   MetaBlock snapshots, including inline AllocMap        |
+|   ColumnBlockIndex branch and leaf nodes                |
+|   LWC value blocks                                      |
+|   External deletion-blob blocks                         |
+|   Secondary-index DiskTree nodes                        |
+|   Free blocks                                           |
++---------------------------------------------------------+
 ```
+
+The allocation bitmap is serialized inside each `MetaBlock`; there is no
+separate space-map block. Row-ID lists live inside `ColumnBlockIndex` leaf
+entries, and external deletion blobs are reached through those entries.
+
+Meta blocks, column block-index nodes, LWC blocks, and deletion-blob blocks use
+a shared integrity envelope: a 16-byte magic/version header and a 32-byte
+BLAKE3 checksum trailer, leaving 65,488 bytes for payload and padding.
+`DiskTree` nodes use their own node layout with the shared checksum trailer;
+super-block slots use the header/body/footer format described below.
 
 ## 3. SuperBlock
 
@@ -46,33 +54,43 @@ The super block is the fixed entry point of the table file.
 Each slot stores:
 
 - magic/version
+- slot number
 - root timestamp
 - pointer to the active `MetaBlock`
 - checksum/footer redundancy
 
 Commit protocol:
 
-1. write the inactive slot with the new `MetaBlock` pointer
-2. submit `fsync` through the shared storage backend and wait for completion
-3. once durable, that slot is the active root
+1. complete writes of the new data, index, and deletion-blob blocks
+2. write the new `MetaBlock`
+3. write the inactive slot with the new `MetaBlock` pointer
+4. submit `fsync` through the shared storage backend and wait for completion
+5. once durable, install the new active root in memory
 
 ## 4. MetaBlock
 
-`MetaBlock` is the logical snapshot for one table checkpoint publication.
+`MetaBlock` stores table state for one CoW root publication.
 
 ### 4.1 Structure
 
 The active `MetaBlock` stores:
 
 - schema metadata
-- root of the persistent RowID/block index
-- root or payload references for persistent cold-row delete metadata
-- root page id of each secondary-index `DiskTree`
-- page allocation state
+- `column_block_index_root`, the root block id of the persistent cold-row index
+- secondary-index slot states and active `DiskTree` root block ids
+- `alloc_map`, the inline block allocation bitmap
 - `pivot_row_id`
 - `heap_redo_start_ts`
 - `deletion_cutoff_ts`
-- `root_ts`, the timestamp carried by the published root
+
+Cold-row identity and persistent delete state are reached through
+`column_block_index_root`. Its leaf entries own the row-ID sections, inline
+delete sections, and references to external deletion blobs. `MetaBlock` has no
+separate deletion root or direct deletion-blob references.
+
+The runtime `ActiveRoot` combines this payload with the super-block anchor.
+Its `root_ts` is serialized as `checkpoint_cts` in the super-block header and
+footer, rather than in the `MetaBlock` payload.
 
 `root_ts` is a publication timestamp, not always a transaction commit
 timestamp. Initial `CREATE TABLE` roots use the create transaction STS because
@@ -101,15 +119,16 @@ to the table file.
 
 Persistent secondary-index state is recovered by loading the checkpointed
 `DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.
-The current table-file format does not persist an obsolete-page side list.
+The current table-file format does not persist an obsolete-block side list.
 Table-file cleanup derives reclaimable blocks from checkpoint-root
 reachability.
 
 ### 4.2 Lifecycle
 
-- a new `MetaBlock` is created for each successful table checkpoint publication
+- a new `MetaBlock` is created for each successful root publication, including
+  table checkpoints and metadata-changing DDL
 - the new `MetaBlock` copies unchanged roots from the previous one
-- changed roots are overwritten with new CoW page ids
+- changed roots are replaced with new CoW block ids
 - obsolete CoW blocks become reclaimable only after the root-reachability gate
   proves no active transaction can still observe the displaced root
 
@@ -137,9 +156,9 @@ phase.
 ## 5. Space Management And GC
 
 New user `.tbl` files and `catalog.mtb` begin with a 16 MiB sparse logical
-extent (256 64-KiB pages). The allocation-map length in each CoW root is the
+extent (256 64-KiB blocks). The allocation-map length in each CoW root is the
 root's logical capacity. When a mutable root exhausts that map, the shared CoW
-allocator doubles its page count, clamped to `FileSystemConfig::cow_file_max_size`.
+allocator doubles its block count, clamped to `FileSystemConfig::cow_file_max_size`.
 The default ceiling is 16 GiB and applies independently to every physical user
 table file and to the catalog file; it is neither eagerly allocated nor a
 combined quota.
@@ -147,7 +166,7 @@ combined quota.
 Growth is failure-atomic with root publication:
 
 1. build a larger allocation map without changing the mutable root
-2. verify the concrete table or catalog meta payload still fits one checksummed page
+2. verify the concrete table or catalog meta payload still fits one checksummed block
 3. extend the sparse logical file with `ftruncate`
 4. install the larger mutable map and allocate from the new range
 5. publish data, meta, and the inactive super slot through the existing `fsync`
@@ -156,7 +175,7 @@ No sync is added at extension time. Until publication `fsync` succeeds, the old
 active root remains authoritative. User-table metadata size depends on schema
 and secondary-index roots, so its exact inline allocation-map ceiling is
 file-specific. The fixed catalog payload can represent about 31.9 GiB of
-64-KiB pages. Candidate growth is rejected with a typed capacity error before
+64-KiB blocks. Candidate growth is rejected with a typed capacity error before
 `ftruncate` if either concrete inline format would overflow.
 
 Startup validates all concrete top-level roots before reconciling the sparse
@@ -165,10 +184,10 @@ is never auto-extended. A longer file is an abandoned unpublished sparse tail;
 startup truncates it to the selected published capacity, durably syncs that
 repair, and only then installs the loaded user-table or catalog root. Existing
 published roots larger than a newly lowered configured ceiling remain valid and
-may use their existing free pages, but cannot grow again until the ceiling is
+may use their existing free blocks, but cannot grow again until the ceiling is
 raised.
 
-Pages move through three states:
+Blocks conceptually move through three lifecycle states:
 
 1. `Allocated`
    - reachable from the active `MetaBlock`
@@ -177,13 +196,16 @@ Pages move through three states:
 3. `Free`
    - reusable by future CoW writes
 
+`AllocMap` persists allocated/free bits. `GC_Wait` describes retention of an
+allocated block; it is not a separate persisted bitmap state.
+
 Long-running readers are protected by root indirection:
 
 - old `MetaBlock` snapshots remain valid until no active reader needs them
-- page reclamation only happens after that retention condition is satisfied
+- block reclamation only happens after that retention condition is satisfied
 - transition from `GC_Wait` to `Free` is checkpoint-integrated
   root-reachability work, covering table metadata, `ColumnBlockIndex` nodes,
-  LWC replacement blocks, external deletion blob pages, and secondary-index
+  LWC replacement blocks, external deletion-blob blocks, and secondary-index
   `DiskTree` blocks
 
 User-table reclamation traces two protected roots when the checkpoint gate
@@ -193,11 +215,11 @@ checkpoint boundary, so catalog checkpoints that rewrite catalog file blocks
 trace only the to-be-committed mutable catalog root. The final new catalog
 meta-block id is reserved before the allocation map is rebuilt, allowing the
 newly serialized `catalog.mtb` root to free displaced catalog meta blocks,
-catalog `ColumnBlockIndex` nodes, LWC blocks, and external deletion blob pages
+catalog `ColumnBlockIndex` nodes, LWC blocks, and external deletion-blob blocks
 that are no longer reachable from the committed catalog root. Metadata-only
 catalog checkpoints skip the trace and clear only the displaced meta block.
 
-Whole-table deletion is outside table-file page GC. After a committed
+Whole-table deletion is outside table-file block GC. After a committed
 `DROP TABLE`, transaction GC first destroys the removed runtime after
 `Global_Min_Active_STS > drop_cts`. The table file itself is unlinked only
 after the catalog checkpoint boundary proves the catalog absence is durable:
@@ -205,13 +227,69 @@ after the catalog checkpoint boundary proves the catalog absence is durable:
 user-table files that are below checkpointed `next_table_id` and absent from
 the checkpointed catalog table list.
 
-## 6. LWC Blocks
+## 6. Cold-Row Storage
+
+Cold rows span three related structures: `ColumnBlockIndex` owns row identity
+and persistent delete state, LWC blocks store values by row ordinal, and
+deletion-blob blocks hold delete payloads that exceed the inline policy.
+
+### 6.1 ColumnBlockIndex And Row-ID Lists
+
+`ColumnBlockIndex` is a persisted CoW tree rooted at
+`MetaBlock.column_block_index_root`. Branch entries map inclusive RowID lower
+bounds to child block ids. Each logical leaf entry describes one LWC block
+and its RowID coverage.
+
+A leaf separates its compact search prefixes from variable-length entry
+payloads:
+
+| Leaf component | Persisted contents |
+| --- | --- |
+| Search prefix | Entry start RowID as a plain `u64` or a leaf-relative `u16`/`u32` delta, followed by a `u16` payload offset |
+| Entry header | LWC block id, `row_shape_fingerprint`, RowID span, entry length, and row-section length |
+| Row section | Authoritative row identity encoded as a dense span or a sparse delta list |
+| Optional delete section | Delete domain/count and either inline delete values or an external `BlobRef` |
+
+The leaf selects one search-prefix encoding for all its entries. The 32-byte
+entry header and its row/delete sections are packed from the end of the leaf
+payload, while search prefixes grow from the front.
+
+The row section has two current encodings:
+
+- **Dense:** all RowIDs in `[start_row_id, start_row_id + row_id_span)` are
+  present. The section stores only its codec header; row ordinal `i` maps to
+  `start_row_id + i`.
+- **Sparse:** a sorted list of little-endian `u32` deltas from `start_row_id`
+  identifies the rows physically present in the LWC block. A delta's position
+  in the list is its LWC row ordinal. Gaps in the covered range are absent rows.
+
+Both encodings live inside the leaf entry. Persistent deletes are a separate
+set over these physically present rows, so marking a row deleted preserves
+its ordinal and its stored values. Lookup resolves the LWC block id, row
+ordinal, row-shape fingerprint, and durable delete membership from the index.
+See [Block Index](./block-index.md) for routing and MVCC behavior.
+
+### 6.2 LWC Value Blocks
 
 Persistent rows are stored in LWC blocks using a PAX-style layout optimized for:
 
 - point lookup
 - range scan
 - lightweight compression
+
+An LWC payload begins with a 32-byte header containing:
+
+- `row_shape_fingerprint: u128`
+- `row_count: u16`
+- `col_count: u16`
+- `flags: u16`
+- ten reserved bytes
+
+The body contains a `u16` column-end-offset array, compressed column payloads,
+and padding. Row IDs and persistent delete sets are stored in the block index,
+not in this body. Readers obtain a row ordinal from the index, verify that its
+expected fingerprint matches the LWC header, and decode values at that ordinal.
+Recovery and checkpoint consumers likewise obtain row identity from the index.
 
 LWC blocks are immutable once published. Updates and deletes against persistent
 rows are represented through:
@@ -220,11 +298,39 @@ rows are represented through:
 - reinsertion of updated rows into hot RowStore
 - companion secondary-index maintenance
 
+### 6.3 Delete Sections And Deletion-Blob Blocks
+
+An entry with no persistent deletes omits its delete section. A small delete
+set is serialized inline after the row section. Larger sets use a delete
+section containing a `BlobRef` with `start_block_id: u64`, `start_offset: u16`,
+and `byte_len: u32`. The offset is relative to the first block's blob body,
+and the byte length includes the blob's framing header.
+
+The delete section records its codec, version, domain, and count. Current
+payloads are sorted little-endian `u32` lists. The domain tag distinguishes
+RowID deltas from row ordinals; new entries default to RowID deltas, and delete
+rewrites preserve the existing domain. These lists represent a delete set,
+rather than a persisted bit-per-row bitmap.
+
+External payloads are packed into immutable deletion-blob blocks. Each block
+has a ten-byte payload header containing the next block id and used byte count.
+Each referenced blob begins with an eight-byte framing header containing its
+kind, codec, codec version, flags, and payload length. A block can contain
+multiple blobs, and a blob can continue across linked blocks. `BlobRef` selects
+the exact framed byte range; it does not imply one dedicated block per LWC
+block.
+
+Deletion checkpoint rewrites affected `ColumnBlockIndex` entries through CoW,
+writes any new external blobs, and publishes the replacement column-index
+root together with companion secondary-index changes. Reachability tracing
+follows leaf references to retain the required blob blocks. See
+[Deletion Checkpoint](./deletion-checkpoint.md) for selection and publication.
+
 For cold-row deletes, the table file owns a retention contract needed by
 deletion checkpoint and secondary-index maintenance: deleted cold row values
 remain reconstructible from their persisted LWC blocks until a checkpoint root
 durably publishes both the persistent delete metadata and the companion
-secondary-index `DiskTree` delete/update. Storage compaction, vacuum, or page
+secondary-index `DiskTree` delete/update. Storage compaction, vacuum, or block
 reclamation must not make those row values undecodable before that joint
 publication.
 
@@ -240,7 +346,7 @@ state, or a combination of those changes:
 Secondary-index `DiskTree` updates are companion work of those checkpoints, not
 an independent third checkpoint stream.
 
-The table's volatile checkpoint workflow owns the canonical frozen-page batch
+The table's volatile checkpoint workflow owns the canonical frozen row-page batch
 and original fence. Before publication it optimistically builds owned,
 cutoff-specific transition plans without page-state write locks. Frozen-page
 mutations use paired equality-only version increments; plans whose version
@@ -282,7 +388,7 @@ publication and recovery.
 Data checkpoint publishes:
 
 - new LWC blocks
-- new block-index roots
+- a new `ColumnBlockIndex` root with row identity for the new LWC blocks
 - updated secondary-index `DiskTree` roots for the newly checkpointed rows
 - updated `pivot_row_id`
 - updated `heap_redo_start_ts`
@@ -311,14 +417,15 @@ blocks, but cannot expose a partially built LWC/index pair.
 
 Deletion checkpoint publishes:
 
-- new persistent delete metadata
+- a new `ColumnBlockIndex` root with updated delete sections and any new
+  external deletion-blob blocks
 - updated secondary-index `DiskTree` roots for the deleted cold rows
 - updated `deletion_cutoff_ts`
 
 The deleted row values used to reconstruct secondary-index keys remain
 available until this publication succeeds. The delete metadata and companion
 `DiskTree` root changes are one table-checkpoint outcome, so recovery never
-observes a checkpoint root where the durable delete bitmap has advanced without
+observes a checkpoint root where the persistent delete set has advanced without
 the matching secondary-index delete publication.
 
 If no table-file state changes are selected and only `heap_redo_start_ts` or
@@ -353,7 +460,7 @@ readiness observation that can race with checkpoint execution. Once the active
 root crosses the horizon, checkpoint may rebuild the mutable root's allocation
 map from only two protected roots: the current active root and the mutable root
 about to be published. This reclaims obsolete CoW blocks and dropped
-secondary-index `DiskTree` pages without a foreground vacuum command.
+secondary-index `DiskTree` blocks without a foreground vacuum command.
 
 Catalog checkpoints do not use the user-table two-root retention rule.
 Foreground catalog reads use in-memory catalog tables, and `catalog.mtb` is
@@ -378,11 +485,12 @@ storage and does not depend on `TransactionSystem`.
 ### 7.4 Generic Publish Flow
 
 1. read the active `MetaBlock`
-2. allocate new CoW pages for changed structures
+2. allocate and write new CoW blocks for changed structures
 3. build a new `MetaBlock` that copies unchanged roots and overwrites changed
    roots
 4. persist the new `MetaBlock`
-5. atomically switch the super block to it
+5. write the inactive super-block slot, complete publication `fsync`, and
+   install the new active root
 
 ## 8. Recovery Role
 
