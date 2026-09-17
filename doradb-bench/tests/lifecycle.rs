@@ -755,22 +755,78 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     #[test]
     fn whole_page_freeze_failure_retains_root_without_success_artifact() {
         let temp = TempDir::new().unwrap();
-        let source = temp.path().join("invalid-freeze.toml");
-        fs::write(
-            &source,
-            "[engine.transaction]\nlog_sync = \"none\"\n\
-             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
-             [[phase]]\nworkload = { type = \"insert-seq\", num = 8, value_size = \"128 B\", batch_size = 8 }\n\
-             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 0\nmeasured_runs = 1\n\
-             workload = { type = \"freeze-table\", max_rows = 4 }\n",
-        )
-        .unwrap();
-        let root = temp.path().join("invalid-freeze-root");
-        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
-        assert!(assert_failure(output).contains("did not install a nonempty proper prefix"));
-        assert!(root.exists());
-        assert!(!root.join("benchmark-result.toml").exists());
+        let hot = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '128 B', batch_size = 8 }\n";
+        let checkpointed = format!(
+            "[[phase]]\nworkload = {{ type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }}\n\
+             [[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n\
+             [[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{hot}"
+        );
+        let prefix_checkpointed = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }\n\
+                                   [[phase]]\nworkload = { type = 'freeze-table', max_rows = 4 }\n\
+                                   [[phase]]\nworkload = { type = 'checkpoint-table' }\n";
+        for (name, preparation, max_rows) in [
+            ("hot-rounded", hot, 4),
+            ("checkpointed-oversized", checkpointed.as_str(), 16),
+            ("checkpointed-rounded", checkpointed.as_str(), 4),
+            ("prefix-checkpointed", prefix_checkpointed, 7),
+        ] {
+            let source = temp.path().join(format!("{name}.toml"));
+            fs::write(
+                &source,
+                format!(
+                    "[engine.transaction]\nlog_sync = 'none'\n\
+                     [[phase]]\nworkload = {{ type = 'create-table', index = 'none' }}\n\
+                     {preparation}\n\
+                     [[phase]]\nkind = 'benchmark'\nwarmup_runs = 0\nmeasured_runs = 1\n\
+                     workload = {{ type = 'freeze-table', max_rows = {max_rows} }}\n"
+                ),
+            )
+            .unwrap();
+            let root = temp.path().join(format!("{name}-root"));
+            let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = assert_failure(output);
+            assert!(
+                stderr.contains("did not install a nonempty proper prefix"),
+                "{name}: {stderr}"
+            );
+            assert!(!stdout.contains("DoraDB benchmark summary"));
+            assert!(root.exists());
+            assert!(!root.join("benchmark-result.toml").exists());
+        }
+    }
+
+    #[test]
+    fn prefix_freeze_after_full_checkpoint_preserves_hot_suffix() {
+        let temp = TempDir::new().unwrap();
+        let phases = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n\
+                      [[phase]]\nworkload = { type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }\n\
+                      [[phase]]\nworkload = { type = 'freeze-table', all = true }\n\
+                      [[phase]]\nworkload = { type = 'checkpoint-table' }\n\
+                      [[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }\n\
+                      [[phase]]\nworkload = { type = 'freeze-table', max_rows = 4 }\n\
+                      [[phase]]\nworkload = { type = 'checkpoint-table' }\n\
+                      [[phase]]\nkind = 'benchmark'\nworkload = { type = 'freeze-table', all = true }\n";
+        let (_, report) = execute_plan(&temp, "checkpointed-prefix", phases);
+        let Some(WorkloadMetrics::FreezeTable {
+            approximate_rows: prefix_rows,
+            page_count: prefix_pages,
+            ..
+        }) = report.prepare_phases[5].workload_metrics
+        else {
+            panic!("missing prefix freeze metrics")
+        };
+        let Some(WorkloadMetrics::FreezeTable {
+            approximate_rows: suffix_rows,
+            page_count: suffix_pages,
+            ..
+        }) = report.measured_runs[0].workload_metrics
+        else {
+            panic!("missing hot suffix freeze metrics")
+        };
+        assert!(prefix_rows > 0 && suffix_rows > 0);
+        assert_eq!(prefix_rows + suffix_rows, 8);
+        assert!(prefix_pages > 0 && suffix_pages > 0);
     }
 
     #[test]

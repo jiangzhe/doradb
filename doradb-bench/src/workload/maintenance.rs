@@ -354,11 +354,13 @@ fn verify_frozen_outcome(
         .map_err(|_| BenchError::message("frozen page count exceeds u64"))?;
     let stable_page_count = u64::try_from(batch.stable_page_count())
         .map_err(|_| BenchError::message("stable frozen page count exceeds u64"))?;
+    // Lifetime inserts include checkpointed rows. Use current hot pages to
+    // prove that a prefix leaves a suffix, even when exact placement is unknown.
     if batch.table_id() != primary.table_id
         || batch.is_empty()
         || approximate_rows == 0
         || (matches!(selection, FreezeSelection::Prefix { .. })
-            && approximate_rows >= primary.inserted_rows)
+            && (approximate_rows >= primary.inserted_rows || batch.page_count() >= observed_pages))
         || (selection == FreezeSelection::All && batch.page_count() != observed_pages)
         || stable_page_count > page_count
     {
@@ -367,7 +369,7 @@ fn verify_frozen_outcome(
             FreezeSelection::Prefix { .. } => "a nonempty proper prefix",
         };
         return Err(BenchError::message(format!(
-            "freeze-table did not install {selection_label}: expected_table={}, actual_table={}, inserted_rows={}, approximate_rows={}, page_count={}, stable_page_count={}",
+            "freeze-table did not install {selection_label}: expected_table={}, actual_table={}, inserted_rows={}, approximate_rows={}, page_count={}, observed_hot_pages={observed_pages}, stable_page_count={}",
             primary.table_id,
             batch.table_id(),
             primary.inserted_rows,
