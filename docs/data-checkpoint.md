@@ -181,7 +181,7 @@ same prepared bitmap is reused rather than walking undo state again.
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
 complete block input, checkpoint submits only LWC serialization, compression,
-and checksum generation to the engine CPU thread pool. One checkpoint-local
+and checksum generation to the engine thread pool. One checkpoint-local
 state list retains blocks in logical RowID order and moves each block
 monotonically from `Encoding` to `Writing` to `Written`. The number of blocks
 that have not crossed shared-storage ingress is bounded by the configured CPU

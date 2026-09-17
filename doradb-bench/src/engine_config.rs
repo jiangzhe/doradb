@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EngineConfigOverlay {
-    /// CPU thread-pool sizing overrides.
+    /// Finite sync/async thread-pool sizing overrides.
     pub thread_pool: ThreadPoolOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
@@ -65,11 +65,11 @@ impl TableScanConfigOverlay {
     }
 }
 
-/// Strict CPU thread-pool overlay.
+/// Strict finite sync/async thread-pool overlay.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ThreadPoolOverlay {
-    /// Fixed CPU worker-thread count.
+    /// Fixed worker-thread count shared by sync and async jobs.
     pub worker_threads: Option<usize>,
 }
 
@@ -230,7 +230,7 @@ impl LogSyncValue {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedEngineConfig {
-    /// CPU thread-pool sizing.
+    /// Finite sync/async thread-pool sizing.
     pub thread_pool: ResolvedThreadPoolConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
@@ -299,11 +299,11 @@ pub struct ResolvedTableScanConfig {
     pub row_pages_per_partition: usize,
 }
 
-/// Serializable normalized CPU thread-pool configuration.
+/// Serializable normalized finite sync/async thread-pool configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedThreadPoolConfig {
-    /// Fixed CPU worker-thread count.
+    /// Fixed worker-thread count shared by sync and async jobs.
     pub worker_threads: usize,
 }
 

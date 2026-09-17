@@ -252,17 +252,17 @@ impl Drop for ComponentShutdownOutcome {
 /// Current engine registration order:
 /// 1. `StorageRootLease`
 /// 2. `EnginePoisoner`
-/// 3. `ThreadPool` -> `EnginePoisoner`
-/// 4. `ThreadPoolWorkers` -> `ThreadPool`
-/// 5. `MandatoryRuntime` -> `EnginePoisoner`
-/// 6. `FileSystem`
-/// 7. `DiskPool` -> `FileSystem`
-/// 8. `MetaPool`
-/// 9. `IndexPool` -> `FileSystem`
-/// 10. `MemPool` -> `FileSystem`
-/// 11. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
-///     `MemPool`
-/// 12. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 3. `MandatoryRuntime` -> `EnginePoisoner`
+/// 4. `FileSystem`
+/// 5. `DiskPool` -> `FileSystem`
+/// 6. `MetaPool`
+/// 7. `IndexPool` -> `FileSystem`
+/// 8. `MemPool` -> `FileSystem`
+/// 9. `FileSystemWorkers` -> `EnginePoisoner`, `FileSystem`, `IndexPool`,
+///    `MemPool`
+/// 10. `SharedPoolEvictorWorkers` -> `DiskPool`, `IndexPool`, `MemPool`
+/// 11. `ThreadPool` -> `EnginePoisoner`
+/// 12. `ThreadPoolWorkers` -> `ThreadPool`
 /// 13. `LockManager`
 /// 14. `Catalog` -> `EnginePoisoner`, `MetaPool`, `FileSystem`, `DiskPool`
 /// 15. `TransactionSystem` -> `EnginePoisoner`, `MandatoryRuntime`,

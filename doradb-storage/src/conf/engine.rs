@@ -13,15 +13,17 @@ use super::consts::{
 };
 use super::{EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
 
-/// Immutable sizing for the engine-owned CPU thread pool.
+/// Immutable sizing for the engine-owned thread pool.
 ///
 /// The default is two fixed operating-system workers. Pool tasks are finite,
-/// synchronous CPU computations submitted only by storage-internal owners.
+/// synchronous computations or asynchronous jobs submitted only by storage-internal
+/// owners. Async jobs use backend I/O and cooperative scheduling; callers bound
+/// fan-out and temporary memory and drain their accepted children.
 /// Sizing is validated once during engine startup; a running engine cannot be
 /// resized.
 #[derive(Clone, Debug)]
 pub struct ThreadPoolConfig {
-    /// Number of fixed operating-system threads executing CPU tasks.
+    /// Number of fixed operating-system threads executing finite sync and async jobs.
     pub worker_threads: usize,
 }
 
@@ -33,7 +35,7 @@ impl Default for ThreadPoolConfig {
 }
 
 impl ThreadPoolConfig {
-    /// Set the fixed number of CPU worker threads.
+    /// Set the fixed number of worker threads.
     #[inline]
     pub fn worker_threads(mut self, worker_threads: usize) -> Self {
         self.worker_threads = worker_threads;
@@ -155,7 +157,7 @@ pub struct EngineConfig {
     pub storage_root: PathBuf,
     /// Transaction-system configuration.
     pub trx: TrxSysConfig,
-    /// Engine-owned CPU thread-pool configuration.
+    /// Engine-owned thread-pool configuration.
     pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
     pub mandatory_runtime: MandatoryRuntimeConfig,
@@ -246,7 +248,7 @@ impl EngineConfig {
         self
     }
 
-    /// Set the engine-owned CPU thread-pool configuration.
+    /// Set the engine-owned thread-pool configuration.
     #[inline]
     pub fn thread_pool(mut self, thread_pool: ThreadPoolConfig) -> Self {
         self.thread_pool = thread_pool;

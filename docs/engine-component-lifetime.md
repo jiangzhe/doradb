@@ -48,6 +48,7 @@ The runtime uses an explicit owner/runtime split:
 - `EngineCore` owns the shared runtime capabilities:
   - engine poisoner
   - mandatory runtime
+  - finite-job thread pool
   - catalog
   - transaction system
   - logical lock manager
@@ -85,17 +86,18 @@ one fixed dependency order:
 8. `MemPool`
 9. `FileSystemWorkers`
 10. `SharedPoolEvictorWorkers`
-11. `LockManager`
-12. `Catalog`
-13. `TransactionSystem`
-14. `TransactionPurgeWorkers`
-15. `MandatoryRuntimeWorkers`
-16. `TransactionRedoWorkers`
+11. `ThreadPool`
+12. `ThreadPoolWorkers`
+13. `LockManager`
+14. `Catalog`
+15. `TransactionSystem`
+16. `TransactionPurgeWorkers`
+17. `MandatoryRuntimeWorkers`
+18. `TransactionRedoWorkers`
 
-Every entry is an explicit `RegistryBuilder::build` call in
-`bootstrap_inner`. Components register only themselves. Upstream
-components may publish typed startup provisions to the shared build shelf, but
-the downstream component remains a separate explicit build step.
+Bootstrap establishes each component's dependencies before making it available
+to downstream components. Worker startup and shutdown remain distinct lifecycle
+responsibilities from ownership of the resources those workers use.
 
 While the lease is held, bootstrap removes only names matching DoraDB's exact
 marker-temporary grammar and syncs the root directory before marker validation.
@@ -121,16 +123,14 @@ can poison the engine without depending on `TransactionSystem`; components
 that publish or inspect fatal state retain their own direct poisoner
 dependency.
 
-`ThreadPool` and `ThreadPoolWorkers` are registered immediately after the
-poisoner. The core owns the only job sender and a direct poisoner guard; its
-adjacent worker owner starts the configured fixed workers. `MandatoryRuntime`
-is registered next. Catalog, transaction, recovery, and operation adapters can
-therefore retain its direct `QuiescentGuard` without owning the engine owner
-shell. Its build shelves the runtime guard. The later
-`MandatoryRuntimeWorkers` build starts the one fixed runner and registers its
-join-handle owner at the required shutdown position. Reverse teardown stops
-mandatory execution before the CPU-pool owner enqueues FIFO stop messages and
-joins the drained workers.
+The mandatory runtime depends on engine poison state and is available to
+catalog, transaction, and recovery operations. Its workers have a separate
+lifecycle so accepted operations and transaction cleanup can finish before
+supporting services stop.
+
+The thread pool is available before catalog and transaction recovery begin.
+Its position in the dependency order keeps eviction and storage I/O available
+throughout the drain of accepted jobs, including rollback after startup failure.
 
 Registration order is the dependency order. Reverse registration order is both:
 
@@ -177,10 +177,10 @@ The storage-runtime worker components include:
   - stops purge only after mandatory cleanup can no longer update transaction
     GC state.
 - `ThreadPoolWorkers`
-  - enqueues one FIFO stop message per CPU worker after mandatory execution
-    has stopped;
-  - drains every finite task accepted before those messages; and
-  - joins every CPU worker before propagating the first join payload.
+  - closes admission after mandatory execution and purge stop;
+  - finishes accepted jobs and their cleanup while eviction and storage remain
+    available, including jobs waiting for I/O;
+  - stops all pool workers before reporting a shutdown failure.
 
 The last three registrations intentionally produce reverse shutdown
 `TransactionRedoWorkers -> MandatoryRuntimeWorkers ->
@@ -190,30 +190,38 @@ the later redo build makes the initial redo header durable before engine
 bootstrap returns. Registration order, rather than thread-start order, defines
 the teardown dependency.
 
-## CPU Thread Pool
+## Finite Work in the Thread Pool
 
-`ThreadPoolConfig::worker_threads` is nonzero, defaults to two, and is fixed
-for the engine lifetime. Submission uses `EnginePoisoner`'s atomic healthy
-check followed by one synchronous nonblocking send to an unbounded `flume`
-channel and returns the existing `Completion<T>`. The sender needs no external
-submission mutex. Dropping that observer does not cancel accepted computation.
-Pool jobs are crate-private, finite synchronous CPU work and must not perform
-IO, waits, sleeps, latch or logical-lock acquisition, or submit async futures.
+The engine's internal thread pool runs finite synchronous computations and
+asynchronous jobs on one fixed set of workers. Enclosing operations own the
+ordering, cleanup, and publication of their combined work. They bound parallel
+work and temporary memory, and wait for accepted children before terminating.
+The pool does not guarantee execution or completion order.
 
-Each task body is unwind-supervised. A panic publishes
-`ThreadPoolTaskPanic` through `EnginePoisoner` before completing the task with
-the same shared Fatal bridge; the worker then continues its receive loop. An
-unexpected unavailable ingress similarly publishes `ThreadPoolUnavailable`
-and returns an already-failed completion. Once submission observes poison, it
-returns the cached shared Fatal without enqueueing. Poison may race the fast
-check, so bounded extra finite work can be accepted and is drained normally.
+Acceptance transfers responsibility for a job to the pool before execution
+begins. A submission racing shutdown is either accepted and fully drained or
+rejected without execution. Dropping a result observer cannot cancel accepted
+work, and retaining a completed observer does not keep workers running. Any
+resources retained by a result remain the observer's responsibility.
 
-The pool has no shutdown counter of its own. Each production job is nested
-under an already-accounted foreground or mandatory owner, and that owner must
-drain its task handles before terminal publication. Worker-owner shutdown is a
-defensive final drain: after mandatory execution stops, it sends one private
-FIFO stop message per worker, attempts every join, and only then propagates a
-captured join panic. These control messages bypass the poison health gate.
+The pool accepts work only once all of its workers are available. Shutdown
+closes admission and waits for every accepted job to finish execution and cleanup,
+including jobs not yet running and jobs waiting for external I/O. Only then may pool
+workers stop, followed by eviction and storage services. Startup failure
+reclaims started workers while preserving the original failure. Shutdown must
+still attempt to stop every worker if one worker fails.
+
+A job panic poisons the engine before its failure is reported to observers.
+Already accepted jobs retain their completion and cleanup obligations. New
+submissions that observe poison are rejected with the original fatal reason;
+work accepted concurrently with poison still drains. Ordinary job errors remain
+the enclosing operation's responsibility. Clean shutdown does not create poison.
+
+Jobs must cooperate with the shared workers: synchronous computations cannot
+block on I/O or other jobs, and longer computations must regularly give other
+work an opportunity to run. Asynchronous jobs may wait for storage and resource
+access under those services' ownership and failure contracts. Persistent
+service loops are outside the pool's finite-work contract.
 
 ## Mandatory Runtime
 
@@ -380,9 +388,10 @@ Normal shutdown is:
    that blocker's exact currently claimable transaction cleanup hint, wait for
    its local event, and repeat from the first current blocker
 6. remove idle registry-owned sessions
-7. call `ComponentRegistry::shutdown_all()` in reverse registration order;
-   redo stops before internal mandatory admission drains, purge stops last, and
-   each hook is independently panic-contained so later hooks still run
+7. shut down components in reverse dependency order: redo stops before mandatory
+   cleanup drains, followed by purge and the thread pool, then eviction and
+   storage I/O; a failure in one component does not prevent the others from
+   completing their shutdown responsibilities
 8. mark lifecycle state as `Shutdown`, release the owner shutdown mutex, report
    the aggregate outcome, and only then propagate or suppress its first payload
 
@@ -423,16 +432,16 @@ The complete reverse-order shutdown audit is:
 | 4 | `TransactionSystem` | Passive hook. Redo, mandatory-runtime, and purge worker owners hold active shutdown authority; transaction state is terminal after a worker panic. |
 | 5 | `Catalog` | Passive hook. Purge stops before owner release, and foreground catalog users were drained before component dispatch. |
 | 6 | `LockManager` | Passive hook. The session/operation drain removes its users. |
-| 7 | `SharedPoolEvictorWorkers` | Sets the shutdown flag, signals every pool, wakes the worker, and then joins. Join propagation follows all stop signalling; arbitrary eviction-body unwind is not repaired. |
-| 8 | `FileSystemWorkers` | Closes every I/O ingress lane, drains the worker, and then joins. Arbitrary I/O-body unwind is not repaired. |
-| 9 | `MemPool` | Passive hook. Shared evictor and I/O worker components own active shutdown. |
-| 10 | `IndexPool` | Passive hook with the same split authority as `MemPool`. |
-| 11 | `MetaPool` | Passive owner with no worker; release follows catalog and transaction guard teardown. |
-| 12 | `DiskPool` | Passive hook. The shared evictor stops earlier in reverse order. |
-| 13 | `FileSystem` | Passive hook. `FileSystemWorkers` owns active I/O shutdown and retains this dependency. |
-| 14 | `MandatoryRuntime` | Passive hook. `MandatoryRuntimeWorkers` owns admission drain, stop, and joins. |
-| 15 | `ThreadPoolWorkers` | Enqueues one FIFO stop per CPU worker, drains earlier accepted jobs, attempts every worker join, then exposes the first join payload. |
-| 16 | `ThreadPool` | Passive hook. Its adjacent worker owner owns stop signalling and joins. |
+| 7 | `ThreadPoolWorkers` | Closes admission and drains accepted jobs and cleanup while storage and eviction remain available. Attempts to stop every worker before reporting a shutdown failure. |
+| 8 | `ThreadPool` | Retains pool resources until its workers have stopped; the worker component owns admission closure and draining. |
+| 9 | `SharedPoolEvictorWorkers` | Sets the shutdown flag, signals every pool, wakes the worker, and then joins. Join propagation follows all stop signalling; arbitrary eviction-body unwind is not repaired. |
+| 10 | `FileSystemWorkers` | Closes every I/O ingress lane, drains the worker, and then joins. Arbitrary I/O-body unwind is not repaired. |
+| 11 | `MemPool` | Passive hook. Shared evictor and I/O worker components own active shutdown. |
+| 12 | `IndexPool` | Passive hook with the same split authority as `MemPool`. |
+| 13 | `MetaPool` | Passive owner with no worker; release follows catalog and transaction guard teardown. |
+| 14 | `DiskPool` | Passive hook. The shared evictor stops earlier in reverse order. |
+| 15 | `FileSystem` | Passive hook. `FileSystemWorkers` owns active I/O shutdown and retains this dependency. |
+| 16 | `MandatoryRuntime` | Passive hook. `MandatoryRuntimeWorkers` owns admission drain, stop, and joins. |
 | 17 | `EnginePoisoner` | Passive hook. It remains available through components that may report fatal state. |
 | 18 | `StorageRootLease` | Takes and drops the lock file last, so root ownership brackets subordinate storage activity even after a contained earlier panic. |
 
@@ -522,7 +531,7 @@ The owned-handle inventory follows those authorities:
 - terminal and cleanup paths reuse existing authority, upgrade the exact weak
   state without new foreground admission, and validate both operation key and
   transaction id directly on that state.
-- redo, mandatory-runtime, CPU-pool, purge, file, and eviction workers are owned and
+- redo, mandatory-runtime, thread-pool, purge, file, and eviction workers are owned and
   joined by their registered component owners.
 
 A surviving public handle retains only a weak state reference and its small
