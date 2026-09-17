@@ -604,6 +604,100 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     }
 
     #[test]
+    fn create_index_verifies_all_placements_modes_and_duplicate_multiplicity() {
+        use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
+        let temp = TempDir::new().unwrap();
+        for (placement, kind) in [
+            ("hot", PlacementKind::Hot),
+            ("checkpointed", PlacementKind::Checkpointed),
+            ("mixed", PlacementKind::Mixed),
+        ] {
+            for index in ["unique", "non-unique"] {
+                let mut phases = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 64, value_size = '4 KiB', batch_size = 16 }\n".to_owned();
+                if placement != "hot" {
+                    phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
+                }
+                if placement == "mixed" {
+                    phases.push_str("[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '4 KiB' }\n");
+                }
+                let stats = index == "unique";
+                phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = '{index}', include_stats = {stats} }}\n"));
+                let (_, report) =
+                    execute_plan(&temp, &format!("create-{placement}-{index}"), &phases);
+                let run = &report.measured_runs[0];
+                let Some(WorkloadMetrics::CreateIndex { report: create }) = &run.workload_metrics
+                else {
+                    panic!("missing CREATE report")
+                };
+                assert_eq!(create.placement, kind);
+                assert_eq!(
+                    create.index,
+                    if stats {
+                        IndexMode::Unique
+                    } else {
+                        IndexMode::NonUnique
+                    }
+                );
+                assert_eq!(
+                    create.rows,
+                    match placement {
+                        "hot" => RowPlacement {
+                            hot_rows: 64,
+                            checkpointed_rows: 0
+                        },
+                        "checkpointed" => RowPlacement {
+                            hot_rows: 0,
+                            checkpointed_rows: 64
+                        },
+                        _ => RowPlacement {
+                            hot_rows: 8,
+                            checkpointed_rows: 64
+                        },
+                    }
+                );
+                let total = if placement == "mixed" { 72 } else { 64 };
+                assert_eq!(create.total_rows, total);
+                let verification = create.verification.as_ref().unwrap();
+                assert_eq!(verification.table_rows, total);
+                assert_eq!(verification.index_rows, total);
+                assert_eq!(verification.fingerprint.len(), 64);
+                assert_eq!(create.sampled_process_rss.is_some(), stats);
+                assert_eq!(!run.internal_metrics.is_empty(), stats);
+                assert_eq!(run.latency.unit, LatencyUnit::IndexCreation);
+                assert_eq!(run.latency.sum_nanos, create.create_elapsed_nanos);
+                assert_eq!(run.latency.sample_count, 1);
+                assert_eq!(
+                    run.counters,
+                    WorkloadCounters {
+                        operations: 1,
+                        ..WorkloadCounters::default()
+                    }
+                );
+            }
+        }
+        let random = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-rand', num = 128, seed = 42, batch_size = 32 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'non-unique' }\n";
+        let (_, report) = execute_plan(&temp, "create-duplicates", random);
+        let Some(WorkloadMetrics::CreateIndex { report }) =
+            &report.measured_runs[0].workload_metrics
+        else {
+            panic!("missing CREATE")
+        };
+        assert_eq!(report.verification.as_ref().unwrap().index_rows, 128);
+        let source = temp.path().join("unique-duplicates.toml");
+        fs::write(
+            &source,
+            random.replace("index = 'non-unique'", "index = 'unique'"),
+        )
+        .unwrap();
+        let root = temp.path().join("failed-unique-root");
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        assert!(!output.status.success());
+        assert!(root.exists());
+        assert!(!root.join("benchmark-result.toml").exists());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
+    }
+
+    #[test]
     fn single_table_checkpoint_plan_publishes_canonical_metrics() {
         let temp = TempDir::new().unwrap();
         let phases = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
@@ -661,22 +755,78 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     #[test]
     fn whole_page_freeze_failure_retains_root_without_success_artifact() {
         let temp = TempDir::new().unwrap();
-        let source = temp.path().join("invalid-freeze.toml");
-        fs::write(
-            &source,
-            "[engine.transaction]\nlog_sync = \"none\"\n\
-             [[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
-             [[phase]]\nworkload = { type = \"insert-seq\", num = 8, value_size = \"128 B\", batch_size = 8 }\n\
-             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 0\nmeasured_runs = 1\n\
-             workload = { type = \"freeze-table\", max_rows = 4 }\n",
-        )
-        .unwrap();
-        let root = temp.path().join("invalid-freeze-root");
-        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
-        assert!(assert_failure(output).contains("did not install a nonempty proper prefix"));
-        assert!(root.exists());
-        assert!(!root.join("benchmark-result.toml").exists());
+        let hot = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '128 B', batch_size = 8 }\n";
+        let checkpointed = format!(
+            "[[phase]]\nworkload = {{ type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }}\n\
+             [[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n\
+             [[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{hot}"
+        );
+        let prefix_checkpointed = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }\n\
+                                   [[phase]]\nworkload = { type = 'freeze-table', max_rows = 4 }\n\
+                                   [[phase]]\nworkload = { type = 'checkpoint-table' }\n";
+        for (name, preparation, max_rows) in [
+            ("hot-rounded", hot, 4),
+            ("checkpointed-oversized", checkpointed.as_str(), 16),
+            ("checkpointed-rounded", checkpointed.as_str(), 4),
+            ("prefix-checkpointed", prefix_checkpointed, 7),
+        ] {
+            let source = temp.path().join(format!("{name}.toml"));
+            fs::write(
+                &source,
+                format!(
+                    "[engine.transaction]\nlog_sync = 'none'\n\
+                     [[phase]]\nworkload = {{ type = 'create-table', index = 'none' }}\n\
+                     {preparation}\n\
+                     [[phase]]\nkind = 'benchmark'\nwarmup_runs = 0\nmeasured_runs = 1\n\
+                     workload = {{ type = 'freeze-table', max_rows = {max_rows} }}\n"
+                ),
+            )
+            .unwrap();
+            let root = temp.path().join(format!("{name}-root"));
+            let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = assert_failure(output);
+            assert!(
+                stderr.contains("did not install a nonempty proper prefix"),
+                "{name}: {stderr}"
+            );
+            assert!(!stdout.contains("DoraDB benchmark summary"));
+            assert!(root.exists());
+            assert!(!root.join("benchmark-result.toml").exists());
+        }
+    }
+
+    #[test]
+    fn prefix_freeze_after_full_checkpoint_preserves_hot_suffix() {
+        let temp = TempDir::new().unwrap();
+        let phases = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n\
+                      [[phase]]\nworkload = { type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }\n\
+                      [[phase]]\nworkload = { type = 'freeze-table', all = true }\n\
+                      [[phase]]\nworkload = { type = 'checkpoint-table' }\n\
+                      [[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }\n\
+                      [[phase]]\nworkload = { type = 'freeze-table', max_rows = 4 }\n\
+                      [[phase]]\nworkload = { type = 'checkpoint-table' }\n\
+                      [[phase]]\nkind = 'benchmark'\nworkload = { type = 'freeze-table', all = true }\n";
+        let (_, report) = execute_plan(&temp, "checkpointed-prefix", phases);
+        let Some(WorkloadMetrics::FreezeTable {
+            approximate_rows: prefix_rows,
+            page_count: prefix_pages,
+            ..
+        }) = report.prepare_phases[5].workload_metrics
+        else {
+            panic!("missing prefix freeze metrics")
+        };
+        let Some(WorkloadMetrics::FreezeTable {
+            approximate_rows: suffix_rows,
+            page_count: suffix_pages,
+            ..
+        }) = report.measured_runs[0].workload_metrics
+        else {
+            panic!("missing hot suffix freeze metrics")
+        };
+        assert!(prefix_rows > 0 && suffix_rows > 0);
+        assert_eq!(prefix_rows + suffix_rows, 8);
+        assert!(prefix_pages > 0 && suffix_pages > 0);
     }
 
     #[test]

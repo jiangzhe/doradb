@@ -6,7 +6,7 @@ Reduce the remaining warm-cache cold-row sequential and parallel table-scan cost
 
 ## Reference
 
-Discovered while completing and profiling docs/tasks/000285-parallel-scan-benchmark-performance-proof.md. The release proof in docs/benchmark-tool.md uses 1,000,000 rows, projection [0, 1], 2,233 physical scan units, and a warm cache. Hot sequential scan measured 73.93 ms versus 263.15 ms for the 900,032-row cold-dominant fixture (3.56x); target-nine parallel scan measured 20.68 ms versus 57.08 ms (2.76x). Warm-up statistics showed 4,021 readonly-cache hits and zero misses, completed reads, or backend submissions for the cold-dominant scan.
+Discovered while completing and profiling docs/tasks/000285-parallel-scan-benchmark-performance-proof.md. The release proof in docs/tasks/000285-parallel-scan-benchmark-performance-proof.md uses 1,000,000 rows, projection [0, 1], 2,233 physical scan units, and a warm cache. Hot sequential scan measured 73.93 ms versus 263.15 ms for the 900,032-row cold-dominant fixture (3.56x); target-nine parallel scan measured 20.68 ms versus 57.08 ms (2.76x). Warm-up statistics showed 4,021 readonly-cache hits and zero misses, completed reads, or backend submissions for the cold-dominant scan.
 
 Task 000286 implemented validation provenance tied to the readonly mapping and frame generation, so warm validated hits no longer rehash the resident 64 KiB block. A fresh 20-run release CPU-clock profile after that change measured a 71.43 ms hot median and 128.55 ms cold median, leaving a 57.12 ms sequential gap. The cold run still recorded 4,021 readonly-cache hits and zero misses, completed reads, or backend submissions.
 

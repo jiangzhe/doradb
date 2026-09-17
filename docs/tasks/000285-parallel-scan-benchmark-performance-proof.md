@@ -174,8 +174,8 @@ fixture and exercises warm-up plus measured parallel scans.
 
 `docs/benchmark-tool.md` defines the strict controls, exceptional
 one-session/target-sized-worker topology, lifecycle envelope, equations,
-metrics, failure behavior, template, and release proof. RFC-0030 Phase 5 owns
-the final implementation summary and performance outcome.
+metrics, failure behavior, and template. The release proof is summarized below.
+RFC-0030 Phase 5 owns the final implementation summary and performance outcome.
 
 ## Implementation Notes
 

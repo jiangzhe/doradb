@@ -4,8 +4,8 @@ use crate::engine_config::{
 };
 use crate::error::{BenchError, Result};
 use crate::fixture::{
-    FixturePlanEffect, FixturePlanState, FixtureRequirement, IndexMode, IndexRequirement, KeyRange,
-    LoadRequirement, PrimaryTableShape,
+    FixturePlanEffect, FixturePlanState, FixtureRequirement, FreezeSelection, IndexMode,
+    IndexRequirement, KeyRange, LoadRequirement, PrimaryTableShape,
 };
 use crate::measurement::LatencyUnit;
 use byte_unit::Byte;
@@ -172,6 +172,8 @@ impl fmt::Display for CatalogCheckpointCase {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum WorkloadSpec {
+    /// Build and retain one secondary index over committed data.
+    CreateIndex(CreateIndexSpec),
     /// Measure one clean engine reopen.
     Recovery(RecoverySpec),
     /// Create the invocation's implicit homogeneous table pool.
@@ -208,7 +210,7 @@ pub enum WorkloadSpec {
     IndexDdl(IterationWorkerSpec),
     /// Execute table-lock lifecycle scenarios.
     LockTable(LockTableSpec),
-    /// Freeze a nonempty proper row-page prefix of the primary table.
+    /// Freeze all hot pages or a nonempty proper prefix of the primary table.
     FreezeTable(FreezeTableSpec),
     /// Checkpoint the primary table's installed frozen-page batch.
     CheckpointTable(CheckpointTableSpec),
@@ -360,12 +362,34 @@ pub struct UpdateSpec {
     pub include_stats: Option<bool>,
 }
 
+/// Strict single-run CREATE INDEX controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIndexSpec {
+    /// Required secondary-index mode; none is rejected during resolution.
+    pub index: IndexMode,
+    /// Optional engine-statistics and process-RSS override.
+    pub include_stats: Option<bool>,
+}
+
+/// Resolved single-session CREATE INDEX configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIndexConfig {
+    /// Secondary-index mode built over the logical-key column.
+    pub index: IndexMode,
+    /// Whether to capture engine statistics and sampled process RSS.
+    pub include_stats: bool,
+}
+
 /// Strict single-table freeze controls.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreezeTableSpec {
-    /// Required positive frozen-prefix row budget.
-    pub max_rows: NonZeroUsize,
+    /// Positive frozen-prefix row budget, exclusive with all.
+    pub max_rows: Option<NonZeroUsize>,
+    /// Select all currently hot pages; only true is accepted.
+    pub all: Option<bool>,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
 }
@@ -756,8 +780,8 @@ pub struct UpdateConfig {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FreezeTableConfig {
-    /// Frozen-prefix row budget passed to the public storage API.
-    pub max_rows: usize,
+    /// Full or prefix selection passed to the public storage API.
+    pub selection: FreezeSelection,
     /// Whether engine diagnostics are captured around the run.
     pub include_stats: bool,
 }
@@ -888,6 +912,8 @@ pub struct LockTableConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ResolvedWorkload {
+    /// Build and retain one secondary index over committed data.
+    CreateIndex(CreateIndexConfig),
     /// Single coordinator-owned engine reopen.
     Recovery(RecoveryConfig),
     /// Table-pool creation workload.
@@ -938,6 +964,7 @@ impl ResolvedWorkload {
     /// Stable workload identity.
     pub fn identity(&self) -> &'static str {
         match self {
+            Self::CreateIndex(_) => "create-index",
             Self::Recovery(_) => "recovery",
             Self::CreateTable(_) => "create-table",
             Self::ManagedBindingsPrepare(_) => "managed-bindings-prepare",
@@ -966,14 +993,12 @@ impl ResolvedWorkload {
     /// Return the fixture capability consumed by this workload.
     pub(crate) fn fixture_requirement(&self) -> FixtureRequirement {
         match self {
+            Self::CreateIndex(_) => FixtureRequirement::CreateIndex,
             Self::Recovery(_) => FixtureRequirement::Recoverable,
             Self::CreateTable(_) => FixtureRequirement::AbsentPrimary,
             Self::ManagedBindingsPrepare(_) => FixtureRequirement::AbsentManagedBindings,
             Self::ResolveTableBinding(_) => FixtureRequirement::ManagedBindings,
-            Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Primary {
-                index: IndexRequirement::Any,
-                load: LoadRequirement::Optional,
-            },
+            Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Insert,
             Self::UpdateRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Secondary,
                 load: LoadRequirement::Committed,
@@ -998,7 +1023,7 @@ impl ResolvedWorkload {
                 minimum: config.minimum_tables,
             },
             Self::FreezeTable(config) => FixtureRequirement::FreezeCandidate {
-                max_rows: config.max_rows,
+                selection: config.selection,
             },
             Self::CheckpointTable(_) => FixtureRequirement::FrozenPrimary,
             Self::CatalogCheckpointPrepare(_) => FixtureRequirement::AbsentCatalogCheckpoint,
@@ -1013,7 +1038,7 @@ impl ResolvedWorkload {
     /// Return whether repeated execution against one fixture is safe.
     pub fn replay_policy(&self) -> ReplayPolicy {
         match self {
-            Self::Recovery(_) => ReplayPolicy::SingleRun,
+            Self::Recovery(_) | Self::CreateIndex(_) => ReplayPolicy::SingleRun,
             Self::StmtNoop(_)
             | Self::TrxNoop(_)
             | Self::LookupSeq(_)
@@ -1041,6 +1066,7 @@ impl ResolvedWorkload {
     /// Return the resolved worker/session counts.
     pub fn worker_counts(&self) -> (usize, usize) {
         match self {
+            Self::CreateIndex(_) => (1, 1),
             Self::Recovery(_) => (0, 0),
             Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => (1, 1),
             Self::ResolveTableBinding(config) => (config.threads, config.sessions),
@@ -1065,6 +1091,7 @@ impl ResolvedWorkload {
     /// Return whether engine diagnostics are requested.
     pub fn include_stats(&self) -> bool {
         match self {
+            Self::CreateIndex(config) => config.include_stats,
             Self::Recovery(config) => config.include_stats,
             Self::CreateTable(config) => config.include_stats,
             Self::ManagedBindingsPrepare(_) => false,
@@ -1091,6 +1118,7 @@ impl ResolvedWorkload {
     /// Return the semantic latency unit for sampled executions.
     pub fn latency_unit(&self) -> LatencyUnit {
         match self {
+            Self::CreateIndex(_) => LatencyUnit::IndexCreation,
             Self::Recovery(_) => LatencyUnit::EngineRecovery,
             Self::CreateTable(_) | Self::ManagedBindingsPrepare(_) => LatencyUnit::TableCreation,
             Self::ResolveTableBinding(_) => LatencyUnit::TableBindingResolution,
@@ -1126,7 +1154,7 @@ impl ResolvedWorkload {
     /// Return the exact successful sampled-run latency count.
     pub fn expected_samples(&self) -> Result<u64> {
         match self {
-            Self::Recovery(_) => Ok(1),
+            Self::Recovery(_) | Self::CreateIndex(_) => Ok(1),
             Self::CreateTable(config) => u64::try_from(config.table_count)
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
@@ -1246,7 +1274,9 @@ fn validate_and_resolve_phases(
         if raw.kind == PhaseKind::Prepare
             && matches!(
                 workload,
-                ResolvedWorkload::UpdateRand(_) | ResolvedWorkload::Recovery(_)
+                ResolvedWorkload::UpdateRand(_)
+                    | ResolvedWorkload::Recovery(_)
+                    | ResolvedWorkload::CreateIndex(_)
             )
         {
             return Err(BenchError::message(format!(
@@ -1351,6 +1381,20 @@ fn resolve_workload(
 ) -> Result<(ResolvedWorkload, FixturePlanEffect)> {
     let no_effect = |workload| Ok((workload, FixturePlanEffect::None));
     match spec {
+        WorkloadSpec::CreateIndex(spec) => {
+            if spec.index == IndexMode::None {
+                return Err(BenchError::message(
+                    "create-index requires unique or non-unique index",
+                ));
+            }
+            Ok((
+                ResolvedWorkload::CreateIndex(CreateIndexConfig {
+                    index: spec.index,
+                    include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                }),
+                FixturePlanEffect::CreateIndex { index: spec.index },
+            ))
+        }
         WorkloadSpec::Recovery(spec) => no_effect(ResolvedWorkload::Recovery(RecoveryConfig {
             include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
         })),
@@ -1468,13 +1512,23 @@ fn resolve_workload(
             no_effect(ResolvedWorkload::LockTable(resolve_lock(spec, defaults)?))
         }
         WorkloadSpec::FreezeTable(spec) => {
-            let max_rows = spec.max_rows.get();
+            let selection = match (spec.max_rows, spec.all) {
+                (Some(max_rows), None) => FreezeSelection::Prefix {
+                    max_rows: max_rows.get(),
+                },
+                (None, Some(true)) => FreezeSelection::All,
+                _ => {
+                    return Err(BenchError::message(
+                        "freeze-table requires either positive max_rows or all = true",
+                    ));
+                }
+            };
             Ok((
                 ResolvedWorkload::FreezeTable(FreezeTableConfig {
-                    max_rows,
+                    selection,
                     include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
                 }),
-                FixturePlanEffect::Freeze { max_rows },
+                FixturePlanEffect::Freeze { selection },
             ))
         }
         WorkloadSpec::CheckpointTable(spec) => Ok((
@@ -1836,8 +1890,8 @@ mod tests {
     }
 
     fn resolve(raw: &str) -> Result<Vec<Phase>> {
-        let raw = parse(raw).unwrap();
-        validate_and_resolve_phases(raw.phases, raw.workload_defaults.resolve().unwrap())
+        let raw = parse(raw)?;
+        validate_and_resolve_phases(raw.phases, raw.workload_defaults.resolve()?)
     }
 
     #[test]
@@ -2110,7 +2164,6 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
             .is_ok()
         );
         for invalid in [
-            "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\" }\n",
             "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\", max_rows = 0 }\n",
             "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\", max_rows = 1, threads = 1 }\n",
             "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"checkpoint-table\", batch_size = 1 }\n",
@@ -2136,7 +2189,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert_eq!(freeze.expected_samples().unwrap(), 1);
         assert_eq!(
             phases[2].fixture_effect(),
-            &FixturePlanEffect::Freeze { max_rows: 4 }
+            &FixturePlanEffect::Freeze {
+                selection: FreezeSelection::Prefix { max_rows: 4 }
+            }
         );
         let checkpoint = phases[3].workload();
         assert_eq!(checkpoint.identity(), "checkpoint-table");
@@ -2332,9 +2387,115 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
     }
 
     #[test]
+    fn create_index_admission_and_full_freeze_are_strict() {
+        let fixture = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 100 }\n";
+        for index in ["unique", "non-unique"] {
+            for preparation in [
+                "",
+                "[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n",
+            ] {
+                let phases = resolve(&format!("[workload_defaults]\nthreads = 4\nsessions = 16\ninclude_stats = true\n{fixture}{preparation}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = '{index}' }}")).unwrap();
+                let workload = phases.last().unwrap().workload();
+                assert_eq!(workload.worker_counts(), (1, 1));
+                assert_eq!(workload.expected_samples().unwrap(), 1);
+                assert_eq!(workload.latency_unit(), LatencyUnit::IndexCreation);
+                assert_eq!(workload.replay_policy(), ReplayPolicy::SingleRun);
+                assert!(workload.include_stats());
+            }
+        }
+        let benchmark = "[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'unique', include_stats = false }\n";
+        assert!(
+            !resolve(&format!("{fixture}{benchmark}"))
+                .unwrap()
+                .last()
+                .unwrap()
+                .workload()
+                .include_stats()
+        );
+        for control in [
+            "",
+            ", index = 'none'",
+            ", num = 1",
+            ", threads = 1",
+            ", sessions = 1",
+            ", batch_size = 1",
+            ", value_size = '1 B'",
+            ", seed = 42",
+            ", all = true",
+        ] {
+            let index = if control.is_empty() || control.contains("index") {
+                ""
+            } else {
+                ", index = 'unique'"
+            };
+            assert!(resolve(&format!("{fixture}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index'{index}{control} }}")).is_err(), "{control}");
+        }
+        for controls in [
+            "",
+            ", all = false",
+            ", all = true, max_rows = 5",
+            ", all = false, max_rows = 5",
+            ", max_rows = 0",
+        ] {
+            assert!(resolve(&format!("{fixture}[[phase]]\nworkload = {{ type = 'freeze-table'{controls} }}\n{benchmark}")).is_err(), "{controls}");
+        }
+        for repetition in ["warmup_runs = 1", "measured_runs = 2"] {
+            assert!(
+                resolve(&format!(
+                    "{fixture}{}",
+                    benchmark.replace(
+                        "kind = 'benchmark'",
+                        &format!("kind = 'benchmark'\n{repetition}")
+                    )
+                ))
+                .is_err()
+            );
+        }
+        assert!(resolve(&format!("{fixture}[[phase]]\nworkload = {{ type = 'create-index', index = 'unique' }}\n{benchmark}")).is_err());
+        for invalid in [
+            String::new(),
+            "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n".to_owned(),
+            fixture.replace("index = 'none'", "index = 'unique'"),
+            fixture.replace("index = 'none'", "index = 'none', tables = 2"),
+            format!(
+                "{fixture}[[phase]]\nworkload = {{ type = 'managed-bindings-prepare', tables = 1 }}\n"
+            ),
+            format!(
+                "{fixture}[[phase]]\nworkload = {{ type = 'catalog-checkpoint-prepare', profile = 'small', case = 'managed-create' }}\n"
+            ),
+            format!("{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n"),
+            format!(
+                "{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', max_rows = 50 }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n"
+            ),
+            format!(
+                "{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 1 }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n"
+            ),
+        ] {
+            assert!(
+                resolve(&format!("{invalid}{benchmark}")).is_err(),
+                "{invalid}"
+            );
+        }
+        let no_hot = format!(
+            "{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{benchmark}"
+        );
+        assert!(resolve(&no_hot).is_err());
+        let restore = format!(
+            "{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', max_rows = 50 }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{benchmark}"
+        );
+        assert!(resolve(&restore).is_ok());
+    }
+
+    #[test]
     fn checked_in_templates_are_the_exact_complete_workload_inventory() {
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         let cases = [
+            ("create-index-hot-unique.toml", "create-index"),
+            ("create-index-hot-non-unique.toml", "create-index"),
+            ("create-index-checkpointed-unique.toml", "create-index"),
+            ("create-index-checkpointed-non-unique.toml", "create-index"),
+            ("create-index-mixed-unique.toml", "create-index"),
+            ("create-index-mixed-non-unique.toml", "create-index"),
             ("recovery-empty.toml", "recovery"),
             ("recovery.toml", "recovery"),
             ("recovery-indexed.toml", "recovery"),
@@ -2373,6 +2534,74 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
                 loaded.plan.engine.index_buffer.max_mem_size_bytes,
                 512 * 1024 * 1024
             );
+            if identity == "create-index" {
+                let mixed = file.contains("mixed");
+                let hot = file.contains("hot");
+                assert_eq!(
+                    loaded.plan.phases.len(),
+                    if hot {
+                        3
+                    } else if mixed {
+                        6
+                    } else {
+                        5
+                    }
+                );
+                let ResolvedWorkload::CreateTable(create) = loaded.plan.phases[0].workload() else {
+                    panic!("missing create")
+                };
+                assert_eq!(create.shape.index, IndexMode::None);
+                assert_eq!(create.table_count, 1);
+                let ResolvedWorkload::InsertSeq(insert) = loaded.plan.phases[1].workload() else {
+                    panic!("missing insert")
+                };
+                assert_eq!(insert.num, if mixed { 990_000 } else { 1_000_000 });
+                assert_eq!(
+                    (
+                        insert.threads,
+                        insert.sessions,
+                        insert.batch_size,
+                        insert.value_size_bytes
+                    ),
+                    (4, 16, 100, 128)
+                );
+                if !hot {
+                    let ResolvedWorkload::FreezeTable(freeze) = loaded.plan.phases[2].workload()
+                    else {
+                        panic!("missing freeze")
+                    };
+                    assert_eq!(freeze.selection, FreezeSelection::All);
+                    assert!(matches!(
+                        loaded.plan.phases[3].workload(),
+                        ResolvedWorkload::CheckpointTable(_)
+                    ));
+                }
+                if mixed {
+                    let ResolvedWorkload::InsertSeq(tail) = loaded.plan.phases[4].workload() else {
+                        panic!("missing tail")
+                    };
+                    assert_eq!(tail.num, 10_000);
+                }
+                let Phase::Benchmark {
+                    workload: ResolvedWorkload::CreateIndex(create),
+                    measurement,
+                    ..
+                } = loaded.plan.phases.last().unwrap()
+                else {
+                    panic!("missing CREATE")
+                };
+                assert_eq!(
+                    create.index,
+                    if file.contains("non-unique") {
+                        IndexMode::NonUnique
+                    } else {
+                        IndexMode::Unique
+                    }
+                );
+                assert!(create.include_stats);
+                assert_eq!(measurement.warmup_runs, 0);
+                assert_eq!(measurement.measured_runs.get(), 1);
+            }
             if file == "checkpoint-table.toml" {
                 assert_eq!(loaded.plan.phases.len(), 4);
                 let ResolvedWorkload::CreateTable(create) = loaded.plan.phases[0].workload() else {
@@ -2390,7 +2619,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
                 let ResolvedWorkload::FreezeTable(freeze) = loaded.plan.phases[2].workload() else {
                     panic!("checkpoint template must freeze the primary")
                 };
-                assert_eq!(freeze.max_rows, 500_000);
+                assert_eq!(
+                    freeze.selection,
+                    FreezeSelection::Prefix { max_rows: 500_000 }
+                );
                 let Phase::Benchmark { measurement, .. } = &loaded.plan.phases[3] else {
                     panic!("checkpoint template must end in a benchmark")
                 };

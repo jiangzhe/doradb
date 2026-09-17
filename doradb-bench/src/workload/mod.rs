@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod binding;
 mod catalog;
+mod create_index;
 mod ddl;
 mod insert;
 mod lock;
@@ -15,9 +16,11 @@ mod recovery;
 mod table_scan;
 mod update;
 mod util;
+mod verification;
 
 pub(crate) use binding::{ManagedBindingsPrepareExecutor, ResolveTableBindingExecutor};
 pub(crate) use catalog::{CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor};
+pub(crate) use create_index::{CreateIndexExecutor, complete_create_index};
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;

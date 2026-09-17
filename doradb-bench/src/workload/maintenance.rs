@@ -1,6 +1,6 @@
 use crate::error::{BenchError, Result};
 use crate::fixture::{
-    FixturePlanEffect, FixtureRuntimeEffect, FrozenFixtureSummary, PrimaryBinding,
+    FixturePlanEffect, FixtureRuntimeEffect, FreezeSelection, FrozenFixtureSummary, PrimaryBinding,
 };
 use crate::measurement::{
     LatencyDistribution, MeasurementClock, WorkloadCounters, WorkloadMetrics,
@@ -17,7 +17,7 @@ use doradb_storage::id::TableID;
 use doradb_storage::{CheckpointDelayReason, CheckpointOutcome, Engine, FreezeOutcome, Session};
 use smol::future::or;
 
-/// Single-table frozen-prefix executor.
+/// Single-table full or prefix freeze executor.
 #[derive(Clone, Copy)]
 pub(crate) struct FreezeTableExecutor {
     config: FreezeTableConfig,
@@ -32,11 +32,9 @@ impl SessionExecutor for FreezeTableExecutor {
 
     fn new(config: Self::Config) -> Result<Self> {
         let primary = require_primary(config.binding, Self::IDENTITY)?;
-        let max_rows = u64::try_from(config.resolved.max_rows)
-            .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
-        if max_rows == 0 || max_rows >= primary.inserted_rows || primary.frozen.is_some() {
+        if primary.inserted_rows == 0 || primary.frozen.is_some() {
             return Err(BenchError::message(
-                "freeze-table runtime binding is not a proper unfrozen prefix candidate",
+                "freeze-table requires loaded unfrozen data",
             ));
         }
         Ok(Self {
@@ -77,7 +75,7 @@ impl SessionExecutor for FreezeTableExecutor {
             expected_samples,
         )?;
         verify_simple_counters(Self::IDENTITY, outcome.measurement.counters, 1)?;
-        let FixturePlanEffect::Freeze { max_rows } = planned_effect else {
+        let FixturePlanEffect::Freeze { selection } = planned_effect else {
             return Err(BenchError::message(
                 "freeze-table received an incompatible fixture effect",
             ));
@@ -85,7 +83,7 @@ impl SessionExecutor for FreezeTableExecutor {
         let summary = outcome.summary.ok_or_else(|| {
             BenchError::message("freeze-table produced no verified frozen summary")
         })?;
-        if *max_rows != self.config.max_rows || summary.max_rows != self.config.max_rows {
+        if *selection != self.config.selection || summary.selection != self.config.selection {
             return Err(BenchError::message(
                 "freeze-table runtime effect differs from the resolved fixture effect",
             ));
@@ -133,14 +131,25 @@ impl SessionExecutor for CheckpointTableExecutor {
         sample_latency: bool,
         cancellation: &RunCancellation,
     ) -> Result<Self::Outcome> {
-        execute_checkpoint_session(
+        let outcome = execute_checkpoint_session(
             session,
             self.primary.table_id,
             clock,
             sample_latency,
             cancellation,
         )
-        .await
+        .await?;
+        // Prove logical placement after publication, outside the checkpoint sample.
+        // Retired physical pages may still await reclamation.
+        if self
+            .primary
+            .frozen
+            .is_some_and(|summary| summary.selection == FreezeSelection::All)
+            && session.total_row_pages(self.primary.table_id).await? != 0
+        {
+            return Err(BenchError::message("full checkpoint left hot row pages"));
+        }
+        Ok(outcome)
     }
 
     fn verify_outcome(
@@ -292,15 +301,16 @@ async fn execute_freeze_session(
     clock: &MeasurementClock,
     sample_latency: bool,
 ) -> Result<FreezeSessionOutcome> {
+    let observed_pages = session.total_row_pages(primary.table_id).await?;
     let started = clock.raw();
     let freeze_result = session
-        .freeze_table(primary.table_id, config.max_rows)
+        .freeze_table(primary.table_id, config.selection.max_rows())
         .await;
     let stopped = clock.raw();
     let elapsed_result = clock.raw_delta_nanos(started, stopped);
     let outcome = freeze_result?;
     let elapsed_nanos = elapsed_result?;
-    let summary = verify_frozen_outcome(primary, config.max_rows, outcome)?;
+    let summary = verify_frozen_outcome(primary, config.selection, observed_pages, outcome)?;
     let mut latency = LatencyDistribution::new()?;
     if sample_latency {
         latency.record(elapsed_nanos)?;
@@ -319,7 +329,8 @@ async fn execute_freeze_session(
 
 fn verify_frozen_outcome(
     primary: PrimaryBinding,
-    max_rows: usize,
+    selection: FreezeSelection,
+    observed_pages: usize,
     outcome: FreezeOutcome,
 ) -> Result<FrozenFixtureSummary> {
     let batch = match outcome {
@@ -343,14 +354,22 @@ fn verify_frozen_outcome(
         .map_err(|_| BenchError::message("frozen page count exceeds u64"))?;
     let stable_page_count = u64::try_from(batch.stable_page_count())
         .map_err(|_| BenchError::message("stable frozen page count exceeds u64"))?;
+    // Lifetime inserts include checkpointed rows. Use current hot pages to
+    // prove that a prefix leaves a suffix, even when exact placement is unknown.
     if batch.table_id() != primary.table_id
         || batch.is_empty()
         || approximate_rows == 0
-        || approximate_rows >= primary.inserted_rows
+        || (matches!(selection, FreezeSelection::Prefix { .. })
+            && (approximate_rows >= primary.inserted_rows || batch.page_count() >= observed_pages))
+        || (selection == FreezeSelection::All && batch.page_count() != observed_pages)
         || stable_page_count > page_count
     {
+        let selection_label = match selection {
+            FreezeSelection::All => "all observed hot pages",
+            FreezeSelection::Prefix { .. } => "a nonempty proper prefix",
+        };
         return Err(BenchError::message(format!(
-            "freeze-table did not install a nonempty proper prefix: expected_table={}, actual_table={}, inserted_rows={}, approximate_rows={}, page_count={}, stable_page_count={}",
+            "freeze-table did not install {selection_label}: expected_table={}, actual_table={}, inserted_rows={}, approximate_rows={}, page_count={}, observed_hot_pages={observed_pages}, stable_page_count={}",
             primary.table_id,
             batch.table_id(),
             primary.inserted_rows,
@@ -360,7 +379,7 @@ fn verify_frozen_outcome(
         )));
     }
     Ok(FrozenFixtureSummary {
-        max_rows,
+        selection,
         approximate_rows,
         page_count,
         stable_page_count,

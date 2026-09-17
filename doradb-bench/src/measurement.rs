@@ -1,5 +1,5 @@
 use crate::error::{BenchError, Result};
-use crate::fixture::{CatalogCardinalities, IndexMode, KeyRange};
+use crate::fixture::{CatalogCardinalities, IndexMode, KeyRange, PlacementKind, RowPlacement};
 use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
 use doradb_storage::{
     CatalogCheckpointReport, RecoveryPhaseTimings as StorageRecoveryPhaseTimings,
@@ -9,6 +9,7 @@ use doradb_storage::{
 use hdrhistogram::Histogram;
 use quanta::{Clock, Instant};
 use rustix::param::page_size;
+use rustix::time::{ClockId, Timespec, clock_gettime};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -94,6 +95,8 @@ impl Default for MeasurementClock {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LatencyUnit {
+    /// One complete public CREATE INDEX call through publication.
+    IndexCreation,
     /// One complete successful public engine bootstrap.
     EngineRecovery,
     /// Public transaction begin-through-successful-commit lifecycle.
@@ -141,6 +144,7 @@ pub enum LatencyUnit {
 impl fmt::Display for LatencyUnit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::IndexCreation => "index-creation",
             Self::EngineRecovery => "engine-recovery",
             Self::TransactionLifecycle => "transaction-lifecycle",
             Self::StatementExecution => "statement-execution",
@@ -172,6 +176,11 @@ impl fmt::Display for LatencyUnit {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum WorkloadMetrics {
+    /// One public CREATE call and its subsequent complete verification.
+    CreateIndex {
+        /// Exact placement, identity, process measurements, and verification.
+        report: CreateIndexReport,
+    },
     /// Complete startup attribution and verified recovered content.
     Recovery {
         /// Normalized immutable storage startup report.
@@ -480,7 +489,7 @@ pub struct SampledProcessRss {
     pub baseline_bytes: usize,
     /// Greatest one-millisecond or terminal synchronous RSS sample.
     pub peak_bytes: usize,
-    /// Saturating sampled peak above the pre-checkpoint baseline.
+    /// Saturating sampled peak above the pre-operation baseline.
     pub peak_above_baseline_bytes: usize,
 }
 
@@ -567,6 +576,71 @@ impl ProcessRssSampler {
             peak_above_baseline_bytes: peak_bytes.saturating_sub(self.baseline_bytes),
         })
     }
+}
+
+/// Complete CREATE measurements; verification is filled after the runner ends.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIndexReport {
+    /// Public primary-table identity.
+    pub table_id: u64,
+    /// Stable index identity returned by CREATE.
+    pub index_id: u32,
+    /// Installed secondary-index mode.
+    pub index: IndexMode,
+    /// Placement category derived from the exact counts.
+    pub placement: PlacementKind,
+    /// Successful committed fixture inserts.
+    pub total_rows: u64,
+    /// Exact hot and checkpointed row counts before CREATE.
+    pub rows: RowPlacement,
+    /// Exact public CREATE latency, in nanoseconds.
+    pub create_elapsed_nanos: u64,
+    /// Process CPU consumed across all threads, in nanoseconds.
+    pub process_cpu_nanos: u64,
+    /// Optional one-millisecond sampled process RSS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampled_process_rss: Option<SampledProcessRss>,
+    /// Full content verification performed after all measurement windows end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<CreateIndexVerification>,
+}
+
+impl CreateIndexReport {
+    /// Reject incomplete or inconsistent records before success publication.
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.rows.validate(self.total_rows)?;
+        let verification = self
+            .verification
+            .as_ref()
+            .ok_or_else(|| BenchError::message("CREATE verification is incomplete"))?;
+        if self.index == IndexMode::None
+            || self.total_rows == 0
+            || self.placement != self.rows.kind()
+            || verification.table_rows != self.total_rows
+            || verification.index_rows != self.total_rows
+            || verification.fingerprint.len() != 64
+            || !verification
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(BenchError::message("invalid CREATE result or verification"));
+        }
+        Ok(())
+    }
+}
+
+/// Observed complete table and index content agreement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIndexVerification {
+    /// Rows drained from the full MVCC table scan.
+    pub table_rows: u64,
+    /// Rows drained from the unbounded stable-ID index scan.
+    pub index_rows: u64,
+    /// Matching order-independent, multiplicity-preserving row fingerprint.
+    pub fingerprint: String,
 }
 
 /// Exact session-local latency samples and their HDR distribution.
@@ -886,6 +960,17 @@ pub fn operations_per_second(operations: u64, elapsed_nanos: u64) -> f64 {
     }
 }
 
+/// Read all process threads' accumulated CPU time using the safe Linux clock API.
+pub(crate) fn process_cpu_nanos() -> Result<u64> {
+    timespec_nanos(clock_gettime(ClockId::ProcessCPUTime))
+}
+
+/// Validate a nonnegative process CPU delta.
+pub(crate) fn process_cpu_delta(start: u64, end: u64) -> Result<u64> {
+    end.checked_sub(start)
+        .ok_or_else(|| BenchError::message("process CPU clock moved backwards"))
+}
+
 /// Convert a duration to exact nanoseconds, rejecting values outside the metric range.
 fn duration_nanos(duration: Duration) -> Result<u64> {
     u64::try_from(duration.as_nanos())
@@ -899,6 +984,19 @@ fn durations_nanos<const N: usize>(durations: [Duration; N]) -> Result<[u64; N]>
         *target = duration_nanos(duration)?;
     }
     Ok(nanos)
+}
+
+fn timespec_nanos(value: Timespec) -> Result<u64> {
+    let seconds = u64::try_from(value.tv_sec)
+        .map_err(|_| BenchError::message("negative process CPU seconds"))?;
+    let nanos = u64::try_from(value.tv_nsec)
+        .ok()
+        .filter(|nanos| *nanos < 1_000_000_000)
+        .ok_or_else(|| BenchError::message("invalid process CPU nanoseconds"))?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(nanos))
+        .ok_or_else(|| BenchError::message("process CPU duration exceeds u64 nanoseconds"))
 }
 
 fn check_recovery_sum(actual: u64, components: &[u64]) -> Result<()> {
@@ -1038,6 +1136,51 @@ mod tests {
         CatalogCheckpointOutcome, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn process_cpu_conversion_and_deltas_are_checked() {
+        assert_eq!(
+            timespec_nanos(Timespec {
+                tv_sec: 1,
+                tv_nsec: 2
+            })
+            .unwrap(),
+            1_000_000_002
+        );
+        assert_eq!(
+            timespec_nanos(Timespec {
+                tv_sec: 0,
+                tv_nsec: 0
+            })
+            .unwrap(),
+            0
+        );
+        for value in [
+            Timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
+            Timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            },
+            Timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            },
+            Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 0,
+            },
+        ] {
+            assert!(timespec_nanos(value).is_err());
+        }
+        assert_eq!(process_cpu_delta(10, 15).unwrap(), 5);
+        assert_eq!(process_cpu_delta(10, 10).unwrap(), 0);
+        assert!(process_cpu_delta(10, 9).is_err());
+        let first = process_cpu_nanos().unwrap();
+        assert!(process_cpu_delta(first, process_cpu_nanos().unwrap()).is_ok());
+    }
 
     #[test]
     fn raw_timestamp_order_is_checked() {
