@@ -49,6 +49,7 @@ pub struct InvocationReport {
 
 /// Atomically stage and install the canonical TOML artifact.
 pub fn write_plan_output(report: &InvocationReport) -> Result<PathBuf> {
+    validate_create_result(report)?;
     let toml_path = result_toml_path(&report.root);
     let absolute_path = absolute_result_path(&report.root)?;
     let toml_staged = staged_path(&toml_path);
@@ -70,6 +71,7 @@ pub(crate) fn render_stdout_summary(
     report: &InvocationReport,
     detailed_result: &Path,
 ) -> Result<String> {
+    validate_create_result(report)?;
     let workload = report
         .plan
         .phases
@@ -98,6 +100,30 @@ pub(crate) fn render_stdout_summary(
         aggregate.latency.p95_nanos,
         aggregate.latency.p99_nanos
     );
+    if let Some(WorkloadMetrics::CreateIndex { report: create }) = report
+        .measured_runs
+        .first()
+        .and_then(|run| run.workload_metrics.as_ref())
+    {
+        summary.push_str(&format!("\ntable_id: {}\nindex_id: {}\nindex: {}\nplacement: {}\ntotal_rows: {}\nhot_rows: {}\ncheckpointed_rows: {}\ncreate_elapsed_nanos: {}\nprocess_cpu_nanos: {}",
+            create.table_id, create.index_id, create.index, create.placement,
+            create.total_rows, create.rows.hot_rows, create.rows.checkpointed_rows,
+            create.create_elapsed_nanos, create.process_cpu_nanos));
+        if create.create_elapsed_nanos != 0 {
+            summary.push_str(&format!(
+                "\ncreate_rows_per_second: {:.3}\naverage_cpu_cores: {:.3}",
+                operations_per_second(create.total_rows, create.create_elapsed_nanos),
+                create.process_cpu_nanos as f64 / create.create_elapsed_nanos as f64
+            ));
+        }
+        if let Some(rss) = &create.sampled_process_rss {
+            summary.push_str(&format!("\nsampled_process_rss_baseline_bytes: {}\nsampled_process_rss_peak_bytes: {}\nsampled_process_rss_peak_above_baseline_bytes: {}",
+                rss.baseline_bytes, rss.peak_bytes, rss.peak_above_baseline_bytes));
+        }
+        summary.push_str(
+            "\nverification: complete\nOne CREATE sample; p95/p99 do not establish a distribution.",
+        );
+    }
     if workload.identity() == "checkpoint-table" {
         let metrics = report
             .measured_runs
@@ -377,6 +403,42 @@ pub(crate) fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
         })
 }
 
+fn validate_create_result(report: &InvocationReport) -> Result<()> {
+    if report
+        .plan
+        .phases
+        .last()
+        .is_none_or(|phase| phase.workload().identity() != "create-index")
+    {
+        return Ok(());
+    }
+    let [run] = report.measured_runs.as_slice() else {
+        return Err(BenchError::message(
+            "CREATE requires exactly one measured result",
+        ));
+    };
+    let Some(WorkloadMetrics::CreateIndex { report: create }) = &run.workload_metrics else {
+        return Err(BenchError::message("CREATE report has no measurements"));
+    };
+    create.validate()?;
+    let counters = WorkloadCounters {
+        operations: 1,
+        ..WorkloadCounters::default()
+    };
+    if run.counters != counters
+        || report.aggregate.counters != counters
+        || run.latency.sample_count != 1
+        || run.latency.sum_nanos != create.create_elapsed_nanos
+        || report.aggregate.latency.sample_count != 1
+        || report.aggregate.latency.sum_nanos != create.create_elapsed_nanos
+    {
+        return Err(BenchError::message(
+            "CREATE counters or exact latency sum mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn result_toml_path(storage_root: &Path) -> PathBuf {
     storage_root.join(RESULT_TOML_FILE_NAME)
 }
@@ -467,6 +529,99 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn create_output_requires_complete_verification_and_preserves_raw_units() {
+        use crate::fixture::{IndexMode, PlacementKind, RowPlacement};
+        use crate::measurement::{CreateIndexReport, CreateIndexVerification, SampledProcessRss};
+        use crate::plan::CreateIndexConfig;
+        let temp = TempDir::new().unwrap();
+        let mut report = report(temp.path());
+        let Phase::Benchmark { workload, .. } = &mut report.plan.phases[0] else {
+            panic!("benchmark")
+        };
+        *workload = ResolvedWorkload::CreateIndex(CreateIndexConfig {
+            index: IndexMode::Unique,
+            include_stats: true,
+        });
+        report.aggregate.latency.unit = LatencyUnit::IndexCreation;
+        let create = CreateIndexReport {
+            table_id: 42,
+            index_id: 7,
+            index: IndexMode::Unique,
+            placement: PlacementKind::Mixed,
+            total_rows: 100,
+            rows: RowPlacement {
+                hot_rows: 10,
+                checkpointed_rows: 90,
+            },
+            create_elapsed_nanos: 10,
+            process_cpu_nanos: 25,
+            sampled_process_rss: Some(SampledProcessRss {
+                baseline_bytes: 1000,
+                peak_bytes: 2000,
+                peak_above_baseline_bytes: 1000,
+            }),
+            verification: Some(CreateIndexVerification {
+                table_rows: 100,
+                index_rows: 100,
+                fingerprint: "a".repeat(64),
+            }),
+        };
+        report.measured_runs.push(MeasuredRunResult {
+            run_index: 1,
+            elapsed_nanos: 50,
+            counters: report.aggregate.counters,
+            operations_per_second: 20_000_000.0,
+            latency: report.aggregate.latency.clone(),
+            workload_metrics: Some(WorkloadMetrics::CreateIndex { report: create }),
+            internal_metrics: Vec::new(),
+        });
+        for failure in ["pending", "count", "placement", "counters", "latency"] {
+            let mut invalid = report.clone();
+            let Some(WorkloadMetrics::CreateIndex { report: create }) =
+                invalid.measured_runs[0].workload_metrics.as_mut()
+            else {
+                panic!("CREATE")
+            };
+            match failure {
+                "pending" => create.verification = None,
+                "count" => create.verification.as_mut().unwrap().index_rows -= 1,
+                "placement" => create.rows.hot_rows += 1,
+                "counters" => invalid.measured_runs[0].counters.operations = 2,
+                "latency" => invalid.measured_runs[0].latency.sum_nanos += 1,
+                _ => unreachable!(),
+            }
+            assert!(write_plan_output(&invalid).is_err(), "{failure}");
+            assert!(
+                render_stdout_summary(&invalid, &temp.path().join(RESULT_TOML_FILE_NAME)).is_err()
+            );
+            assert!(!result_toml_path(temp.path()).exists());
+        }
+        let path = write_plan_output(&report).unwrap();
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            toml::from_str::<InvocationReport>(&encoded).unwrap(),
+            report
+        );
+        assert!(encoded.contains("process_cpu_nanos = 25"));
+        assert!(encoded.contains("index_id = 7"));
+        assert!(encoded.contains("placement = \"mixed\""));
+        let summary = render_stdout_summary(&report, &path).unwrap();
+        assert!(summary.contains("create_rows_per_second: 10000000000.000"));
+        assert!(summary.contains("average_cpu_cores: 2.500"));
+        let Some(WorkloadMetrics::CreateIndex { report: create }) =
+            report.measured_runs[0].workload_metrics.as_mut()
+        else {
+            panic!("CREATE")
+        };
+        create.create_elapsed_nanos = 0;
+        report.measured_runs[0].latency.sum_nanos = 0;
+        report.aggregate.latency.sum_nanos = 0;
+        let summary = render_stdout_summary(&report, &path).unwrap();
+        assert!(!summary.contains("create_rows_per_second:"));
+        assert!(!summary.contains("average_cpu_cores:"));
     }
 
     #[test]

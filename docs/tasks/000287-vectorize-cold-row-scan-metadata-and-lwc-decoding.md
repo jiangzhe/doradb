@@ -205,8 +205,7 @@ reads, or backend submissions.
 Release measurements used 20 samples per shape against exact `origin/main`
 `b58f2192486a1677b9d88aef5c7ef579c281eb94`. Cold sequential improved 38.51%
 and cold target-nine improved 42.55%; hot sequential improved 0.19% and hot
-target-nine regressed 4.97%. `docs/benchmark-tool.md` retains the fixture,
-commands, statistics, cache equations, and CPU-profile attribution.
+target-nine regressed 4.97%.
 
 CPU-clock profiles removed the baseline 10.54% direct
 `ValidatedColumnBlockNode::leaf_prefix_plane` attribution from the candidate
@@ -231,7 +230,7 @@ coverage across seven changed runtime files was 91.25%, with every file above
 - Prepared LWC decoding amortizes offset, null-layout, and codec parsing while
   preserving per-row `Val` decoding.
 - `docs/block-index.md` documents identity, visibility precedence, and deferred
-  blob behavior; `docs/benchmark-tool.md` records reproducible release proof.
+  blob behavior; `docs/benchmark-tool.md` documents workload usage.
 - Public APIs, durable data, recovery, transaction semantics, and operational
   configuration are unchanged.
 

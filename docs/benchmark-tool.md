@@ -122,50 +122,41 @@ and eventually sending `SIGCONT`; an earlier `SIGCONT` can race ahead of
 stop external resources or guarantee that already-submitted kernel or device
 I/O makes no progress.
 
-### Samply checkpoint workflow
+### Profiling with Samply
 
-The release profile retains debug information. The checked-in
-`checkpoint-table.toml` prepares the million-row fixture but intentionally
-omits `pause`, so routine runs never stop. For a profiling run, make a working
-copy of that plan, keep its `engine_defaults` path valid, and add `pause = true`
-to its final benchmark phase.
-
-In terminal 1, build release mode and start the working plan against a fresh
-root:
+The release profile retains debug information. Copy a workload template, keep
+its `engine_defaults` path valid, and add `pause = true` to the final benchmark
+phase. Start it against a fresh root:
 
 ```bash
 rtk cargo build --release -p doradb-bench
 target/release/doradb-bench \
-  --root target/doradb-bench/checkpoint-profile \
-  --plan path/to/checkpoint-profile.toml
+  --root target/doradb-bench/profile-run \
+  --plan path/to/profile.toml
 ```
 
-After terminal 1 prints `DORADB_BENCH_PAUSING`, use terminal 2 to copy the PID,
-confirm the stopped state, and attach Samply. The optional flags retain the
-profile without opening the viewer:
+After the pausing notice appears, confirm the stopped state and attach from
+another terminal:
 
 ```bash
 pid=<pid>
 awk '/^State:/ { print $2 }' "/proc/$pid/status"  # must print T or t
-samply record -p "$pid"
-# Or: samply record --save-only --output checkpoint-profile.json.gz -p "$pid"
+samply record --save-only --output profile.json.gz -p "$pid"
 ```
 
-Once Samply is attached and waiting, resume the benchmark from terminal 3:
+Samply may resume the process during attachment. If it remains stopped after
+the profiler is ready, send `kill -CONT <pid>` from another terminal. Once the
+benchmark exits, inspect the capture with `samply load profile.json.gz`.
 
-```bash
-kill -CONT <pid>
-```
-
-Samply records the final checkpoint phase and exits when the benchmark
-process exits. Normal benchmark teardown remains part of the attached process
-profile.
+Profiles include verification and teardown. Focus on the workload's call stacks
+when attributing its cost; whole-profile percentages can be dominated by work
+outside the benchmark timer. Keep profiled runs separate from timing baselines.
 
 ## Fixture composition
 
 `create-table` creates a positive ordered homogeneous table pool. `tables`
 defaults to one; the first returned ID is the implicit primary for inserts,
-reads, and index DDL. Runtime IDs never appear in TOML.
+reads, and index DDL. Plans do not specify runtime table IDs.
 
 Insert phases allocate fresh contiguous candidate key ranges. The attempted
 range advances even if duplicate-key or write-conflict outcomes occur. Runtime
@@ -182,13 +173,17 @@ The candidate range may contain gaps after expected insert outcomes; lookup
 loaded index-free primary. Lock workloads bind the ordered pool and validate
 their minimum width.
 
-`freeze-table` requires exactly one index-free primary, a nonempty candidate
-range, at least one successfully inserted row, a latest write-bearing commit
-fence, and no installed frozen fixture. Its required `max_rows` must be below
-both the planned candidate count and the runtime successful-row count. A
-successful freeze installs a typed canonical-batch summary. `checkpoint-table`
-requires and consumes that summary, so duplicate freeze and
-checkpoint-before-freeze plans fail in the ordered fixture fold.
+`freeze-table` requires one loaded, index-free primary with no active frozen
+batch. Select either positive `max_rows` for a proper prefix or `all = true`
+for all hot pages; both options together and explicit `all = false` are
+rejected. Prefix `max_rows` must be below the loaded row count, and the selected
+row count is approximate because freezing operates on whole pages.
+
+Follow freezing with `checkpoint-table` to publish the batch. Inserts are
+forbidden while a full freeze is pending. After a full checkpoint there are no
+hot pages; insert a new tail afterward to build a mixed fixture. Exact placement
+counts successful inserts, not attempted keys. A prefix checkpoint leaves
+placement unknown; a later full checkpoint restores exact counts.
 
 `managed-bindings-prepare` owns a separate typed fixture category and executes
 once as an unmeasured prepare phase. It creates empty managed tables with the
@@ -236,8 +231,9 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `index-scan` | required `num`; optional `range`, `seed`, `batch_size` | committed secondary index | safe |
 | `index-stream` | optional `num`, `range`, `seed` | committed secondary index | safe |
 | `index-ddl` | optional `num` | index-free primary, load optional | single run |
+| `create-index` | required `index`: `unique` or `non-unique` | one loaded ordinary index-free primary, exact placement, no freeze | single run, benchmark only |
 | `lock-table` | required `num`; lock controls below | ordered table pool | safe |
-| `freeze-table` | required `max_rows` | one loaded, unfrozen, index-free primary | single run |
+| `freeze-table` | positive `max_rows` or `all = true` | one loaded, unfrozen, index-free primary | single run |
 | `checkpoint-table` | none | one frozen index-free primary | single run |
 | `recovery` | only `include_stats`; no worker fields | empty or one ordinary unfrozen primary | single run, benchmark only |
 
@@ -294,6 +290,49 @@ Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
 A create or drop failure is invocation-fatal.
 
+### CREATE INDEX
+
+`create-index` builds and retains one index over a loaded, index-free table.
+It accepts required `index = "unique"` or `"non-unique"` and optional
+`include_stats`. It runs only as the final benchmark, with zero warm-ups, one
+measured run, and one thread/session. Worker defaults apply to preparation.
+
+```toml
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "create-index", index = "unique", include_stats = true }
+```
+
+Start from a `create-index-{hot,checkpointed,mixed}-{unique,non-unique}.toml`
+template. Each loads one million sequential keys with 128-byte values:
+
+| Template placement | Preparation | Hot rows | Checkpointed rows |
+| --- | --- | ---: | ---: |
+| `hot` | Insert all rows | 1,000,000 | 0 |
+| `checkpointed` | Insert all rows; freeze all; checkpoint | 0 | 1,000,000 |
+| `mixed` | Insert 990,000; freeze all; checkpoint; insert 10,000 | 10,000 | 990,000 |
+
+Custom fixtures require exactly one ordinary table with committed rows and
+known placement. Active freezes, managed bindings, and pending catalog
+checkpoints are rejected. A prefix checkpoint leaves exact placement unknown;
+use `all = true` to prepare a checkpointed CREATE fixture. Random inserts into
+an index-free table may produce duplicate keys and make unique CREATE fail.
+
+`create_elapsed_nanos` times the complete public CREATE call; preparation,
+profiler attachment, and full table/index verification are outside it.
+`process_cpu_nanos` measures all process threads. The summary derives rows per
+second and average CPU cores from these durations, omitting rates for zero
+duration. Generic `elapsed_nanos` includes worker/session overhead.
+
+`include_stats = true` adds engine statistics and process RSS sampled every
+1 ms, reporting baseline, peak, and peak above baseline. Engine statistics and
+RSS exclude content verification; CPU measurement remains enabled when
+statistics are disabled. Results also retain stable table/index IDs, exact row
+placement, and verification counts. Checkpointed placement does not imply cold
+OS/device caches, and sampled RSS does not measure temporary allocations alone.
+
 ### Maintenance controls and terminal policy
 
 Maintenance workloads accept only their listed controls plus optional
@@ -304,9 +343,10 @@ both reject any warm-up and more than one measured run.
 
 `freeze-table` calls the public `Session::freeze_table` once. It accepts only a
 new `Frozen` outcome for the bound table and verifies that the canonical batch
-has nonzero pages and approximate rows while leaving a nonempty hot suffix.
-`AlreadyFrozen`, cancellation, a mismatched table, an empty batch, or a batch
-covering all successfully inserted rows is invocation-fatal.
+has nonzero pages and approximate rows. Prefix selection must leave a nonempty
+hot suffix; full selection must contain every hot page counted before freezing.
+`AlreadyFrozen`, cancellation, a mismatched table, an empty batch, or a selection
+mismatch is invocation-fatal.
 
 `checkpoint-table` starts its total sample immediately before the first public
 `Session::checkpoint_table` attempt. Every `Delayed` outcome is handed without
@@ -396,6 +436,7 @@ uncontrolled caches; one sample does not establish a latency distribution.
 | `index-scan` | `index-scan-batch-transaction` | sum of per-session batch ceilings |
 | `index-stream` | `index-stream-transaction` | `num` |
 | `index-ddl` | `index-create-drop-cycle` | `num` |
+| `create-index` | `index-creation` | 1 |
 | retained session lock | `table-lock-session-retained-lifecycle` | nonempty sessions |
 | retained transaction lock | `table-lock-transaction-retained-lifecycle` | nonempty sessions |
 | paired/specialized lock | `table-lock-operation-lifecycle` | `num` |
@@ -429,19 +470,25 @@ Counter equations are verified before phase state advances:
   classification counters are zero. Every multiplication and aggregation is
   checked.
 - Index scan: `operations = found + not_found`; returned rows are actual.
-- DDL: `operations = 2 * num`.
+- Transient table/index DDL: `operations = 2 * num`.
 - Locks: `operations = num`; unrelated counters are zero.
-- Freeze, checkpoint, and recovery: `operations = 1`; unrelated counters are zero.
+- CREATE INDEX, freeze, checkpoint, and recovery: `operations = 1`; unrelated
+  counters are zero.
 
-Each session owns an HDR histogram; recovery owns its histogram in the coordinator.
-Results merge exact distributions rather
-than averaging percentiles. Aggregate throughput is total operations divided
-by total wall duration. Optional internal metrics are typed as counter deltas,
-end gauges, or lifetime peaks with explicit count/byte/nanosecond/frame units.
-Recovery uses cumulative counters from its fresh engine as described above.
-For `update-rand`, throughput therefore means actual updated rows per wall
-second, while every successfully committed range transaction contributes one
-latency sample even when its range matches no row.
+Each session owns an HDR histogram; recovery owns its histogram in the
+coordinator. Results merge distributions rather than averaging percentiles.
+Aggregate throughput is total operations divided by total wall duration. For
+`update-rand`, this means actual updated rows per second, while every committed
+range transaction contributes a sample even when it matches no rows. A single
+p95/p99 sample does not establish a latency distribution.
+
+Optional engine statistics use explicit count/byte/nanosecond/frame units and
+are typed as counter deltas, end gauges, or lifetime peaks. Recovery uses
+cumulative counters from its fresh engine. Lifetime peaks may come from
+preparation. Buffer frame counts are not resident bytes, and storage request
+counts are not physical bandwidth. Statistics include background activity and
+overlapping intervals, so their durations cannot be added as fractions of
+workload time. Keep engine settings and diagnostics consistent across comparisons.
 
 Freeze results also retain canonical `approximate_rows`, `page_count`, and
 `stable_page_count` fields. Checkpoint results retain checked `attempt_count`,
@@ -453,149 +500,14 @@ orchestration may account for the remaining total interval. Prepare metrics
 are retained on their phase result, measured metrics on their run result, and
 warm-up metrics are discarded.
 
-## Parallel scan release proof
-
-Task 000285 was measured on 2026-08-27 from revision
-`cc5b9b62019c6853729f8fdcd7443320bbcd5c42` plus the task's working-tree
-changes. The build used the Cargo `release` profile and the default `io_uring`
-backend. The host was Linux
-`7.0.14-orbstack-00380-ga7e0a2dc9535` on AArch64 with 10 online Apple virtual
-CPU cores at 2.0 GHz, 9 CPUs available to the process, 11 GiB RAM, and a
-`/dev/vdb1` Btrfs filesystem mounted with `ssd`, `nodatacow`, and `noatime`.
-
-Every configuration used a fresh root and an equivalent plan copy. The fixture
-had 1,000,000 sequential rows with a 128-byte payload, inserted with four
-workers, four sessions, and batches of 100. The engine used the normalized
-default scan packing of 16 LWC blocks and 32 row pages per initial partition;
-redo log sync was disabled consistently for fixture construction. Each
-benchmark operation scanned projection `[0, 1]` once. Each configuration ran
-one warm-up and five measured runs with internal statistics enabled. The
-sequential comparison used one worker, one session, and batch size one.
-Parallel targets covered 1, 2, 4, 8, and the effective worker capacity of 9.
-
-The hot fixture was not frozen. The mixed fixture checkpointed a freeze request
-of 500,000 rows; its public freeze metrics reported 500,416 persisted-tier rows
-across 1,117 frozen pages and a 499,584-row hot suffix across 1,116 row pages.
-The cold-dominant fixture checkpointed a 900,000-row request: freeze metrics
-reported 900,032 persisted-tier rows across 2,009 frozen pages and a
-99,968-row hot suffix across 224 row pages. For these full, undeleted pages,
-checkpoint produced one 64 KiB LWC block per frozen page. “Cold-dominant”
-describes physical placement only. These runs did not restart or evict the
-cache, and therefore make no cold-cache or pure-cold claim.
-
-The resulting physical-unit count was materially larger than the original
-smoke-sized fixture and exceeded the host's 64 MiB LLC. The hot sequential
-fresh root had 2,234 row pages; the five hot parallel roots each had 2,233.
-Every mixed root had 1,117 LWC blocks plus 1,116 hot row pages, while every
-cold-dominant root had 2,009 LWC blocks plus 224 hot row pages. Thus every
-parallel run scanned exactly 2,233 physical units (139.56 MiB at 64 KiB per
-unit); the sequential hot run scanned 2,234 units (139.62 MiB). The persisted
-column index occupied one additional page for mixed and three for
-cold-dominant, but those index pages are planning/metadata reads rather than
-partition scan units.
-
-The table reports the median complete-run envelope and derived median row
-throughput. Scaling is relative to the same shape's parallel target-one median.
-
-| Shape | Workload / target | Actual partitions | Scan units | Rows | Median elapsed (ns) | Median rows/s | Scaling |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| hot | sequential | - | 2,234 | 1,000,000 | 73,934,261 | 13,525,529 | - |
-| hot | 1 | 1 | 2,233 | 1,000,000 | 74,756,460 | 13,376,770 | 1.00x |
-| hot | 2 | 3 | 2,233 | 1,000,000 | 38,271,993 | 26,128,767 | 1.95x |
-| hot | 4 | 5 | 2,233 | 1,000,000 | 23,510,406 | 42,534,357 | 3.18x |
-| hot | 8 | 9 | 2,233 | 1,000,000 | 20,745,034 | 48,204,308 | 3.60x |
-| hot | 9 | 10 | 2,233 | 1,000,000 | 20,683,215 | 48,348,383 | 3.61x |
-| mixed | sequential | - | 2,233 | 1,000,000 | 176,644,288 | 5,661,094 | - |
-| mixed | 1 | 1 | 2,233 | 1,000,000 | 177,120,749 | 5,645,866 | 1.00x |
-| mixed | 2 | 3 | 2,233 | 1,000,000 | 105,668,344 | 9,463,572 | 1.68x |
-| mixed | 4 | 5 | 2,233 | 1,000,000 | 55,450,235 | 18,034,189 | 3.19x |
-| mixed | 8 | 9 | 2,233 | 1,000,000 | 41,674,485 | 23,995,497 | 4.25x |
-| mixed | 9 | 10 | 2,233 | 1,000,000 | 41,626,943 | 24,022,903 | 4.26x |
-| cold-dominant | sequential | - | 2,233 | 1,000,000 | 263,145,795 | 3,800,175 | - |
-| cold-dominant | 1 | 1 | 2,233 | 1,000,000 | 263,723,341 | 3,791,852 | 1.00x |
-| cold-dominant | 2 | 3 | 2,233 | 1,000,000 | 143,720,412 | 6,957,954 | 1.83x |
-| cold-dominant | 4 | 5 | 2,233 | 1,000,000 | 75,035,914 | 13,326,952 | 3.51x |
-| cold-dominant | 8 | 9 | 2,233 | 1,000,000 | 59,400,082 | 16,834,994 | 4.44x |
-| cold-dominant | 9 | 10 | 2,233 | 1,000,000 | 57,082,987 | 17,518,354 | 4.62x |
-
-Parallel target one retained 98.9% of sequential median throughput for hot,
-99.7% for mixed, and 99.8% for cold-dominant, so all shapes passed the 90%
-manual gate. The first target-nine measured run also confirmed the intended
-physical tiers through buffer metrics: hot recorded 2,233 memory-cache hits;
-mixed recorded 1,116 memory-cache and 2,235 disk-cache hits; cold-dominant
-recorded 224 memory-cache and 4,021 disk-cache hits. Mixed retained 1,118 disk
-frames (1,117 LWC plus one index page), and cold-dominant retained 2,012 (2,009
-LWC plus three index pages). All three recorded zero disk-cache
-misses, completed reads, and backend submissions after warm-up, consistent with
-the explicitly warm-cache proof. Target nine produced the best median for all
-three shapes; no minimum scaling threshold applies.
-Source inspection after the proof confirmed that
-`TableScanPartitionStream::next` checks peer failure only before and after a
-physical-unit load and after exhaustion. The returned-row branch still returns
-directly without a peer-failure load.
-
-## Cold scan vectorization release proof
-
-Task 000287 was measured on 2026-08-28 against exact `origin/main` revision
-`b58f2192486a1677b9d88aef5c7ef579c281eb94`; the candidate was the Task 000287
-working tree based on that same revision. Baseline and candidate were separate
-release builds and used separate fresh roots on the same host described above.
-The four plans retained the one-million-row, 128-byte fixture, projection
-`[0, 1]`, four fixture workers/sessions, batch size 100, disabled redo sync,
-one unmeasured warm-up, internal statistics, and 20 measured runs. Sequential
-plans used one scan worker/session. Parallel plans requested the host's target
-capacity of nine and produced ten physical partitions. Cold-dominant plans
-froze and checkpointed 900,000 requested rows, producing 2,009 LWC blocks,
-224 hot pages, and three column-index pages.
-
-Both source trees ran:
-
-```bash
-rtk cargo build --release -p doradb-bench
-target/release/doradb-bench --root <fresh-root> --plan <shape-plan>.toml
-```
-
-The shape plans differed only by the presence of the 900,000-row freeze and
-checkpoint and by final `table-scan` versus `parallel-table-scan` target nine.
-The table reports complete-run medians plus IQR and median absolute deviation;
-positive hot change is regression and positive cold change is improvement.
-
-| Shape | Baseline median (ms) | Candidate median (ms) | Candidate IQR (ms) | Candidate MAD (ms) | Change |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| hot sequential | 75.367 | 75.224 | 2.770 | 0.549 | 0.19% faster |
-| hot target-nine | 19.419 | 20.383 | 4.881 | 2.249 | 4.97% slower |
-| cold-dominant sequential | 131.084 | 80.601 | 0.443 | 0.221 | 38.51% faster |
-| cold-dominant target-nine | 37.258 | 21.404 | 2.883 | 1.309 | 42.55% faster |
-
-Every measured cold candidate run returned exactly 1,000,000 rows and recorded
-2,012 readonly-cache hits: three planning index pages plus 2,009 LWC pages.
-Every run also recorded zero readonly misses, completed reads, and backend
-submissions. The corresponding baseline cold sequential runs recorded 4,021
-hits, confirming that the 2,009 execution-time leaf reopens were removed rather
-than hidden by changed I/O.
-
-CPU-clock attribution used a profiler-paused cold sequential plan and:
-
-```bash
-perf record -F 999 -g -p <paused-pid> -o <profile.data> -- sleep 4
-perf report --stdio --no-children --call-graph none -i <profile.data>
-```
-
-The baseline captured 3,576 samples and attributed 10.54% directly to
-`ValidatedColumnBlockNode::leaf_prefix_plane`; the candidate captured 2,122
-samples and had no leaf-prefix or execution leaf-entry symbol above the 0.1%
-report threshold. Baseline per-row LWC parser helpers such as
-`for_bitpacking_lwc_payload` remained visible, while candidate samples moved to
-`PreparedLwcBlock::decode_value` and `PreparedLwcData::value`, confirming that
-codec preparation was amortized and ordinary value decoding remained. Raw
-latency samples are retained in Task 000287's implementation notes.
-
 ## Results and failure behavior
 
 After atomically installing the result, a successful invocation prints the
 final benchmark workload, measured-run count, aggregate operations and elapsed
 nanoseconds, throughput, latency unit, mean, p95, p99, and the absolute detailed
 result path to stdout.
+For `create-index`, it also prints placement, CREATE/CPU duration, row throughput,
+average CPU cores, optional RSS, and verification status.
 For a final `checkpoint-table`, the summary additionally prints the four
 checkpoint attempt/wait fields from its single measured run.
 For a final `parallel-table-scan`, it additionally prints target and actual
@@ -628,7 +540,7 @@ the coordinator returns the first partition, orchestration, or close failure.
 ## Templates
 
 `doradb-bench/templates/` contains complete directly executable plans, including
-four fixture shapes for the single recovery workload:
+four recovery fixtures and six CREATE INDEX placement/mode combinations:
 
 ```text
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
@@ -640,13 +552,13 @@ checkpoint-table.toml                     catalog-checkpoint.toml
 resolve-table-binding.toml
 recovery-empty.toml  recovery.toml        recovery-indexed.toml
 recovery-checkpoint.toml
+create-index-hot-unique.toml              create-index-hot-non-unique.toml
+create-index-checkpointed-unique.toml     create-index-checkpointed-non-unique.toml
+create-index-mixed-unique.toml            create-index-mixed-non-unique.toml
 ```
 
 Every plan includes the colocated `engine-defaults.toml`, contains all required
-fixture preparation, and ends with its benchmark workload. All recovery templates
-use `recovery`: empty, one-million-row index-free, one-million-row unique-indexed,
-and one-million-row index-free with a 500,000-row requested freeze followed by a
-completed checkpoint. Nonempty recovery fixtures use 128-byte values, batch size
-100, and four preparation threads with sixteen sessions. Page-granular checkpoint
-results remain in the prepare metrics. All four use one measured reopen, zero warm-ups, and
-`include_stats = true`.
+fixture preparation, and ends with its benchmark workload. Recovery templates
+cover empty, loaded index-free, unique-indexed, and prefix-checkpointed fixtures;
+each uses one measured reopen, zero warm-ups, and diagnostics enabled. CREATE
+INDEX templates cover the placements listed above for both index modes.

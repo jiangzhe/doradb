@@ -14,12 +14,12 @@ use crate::plan_output::{
 };
 use crate::workload::{
     CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor, CheckpointTableExecutor,
-    CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor, IndexScanExecutor,
-    IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor, LockTableExecutor,
-    LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
+    CreateIndexExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
+    IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
+    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
     ParallelTableScanExecutor, ParallelTableScanExecutorConfig, ResolveTableBindingExecutor,
     RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor, TableScanExecutor,
-    TrxNoopExecutor, UpdateRandExecutor, run_recovery,
+    TrxNoopExecutor, UpdateRandExecutor, complete_create_index, run_recovery,
 };
 use doradb_storage::{Engine, EngineConfig, Session};
 use easy_parallel::Parallel;
@@ -436,6 +436,26 @@ async fn dispatch_workload(
         ResolvedWorkload::Recovery(_) => Err(BenchError::message(
             "recovery must execute at the coordinator lifecycle boundary",
         )),
+        ResolvedWorkload::CreateIndex(config) => {
+            let mut outcome = run_executor::<CreateIndexExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await?;
+            // The generic envelope, all sessions, and final engine snapshots have ended.
+            let Some(WorkloadMetrics::CreateIndex { report }) = outcome.workload_metrics.as_mut()
+            else {
+                return Err(BenchError::message(
+                    "CREATE coordinator received no measurements",
+                ));
+            };
+            outcome.effect = complete_create_index(engine, report).await?;
+            Ok(outcome)
+        }
         ResolvedWorkload::CreateTable(config) => {
             run_executor::<CreateTableExecutor>(
                 engine,
@@ -789,7 +809,15 @@ where
             return Err(error);
         }
     };
-    let elapsed_nanos = elapsed_result?;
+    let elapsed_nanos = match elapsed_result {
+        Ok(elapsed) => elapsed,
+        Err(error) => {
+            if let Some((session, _)) = stats_state {
+                return close_stats_session(session, Err(error)).await;
+            }
+            return Err(error);
+        }
+    };
 
     let internal_metrics = if let Some((mut session, before)) = stats_state {
         let metrics_result =

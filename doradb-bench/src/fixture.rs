@@ -1,5 +1,6 @@
 use crate::error::{BenchError, Result};
 use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
+use doradb_storage::IndexID;
 use doradb_storage::id::{TableID, TrxID};
 use doradb_storage::{
     BindingNamespaceID, ManagedTableDefinitionSnapshot, StorageColumnFlags, StorageColumnSpec,
@@ -85,9 +86,104 @@ pub enum LoadRequirement {
     Committed,
 }
 
+/// Requested frozen-page selection.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum FreezeSelection {
+    /// Freeze every currently hot page.
+    All,
+    /// Freeze a nonempty proper prefix within the row budget.
+    Prefix {
+        /// Positive requested row budget.
+        max_rows: usize,
+    },
+}
+
+impl FreezeSelection {
+    /// Return the public storage row budget.
+    pub(crate) fn max_rows(self) -> usize {
+        match self {
+            Self::All => usize::MAX,
+            Self::Prefix { max_rows } => max_rows,
+        }
+    }
+
+    fn validate(self, rows: u64) -> Result<()> {
+        if let Self::Prefix { max_rows } = self {
+            let max_rows = u64::try_from(max_rows)
+                .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
+            if max_rows == 0 || max_rows >= rows {
+                return Err(BenchError::message(format!(
+                    "freeze-table max_rows ({max_rows}) must be below loaded rows ({rows})"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exact committed-row placement, independent of candidate-key ranges.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowPlacement {
+    /// Successful inserts still in hot row pages.
+    pub hot_rows: u64,
+    /// Successful inserts published in checkpointed storage.
+    pub checkpointed_rows: u64,
+}
+
+impl RowPlacement {
+    /// Check that placement accounts for every successful insert exactly once.
+    pub(crate) fn validate(self, inserted_rows: u64) -> Result<()> {
+        if self.hot_rows.checked_add(self.checkpointed_rows) != Some(inserted_rows) {
+            return Err(BenchError::message(
+                "fixture placement does not equal successful inserts",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Derive the placement category from exact row counts.
+    pub fn kind(self) -> PlacementKind {
+        if self.checkpointed_rows == 0 {
+            PlacementKind::Hot
+        } else if self.hot_rows == 0 {
+            PlacementKind::Checkpointed
+        } else {
+            PlacementKind::Mixed
+        }
+    }
+}
+
+/// Storage placement derived from exact successful-row accounting.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlacementKind {
+    /// Every row is hot.
+    Hot,
+    /// Every row is checkpointed.
+    Checkpointed,
+    /// Both hot and checkpointed rows are present.
+    Mixed,
+}
+
+impl fmt::Display for PlacementKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Hot => "hot",
+            Self::Checkpointed => "checkpointed",
+            Self::Mixed => "mixed",
+        })
+    }
+}
+
 /// Closed fixture capability requested by a resolved workload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FixtureRequirement {
+    /// One loaded ordinary index-free table with exact placement and no freeze.
+    CreateIndex,
+    /// A primary table that may accept new hot inserts.
+    Insert,
     /// Empty root or one ordinary table with no active frozen batch.
     Recoverable,
     /// No fixture state is consumed.
@@ -110,12 +206,12 @@ pub enum FixtureRequirement {
         /// Checked minimum table count.
         minimum: usize,
     },
-    /// Consume one loaded index-free primary that can install a frozen prefix.
+    /// Consume one loaded index-free primary that can install a frozen batch.
     FreezeCandidate {
-        /// Requested frozen-prefix row budget.
-        max_rows: usize,
+        /// Requested full or prefix selection.
+        selection: FreezeSelection,
     },
-    /// Consume one index-free primary with an installed frozen-prefix summary.
+    /// Consume one index-free primary with an installed frozen-batch summary.
     FrozenPrimary,
     /// No catalog-checkpoint fixture may already be pending.
     AbsentCatalogCheckpoint,
@@ -132,6 +228,11 @@ pub enum FixtureRequirement {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum FixturePlanEffect {
+    /// Install a verified secondary index on the primary table.
+    CreateIndex {
+        /// Successfully built index shape.
+        index: IndexMode,
+    },
     /// The workload does not modify the implicit fixture.
     None,
     /// Establish the invocation's ordered homogeneous table pool.
@@ -146,12 +247,12 @@ pub enum FixturePlanEffect {
         /// Exact nonempty range allocated to this insert phase.
         attempted_range: KeyRange,
     },
-    /// Install the planned active frozen-prefix budget.
+    /// Install the planned full or prefix freeze selection.
     Freeze {
-        /// Requested frozen-prefix row budget.
-        max_rows: usize,
+        /// Requested full or prefix selection.
+        selection: FreezeSelection,
     },
-    /// Consume the planned active frozen-prefix state.
+    /// Consume the planned active frozen selection.
     Checkpoint,
     /// Establish the deterministic managed-binding fixture.
     PrepareManagedBindings {
@@ -180,7 +281,9 @@ struct PrimaryPlanFixture {
     table_count: usize,
     next_key: u64,
     attempted_range: Option<KeyRange>,
-    frozen_max_rows: Option<usize>,
+    frozen: Option<FreezeSelection>,
+    exact_placement: bool,
+    hot_rows_possible: bool,
 }
 
 /// Ordered plan-time state for the implicit benchmark fixture.
@@ -195,10 +298,37 @@ impl FixturePlanState {
     /// Validate one typed requirement against the logical fixture.
     pub(crate) fn validate(&self, requirement: FixtureRequirement) -> Result<()> {
         match requirement {
+            FixtureRequirement::CreateIndex => {
+                self.validate(FixtureRequirement::Recoverable)?;
+                self.validate(FixtureRequirement::Primary {
+                    index: IndexRequirement::Exact(IndexMode::None),
+                    load: LoadRequirement::Committed,
+                })?;
+                if !self.primary.is_some_and(|primary| primary.exact_placement) {
+                    return Err(BenchError::message(
+                        "create-index requires exact fixture placement",
+                    ));
+                }
+                Ok(())
+            }
+            FixtureRequirement::Insert => {
+                self.validate(FixtureRequirement::Primary {
+                    index: IndexRequirement::Any,
+                    load: LoadRequirement::Optional,
+                })?;
+                if self
+                    .primary
+                    .is_some_and(|primary| primary.frozen == Some(FreezeSelection::All))
+                {
+                    return Err(BenchError::message(
+                        "inserts are forbidden during a full freeze; checkpoint first",
+                    ));
+                }
+                Ok(())
+            }
             FixtureRequirement::Recoverable => validate_recoverable_fixture(
                 self.primary.map_or(0, |primary| primary.table_count),
-                self.primary
-                    .is_some_and(|primary| primary.frozen_max_rows.is_some()),
+                self.primary.is_some_and(|primary| primary.frozen.is_some()),
                 self.managed_bindings.is_some(),
                 self.catalog_checkpoint.is_some(),
             ),
@@ -238,7 +368,7 @@ impl FixturePlanState {
                 }
                 Ok(())
             }
-            FixtureRequirement::FreezeCandidate { max_rows } => {
+            FixtureRequirement::FreezeCandidate { selection } => {
                 let primary = self.primary.as_ref().ok_or_else(|| {
                     BenchError::message("freeze-table requires a preceding create-table phase")
                 })?;
@@ -252,14 +382,13 @@ impl FixturePlanState {
                         )
                     })?
                     .len;
-                let max_rows = u64::try_from(max_rows)
-                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
-                if max_rows == 0 || max_rows >= candidate_rows {
-                    return Err(BenchError::message(format!(
-                        "freeze-table max_rows ({max_rows}) must be below candidate rows ({candidate_rows})"
-                    )));
+                if !primary.hot_rows_possible {
+                    return Err(BenchError::message(
+                        "freeze-table requires hot rows after the last full checkpoint",
+                    ));
                 }
-                if primary.frozen_max_rows.is_some() {
+                selection.validate(candidate_rows)?;
+                if primary.frozen.is_some() {
                     return Err(BenchError::message(
                         "freeze-table requires no active frozen fixture",
                     ));
@@ -275,7 +404,7 @@ impl FixturePlanState {
                     primary.table_count,
                     "checkpoint-table",
                 )?;
-                if primary.frozen_max_rows.is_none() {
+                if primary.frozen.is_none() {
                     return Err(BenchError::message(
                         "checkpoint-table requires a preceding successful freeze-table phase",
                     ));
@@ -321,10 +450,7 @@ impl FixturePlanState {
 
     /// Allocate one insert range from the current primary cursor.
     pub(crate) fn allocate_insert(&self, num: u64) -> Result<(PrimaryTableShape, KeyRange)> {
-        self.validate(FixtureRequirement::Primary {
-            index: IndexRequirement::Any,
-            load: LoadRequirement::Optional,
-        })?;
+        self.validate(FixtureRequirement::Insert)?;
         let primary = self.primary.as_ref().ok_or_else(|| {
             BenchError::message("insert workload requires a preceding create-table phase")
         })?;
@@ -356,6 +482,16 @@ impl FixturePlanState {
     /// Apply one already-validated transition before resolving the next phase.
     pub(crate) fn apply(&mut self, effect: &FixturePlanEffect) -> Result<()> {
         match *effect {
+            FixturePlanEffect::CreateIndex { index } => {
+                self.validate(FixtureRequirement::CreateIndex)?;
+                validate_index(index, IndexRequirement::Secondary)?;
+                let primary = self
+                    .primary
+                    .as_mut()
+                    .ok_or_else(|| BenchError::message("missing CREATE primary"))?;
+                primary.shape.index = index;
+                Ok(())
+            }
             FixturePlanEffect::None => Ok(()),
             FixturePlanEffect::CreateTables { shape, table_count } => {
                 self.validate(FixtureRequirement::AbsentPrimary)?;
@@ -367,11 +503,14 @@ impl FixturePlanState {
                     table_count,
                     next_key: 0,
                     attempted_range: None,
-                    frozen_max_rows: None,
+                    frozen: None,
+                    exact_placement: true,
+                    hot_rows_possible: false,
                 });
                 Ok(())
             }
             FixturePlanEffect::Insert { attempted_range } => {
+                self.validate(FixtureRequirement::Insert)?;
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("insert fixture effect requires a primary table")
                 })?;
@@ -387,14 +526,15 @@ impl FixturePlanState {
                     "plan attempted range",
                 )?);
                 primary.next_key = end;
+                primary.hot_rows_possible = true;
                 Ok(())
             }
-            FixturePlanEffect::Freeze { max_rows } => {
-                self.validate(FixtureRequirement::FreezeCandidate { max_rows })?;
+            FixturePlanEffect::Freeze { selection } => {
+                self.validate(FixtureRequirement::FreezeCandidate { selection })?;
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("freeze fixture effect requires a primary table")
                 })?;
-                primary.frozen_max_rows = Some(max_rows);
+                primary.frozen = Some(selection);
                 Ok(())
             }
             FixturePlanEffect::Checkpoint => {
@@ -402,7 +542,9 @@ impl FixturePlanState {
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("checkpoint fixture effect requires a primary table")
                 })?;
-                primary.frozen_max_rows = None;
+                primary.exact_placement = primary.frozen == Some(FreezeSelection::All);
+                primary.hot_rows_possible = !primary.exact_placement;
+                primary.frozen = None;
                 Ok(())
             }
             FixturePlanEffect::PrepareManagedBindings { tables } => {
@@ -467,8 +609,8 @@ pub(crate) struct CatalogCheckpointFixtureSummary {
 /// Verified runtime summary of the active canonical frozen-page batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FrozenFixtureSummary {
-    /// Requested frozen-prefix row budget.
-    pub(crate) max_rows: usize,
+    /// Verified full or prefix selection.
+    pub(crate) selection: FreezeSelection,
     /// Approximate non-deleted rows selected by the batch.
     pub(crate) approximate_rows: u64,
     /// Number of selected row pages.
@@ -502,6 +644,13 @@ pub(crate) struct ManagedBindingsFixture {
 /// Runtime fixture transition returned by one completely drained workload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FixtureRuntimeEffect {
+    /// Retain a secondary index after complete content verification.
+    CreateIndex {
+        /// Verified index shape.
+        index: IndexMode,
+        /// Stable identity returned by public CREATE.
+        index_id: IndexID,
+    },
     /// The workload does not modify the implicit fixture.
     None,
     /// Bind the planned table pool to ordered runtime identifiers.
@@ -541,6 +690,8 @@ pub(crate) enum FixtureRuntimeEffect {
 /// Typed primary-table runtime binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PrimaryBinding {
+    /// Exact row counts, unknown after a legacy prefix checkpoint.
+    pub(crate) placement: Option<RowPlacement>,
     /// Public primary table identifier.
     pub(crate) table_id: TableID,
     /// Bound logical shape.
@@ -587,6 +738,8 @@ pub(crate) enum FixtureBinding {
 
 #[derive(Debug)]
 struct RuntimePrimaryFixture {
+    placement: Option<RowPlacement>,
+    created_index_id: Option<IndexID>,
     shape: PrimaryTableShape,
     table_ids: Arc<[TableID]>,
     next_key: u64,
@@ -608,6 +761,39 @@ impl FixtureRuntimeState {
     /// Validate and bind one typed runtime requirement.
     pub(crate) fn bind(&self, requirement: FixtureRequirement) -> Result<FixtureBinding> {
         match requirement {
+            FixtureRequirement::CreateIndex => {
+                self.bind(FixtureRequirement::Recoverable)?;
+                let binding = self.bind(FixtureRequirement::Primary {
+                    index: IndexRequirement::Exact(IndexMode::None),
+                    load: LoadRequirement::Committed,
+                })?;
+                let FixtureBinding::Primary(primary) = &binding else {
+                    return Err(BenchError::message("missing CREATE primary"));
+                };
+                primary
+                    .placement
+                    .ok_or_else(|| {
+                        BenchError::message("create-index requires exact fixture placement")
+                    })?
+                    .validate(primary.inserted_rows)?;
+                Ok(binding)
+            }
+            FixtureRequirement::Insert => {
+                let binding = self.bind(FixtureRequirement::Primary {
+                    index: IndexRequirement::Any,
+                    load: LoadRequirement::Optional,
+                })?;
+                if self.primary.as_ref().is_some_and(|primary| {
+                    primary
+                        .frozen
+                        .is_some_and(|summary| summary.selection == FreezeSelection::All)
+                }) {
+                    return Err(BenchError::message(
+                        "inserts are forbidden during a full freeze; checkpoint first",
+                    ));
+                }
+                Ok(binding)
+            }
             FixtureRequirement::Recoverable => {
                 validate_recoverable_fixture(
                     self.primary
@@ -642,14 +828,7 @@ impl FixtureRuntimeState {
                     .as_ref()
                     .ok_or_else(|| BenchError::message("runtime primary fixture is missing"))?;
                 validate_index(primary.shape.index, index)?;
-                let binding = PrimaryBinding {
-                    table_id: primary.table_ids[0],
-                    shape: primary.shape,
-                    loaded_range: primary.attempted_range,
-                    inserted_rows: primary.inserted_rows,
-                    latest_write_fence: primary.latest_write_fence,
-                    frozen: primary.frozen,
-                };
+                let binding = runtime_primary_binding(primary);
                 if load == LoadRequirement::Committed
                     && (binding.loaded_range.is_none_or(KeyRange::is_empty)
                         || binding.inserted_rows == 0
@@ -673,7 +852,7 @@ impl FixtureRuntimeState {
                 }
                 Ok(FixtureBinding::TablePool(Arc::clone(&primary.table_ids)))
             }
-            FixtureRequirement::FreezeCandidate { max_rows } => {
+            FixtureRequirement::FreezeCandidate { selection } => {
                 let primary = self
                     .primary
                     .as_ref()
@@ -691,14 +870,10 @@ impl FixtureRuntimeState {
                         "freeze-table requires successfully committed loaded data",
                     ));
                 }
-                let max_rows_u64 = u64::try_from(max_rows)
-                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
-                if max_rows_u64 == 0 || max_rows_u64 >= primary.inserted_rows {
-                    return Err(BenchError::message(format!(
-                        "freeze-table max_rows ({max_rows}) must be below inserted rows ({})",
-                        primary.inserted_rows
-                    )));
+                if primary.placement.is_some_and(|rows| rows.hot_rows == 0) {
+                    return Err(BenchError::message("freeze-table requires hot rows"));
                 }
+                selection.validate(primary.inserted_rows)?;
                 if primary.frozen.is_some() {
                     return Err(BenchError::message(
                         "freeze-table runtime fixture is already frozen",
@@ -759,6 +934,20 @@ impl FixtureRuntimeState {
     /// Apply a verified effect at a structural phase fence.
     pub(crate) fn apply(&mut self, effect: FixtureRuntimeEffect) -> Result<()> {
         match effect {
+            FixtureRuntimeEffect::CreateIndex { index, index_id } => {
+                self.bind(FixtureRequirement::CreateIndex)?;
+                validate_index(index, IndexRequirement::Secondary)?;
+                let primary = self
+                    .primary
+                    .as_mut()
+                    .ok_or_else(|| BenchError::message("missing CREATE primary"))?;
+                if primary.created_index_id.is_some() {
+                    return Err(BenchError::message("CREATE already installed an index"));
+                }
+                primary.shape.index = index;
+                primary.created_index_id = Some(index_id);
+                Ok(())
+            }
             FixtureRuntimeEffect::None => Ok(()),
             FixtureRuntimeEffect::CreateTables { shape, table_ids } => {
                 if self.primary.is_some() || table_ids.is_empty() {
@@ -767,6 +956,8 @@ impl FixtureRuntimeState {
                     ));
                 }
                 self.primary = Some(RuntimePrimaryFixture {
+                    placement: Some(RowPlacement::default()),
+                    created_index_id: None,
                     shape,
                     table_ids,
                     next_key: 0,
@@ -782,6 +973,7 @@ impl FixtureRuntimeState {
                 inserted_rows,
                 latest_write_fence,
             } => {
+                self.bind(FixtureRequirement::Insert)?;
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("runtime insert effect requires a primary table")
                 })?;
@@ -790,7 +982,9 @@ impl FixtureRuntimeState {
                         "runtime insert effect does not continue the generated-key cursor",
                     ));
                 }
-                if (inserted_rows == 0) != latest_write_fence.is_none() {
+                if inserted_rows > attempted_range.len
+                    || (inserted_rows == 0) != latest_write_fence.is_none()
+                {
                     return Err(BenchError::message(
                         "runtime insert fence must exist if and only if rows were inserted",
                     ));
@@ -805,6 +999,13 @@ impl FixtureRuntimeState {
                     .inserted_rows
                     .checked_add(inserted_rows)
                     .ok_or_else(|| BenchError::message("runtime inserted row count overflow"))?;
+                if let Some(placement) = primary.placement.as_mut() {
+                    placement.hot_rows = placement
+                        .hot_rows
+                        .checked_add(inserted_rows)
+                        .ok_or_else(|| BenchError::message("hot row count overflow"))?;
+                    placement.validate(primary.inserted_rows)?;
+                }
                 if let Some(fence) = latest_write_fence {
                     primary.latest_write_fence = Some(
                         primary
@@ -823,13 +1024,12 @@ impl FixtureRuntimeState {
                     primary.table_ids.len(),
                     "freeze-table",
                 )?;
-                let max_rows = u64::try_from(summary.max_rows)
-                    .map_err(|_| BenchError::message("freeze-table max_rows exceeds u64"))?;
+                summary.selection.validate(primary.inserted_rows)?;
                 if primary.frozen.is_some()
-                    || max_rows == 0
-                    || max_rows >= primary.inserted_rows
                     || summary.approximate_rows == 0
-                    || summary.approximate_rows >= primary.inserted_rows
+                    || summary.approximate_rows > primary.inserted_rows
+                    || (matches!(summary.selection, FreezeSelection::Prefix { .. })
+                        && summary.approximate_rows >= primary.inserted_rows)
                     || summary.page_count == 0
                     || summary.stable_page_count > summary.page_count
                 {
@@ -844,11 +1044,19 @@ impl FixtureRuntimeState {
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("runtime checkpoint effect requires a primary table")
                 })?;
-                if primary.frozen.take().is_none() {
-                    return Err(BenchError::message(
-                        "runtime checkpoint effect has no frozen batch to consume",
-                    ));
-                }
+                let summary = primary.frozen.take().ok_or_else(|| {
+                    BenchError::message("runtime checkpoint effect has no frozen batch to consume")
+                })?;
+                primary.placement = if summary.selection == FreezeSelection::All {
+                    let placement = RowPlacement {
+                        hot_rows: 0,
+                        checkpointed_rows: primary.inserted_rows,
+                    };
+                    placement.validate(primary.inserted_rows)?;
+                    Some(placement)
+                } else {
+                    None
+                };
                 Ok(())
             }
             FixtureRuntimeEffect::PrepareManagedBindings(fixture) => {
@@ -940,6 +1148,7 @@ fn validate_maintenance_primary(
 
 fn runtime_primary_binding(primary: &RuntimePrimaryFixture) -> PrimaryBinding {
     PrimaryBinding {
+        placement: primary.placement,
         table_id: primary.table_ids[0],
         shape: primary.shape,
         loaded_range: primary.attempted_range,
@@ -982,6 +1191,161 @@ fn validate_recoverable_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loaded_runtime(inserted_rows: u64) -> FixtureRuntimeState {
+        let mut state = FixtureRuntimeState::default();
+        state
+            .apply(FixtureRuntimeEffect::CreateTables {
+                shape: PrimaryTableShape {
+                    index: IndexMode::None,
+                },
+                table_ids: vec![TableID::new(7)].into(),
+            })
+            .unwrap();
+        state
+            .apply(FixtureRuntimeEffect::Insert {
+                attempted_range: KeyRange { start: 0, len: 20 },
+                inserted_rows,
+                latest_write_fence: (inserted_rows != 0).then_some(TrxID::new(11)),
+            })
+            .unwrap();
+        state
+    }
+
+    fn freeze_runtime(state: &mut FixtureRuntimeState, selection: FreezeSelection) {
+        state
+            .apply(FixtureRuntimeEffect::Freeze {
+                summary: FrozenFixtureSummary {
+                    selection,
+                    approximate_rows: 4,
+                    page_count: 2,
+                    stable_page_count: 1,
+                },
+            })
+            .unwrap();
+    }
+
+    fn placement(state: &FixtureRuntimeState) -> Option<RowPlacement> {
+        let FixtureBinding::Primary(primary) = state
+            .bind(FixtureRequirement::Primary {
+                index: IndexRequirement::Any,
+                load: LoadRequirement::Optional,
+            })
+            .unwrap()
+        else {
+            panic!("expected primary")
+        };
+        primary.placement
+    }
+
+    #[test]
+    fn exact_placement_tracks_successes_full_checkpoint_and_hot_tail() {
+        let mut state = loaded_runtime(8);
+        assert_eq!(
+            placement(&state),
+            Some(RowPlacement {
+                hot_rows: 8,
+                checkpointed_rows: 0
+            })
+        );
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_ok());
+        freeze_runtime(&mut state, FreezeSelection::Prefix { max_rows: 4 });
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_err());
+        state.apply(FixtureRuntimeEffect::Checkpoint).unwrap();
+        assert_eq!(placement(&state), None);
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_err());
+        freeze_runtime(&mut state, FreezeSelection::All);
+        assert!(state.bind(FixtureRequirement::Insert).is_err());
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_err());
+        state.apply(FixtureRuntimeEffect::Checkpoint).unwrap();
+        assert_eq!(
+            placement(&state),
+            Some(RowPlacement {
+                hot_rows: 0,
+                checkpointed_rows: 8
+            })
+        );
+        assert!(
+            state
+                .bind(FixtureRequirement::FreezeCandidate {
+                    selection: FreezeSelection::All
+                })
+                .is_err()
+        );
+        state
+            .apply(FixtureRuntimeEffect::Insert {
+                attempted_range: KeyRange { start: 20, len: 5 },
+                inserted_rows: 3,
+                latest_write_fence: Some(TrxID::new(12)),
+            })
+            .unwrap();
+        assert_eq!(
+            placement(&state),
+            Some(RowPlacement {
+                hot_rows: 3,
+                checkpointed_rows: 8
+            })
+        );
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_ok());
+        state
+            .apply(FixtureRuntimeEffect::CreateIndex {
+                index: IndexMode::Unique,
+                index_id: IndexID::new(17),
+            })
+            .unwrap();
+        assert!(state.bind(FixtureRequirement::CreateIndex).is_err());
+        assert_eq!(
+            state.primary.as_ref().unwrap().created_index_id,
+            Some(IndexID::new(17))
+        );
+    }
+
+    #[test]
+    fn create_runtime_requires_ordinary_committed_exact_fixture() {
+        assert!(
+            FixtureRuntimeState::default()
+                .bind(FixtureRequirement::CreateIndex)
+                .is_err()
+        );
+        assert!(
+            loaded_runtime(0)
+                .bind(FixtureRequirement::CreateIndex)
+                .is_err()
+        );
+        for invalid in ["fence", "range", "indexed", "multiple", "unknown", "counts"] {
+            let mut state = loaded_runtime(8);
+            let primary = state.primary.as_mut().unwrap();
+            match invalid {
+                "fence" => primary.latest_write_fence = None,
+                "range" => primary.attempted_range = None,
+                "indexed" => primary.shape.index = IndexMode::Unique,
+                "multiple" => primary.table_ids = vec![TableID::new(7), TableID::new(8)].into(),
+                "unknown" => primary.placement = None,
+                "counts" => primary.placement.as_mut().unwrap().hot_rows += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                state.bind(FixtureRequirement::CreateIndex).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            RowPlacement {
+                hot_rows: u64::MAX,
+                checkpointed_rows: 1
+            }
+            .validate(0)
+            .is_err()
+        );
+        assert!(
+            RowPlacement {
+                hot_rows: 1,
+                checkpointed_rows: 1
+            }
+            .validate(1)
+            .is_err()
+        );
+    }
 
     #[test]
     fn plan_fixture_validates_shape_load_and_pool_capabilities() {
@@ -1071,7 +1435,9 @@ mod tests {
         let mut state = FixturePlanState::default();
         assert!(
             state
-                .validate(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+                .validate(FixtureRequirement::FreezeCandidate {
+                    selection: FreezeSelection::Prefix { max_rows: 4 }
+                })
                 .is_err()
         );
         state
@@ -1087,15 +1453,21 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .validate(FixtureRequirement::FreezeCandidate { max_rows: 8 })
+                .validate(FixtureRequirement::FreezeCandidate {
+                    selection: FreezeSelection::Prefix { max_rows: 8 }
+                })
                 .is_err()
         );
         state
-            .apply(&FixturePlanEffect::Freeze { max_rows: 4 })
+            .apply(&FixturePlanEffect::Freeze {
+                selection: FreezeSelection::Prefix { max_rows: 4 },
+            })
             .unwrap();
         assert!(
             state
-                .validate(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+                .validate(FixtureRequirement::FreezeCandidate {
+                    selection: FreezeSelection::Prefix { max_rows: 4 }
+                })
                 .is_err()
         );
         state.apply(&FixturePlanEffect::Checkpoint).unwrap();
@@ -1123,11 +1495,15 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .bind(FixtureRequirement::FreezeCandidate { max_rows: 8 })
+                .bind(FixtureRequirement::FreezeCandidate {
+                    selection: FreezeSelection::Prefix { max_rows: 8 }
+                })
                 .is_err()
         );
         let FixtureBinding::Primary(candidate) = state
-            .bind(FixtureRequirement::FreezeCandidate { max_rows: 4 })
+            .bind(FixtureRequirement::FreezeCandidate {
+                selection: FreezeSelection::Prefix { max_rows: 4 },
+            })
             .unwrap()
         else {
             panic!("expected freeze primary binding")
@@ -1136,7 +1512,7 @@ mod tests {
         assert_eq!(candidate.frozen, None);
 
         let summary = FrozenFixtureSummary {
-            max_rows: 4,
+            selection: FreezeSelection::Prefix { max_rows: 4 },
             approximate_rows: 4,
             page_count: 2,
             stable_page_count: 1,
