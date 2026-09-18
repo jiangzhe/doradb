@@ -38,7 +38,7 @@ use crate::table::{
 };
 use crate::trx::PrivateTransaction;
 use crate::trx::sys::TransactionSystem;
-use crate::value::{Val, ValKind, ValType};
+use crate::value::{Val, ValKind, ValRef, ValType};
 use error_stack::{Report, ResultExt};
 use std::any::Any;
 use std::mem;
@@ -966,8 +966,14 @@ impl TableColumnLayout {
     /// Returns whether the type is matched at given column index.
     #[inline]
     pub(crate) fn col_type_match(&self, col_idx: usize, val: &Val) -> bool {
+        self.col_type_match_ref(col_idx, val.view())
+    }
+
+    /// Checks a borrowed value's kind and the column's nullability.
+    #[inline]
+    pub(crate) fn col_type_match_ref(&self, col_idx: usize, val: ValRef<'_>) -> bool {
         let col_type = self.col_type(col_idx);
-        if matches!(val, Val::Null) {
+        if val.is_null() {
             col_type.nullable
         } else {
             val.matches_kind(col_type.kind)

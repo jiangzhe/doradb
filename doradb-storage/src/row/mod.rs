@@ -1,7 +1,9 @@
 pub(crate) mod ops;
+mod values;
 pub(crate) mod vector_scan;
 
 pub(crate) use ops::*;
+pub(crate) use values::{RowValues, UpdateValues};
 pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
@@ -15,7 +17,7 @@ use ordered_float::OrderedFloat;
 use std::borrow::Cow;
 use std::fmt;
 use std::mem;
-use std::ptr::copy_nonoverlapping;
+use std::ptr::{copy_nonoverlapping, from_ref};
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
@@ -325,7 +327,7 @@ impl RowPage {
             };
         let mut new_row = self.new_row(row_idx, var_offset);
         for v in user_cols {
-            new_row.add_col(col_layout, v);
+            new_row.add_col(col_layout, v.view());
         }
         InsertRow::Ok(new_row.finish())
     }
@@ -393,7 +395,7 @@ impl RowPage {
         };
         let mut row = self.row_mut(row_idx, var_offset, var_offset + var_len);
         for uc in cols {
-            row.update_col(col_layout, uc.idx, &uc.val);
+            row.update_col(col_layout, uc.idx, uc.val.view());
         }
         row.finish();
         Update::Ok(row_id)
@@ -414,24 +416,31 @@ impl RowPage {
         Select::Ok(row)
     }
 
-    /// Returns additional variable-length bytes needed to update an existing row.
+    /// Returns additional outlined bytes required by a repeatable sparse update.
     #[inline]
-    pub(crate) fn var_len_for_update(&self, row_idx: usize, update: &[UpdateCol]) -> usize {
+    pub(crate) fn var_len_for_update<U: UpdateValues + ?Sized>(
+        &self,
+        row_idx: usize,
+        update: &U,
+    ) -> usize {
         let row = self.row(row_idx);
-        update
-            .iter()
-            .map(|item| match &item.val {
-                Val::VarByte(var) => {
-                    let col = row.var(item.idx);
-                    let orig_var_len = PageVar::outline_len(col);
-                    let upd_var_len = PageVar::outline_len(var.as_bytes());
-                    if upd_var_len > orig_var_len {
-                        upd_var_len
-                    } else {
-                        0
+        (0..update.len())
+            .map(|position| {
+                let (col_idx, value) = update.value(position);
+                match value {
+                    ValRef::VarByte(var) => {
+                        let orig_var_len = PageVar::outline_len(row.var(col_idx));
+                        let upd_var_len = PageVar::outline_len(var);
+                        // Reuse an existing region if it fits; growth reserves a
+                        // complete replacement, not just the length difference.
+                        if upd_var_len > orig_var_len {
+                            upd_var_len
+                        } else {
+                            0
+                        }
                     }
+                    _ => 0,
                 }
-                _ => 0,
             })
             .sum()
     }
@@ -642,55 +651,57 @@ impl RowPage {
     }
 
     /// Updates one column value and returns the next variable-length write offset.
+    /// Input bytes must be separate from this page and are copied into reserved space.
+    /// Panics before writing the column if nonempty input overlaps this page.
     #[inline]
     pub(crate) fn update_col(
         &self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
-        value: &Val,
+        value: ValRef<'_>,
         mut var_offset: usize,
         old_exists: bool,
     ) -> usize {
         match value {
-            Val::Null => {
+            ValRef::Null => {
                 debug_assert!(col_layout.nullable(col_idx));
                 self.set_null(col_layout, row_idx, col_idx, true);
                 return var_offset;
             }
-            Val::I8(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::I8(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::U8(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::U8(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::I16(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::I16(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::U16(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::U16(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::I32(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::I32(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::U32(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::U32(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::F32(v) => {
+            ValRef::F32(v) => {
                 self.update_val(row_idx, col_idx, v.0);
             }
-            Val::I64(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::I64(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::U64(v) => {
-                self.update_val(row_idx, col_idx, *v);
+            ValRef::U64(v) => {
+                self.update_val(row_idx, col_idx, v);
             }
-            Val::F64(v) => {
+            ValRef::F64(v) => {
                 self.update_val(row_idx, col_idx, v.0);
             }
-            Val::VarByte(var) => {
+            ValRef::VarByte(var) => {
                 if let Some(new_offset) =
-                    self.modify_var(row_idx, col_idx, var.as_bytes(), var_offset, old_exists)
+                    self.modify_var(row_idx, col_idx, var, var_offset, old_exists)
                 {
                     var_offset = new_offset;
                 }
@@ -701,55 +712,57 @@ impl RowPage {
     }
 
     /// Updates one column value through exclusive page access.
+    /// Input bytes must be separate from this page and are copied into reserved space.
+    /// Panics before writing the column if nonempty input overlaps this page.
     #[inline]
     pub(crate) fn update_col_exclusive(
         &mut self,
         col_layout: &TableColumnLayout,
         row_idx: usize,
         col_idx: usize,
-        value: &Val,
+        value: ValRef<'_>,
         mut var_offset: usize,
         old_exists: bool,
     ) -> usize {
         match value {
-            Val::Null => {
+            ValRef::Null => {
                 debug_assert!(col_layout.nullable(col_idx));
                 self.set_null_exclusive(col_layout, row_idx, col_idx, true);
                 return var_offset;
             }
-            Val::I8(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::I8(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::U8(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::U8(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::I16(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::I16(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::U16(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::U16(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::I32(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::I32(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::U32(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::U32(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::F32(v) => {
+            ValRef::F32(v) => {
                 self.update_val_exclusive(row_idx, col_idx, v.0);
             }
-            Val::I64(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::I64(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::U64(v) => {
-                self.update_val_exclusive(row_idx, col_idx, *v);
+            ValRef::U64(v) => {
+                self.update_val_exclusive(row_idx, col_idx, v);
             }
-            Val::F64(v) => {
+            ValRef::F64(v) => {
                 self.update_val_exclusive(row_idx, col_idx, v.0);
             }
-            Val::VarByte(var) => {
+            ValRef::VarByte(var) => {
                 if let Some(new_offset) =
-                    self.modify_var(row_idx, col_idx, var.as_bytes(), var_offset, old_exists)
+                    self.modify_var(row_idx, col_idx, var, var_offset, old_exists)
                 {
                     var_offset = new_offset;
                 }
@@ -762,6 +775,7 @@ impl RowPage {
     /// Update variable-length value.
     /// If old value exists, we will try to reuse space occupied by old value.
     /// Returns the updated var length offset.
+    /// Panics before writing the column if nonempty input overlaps this page.
     #[inline]
     pub(crate) fn modify_var(
         &self,
@@ -771,6 +785,7 @@ impl RowPage {
         var_offset: usize,
         old_exists: bool,
     ) -> Option<usize> {
+        self.assert_external_var_input(input);
         if input.len() <= PAGE_VAR_LEN_INLINE {
             // inlined var can be directly updated,
             // without overwriting original var-len data in page.
@@ -829,8 +844,10 @@ impl RowPage {
     }
 
     /// Appends a variable-length value and returns its page descriptor and next offset.
+    /// Panics if nonempty input overlaps this page, including inline input.
     #[inline]
     pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
+        self.assert_external_var_input(input);
         let len = input.len();
         if len <= PAGE_VAR_LEN_INLINE {
             return (PageVar::inline(input), var_offset);
@@ -1067,10 +1084,35 @@ impl RowPage {
     }
 
     #[inline]
+    fn assert_external_var_input(&self, input: &[u8]) {
+        if input.is_empty() {
+            return;
+        }
+        let page_start = from_ref(self).addr();
+        let input_start = input.as_ptr().addr();
+        // Compare the gap to the earlier range's length without computing end
+        // addresses that could overflow. The complete page is excluded because
+        // column writes also update descriptors and null bits outside the payload.
+        let separate = if input_start < page_start {
+            input.len() <= page_start - input_start
+        } else {
+            input_start - page_start >= mem::size_of::<Self>()
+        };
+        // Borrowed write inputs belong to a separate owner. Enforce that contract
+        // in release builds before either copying bytes or replacing a descriptor.
+        assert!(
+            separate,
+            "RowPage byte input overlaps destination page: input_len={}, input_addr={input_start:#x}, page_addr={page_start:#x}",
+            input.len()
+        );
+    }
+
+    #[inline]
     fn copy_var_bytes(&self, offset: usize, input: &[u8]) {
         debug_assert!(offset + input.len() <= self.data().len());
-        // SAFETY: caller reserves and bounds-checks the destination range before writing.
-        // Row/page lock protocol ensures no conflicting writer touches this range.
+        // SAFETY: `add_var` checks that input is disjoint from the entire page.
+        // The caller reserves and bounds-checks the destination range, and the
+        // row/page lock protocol excludes conflicting writers to this range.
         unsafe {
             let dst = self.data().as_ptr().add(offset) as *mut u8;
             copy_nonoverlapping(input.as_ptr(), dst, input.len());
@@ -1289,6 +1331,7 @@ impl NewRow<'_> {
     }
 
     /// Add variable-length value to current row.
+    /// Panics before writing the column if nonempty input overlaps the destination page.
     #[inline]
     pub(crate) fn add_var(&mut self, col_layout: &TableColumnLayout, input: &[u8]) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
@@ -1301,21 +1344,23 @@ impl NewRow<'_> {
     }
 
     /// Adds one typed column value to the current row.
+    /// Input bytes must be separate from the destination page.
+    /// Panics before writing the column if nonempty input overlaps that page.
     #[inline]
-    pub(crate) fn add_col(&mut self, col_layout: &TableColumnLayout, val: &Val) {
+    pub(crate) fn add_col(&mut self, col_layout: &TableColumnLayout, val: ValRef<'_>) {
         match val {
-            Val::Null => self.add_null(col_layout),
-            Val::I8(v) => self.add_val(col_layout, *v),
-            Val::U8(v) => self.add_val(col_layout, *v),
-            Val::I16(v) => self.add_val(col_layout, *v),
-            Val::U16(v) => self.add_val(col_layout, *v),
-            Val::I32(v) => self.add_val(col_layout, *v),
-            Val::U32(v) => self.add_val(col_layout, *v),
-            Val::F32(v) => self.add_val(col_layout, v.0),
-            Val::I64(v) => self.add_val(col_layout, *v),
-            Val::U64(v) => self.add_val(col_layout, *v),
-            Val::F64(v) => self.add_val(col_layout, v.0),
-            Val::VarByte(var) => self.add_var(col_layout, var.as_bytes()),
+            ValRef::Null => self.add_null(col_layout),
+            ValRef::I8(v) => self.add_val(col_layout, v),
+            ValRef::U8(v) => self.add_val(col_layout, v),
+            ValRef::I16(v) => self.add_val(col_layout, v),
+            ValRef::U16(v) => self.add_val(col_layout, v),
+            ValRef::I32(v) => self.add_val(col_layout, v),
+            ValRef::U32(v) => self.add_val(col_layout, v),
+            ValRef::F32(v) => self.add_val(col_layout, v.0),
+            ValRef::I64(v) => self.add_val(col_layout, v),
+            ValRef::U64(v) => self.add_val(col_layout, v),
+            ValRef::F64(v) => self.add_val(col_layout, v.0),
+            ValRef::VarByte(var) => self.add_var(col_layout, var),
         }
     }
 
@@ -1550,12 +1595,14 @@ impl RowRead for RowMut<'_> {
 
 impl RowMut<'_> {
     /// Update column by given index and value.
+    /// Input bytes must be separate from the destination page.
+    /// Panics before writing the column if nonempty input overlaps that page.
     #[inline]
     pub(crate) fn update_col(
         &mut self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
-        value: &Val,
+        value: ValRef<'_>,
     ) {
         debug_assert!(col_layout.nullable(col_idx) || !value.is_null());
         self.var_offset = self.page.update_col(
@@ -1604,12 +1651,14 @@ impl RowRead for RowMutExclusive<'_> {
 
 impl RowMutExclusive<'_> {
     /// Update column by given index and value.
+    /// Input bytes must be separate from the destination page.
+    /// Panics before writing the column if nonempty input overlaps that page.
     #[inline]
     pub(crate) fn update_col(
         &mut self,
         col_layout: &TableColumnLayout,
         col_idx: usize,
-        value: &Val,
+        value: ValRef<'_>,
         old_exists: bool,
     ) {
         self.var_offset = self.page.update_col_exclusive(
@@ -1658,14 +1707,17 @@ pub(crate) const fn align8(value: usize) -> usize {
     value.div_ceil(8) * 8
 }
 
-/// Returns additional space of var-len data of the new row to be inserted.
+/// Returns outlined insert bytes from the layout's variable columns only.
 #[inline]
-pub(crate) fn var_len_for_insert(schema: &TableColumnLayout, cols: &[Val]) -> usize {
+pub(crate) fn var_len_for_insert<R: RowValues + ?Sized>(
+    schema: &TableColumnLayout,
+    cols: &R,
+) -> usize {
     schema
         .var_cols()
         .iter()
-        .map(|idx| match &cols[*idx] {
-            Val::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
+        .map(|idx| match cols.value(*idx) {
+            ValRef::VarByte(var) if var.len() > PAGE_VAR_LEN_INLINE => var.len(),
             _ => 0,
         })
         .sum()
@@ -1714,19 +1766,176 @@ const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use core::str;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::catalog::{
         ColumnOrdinal, IndexOrder, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
         StorageIndexKey, StorageIndexSpec, TableMetadata,
     };
+    use crate::table::DmlValidator;
     use crate::value::ValKind;
 
+    pub(crate) use super::values::BufferValues;
     use super::*;
 
     pub(super) fn create_row_page() -> RowPage {
         RowPage::new_test_page()
+    }
+
+    fn var_input_test_page() -> (TableMetadata, RowPage) {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::VarByte,
+                StorageColumnFlags::NULLABLE,
+            )],
+            vec![],
+        )
+        .unwrap();
+        let mut page = create_row_page();
+        page.init(RowID::new(100), 4, &metadata.col);
+        for value in [
+            Val::from("abcdefghijklmnop"),
+            Val::from("inline"),
+            Val::Null,
+        ] {
+            assert!(page.insert(&metadata.col, &[value]).is_ok());
+        }
+        (metadata, page)
+    }
+
+    fn assert_aliased_var_input_rejected(page: &RowPage, input_len: usize, write: impl FnOnce()) {
+        let before = page.data().to_vec();
+        let header_before = format!("{:?}", page.header);
+        let approx_deleted_before = page.header.approx_deleted.load(Ordering::Relaxed);
+        let padding_before = page.header.padding;
+        let footer_before = page.footer;
+        let panic = catch_unwind(AssertUnwindSafe(write)).expect_err("page input must be rejected");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("assertion panic must contain a message");
+        assert!(
+            message.contains("RowPage byte input overlaps destination page"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("input_len={input_len}")),
+            "{message}"
+        );
+        // Includes the payloads, inline descriptors, null bits, and deletion bits.
+        assert_eq!(page.data(), before);
+        assert_eq!(format!("{:?}", page.header), header_before);
+        assert_eq!(
+            page.header.approx_deleted.load(Ordering::Relaxed),
+            approx_deleted_before
+        );
+        assert_eq!(page.header.padding, padding_before);
+        assert_eq!(page.footer, footer_before);
+    }
+
+    fn insert_view_case(
+        page: &mut RowPage,
+        layout: &TableColumnLayout,
+        owned: &[Val],
+        input: &BufferValues,
+        borrowed: bool,
+        exclusive: bool,
+    ) {
+        let var_len = var_len_for_insert(layout, input);
+        assert_eq!(var_len, var_len_for_insert(layout, owned));
+        let (row_idx, offset) = page.request_row_idx_and_free_space(var_len).unwrap();
+        if exclusive {
+            let mut row = page.row_mut_exclusive(row_idx, offset, offset + var_len);
+            for (idx, value) in owned.iter().enumerate() {
+                let value = if borrowed {
+                    RowValues::value(input, idx)
+                } else {
+                    value.view()
+                };
+                row.update_col(layout, idx, value, false);
+            }
+            row.finish_insert();
+        } else {
+            let mut row = page.new_row(row_idx, offset);
+            for (idx, value) in owned.iter().enumerate() {
+                let value = if borrowed {
+                    RowValues::value(input, idx)
+                } else {
+                    value.view()
+                };
+                row.add_col(layout, value);
+            }
+            row.finish();
+        }
+    }
+
+    fn update_view_case(
+        page: &mut RowPage,
+        layout: &TableColumnLayout,
+        owned: &[UpdateCol],
+        input: &BufferValues,
+        borrowed: bool,
+        exclusive: bool,
+    ) {
+        let var_len = page.var_len_for_update(0, input);
+        assert_eq!(var_len, page.row(0).var_len_for_update(owned));
+        let offset = page.request_free_space(var_len).unwrap();
+        if exclusive {
+            let mut row = page.row_mut_exclusive(0, offset, offset + var_len);
+            for (position, col) in owned.iter().enumerate() {
+                let (idx, value) = if borrowed {
+                    UpdateValues::value(input, position)
+                } else {
+                    (col.idx, col.val.view())
+                };
+                row.update_col(layout, idx, value, true);
+            }
+            row.finish_update();
+        } else {
+            let mut row = page.row_mut(0, offset, offset + var_len);
+            for (position, col) in owned.iter().enumerate() {
+                let (idx, value) = if borrowed {
+                    UpdateValues::value(input, position)
+                } else {
+                    (col.idx, col.val.view())
+                };
+                row.update_col(layout, idx, value);
+            }
+            row.finish();
+        }
+    }
+
+    fn assert_view_pages(pages: &[RowPage], layout: &TableColumnLayout, expected: &[Val]) {
+        for page in pages {
+            assert_eq!(page.header.row_count(), 1);
+            assert_eq!(page.header.approx_deleted.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                page.header.var_field_offset(),
+                pages[0].header.var_field_offset()
+            );
+            assert_eq!(page.row(0).clone_vals(layout), expected);
+            assert!(!page.row(0).is_deleted());
+            for (idx, value) in expected.iter().enumerate() {
+                assert_eq!(page.row(0).is_null(layout, idx), value.is_null());
+                match value {
+                    Val::F32(value) => assert_eq!(
+                        page.row(0).val(layout, idx).as_f32().unwrap().to_bits(),
+                        value.to_bits()
+                    ),
+                    Val::F64(value) => assert_eq!(
+                        page.row(0).val(layout, idx).as_f64().unwrap().to_bits(),
+                        value.to_bits()
+                    ),
+                    Val::VarByte(_) => {
+                        assert_eq!(page.var(0, idx).offset(), pages[0].var(0, idx).offset())
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]
@@ -2005,5 +2214,220 @@ mod tests {
 
         let select = page.select(RowID::new(row_id));
         assert!(matches!(select, Select::RowDeleted(_)));
+    }
+
+    #[test]
+    fn test_row_page_var_input_rejects_aliases_on_update() {
+        let (metadata, page) = var_input_test_page();
+        let offset = page.header.var_field_offset();
+        let cases = [
+            (0, 0..16, 0), // Identical outlined source and destination.
+            (0, 0..12, 0), // Shrink while retaining the same start address.
+            (0, 3..16, 0), // Partially overlapping outlined suffix.
+            (1, 0..6, 1),  // Inline source overlaps its descriptor.
+            (0, 2..6, 0),  // Outlined source would become inline.
+            (1, 0..6, 2),  // Disjoint source on the same page; target is null.
+        ];
+        for (source_idx, range, target_idx) in cases {
+            let source = page.row(source_idx);
+            let input = &source.var(0)[range];
+            for through_row in [false, true] {
+                assert_aliased_var_input_rejected(&page, input.len(), || {
+                    if through_row {
+                        let mut row = page.row_mut(target_idx, offset, offset);
+                        row.update_col(&metadata.col, 0, ValRef::VarByte(input));
+                        row.finish();
+                    } else {
+                        page.update_col(
+                            &metadata.col,
+                            target_idx,
+                            0,
+                            ValRef::VarByte(input),
+                            offset,
+                            true,
+                        );
+                    }
+                });
+            }
+        }
+        // The contract covers the complete page, not only its logical data area.
+        for input in [&page.header.padding[..], &page.footer[..]] {
+            let offset = page
+                .request_free_space(PageVar::outline_len(input))
+                .unwrap();
+            assert_aliased_var_input_rejected(&page, input.len(), || {
+                page.update_col(&metadata.col, 2, 0, ValRef::VarByte(input), offset, true);
+            });
+        }
+    }
+
+    #[test]
+    fn test_row_page_var_input_rejects_aliases_on_insert() {
+        for source_idx in [0, 1] {
+            let (metadata, page) = var_input_test_page();
+            let source = page.row(source_idx);
+            let input = source.var(0);
+            let (row_idx, offset) = page
+                .request_row_idx_and_free_space(PageVar::outline_len(input))
+                .unwrap();
+            // Reservation precedes the attempted column write. Rejection must
+            // leave that reserved row unpublished and all its bytes untouched.
+            assert_aliased_var_input_rejected(&page, input.len(), || {
+                let mut row = page.new_row(row_idx, offset);
+                row.add_col(&metadata.col, ValRef::VarByte(input));
+                row.finish();
+            });
+            assert!(page.is_deleted(row_idx));
+        }
+    }
+
+    #[test]
+    fn test_row_page_var_input_accepts_external_and_empty() {
+        let (metadata, first) = var_input_test_page();
+        let (_, second) = var_input_test_page();
+        let pages = [first, second];
+        // Adjacent pages exercise external sources on either side of the
+        // destination address without constructing raw-pointer byte views.
+        for (source_idx, target_idx) in [(0, 1), (1, 0)] {
+            let source = pages[source_idx].row(0);
+            let input = source.var(0);
+            let target = &pages[target_idx];
+            let offset = target.header.var_field_offset();
+            assert_eq!(
+                target.update_col(&metadata.col, 0, 0, ValRef::VarByte(input), offset, true),
+                offset
+            );
+            assert_eq!(target.row(0).var(0), input);
+            assert_eq!(target.header.var_field_offset(), offset);
+        }
+
+        let page = &pages[0];
+        let source = page.row(1);
+        let empty = &source.var(0)[..0];
+        let offset = page.header.var_field_offset();
+        page.update_col(&metadata.col, 0, 0, ValRef::VarByte(empty), offset, true);
+        assert_eq!(page.row(0).val(&metadata.col, 0), Val::from(""));
+        assert_eq!(page.header.var_field_offset(), offset);
+        let (row_idx, offset) = page.request_row_idx_and_free_space(0).unwrap();
+        let mut row = page.new_row(row_idx, offset);
+        row.add_col(&metadata.col, ValRef::VarByte(empty));
+        row.finish();
+        assert_eq!(page.row(row_idx).val(&metadata.col, 0), Val::from(""));
+        assert!(!page.is_deleted(row_idx));
+    }
+
+    #[test]
+    fn test_borrowed_row_writers_and_space_parity() {
+        let mut expected = vec![
+            Val::I8(i8::MIN),
+            Val::U8(u8::MAX),
+            Val::I16(i16::MIN),
+            Val::U16(u16::MAX),
+            Val::I32(i32::MIN),
+            Val::U32(u32::MAX),
+            Val::F32(OrderedFloat(f32::from_bits(0x7fc01234))),
+            Val::I64(i64::MIN),
+            Val::U64(u64::MAX),
+            Val::F64(OrderedFloat(-0.0)),
+        ];
+        let first_var = expected.len();
+        for len in [0, 6, 7, 14, 15, 128] {
+            expected.push(Val::from(vec![b'x'; len]));
+        }
+        expected.push(Val::Null);
+        let metadata = TableMetadata::try_new(
+            expected
+                .iter()
+                .map(|value| {
+                    StorageColumnSpec::new(
+                        value.kind().unwrap_or(ValKind::I32),
+                        StorageColumnFlags::NULLABLE,
+                    )
+                })
+                .collect(),
+            vec![],
+        )
+        .unwrap();
+        let layout = metadata.col.as_ref();
+        let modes = [(false, false), (true, false), (false, true), (true, true)];
+        let mut pages: Vec<_> = modes
+            .iter()
+            .map(|_| {
+                let mut page = create_row_page();
+                page.init(RowID::new(100), 2, layout);
+                page
+            })
+            .collect();
+        let mut input = BufferValues::new(
+            expected
+                .iter()
+                .enumerate()
+                .map(|(idx, val)| (idx, val.view())),
+        );
+        DmlValidator::new(&metadata)
+            .validate_full_row(&input)
+            .unwrap();
+        assert_eq!(var_len_for_insert(layout, &input), 7 + 14 + 15 + 128);
+        for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {
+            insert_view_case(page, layout, &expected, &input, borrowed, exclusive);
+        }
+        input.overwrite_bytes();
+        assert_view_pages(&pages, layout, &expected);
+
+        // Null every column, then restore it: outlined storage remains reusable.
+        let original = expected.clone();
+        for values in [vec![Val::Null; expected.len()], original] {
+            let update: Vec<_> = values
+                .iter()
+                .enumerate()
+                .map(|(idx, val)| UpdateCol {
+                    idx,
+                    val: val.clone(),
+                })
+                .collect();
+            let mut input = BufferValues::new(
+                values
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, val)| (idx, val.view())),
+            );
+            DmlValidator::new(&metadata)
+                .validate_sparse_update(&input)
+                .unwrap();
+            let before = pages[0].header.var_field_offset();
+            for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {
+                update_view_case(page, layout, &update, &input, borrowed, exclusive);
+                assert_eq!(page.header.var_field_offset(), before);
+            }
+            input.overwrite_bytes();
+            expected = values;
+            assert_view_pages(&pages, layout, &expected);
+        }
+
+        // Cross both inline thresholds, shrink/reuse, grow again, and return inline.
+        let mut previous_len = 0;
+        for len in [0, 6, 7, 14, 15, 128, 64, 7, 15, 6, 0] {
+            let bytes = vec![0xff; len];
+            let update = [UpdateCol {
+                idx: first_var,
+                val: Val::from(bytes.as_slice()),
+            }];
+            let mut input = BufferValues::new([(first_var, ValRef::VarByte(&bytes))]);
+            let reserve = if len > PAGE_VAR_LEN_INLINE && len > previous_len {
+                len
+            } else {
+                0
+            };
+            for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {
+                let before = page.header.var_field_offset();
+                assert_eq!(page.var_len_for_update(0, &input), reserve);
+                update_view_case(page, layout, &update, &input, borrowed, exclusive);
+                assert_eq!(before - page.header.var_field_offset(), reserve);
+            }
+            expected[first_var] = update[0].val.clone();
+            input.overwrite_bytes();
+            assert_view_pages(&pages, layout, &expected);
+            previous_len = len;
+        }
     }
 }

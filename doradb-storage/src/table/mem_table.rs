@@ -593,7 +593,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             let mut row = page.row_mut_exclusive(row_idx, var_offset, var_offset + var_len);
             debug_assert!(row.is_deleted());
             for (col_idx, user_col) in cols.iter().enumerate() {
-                row.update_col(metadata.col.as_ref(), col_idx, user_col, false);
+                row.update_col(metadata.col.as_ref(), col_idx, user_col.view(), false);
             }
             for key in keys {
                 self.insert_index_slot_no_trx(guards, key, row_id).await?;
@@ -633,7 +633,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
         if !disable_dml_validation {
             let validator = DmlValidator::new(metadata);
             validator
-                .validate_full_row(&cols)
+                .validate_full_row(cols.as_slice())
                 .change_context(DataIntegrityError::InvalidPayload)
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
@@ -952,7 +952,7 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                         row.update_col(
                             metadata.col.as_ref(),
                             update_col.idx,
-                            &update_col.val,
+                            update_col.val.view(),
                             true,
                         );
                     }

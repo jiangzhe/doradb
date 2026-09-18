@@ -1,5 +1,5 @@
 use crate::catalog::{IndexSlot, PrimaryKeyMatchError, TableIndexMetadata, TableMetadata};
-use crate::row::ops::UpdateCol;
+use crate::row::{RowValues, UpdateValues};
 use crate::value::Val;
 use error_stack::Report;
 use std::ops::{Bound, RangeBounds};
@@ -41,9 +41,12 @@ impl<'m> DmlValidator<'m> {
         Self { metadata }
     }
 
-    /// Validates a full-row DML payload against table column metadata.
+    /// Validates a repeatable full-row input without taking ownership of values.
     #[inline]
-    pub(crate) fn validate_full_row(&self, vals: &[Val]) -> DmlValidationResult<()> {
+    pub(crate) fn validate_full_row<R: RowValues + ?Sized>(
+        &self,
+        vals: &R,
+    ) -> DmlValidationResult<()> {
         if vals.len() != self.metadata.col.col_count() {
             return Err(Report::new(DmlValidationError::RowShape).attach(format!(
                 "row value count mismatch: actual={}, expected={}",
@@ -51,8 +54,9 @@ impl<'m> DmlValidator<'m> {
                 self.metadata.col.col_count()
             )));
         }
-        for (col_no, val) in vals.iter().enumerate() {
-            if !self.metadata.col.col_type_match(col_no, val) {
+        for col_no in 0..vals.len() {
+            let val = vals.value(col_no);
+            if !self.metadata.col.col_type_match_ref(col_no, val) {
                 return Err(Report::new(DmlValidationError::RowShape).attach(format!(
                     "row value type mismatch: column_no={col_no}, expected={:?}, actual={val:?}",
                     self.metadata.col.col_type(col_no)
@@ -62,43 +66,43 @@ impl<'m> DmlValidator<'m> {
         Ok(())
     }
 
-    /// Validates a sparse update DML payload against table column metadata.
+    /// Validates sparse input in its original order, including duplicate ordinals.
     #[inline]
-    pub(crate) fn validate_sparse_update(&self, update: &[UpdateCol]) -> DmlValidationResult<()> {
+    pub(crate) fn validate_sparse_update<U: UpdateValues + ?Sized>(
+        &self,
+        update: &U,
+    ) -> DmlValidationResult<()> {
         let mut last_idx = None;
-        for update_col in update {
-            if update_col.idx >= self.metadata.col.col_count() {
+        for position in 0..update.len() {
+            let (col_idx, val) = update.value(position);
+            if col_idx >= self.metadata.col.col_count() {
                 return Err(
                     Report::new(DmlValidationError::SparseUpdate).attach(format!(
                         "update column out of range: column_no={}, column_count={}",
-                        update_col.idx,
+                        col_idx,
                         self.metadata.col.col_count()
                     )),
                 );
             }
-            if last_idx.is_some_and(|idx| update_col.idx <= idx) {
+            if last_idx.is_some_and(|idx| col_idx <= idx) {
                 return Err(
                     Report::new(DmlValidationError::SparseUpdate).attach(format!(
                         "update columns not strictly ordered: column_no={}",
-                        update_col.idx
+                        col_idx
                     )),
                 );
             }
-            if !self
-                .metadata
-                .col
-                .col_type_match(update_col.idx, &update_col.val)
-            {
+            if !self.metadata.col.col_type_match_ref(col_idx, val) {
                 return Err(
                     Report::new(DmlValidationError::SparseUpdate).attach(format!(
                         "update column type mismatch: column_no={}, expected={:?}, actual={:?}",
-                        update_col.idx,
-                        self.metadata.col.col_type(update_col.idx),
-                        update_col.val
+                        col_idx,
+                        self.metadata.col.col_type(col_idx),
+                        val
                     )),
                 );
             }
-            last_idx = Some(update_col.idx);
+            last_idx = Some(col_idx);
         }
         Ok(())
     }
@@ -273,10 +277,39 @@ impl<'m> DmlValidator<'m> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DmlValidationError, DmlValidator};
+    use super::{DmlValidationError, DmlValidationResult, DmlValidator};
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::row::ops::UpdateCol;
+    use crate::row::tests::BufferValues;
     use crate::value::{Val, ValKind};
+    use error_stack::Report;
+
+    fn assert_validation_parity(
+        owned: DmlValidationResult<()>,
+        borrowed: DmlValidationResult<()>,
+        expected: Option<DmlValidationError>,
+        fact: &str,
+    ) {
+        assert_eq!(
+            owned.as_ref().err().map(|err| *err.current_context()),
+            expected
+        );
+        assert_eq!(
+            borrowed.as_ref().err().map(|err| *err.current_context()),
+            expected
+        );
+        if let (Err(owned), Err(borrowed)) = (owned, borrowed) {
+            // Compare caller-owned diagnostic facts, excluding source locations.
+            let facts = |report: &Report<DmlValidationError>| {
+                report
+                    .frames()
+                    .filter_map(|frame| frame.downcast_ref::<String>().cloned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(facts(&owned), facts(&borrowed));
+            assert!(format!("{borrowed:?}").contains(fact), "{borrowed:?}");
+        }
+    }
 
     #[test]
     fn test_sparse_update_validates_order_bounds_and_types() {
@@ -316,7 +349,7 @@ mod tests {
                 .into_iter()
                 .map(|(idx, val)| UpdateCol { idx, val })
                 .collect();
-            let result = validator.validate_sparse_update(&update);
+            let result = validator.validate_sparse_update(update.as_slice());
             assert_eq!(result.is_ok(), valid, "case={case}, result={result:?}");
             if let Err(err) = result {
                 assert_eq!(
@@ -325,6 +358,74 @@ mod tests {
                     "case={case}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_borrowed_validation_parity() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let validator = DmlValidator::new(&metadata);
+        let rows = [
+            (vec![Val::I32(1), Val::from("bytes")], true, ""),
+            (vec![Val::I32(1), Val::Null], true, ""),
+            (vec![Val::I32(1)], false, "actual=1, expected=2"),
+            (
+                vec![Val::I32(1), Val::Null, Val::Null],
+                false,
+                "actual=3, expected=2",
+            ),
+            (vec![Val::Null, Val::from("")], false, "column_no=0"),
+            (vec![Val::U32(1), Val::from("")], false, "actual=u32(1)"),
+            (vec![Val::I32(1), Val::I8(1)], false, "column_no=1"),
+        ];
+        for (owned, valid, fact) in rows {
+            let borrowed =
+                BufferValues::new(owned.iter().enumerate().map(|(idx, val)| (idx, val.view())));
+            assert_validation_parity(
+                validator.validate_full_row(owned.as_slice()),
+                validator.validate_full_row(&borrowed),
+                (!valid).then_some(DmlValidationError::RowShape),
+                fact,
+            );
+        }
+        let updates = [
+            (vec![], true, ""),
+            (vec![(0, Val::I32(2)), (1, Val::from("new"))], true, ""),
+            (vec![(1, Val::Null)], true, ""),
+            (vec![(0, Val::Null)], false, "type mismatch"),
+            (vec![(0, Val::U32(2))], false, "actual=u32(2)"),
+            (
+                vec![(1, Val::Null), (0, Val::I32(2))],
+                false,
+                "not strictly ordered",
+            ),
+            // Ordering wins over type checking at a duplicate ordinal.
+            (
+                vec![(0, Val::I32(2)), (0, Val::Null)],
+                false,
+                "not strictly ordered",
+            ),
+            (vec![(2, Val::Null)], false, "out of range"),
+        ];
+        for (entries, valid, fact) in updates {
+            let owned: Vec<_> = entries
+                .into_iter()
+                .map(|(idx, val)| UpdateCol { idx, val })
+                .collect();
+            let borrowed = BufferValues::new(owned.iter().map(|col| (col.idx, col.val.view())));
+            assert_validation_parity(
+                validator.validate_sparse_update(owned.as_slice()),
+                validator.validate_sparse_update(&borrowed),
+                (!valid).then_some(DmlValidationError::SparseUpdate),
+                fact,
+            );
         }
     }
 }

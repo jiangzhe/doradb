@@ -99,19 +99,33 @@ impl Table {
             RowRedoKind::Insert(_, cols) => {
                 if !disable_dml_validation {
                     DmlValidator::new(metadata)
-                        .validate_full_row(cols)
+                        .validate_full_row(cols.as_slice())
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
-                self.recover_row_insert_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
+                self.recover_row_insert_to_page(
+                    metadata,
+                    page_guard,
+                    replay,
+                    row_id,
+                    cols.as_slice(),
+                    cts,
+                )?;
                 counts.inserts += 1;
             }
             RowRedoKind::Update(_, cols) => {
                 if !disable_dml_validation {
                     DmlValidator::new(metadata)
-                        .validate_sparse_update(cols)
+                        .validate_sparse_update(cols.as_slice())
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
-                self.recover_row_update_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
+                self.recover_row_update_to_page(
+                    metadata,
+                    page_guard,
+                    replay,
+                    row_id,
+                    cols.as_slice(),
+                    cts,
+                )?;
                 counts.updates += 1;
             }
             RowRedoKind::Delete(_) => {
@@ -271,11 +285,12 @@ mod tests {
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::recovery::{ReplayOp, RowReplayState};
     use crate::row::ops::UpdateCol;
-    use crate::row::{RowPage, RowRead};
+    use crate::row::tests::BufferValues;
+    use crate::row::{RowPage, RowRead, RowValues, UpdateValues};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::{DmlValidationError, tests::*};
     use crate::trx::MAX_SNAPSHOT_TS;
-    use crate::value::Val;
+    use crate::value::{Val, ValRef};
     use error_stack::Report;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -291,6 +306,129 @@ mod tests {
         );
         let report = format!("{err:?}");
         assert!(report.contains(reason), "{report}");
+    }
+
+    async fn check_recovery_slot_history<R: RowValues + ?Sized, U: UpdateValues + ?Sized>(
+        vals: &R,
+        update: &U,
+        huge: &R,
+        huge_update: &U,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let session = engine.new_session().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let metadata = table.metadata();
+        let mut page = table
+            .row_store
+            .get_insert_page_exclusive(&session.pool_guards(), 70)
+            .await
+            .unwrap();
+        let mut replay = replay_state(&page);
+        let first = page.page().header.start_row_id;
+        let mut cts = TrxID::new(10);
+        for idx in [69, 64, 63, 0] {
+            let row_id = first + idx as u64;
+            table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, row_id, vals, cts)
+                .unwrap();
+            assert!(replay.is_inserted(idx));
+            cts = cts + 1;
+            let err = table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, row_id, vals, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row slot was already inserted");
+            cts = cts + 1;
+            table
+                .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, update, cts)
+                .unwrap();
+            assert_eq!(
+                page.page().row(idx).val(&metadata.col, 1),
+                Val::from("changed")
+            );
+            assert!(replay.is_inserted(idx));
+            cts = cts + 1;
+            table
+                .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                .unwrap();
+            assert!(replay.is_inserted(idx));
+            cts = cts + 1;
+            let err = table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, row_id, vals, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row slot was already inserted");
+            let err = table
+                .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, update, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row is deleted");
+            let err = table
+                .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row is already deleted");
+            cts = cts + 1;
+        }
+        assert_eq!(page.page().header.row_count(), 70);
+        assert!((0..70).all(|slot| page.page().is_deleted(slot)));
+        for idx in 0..70 {
+            assert_eq!(replay.is_inserted(idx), [0, 63, 64, 69].contains(&idx));
+        }
+        // Slot 70 is inside the rounded bitmap storage but outside this page.
+        for row_id in [first + 70, first + 127] {
+            let err = table
+                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, row_id, vals, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row id outside page range");
+            let err = table
+                .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, update, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row id outside page range");
+            let err = table
+                .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
+                .unwrap_err();
+            assert_invalid_replay(err, "row id outside page range");
+        }
+        let unused = first + 1;
+        let err = table
+            .recover_row_update_to_page(&metadata, &mut page, &replay, unused, update, cts)
+            .unwrap_err();
+        assert_invalid_replay(err, "missing inserted state");
+        let err = table
+            .recover_row_delete_to_page(&mut page, &replay, unused, cts)
+            .unwrap_err();
+        assert_invalid_replay(err, "missing inserted state");
+        let count_before = page.page().header.row_count();
+        let offset_before = page.page().header.var_field_offset();
+        let err = table
+            .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, huge, cts)
+            .unwrap_err();
+        assert_invalid_replay(err, "insufficient row page space");
+        assert!(!replay.is_inserted(1));
+        assert!(page.page().is_deleted(1));
+        assert_eq!(page.page().header.row_count(), count_before);
+        assert_eq!(page.page().header.var_field_offset(), offset_before);
+        // A live physical row without its inserted bit is also invalid.
+        page.page_mut().set_deleted_exclusive(1, false);
+        let before = page.page().header.var_field_offset();
+        let err = table
+            .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, vals, cts)
+            .unwrap_err();
+        assert_invalid_replay(err, "row slot is not deleted");
+        assert!(!replay.is_inserted(1));
+        assert_eq!(page.page().header.var_field_offset(), before);
+        page.page_mut().set_deleted_exclusive(1, true);
+        table
+            .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, vals, cts)
+            .unwrap();
+        let offset_before = page.page().header.var_field_offset();
+        let err = table
+            .recover_row_update_to_page(&metadata, &mut page, &replay, unused, huge_update, cts + 1)
+            .unwrap_err();
+        assert_invalid_replay(err, "insufficient row page space");
+        assert!(replay.is_inserted(1));
+        assert_eq!(page.page().header.var_field_offset(), offset_before);
+        assert!(!page.page().is_deleted(1));
+        assert_eq!(page.page().row(1).val(&metadata.col, 1), Val::from("name"));
     }
 
     #[test]
@@ -355,159 +493,24 @@ mod tests {
     #[test]
     fn test_recover_row_page_sparse_bitmap_boundaries_and_slot_history() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let session = engine.new_session().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let metadata = table.metadata();
-            let mut page = table
-                .row_store
-                .get_insert_page_exclusive(&session.pool_guards(), 70)
-                .await
-                .unwrap();
-            let mut replay = replay_state(&page);
-            let first = page.page().header.start_row_id;
             let vals = [Val::from(1i32), Val::from("name")];
             let update = [UpdateCol {
                 idx: 1,
                 val: Val::from("changed"),
             }];
-            let mut cts = TrxID::new(10);
-            for idx in [69, 64, 63, 0] {
-                let row_id = first + idx as u64;
-                table
-                    .recover_row_insert_to_page(
-                        &metadata,
-                        &mut page,
-                        &mut replay,
-                        row_id,
-                        &vals,
-                        cts,
-                    )
-                    .unwrap();
-                assert!(replay.is_inserted(idx));
-                cts = cts + 1;
-                let err = table
-                    .recover_row_insert_to_page(
-                        &metadata,
-                        &mut page,
-                        &mut replay,
-                        row_id,
-                        &vals,
-                        cts,
-                    )
-                    .unwrap_err();
-                assert_invalid_replay(err, "row slot was already inserted");
-                cts = cts + 1;
-                table
-                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
-                    .unwrap();
-                assert_eq!(
-                    page.page().row(idx).val(&metadata.col, 1),
-                    Val::from("changed")
-                );
-                assert!(replay.is_inserted(idx));
-                cts = cts + 1;
-                table
-                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
-                    .unwrap();
-                assert!(replay.is_inserted(idx));
-                cts = cts + 1;
-                let err = table
-                    .recover_row_insert_to_page(
-                        &metadata,
-                        &mut page,
-                        &mut replay,
-                        row_id,
-                        &vals,
-                        cts,
-                    )
-                    .unwrap_err();
-                assert_invalid_replay(err, "row slot was already inserted");
-                let err = table
-                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
-                    .unwrap_err();
-                assert_invalid_replay(err, "row is deleted");
-                let err = table
-                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
-                    .unwrap_err();
-                assert_invalid_replay(err, "row is already deleted");
-                cts = cts + 1;
-            }
-            assert_eq!(page.page().header.row_count(), 70);
-            assert!((0..70).all(|slot| page.page().is_deleted(slot)));
-            for idx in 0..70 {
-                assert_eq!(replay.is_inserted(idx), [0, 63, 64, 69].contains(&idx));
-            }
-            // Slot 70 is inside the rounded bitmap storage but outside this page.
-            for row_id in [first + 70, first + 127] {
-                let err = table
-                    .recover_row_insert_to_page(
-                        &metadata,
-                        &mut page,
-                        &mut replay,
-                        row_id,
-                        &vals,
-                        cts,
-                    )
-                    .unwrap_err();
-                assert_invalid_replay(err, "row id outside page range");
-                let err = table
-                    .recover_row_update_to_page(&metadata, &mut page, &replay, row_id, &update, cts)
-                    .unwrap_err();
-                assert_invalid_replay(err, "row id outside page range");
-                let err = table
-                    .recover_row_delete_to_page(&mut page, &replay, row_id, cts)
-                    .unwrap_err();
-                assert_invalid_replay(err, "row id outside page range");
-            }
-            let unused = first + 1;
-            let err = table
-                .recover_row_update_to_page(&metadata, &mut page, &replay, unused, &update, cts)
-                .unwrap_err();
-            assert_invalid_replay(err, "missing inserted state");
-            let err = table
-                .recover_row_delete_to_page(&mut page, &replay, unused, cts)
-                .unwrap_err();
-            assert_invalid_replay(err, "missing inserted state");
-            let huge = [Val::from(1i32), Val::from(vec![b'x'; PAGE_SIZE - 1])];
-            let err = table
-                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &huge, cts)
-                .unwrap_err();
-            assert_invalid_replay(err, "insufficient row page space");
-            assert!(!replay.is_inserted(1));
-            assert!(page.page().is_deleted(1));
-            // A live physical row without its inserted bit is also invalid.
-            page.page_mut().set_deleted_exclusive(1, false);
-            let before = page.page().header.var_field_offset();
-            let err = table
-                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &vals, cts)
-                .unwrap_err();
-            assert_invalid_replay(err, "row slot is not deleted");
-            assert!(!replay.is_inserted(1));
-            assert_eq!(page.page().header.var_field_offset(), before);
-            page.page_mut().set_deleted_exclusive(1, true);
-            table
-                .recover_row_insert_to_page(&metadata, &mut page, &mut replay, unused, &vals, cts)
-                .unwrap();
-            let err = table
-                .recover_row_update_to_page(
-                    &metadata,
-                    &mut page,
-                    &replay,
-                    unused,
-                    &[UpdateCol {
-                        idx: 1,
-                        val: huge[1].clone(),
-                    }],
-                    cts + 1,
-                )
-                .unwrap_err();
-            assert_invalid_replay(err, "insufficient row page space");
-            assert!(replay.is_inserted(1));
-            assert_eq!(page.page().row(1).val(&metadata.col, 1), vals[1]);
+            let bytes = vec![b'x'; PAGE_SIZE - 1];
+            let huge = [Val::from(1i32), Val::from(bytes.as_slice())];
+            let huge_update = [UpdateCol {
+                idx: 1,
+                val: Val::from(bytes.as_slice()),
+            }];
+            check_recovery_slot_history(&vals[..], &update[..], &huge[..], &huge_update[..]).await;
+            // Construct the independent payload directly, without owning value objects.
+            let vals = BufferValues::new([(0, ValRef::I32(1)), (1, ValRef::VarByte(b"name"))]);
+            let update = BufferValues::new([(1, ValRef::VarByte(b"changed"))]);
+            let huge = BufferValues::new([(0, ValRef::I32(1)), (1, ValRef::VarByte(&bytes))]);
+            let huge_update = BufferValues::new([(1, ValRef::VarByte(&bytes))]);
+            check_recovery_slot_history(&vals, &update, &huge, &huge_update).await;
         });
     }
 
@@ -560,7 +563,59 @@ mod tests {
                 let report = format!("{err:?}");
                 assert!(report.contains("recover_row_batch"), "{report}");
                 assert!(report.contains(&format!("table_id={table_id}")), "{report}");
+                assert!(report.contains(&format!("page_id={page_id}")), "{report}");
+                assert!(report.contains(&format!("row_id={row_id}")), "{report}");
+                assert!(report.contains("cts=10"), "{report}");
                 assert!(!replay.is_inserted(0));
+            }
+            {
+                let page = table
+                    .row_store
+                    .must_get_row_page_exclusive(&guards, page_id)
+                    .await
+                    .unwrap();
+                assert_eq!(page.page().header.row_count(), 0);
+                assert!(page.page().is_deleted(0));
+            }
+            for (slot, disable_validation) in [false, true].into_iter().enumerate() {
+                let current_row = row_id + slot as u64;
+                let kinds = [
+                    RowRedoKind::Insert(page_id, vec![Val::I32(1), Val::from("initial")]),
+                    RowRedoKind::Update(
+                        page_id,
+                        vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("replacement bytes"),
+                        }],
+                    ),
+                ];
+                let ops: Vec<_> = kinds
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, kind)| ReplayOp {
+                        cts: TrxID::new(20 + idx as u64),
+                        row: RowRedo {
+                            row_id: current_row,
+                            kind,
+                        },
+                    })
+                    .collect();
+                let counts = table
+                    .recover_row_batch(&guards, &mut replay, &ops, disable_validation)
+                    .await
+                    .unwrap();
+                assert_eq!(counts.inserts, 1);
+                assert_eq!(counts.updates, 1);
+                assert!(replay.is_inserted(slot));
+                let page = table
+                    .row_store
+                    .must_get_row_page_exclusive(&guards, page_id)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page.page().row(slot).clone_vals(&table.metadata().col),
+                    vec![Val::I32(1), Val::from("replacement bytes")]
+                );
             }
         });
     }

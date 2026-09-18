@@ -114,7 +114,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         debug_assert!(self.metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(self.metadata.col.as_ref(), &cols);
+        let var_len = var_len_for_insert(self.metadata.col.as_ref(), cols.as_slice());
         let (row_idx, var_offset) =
             if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                 (row_idx, var_offset)
@@ -138,7 +138,7 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         // Apply insert
         let mut new_row = page.new_row(row_idx, var_offset);
         for v in &cols {
-            new_row.add_col(self.metadata.col.as_ref(), v);
+            new_row.add_col(self.metadata.col.as_ref(), v.view());
         }
         let new_row_id = new_row.finish();
         debug_assert!(new_row_id == row_id);
@@ -530,7 +530,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         let page = page_guard.page();
         debug_assert!(
             DmlValidator::new(self.metadata)
-                .validate_sparse_update(&update)
+                .validate_sparse_update(update.as_slice())
                 .is_ok(),
             "row update values must be ordered, in range, and type-compatible"
         );
@@ -572,7 +572,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         let page_id = self.page_guard.page_id();
         debug_assert!(
             DmlValidator::new(self.metadata)
-                .validate_sparse_update(&update)
+                .validate_sparse_update(update.as_slice())
                 .is_ok(),
             "row update values must be ordered, in range, and type-compatible"
         );
@@ -606,7 +606,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                         if self.metadata.idx.index_columns().contains(&idx) {
                             index_change_cols.insert(idx, old_val.clone());
                         }
-                        row.update_col(self.metadata.col.as_ref(), idx, &val);
+                        row.update_col(self.metadata.col.as_ref(), idx, val.view());
                         undo_cols.push(UndoCol {
                             idx,
                             val: old_val,

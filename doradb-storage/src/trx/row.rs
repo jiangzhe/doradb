@@ -1406,7 +1406,7 @@ impl<'a> RowWriteAccess<'a> {
                         column_layout,
                         self.row_idx,
                         uc.idx,
-                        &uc.val,
+                        uc.val.view(),
                         uc.var_offset.unwrap_or(0) as usize,
                         true,
                     );
@@ -1954,7 +1954,7 @@ pub(crate) mod tests {
                         page.header.var_field_offset(),
                         page.header.var_field_offset(),
                     )
-                    .update_col(metadata.col.as_ref(), 0, &Val::from(11i32));
+                    .update_col(metadata.col.as_ref(), 0, Val::from(11i32).view());
             } else {
                 test_row_write_access(&page, &row_ver, &dirty, 0).delete_row();
             }
@@ -2199,7 +2199,14 @@ pub(crate) mod tests {
         );
         {
             let _access = test_row_write_access(&page, &row_ver, &dirty, 0);
-            page.update_col(metadata.col.as_ref(), 0, 0, &Val::from(11i32), 0, true);
+            page.update_col(
+                metadata.col.as_ref(),
+                0,
+                0,
+                Val::from(11i32).view(),
+                0,
+                true,
+            );
         }
         {
             let mut access = test_row_write_access(&page, &row_ver, &dirty, 1);

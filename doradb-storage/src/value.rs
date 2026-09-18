@@ -263,10 +263,29 @@ impl Hash for Val {
 }
 
 impl Val {
+    /// Borrows this value without allocating or copying its byte payload.
+    #[inline]
+    pub(crate) fn view(&self) -> ValRef<'_> {
+        match self {
+            Val::Null => ValRef::Null,
+            Val::I8(value) => ValRef::I8(*value),
+            Val::U8(value) => ValRef::U8(*value),
+            Val::I16(value) => ValRef::I16(*value),
+            Val::U16(value) => ValRef::U16(*value),
+            Val::I32(value) => ValRef::I32(*value),
+            Val::U32(value) => ValRef::U32(*value),
+            Val::F32(value) => ValRef::F32(*value),
+            Val::I64(value) => ValRef::I64(*value),
+            Val::U64(value) => ValRef::U64(*value),
+            Val::F64(value) => ValRef::F64(*value),
+            Val::VarByte(value) => ValRef::VarByte(value.as_bytes()),
+        }
+    }
+
     /// Returns true when this value is null.
     #[inline]
     pub fn is_null(&self) -> bool {
-        matches!(self, Val::Null)
+        self.view().is_null()
     }
 
     /// Returns this value as `u8`, when it has that kind.
@@ -390,28 +409,13 @@ impl Val {
     /// Returns the non-null kind for this value.
     #[inline]
     pub fn kind(&self) -> Option<ValKind> {
-        let kind = match self {
-            Val::Null => return None,
-            Val::I8(_) => ValKind::I8,
-            Val::U8(_) => ValKind::U8,
-            Val::I16(_) => ValKind::I16,
-            Val::U16(_) => ValKind::U16,
-            Val::I32(_) => ValKind::I32,
-            Val::U32(_) => ValKind::U32,
-            Val::F32(_) => ValKind::F32,
-            Val::I64(_) => ValKind::I64,
-            Val::U64(_) => ValKind::U64,
-            Val::F64(_) => ValKind::F64,
-            Val::VarByte(_) => ValKind::VarByte,
-        };
-        Some(kind)
+        self.view().kind()
     }
 
     /// Returns true when this value is null or has the requested kind.
     #[inline]
     pub fn matches_kind(&self, kind: ValKind) -> bool {
-        // null matches all types.
-        self.kind().map(|k| k == kind).unwrap_or(true)
+        self.view().matches_kind(kind)
     }
 
     #[inline]
@@ -456,69 +460,7 @@ impl Val {
 impl fmt::Debug for Val {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // f.debug_struct("Val").finish()
-        match self {
-            Val::Null => f.pad("Null"),
-            Val::I8(v) => {
-                f.pad("i8(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::U8(v) => {
-                f.pad("u8(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::I16(v) => {
-                f.pad("i16(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::U16(v) => {
-                f.pad("u16(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::I32(v) => {
-                f.pad("i32(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::U32(v) => {
-                f.pad("u32(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::F32(v) => {
-                f.pad("f32(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::I64(v) => {
-                f.pad("i64(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::U64(v) => {
-                f.pad("u64(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::F64(v) => {
-                f.pad("f64(")?;
-                write!(f, "{}", v)?;
-                f.pad(")")
-            }
-            Val::VarByte(v) => {
-                f.pad("bytes(")?;
-                if let Ok(s) = str::from_utf8(v.as_bytes()) {
-                    f.write_str(s)?;
-                } else {
-                    write!(f, "{:?}", v.as_bytes())?;
-                }
-                f.pad(")")
-            }
-        }
+        self.view().fmt(f)
     }
 }
 
@@ -715,6 +657,127 @@ impl Deser for Val {
                 let (idx, s) = input.deser(idx, len as usize)?;
                 let v = MemVar::from(s);
                 Ok((idx, Val::VarByte(v)))
+            }
+        }
+    }
+}
+
+/// A short-lived value view borrowing bytes from its input owner.
+/// Scalar payloads retain their exact bits, including floating-point values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValRef<'a> {
+    Null,
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    F32(OrderedFloat<f32>),
+    I64(i64),
+    U64(u64),
+    F64(OrderedFloat<f64>),
+    VarByte(&'a [u8]),
+}
+
+impl ValRef<'_> {
+    /// Returns true when this value is null.
+    #[inline]
+    pub(crate) fn is_null(&self) -> bool {
+        matches!(self, ValRef::Null)
+    }
+
+    /// Returns the non-null kind for this value.
+    #[inline]
+    pub(crate) fn kind(&self) -> Option<ValKind> {
+        let kind = match self {
+            ValRef::Null => return None,
+            ValRef::I8(_) => ValKind::I8,
+            ValRef::U8(_) => ValKind::U8,
+            ValRef::I16(_) => ValKind::I16,
+            ValRef::U16(_) => ValKind::U16,
+            ValRef::I32(_) => ValKind::I32,
+            ValRef::U32(_) => ValKind::U32,
+            ValRef::F32(_) => ValKind::F32,
+            ValRef::I64(_) => ValKind::I64,
+            ValRef::U64(_) => ValKind::U64,
+            ValRef::F64(_) => ValKind::F64,
+            ValRef::VarByte(_) => ValKind::VarByte,
+        };
+        Some(kind)
+    }
+
+    /// Returns true when this value is null or has the requested kind.
+    #[inline]
+    pub(crate) fn matches_kind(&self, kind: ValKind) -> bool {
+        // null matches all types.
+        self.kind().map(|k| k == kind).unwrap_or(true)
+    }
+}
+
+impl fmt::Debug for ValRef<'_> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValRef::Null => f.pad("Null"),
+            ValRef::I8(v) => {
+                f.pad("i8(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::U8(v) => {
+                f.pad("u8(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::I16(v) => {
+                f.pad("i16(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::U16(v) => {
+                f.pad("u16(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::I32(v) => {
+                f.pad("i32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::U32(v) => {
+                f.pad("u32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::F32(v) => {
+                f.pad("f32(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::I64(v) => {
+                f.pad("i64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::U64(v) => {
+                f.pad("u64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::F64(v) => {
+                f.pad("f64(")?;
+                write!(f, "{}", v)?;
+                f.pad(")")
+            }
+            ValRef::VarByte(v) => {
+                f.pad("bytes(")?;
+                if let Ok(s) = str::from_utf8(v) {
+                    f.write_str(s)?;
+                } else {
+                    write!(f, "{:?}", v)?;
+                }
+                f.pad(")")
             }
         }
     }
@@ -1716,5 +1779,99 @@ mod tests {
         assert!(format!("{:?}", utf8) == "bytes(hi)");
         let non_utf8 = Val::VarByte(MemVar::from(&[0xffu8][..]));
         assert!(format!("{:?}", non_utf8) == "bytes([255])");
+    }
+
+    #[test]
+    fn test_value_views_preserve_variants_and_scalar_bits() {
+        let cases = [
+            (Val::Null, ValRef::Null),
+            (Val::I8(i8::MIN), ValRef::I8(i8::MIN)),
+            (Val::I8(i8::MAX), ValRef::I8(i8::MAX)),
+            (Val::U8(u8::MIN), ValRef::U8(u8::MIN)),
+            (Val::U8(u8::MAX), ValRef::U8(u8::MAX)),
+            (Val::I16(i16::MIN), ValRef::I16(i16::MIN)),
+            (Val::I16(i16::MAX), ValRef::I16(i16::MAX)),
+            (Val::U16(u16::MIN), ValRef::U16(u16::MIN)),
+            (Val::U16(u16::MAX), ValRef::U16(u16::MAX)),
+            (Val::I32(i32::MIN), ValRef::I32(i32::MIN)),
+            (Val::I32(i32::MAX), ValRef::I32(i32::MAX)),
+            (Val::U32(u32::MIN), ValRef::U32(u32::MIN)),
+            (Val::U32(u32::MAX), ValRef::U32(u32::MAX)),
+            (Val::I64(i64::MIN), ValRef::I64(i64::MIN)),
+            (Val::I64(i64::MAX), ValRef::I64(i64::MAX)),
+            (Val::U64(u64::MIN), ValRef::U64(u64::MIN)),
+            (Val::U64(u64::MAX), ValRef::U64(u64::MAX)),
+        ];
+        for (owned, expected) in cases {
+            assert_eq!(owned.view(), expected);
+            assert_eq!(owned.kind(), expected.kind());
+            assert_eq!(owned.is_null(), expected.is_null());
+            for kind in [ValKind::I8, ValKind::U64, ValKind::VarByte] {
+                let matches = expected.is_null() || expected.kind() == Some(kind);
+                assert_eq!(owned.matches_kind(kind), matches);
+                assert_eq!(expected.matches_kind(kind), matches);
+            }
+            assert_eq!(format!("{owned:?}"), format!("{expected:?}"));
+        }
+        for value in [
+            0.0f32,
+            -0.0,
+            1.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc01234),
+        ] {
+            let owned = Val::from(value);
+            let ValRef::F32(view) = owned.view() else {
+                panic!("expected f32")
+            };
+            assert_eq!(view.to_bits(), value.to_bits());
+            assert_eq!(owned.kind(), Some(ValKind::F32));
+            assert_eq!(format!("{:?}", owned.view()), format!("f32({value})"));
+        }
+        for value in [
+            0.0f64,
+            -0.0,
+            2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8000000001234),
+        ] {
+            let owned = Val::from(value);
+            let ValRef::F64(view) = owned.view() else {
+                panic!("expected f64")
+            };
+            assert_eq!(view.to_bits(), value.to_bits());
+            assert_eq!(owned.kind(), Some(ValKind::F64));
+            assert_eq!(format!("{:?}", owned.view()), format!("f64({value})"));
+        }
+    }
+
+    #[test]
+    fn test_value_views_borrow_inline_and_outlined_bytes() {
+        for len in [0, 6, 7, 14, 15, 128] {
+            let input = vec![b'x'; len];
+            let owned = Val::from(input.as_slice());
+            let ValRef::VarByte(bytes) = owned.view() else {
+                panic!("expected bytes")
+            };
+            assert_eq!(bytes, input);
+            assert_eq!(bytes.as_ptr(), owned.as_bytes().unwrap().as_ptr());
+            assert_eq!(bytes.len(), len);
+            assert!(!owned.view().is_null());
+            assert_eq!(owned.view().kind(), Some(ValKind::VarByte));
+            assert_eq!(
+                format!("{:?}", owned.view()),
+                format!("bytes({})", "x".repeat(len))
+            );
+        }
+        assert_ne!(ValRef::Null, ValRef::VarByte(b""));
+        for (bytes, expected) in [
+            (b"hello".as_slice(), "bytes(hello)"),
+            (&[0xff, 0, 0x80], "bytes([255, 0, 128])"),
+        ] {
+            assert_eq!(format!("{:?}", ValRef::VarByte(bytes)), expected);
+            assert_eq!(format!("{:?}", Val::from(bytes)), expected);
+        }
     }
 }
