@@ -1,182 +1,71 @@
 # Issue Tracking and Planning
 
-**IMPORTANT**: This project uses a "Document-First" approach for all significant work.
-- **Planning**: All work must be documented in `docs/tasks/` or `docs/rfcs/` *before* implementation.
-- **Tracking**: Use **GitHub Issues** via `gh` CLI for creation and read-only tracking.
+Document work in a task or RFC before implementation. Use GitHub Issues via `gh` for creation and read-only tracking.
 
-## Planning: Tasks & RFCs
+## Planning
 
-Before writing code, you must create a planning document in the repository.
-`docs/backlogs/` is used for brief follow-up todos and does not replace task/RFC planning documents for implementation.
-Backlog files use:
-- open: `docs/backlogs/<6digits>-<topic>.md`
-- closed/archived: `docs/backlogs/closed/<6digits>-<topic>.md`
+Analyze the background, codebase, scope, and possible solutions before creating the planning document.
 
-### 1. Tasks (Small/Simple)
-- **Scope**: Narrow, well-defined changes (e.g., bug fixes, small features, refactoring).
-- **Location**: `docs/tasks/<nnnnnn>-<description>.md`
-- **Template**: Use `docs/tasks/000000-template.md`.
-- **Workflow**: Use `$task-create` -> Use `$issue-task` -> Implement -> Use `$task-resolve`.
-- **Resolve rule**: During `$task-resolve`, always check whether the task belongs to an RFC; if yes, sync the corresponding RFC `Implementation Phases`.
+| Kind | Scope | Location | Template |
+| --- | --- | --- | --- |
+| Task | Bug fixes, small features, focused refactoring | `docs/tasks/<6digits>-<description>.md` | [Task](../tasks/000000-template.md) |
+| RFC | Architectural changes, new subsystems, complex implementations | `docs/rfcs/<4digits>-<description>.md` | [RFC](../rfcs/0000-template.md) |
 
-### 2. RFCs (Large/Complex)
-- **Scope**: Large architectural changes, new subsystems, or complex implementations.
-- **Location**: `docs/rfcs/<nnnn>-<description>.md`
-- **Template**: Use `docs/rfcs/0000-template.md`.
-- **Workflow**: Create draft RFC (`status: draft`) -> Formalize (`proposal`/`accepted`) -> Use `$issue-rfc` -> Break into Tasks -> Implement -> Resolve (`implemented`/`superseded`).
+- **Tasks:** [$task-create](../../.codex/skills/task-create/SKILL.md) → [$issue-task](../../.codex/skills/issue-task/SKILL.md) → implement → [$task-resolve](../../.codex/skills/task-resolve/SKILL.md).
+- **RFCs:** [$rfc-create](../../.codex/skills/rfc-create/SKILL.md): draft (`draft`) → formalize (`proposal`/`accepted`) → [$issue-rfc](../../.codex/skills/issue-rfc/SKILL.md) → break into tasks → implement → [$rfc-resolve](../../.codex/skills/rfc-resolve/SKILL.md) (`implemented`/`superseded`).
+- **Branches:** Create a task branch, rebase it onto `main`, and push it upstream before implementation; keep implementation changes on that branch.
+- **Resolution:** Always check whether a task belongs to an RFC; if so, synchronize the RFC's `Implementation Phases` during `$task-resolve`.
 
-## Quick Start (with `gh` CLI)
+Backlogs are brief follow-up todos, not implementation plans. Use `docs/backlogs/<6digits>-<topic>.md` for open items and `docs/backlogs/closed/<6digits>-<topic>.md` for closed or archived items.
+
+## Issue Creation
+
+Use `$issue-task` or `$issue-rfc` and its `tools/issue.rs create-issue-from-doc` command to file the planning document as an issue.
+
+- Resolve ID-only inputs to a document path first, e.g. `tools/doc-id.rs search-by-id --kind task --id 000047 --scope open`.
+- Creation must be non-interactive: provide `--title` and `--body` or `--body-file` to `gh`. The helper uses `--body-file`, removes its temporary file, assigns `@me`, and records the issue number as `github_issue` in the planning document.
+- Generated bodies include planning metadata plus `Summary`, `Context`, `Goals`, and `Non-Goals` for tasks; `Summary`, `Context`, and `Decision` for RFCs.
+- Create the RFC epic first. Read its `github_issue` and pass `--parent <issue-number>` when creating each phase task to establish the native sub-issue relationship in the same command.
+- Keep the hierarchy flat: epic → tasks. Label parents `type:epic` and children `type:task` or `type:feature`.
+- Do not add textual parent references such as `Part of #<number>` or link the parent again after creation. Reference other related work with `Ref #<number>` in the body.
+
+## Labels
+
+Use labels to define type and priority.
+
+**Types:**
+
+- `type:doc` — documentation
+- `type:perf` — performance
+- `type:question` — research or questions
+- `type:bug` — broken behavior
+- `type:feature` — new functionality
+- `type:chore` — repository or tooling maintenance
+- `type:task` — work items such as tests, docs, or refactoring
+- `type:epic` — large feature tracking
+
+**Priorities:**
+
+- `priority:critical` (P0) — security, data loss, broken builds
+- `priority:high` (P1) — major features, important bugs
+- `priority:medium` (P2) — default, nice-to-have
+- `priority:low` (P3) — polish, optimization
+
+Use `codex` for tasks intended for Codex implementation.
+
+For `create-issue-from-doc`, CLI `--labels` override the planning document's `Issue Labels:` metadata for `type:*` and `priority:*`; `codex` is included if either source supplies it. Missing values default to `type:task` for tasks, `type:epic` for RFCs, and `priority:medium`.
+
+## Tracking and Constraints
+
+Always use `--json` when listing issues. Add `--label "priority:high"` or another label to filter results.
 
 ```bash
-# Find unassigned, open issues (Ready work)
+# Unassigned open issues
 gh issue list --state open -S "no:assignee" --json number,title,labels,body
 
-# Create new issues (Labels replace strict types/priorities)
-gh issue create --title "Issue title" --body "Description" --label "type:bug,priority:high" --assignee "@me"
-gh issue create --title "Subtask" --body "Description" --label "type:task" --assignee "@me" --parent 123
-
-# Check your current tasks
+# Your open issues
 gh issue list --assignee "@me" --state open --json number,title
 ```
 
-## Handle Body-Too-Long Problem
-
-If issue body is too long, use `gh issue create --title "..." --body "..."` may fail.
-To solve this problem, create a temporary file, e.g. `issue-description.txt`. Then use follow command to create issue.
-
-```bash
-gh issue create --title "Issue title" --body-file issue-description.txt --label "type:task"
-```
-
-Do NOT forget to remove the temporary file once issue is created successfully.
-
-## Labels & Taxonomy
-
-Since GitHub does not have strict fields for type/priority, use **Labels**:
-
-**Type Labels:**
-- `type:doc` - Documentation work
-- `type:perf` - Performance-focused work
-- `type:question` - Research/question tracking
-- `type:bug` - Something broken
-- `type:feature` - New functionality
-- `type:chore` - Repository/tooling maintenance work
-- `type:task` - Work item (tests, docs, refactoring)
-- `type:epic` - Large feature tracking
-
-**Priority Labels:**
-- `priority:critical` (P0) - Security, data loss, broken builds
-- `priority:high` (P1) - Major features, important bugs
-- `priority:medium` (P2) - Default, nice-to-have
-- `priority:low` (P3) - Polish, optimization
-
-**Special Labels:**
-- `codex` - Task intended for Codex implementation flow
-
-For `tools/issue.rs create-issue-from-doc`, labels can come from CLI `--labels` and/or planning-doc metadata (`Issue Labels:` block). CLI `type:*`/`priority:*` override metadata values, and `codex` is unioned.
-
-`tools/issue.rs create-issue-from-doc` always creates the issue with `--body-file`.
-The generated issue body includes planning metadata plus the key context sections
-developers need when reading only GitHub:
-- task docs include `Summary`, `Context`, `Goals`, and `Non-Goals`
-- RFC docs include `Summary`, `Context`, and `Decision`
-
-For id-only shorthand inputs, resolve planning doc path first:
-```bash
-tools/doc-id.rs search-by-id --kind task --id 000047 --scope open
-```
-
-When creating from planning docs with no explicit type/priority from either source:
-- task docs default to `type:task`
-- RFC docs default to `type:epic`
-- priority defaults to `priority:medium`
-
-## Epic & Subtask Management
-
-GitHub supports native sub-issues. Create the RFC issue first, then pass its
-issue number with `--parent` while creating each phase task.
-
-### Workflow: Create Epic and Children
-
-Since you are an AI, you must execute this in a sequence where you capture the output of the first command.
-
-#### 1. Create the Epic (Parent)
-Create the parent issue first and define it as an `epic`. Store the resulting
-issue number as `github_issue` in the RFC planning document.
-
-```bash
-gh issue create \
-  --title "Epic: Refactor Database Layer" \
-  --body "High-level goal for the refactoring." \
-  --label "type:epic" \
-  --assignee "@me"
-```
-
-#### 2. Create Sub-issues (Children)
-Read the RFC document's `github_issue` value and create each phase task with
-that number as the native parent. Use one `gh issue create` command and do not
-add a textual parent reference to the body.
-
-```bash
-# Create sub-tasks referencing the parent (e.g., #42)
-gh issue create \
-  --title "Design Schema" \
-  --body "Define new tables." \
-  --label "type:task" \
-  --assignee "@me" \
-  --parent 42
-
-gh issue create \
-  --title "Migration Script" \
-  --body "Write SQL migration." \
-  --label "type:task" \
-  --assignee "@me" \
-  --parent 42
-```
-
-### Epic Rules
-
-- ✅ **Labeling**: Always tag the parent with `type:epic` and children with `type:task` or `type:feature`.
-- ✅ **Linking**: Pass `--parent <ParentID>` during child creation so GitHub records a native sub-issue relationship.
-- ❌ **No Duplicate Link**: Do not add `Part of #<ParentID>` to the body or link the issue again after creation.
-- ❌ **No Nested Epics**: Avoid creating Epics inside Epics (Grandparent -> Parent -> Child). Keep hierarchy flat (Epic -> Tasks) for simplicity.
-
-## Workflow for AI Agents
-
-1.  **Plan**:
-    *   This step is often triggered by a user command.
-    *   Perform solid analysis on background, codebase, problem scope, and potential solutions.
-    *   **Output**: Create a Task or RFC document in `docs/tasks/` or `docs/rfcs/`.
-
-2.  **File Issue**:
-    *   File a GitHub issue based on the created Task/RFC document.
-    *   Use `$issue-task` for a task document or `$issue-rfc` for an RFC document.
-    *   Use the selected skill's `tools/issue.rs create-issue-from-doc` command.
-
-3.  **Branch**:
-    *   Create a new branch for the task.
-    *   Ensure it is rebased to `main` first.
-    *   Push the branch to upstream.
-
-4.  **Implement**:
-    *   Perform implementation and bug fixes.
-    *   Update the new branch with these changes.
-
-## CLI Rules & Data Format
-
-- **JSON Output**: Always use `--json` when listing issues to get machine-readable output.
-  - Example: `gh issue list --json number,title,state,body,labels`
-- **Non-Interactive**: Always provide required flags (`--title`, `--body`) when creating issues to avoid interactive prompts hanging the session.
-- **Filtering**: Use `--label "..."` to filter lists (e.g., `gh issue list --label "priority:high"`).
-
-## CLI Help
-
-Run `gh <command> --help` to see all available flags for any command.
-
-## Important Rules
-
-- ✅ Use `gh` CLI for issue creation and read-only tracking.
-- ✅ Use **Labels** strictly to define Type and Priority.
-- ✅ Link related work by mentioning "Ref #<number>" in the issue body.
-- ❌ Do NOT create markdown TODO lists in source code.
-- ❌ Issue mutation after creation is outside this workflow.
+- Issue mutation after creation is outside this workflow.
+- Do not create Markdown TODO lists in source code.
