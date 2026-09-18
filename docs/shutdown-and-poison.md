@@ -1,820 +1,259 @@
 # Shutdown and Engine Poison
 
-This document is the canonical contract for engine shutdown, fatal runtime
-poison, and waits that can observe either condition. Subsystem documents should
-describe their local state machines and refer here for lifecycle, error,
-cancellation, and wakeup policy.
+This document describes the engine-wide model and guarantees for shutdown,
+fatal runtime poison, and the work affected by either condition. Subsystem
+documents and code own their local algorithms and state machines.
 
-In this document, *poison* means Doradb's explicit engine-level
-`EnginePoisoner`. It is unrelated to standard-library mutex poisoning.
+Here, *poison* means Doradb's explicit engine-level `EnginePoisoner`, unrelated
+to standard-library mutex poisoning.
 
-## The Three Independent Questions
+## Lifecycle, Health, and Ownership
 
-Correct behavior depends on three independent facts:
+Three independent questions determine what an operation may do:
 
-1. **Engine lifecycle**: is the engine `Running`, `ShuttingDown`, or `Shutdown`?
-2. **Engine health**: is this engine instance healthy or irreversibly
-   `Poisoned`?
-3. **Work ownership**: is the work still reversible preparation, already
-   accepted execution, or terminal cleanup?
+1. **Lifecycle:** is the engine `Running`, `ShuttingDown`, or `Shutdown`?
+2. **Health:** is this engine instance healthy or irreversibly poisoned?
+3. **Ownership:** is the work reversible preparation, accepted execution, or
+   terminal cleanup?
 
-Poison and shutdown are deliberately separate axes. Poison says that normal
-storage work must no longer be admitted and that a reversible wait may have
-lost its progress producer. Shutdown says that owner teardown has started and
-new lifecycle admission is closed. Neither transition implies the other.
+Shutdown closes admission and coordinates teardown. Poison records that normal
+storage work is no longer safe and that some waits may have lost their source
+of progress. Neither transition implies the other.
 
-| Lifecycle and health | Foreground admission | Already accepted work | Inspection |
-| --- | --- | --- | --- |
-| `Running` and healthy | admitted | runs normally | available |
-| `Running` and poisoned | rejected as Fatal | follows its ownership policy | selected read-only diagnostics remain available |
-| `ShuttingDown`, healthy or poisoned | rejected as Lifecycle shutdown | drains or performs terminal cleanup | no new inspection admission |
-| `Shutdown` | unavailable | no runnable work may remain; the graph is terminal | unavailable |
+| Lifecycle and health | New foreground work | Existing work and inspection |
+| --- | --- | --- |
+| Running, healthy | Admitted | Normal execution and inspection |
+| Running, poisoned | Rejected as Fatal | Existing ownership still applies; selected read-only diagnostics remain available |
+| ShuttingDown, healthy or poisoned | Rejected as Lifecycle shutdown | Existing owners drain; no new inspection admission |
+| Shutdown | Unavailable | Terminal engine; no runnable work remains |
 
-Both axes are monotonic for one engine instance. Lifecycle never moves
-backward, poison has no reset or epoch, and poison state is not persisted as a
-storage-format field. A fresh instance requires the old instance to release
-storage ownership, normally through shutdown and otherwise through process
-termination, followed by a new bootstrap/recovery attempt.
+Lifecycle moves only from `Running` to `ShuttingDown` to `Shutdown`. Poison is
+sticky for one engine instance, has no reset, and is not persisted as storage
+metadata. A fresh instance requires release of the old instance's storage
+ownership, normally through shutdown or otherwise through process termination,
+followed by a new bootstrap and recovery attempt.
 
 ## Engine Poison
 
-### State and publication
-
-`EnginePoisoner` contains three pieces of state:
-
-- an atomic sticky poisoned flag;
-- the first source-bearing `Fatal` report, retained in shared form; and
-- a one-shot event used only to wake waits that must reconsider engine health.
-
-Publication follows this order:
-
-1. capture the caller's complete Fatal report, including source frames and
-   attachments;
-2. store it as the canonical reason only if no earlier reason exists;
-3. publish the poisoned flag with release ordering; and
-4. only for the first healthy-to-poisoned transition, notify all listeners
-   registered at that time.
-
-The reason is stored before the flag becomes observable. A health check that
-loads the flag with acquire ordering can therefore reconstruct the canonical
-report immediately; `poisoned == true` with no stored reason is an invariant
-violation.
-
-Concurrent or repeated poison calls do not replace the canonical reason and do
-not emit another poison wake. `poison()` and `poison_shared()` return the
-publisher's local Fatal report; `poison_and_get_first()` returns the stored
-first failure. This distinction is intentional:
-
-- engine admission and unrelated waiters report the first canonical failure;
-- a producer that discovers a later fatal failure may return its own local
-  failure to the direct caller; and
-- later context may be attached while forwarding either report, but its Fatal
-  domain and underlying source chain must not be replaced.
-
-The event is not durable state. A listener installed after the one transition
-will not be notified by a later poison call. The atomic health flag and stored
-reason are the durable truth; every poison-aware wait must use listener
-registration plus sticky health rechecks.
-
-At the API level, `poison_error()` and `ensure_healthy()` reconstruct the
-canonical first report, `listener()` supplies only the wake hint, `poison()`
-captures a local typed report, and `poison_shared()` republishes an already
-captured shared Fatal without rebuilding it. `poison_and_get_first()` publishes
-a local report and returns the cached first shared Fatal for rollback callers.
-Completed publication guarantees a stored reason, so this method requires no
-fallback to the local error.
-
-### Fatal reasons
-
-The current Fatal classifications describe the policy boundary that decided
-continued normal execution was unsafe:
-
-| Fatal reason | Typical boundary |
-| --- | --- |
-| `Poisoned` | a catalog, table, or index owner crossed a retry boundary or could no longer compensate or publish one unambiguous state |
-| `RedoWrite` | redo data or redo-header write could not preserve ordered durability |
-| `RedoSync` | a required redo or rotated-file seal sync failed |
-| `StorageIo` | the shared storage backend could no longer make reliable submit/wait progress |
-| `CheckpointWrite` | checkpoint work failed after transition or publication became irreversible |
-| `CatalogWrite` | catalog-backed checkpoint metadata failed after its irreversible gate |
-| `PurgeDeallocate` | purge could not safely destroy or deallocate retired storage |
-| `PurgeAccess` | purge could not access state required for safe reclamation |
-| `RollbackAccess` | rollback could not access state required to undo or release ownership safely |
-| `MandatoryTaskPanic` | accepted mandatory execution panicked under its supervisor |
-| `ThreadPoolTaskPanic` | an accepted synchronous or asynchronous pool job panicked |
-| `ThreadPoolUnavailable` | internal work was submitted while the thread pool was unavailable |
-
-Fatal is a policy decision, not a synonym for I/O failure. The owning policy
-boundary stacks the appropriate `FatalError` over the initiating I/O,
-Runtime, DataIntegrity, Resource, panic, or invariant evidence. An already
-Fatal report passes through unchanged.
-
-A shared storage backend progress failure is captured once as
-`FatalError::StorageIo -> IoError -> BackendError` before failing affected
-requests. Request completions clone that shared failure. Buffer and file
-consumers reconstruct its Fatal arm without adding Runtime. Ordinary individual
-request I/O failures still acquire the consuming Runtime context. Pool-generic
-code exposes the pool's native associated error: fixed pools remain Runtime,
-while evictable pools and persisted reads can return Runtime or Fatal.
-
-The operation receives the failure that interrupted it, even when engine poison
-already retains a different first Fatal. Health checks continue to return that
-first report; forwarding an incoming Fatal does not republish or replace it.
-
-### What poison does
-
-Poison has four effects:
-
-1. normal effectful admission and ordinary healthy-runtime observation reject
-   with the canonical Fatal report;
-2. mandatory caller-capacity waiters and semantic waits whose progress may be
-   stranded are woken;
-3. affected reversible attempts unwind through their existing ownership
-   guards; and
-4. future health checks keep returning the canonical first Fatal report.
-
-At a public boundary, poison remains `ErrorKind::Fatal`. It must not be
-reinterpreted as Runtime, Lifecycle, Operation, or a generic catalog-access
-error. Pairwise carriers and `QuadError` preserve the native Fatal arm until
-the public facade discloses it.
-
-The narrow internal propagation contracts are:
-
-- poison-aware logical-lock acquisition combines only Operation and Fatal;
-- prepare-or-poison waiting and hot row-lock acquisition return Fatal at their
-  narrow layer, while affected hot delete/update operations combine it with
-  their existing Operation result;
-- user-table seams where Operation, Runtime, and Fatal meet use the existing
-  `QuadError` arms without a public-error round trip;
-- catalog mutation and private DDL statement staging preserve Runtime versus
-  Fatal until their existing public disclosure boundary; and
-- an Operation or Lifecycle arm proven impossible by an internal catalog
-  invariant remains an assertion rather than a conversion target for Fatal.
-
-Caller-owned operation, phase, table, row, and lock context may be attached at
-each boundary. Those attachments supplement the canonical first report; they
-must not erase its original Fatal context or source frames.
-
-### What poison does not do
-
-Poison does **not**:
-
-- move engine lifecycle to `ShuttingDown`;
-- call `Engine::shutdown()` or stop component workers;
-- revoke accepted logical-lock claims;
-- globally drain the lock manager or session registry;
-- cancel accepted DDL, maintenance, redo, I/O, or mandatory execution;
-- interrupt commit/rollback ownership after its accepted handoff;
-- release unsafe rollback or failed-precommit state;
-- provide a timeout, deadlock victim, client-cancellation, or thread
-  preemption mechanism; or
-- guarantee that shutdown can eventually complete.
-
-The last point is essential. A rollback-access failure or panic policy may
-retain ownership in `FailedRetained` because dropping it would be unsafe.
-That retained session operation remains a shutdown blocker indefinitely.
-Poison protects correctness; it is not a promise of recoverable in-process
-teardown.
-
-## Admission and Acceptance Boundaries
-
-### Normal foreground admission
-
-Normal engine, session, and non-terminal transaction entry follows this
-logical order:
-
-1. acquire lifecycle admission while the engine is still `Running`;
-2. upgrade and validate the exact session or transaction state;
-3. check engine health where the operation requires a healthy runtime;
-4. publish a stable session operation or observer record; and
-5. release the short-lived lifecycle admission token.
-
-The lifecycle admission token closes the race with shutdown. Once it is
-released, the stable session entry or observer count is the durable proof that
-shutdown must drain that work. A poison failure drops the admission token and
-does not publish a new operation.
-
-Lifecycle is checked before health on ordinary engine/session admission.
-Consequently, a running poisoned engine normally returns Fatal, while an
-engine whose shutdown admission is already closed returns Lifecycle shutdown
-even if poison was also published. This is admission ordering, not a global
-rule that Lifecycle always outranks Fatal.
-
-`Session::list_table_ids()` and the transaction-system, storage-I/O,
-buffer-pool, mandatory-runtime, and logical-lock statistics snapshots are
-explicit exceptions. They use lifecycle-pinned, read-only inspection that
-skips health validation, so operators can diagnose a poisoned engine while it
-is still running. They still fail after session close, registry removal, or
-engine shutdown and must not create new runtime work.
-
-`Session::close()` is ordinary healthy-runtime admission. It can be used while
-healthy; an open session on a running poisoned engine reports Fatal instead of
-acting as a poison-bypass teardown API. Engine shutdown and the existing
-terminal/abandonment machinery own poisoned-engine cleanup.
-
-### Reversible preparation
-
-Preparation is reversible while an exact guard or owner can synchronously
-remove everything the attempt has published. Examples include a queued
-logical-lock request, a caller waiting for mandatory capacity, and a row-write
-attempt waiting for a foreign preparing transaction.
-
-If poison can strand the normal progress producer, the semantic waiter must
-race poison and return Fatal only after its existing guard has made cleanup
-inevitable. Poison does not introduce a second rollback state machine.
-
-### Accepted execution
-
-An operation becomes accepted at its documented consuming handoff. Examples
-are:
-
-- consuming a mandatory caller permit and transferring the prepared owner;
-- enqueueing a prepared transaction into ordered group commit;
-- submitting I/O with an owner and completion path;
-- transferring responsibility for a finite job to the thread pool;
-- entering an irreversible checkpoint or DDL publication section; and
-- claiming a transaction for terminal rollback.
-
-Poison published after that handoff does not retroactively cancel the work.
-The accepted owner must finish, publish its own error, retain unsafe state, or
-run terminal cleanup according to its domain contract. Shutdown drains the
-same owner.
-
-Mandatory caller admission illustrates the boundary. Before acceptance, its
-capacity wait races engine poison and is closed by shutdown. A successfully
-acquired permit is the poison-race linearization point; synchronous acceptance
-then transfers the complete operation to engine ownership with no intervening
-await. Later poison cannot detach the accepted task, and dropping its result
-observer cannot cancel it.
-
-### Terminal and cleanup authority
-
-Terminal paths reuse already established authority instead of asking for new
-foreground admission. This allows an active transaction to commit or roll
-back after clean shutdown has started, and allows abandoned, terminal
-rollback, and failed-precommit cleanup to drain a poisoned engine.
-
-When commit observes poison before its ordered handoff, it claims the
-transaction, queues mandatory rollback, waits for that cleanup, and then
-returns the Fatal report. Explicit rollback does not reject merely because the
-engine is poisoned. Once ordered commit owns a precommit transaction, its redo
-completion and failed-precommit cleanup own the terminal outcome.
-
-Cleanup may itself publish poison. It must first preserve or retain all unsafe
-ownership, then publish poison, then wake dependent waiters or completion
-observers. Normal terminal resolution must never be published for retained
-failed state.
-
-## The Semantic Wait Protocol
-
-`Event`, `Completion`, latches, and gates are policy-neutral primitives. They
-do not know whether engine poison or shutdown should cancel a particular
-operation. That decision belongs to the semantic waiter that knows the
-predicate, progress producer, accepted boundary, and cleanup owner.
-
-For a reversible wait whose producer may stop making progress after poison,
-the required protocol begins only after the operation has established that it
-will actually block:
-
-1. install or retain registration for the primary predicate/completion;
-2. register an engine-poison listener;
-3. recheck sticky engine health and the primary predicate;
-4. race primary progress against the poison listener; and
-5. recheck sticky engine health before accepting state or retrying normal
-   work.
-
-If clean shutdown is also a cancellation source for that semantic family, its
-listener is installed before the same predicate recheck and its sticky
-lifecycle state is checked alongside health.
-
-This is a predicate protocol, not an event protocol:
-
-- primary progress stored before listener registration is found by the
-  predicate/completion recheck;
-- poison published before or during listener registration is found by the
-  health recheck;
-- if primary progress and poison are both ready, the final health check makes
-  poison win when it was published before the wait's acceptance check; and
-- poison published after the final successful health check does not revoke the
-  accepted boundary.
-
-There must be no `.await` between the final health check and consuming the
-accepted state or returning permission to retry. Synchronous instructions may
-still interleave with a concurrent publisher; the contract linearizes a later
-poison after the final successful check and therefore does not roll back the
-accepted result.
-
-A poison wake makes the future runnable; it does not poll or drop the future
-on the caller's behalf. A caller that retains a woken future without polling
-or dropping it continues to retain its guard, queue node, page pin, session
-operation, or other shutdown blocker.
-
-## Concrete Foreground Wait Contracts
-
-### Logical-lock acquisition
-
-Logical-lock poison policy is attached to `PendingClaimGuard`, not
-`LockManager` and not the success-only `Completion<()>`. The manager remains a
-health-agnostic arbitration service.
-
-Existing exact claims, family-covered claims, immediate grants, and immediate
-conversions do not register a poison listener or perform an additional health
-load. Their existing session/transaction/operation admission is the health
-gate. Only a fresh request that actually reaches
-`PendingGuardState::Waiting` enters poison-aware logic:
-
-1. the guard stores the exact `WaitNodeID`, `PendingClaimToken`, and completion;
-2. it registers the poison listener and rechecks health;
-3. it races the success completion against poison;
-4. if poison is observed, it returns the canonical first Fatal report and
-   guard drop cancels the exact queued or provisional manager state;
-5. if completion is observed, it checks health before owner-side transfer;
-6. it publishes the family/resource and exact-scope indexes, observes the
-   provisional manager grant, and becomes `FreshGranted`;
-7. it checks health once more before consuming the pending token; and
-8. successful token consumption disarms the guard and commits the accepted
-   claim.
-
-The two post-completion checks cover different ownership windows. The first
-prevents publication after poison. The second lets guard drop undo both local
-indexes and the physical family if poison arrives during synchronous
-publication or provisional observation. There is no await between the last
-check and token acceptance.
-
-Consequently, poison that races an admitted acquisition which never blocks
-does not retroactively cancel its immediate result. This is the deliberate
-fast-path acceptance boundary; the exact claim remains owned until its normal
-scope cleanup.
-
-Cancellation remains token-exact:
-
-- a queued node is unlinked and the next compatible FIFO prefix is promoted;
-- a promoted-but-unobserved provisional family and node are removed;
-- partial owner-index publication is rolled back;
-- a newly adopted physical family is released; and
-- releasing the original blocker later cannot resurrect the cancelled waiter.
-
-For a multi-resource acquisition, ordinary Fatal propagation drops the
-existing `FreshClaimsGuard`. It releases only the fresh accepted prefix from
-that same unfinished attempt, in reverse order. A newly published exact claim
-is fresh even when an existing family holder physically covers it, so that
-claim is recorded. Claims that existed before the attempt, acquisitions that
-return `LockGrant::Existing`, and successfully disarmed attempts are not
-released. Single-claim callers retain their existing enclosing-scope cleanup
-policy. There is no poison-specific branch in `FreshClaimsGuard::Drop` and no
-global lock-manager drain.
-
-Clean shutdown does not cancel a logical-lock wait. The active session owner
-remains a shutdown blocker until its future completes, is polled after poison,
-or is dropped by its caller. Lock timeout, lease, deadlock detection, and
-victim selection remain separate policy.
-
-### Hot- and cold-row prepare waiting
-
-Row waiting applies only when a foreign row owner is already in ordered
-prepare. A foreign ordinary active owner remains an immediate
-`WriteConflict`; same-owner reuse and non-conflict results remain immediate.
-
-`SharedTrxStatus::prepare_listener` losslessly distinguishes three states:
-
-- not preparing, which follows ordinary row classification;
-- a registered primary listener, wrapped as a poison-aware registered token;
-  and
-- prepare completion winning registration, represented by a poison-aware
-  recheck-only token.
-
-Both preparing outcomes travel through row mutation as an opaque
-`PoisonAwareListener`. The name describes the semantic protocol rather than
-its internal representation: the value is move-only, its raw listener and
-state are private, and it implements neither `Future` nor `Clone`. Production
-code therefore cannot directly await prepare completion or reuse one result to
-authorize multiple retries. Dropping the token is legal cancellation, but it
-does not grant permission to retry the row operation.
-
-The only production consumer is `EnginePoisoner::wait_or_poison`, reached by
-the shared `TrxRuntime::wait_prepare_or_poison` helper and invoked only for a
-`Preparing` result:
-
-- for a recheck-only token, it performs one sticky health check before
-  permitting retry, without registering a listener or selecting futures;
-- for a registered token, it first registers the poison listener, rechecks
-  sticky health, races prepare completion against poison, and checks sticky
-  health again before permitting retry.
-
-Registering the poison listener before the first health recheck closes the
-lost-wakeup window. The final recheck makes either selected event only a prompt
-to inspect authoritative health; selection itself does not determine success.
-Because the token is consumed by this operation, a successful return is the
-single-use authority to retry from authoritative row state.
-
-Failed-precommit fatal cleanup publishes poison before it releases prepare
-waiters. A registered waiter and a completion-won-registration waiter
-therefore return the canonical Fatal report instead of touching retained undo
-or masking the failure as `WriteConflict`. Successful commit publishes its
-CTS before wake; successful rollback removes row/deletion ownership before
-wake. Either successful outcome causes a complete authoritative retry rather
-than assuming what the wake meant.
-
-The hot path drops row access but deliberately retains the shared row-page
-guard during the expected-short prepare wait; other rows remain accessible and
-the page cannot be evicted. Fatal unwind drops that guard normally. Cold point
-and scan paths release deletion-buffer entries, index handles, row-location
-state, decoded block guards, and other operation-local state before awaiting,
-then restart from authoritative row location and marker state. Callback
-at-most-once scan ownership remains with the surrounding mutation state.
-
-`LockUndo::Ok`, invalid-index, ordinary conflict, and row-page transition
-outcomes never enter the helper. An uncontended hot delete/update therefore
-adds no poison load, listener allocation, or second-future selection. Clean
-shutdown does not cancel a prepare wait; its active transaction or operation
-continues to block graceful shutdown until it finishes or unwinds.
-
-As with immediate logical-lock acquisition, poison racing after healthy
-operation admission does not add retroactive cancellation to an uncontended
-row mutation. Later durability, terminal, or admission boundaries retain their
-own health checks.
-
-### Row-page transition routing
-
-Foreground mutation that encounters `TRANSITION` waits for authoritative cold
-routing when it needs the LWC image. The shared table waiter races route-epoch
-progress with poison and checks health before and after the race. The
-checkpoint's irreversible guard publishes poison if it cannot publish a safe
-route. The caller releases page and row guards, retains its statement effects,
-and retries from the pivot; the epoch is only a wake hint. A final successful
-health check authorizes immediate retry. Shutdown drains the accepted operation.
-
-Row-undo cleanup no longer belongs to this wait family. It accesses the exact
-retained generation through existing buffer pin/reload waits, including on
-Transition pages before publication. The current undo and source journal own
-cancellation across page access; local inverse, unlink, marker reconciliation,
-and pop have no intervening await. Between-entry cooperative yields retain the
-remaining vector. Missing generations and invalid ownership/state are Runtime
-access failures, not route waits. Policy owners retain unsafe residuals on
-Runtime and Fatal failures alike. Statement and terminal rollback forward an
-incoming Fatal unchanged. A Runtime failure is promoted to `RollbackAccess`;
-publication then returns the cached first fatal reason if one already exists.
-Failed-precommit cleanup also retains incoming Fatal failures without publishing
-them again; the original redo failure remains its waiter's outcome. Safe cleanup
-may complete despite checkpoint poison and never clears that poison or releases
-active STS before required cleanup finishes.
-
-### Maintenance progress and checkpoint retry
-
-Caller-side waits for GC-horizon progress, completed purge progress, active
-root release, and frozen-page retry are reversible observations. Their normal
-producers can stop after a fatal purge, rollback, or checkpoint failure, and
-the observation itself should not prevent clean shutdown.
-
-These waits therefore register the applicable progress, transaction-terminal,
-and table-lifecycle listeners together with poison and engine-shutdown
-listeners, then recheck every sticky predicate. Poison returns Fatal; shutdown
-returns the wait family's documented shutdown error; normal progress causes
-authoritative reanalysis. The current helpers check health before shutdown, so
-an already-observed poison is retained as Fatal when both conditions are
-visible.
-
-Checkpoint retry detaches only listener state before sleeping and releases the
-strong table runtime. Its session observer remains the shutdown-visible owner
-until the wait returns or is cancelled. Maintenance notifications are hints;
-completion means only that retry or reanalysis may now be useful.
-
-## Production Wait Classification
-
-The table below classifies the production wait families. A new wait must fit
-one row or add a new documented category.
-
-| Wait family | Progress producer and primary wake | Poison behavior | Shutdown behavior | Cancellation or cleanup owner |
-| --- | --- | --- | --- | --- |
-| Queued logical-lock acquisition | blocker release promotes FIFO prefix and completes success-only waiter | race poison only after entering `Waiting`; return first Fatal and cancel exact pending state | no direct cancellation; graceful session drain waits | `PendingClaimGuard`, then `FreshClaimsGuard` for an acquired prefix |
-| Read-snapshot metadata acquisition | blocker release grants metadata-S, or the exact snapshot entry publishes sticky abort and wakes its listener | the underlying logical-lock wait retains its poison-aware Fatal behavior and cancels exact pending state | close, abandonment, or shutdown requests snapshot abort; a retained checked-out build remains a visible blocker until polled or dropped | pending acquisition guard first, then build checkout and snapshot terminal claim close the accepted prefix |
-| Hot/cold foreign prepare | owner commit or rollback drops the injected prepare notifier | registered and completion-race paths check poison before retry | no direct cancellation; active owner drains | row access/CDB guards plus statement/transaction owner |
-| Row-page transition route | checkpoint publishes a newer route epoch; pivot is authoritative | route-or-poison race; fatal checkpoint guard supplies poison | no direct cancellation; active or mandatory owner drains | foreground row attempt and its statement owner |
-| GC/purge progress and checkpoint retry | monotonic progress, transaction terminal state, or table lifecycle change | poison terminates observation as Fatal | shutdown listener terminates observation | detached listeners and `SessionObserverPin` |
-| Mandatory caller capacity | permit release or admission close | capacity wait races poison; a won permit is acceptance | admission close wakes with Lifecycle shutdown | prepared caller owner before acceptance; mandatory supervisor after it |
-| I/O, page-I/O, redo, group-commit, mandatory-result, and pool-job completions | the owning service publishes the authoritative success or failure result; pool acceptance transfers responsibility before execution begins | pool submission rejects observed poison; accepted work follows its service's completion or retention policy | enclosing operations drain their children; pool jobs finish before eviction and storage stop | the accepted request or job owns its resources; the enclosing operation owns combined cleanup and publication |
-| Thread-pool drain | workers finish accepted jobs with storage and buffer services supplying awaited progress; completion of all accepted work and cleanup establishes drain, while notifications only request reassessment | poison does not cancel accepted work or release resources still owned by a service | close admission and finish all accepted work, including jobs not yet running or waiting for I/O, before stopping workers and their dependencies | accepted jobs own execution and cleanup independently of observers; enclosing operations retain responsibility for combined cleanup and publication |
-| DDL/maintenance table/catalog gates and table-drop publish drain | active prepared or accepted scope releases its lease and notifies gate/lifecycle change | do not preempt; failure follows compensation, poison, or retention policy | shutdown waits for the voluntary session operation or accepted mandatory owner | prepared/accepted scope and RAII pending/lease guards |
-| Rollback, abandoned, terminal, and failed-precommit cleanup | mandatory internal task completes or retains terminal state | never cancelled by poison; cleanup may publish poison itself | internal admission drains before runner stop | exact cleanup job, terminal claim, and fatal-retention owner |
-| Buffer allocation, residency, and eviction progress | deallocation, load completion, or evictor progress; poison alone does not stop these producers | unrelated poison does not replace local progress/completion policy | foreground drain is graceful; pool flags wake any remaining service waiters once component teardown starts | reservation/page guards and pool worker owner |
-| Session close and engine/session drain | exact operation transition or observer release | poison is not a drain signal; close requires healthy admission at entry | this is lifecycle coordination itself | session lifecycle entry, exact cleanup hint, and engine coordinator |
-| Background worker idle/channel waits | request arrival, channel close, stop marker, or worker wake flag | a worker-specific fatal exit may publish poison; unrelated poison is not a generic stop request | component hook closes ingress/signals stop and joins | registered worker component owner |
-| Final quiescent owner release | final `QuiescentGuard` drop decrements the guard count | poison is irrelevant to guard ownership | after shutdown hooks, normal owner drop waits for zero; degraded teardown may leak instead | each guard and the final `QuiescentBox` owner |
-| Generic `Event`, `Completion`, latch, mutex, RW lock, notifier, and exclusive gate | primitive-specific state transition | none unless the semantic caller adds it | none unless the semantic caller adds it | primitive guard or higher-level semantic owner |
-
-Recovery admission pressure and table/global replay barriers belong to the
-pool-job completion family above. Accepted finite page jobs, with live I/O,
-latches, and eviction, produce progress. A table is drained exactly when both
-its pending-operation count and submitted-batch count are zero; global drain
-requires this for every table. Outstanding submission slots remain held through
-completion collection, including completed-but-uncollected jobs.
-Before waiting, the coordinator reaps ready results and submits FIFO partial
-batches within admission. Pool reservation is acceptance's linearization point.
-Poison stops new acceptance but never substitutes for draining accepted work.
-The coordinator owns combined cleanup on failure; each accepted job owns its
-captures independently of observers. Cancelled bootstrap drops pending work and
-observers, then registry rollback drains the pool before storage/eviction stop.
-
-Service completions are intentionally different from reversible arbitration.
-Once I/O or redo has accepted buffers, transaction payloads, or request slots,
-returning early on a separate poison event could free or reuse state while the
-service still owns it. Backend progress failure instead fails every safely
-completable request, quarantines submitted state when safe ownership cannot be
-proved, publishes poison, and lets the service's completion/retention contract
-settle the owner.
-
-Policy-neutral table/catalog gates and latches also do not observe poison by
-default. Their current progress owners are accepted or RAII-protected and must
-release the gate even while the engine is poisoned. If a future use can be
-stranded because its producer stops on poison, that semantic use must add a
-poison race without changing the generic primitive.
+### Failure and notification
+
+A subsystem poisons the engine when its owning policy determines that normal
+execution cannot safely continue, for example after an irreversible durability
+failure or an inability to undo partially completed work. An ordinary I/O or
+operation error is not automatically fatal.
+
+The engine retains the first fatal report, including its source chain and
+diagnostic context, before making poison visible. Repeated failures do not
+replace that reason. Admission checks and poison-aware waiters report this
+canonical failure; an operation interrupted by a later failure may report its
+own failure to its caller. Fatal reports remain Fatal throughout propagation
+and appear publicly as `ErrorKind::Fatal`.
+
+The first transition also wakes registered poison-aware waiters. This is a
+one-shot notification, not the source of truth: a waiter must check persistent
+health state even if it registers after the notification. Later poison calls
+do not provide another wake.
+
+### Effect on the engine
+
+Poison rejects normal admission, wakes affected reversible waits, and lets
+those attempts unwind through their existing cleanup owners. Selected
+read-only diagnostics remain available while lifecycle admission is open;
+they cannot create new runtime work.
+
+Poison does not start shutdown, stop all workers, revoke accepted locks, or
+cancel work already owned by a service. It also does not release state whose
+cleanup cannot be proved safe. Shutdown remains the engine owner's
+responsibility, and poisoning does not guarantee that teardown can finish.
+
+`Session::close()` requires a healthy runtime; it is not a poison-bypass
+cleanup API. Engine shutdown and existing transaction terminal or abandonment
+paths retain responsibility for cleanup after poison.
+
+## Admission and Work Ownership
+
+### Foreground admission
+
+Ordinary engine and session entry first acquires lifecycle admission, validates
+the session or transaction, and checks health where required. Before releasing
+that short-lived admission, it records the operation or observer that shutdown
+must drain. This prevents work from disappearing between admission and shutdown
+coordination.
+
+Lifecycle is checked before health at this boundary. A running poisoned engine
+therefore rejects normal work as Fatal, while already-closed lifecycle
+admission returns Lifecycle shutdown. This ordering is local to admission;
+there is no universal precedence between poison and shutdown.
+
+### Preparation and acceptance
+
+Preparation is reversible while its owner can remove the attempt's partial
+state safely. Queued lock requests and waits for execution capacity are
+examples. Poison-aware cancellation uses that existing ownership to unwind.
+
+Acceptance transfers responsibility to an execution owner, such as ordered
+commit, submitted I/O, a finite pool job, or mandatory execution. The handoff
+must be explicit. For mandatory caller admission, acquiring the permit settles
+the poison race and acceptance transfers the prepared operation without an
+intervening await.
+
+After acceptance, poison cannot retroactively cancel the work. Its owner must
+complete it, report failure, perform terminal cleanup, or retain unsafe state.
+Dropping a result observer does not cancel accepted execution. Returning early
+while a service still owns buffers or transaction state would violate this
+ownership contract.
+
+### Terminal cleanup
+
+Commit, rollback, and abandonment reuse authority established by the active
+transaction rather than requesting new foreground admission. Existing
+transactions can therefore settle after clean shutdown starts, and rollback
+can proceed despite poison.
+
+A commit that observes poison before its ordered handoff runs mandatory
+rollback before returning Fatal. After the handoff, ordered commit and its
+cleanup path own the outcome. Cleanup failures preserve unsafe ownership
+before publishing poison or waking dependent waiters; retained failed state
+must never be reported as normal completion.
+
+## Wait Policy
+
+A wait's semantic owner knows what can make progress and who owns cancellation
+cleanup. Events, completions, latches, and gates do not choose shutdown or
+poison policy themselves.
+
+For a reversible wait whose progress can be stranded by poison, register the
+applicable listeners before rechecking the authoritative predicate and engine
+health. After either normal progress or a poison wake, recheck health before
+accepting work or retrying. Notifications request reassessment; they do not
+prove success. Do not await between the final successful health check and
+acceptance.
+
+This closes missed-wakeup races and makes poison visible before that final
+check win over a simultaneous normal wake. Poison arriving after the accepted
+boundary does not revoke the result. Healthy immediate operations retain their
+own admission and acceptance boundary rather than inheriting every slow-wait
+check.
+
+A poison wake only makes a future runnable. The caller must still poll or drop
+it to release its guards and other ownership. Retaining an unpolled future can
+therefore continue to block shutdown.
+
+### Production Wait Classification
+
+These are behavioral categories, not an inventory of individual wait sites.
+Each subsystem documents its exact progress source and cleanup owner.
+
+| Category | Poison behavior | Shutdown behavior |
+| --- | --- | --- |
+| Reversible foreground acquisition or retry | Affected waits unwind on poison through existing guards | Family-specific: ordinary lock and row-prepare waits drain; snapshot acquisition has an abort policy |
+| Maintenance progress observation | Ends with Fatal when poison is observed | Observes shutdown and ends the wait |
+| Accepted service requests and jobs | Follow the service's completion or safe-retention outcome | Drain before workers and dependencies stop |
+| Terminal cleanup | Continues; may itself poison or retain unsafe state | Internal cleanup authority remains available until drained |
+| Service progress and lifecycle coordination | Follow their own progress policy; unrelated poison is not a stop signal | Their owner coordinates admission closure, drain, and worker stop |
+| Generic events, completions, latches, and gates | No built-in poison policy | No built-in shutdown policy |
+
+Clean shutdown interrupts only wait families that explicitly observe it.
+Maintenance observations check health before shutdown and retain an already
+visible Fatal report. Ordinary lock and row-prepare waits remain owned by their
+active operation until completion or cancellation. These differences reflect
+ownership, not a universal cancellation rule.
+
+Poison can still be published during `ShuttingDown`. It may help reversible
+work unwind, but shutdown waits for the resulting ownership transitions;
+poison is not itself a drain signal and does not clear blockers.
 
 ## Graceful Shutdown
 
-### Lifecycle states and APIs
-
-Engine lifecycle is monotonic:
-
-```text
-Running -> ShuttingDown -> Shutdown
-```
+### APIs and sequence
 
 `Engine::shutdown()` is synchronous, blocking, and idempotent. It returns
-normally only after the foreground/mandatory drain and reverse component
-shutdown finish. It has no typed poison result; a poisoned engine follows the
-same drain contract.
+normally after foreground and mandatory work have drained and component
+shutdown has finished. It has no timeout and no typed poison result: a poisoned
+engine follows the same ownership and drain contract.
 
-`Engine::try_shutdown()` initiates the same irreversible transition, waits for
-short-lived engine admission tokens to leave, and performs one blocker probe.
-It returns `LifecycleError::ShutdownBusy` rather than waiting for session
-operations, observers, or mandatory permits. A Busy result does **not** reopen
-the engine: lifecycle remains `ShuttingDown`, engine and mandatory caller
-admission remain closed, and a later `try_shutdown()` or `shutdown()` continues
-the same teardown.
+`Engine::try_shutdown()` starts the same irreversible transition. It waits for
+short-lived admission tokens, then probes current blockers instead of waiting
+for active session work, observers, or mandatory permits. A
+`LifecycleError::ShutdownBusy` result leaves the engine in `ShuttingDown` with
+admission closed. Later calls continue teardown; they do not reopen the engine.
+If no blockers remain, the call completes component shutdown. Both APIs do no
+work after `Shutdown`.
 
-Both APIs are safe to call again after `Shutdown`; repeated calls do no work.
-Neither API uses poison to force blockers away.
+Shutdown proceeds conceptually as follows:
 
-`Engine::drop` invokes the blocking shutdown path. Dropping the owner at an
-uncontrolled point can therefore block indefinitely. Applications should end
-foreground work and call explicit shutdown where blocker diagnostics and the
-blocking location can be observed.
+1. Close engine and mandatory caller admission and enter `ShuttingDown`.
+2. Drain in-flight admission and existing foreground owners, observers, and
+   accepted mandatory work, requesting owned cleanup where appropriate.
+3. Stop components in reverse dependency order, preserving the services needed
+   by accepted work and terminal cleanup until they finish.
+4. Release storage-root ownership and publish terminal `Shutdown` state.
 
-### Coordinator drain
+Redo completion can still require internal cleanup. That cleanup must drain
+before its runner stops; finite jobs must drain while their storage and buffer
+services remain available. The poisoner outlives components that can report
+fatal state, and the storage-root lease is released last. A later engine can
+then acquire the root even while the old, shut-down `Engine` value exists.
 
-Blocking shutdown performs these steps:
+### Blockers and caller responsibility
 
-1. atomically close engine lifecycle admission and publish
-   `Running -> ShuttingDown`;
-2. close mandatory caller admission;
-3. wait for short-lived engine admission tokens to drain;
-4. wait for already accepted mandatory caller permits to reach terminal
-   handling;
-5. scan the session registry for the first current blocker, preferring an
-   active operation over standalone observers in the same session;
-6. for blocking shutdown, arm that exact session's lifecycle event under its
-   mutex, recheck the blocker, request abort/drain for an exact read snapshot,
-   release all registry/state guards, perform synchronous checked-in snapshot
-   cleanup or queue at most one transaction cleanup hint, wait, and rescan;
-7. remove idle registry-owned sessions;
-8. shut down registered components in reverse dependency order; and
-9. publish `Shutdown`, release the owner shutdown mutex, and apply the
-   aggregate panic policy.
+Active operations and transactions, inspection observers, and accepted
+mandatory or cleanup work hold shutdown-visible ownership. Caller-retained
+futures and unsafe failed operations can retain these blockers indefinitely.
+Idle sessions, weak public handles, and dropped result observers do not by
+themselves block shutdown.
 
-`try_shutdown()` uses the same first-blocker classification but installs no
-listener. It may synchronously clean one checked-in snapshot or queue one exact
-transaction cleanup hint and still reports Busy for the blocker sampled by that
-call. A later call observes the resulting terminal edge. Its
-diagnostic attachment includes `session_blocker`, `operation_state`,
-`observer_count`, `cleanup_queued`, `mandatory_callers`, and
-`mandatory_internal`.
+Shutdown neither drops caller futures nor forces accepted resources free.
+Applications should stop submitting work, finish or drop operation futures,
+settle transactions, and explicitly shut down at a controlled blocking point.
+Dropping `Engine` invokes blocking shutdown and can also wait indefinitely.
 
-The listener-before-recheck protocol prevents a session transition from being
-lost between inspection and sleep. Transaction cleanup messages carry the exact
-`(SessionOperationKey, TrxID)`, while synchronous snapshot cleanup validates the
-exact typed entry and operation key; stale work cannot claim a replacement
-operation.
+### Teardown failures
 
-### What blocks shutdown
+Component hooks run under terminal panic containment so a hook failure does
+not prevent remaining hooks from running. The engine becomes terminal before
+the first panic is propagated; owner drop during an existing unwind suppresses
+that additional panic. This does not make the engine reusable or turn a
+teardown panic into a recoverable poison result.
 
-Shutdown-visible owners include:
-
-- active engine admission tokens;
-- session operations in `Voluntary`, `Mandatory`, `CleanupReady`,
-  `Completing`, or `FailedRetained` state;
-- standalone `SessionObserverPin`s;
-- accepted mandatory caller permits;
-- mandatory internal cleanup permits; and
-- any reversible future whose already-published session operation still owns
-  locks, waiters, effects, or prepared resources.
-
-`Terminal` operations, idle session entries, weak public session/transaction
-handles, and dropped mandatory result observers do not by themselves block
-shutdown. An accepted mandatory task continues to block through its permit
-even if its result observer was dropped.
-
-Shutdown has no timeout and does not drop caller futures. A clean logical-lock
-or row-prepare wait, a caller-retained future that has not been resumed or
-dropped, or an irreversible `FailedRetained` operation can therefore keep
-blocking. This is the cost of preserving accepted ownership and avoiding
-unsafe forced cleanup.
-
-### Terminal work during shutdown
-
-After foreground admission closes, existing terminal authority remains valid:
-
-- an active transaction may commit or roll back;
-- dropping a transaction/session may publish abandonment and queue cleanup;
-- terminal rollback and failed-precommit jobs use mandatory internal admission;
-- redo drains before internal cleanup admission closes; and
-- internal cleanup drains before the mandatory runner stops.
-
-Non-terminal transaction checkout and new session/operation/observer
-registration are rejected. Clean shutdown does not synthesize poison or turn
-ordinary lifecycle rejection into Fatal.
-
-### Component teardown and panic containment
-
-After foreground owners drain, components shut down in this exact reverse
-registration order:
-
-```text
-TransactionRedoWorkers
--> MandatoryRuntimeWorkers
--> TransactionPurgeWorkers
--> TransactionSystem
--> Catalog
--> LockManager
--> ThreadPoolWorkers
--> ThreadPool
--> SharedPoolEvictorWorkers
--> FileSystemWorkers
--> MemPool
--> IndexPool
--> MetaPool
--> DiskPool
--> FileSystem
--> MandatoryRuntime
--> EnginePoisoner
--> StorageRootLease
-```
-
-The ordering keeps the poisoner available to every earlier component that may
-report fatal state, keeps eviction and storage I/O live until finite pool jobs
-drain, and releases the storage-root lease only after all subordinate activity
-has stopped. The dependency and shutdown responsibilities are described in
+Final owner destruction normally waits for outstanding component guards.
+After a contained hook panic, unsafe owners and their retained dependencies
+may be leaked rather than destroyed unsafely. Failed bootstrap uses the same
+reverse teardown for components that were successfully registered. Detailed
+component ordering and ownership rules belong to
 [Engine Component Lifetime](engine-component-lifetime.md).
-
-Required rotated-file redo seals remain part of live ordered durability and
-poison on write or sync failure. Final sealing of the active redo file after a
-clean shutdown drain is best effort: failure at that shutdown-only boundary
-does not poison storage or invalidate commits that already completed.
-
-Each component shutdown hook is invoked at most once and independently wrapped
-in terminal panic containment. A hook panic marks that owner suspect, retains
-the first original payload, reports later payloads, and does not prevent later
-hooks from running. Lifecycle is published as `Shutdown` before the first
-payload is resumed or suppressed. Teardown-hook panic uses this terminal panic
-policy; it is not converted into a recoverable poison result.
-
-Containment does not claim that storage mutation implements `UnwindSafe`.
-It is valid only because the graph is terminal and never exposed for reuse.
-An active hook must close ingress and signal or join all required workers
-before exposing a captured payload. Later payloads are reported and forgotten
-without running arbitrary payload destructors.
-
-An explicit shutdown caller on a non-unwinding thread receives the first
-payload through resumed unwind. Owner drop during an existing unwind reports
-and suppresses it to avoid a double panic. The graph is terminal in either
-case and must not be reused. Final registry drop may deliberately leak a
-suspect owner and its quiescent dependency closure instead of hanging or
-dropping through unsafe outstanding guards.
-
-Completion of the `StorageRootLease` shutdown hook releases root ownership, so
-another engine may acquire the root even while the shut-down `Engine` value
-itself remains allocated.
-A failed bootstrap has no foreground drain; it shuts down only the components
-that were successfully registered, in the same reverse dependency order, and
-releases the root lease last.
-
-### Final component-owner release
-
-Explicit shutdown runs every component hook but does not immediately destroy
-the `Engine` value or every registry allocation. On final owner drop, field
-order first drops `EngineInner`, releasing the registry-owned session states,
-`EngineCore`, and their runtime `QuiescentGuard`s. It then drops
-`ComponentRegistry` and its component owners in reverse order.
-
-In a panic-free graph, each `QuiescentBox` waits until its outstanding guard
-count reaches zero. Access handles and build-shelf provisions are already gone,
-so a sampled zero cannot increase. This strict final wait exposes hidden guard
-lifetime defects instead of racing owner destruction.
-
-After a contained shutdown-hook panic, final drop uses the degraded policy:
-the suspect owner is leaked, and any otherwise non-suspect owner with a
-nonzero acquire-ordered guard-count sample is also leaked as part of the
-bounded dependency closure. Independent zero-guard owners are still dropped.
-Surviving public session and transaction handles are weak and cannot retain or
-recover component capabilities after registry ownership is removed.
-
-## Poison and Shutdown Races
-
-There is no universal "poison always wins" or "shutdown always wins" rule.
-Each boundary has a documented linearization point:
-
-- ordinary admission checks lifecycle before health, so already-closed
-  lifecycle admission returns Shutdown;
-- poison-aware foreground waits perform a final health check, so poison
-  published before that check wins over a simultaneously ready normal wake;
-- a mandatory permit won before poison is accepted and is not revoked;
-- ordered commit, submitted I/O, and accepted mandatory execution use their
-  own completion/retention outcome after handoff;
-- maintenance observation checks poison and shutdown together and gives an
-  already-visible Fatal report its documented precedence; and
-- shutdown itself never returns the stored poison report and never clears it.
-
-Poison during `ShuttingDown` still stores the first reason and wakes registered
-poison-aware waits. It can help a reversible foreground owner unwind, but the
-shutdown coordinator observes only the resulting session/permit transitions.
-Poison does not wake the shutdown listener, and shutdown does not wake a
-poison-only waiter unless that wait family separately observes shutdown.
 
 ## Review Contract for New Waits
 
-Every new potentially unbounded engine wait must document these five
-properties at its semantic owner:
+Every new potentially unbounded engine wait must document these properties at
+its semantic owner, in the owning subsystem document or code:
 
-1. **Progress producer**: which owner can make the predicate true, and can it
-   stop after poison or shutdown?
-2. **Primary wake or result**: which predicate, epoch, completion, channel, or
-   lifecycle transition is authoritative, and does it transport failure?
-3. **Poison behavior**: ignore, observe before entry, race while waiting, or
-   continue as accepted/terminal work; justify any non-observation.
-4. **Shutdown behavior**: reject, wake and unwind, drain without cancellation,
-   or run as part of component teardown.
-5. **Cancellation and cleanup owner**: which exact guard, token, scope, job, or
-   retention object removes every partial state exactly once?
+1. **Progress producer:** who can make progress, including after failure?
+2. **Authoritative result:** what predicate or completion establishes success
+   or failure, and what notification requests a recheck?
+3. **Poison behavior:** does the wait reject, observe, unwind, or continue?
+4. **Shutdown behavior:** does it cancel, drain, or participate in teardown?
+5. **Cleanup owner:** who removes partial state or retains unsafe ownership?
 
-The review must also identify the acceptance linearization point. If poison is
-added to a slow wait, preserve the uncontended path unless a separate safety
-argument requires an unconditional health read or listener.
+Also identify the acceptance boundary and justify any non-observation of
+poison or shutdown. Use the categories above; keep subsystem algorithms and
+new wait-family details with their owner rather than expanding this overview.
 
-Use this implementation checklist:
+## Limits and Further Reading
 
-- register listeners before the predicate recheck;
-- treat notifications as hints and sticky state as truth;
-- recheck health after either branch of a primary-versus-poison race;
-- place no await between final health validation and acceptance;
-- never return early from submitted service work while its producer still owns
-  buffers, payloads, or raw-state obligations;
-- preserve Fatal as Fatal through every internal carrier;
-- use existing RAII/token cleanup instead of parallel poison-only rollback;
-- state explicitly whether clean shutdown is allowed to interrupt the wait;
-  and
-- update the production classification table when introducing a genuinely new
-  wait family.
+Neither mechanism provides forced cancellation, bounded shutdown latency,
+automatic recovery, lock timeouts, deadlock detection, or a unified cancellation
+policy. Poison cannot be reset, and accepted or retained ownership cannot be
+released merely to make shutdown finish.
 
-Concurrency tests must control semantic race points with hooks, channels,
-barriers, or production predicates rather than sleeps. Cover, as applicable:
-
-- poison before listener registration;
-- poison between registration and recheck;
-- primary completion and poison becoming ready together;
-- promotion/publication/observation before final acceptance;
-- poison immediately before and immediately after the final healthy check;
-- cancellation of queued, provisional, and partially published state;
-- preservation of pre-existing ownership and release of only a fresh prefix;
-- clean shutdown's documented cancel-or-drain behavior;
-- first-Fatal source frames, attachments, and public `ErrorKind::Fatal`; and
-- absence of listener allocation or extra health loads on protected fast
-  paths.
-
-## Explicit Non-Guarantees
-
-This contract does not provide:
-
-- a unified cancellation context spanning poison, shutdown, deadlines, client
-  cancellation, or deadlock victims;
-- forced cancellation or preemption of caller futures;
-- bounded shutdown latency;
-- automatic recovery or unpoisoning of an engine instance;
-- lock-wait timeouts, leases, escalation, or deadlock detection;
-- a global fairness guarantee beyond each subsystem's documented policy; or
-- permission to release accepted or retained ownership merely to make
-  shutdown finish.
-
-Those changes affect ownership across multiple subsystems and require a
-separate design boundary.
-
-## References
-
-- [Storage Architecture](architecture.md)
-- [Engine Component Lifetime](engine-component-lifetime.md)
-- [Storage Error Model](error-spec.md)
-- [Lock System](lock-system.md)
-- [Transaction System](transaction-system.md)
-- [Checkpoint](checkpoint.md)
-- [Data Checkpoint](data-checkpoint.md)
-- [Buffer Pool](buffer-pool.md)
-- [Observability Logging](observability-logging.md)
-- [Task 000264: Integrate Engine Poison with Foreground Waiters](tasks/000264-engine-poison-foreground-waiters.md)
+- [Engine Component Lifetime](engine-component-lifetime.md): component ownership
+  and teardown details.
+- [Storage Error Model](error-spec.md): error domains and fatal propagation.
+- [Public API](public-api.md#shutdown): application shutdown usage.
+- [Lock System](lock-system.md) and [Transaction System](transaction-system.md):
+  foreground ownership, completion, and cancellation.
+- [Checkpoint](checkpoint.md), [Data Checkpoint](data-checkpoint.md), and
+  [Buffer Pool](buffer-pool.md): subsystem progress and failure handling.
+- Implementation entry points: [engine lifecycle](../doradb-storage/src/engine.rs),
+  [poison publication and waiting](../doradb-storage/src/poison.rs), and
+  [component teardown](../doradb-storage/src/component.rs).
