@@ -3874,7 +3874,7 @@ pub(crate) mod tests {
     use crate::catalog::{
         CatalogTable, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
     };
-    use crate::conf::{EngineConfig, TrxSysConfig};
+    use crate::conf::{EngineConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
@@ -4412,17 +4412,19 @@ pub(crate) mod tests {
     }
 
     fn redo_truncation_engine_config(main_dir: &Path, log_file_stem: &str) -> EngineConfig {
-        EngineConfig::default().storage_root(main_dir).trx(
-            TrxSysConfig::default()
-                .log_file_stem(log_file_stem)
-                .log_write_io_depth(1)
-                .recovery_io_depth(1)
-                .catalog_checkpoint_scan_io_depth(1)
-                .log_block_size(TRUNCATE_TEST_LOG_BLOCK_SIZE)
-                .log_file_max_size(TRUNCATE_TEST_LOG_FILE_MAX_SIZE)
-                .log_sync(LogSync::None)
-                .purge_threads(1),
-        )
+        EngineConfig::default()
+            .storage_root(main_dir)
+            .recovery(RecoveryConfig::default().io_depth(1))
+            .trx(
+                TrxSysConfig::default()
+                    .log_file_stem(log_file_stem)
+                    .log_write_io_depth(1)
+                    .catalog_checkpoint_scan_io_depth(1)
+                    .log_block_size(TRUNCATE_TEST_LOG_BLOCK_SIZE)
+                    .log_file_max_size(TRUNCATE_TEST_LOG_FILE_MAX_SIZE)
+                    .log_sync(LogSync::None)
+                    .purge_threads(1),
+            )
     }
 
     fn redo_file_path(main_dir: &Path, log_file_stem: &str, file_seq: u32) -> PathBuf {

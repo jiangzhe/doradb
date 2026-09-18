@@ -2609,7 +2609,7 @@ mod tests {
         StorageColumnSpec, StorageTableSpec, TableCache,
     };
     use crate::completion::{Completion, CompletionTake};
-    use crate::conf::TrxSysConfig;
+    use crate::conf::{RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
         Error, FatalError, IoError, LifecycleError, ResourceError, RuntimeError,
@@ -3205,14 +3205,15 @@ mod tests {
     ) {
         let temp_dir = TempDir::new().unwrap();
         let engine = Engine::bootstrap(
-            lightweight_test_engine_config(temp_dir.path(), log_file_stem).trx(
-                TrxSysConfig::default()
-                    .log_write_io_depth(1)
-                    .recovery_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_file_stem(log_file_stem)
-                    .purge_threads(purge_threads),
-            ),
+            lightweight_test_engine_config(temp_dir.path(), log_file_stem)
+                .recovery(RecoveryConfig::default().io_depth(1))
+                .trx(
+                    TrxSysConfig::default()
+                        .log_write_io_depth(1)
+                        .catalog_checkpoint_scan_io_depth(1)
+                        .log_file_stem(log_file_stem)
+                        .purge_threads(purge_threads),
+                ),
         )
         .await
         .unwrap();

@@ -1315,7 +1315,9 @@ pub(crate) mod tests {
         IndexID, IndexRef, IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags,
         StorageIndexKey, StorageIndexSpec, StorageTableSpec, USER_TABLE_ID_START,
     };
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+    use crate::conf::{
+        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig,
+    };
     use crate::engine::Engine;
     use crate::error::{
         CallbackResult, CompletionErrorBridge, DataIntegrityError, DiscloseError,
@@ -2675,10 +2677,10 @@ pub(crate) mod tests {
                     .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
                     .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
             )
+            .recovery(RecoveryConfig::default().io_depth(1))
             .trx(
                 TrxSysConfig::default()
                     .log_write_io_depth(1)
-                    .recovery_io_depth(1)
                     .catalog_checkpoint_scan_io_depth(1)
                     .log_file_stem(log_file_stem)
                     .purge_threads(1),

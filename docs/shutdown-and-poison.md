@@ -502,6 +502,19 @@ one row or add a new documented category.
 | Final quiescent owner release | final `QuiescentGuard` drop decrements the guard count | poison is irrelevant to guard ownership | after shutdown hooks, normal owner drop waits for zero; degraded teardown may leak instead | each guard and the final `QuiescentBox` owner |
 | Generic `Event`, `Completion`, latch, mutex, RW lock, notifier, and exclusive gate | primitive-specific state transition | none unless the semantic caller adds it | none unless the semantic caller adds it | primitive guard or higher-level semantic owner |
 
+Recovery admission pressure and table/global replay barriers belong to the
+pool-job completion family above. Accepted finite page jobs, with live I/O,
+latches, and eviction, produce progress. A table is drained exactly when both
+its pending-operation count and submitted-batch count are zero; global drain
+requires this for every table. Outstanding submission slots remain held through
+completion collection, including completed-but-uncollected jobs.
+Before waiting, the coordinator reaps ready results and submits FIFO partial
+batches within admission. Pool reservation is acceptance's linearization point.
+Poison stops new acceptance but never substitutes for draining accepted work.
+The coordinator owns combined cleanup on failure; each accepted job owns its
+captures independently of observers. Cancelled bootstrap drops pending work and
+observers, then registry rollback drains the pool before storage/eviction stop.
+
 Service completions are intentionally different from reversible arbitration.
 Once I/O or redo has accepted buffers, transaction payloads, or request slots,
 returning early on a separate poison event could free or reuse state while the

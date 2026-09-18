@@ -2439,7 +2439,7 @@ mod tests {
     use super::*;
     use crate::buffer::test_page_id;
     use crate::catalog::tests::table2;
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
+    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, DiscloseResultExt, ErrorKind, FatalError, IoError, IoResult,
@@ -3113,11 +3113,11 @@ mod tests {
         let engine = Engine::bootstrap(
             EngineConfig::default()
                 .storage_root(temp_dir.path().to_path_buf())
+                .recovery(RecoveryConfig::default().io_depth(1))
                 .trx(
                     TrxSysConfig::default()
                         .log_file_stem(log_file_stem)
                         .log_write_io_depth(1)
-                        .recovery_io_depth(1)
                         .catalog_checkpoint_scan_io_depth(1)
                         .log_sync(log_sync)
                         .log_file_max_size(log_file_max_size),
@@ -5119,7 +5119,6 @@ mod tests {
                 .log_dir(temp_dir.path())
                 .log_file_stem("mixed_config_redo.log")
                 .log_write_io_depth(7)
-                .recovery_io_depth(5)
                 .catalog_checkpoint_scan_io_depth(3)
                 .log_block_size(new_log_block_size)
                 .log_file_max_size(new_file_max_size);
@@ -5127,7 +5126,7 @@ mod tests {
             let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
             let (finalizer, planner, read_depth) = redo_planner_and_finalizer_for_test(
                 &file_prefix,
-                config.recovery_io_depth,
+                RecoveryConfig::default().io_depth(5).io_depth,
                 config.log_write_io_depth,
                 new_file_max_size,
                 new_log_block_size,

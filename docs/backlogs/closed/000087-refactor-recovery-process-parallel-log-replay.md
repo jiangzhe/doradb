@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000309-pipelined-recovery-with-parallel-page-replay.md; allocator and payload reclamation follow-up is tracked separately in backlog 000202.
+- Closed By: backlog close
+- Reference: docs/tasks/000309-pipelined-recovery-with-parallel-page-replay.md
+- Closed At: 2026-09-18

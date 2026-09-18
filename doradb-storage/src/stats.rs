@@ -364,7 +364,7 @@ pub struct RecoveryPhaseTimings {
     pub user_table_bootstrap_elapsed: Duration,
     /// Replay-suffix planning and read-ahead launch.
     pub redo_planning_elapsed: Duration,
-    /// Redo stream consumption, application, and termination.
+    /// Redo stream consumption, application, and final parallel replay drain.
     pub redo_replay_elapsed: Duration,
     /// Catalog, descriptor, table-root, and index lifecycle validation.
     pub validation_elapsed: Duration,
@@ -430,7 +430,8 @@ pub struct RecoveryRedoMetrics {
     pub reader_shutdown_elapsed: Duration,
     /// Refill time excluding receives, decoding, and reader shutdown.
     pub stream_other_elapsed: Duration,
-    /// Replay time excluding refill; includes application, dispatch, and filtering.
+    /// Consumer replay time excluding refill; includes dispatch, filtering, and final drain.
+    /// This is elapsed time, not summed worker CPU time.
     pub apply_and_dispatch_elapsed: Duration,
     /// Complete validated groups decoded.
     pub groups_decoded: u64,

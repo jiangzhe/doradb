@@ -229,6 +229,8 @@ pub(crate) enum ConfigError {
     StorageLayoutMismatch,
     #[error("invalid io depth")]
     InvalidIoDepth,
+    #[error("invalid recovery replay limit")]
+    InvalidRecoveryLimit,
     #[error("invalid purge thread count")]
     InvalidPurgeThreads,
     #[error("invalid transaction GC bucket count")]

@@ -16,6 +16,8 @@ pub struct EngineConfigOverlay {
     pub table_scan: TableScanConfigOverlay,
     /// Transaction-system overrides.
     pub transaction: TransactionConfigOverlay,
+    /// Startup recovery overrides.
+    pub recovery: RecoveryConfigOverlay,
     /// Metadata buffer-pool size.
     pub meta_buffer_size: Option<Byte>,
     /// User-index buffer-pool overrides.
@@ -34,6 +36,7 @@ impl EngineConfigOverlay {
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
+        self.recovery.merge(other.recovery);
         replace(&mut self.meta_buffer_size, other.meta_buffer_size);
         self.index_buffer.merge(other.index_buffer);
         self.data_buffer.merge(other.data_buffer);
@@ -101,8 +104,6 @@ impl MandatoryRuntimeOverlay {
 pub struct TransactionConfigOverlay {
     /// Live redo-writer I/O depth.
     pub log_write_io_depth: Option<usize>,
-    /// Startup recovery I/O depth.
-    pub recovery_io_depth: Option<usize>,
     /// Catalog-checkpoint redo-scan I/O depth.
     pub catalog_checkpoint_scan_io_depth: Option<usize>,
     /// Redo block size.
@@ -119,15 +120,12 @@ pub struct TransactionConfigOverlay {
     pub purge_threads: Option<usize>,
     /// Transaction GC bucket count.
     pub gc_buckets: Option<usize>,
-    /// Disable DML validation during recovery.
-    pub recovery_disable_dml_validation: Option<bool>,
 }
 
 impl TransactionConfigOverlay {
     #[inline]
     fn merge(&mut self, other: Self) {
         replace(&mut self.log_write_io_depth, other.log_write_io_depth);
-        replace(&mut self.recovery_io_depth, other.recovery_io_depth);
         replace(
             &mut self.catalog_checkpoint_scan_io_depth,
             other.catalog_checkpoint_scan_io_depth,
@@ -139,10 +137,36 @@ impl TransactionConfigOverlay {
         replace(&mut self.log_sync, other.log_sync);
         replace(&mut self.purge_threads, other.purge_threads);
         replace(&mut self.gc_buckets, other.gc_buckets);
+    }
+}
+
+/// Strict startup recovery overlay; omitted limits use storage defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecoveryConfigOverlay {
+    /// Startup redo read-ahead depth.
+    pub io_depth: Option<usize>,
+    /// Disable catalog and row replay DML validation.
+    pub disable_dml_validation: Option<bool>,
+    /// Positive outstanding-batch override; omission preserves automatic sizing.
+    pub max_in_flight_batches: Option<usize>,
+    /// Positive active-page override; omission preserves automatic sizing.
+    pub max_active_pages: Option<usize>,
+    /// Maximum operations in one replay batch.
+    pub max_batch_ops: Option<usize>,
+}
+
+impl RecoveryConfigOverlay {
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        replace(&mut self.io_depth, other.io_depth);
         replace(
-            &mut self.recovery_disable_dml_validation,
-            other.recovery_disable_dml_validation,
+            &mut self.disable_dml_validation,
+            other.disable_dml_validation,
         );
+        replace(&mut self.max_in_flight_batches, other.max_in_flight_batches);
+        replace(&mut self.max_active_pages, other.max_active_pages);
+        replace(&mut self.max_batch_ops, other.max_batch_ops);
     }
 }
 
@@ -234,6 +258,8 @@ pub struct ResolvedEngineConfig {
     pub thread_pool: ResolvedThreadPoolConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
+    /// Startup recovery settings with automatic limits resolved.
+    pub recovery: ResolvedRecoveryConfig,
     /// Mandatory runtime sizing.
     pub mandatory_runtime: ResolvedMandatoryRuntimeConfig,
     /// Deterministic table-scan planning settings.
@@ -257,7 +283,6 @@ impl ResolvedEngineConfig {
             },
             transaction: ResolvedTransactionConfig {
                 log_write_io_depth: config.trx.log_write_io_depth,
-                recovery_io_depth: config.trx.recovery_io_depth,
                 catalog_checkpoint_scan_io_depth: config.trx.catalog_checkpoint_scan_io_depth,
                 log_block_size_bytes: config.trx.log_block_size.as_u64(),
                 log_dir: config.trx.log_dir.clone(),
@@ -266,7 +291,20 @@ impl ResolvedEngineConfig {
                 log_sync: LogSyncValue::from_storage(config.trx.log_sync),
                 purge_threads: config.trx.purge_threads,
                 gc_buckets: config.trx.gc_buckets,
-                recovery_disable_dml_validation: config.trx.recovery_disable_dml_validation,
+            },
+            // Storage validation resolves both automatic limits before this snapshot.
+            recovery: ResolvedRecoveryConfig {
+                io_depth: config.recovery.io_depth,
+                disable_dml_validation: config.recovery.disable_dml_validation,
+                max_in_flight_batches: config
+                    .recovery
+                    .max_in_flight_batches
+                    .expect("validated recovery batch limit"),
+                max_active_pages: config
+                    .recovery
+                    .max_active_pages
+                    .expect("validated recovery active-page limit"),
+                max_batch_ops: config.recovery.max_batch_ops,
             },
             mandatory_runtime: ResolvedMandatoryRuntimeConfig {
                 concurrency_limit: config.mandatory_runtime.concurrency_limit,
@@ -313,8 +351,6 @@ pub struct ResolvedThreadPoolConfig {
 pub struct ResolvedTransactionConfig {
     /// Live redo-writer I/O depth.
     pub log_write_io_depth: usize,
-    /// Startup recovery I/O depth.
-    pub recovery_io_depth: usize,
     /// Catalog-checkpoint redo-scan I/O depth.
     pub catalog_checkpoint_scan_io_depth: usize,
     /// Sector-aligned physical redo block bytes.
@@ -331,8 +367,22 @@ pub struct ResolvedTransactionConfig {
     pub purge_threads: usize,
     /// Transaction GC bucket count.
     pub gc_buckets: usize,
-    /// Whether recovery DML validation is disabled.
-    pub recovery_disable_dml_validation: bool,
+}
+
+/// Serializable startup recovery settings with concrete positive replay limits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedRecoveryConfig {
+    /// Startup redo read-ahead depth.
+    pub io_depth: usize,
+    /// Whether catalog and row replay DML validation is disabled.
+    pub disable_dml_validation: bool,
+    /// Maximum outstanding replay batches.
+    pub max_in_flight_batches: usize,
+    /// Maximum active replay pages.
+    pub max_active_pages: usize,
+    /// Maximum operations in one replay batch.
+    pub max_batch_ops: usize,
 }
 
 /// Serializable normalized mandatory-runtime configuration.
@@ -408,9 +458,6 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.transaction.log_write_io_depth {
         transaction = transaction.log_write_io_depth(value);
     }
-    if let Some(value) = overlay.transaction.recovery_io_depth {
-        transaction = transaction.recovery_io_depth(value);
-    }
     if let Some(value) = overlay.transaction.catalog_checkpoint_scan_io_depth {
         transaction = transaction.catalog_checkpoint_scan_io_depth(value);
     }
@@ -436,8 +483,21 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.transaction.gc_buckets {
         transaction = transaction.gc_buckets(value);
     }
-    if let Some(value) = overlay.transaction.recovery_disable_dml_validation {
-        transaction = transaction.recovery_disable_dml_validation(value);
+    let mut recovery = default.recovery;
+    if let Some(value) = overlay.recovery.io_depth {
+        recovery = recovery.io_depth(value);
+    }
+    if let Some(value) = overlay.recovery.disable_dml_validation {
+        recovery = recovery.disable_dml_validation(value);
+    }
+    if let Some(value) = overlay.recovery.max_in_flight_batches {
+        recovery = recovery.max_in_flight_batches(Some(value));
+    }
+    if let Some(value) = overlay.recovery.max_active_pages {
+        recovery = recovery.max_active_pages(Some(value));
+    }
+    if let Some(value) = overlay.recovery.max_batch_ops {
+        recovery = recovery.max_batch_ops(value);
     }
 
     let index_buffer = apply_evictable_buffer_overlay(
@@ -474,6 +534,7 @@ pub fn resolve_engine_config(
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
         .trx(transaction)
+        .recovery(recovery)
         .meta_buffer(
             overlay
                 .meta_buffer_size
@@ -611,10 +672,121 @@ mod tests {
         assert!(toml::from_str::<EngineConfigOverlay>("meta_buffer_size = 4096").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("[thread_pool]\nunknown = 1").is_err());
         assert!(toml::from_str::<EngineConfigOverlay>("[table_scan]\nunknown = 1").is_err());
+        assert!(toml::from_str::<EngineConfigOverlay>("[recovery]\nunknown = 1").is_err());
+        for field in ["max_batch_bytes", "max_buffered_bytes"] {
+            assert!(
+                toml::from_str::<EngineConfigOverlay>(&format!(
+                    "[recovery]\n{field} = \"64 KiB\"\n"
+                ))
+                .is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            toml::from_str::<EngineConfigOverlay>("[transaction]\nrecovery_io_depth = 1").is_err()
+        );
+        assert!(
+            toml::from_str::<EngineConfigOverlay>(
+                "[transaction]\nrecovery_disable_dml_validation = true"
+            )
+            .is_err()
+        );
         assert!(
             toml::from_str::<EngineConfigOverlay>("[mandatory_runtime]\nworker_threads = 2")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn recovery_overlay_merges_resolves_and_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let mut base: EngineConfigOverlay = toml::from_str(
+            r"
+            [thread_pool]
+            worker_threads = 3
+            [recovery]
+            io_depth = 2
+            disable_dml_validation = true
+            max_in_flight_batches = 5
+            max_active_pages = 7
+            max_batch_ops = 11
+        ",
+        )
+        .unwrap();
+        base.merge(
+            toml::from_str(
+                r"
+            [recovery]
+            io_depth = 4
+            disable_dml_validation = false
+            max_in_flight_batches = 6
+        ",
+            )
+            .unwrap(),
+        );
+        let (config, resolved) = resolve_engine_config(temp.path(), &base).unwrap();
+        assert_eq!(config.recovery.max_in_flight_batches, Some(6));
+        assert_eq!(config.recovery.max_active_pages, Some(7));
+        assert_eq!(
+            resolved.recovery,
+            ResolvedRecoveryConfig {
+                io_depth: 4,
+                disable_dml_validation: false,
+                max_in_flight_batches: 6,
+                max_active_pages: 7,
+                max_batch_ops: 11,
+            }
+        );
+        let encoded = toml::to_string(&resolved).unwrap();
+        assert_eq!(
+            toml::from_str::<ResolvedEngineConfig>(&encoded).unwrap(),
+            resolved
+        );
+        for field in ["max_batch_bytes", "max_buffered_bytes"] {
+            let mut obsolete: toml::Value = toml::from_str(&encoded).unwrap();
+            obsolete["recovery"]
+                .as_table_mut()
+                .unwrap()
+                .insert(field.to_owned(), toml::Value::Integer(65536));
+            assert!(
+                obsolete.try_into::<ResolvedEngineConfig>().is_err(),
+                "{field}"
+            );
+        }
+        let mut missing_recovery: toml::Value = toml::from_str(&encoded).unwrap();
+        missing_recovery.as_table_mut().unwrap().remove("recovery");
+        assert!(missing_recovery.try_into::<ResolvedEngineConfig>().is_err());
+    }
+
+    #[test]
+    fn recovery_overlay_automatic_limits_follow_final_worker_and_batch_overrides() {
+        let temp = TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay =
+            toml::from_str("[thread_pool]\nworker_threads = 3\n").unwrap();
+        let (_, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(resolved.recovery.max_in_flight_batches, 6);
+        assert_eq!(resolved.recovery.max_active_pages, 24);
+        overlay.merge(toml::from_str("[recovery]\nmax_in_flight_batches = 1\n").unwrap());
+        let (_, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(resolved.recovery.max_in_flight_batches, 1);
+        assert_eq!(resolved.recovery.max_active_pages, 4);
+    }
+
+    #[test]
+    fn recovery_overlay_rejects_invalid_limits() {
+        let temp = TempDir::new().unwrap();
+        for field in [
+            "io_depth = 0",
+            "max_in_flight_batches = 0",
+            "max_active_pages = 0",
+            "max_batch_ops = 0",
+        ] {
+            let overlay = toml::from_str(&format!("[recovery]\n{field}\n")).unwrap();
+            assert!(
+                resolve_engine_config(temp.path(), &overlay).is_err(),
+                "{field}"
+            );
+        }
     }
 
     #[test]
