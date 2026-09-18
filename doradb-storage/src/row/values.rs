@@ -9,6 +9,7 @@ pub(crate) use tests::BufferValues;
 /// stable across validation, sizing, and mutation. Views borrow from this owner
 /// and are not retained by consumers. Write inputs must be stored separately
 /// from the mutable destination page; successful writes copy their bytes.
+/// Writers reject nonempty byte slices overlapping that page with a release assertion.
 pub(crate) trait RowValues {
     /// Returns the number of columns.
     fn len(&self) -> usize;
@@ -24,6 +25,7 @@ pub(crate) trait RowValues {
 /// borrow from this owner and are not retained. Implementations must not sort
 /// or deduplicate entries: validation checks their order. Write inputs must be
 /// stored separately from the mutable destination page, which copies the bytes.
+/// Writers reject nonempty byte slices overlapping that page with a release assertion.
 pub(crate) trait UpdateValues {
     /// Returns the number of update entries.
     fn len(&self) -> usize;
