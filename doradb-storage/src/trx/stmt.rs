@@ -917,7 +917,7 @@ impl<'stmt> Statement<'stmt> {
             .disclose()?;
         if !self.dml_validation_disabled {
             DmlValidator::new(layout.metadata())
-                .validate_full_row(&cols)
+                .validate_full_row(cols.as_slice())
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"))
                 .disclose()?;
@@ -951,7 +951,7 @@ impl<'stmt> Statement<'stmt> {
             let validator = DmlValidator::new(layout.metadata());
             for (batch_index, row) in rows.iter().enumerate() {
                 validator
-                    .validate_full_row(row)
+                    .validate_full_row(row.as_slice())
                     .change_context(OperationError::InvalidDmlInput)
                     .attach_with(|| {
                         format!(
@@ -1053,7 +1053,7 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         narrow_catalog_operation_or_fatal(table_id, metadata_lock)?;
         let validation = DmlValidator::new(table.metadata())
-            .validate_full_row(&cols)
+            .validate_full_row(cols.as_slice())
             .change_context(OperationError::InvalidDmlInput)
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         assert_catalog_operation_invariant(table_id, validation);
@@ -1086,7 +1086,7 @@ impl<'stmt> Statement<'stmt> {
         let validator = DmlValidator::new(table.metadata());
         for (batch_index, row) in rows.iter().enumerate() {
             let validation = validator
-                .validate_full_row(row)
+                .validate_full_row(row.as_slice())
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
@@ -1129,7 +1129,7 @@ impl<'stmt> Statement<'stmt> {
         let validator = DmlValidator::new(table.metadata());
         for (batch_index, row) in rows.iter().enumerate() {
             let validation = validator
-                .validate_full_row(row)
+                .validate_full_row(row.as_slice())
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
@@ -1295,7 +1295,7 @@ impl<'stmt> Statement<'stmt> {
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         assert_catalog_operation_invariant(table_id, key_validation);
         let row_validation = validator
-            .validate_full_row(&cols)
+            .validate_full_row(cols.as_slice())
             .change_context(OperationError::InvalidDmlInput)
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         assert_catalog_operation_invariant(table_id, row_validation);

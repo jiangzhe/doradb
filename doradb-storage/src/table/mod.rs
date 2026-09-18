@@ -81,8 +81,8 @@ use crate::map::FastHashMap;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::RowReplayState;
-use crate::row::ops::{SelectKey, UpdateCol};
-use crate::row::{RowPage, RowRead, var_len_for_insert};
+use crate::row::ops::SelectKey;
+use crate::row::{RowPage, RowRead, RowValues, UpdateValues, var_len_for_insert};
 use crate::runtime::yield_now;
 use crate::trx::{ActiveSnapshotRegistration, PrivateSnapshot, TrxReadProof};
 use crate::value::{PAGE_VAR_LEN_INLINE, Val};
@@ -748,13 +748,13 @@ impl Table {
     }
 
     #[inline]
-    fn recover_row_insert_to_page(
+    fn recover_row_insert_to_page<R: RowValues + ?Sized>(
         &self,
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         replay: &mut RowReplayState,
         row_id: RowID,
-        cols: &[Val],
+        cols: &R,
         cts: TrxID,
     ) -> DataIntegrityResult<()> {
         let page_id = page_guard.page_id();
@@ -805,8 +805,9 @@ impl Table {
         page_guard.page_mut().update_count_to_include_row_id(row_id);
         let page = page_guard.page_mut();
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
-        for (user_col_idx, user_col) in cols.iter().enumerate() {
-            row.update_col(metadata.col.as_ref(), user_col_idx, user_col, false);
+        // Each view is consumed synchronously and copied into the reserved page space.
+        for col_idx in 0..cols.len() {
+            row.update_col(metadata.col.as_ref(), col_idx, cols.value(col_idx), false);
         }
         row.finish_insert();
         // The exclusive sidecar borrow and the pre-write check establish a new slot.
@@ -818,34 +819,23 @@ impl Table {
     }
 
     #[inline]
-    fn recover_row_update_to_page(
+    fn recover_row_update_to_page<U: UpdateValues + ?Sized>(
         &self,
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         replay: &RowReplayState,
         row_id: RowID,
-        cols: &[UpdateCol],
+        cols: &U,
         cts: TrxID,
     ) -> DataIntegrityResult<()> {
         let page_id = page_guard.page_id();
         let page = page_guard.page();
-        // column indexes must be in range
         debug_assert!(
-            {
-                cols.iter()
-                    .all(|uc| uc.idx < page.header.col_count as usize)
-            },
+            (0..cols.len()).all(|position| cols.value(position).0 < page.header.col_count as usize),
             "update column indexes must be in range"
         );
-        // column indexes should be in order.
         debug_assert!(
-            {
-                cols.is_empty()
-                    || cols
-                        .iter()
-                        .zip(cols.iter().skip(1))
-                        .all(|(l, r)| l.idx < r.idx)
-            },
+            (1..cols.len()).all(|position| cols.value(position - 1).0 < cols.value(position).0),
             "update columns should be in order"
         );
         if !page.row_id_in_valid_range(row_id) {
@@ -892,8 +882,9 @@ impl Table {
         let mut row = page.row_mut_exclusive(row_idx, var_offset, var_end);
         debug_assert_eq!(row_id, row.row_id());
 
-        for uc in cols {
-            row.update_col(metadata.col.as_ref(), uc.idx, &uc.val, true);
+        for position in 0..cols.len() {
+            let (col_idx, value) = cols.value(position);
+            row.update_col(metadata.col.as_ref(), col_idx, value, true);
         }
         row.finish_update();
         Ok(())

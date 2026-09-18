@@ -165,7 +165,7 @@ impl MutationValidator<'_> {
             UniqueMutation::Insert(row) => {
                 if let Some(validator) = &self.validator {
                     validator
-                        .validate_full_row(row)
+                        .validate_full_row(row.as_slice())
                         .change_context(OperationError::InvalidDmlInput)?;
                 }
                 let spec = self.metadata.idx.expect_index_spec(self.index);
@@ -181,7 +181,7 @@ impl MutationValidator<'_> {
             UniqueMutation::Update(update) => {
                 if let Some(validator) = &self.validator {
                     validator
-                        .validate_sparse_update(update)
+                        .validate_sparse_update(update.as_slice())
                         .change_context(OperationError::InvalidDmlInput)?;
                 }
             }
