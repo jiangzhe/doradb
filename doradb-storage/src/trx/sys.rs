@@ -6,7 +6,7 @@ use crate::component::{
     Component, ComponentRegistry, EnginePools, FirstPanic, IndexPool, MemPool, MetaPool,
     ShelfScope, Supplier, panic_payload_description,
 };
-use crate::conf::{TrxSysConfig, ValidatedTrxSysConfig};
+use crate::conf::{RecoveryConfig, TrxSysConfig, ValidatedTrxSysConfig};
 use crate::error::{
     CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, FatalError, FatalResult,
     LifecycleResult, MultiDomainResultExt, QuadError, QuadResult, RuntimeError,
@@ -26,6 +26,7 @@ use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::recovery::{RecoveryOutcome, RecoveryResources};
 use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
+use crate::runtime::thread_pool::ThreadPool;
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
 use crate::stats::RecoveryReport;
 use crate::thread;
@@ -631,27 +632,29 @@ pub(crate) struct TransactionSystem {
 impl TransactionSystem {
     /// Recover durable state and bootstrap transaction-system startup resources.
     pub(crate) async fn bootstrap(
-        validated: ValidatedTrxSysConfig,
+        config: (ValidatedTrxSysConfig, RecoveryConfig),
         poisoner: QuiescentGuard<EnginePoisoner>,
         mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
+        thread_pool: QuiescentGuard<ThreadPool>,
         pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
         catalog: QuiescentGuard<Catalog>,
     ) -> RuntimeOrFatalResult<(Self, PendingTransactionWorkerStartups)> {
+        let (validated, recovery) = config;
         let (config, file_prefix) = validated.into_parts();
         debug_assert!(config.purge_threads != 0);
         debug_assert!(
             (1..=256).contains(&config.gc_buckets) && config.gc_buckets.is_power_of_two()
         );
         debug_assert!(config.log_write_io_depth != 0);
-        debug_assert!(config.recovery_io_depth != 0);
         debug_assert!(config.catalog_checkpoint_scan_io_depth != 0);
 
         let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
         let preparation_started = Instant::now();
-        let recovery_resources = RecoveryResources::new(pools, table_fs.clone(), &catalog);
-        let coordinator = recovery_resources.prepare(&config, file_prefix.clone())?;
+        let recovery_resources =
+            RecoveryResources::new(pools, table_fs.clone(), thread_pool, &catalog);
+        let coordinator = recovery_resources.prepare(&config, &recovery, file_prefix.clone())?;
         let preparation_elapsed = preparation_started.elapsed();
         let RecoveryOutcome {
             max_recovered_cts,
@@ -1708,7 +1711,7 @@ impl Supplier<TransactionRedoWorkers> for TransactionSystem {
 }
 
 impl Component for TransactionSystem {
-    type Config = ValidatedTrxSysConfig;
+    type Config = (ValidatedTrxSysConfig, RecoveryConfig);
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
     type Error = RuntimeOrFatalError;
@@ -1729,11 +1732,13 @@ impl Component for TransactionSystem {
         let catalog = registry.dependency::<Catalog>();
         let poisoner = registry.dependency::<EnginePoisoner>();
         let mandatory_runtime = registry.dependency::<MandatoryRuntime>();
+        let thread_pool = registry.dependency::<ThreadPool>();
 
         let (trx_sys, startups) = TransactionSystem::bootstrap(
             config,
             poisoner,
             mandatory_runtime,
+            thread_pool,
             EnginePools::new(
                 meta_pool.clone_inner(),
                 index_pool.clone_inner(),
@@ -2029,11 +2034,11 @@ pub(crate) mod tests {
         let engine = Engine::bootstrap(
             EngineConfig::default()
                 .storage_root(temp_dir.path().to_path_buf())
+                .recovery(RecoveryConfig::default().io_depth(1))
                 .trx(
                     TrxSysConfig::default()
                         .log_file_stem(log_file_stem)
                         .log_write_io_depth(1)
-                        .recovery_io_depth(1)
                         .catalog_checkpoint_scan_io_depth(1)
                         .log_sync(LogSync::None)
                         .log_file_max_size(log_file_max_size),

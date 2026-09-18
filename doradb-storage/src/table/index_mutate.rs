@@ -1268,8 +1268,14 @@ mod tests {
     #[test]
     fn test_table_index_mutate_mvcc_deferred_hot_lock_resumes_after_cold_publication() {
         smol::block_on(async {
-            assert_deferred_hot_lock_resumes_after_cold_publication(true).await;
-            assert_deferred_hot_lock_resumes_after_cold_publication(false).await;
+            Box::pin(assert_deferred_hot_lock_resumes_after_cold_publication(
+                true,
+            ))
+            .await;
+            Box::pin(assert_deferred_hot_lock_resumes_after_cold_publication(
+                false,
+            ))
+            .await;
         });
     }
 

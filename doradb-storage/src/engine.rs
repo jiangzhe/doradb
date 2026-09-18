@@ -696,7 +696,7 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     let readonly_buffer_size = file.readonly_buffer_size;
     let file = file.validate().disclose()?;
     let trx_cfg = config.trx.log_dir(resolved.log_dir_path());
-    let catalog_cfg = CatalogConfig::new(trx_cfg.recovery_disable_dml_validation);
+    let catalog_cfg = CatalogConfig::new(config.recovery.disable_dml_validation);
     let trx_cfg = ValidatedTrxSysConfig::try_new(trx_cfg).disclose()?;
     // Components are registered in one fixed dependency order. Reverse
     // registration order then defines both explicit shutdown order and the
@@ -753,7 +753,7 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
     let transaction_started = Instant::now();
     builder
-        .build::<TransactionSystem>(trx_cfg)
+        .build::<TransactionSystem>((trx_cfg, config.recovery))
         .await
         .disclose()?;
     let runtime_started = Instant::now();
@@ -847,7 +847,9 @@ mod tests {
     use super::*;
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
-    use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+    use crate::conf::{
+        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig,
+    };
     use crate::error::{
         ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
         RuntimeOrFatalError,
@@ -1306,12 +1308,13 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let engine = Engine::bootstrap(
-                test_engine_config_for(root.path()).trx(
-                    TrxSysConfig::default()
-                        .log_write_io_depth(2)
-                        .recovery_io_depth(3)
-                        .catalog_checkpoint_scan_io_depth(4),
-                ),
+                test_engine_config_for(root.path())
+                    .recovery(RecoveryConfig::default().io_depth(3))
+                    .trx(
+                        TrxSysConfig::default()
+                            .log_write_io_depth(2)
+                            .catalog_checkpoint_scan_io_depth(4),
+                    ),
             )
             .await
             .unwrap();
@@ -2745,10 +2748,15 @@ mod tests {
                 .log_dir(&log_dir)
                 .log_file_stem("pending-startup-cleanup");
             let config = ValidatedTrxSysConfig::try_new(config).unwrap();
+            let mut recovery = RecoveryConfig::default();
+            recovery
+                .validate(engine.inner().thread_pool.worker_threads())
+                .unwrap();
             let (trx_sys, startup) = TransactionSystem::bootstrap(
-                config,
+                (config, recovery),
                 engine.inner().poisoner.clone(),
                 engine.inner().mandatory_runtime.clone(),
+                engine.inner().thread_pool.clone(),
                 EnginePools::new(
                     engine.inner().core.pools.meta.clone(),
                     engine.inner().core.pools.index.clone(),

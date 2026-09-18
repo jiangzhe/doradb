@@ -43,6 +43,14 @@ pub(crate) const DEFAULT_EVICTABLE_BUFFER_POOL_MAX_MEM_SIZE: Byte =
 pub const DEFAULT_LOG_WRITE_IO_DEPTH: usize = 32;
 /// Default direct-IO read-ahead depth allocated to startup recovery.
 pub const DEFAULT_RECOVERY_IO_DEPTH: usize = 32;
+/// Default recovery DML validation opt-out; validation is enabled.
+pub const DEFAULT_RECOVERY_DISABLE_DML_VALIDATION: bool = false;
+/// Default outstanding replay batches per pool worker when sizing is automatic.
+pub const DEFAULT_RECOVERY_TASKS_PER_WORKER: usize = 2;
+/// Default active replay pages per outstanding batch when sizing is automatic.
+pub const DEFAULT_RECOVERY_ACTIVE_PAGES_PER_TASK: usize = 4;
+/// Default maximum operations reserved in one replay batch.
+pub const DEFAULT_RECOVERY_MAX_BATCH_OPS: usize = 256;
 /// Default direct-IO read-ahead depth allocated to catalog checkpoint scans.
 pub const DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH: usize = 32;
 /// Default upper bound for one redo-log IO request payload.

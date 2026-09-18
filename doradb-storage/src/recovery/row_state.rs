@@ -1,7 +1,8 @@
 use crate::bitmap::{Bitmap, new_bitmap};
 use crate::id::PageID;
 
-/// Inserted-slot history owned by sequential recovery for one page lifetime.
+/// Inserted-slot history exclusively moved between page history, an active page,
+/// and its outstanding replay job/result. Retirement retains the bitmap.
 /// The coordinator removes this state before page reuse, so the page ID remains
 /// bound to its allocation throughout replay and index reconstruction.
 pub(crate) struct RowReplayState {

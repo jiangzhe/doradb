@@ -56,7 +56,7 @@ pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
     DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION, EngineConfig, EvictableBufferPoolConfig,
     FileSystemConfig, LogSync, MAX_TABLE_SCAN_UNITS_PER_PARTITION, MandatoryRuntimeConfig,
-    TableScanConfig, ThreadPoolConfig, TrxSysConfig,
+    RecoveryConfig, TableScanConfig, ThreadPoolConfig, TrxSysConfig,
 };
 pub use engine::Engine;
 pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};

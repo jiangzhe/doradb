@@ -1,8 +1,8 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::Catalog;
 use crate::component::EnginePools;
-use crate::conf::TrxSysConfig;
 use crate::conf::path::validate_log_file_stem;
+use crate::conf::{RecoveryConfig, TrxSysConfig};
 use crate::error::RuntimeResult;
 use crate::file::fs::FileSystem;
 use crate::io::STORAGE_SECTOR_SIZE;
@@ -10,6 +10,7 @@ use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{RedoLogFinalizer, discover_redo_log_files};
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
+use crate::runtime::thread_pool::ThreadPool;
 
 use super::RecoveryCoordinator;
 
@@ -21,6 +22,8 @@ pub(crate) struct RecoveryResources<'a> {
     pub(crate) pool_guards: PoolGuards,
     /// Table file system used to reload and clean recovered user-table files.
     pub(crate) table_fs: QuiescentGuard<FileSystem>,
+    /// Existing finite-job pool, already running before recovery starts.
+    pub(crate) thread_pool: QuiescentGuard<ThreadPool>,
     /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     pub(crate) catalog: &'a Catalog,
 }
@@ -31,6 +34,7 @@ impl<'a> RecoveryResources<'a> {
     pub(crate) fn new(
         pools: EnginePools,
         table_fs: QuiescentGuard<FileSystem>,
+        thread_pool: QuiescentGuard<ThreadPool>,
         catalog: &'a Catalog,
     ) -> Self {
         let pool_guards = pools.pool_guards().clone();
@@ -38,6 +42,7 @@ impl<'a> RecoveryResources<'a> {
             pools,
             pool_guards,
             table_fs,
+            thread_pool,
             catalog,
         }
     }
@@ -47,12 +52,12 @@ impl<'a> RecoveryResources<'a> {
     pub(crate) fn prepare(
         self,
         config: &TrxSysConfig,
+        recovery: &RecoveryConfig,
         file_prefix: String,
     ) -> RuntimeResult<RecoveryCoordinator<'a>> {
         let log_block_size = config.log_block_size.as_u64() as usize;
         let file_max_size = config.log_file_max_size.as_u64() as usize;
         debug_assert!(config.log_write_io_depth != 0);
-        debug_assert!(config.recovery_io_depth != 0);
         debug_assert!(validate_log_file_stem(&config.log_file_stem));
         debug_assert!((STORAGE_SECTOR_SIZE..=u16::MAX as usize + 1).contains(&log_block_size));
         debug_assert_eq!(log_block_size % STORAGE_SECTOR_SIZE, 0);
@@ -77,12 +82,6 @@ impl<'a> RecoveryResources<'a> {
             log_block_size,
             0,
         );
-        Ok(RecoveryCoordinator::new(
-            self,
-            planner,
-            config.recovery_io_depth,
-            config.recovery_disable_dml_validation,
-            finalizer,
-        ))
+        Ok(RecoveryCoordinator::new(self, planner, recovery, finalizer))
     }
 }

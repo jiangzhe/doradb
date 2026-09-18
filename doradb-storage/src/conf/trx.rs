@@ -9,19 +9,17 @@ use std::path::{Path, PathBuf};
 use super::consts::{
     DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_GC_BUCKETS, DEFAULT_LOG_BLOCK_SIZE,
     DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM, DEFAULT_LOG_SYNC,
-    DEFAULT_LOG_WRITE_IO_DEPTH, DEFAULT_PURGE_THREADS, DEFAULT_RECOVERY_IO_DEPTH,
+    DEFAULT_LOG_WRITE_IO_DEPTH, DEFAULT_PURGE_THREADS,
 };
 use super::path::{path_to_utf8, validate_log_file_stem};
 
 const MAX_REDO_LOG_BLOCK_SIZE: usize = u16::MAX as usize + 1;
 
-/// Configuration for redo logging, recovery, and transaction-system workers.
+/// Configuration for redo logging and transaction-system workers.
 #[derive(Debug, Clone)]
 pub struct TrxSysConfig {
     /// In-flight IO request depth of the live redo writer.
     pub log_write_io_depth: usize,
-    /// Direct-IO read-ahead depth used during startup recovery.
-    pub recovery_io_depth: usize,
     /// Direct-IO read-ahead depth used by catalog checkpoint redo scans.
     pub catalog_checkpoint_scan_io_depth: usize,
     /// Sector-aligned physical write size for fixed-block redo data.
@@ -54,8 +52,6 @@ pub struct TrxSysConfig {
     /// count is fixed for the lifetime of one engine instance and does not
     /// affect persistent storage formats.
     pub gc_buckets: usize,
-    /// Disable DML payload validation during recovery/no-transaction replay.
-    pub recovery_disable_dml_validation: bool,
 }
 
 impl Default for TrxSysConfig {
@@ -63,7 +59,6 @@ impl Default for TrxSysConfig {
     fn default() -> Self {
         TrxSysConfig {
             log_write_io_depth: DEFAULT_LOG_WRITE_IO_DEPTH,
-            recovery_io_depth: DEFAULT_RECOVERY_IO_DEPTH,
             catalog_checkpoint_scan_io_depth: DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH,
             log_block_size: DEFAULT_LOG_BLOCK_SIZE,
             log_dir: PathBuf::from(DEFAULT_LOG_DIR),
@@ -72,7 +67,6 @@ impl Default for TrxSysConfig {
             log_sync: DEFAULT_LOG_SYNC,
             purge_threads: DEFAULT_PURGE_THREADS,
             gc_buckets: DEFAULT_GC_BUCKETS,
-            recovery_disable_dml_validation: false,
         }
     }
 }
@@ -82,20 +76,6 @@ impl TrxSysConfig {
     #[inline]
     pub fn log_write_io_depth(mut self, io_depth: usize) -> Self {
         self.log_write_io_depth = io_depth;
-        self
-    }
-
-    /// Set the startup recovery direct-IO read-ahead depth.
-    #[inline]
-    pub fn recovery_io_depth(mut self, io_depth: usize) -> Self {
-        self.recovery_io_depth = io_depth;
-        self
-    }
-
-    /// Disable recovery/no-transaction DML shape, type, and nullability validation.
-    #[inline]
-    pub fn recovery_disable_dml_validation(mut self, disable: bool) -> Self {
-        self.recovery_disable_dml_validation = disable;
         self
     }
 
@@ -196,7 +176,6 @@ impl TrxSysConfig {
         validate_purge_threads(self.purge_threads)?;
         validate_gc_buckets(self.gc_buckets)?;
         validate_redo_io_depth(self.log_write_io_depth).attach("invalid log_write_io_depth")?;
-        validate_redo_io_depth(self.recovery_io_depth).attach("invalid recovery_io_depth")?;
         validate_redo_io_depth(self.catalog_checkpoint_scan_io_depth)
             .attach("invalid catalog_checkpoint_scan_io_depth")?;
         if !validate_log_file_stem(&self.log_file_stem) {
@@ -360,35 +339,24 @@ mod tests {
         let config = TrxSysConfig::default();
 
         assert_eq!(config.log_write_io_depth, DEFAULT_LOG_WRITE_IO_DEPTH);
-        assert_eq!(config.recovery_io_depth, DEFAULT_RECOVERY_IO_DEPTH);
         assert_eq!(
             config.catalog_checkpoint_scan_io_depth,
             DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH
         );
         assert_eq!(config.log_write_io_depth, 32);
-        assert_eq!(config.recovery_io_depth, 32);
         assert_eq!(config.catalog_checkpoint_scan_io_depth, 32);
         assert_eq!(config.gc_buckets, DEFAULT_GC_BUCKETS);
         assert_eq!(config.gc_buckets, 32);
-        assert!(!config.recovery_disable_dml_validation);
     }
 
     #[test]
     fn redo_io_depth_builders_are_independent() {
         let config = TrxSysConfig::default()
             .log_write_io_depth(2)
-            .recovery_io_depth(3)
             .catalog_checkpoint_scan_io_depth(4);
 
         assert_eq!(config.log_write_io_depth, 2);
-        assert_eq!(config.recovery_io_depth, 3);
         assert_eq!(config.catalog_checkpoint_scan_io_depth, 4);
-    }
-
-    #[test]
-    fn recovery_dml_validation_builder_sets_flag() {
-        let config = TrxSysConfig::default().recovery_disable_dml_validation(true);
-        assert!(config.recovery_disable_dml_validation);
     }
 
     #[test]
@@ -432,7 +400,6 @@ mod tests {
     #[test]
     fn validate_rejects_zero_redo_io_depths() {
         assert_validate_rejects_invalid_io_depth(TrxSysConfig::default().log_write_io_depth(0));
-        assert_validate_rejects_invalid_io_depth(TrxSysConfig::default().recovery_io_depth(0));
         assert_validate_rejects_invalid_io_depth(
             TrxSysConfig::default().catalog_checkpoint_scan_io_depth(0),
         );

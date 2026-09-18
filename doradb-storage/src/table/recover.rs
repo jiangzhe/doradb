@@ -1,129 +1,127 @@
 use crate::buffer::PoolGuards;
-use crate::catalog::IndexSlot;
+use crate::buffer::guard::PageExclusiveGuard;
+use crate::catalog::{IndexSlot, TableMetadata};
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError,
-    RuntimeOrFatalResult,
+    RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
-use crate::recovery::RowReplayState;
-use crate::row::RowRead;
-use crate::row::ops::{ReadRow, UpdateCol};
+use crate::log::redo::RowRedoKind;
+use crate::recovery::{ReplayOp, RowReplayCounts, RowReplayState};
+use crate::row::ops::ReadRow;
+use crate::row::{RowPage, RowRead};
 use crate::stats::recovery_add_count;
 use crate::table::{DeletionError, DmlValidator, Table};
 use crate::trx::MIN_SNAPSHOT_TS;
-use crate::value::Val;
 use error_stack::{Report, ResultExt};
 
 impl Table {
-    /// Recover row insert from redo log.
-    pub(crate) async fn recover_row_insert(
+    /// Apply one ordered hot-page batch through one exclusive page acquisition.
+    /// The caller groups all operations for `replay.page_id()`.
+    pub(crate) async fn recover_row_batch(
         &self,
         guards: &PoolGuards,
         replay: &mut RowReplayState,
-        row_id: RowID,
-        cols: &[Val],
-        cts: TrxID,
+        ops: &[ReplayOp],
         disable_dml_validation: bool,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<RowReplayCounts> {
         let page_id = replay.page_id();
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
-        if !disable_dml_validation {
-            DmlValidator::new(metadata)
-                .validate_full_row(cols)
-                .change_context(DataIntegrityError::InvalidPayload)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!("operation=recover_row_insert, table_id={}", self.table_id())
-                })?;
-        }
-        debug_assert!(cols.len() == metadata.col.col_count());
-        debug_assert!({
-            cols.iter()
-                .enumerate()
-                .all(|(idx, val)| metadata.col.col_type_match(idx, val))
-        });
-        // Canonical sequential replay owns the sidecar; the latch protects page bytes.
         let mut page_guard = self
             .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
-
-        self.recover_row_insert_to_page(metadata, &mut page_guard, replay, row_id, cols, cts)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=recover_row_insert, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
-                    self.table_id()
-                )
-            })?;
-        page_guard.set_dirty(); // mark as dirty page.
-        Ok(())
+        let mut counts = RowReplayCounts::default();
+        // The job exclusively owns the bitmap. No scheduler wait occurs while
+        // the latch is held, and every successful mutation is marked dirty even
+        // if validation or mutation of a later operation fails.
+        let result = self.recover_row_batch_to_page(
+            metadata,
+            &mut page_guard,
+            replay,
+            ops,
+            disable_dml_validation,
+            &mut counts,
+        );
+        if !counts.is_empty() {
+            page_guard.set_dirty();
+        }
+        result?;
+        Ok(counts)
     }
 
-    /// Recover row update from redo log.
-    pub(crate) async fn recover_row_update(
+    /// Apply ordered operations to the latched page, retaining counts on failure.
+    fn recover_row_batch_to_page(
         &self,
-        guards: &PoolGuards,
-        replay: &RowReplayState,
-        row_id: RowID,
-        update: &[UpdateCol],
-        cts: TrxID,
+        metadata: &TableMetadata,
+        page_guard: &mut PageExclusiveGuard<RowPage>,
+        replay: &mut RowReplayState,
+        ops: &[ReplayOp],
         disable_dml_validation: bool,
-    ) -> RuntimeOrFatalResult<()> {
+        counts: &mut RowReplayCounts,
+    ) -> RuntimeResult<()> {
         let page_id = replay.page_id();
-        let layout = self.layout_snapshot();
-        let metadata = layout.metadata();
-        if !disable_dml_validation {
-            DmlValidator::new(metadata)
-                .validate_sparse_update(update)
-                .change_context(DataIntegrityError::InvalidPayload)
-                .change_context(RuntimeError::TableAccess)
-                .attach_with(|| {
-                    format!("operation=recover_row_update, table_id={}", self.table_id())
-                })?;
-        }
-        let mut page_guard = self
-            .row_store
-            .must_get_row_page_exclusive(guards, page_id)
-            .await?;
-
-        self.recover_row_update_to_page(metadata, &mut page_guard, replay, row_id, update, cts)
+        for op in ops {
+            self.recover_row_op_to_page(
+                metadata,
+                page_guard,
+                replay,
+                op,
+                disable_dml_validation,
+                counts,
+            )
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=recover_row_update, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
-                    self.table_id()
+                    "operation=recover_row_batch, kind={:?}, table_id={}, page_id={page_id}, row_id={}, cts={}",
+                    op.row.kind.code(), self.table_id(), op.row.row_id, op.cts
                 )
             })?;
-        page_guard.set_dirty(); // mark as dirty page.
+        }
         Ok(())
     }
 
-    /// Recover row delete from redo log.
-    pub(crate) async fn recover_row_delete(
+    /// Validate and apply one operation, counting only its successful mutation.
+    fn recover_row_op_to_page(
         &self,
-        guards: &PoolGuards,
-        replay: &RowReplayState,
-        row_id: RowID,
-        cts: TrxID,
-    ) -> RuntimeOrFatalResult<()> {
-        let page_id = replay.page_id();
-        let mut page_guard = self
-            .row_store
-            .must_get_row_page_exclusive(guards, page_id)
-            .await?;
-
-        self.recover_row_delete_to_page(&mut page_guard, replay, row_id, cts)
-            .change_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=recover_row_delete, table_id={}, page_id={page_id}, row_id={row_id}, cts={cts}",
-                    self.table_id()
-                )
-            })?;
-        page_guard.set_dirty(); // mark as dirty page.
+        metadata: &TableMetadata,
+        page_guard: &mut PageExclusiveGuard<RowPage>,
+        replay: &mut RowReplayState,
+        op: &ReplayOp,
+        disable_dml_validation: bool,
+        counts: &mut RowReplayCounts,
+    ) -> DataIntegrityResult<()> {
+        let row_id = op.row.row_id;
+        let cts = op.cts;
+        match &op.row.kind {
+            RowRedoKind::Insert(_, cols) => {
+                if !disable_dml_validation {
+                    DmlValidator::new(metadata)
+                        .validate_full_row(cols)
+                        .change_context(DataIntegrityError::InvalidPayload)?;
+                }
+                self.recover_row_insert_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
+                counts.inserts += 1;
+            }
+            RowRedoKind::Update(_, cols) => {
+                if !disable_dml_validation {
+                    DmlValidator::new(metadata)
+                        .validate_sparse_update(cols)
+                        .change_context(DataIntegrityError::InvalidPayload)?;
+                }
+                self.recover_row_update_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
+                counts.updates += 1;
+            }
+            RowRedoKind::Delete(_) => {
+                self.recover_row_delete_to_page(page_guard, replay, row_id, cts)?;
+                counts.deletes += 1;
+            }
+            RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
+                unreachable!("catalog redo in hot-page batch")
+            }
+        }
         Ok(())
     }
 
@@ -268,9 +266,10 @@ mod tests {
     use crate::error::RuntimeOrFatalError;
     use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
     use crate::id::RowID;
-    use crate::id::{PageID, TrxID};
+    use crate::id::TrxID;
     use crate::index::IndexInsert;
-    use crate::recovery::RowReplayState;
+    use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::recovery::{ReplayOp, RowReplayState};
     use crate::row::ops::UpdateCol;
     use crate::row::{RowPage, RowRead};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
@@ -521,59 +520,48 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
-
-            let mut replay = RowReplayState::new(PageID::new(0), 2);
-            let err = table
-                .recover_row_insert(
-                    &session.pool_guards(),
-                    &mut replay,
-                    RowID::new(0),
-                    &[Val::from(1i32)],
-                    TrxID::new(10),
-                    false,
-                )
+            let guards = session.pool_guards();
+            let page = table
+                .row_store
+                .get_insert_page_exclusive(&guards, 2)
                 .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-            assert!(err.downcast_ref::<DmlValidationError>().is_some());
-            let report = format!("{err:?}");
-            assert!(report.contains("recover_row_insert"), "{report}");
-            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
-
-            assert!(!replay.is_inserted(0));
-            let err = table
-                .recover_row_update(
-                    &session.pool_guards(),
-                    &replay,
-                    RowID::new(0),
-                    &[UpdateCol {
+                .unwrap();
+            let page_id = page.page_id();
+            let row_id = page.page().header.start_row_id;
+            let mut replay = replay_state(&page);
+            drop(page);
+            for kind in [
+                RowRedoKind::Insert(page_id, vec![Val::from(1i32)]),
+                RowRedoKind::Update(
+                    page_id,
+                    vec![UpdateCol {
                         idx: 2,
                         val: Val::from("out-of-range"),
                     }],
-                    TrxID::new(11),
-                    false,
-                )
-                .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(*err.current_context(), RuntimeError::TableAccess);
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-            assert!(err.downcast_ref::<DmlValidationError>().is_some());
-            let report = format!("{err:?}");
-            assert!(report.contains("recover_row_update"), "{report}");
-            assert!(report.contains(&format!("table_id={table_id}")), "{report}");
+                ),
+            ] {
+                let ops = [ReplayOp {
+                    cts: TrxID::new(10),
+                    row: RowRedo { row_id, kind },
+                }];
+                let err = table
+                    .recover_row_batch(&guards, &mut replay, &ops, false)
+                    .await
+                    .unwrap_err();
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("expected Runtime error, got {err:?}")
+                };
+                assert_eq!(*err.current_context(), RuntimeError::TableAccess);
+                assert_eq!(
+                    err.downcast_ref::<DataIntegrityError>().copied(),
+                    Some(DataIntegrityError::InvalidPayload)
+                );
+                assert!(err.downcast_ref::<DmlValidationError>().is_some());
+                let report = format!("{err:?}");
+                assert!(report.contains("recover_row_batch"), "{report}");
+                assert!(report.contains(&format!("table_id={table_id}")), "{report}");
+                assert!(!replay.is_inserted(0));
+            }
         });
     }
 

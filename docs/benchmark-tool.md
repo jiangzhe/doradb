@@ -24,6 +24,51 @@ Both `--root` and `--plan` are required execution inputs; the benchmark binary
 does not delete storage roots. Remove completed or diagnostic roots with the
 normal directory-management tools for the host environment.
 
+## Allocator impact
+
+**Record the allocator when reporting benchmark results.** Moving allocations
+between threads can change allocator contention enough to reverse a performance
+comparison. During parallel recovery, the coordinator allocates decoded row
+values and replay workers free them. With glibc, these concurrent allocations
+and frees caused substantial allocator-lock contention in serial decode/refill.
+
+In the 10-million-row unindexed comparison for
+[Task 000309](tasks/000309-pipelined-recovery-with-parallel-page-replay.md#allocator-impact-2026-09-18),
+loading jemalloc reduced the parallel implementation's median recovery time from
+5.744 s to 3.566 s and redo replay from 4.093 s to 2.014 s. With jemalloc on both
+versions, parallel recovery was 22.6% faster than the sequential baseline;
+the glibc comparison showed a regression. These are workload-specific local
+measurements, not a universal allocator ranking.
+
+On Ubuntu/Debian, install the runtime library and preload it for an existing
+dynamically linked benchmark binary. No allocator code change or development
+headers are needed. For example, using the shipped recovery template:
+
+```bash
+sudo apt-get install -y libjemalloc2
+rtk cargo build --release -p doradb-bench
+LD_PRELOAD=libjemalloc.so.2 target/release/doradb-bench \
+  --root target/doradb-bench/recovery-jemalloc \
+  --plan doradb-bench/templates/recovery.toml
+```
+
+The preload applies to the whole invocation, including fixture preparation.
+The example uses the template's default row count; the task record describes
+the 10-million-row experiment. Keep the following controls for comparisons:
+
+- Use the same allocator and settings for baseline and candidate. When
+  investigating allocator impact, run both versions with both allocators.
+- Record allocator/library version, `LD_PRELOAD`, `MALLOC_CONF`, and any glibc
+  tuning variables beside the canonical result; `benchmark-result.toml` does
+  not capture these environment settings. Unset them for an untuned system
+  allocator control. Keep the binary, plan, worker count, and cache policy fixed
+  when comparing allocators, and use fresh roots and repeated, interleaved runs.
+- Confirm the library is loaded through `/proc/<pid>/maps`; an untimed
+  `LD_DEBUG=bindings` invocation can verify that allocation symbols bind to it.
+  Keep loader tracing and profiling out of timing baselines. If an unchanged
+  decoder becomes slower after parallelizing consumers, inspect allocator
+  malloc/free and lock stacks as well as row-application work.
+
 ## Plan structure
 
 The schema is unversioned and uses `deny_unknown_fields` throughout. Exactly
@@ -68,7 +113,7 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
-`mandatory_runtime`, `table_scan`, `transaction`, `index_buffer`,
+`mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `index_buffer`,
 `data_buffer`, and `file`; `meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
 `concurrency_limit` because orchestration always uses one runner.
@@ -78,6 +123,27 @@ range is `1..=8192`. Byte inputs are strings such as `"512 MiB"`. The canonical
 result records the complete normalized engine configuration, including both
 effective table-scan counts. Normalized result documents must include the
 `table_scan` table.
+
+`[engine.recovery]` accepts `io_depth`, `disable_dml_validation`,
+`max_in_flight_batches`, `max_active_pages`, and `max_batch_ops`. All counts
+must be positive. When omitted from the merged overlay,
+submission capacity defaults to twice the configured pool worker count, and
+active-page capacity defaults to four times the effective submission capacity.
+Resolved results require a `recovery` table with concrete limits. Replay memory
+depends on payload sizes; there is no byte budget. The old
+`transaction.recovery_io_depth` and
+`transaction.recovery_disable_dml_validation` keys are rejected; use
+`recovery.io_depth` and `recovery.disable_dml_validation`.
+The removed `recovery.max_batch_bytes` and `recovery.max_buffered_bytes` keys
+are also rejected.
+
+For example, retain automatic submission and page sizing while reducing batches:
+
+```toml
+[engine.recovery]
+io_depth = 8
+max_batch_ops = 128
+```
 
 `[workload_defaults]` accepts `threads`, `sessions`, `value_size`, `batch_size`,
 and `include_stats`. Defaults are one thread, sessions equal to threads,

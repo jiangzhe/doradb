@@ -237,10 +237,71 @@ Hot row pages retain their runtime version metadata throughout recovery.
 Redo restores page creation timestamps and committed row images without
 reconstructing pre-crash undo history.
 
-Sequential commit-order replay needs no per-row recovery timestamps. Recovery
-owns temporary insertion history separately from buffer frames to reject
-duplicate inserts, including reinsertion after deletion. This history is
-released after index reconstruction.
+The decoder/coordinator consumes redo in its canonical order. Eligible hot-row
+operations are grouped by table and page and run on the existing finite-job
+thread pool. Each page has at most one submitted batch and one pending batch;
+its operations preserve consumed order, including page-local space allocation.
+A batch captures the table layout and acquires its page once. Independent pages,
+including pages in the same transaction or table, may execute concurrently.
+There are no foreground readers or surviving transactions during startup, and
+secondary indexes consume only final row images after the global replay drain.
+No per-row recovery timestamps are needed.
+
+Recovery owns temporary insertion history separately from buffer frames to
+reject duplicate inserts, including reinsertion after deletion. The bitmap moves
+exclusively between page history, an active entry, and its job/completion result.
+Idle entries retire immediately while their history remains available for later
+redo. Empty created pages also retain history for final index reconstruction.
+DROP drains that table and removes its history before a PageID can be reused.
+
+Page creation, catalog replay, cold deletes, and DDL remain serial. Eligible
+CreateTable, DropTable, CreateIndex, and DropIndex wait for their table's pending
+and submitted work before changing metadata; skipped DDL does not add a barrier.
+The normal FIFO ready queue continues making progress for already-parsed work
+on other tables, whose completion is not a barrier condition. DataCheckpoint and
+silent-watermark handling retain their existing filters and semantics.
+
+`EngineConfig.recovery` owns startup recovery settings through `RecoveryConfig`.
+Its default settings are:
+
+| Setting | Default |
+| --- | --- |
+| `io_depth` | 32 direct-IO read-ahead requests |
+| `disable_dml_validation` | `false`; catalog and row DML validation enabled |
+| `max_in_flight_batches` | `None`: twice the pool worker count |
+| `max_active_pages` | `None`: four times the effective submission limit |
+| `max_batch_ops` | 256 operations |
+
+Explicit limits and I/O depth must be positive. Engine configuration validation
+resolves automatic limits into `Some` values with saturating arithmetic before
+filesystem changes or worker startup. The automatic page limit follows an
+explicit submission override. On an already validated configuration, set a limit
+back to `None` to recompute it after changing pool sizing. These settings are
+fixed for one startup and do not change storage formats. Named defaults live in
+`conf::DEFAULT_RECOVERY_*` constants.
+
+The former `TrxSysConfig.recovery_io_depth` and
+`TrxSysConfig.recovery_disable_dml_validation` settings are now
+`RecoveryConfig.io_depth` and `RecoveryConfig.disable_dml_validation`.
+Writer and catalog checkpoint scan settings remain in `TrxSysConfig`.
+
+Admission bounds the number of outstanding batches, active pages, and operations
+in each batch. Each batch reserves `max_batch_ops` operation slots. Payload sizes
+do not change admission or force global draining; retained memory depends on
+payload sizes and has no explicit byte budget. Decoded groups, the current
+unadmitted operation, recovered pages, retained insertion history, and allocator
+overhead are additional costs. Submission slots are released only when completion
+is collected. Full batches dispatch at the operation limit; partial batches
+dispatch at transaction boundaries and whenever progress is needed, without
+waiting for EOF. Eligible batches are submitted in FIFO order.
+
+While waiting for redo input, recovery collects completions and pumps pending
+work without cancelling the pinned group-read future. EOF drains all jobs before
+validation, index reconstruction, or redo repair. Every replay error discards
+pending work and drains accepted jobs; Fatal observed during drain outranks an
+ordinary error and preserves its original poison reason. Bootstrap cancellation
+leaves accepted captures pool-owned, and registry rollback drains the pool with
+storage and eviction still running.
 
 ## Secondary-Index Reconstruction
 
