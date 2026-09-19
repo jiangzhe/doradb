@@ -20,6 +20,82 @@ const MIN_TRX_LOG_FRAME_LEN: usize =
 /// The builder keeps transaction frames in logical order and materializes them
 /// into one or more exact-`log_block_size` direct buffers only when the group is
 /// handed to the redo writer.
+///
+/// # Group format contract
+///
+/// This is the shared group contract for the writer, owning redo scan, and packed
+/// recovery decoder. It describes the format selected by
+/// [`REDO_FILE_FORMAT_VERSION`](crate::log::format::REDO_FILE_FORMAT_VERSION).
+/// Transaction encoding is specified by [`TrxLog`]. All multibyte fields below
+/// use little-endian encoding, with no implicit alignment or padding between fields.
+///
+/// Each group occupies consecutive fixed-size blocks within one file's data
+/// region. Every block starts with the 11-byte [`RedoBlockHeader`]:
+///
+/// | Block offset | Field | Encoding |
+/// | --- | --- | --- |
+/// | 0 | `checksum` | `u32`, CRC32 of every remaining byte in this block |
+/// | 4 | `flags` | `u8`, START = 1, END = 2; other bits are invalid |
+/// | 5 | `payload_len` | `u16`, logical payload bytes in this block |
+/// | 7 | `group_block_idx` | `u32`, zero-based position within the group |
+///
+/// Only the START block has the following 28-byte [`RedoGroupStartExtension`]
+/// immediately after its common header:
+///
+/// | Block offset | Field | Encoding |
+/// | --- | --- | --- |
+/// | 11 | `group_payload_len` | `u64`, total logical bytes, including frame prefixes |
+/// | 19 | `group_block_count` | `u32`, total physical blocks in this group |
+/// | 23 | `min_redo_cts` | `u64`, inclusive lower transaction CTS bound |
+/// | 31 | `max_redo_cts` | `u64`, inclusive upper transaction CTS bound |
+///
+/// Payload starts at byte 39 in the START block and byte 11 in continuation
+/// blocks. Bytes after each block's payload must be zero; the checksum includes
+/// this padding and, for the START block, the extension. Block indices must be
+/// consecutive from zero, START appears only at index zero, and END appears only
+/// on the final block. A one-block group carries both flags. Every block has
+/// nonempty payload; nonfinal blocks fill their payload capacity completely.
+/// The declared block count must match the count required for `group_payload_len`.
+/// Group payload length and block count must be nonzero, and `min_redo_cts` must
+/// not exceed `max_redo_cts`.
+///
+/// Concatenating only the blocks' payload bytes must yield exactly
+/// `group_payload_len` bytes, with this logical layout:
+///
+/// ```text
+/// group_body = transaction_frame ... transaction_frame
+/// transaction_frame = data_len:u64 + transaction_body[data_len]
+/// ```
+///
+/// There is no transaction count or padding in the logical body. A transaction,
+/// including its length prefix, may cross physical block boundaries. Decoding
+/// must advance for every frame, consume the complete body, and check each CTS
+/// against the inclusive group bounds. The writer records the actual minimum and
+/// maximum CTS; body decoders check containment, without requiring either bound
+/// to occur or checking monotonic CTS order.
+///
+/// The writer puts multiple transactions together only when they fit in one
+/// block; an oversized transaction gets a group of its own. This is a writer
+/// batching policy, not an additional transaction-count check in the decoders.
+///
+/// # Validation and publication
+///
+/// The shared group reader validates physical blocks and assembles the body.
+/// Its file-level policy distinguishes an acceptable unsealed crash tail from
+/// corruption in required history; a discarded tail is never passed to a body
+/// decoder. The owning iterator validates frames incrementally, while packed
+/// decoding validates the entire body in one call. Both stream adapters must
+/// finish validating every transaction before publishing any record from that
+/// group. A decoding failure discards partial results and makes the stream
+/// terminal; reading it again violates the stream protocol and panics. The raw
+/// body decoders can exhaust an empty slice, but persisted groups are nonempty
+/// because the physical reader enforces the extension rules above.
+///
+/// The two paths must agree on acceptance, decoded transaction contents, and
+/// integrity error kind; diagnostic attachments may differ. The differential
+/// corpus in `recovery::decode::tests` and
+/// `recovery::stream::tests::both_adapters_reject_a_whole_group_and_remain_terminal`
+/// cover this contract, including rejection of a corrupt later transaction.
 pub(crate) struct LogBlockGroup {
     /// Fixed physical write size for every redo data block.
     log_block_size: usize,
@@ -303,6 +379,120 @@ impl<'a> LogBlockGroupWriter<'a> {
 /// `data_len` covers `header + payload` only. The encoded frame length prefix
 /// lets replay skip exactly one transaction record and reject under-consumed or
 /// over-consumed frame payloads.
+///
+/// # Transaction format contract
+///
+/// This is the shared transaction contract for [`Ser`], [`Deser`], and packed
+/// recovery decoding. [`LogBlockGroup`] specifies the enclosing physical and
+/// logical group format and its version. All fields are concatenated without
+/// alignment padding. Multibyte integers and IEEE-754 floats are little-endian;
+/// signed integers use two's complement. Table, row, page, and transaction IDs
+/// occupy `u64`; index IDs occupy `u32`, and index slots occupy `u16`.
+///
+/// | Frame offset | Field | Encoding |
+/// | --- | --- | --- |
+/// | 0 | `data_len` | `u64`, bytes after this prefix through the end of this frame |
+/// | 8 | `header.cts` | `u64` |
+/// | 16 | `header.trx_kind` | `u8`: User = 0, System = 1 |
+/// | 17 | `payload.ddl` | Optional DDL record, starting with its `u8` presence flag |
+/// | variable | `payload.dml` | Table map, starting with its `u64` entry count |
+///
+/// An empty transaction has an 18-byte body: 9 header bytes, an absent-DDL flag,
+/// and an empty table-map count. The frame prefix adds another 8 bytes. The length
+/// must fit `usize`, cover at least this body, and stay within the input. All
+/// nested reads are restricted to that frame; successful decoding must consume
+/// it exactly. Extra bytes inside a frame are invalid. Bytes following a frame
+/// belong to the next transaction and are consumed by the group decoder.
+///
+/// ## Collections and row operations
+///
+/// `option<T>` is a `u8` presence flag followed by `T` when present. Writers emit
+/// 0 or 1; readers accept 0 as absent and **any nonzero flag** as present. A box
+/// has the same encoding as its contents. `vec<T>` is a `u64` element count
+/// followed by that many elements, without per-element framing. A map is a `u64`
+/// entry count followed by key/value pairs. Counts must fit `usize` and pass the
+/// shared minimum-size checks against the remaining frame before allocation.
+///
+/// ```text
+/// table_map   = count:u64 + (table_id:u64 + row_map) * count
+/// row_map     = count:u64 + (map_row_id:u64 + row_redo) * count
+/// row_redo    = payload_row_id:u64 + operation_tag:u8 + operation_payload
+/// update      = column_ordinal:u32 + value
+/// primary_key = index_slot:u16 + vec<value>
+/// ```
+///
+/// Writers emit maps in ascending key order. Readers accept arbitrary key order
+/// and repeated keys, retain the last encoded value, and expose ascending map
+/// order. Repeated table IDs replace the entire earlier row map. Every encoded
+/// entry must be fully validated, even if later overwritten or filtered during
+/// replay. The row-map key and payload row ID are separate identities and need
+/// not match. Vectors retain encoded order, including repeated or unordered
+/// update ordinals. Empty table/row maps and empty value/update/key vectors are
+/// accepted.
+///
+/// [`RowRedoKind`](crate::log::redo::RowRedoKind) uses these tags and payloads:
+///
+/// | Tag (`u8`) | Operation | Payload after tag |
+/// | --- | --- | --- |
+/// | 1 | Insert | `page_id:u64 + vec<value>` |
+/// | 2 | Delete | `option<page_id:u64>` |
+/// | 3 | Update | `page_id:u64 + vec<update>` |
+/// | 4 | DeleteByPrimaryKey | `primary_key` |
+/// | 5 | UpdateByPrimaryKey | `primary_key + vec<update>` |
+///
+/// Keyed operations are structurally decoded for any table ID; restrictions on
+/// where they may be replayed belong to the replay consumer. Likewise, schema,
+/// column, and page validity are checked by replay rather than this wire grammar.
+///
+/// ## DDL and system operations
+///
+/// When the DDL option is present, [`DDLRedo`](crate::log::redo::DDLRedo) starts
+/// with a `u8` tag and then the following fields in order. DML follows the DDL
+/// record even when DDL is present, and may include both catalog and user tables.
+///
+/// | Tag (`u8`) | Operation | Payload after tag |
+/// | --- | --- | --- |
+/// | 129 | CreateTable | `table_id:u64` |
+/// | 130 | DropTable | `table_id:u64` |
+/// | 131 | CreateIndex | `table_id:u64 + index_id:u32 + index_slot:u16` |
+/// | 132 | DropIndex | `table_id:u64 + index_id:u32 + index_slot:u16` |
+/// | 133 | CreateRowPage | `table_id:u64 + page_id:u64 + start_row_id:u64 + end_row_id:u64` |
+/// | 134 | DataCheckpoint | `table_id:u64 + pivot_row_id:u64 + checkpoint_ts:u64` |
+/// | 135 | TableReplaySilentWatermark | `table_id:u64` |
+///
+/// `pivot_row_id` is spelled `pivor_row_id` in the current Rust variant.
+///
+/// ## Values
+///
+/// Each [`Val`](crate::value::Val) starts with a `u32` tag. Null is tag 0 with no
+/// payload; the remaining tags follow [`ValKind`](crate::value::ValKind):
+///
+/// | Tag (`u32`) | Value kind | Payload after tag |
+/// | --- | --- | --- |
+/// | 0 | Null | None |
+/// | 1, 2 | I8, U8 | 1 byte |
+/// | 3, 4 | I16, U16 | 2 bytes |
+/// | 5, 6, 7 | I32, U32, F32 | 4 bytes |
+/// | 8, 9, 10 | I64, U64, F64 | 8 bytes |
+/// | 11 | VarByte | `byte_len:u16 + bytes[byte_len]` |
+///
+/// Floating-point bits, including NaN payloads and signed zero, are preserved.
+/// Variable bytes are opaque, may be empty, and may occupy the full `u16` length
+/// range. Their encoding is independent of inline/outlined in-memory storage.
+/// Unknown transaction, row-operation, DDL, or value tags, truncated fields,
+/// invalid lengths, and inexact frame consumption yield
+/// [`DataIntegrityError::InvalidPayload`].
+///
+/// ## Decoder responsibilities
+///
+/// [`TrxLog::deser`] decodes one owning frame and returns its end
+/// offset. Group bounds, complete group consumption, and publication atomicity
+/// are enforced by the consumers described on [`LogBlockGroup`]. Packed decoding
+/// changes ownership and representation only: it must preserve the same decoded
+/// meaning and acceptance/error-kind contract. The independent wire fixtures and
+/// differential tests in `recovery::decode::tests` cover tags, scalar bits,
+/// duplicates, option flags, truncations, and all operation variants. Changes to
+/// the wire format must update this contract and both paths' parity coverage.
 #[derive(Debug)]
 pub(crate) struct TrxLog {
     /// Serialized length after the u64 frame prefix.
@@ -332,53 +522,19 @@ impl TrxLog {
     }
 }
 
+/// Decode one frame according to the transaction format contract on [`TrxLog`].
+/// Group validation and publication follow the contract on [`LogBlockGroup`].
 impl Deser for TrxLog {
     const MIN_BYTES_HINT: MinBytesHint =
         min_bytes_hint(mem::size_of::<u64>() + MIN_TRX_LOG_FRAME_LEN);
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (frame_start, data_len) = input.deser_u64(start_idx)?;
-        let data_len = usize::try_from(data_len).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-trx, trx_data_len_exceeds_usize")
-        })?;
-        // Check the advertised frame boundary before slicing. The primitive
-        // deserializers rely on debug assertions and the group checksum/length
-        // checks, so this is the runtime frame boundary for transaction replay.
-        let remaining = input.size().checked_sub(frame_start).ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("block=redo-trx, frame_start={frame_start}"))
-        })?;
-        if data_len > remaining {
-            return Err(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "block=redo-trx, trx_data_len={data_len}, remaining_group_body={remaining}"
-                )),
-            );
-        }
-        // A frame too small to hold an empty transaction record is always
-        // corrupt and would otherwise fail later with less useful context.
-        if data_len < MIN_TRX_LOG_FRAME_LEN {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "block=redo-trx, trx_data_len={data_len}, min_trx_frame_len={MIN_TRX_LOG_FRAME_LEN}"
-                )));
-        }
-        let frame_end = frame_start + data_len;
-        let (_, frame) = input.deser(frame_start, data_len)?;
+        let (frame_end, _, frame) = read_trx_frame(input, start_idx)?;
+        let data_len = frame.len();
         let (idx, header) = RedoHeader::deser(frame, 0)?;
         let (idx, payload) = RedoLogs::deser(frame, idx)?;
-        // The length prefix is authoritative: nested payload parsers must
-        // consume exactly the advertised frame, with no trailing garbage.
-        if idx != frame.len() {
-            return Err(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "block=redo-trx, trx_frame_len={}, consumed={idx}",
-                    frame.len()
-                )),
-            );
-        }
+        validate_trx_frame_consumed(frame.len(), idx)?;
         Ok((
             frame_end,
             TrxLog {
@@ -390,6 +546,7 @@ impl Deser for TrxLog {
     }
 }
 
+/// Encode the transaction format specified on [`TrxLog`], including its length prefix.
 impl Ser<'_> for TrxLog {
     #[inline]
     fn ser_len(&self) -> usize {
@@ -403,6 +560,80 @@ impl Ser<'_> for TrxLog {
         let idx = self.header.ser(out, idx);
         self.payload.ser(out, idx)
     }
+}
+
+/// Read a checked transaction frame and its absolute body offset without decoding it.
+#[inline]
+pub(crate) fn read_trx_frame<S: Serde + ?Sized>(
+    input: &S,
+    start_idx: usize,
+) -> DeserResult<(usize, usize, &[u8])> {
+    let (frame_start, data_len) = input.deser_u64(start_idx)?;
+    let data_len = usize::try_from(data_len).map_err(|_| {
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach("block=redo-trx, trx_data_len_exceeds_usize")
+    })?;
+    // Check the advertised boundary before slicing so every nested checked
+    // reader is restricted to this transaction, even within a larger group.
+    let remaining = input.size().checked_sub(frame_start).ok_or_else(|| {
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("block=redo-trx, frame_start={frame_start}"))
+    })?;
+    if data_len > remaining {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-trx, trx_data_len={data_len}, remaining_group_body={remaining}"
+            )),
+        );
+    }
+    // A frame too small to hold an empty transaction record is always
+    // corrupt and would otherwise fail later with less useful context.
+    if data_len < MIN_TRX_LOG_FRAME_LEN {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-trx, trx_data_len={data_len}, min_trx_frame_len={MIN_TRX_LOG_FRAME_LEN}"
+            )),
+        );
+    }
+    let frame_end = frame_start + data_len;
+    let (_, frame) = input.deser(frame_start, data_len)?;
+    Ok((frame_end, frame_start, frame))
+}
+
+/// Require nested decoders to consume exactly the authoritative transaction frame.
+#[inline]
+pub(crate) fn validate_trx_frame_consumed(frame_len: usize, consumed: usize) -> DeserResult<()> {
+    if consumed != frame_len {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-trx, trx_frame_len={frame_len}, consumed={consumed}"
+            )),
+        );
+    }
+    Ok(())
+}
+
+/// Validate forward progress and the inclusive group timestamp bounds after a full transaction.
+#[inline]
+pub(crate) fn validate_group_trx(
+    start: usize,
+    end: usize,
+    cts: TrxID,
+    min_cts: TrxID,
+    max_cts: TrxID,
+) -> DeserResult<()> {
+    if end <= start {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach("block=redo-group, trx parser did not advance"));
+    }
+    if cts < min_cts || cts > max_cts {
+        return Err(
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "block=redo-group, cts={cts}, min_cts={min_cts}, max_cts={max_cts}"
+            )),
+        );
+    }
+    Ok(())
 }
 
 /// Return the fixed-block count for a logical payload length.
@@ -466,6 +697,21 @@ mod tests {
             },
             RedoLogs { ddl: None, dml },
         )
+    }
+
+    #[test]
+    fn transaction_validation_rejects_nonprogress_and_inexact_consumption() {
+        for end in [0, 10] {
+            let err = validate_group_trx(10, end, TrxID::new(7), TrxID::new(7), TrxID::new(7))
+                .unwrap_err();
+            assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        }
+        validate_group_trx(10, 11, TrxID::new(7), TrxID::new(7), TrxID::new(7)).unwrap();
+        for consumed in [9, 11] {
+            let err = validate_trx_frame_consumed(10, consumed).unwrap_err();
+            assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        }
+        validate_trx_frame_consumed(10, 10).unwrap();
     }
 
     #[test]

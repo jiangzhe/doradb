@@ -12,14 +12,16 @@
 //! We separate all transactions into two kinds:
 //! 1. DDL involved transactions
 //! 2. DML-only transactions
+mod decode;
 mod dispatch;
+mod packed;
 mod resources;
 mod row_state;
 pub(crate) mod stream;
 mod timeline;
 
 use self::dispatch::ReplayDispatcher;
-pub(crate) use self::dispatch::{ReplayOp, RowReplayCounts};
+pub(crate) use self::dispatch::RowReplayCounts;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
@@ -31,15 +33,18 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::log::block_group::TrxLog;
-use crate::log::redo::{DDLRedo, RedoLogs, RowRedo, RowRedoKind, TableDML};
+use crate::log::redo::{DDLRedo, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::FastHashSet;
 use crate::obs;
-use crate::recovery::stream::{PlannedRedoRecovery, RedoLogStream};
+use crate::recovery::stream::{PlannedRedoRecovery, RecoveryLogStream};
 use crate::stats::{RecoveryReport, recovery_add_count};
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
+use decode::{DecodedGroup, DecodedRow, DecodedRowKind, DecodedTable, DecodedTrx, DecodedTrxKind};
+#[cfg(test)]
+pub(crate) use packed::{OwnedReplayOp, pack_test_ops};
+pub(crate) use packed::{PackedPageBatch, ReplayKind, ReplayOp};
 use std::time::Instant;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
@@ -193,7 +198,7 @@ impl<'a> RecoveryCoordinator<'a> {
         let mut replayed_logs = 0usize;
         // All fallible replay exits share settlement. Accepted jobs must release
         // table handles and pool guards before bootstrap reports an error.
-        let replay_result = self.replay_stream(&mut stream, &mut replayed_logs).await;
+        let replay_result = Box::pin(self.replay_stream(&mut stream, &mut replayed_logs)).await;
         if let Err(error) = replay_result {
             let error = self.dispatcher.settle(error).await;
             obs::error!(
@@ -566,46 +571,59 @@ impl<'a> RecoveryCoordinator<'a> {
     /// Consume redo in order and drain replay at EOF, leaving error settlement to the caller.
     async fn replay_stream(
         &mut self,
-        stream: &mut RedoLogStream,
+        stream: &mut RecoveryLogStream,
         replayed_logs: &mut usize,
     ) -> RuntimeOrFatalResult<()> {
         loop {
-            let Some(log) = self.dispatcher.read_next(stream.try_next()).await? else {
+            let Some(mut group) = self.dispatcher.read_next(stream.try_next()).await? else {
                 break;
             };
-            self.replay_log(log).await?;
-            self.dispatcher.progress()?;
-            *replayed_logs += 1;
+            // Move only the routing directory; borrowed group storage remains
+            // coordinator-owned across admission waits and is released here.
+            for trx in mem::take(&mut group.transactions) {
+                self.replay_transaction(trx, &group).await?;
+                self.dispatcher.progress()?;
+                *replayed_logs += 1;
+            }
         }
         self.dispatcher.drain_all().await
     }
 
-    async fn replay_log(&mut self, log: TrxLog) -> RuntimeOrFatalResult<()> {
-        // sequentially replay redo log.
-        let (header, RedoLogs { ddl, dml }) = log.into_inner();
-        for (table_id, table_dml) in &dml {
-            let count = if table_id.is_catalog() {
-                &mut self.report.work.catalog_row_ops_seen
-            } else {
-                &mut self.report.work.user_row_ops_seen
-            };
-            recovery_add_count(
-                count,
-                table_dml.rows.len() as u64,
-                &mut self.report.saturated,
-            );
+    async fn replay_transaction(
+        &mut self,
+        trx: DecodedTrx,
+        group: &DecodedGroup,
+    ) -> RuntimeOrFatalResult<()> {
+        let DecodedTrx { header, kind } = trx;
+        match &kind {
+            DecodedTrxKind::Ddl(_, dml) => {
+                for (id, table) in dml {
+                    self.count_seen(*id, table.rows.len());
+                }
+            }
+            DecodedTrxKind::Dml(dml) => {
+                for (id, table) in dml {
+                    self.count_seen(*id, table.len());
+                }
+            }
         }
         self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(header.cts);
         if header.cts < self.timeline.replay_floor {
             return Ok(());
         }
-
-        if let Some(ddl) = ddl {
-            self.replay_ddl(ddl, dml, header.cts).await?;
-        } else {
-            self.replay_dml(dml, header.cts).await?;
+        match kind {
+            DecodedTrxKind::Ddl(ddl, dml) => self.replay_ddl(ddl, dml, header.cts).await,
+            DecodedTrxKind::Dml(dml) => self.replay_decoded_dml(dml, header.cts, group).await,
         }
-        Ok(())
+    }
+
+    fn count_seen(&mut self, table_id: TableID, rows: usize) {
+        let count = if table_id.is_catalog() {
+            &mut self.report.work.catalog_row_ops_seen
+        } else {
+            &mut self.report.work.user_row_ops_seen
+        };
+        recovery_add_count(count, rows as u64, &mut self.report.saturated);
     }
 
     async fn rebuild_hot_indexes(&mut self) -> RuntimeOrFatalResult<()> {
@@ -1124,13 +1142,14 @@ impl<'a> RecoveryCoordinator<'a> {
     /// Catalog rows are replayed logically into catalog runtimes. User-table
     /// rows replay only heap and cold-delete state; hot secondary indexes are
     /// rebuilt after log replay from recovered RowStore pages.
-    async fn replay_dml(
+    async fn replay_decoded_dml(
         &mut self,
-        dml: BTreeMap<TableID, TableDML>,
+        dml: BTreeMap<TableID, DecodedTable>,
         cts: TrxID,
+        group: &DecodedGroup,
     ) -> RuntimeOrFatalResult<()> {
         for (table_id, table_dml) in dml {
-            if table_id.is_catalog() {
+            if let DecodedTable::Catalog(table_dml) = table_dml {
                 if !self.should_replay_catalog(cts) {
                     continue;
                 }
@@ -1170,7 +1189,10 @@ impl<'a> RecoveryCoordinator<'a> {
                         .attach(format!("replay user table DML: table_id={table_id}"))
                 })
                 .change_context(RuntimeError::Recovery)?;
-            self.replay_table_dml(table_id, &table, table_dml.rows, cts)
+            let DecodedTable::User(rows) = table_dml else {
+                unreachable!("catalog DML handled above");
+            };
+            self.replay_decoded_rows(table_id, &table, rows, cts, group)
                 .await?;
         }
         Ok(())
@@ -1251,12 +1273,13 @@ impl<'a> RecoveryCoordinator<'a> {
         Ok(())
     }
 
-    async fn replay_table_dml(
+    async fn replay_decoded_rows(
         &mut self,
         table_id: TableID,
         table: &Arc<Table>,
-        rows: BTreeMap<RowID, RowRedo>,
+        rows: BTreeMap<RowID, DecodedRow>,
         cts: TrxID,
+        group: &DecodedGroup,
     ) -> RuntimeOrFatalResult<()> {
         let heap_redo_start_ts = self
             .table_heap_redo_start_ts(table_id)
@@ -1267,14 +1290,14 @@ impl<'a> RecoveryCoordinator<'a> {
         let pivot_row_id = table.file().active_root_unchecked().pivot_row_id;
         for row in rows.into_values() {
             let page_id = match &row.kind {
-                RowRedoKind::Insert(page_id, _) | RowRedoKind::Update(page_id, _) => {
+                DecodedRowKind::Insert(page_id, _) | DecodedRowKind::Update(page_id, _) => {
                     // Checkpointed rows and floor-covered redo need no hot history.
                     if !should_replay_heap_row(row.row_id, pivot_row_id, cts, heap_redo_start_ts) {
                         continue;
                     }
                     *page_id
                 }
-                RowRedoKind::Delete(page_id) => {
+                DecodedRowKind::Delete(page_id) => {
                     if row.row_id < pivot_row_id {
                         if cts < deletion_cutoff_ts {
                             continue;
@@ -1296,14 +1319,14 @@ impl<'a> RecoveryCoordinator<'a> {
                         .attach(format!("hot row delete redo requires page identity: operation=delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id)))
                         .change_context(RuntimeError::Recovery)?
                 }
-                RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
-                    return Err(invalid_user_table_keyed_redo(table_id, &row, cts)
+                DecodedRowKind::Keyed(row) => {
+                    return Err(invalid_user_table_keyed_redo(table_id, row, cts)
                         .change_context(RuntimeError::Recovery)
                         .into());
                 }
             };
             self.dispatcher
-                .admit(table, page_id, ReplayOp { cts, row })
+                .admit(table, page_id, group.operation(&row, cts))
                 .await?;
         }
         Ok(())
@@ -1378,6 +1401,8 @@ fn should_replay_heap_row(
 
 #[cfg(test)]
 mod tests {
+    use super::decode::{DecodedTable, DecodedTrxKind, decode_log};
+    use super::dispatch::recycled_snapshot;
     use super::{
         RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
         validate_create_table_reloaded_root_ts,
@@ -1413,6 +1438,7 @@ mod tests {
         REDO_SUPER_BLOCK_SLOT_SIZE, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
         parse_redo_super_block, serialize_redo_super_block, slot_offset,
     };
+    use crate::log::redo::TableDML;
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
     use crate::recovery::RowReplayState;
     use crate::recovery::{RecoveryResources, TableReplayBounds};
@@ -1426,7 +1452,7 @@ mod tests {
         assert_freeze_created, trx_delete_row_by_id, trx_select_row_mvcc_by_id,
         trx_update_row_by_id,
     };
-    use crate::table::{DeleteMarker, TableRedoReplayFloor};
+    use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::ver_map::RowPageState;
     use crate::value::Val;
@@ -1817,6 +1843,47 @@ mod tests {
         recovery
     }
 
+    async fn replay_test_log(
+        recovery: &mut RecoveryCoordinator<'_>,
+        log: TrxLog,
+    ) -> RuntimeOrFatalResult<()> {
+        let mut group = decode_log(&log);
+        let trx = group.transactions.pop().unwrap();
+        recovery.replay_transaction(trx, &group).await
+    }
+
+    async fn replay_test_dml(
+        recovery: &mut RecoveryCoordinator<'_>,
+        dml: BTreeMap<TableID, TableDML>,
+        cts: TrxID,
+    ) -> RuntimeOrFatalResult<()> {
+        let mut group = decode_log(&TrxLog::new(redo_header(cts), RedoLogs { ddl: None, dml }));
+        let DecodedTrxKind::Dml(tables) = group.transactions.pop().unwrap().kind else {
+            panic!()
+        };
+        recovery.replay_decoded_dml(tables, cts, &group).await
+    }
+
+    async fn replay_test_table_dml(
+        recovery: &mut RecoveryCoordinator<'_>,
+        table_id: TableID,
+        table: &Arc<Table>,
+        rows: BTreeMap<RowID, RowRedo>,
+        cts: TrxID,
+    ) -> RuntimeOrFatalResult<()> {
+        let dml = BTreeMap::from([(table_id, TableDML { rows })]);
+        let mut group = decode_log(&TrxLog::new(redo_header(cts), RedoLogs { ddl: None, dml }));
+        let DecodedTrxKind::Dml(mut tables) = group.transactions.pop().unwrap().kind else {
+            panic!()
+        };
+        let DecodedTable::User(rows) = tables.remove(&table_id).unwrap() else {
+            panic!()
+        };
+        recovery
+            .replay_decoded_rows(table_id, table, rows, cts, &group)
+            .await
+    }
+
     fn redo_header(cts: TrxID) -> RedoHeader {
         RedoHeader {
             cts,
@@ -2205,7 +2272,7 @@ mod tests {
     ) -> RuntimeOrFatalResult<()> {
         let mut redo = RedoLogs::default();
         redo.insert_dml(table_id, RowRedo { row_id, kind });
-        recovery.replay_dml(redo.dml, cts).await?;
+        replay_test_dml(recovery, redo.dml, cts).await?;
         recovery.dispatcher.drain_all().await?;
         recovery.dispatcher.merge_counts(&mut recovery.report);
         Ok(())
@@ -2436,14 +2503,13 @@ mod tests {
                     },
                 )]);
                 let skipped_rows = rows.iter().map(clone_hot_redo_entry).collect();
-                recovery
-                    .replay_table_dml(table_id, &table, skipped_rows, TrxID::new(9))
+                replay_test_table_dml(&mut recovery, table_id, &table, skipped_rows, TrxID::new(9))
                     .await
                     .unwrap();
-                let err = recovery
-                    .replay_table_dml(table_id, &table, rows, TrxID::new(10))
-                    .await
-                    .unwrap_err();
+                let err =
+                    replay_test_table_dml(&mut recovery, table_id, &table, rows, TrxID::new(10))
+                        .await
+                        .unwrap_err();
                 let report = format!("{err:?}");
                 for context in [
                     format!("table_id={table_id}"),
@@ -2496,8 +2562,7 @@ mod tests {
                     ),
                 },
             )]);
-            recovery
-                .replay_table_dml(table_id, &table, rows, cts)
+            replay_test_table_dml(&mut recovery, table_id, &table, rows, cts)
                 .await
                 .unwrap();
             for page_id in [None, Some(PageID::new(30))] {
@@ -2702,20 +2767,23 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            replay_test_row(
-                &mut recovery,
+            let mut redo = RedoLogs::default();
+            redo.insert_dml(
                 first_table,
-                RowID::new(0),
-                RowRedoKind::Insert(page_id, vec![Val::from(1i32), Val::from(2i32)]),
-                TrxID::new(11),
-            )
-            .await
-            .unwrap();
+                RowRedo {
+                    row_id: RowID::new(0),
+                    kind: RowRedoKind::Insert(page_id, vec![Val::from(1i32), Val::from(2i32)]),
+                },
+            );
+            replay_test_dml(&mut recovery, redo.dml, TrxID::new(11))
+                .await
+                .unwrap();
             recovery
                 .replay_drop_table_ddl(first_table, BTreeMap::new(), TrxID::new(12))
                 .await
                 .unwrap();
             assert!(!recovery.dispatcher.page_history.contains_key(&first_table));
+            assert_eq!(recycled_snapshot(&recovery.dispatcher).0, 1);
             recovery
                 .replay_create_row_page_ddl(
                     second_table,
@@ -2797,10 +2865,12 @@ mod tests {
                     },
                 );
             }
-            recovery
-                .replay_log(TrxLog::new(redo_header(TrxID::new(11)), redo))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                TrxLog::new(redo_header(TrxID::new(11)), redo),
+            )
+            .await
+            .unwrap();
             recovery.dispatcher.progress().unwrap();
             // One committed transaction replaces a row across pages while also
             // updating a second table. Indexes must only see the final images.
@@ -2835,10 +2905,12 @@ mod tests {
                     ),
                 },
             );
-            recovery
-                .replay_log(TrxLog::new(redo_header(TrxID::new(12)), redo))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                TrxLog::new(redo_header(TrxID::new(12)), redo),
+            )
+            .await
+            .unwrap();
             recovery.dispatcher.drain_all().await.unwrap();
             recovery.dispatcher.merge_counts(&mut recovery.report);
             recovery.rebuild_hot_indexes().await.unwrap();
@@ -2940,10 +3012,12 @@ mod tests {
                     },
                 );
             }
-            recovery
-                .replay_log(TrxLog::new(redo_header(TrxID::new(11)), redo))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                TrxLog::new(redo_header(TrxID::new(11)), redo),
+            )
+            .await
+            .unwrap();
             recovery.dispatcher.progress().unwrap();
             let mut redo = RedoLogs::default();
             redo.insert_dml(
@@ -2956,10 +3030,12 @@ mod tests {
                     ),
                 },
             );
-            recovery
-                .replay_log(TrxLog::new(redo_header(TrxID::new(12)), redo))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                TrxLog::new(redo_header(TrxID::new(12)), redo),
+            )
+            .await
+            .unwrap();
             // Creation of a distinct page must proceed while an older page is blocked.
             recovery
                 .replay_create_row_page_ddl(
@@ -3091,26 +3167,26 @@ mod tests {
             let unknown_table_id = USER_TABLE_ID_START + 142;
             let mut recovery = log_recovery_for_engine(&engine, TrxID::new(10));
 
-            recovery
-                .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(9)))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                unknown_table_dml_log(unknown_table_id, TrxID::new(9)),
+            )
+            .await
+            .unwrap();
 
-            recovery
-                .replay_log(unknown_table_create_row_page_log(
-                    unknown_table_id,
-                    TrxID::new(9),
-                ))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                unknown_table_create_row_page_log(unknown_table_id, TrxID::new(9)),
+            )
+            .await
+            .unwrap();
 
-            recovery
-                .replay_log(unknown_table_data_checkpoint_log(
-                    unknown_table_id,
-                    TrxID::new(9),
-                ))
-                .await
-                .unwrap();
+            replay_test_log(
+                &mut recovery,
+                unknown_table_data_checkpoint_log(unknown_table_id, TrxID::new(9)),
+            )
+            .await
+            .unwrap();
 
             assert_eq!(recovery.report.work.user_row_ops_seen, 1);
             // The coarse floor still counts decoded row maps, including DML carried by DDL.
@@ -3128,8 +3204,7 @@ mod tests {
                 }
             }
             redo.ddl = Some(Box::new(DDLRedo::DropTable(unknown_table_id)));
-            recovery
-                .replay_log(TrxLog::new(redo_header(TrxID::new(9)), redo))
+            replay_test_log(&mut recovery, TrxLog::new(redo_header(TrxID::new(9)), redo))
                 .await
                 .unwrap();
             recovery.report.finish_transaction(Duration::ZERO);
@@ -3156,10 +3231,12 @@ mod tests {
             let unknown_table_id = USER_TABLE_ID_START + 143;
 
             let mut dml_recovery = log_recovery_for_engine(&engine, TrxID::new(10));
-            let err = dml_recovery
-                .replay_log(unknown_table_dml_log(unknown_table_id, TrxID::new(10)))
-                .await
-                .unwrap_err();
+            let err = replay_test_log(
+                &mut dml_recovery,
+                unknown_table_dml_log(unknown_table_id, TrxID::new(10)),
+            )
+            .await
+            .unwrap_err();
             let RuntimeOrFatalError::Runtime(err) = err else {
                 panic!("expected Runtime error, got {err:?}");
             };
@@ -3173,13 +3250,12 @@ mod tests {
             assert!(report.contains("replay user table DML"), "{report}");
 
             let mut ddl_recovery = log_recovery_for_engine(&engine, TrxID::new(10));
-            let err = ddl_recovery
-                .replay_log(unknown_table_create_row_page_log(
-                    unknown_table_id,
-                    TrxID::new(10),
-                ))
-                .await
-                .unwrap_err();
+            let err = replay_test_log(
+                &mut ddl_recovery,
+                unknown_table_create_row_page_log(unknown_table_id, TrxID::new(10)),
+            )
+            .await
+            .unwrap_err();
             let RuntimeOrFatalError::Runtime(err) = err else {
                 panic!("expected Runtime error, got {err:?}");
             };
@@ -5747,5 +5823,63 @@ mod tests {
             drop(session);
             drop(engine);
         })
+    }
+
+    #[test]
+    fn keyed_user_redo_is_fully_decoded_before_floor_filtering_and_rejection() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                temp.path(),
+                "keyed-packed",
+            ))
+            .await
+            .unwrap();
+            let table_id = create_index_ddl_base_table(&engine, vec![]).await;
+            for disable in [false, true] {
+                let mut recovery = row_recovery_for_table(&engine, table_id);
+                recovery.recovery_disable_dml_validation = disable;
+                for update in [false, true] {
+                    for cts in [9, 10] {
+                        let key =
+                            CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::from(42u64)]);
+                        let kind = if update {
+                            RowRedoKind::UpdateByPrimaryKey(
+                                key,
+                                vec![UpdateCol {
+                                    idx: 1,
+                                    val: Val::from("fully decoded bytes"),
+                                }],
+                            )
+                        } else {
+                            RowRedoKind::DeleteByPrimaryKey(key)
+                        };
+                        let mut redo = RedoLogs::default();
+                        redo.insert_dml(
+                            table_id,
+                            RowRedo {
+                                row_id: RowID::new(1),
+                                kind,
+                            },
+                        );
+                        let result = replay_test_log(
+                            &mut recovery,
+                            TrxLog::new(redo_header(TrxID::new(cts)), redo),
+                        )
+                        .await;
+                        if cts == 9 {
+                            result.unwrap();
+                        } else {
+                            assert!(
+                                format!("{:?}", result.unwrap_err())
+                                    .contains("key-based catalog redo")
+                            );
+                        }
+                    }
+                }
+                assert_eq!(recovery.report.work.user_row_ops_seen, 4);
+                assert_eq!(recovery.timeline.max_recovered_cts, TrxID::new(10));
+            }
+        });
     }
 }

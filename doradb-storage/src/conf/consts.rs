@@ -49,8 +49,13 @@ pub const DEFAULT_RECOVERY_DISABLE_DML_VALIDATION: bool = false;
 pub const DEFAULT_RECOVERY_TASKS_PER_WORKER: usize = 2;
 /// Default active replay pages per outstanding batch when sizing is automatic.
 pub const DEFAULT_RECOVERY_ACTIVE_PAGES_PER_TASK: usize = 4;
-/// Default maximum operations reserved in one replay batch.
+/// Default maximum operations admitted in one replay batch.
 pub const DEFAULT_RECOVERY_MAX_BATCH_OPS: usize = 256;
+/// Initial used-storage flush target for recovery page batches.
+pub const DEFAULT_RECOVERY_TARGET_BATCH_BYTES: usize = 256 * 1024;
+
+/// Maximum idle vector capacity retained by recovery batch recycling.
+pub const DEFAULT_RECOVERY_MAX_RECYCLED_BYTES: usize = 16 * 1024 * 1024;
 /// Default direct-IO read-ahead depth allocated to catalog checkpoint scans.
 pub const DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH: usize = 32;
 /// Default upper bound for one redo-log IO request payload.

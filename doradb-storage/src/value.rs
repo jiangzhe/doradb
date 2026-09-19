@@ -606,59 +606,22 @@ impl Deser for Val {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, c) = input.deser_u32(start_idx)?;
-        if c == 0 {
-            return Ok((idx, Val::Null));
-        }
-        let kind = ValKind::decode(c)?;
-        match kind {
-            ValKind::I8 => {
-                let (idx, v) = input.deser_i8(idx)?;
-                Ok((idx, Val::I8(v)))
-            }
-            ValKind::U8 => {
-                let (idx, v) = input.deser_u8(idx)?;
-                Ok((idx, Val::U8(v)))
-            }
-            ValKind::I16 => {
-                let (idx, v) = input.deser_i16(idx)?;
-                Ok((idx, Val::I16(v)))
-            }
-            ValKind::U16 => {
-                let (idx, v) = input.deser_u16(idx)?;
-                Ok((idx, Val::U16(v)))
-            }
-            ValKind::I32 => {
-                let (idx, v) = input.deser_i32(idx)?;
-                Ok((idx, Val::I32(v)))
-            }
-            ValKind::U32 => {
-                let (idx, v) = input.deser_u32(idx)?;
-                Ok((idx, Val::U32(v)))
-            }
-            ValKind::F32 => {
-                let (idx, v) = input.deser_f32(idx)?;
-                Ok((idx, Val::F32(OrderedFloat(v))))
-            }
-            ValKind::I64 => {
-                let (idx, v) = input.deser_i64(idx)?;
-                Ok((idx, Val::I64(v)))
-            }
-            ValKind::U64 => {
-                let (idx, v) = input.deser_u64(idx)?;
-                Ok((idx, Val::U64(v)))
-            }
-            ValKind::F64 => {
-                let (idx, v) = input.deser_f64(idx)?;
-                Ok((idx, Val::F64(OrderedFloat(v))))
-            }
-            ValKind::VarByte => {
-                let (idx, len) = input.deser_u16(idx)?;
-                let (idx, s) = input.deser(idx, len as usize)?;
-                let v = MemVar::from(s);
-                Ok((idx, Val::VarByte(v)))
-            }
-        }
+        let (idx, value) = ValRef::deser(input, start_idx)?;
+        let value = match value {
+            ValRef::Null => Val::Null,
+            ValRef::I8(v) => Val::I8(v),
+            ValRef::U8(v) => Val::U8(v),
+            ValRef::I16(v) => Val::I16(v),
+            ValRef::U16(v) => Val::U16(v),
+            ValRef::I32(v) => Val::I32(v),
+            ValRef::U32(v) => Val::U32(v),
+            ValRef::F32(v) => Val::F32(v),
+            ValRef::I64(v) => Val::I64(v),
+            ValRef::U64(v) => Val::U64(v),
+            ValRef::F64(v) => Val::F64(v),
+            ValRef::VarByte(v) => Val::VarByte(MemVar::from(v)),
+        };
+        Ok((idx, value))
     }
 }
 
@@ -680,7 +643,67 @@ pub(crate) enum ValRef<'a> {
     VarByte(&'a [u8]),
 }
 
-impl ValRef<'_> {
+impl<'a> ValRef<'a> {
+    /// Decode one checked wire value, borrowing variable bytes from the input.
+    #[inline]
+    pub(crate) fn deser<S: Serde + ?Sized>(
+        input: &'a S,
+        start_idx: usize,
+    ) -> DeserResult<(usize, Self)> {
+        let (idx, c) = input.deser_u32(start_idx)?;
+        if c == 0 {
+            return Ok((idx, ValRef::Null));
+        }
+        let kind = ValKind::decode(c)?;
+        match kind {
+            ValKind::I8 => {
+                let (idx, v) = input.deser_i8(idx)?;
+                Ok((idx, ValRef::I8(v)))
+            }
+            ValKind::U8 => {
+                let (idx, v) = input.deser_u8(idx)?;
+                Ok((idx, ValRef::U8(v)))
+            }
+            ValKind::I16 => {
+                let (idx, v) = input.deser_i16(idx)?;
+                Ok((idx, ValRef::I16(v)))
+            }
+            ValKind::U16 => {
+                let (idx, v) = input.deser_u16(idx)?;
+                Ok((idx, ValRef::U16(v)))
+            }
+            ValKind::I32 => {
+                let (idx, v) = input.deser_i32(idx)?;
+                Ok((idx, ValRef::I32(v)))
+            }
+            ValKind::U32 => {
+                let (idx, v) = input.deser_u32(idx)?;
+                Ok((idx, ValRef::U32(v)))
+            }
+            ValKind::F32 => {
+                let (idx, v) = input.deser_f32(idx)?;
+                Ok((idx, ValRef::F32(OrderedFloat(v))))
+            }
+            ValKind::I64 => {
+                let (idx, v) = input.deser_i64(idx)?;
+                Ok((idx, ValRef::I64(v)))
+            }
+            ValKind::U64 => {
+                let (idx, v) = input.deser_u64(idx)?;
+                Ok((idx, ValRef::U64(v)))
+            }
+            ValKind::F64 => {
+                let (idx, v) = input.deser_f64(idx)?;
+                Ok((idx, ValRef::F64(OrderedFloat(v))))
+            }
+            ValKind::VarByte => {
+                let (idx, len) = input.deser_u16(idx)?;
+                let (idx, s) = input.deser(idx, len as usize)?;
+                Ok((idx, ValRef::VarByte(s)))
+            }
+        }
+    }
+
     /// Returns true when this value is null.
     #[inline]
     pub(crate) fn is_null(&self) -> bool {

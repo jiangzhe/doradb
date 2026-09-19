@@ -1,6 +1,7 @@
 use super::consts::{
     DEFAULT_RECOVERY_ACTIVE_PAGES_PER_TASK, DEFAULT_RECOVERY_DISABLE_DML_VALIDATION,
-    DEFAULT_RECOVERY_IO_DEPTH, DEFAULT_RECOVERY_MAX_BATCH_OPS, DEFAULT_RECOVERY_TASKS_PER_WORKER,
+    DEFAULT_RECOVERY_IO_DEPTH, DEFAULT_RECOVERY_MAX_BATCH_OPS, DEFAULT_RECOVERY_MAX_RECYCLED_BYTES,
+    DEFAULT_RECOVERY_TARGET_BATCH_BYTES, DEFAULT_RECOVERY_TASKS_PER_WORKER,
 };
 use crate::error::{ConfigError, ConfigResult};
 use error_stack::Report;
@@ -9,8 +10,8 @@ use error_stack::Report;
 ///
 /// Engine configuration validation resolves automatic limits using the configured
 /// worker count. Settings remain fixed during startup and do not affect storage
-/// formats. Limits bound retained operation counts; memory usage depends on
-/// payload sizes and has no explicit byte budget.
+/// formats. Batch targets and idle capacity caps bound transport storage, excluding
+/// whole-group input, insertion history, recovered pages, and allocator overhead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryConfig {
     /// Positive direct-IO read-ahead depth used by startup redo recovery.
@@ -27,8 +28,12 @@ pub struct RecoveryConfig {
     /// `None` selects four times the effective batch-submission limit, including
     /// an explicit override. Validation replaces `None` with the positive limit.
     pub max_active_pages: Option<usize>,
-    /// Positive maximum number of operations reserved in one replay batch.
+    /// Positive maximum number of operations admitted in one replay batch.
     pub max_batch_ops: usize,
+    /// Positive used-storage flush target; larger single operations run alone.
+    pub target_batch_bytes: usize,
+    /// Maximum aggregate idle vector capacity; zero disables batch recycling.
+    pub max_recycled_bytes: usize,
 }
 
 impl Default for RecoveryConfig {
@@ -40,6 +45,8 @@ impl Default for RecoveryConfig {
             max_in_flight_batches: None,
             max_active_pages: None,
             max_batch_ops: DEFAULT_RECOVERY_MAX_BATCH_OPS,
+            target_batch_bytes: DEFAULT_RECOVERY_TARGET_BATCH_BYTES,
+            max_recycled_bytes: DEFAULT_RECOVERY_MAX_RECYCLED_BYTES,
         }
     }
 }
@@ -80,6 +87,20 @@ impl RecoveryConfig {
         self
     }
 
+    /// Set the positive used-storage target for page-batch flushing.
+    #[inline]
+    pub fn target_batch_bytes(mut self, bytes: usize) -> Self {
+        self.target_batch_bytes = bytes;
+        self
+    }
+
+    /// Set the idle capacity cap; zero disables recycling.
+    #[inline]
+    pub fn max_recycled_bytes(mut self, bytes: usize) -> Self {
+        self.max_recycled_bytes = bytes;
+        self
+    }
+
     /// Validate limits and resolve automatic sizing using validated pool sizing.
     #[inline]
     pub(crate) fn validate(&mut self, worker_threads: usize) -> ConfigResult<()> {
@@ -97,6 +118,7 @@ impl RecoveryConfig {
             ("max_in_flight_batches", tasks),
             ("max_active_pages", pages),
             ("max_batch_ops", self.max_batch_ops),
+            ("target_batch_bytes", self.target_batch_bytes),
         ] {
             if value == 0 {
                 return Err(
@@ -127,6 +149,8 @@ mod tests {
         assert_eq!(default.max_in_flight_batches, None);
         assert_eq!(default.max_active_pages, None);
         assert_eq!(default.max_batch_ops, 256);
+        assert_eq!(default.target_batch_bytes, 256 * 1024);
+        assert_eq!(default.max_recycled_bytes, 16 * 1024 * 1024);
 
         for (workers, tasks, pages, expected_tasks, expected_pages) in [
             (1, None, None, 2, 8),
@@ -162,11 +186,15 @@ mod tests {
             .disable_dml_validation(true)
             .max_in_flight_batches(Some(7))
             .max_active_pages(Some(9))
-            .max_batch_ops(1);
+            .max_batch_ops(1)
+            .target_batch_bytes(1)
+            .max_recycled_bytes(0);
         config.validate(2).unwrap();
         assert_eq!(config.io_depth, 1);
         assert!(config.disable_dml_validation);
         assert_eq!(config.max_batch_ops, 1);
+        assert_eq!(config.target_batch_bytes, 1);
+        assert_eq!(config.max_recycled_bytes, 0);
         config = config.max_in_flight_batches(None).max_active_pages(None);
         config.validate(3).unwrap();
         assert_eq!(config.max_in_flight_batches, Some(6));
@@ -196,6 +224,11 @@ mod tests {
             (
                 "max_batch_ops",
                 RecoveryConfig::default().max_batch_ops(0),
+                ConfigError::InvalidRecoveryLimit,
+            ),
+            (
+                "target_batch_bytes",
+                RecoveryConfig::default().target_batch_bytes(0),
                 ConfigError::InvalidRecoveryLimit,
             ),
         ] {

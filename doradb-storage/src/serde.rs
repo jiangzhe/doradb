@@ -592,16 +592,7 @@ impl<T: Deser> Deser for Vec<T> {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (mut idx, len) = input.deser_u64(start_idx)?;
-        let len = usize::try_from(len).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach("deserialize Vec length exceeds usize")
-        })?;
-        let remaining = input.size().checked_sub(idx).ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("deserialize Vec start exceeds input: idx={idx}"))
-        })?;
-        validate_collection_len("Vec", len, remaining, T::MIN_BYTES_HINT)?;
+        let (mut idx, len) = read_collection_len(input, start_idx, "Vec", T::MIN_BYTES_HINT)?;
         let mut vec = Vec::with_capacity(len);
         for _ in 0..len {
             let (idx0, val) = T::deser(input, idx)?;
@@ -701,20 +692,10 @@ impl<K: Ord + Deser, V: Deser> Deser for BTreeMap<K, V> {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (mut idx, len) = input.deser_u64(start_idx)?;
-        let len = usize::try_from(len).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach("deserialize BTreeMap length exceeds usize")
-        })?;
-        let remaining = input.size().checked_sub(idx).ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "deserialize BTreeMap start exceeds input: idx={idx}"
-            ))
-        })?;
-        validate_collection_len(
+        let (mut idx, len) = read_collection_len(
+            input,
+            start_idx,
             "BTreeMap",
-            len,
-            remaining,
             combined_min_bytes(K::MIN_BYTES_HINT, V::MIN_BYTES_HINT),
         )?;
         let mut map = BTreeMap::new();
@@ -1115,17 +1096,39 @@ pub(crate) const fn min_bytes_hint(bytes: usize) -> MinBytesHint {
     NonZeroUsize::new(bytes)
 }
 
+/// Read and validate a collection length before any element allocation or traversal.
 #[inline]
-fn checked_deser_end(input_len: usize, idx: usize, len: usize) -> DataIntegrityResult<usize> {
-    idx.checked_add(len)
-        .filter(|end| *end <= input_len)
-        .ok_or_else(|| {
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "deserialization range exceeds input: offset={idx}, len={len}, input_len={input_len}"
-            ))
-        })
+pub(crate) fn read_collection_len<S: Serde + ?Sized>(
+    input: &S,
+    start_idx: usize,
+    collection: &str,
+    element_min_bytes: MinBytesHint,
+) -> DeserResult<(usize, usize)> {
+    let (idx, len) = input.deser_u64(start_idx)?;
+    let len = usize::try_from(len).map_err(|_| {
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("deserialize {collection} length exceeds usize"))
+    })?;
+    let remaining = input.size().checked_sub(idx).ok_or_else(|| {
+        Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+            "deserialize {collection} start exceeds input: idx={idx}"
+        ))
+    })?;
+    validate_collection_len(collection, len, remaining, element_min_bytes)?;
+    Ok((idx, len))
 }
 
+/// Combine the lower bounds of two consecutive encoded fields.
+#[inline]
+pub(crate) fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
+    let left = left?;
+    let right = right?;
+    left.get()
+        .checked_add(right.get())
+        .and_then(NonZeroUsize::new)
+}
+
+/// Validate a collection count against its minimum encoded element width.
 #[inline]
 fn validate_collection_len(
     collection: &str,
@@ -1159,12 +1162,14 @@ fn validate_collection_len(
 }
 
 #[inline]
-fn combined_min_bytes(left: MinBytesHint, right: MinBytesHint) -> MinBytesHint {
-    let left = left?;
-    let right = right?;
-    left.get()
-        .checked_add(right.get())
-        .and_then(NonZeroUsize::new)
+fn checked_deser_end(input_len: usize, idx: usize, len: usize) -> DataIntegrityResult<usize> {
+    idx.checked_add(len)
+        .filter(|end| *end <= input_len)
+        .ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                "deserialization range exceeds input: offset={idx}, len={len}, input_len={input_len}"
+            ))
+        })
 }
 
 #[cfg(test)]

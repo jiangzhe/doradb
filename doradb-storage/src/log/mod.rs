@@ -2456,7 +2456,7 @@ mod tests {
     };
     use crate::log::redo::{RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML};
     use crate::quiescent::QuiescentGuard;
-    use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner};
+    use crate::recovery::stream::{RedoLogSegment, RedoReplayPlanner, read_recovery_headers};
     use crate::session::tests::SessionTestExt;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::sys::tests::manual_log_processor_transaction_system;
@@ -4825,8 +4825,7 @@ mod tests {
 
             let planned = planner.plan_recovery(TrxID::new(15), 1).unwrap();
             assert_eq!(planned.skipped_max_recovered_cts, None);
-            let mut stream = planned.stream;
-            let err = stream.try_next().await.unwrap_err();
+            let err = read_recovery_headers(planned.stream).await.unwrap_err();
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
@@ -4838,11 +4837,11 @@ mod tests {
     fn test_redo_replay_planner_can_build_independent_empty_streams() {
         smol::block_on(async {
             let planner = RedoReplayPlanner::new(Vec::new());
-            let mut stream1 = planner.plan_recovery(TrxID::new(10), 1).unwrap().stream;
-            let mut stream2 = planner.plan_recovery(TrxID::new(11), 1).unwrap().stream;
+            let stream1 = planner.plan_recovery(TrxID::new(10), 1).unwrap().stream;
+            let stream2 = planner.plan_recovery(TrxID::new(11), 1).unwrap().stream;
 
-            assert!(stream1.try_next().await.unwrap().is_none());
-            assert!(stream2.try_next().await.unwrap().is_none());
+            assert!(read_recovery_headers(stream1).await.unwrap().is_empty());
+            assert!(read_recovery_headers(stream2).await.unwrap().is_empty());
         });
     }
 
@@ -4864,8 +4863,12 @@ mod tests {
 
             let planned = planner.plan_recovery(TrxID::new(21), read_depth).unwrap();
             assert_eq!(planned.skipped_max_recovered_cts, Some(TrxID::new(20)));
-            let mut stream = planned.stream;
-            assert!(stream.try_next().await.unwrap().is_none());
+            assert!(
+                read_recovery_headers(planned.stream)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(finalizer.next_file_seq, 1);
         });
     }
@@ -4883,8 +4886,12 @@ mod tests {
 
             let planned = planner.plan_recovery(TrxID::new(100), read_depth).unwrap();
             assert_eq!(planned.skipped_max_recovered_cts, None);
-            let mut stream = planned.stream;
-            assert!(stream.try_next().await.unwrap().is_none());
+            assert!(
+                read_recovery_headers(planned.stream)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(finalizer.next_file_seq, 1);
         });
     }
@@ -4906,8 +4913,7 @@ mod tests {
 
             let planned = planner.plan_recovery(TrxID::new(20), 1).unwrap();
             assert_eq!(planned.skipped_max_recovered_cts, None);
-            let mut stream = planned.stream;
-            let err = stream.try_next().await.unwrap_err();
+            let err = read_recovery_headers(planned.stream).await.unwrap_err();
             assert_eq!(
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::LogFileCorrupted)
@@ -5134,11 +5140,10 @@ mod tests {
             );
             let planned = planner.plan_recovery(MIN_SNAPSHOT_TS, read_depth).unwrap();
             assert_eq!(planned.skipped_max_recovered_cts, None);
-            let mut stream = planned.stream;
-            let recovered = stream.try_next().await.unwrap().unwrap();
-            assert_eq!(recovered.header.cts, cts);
-            assert_eq!(recovered.header.trx_kind, RedoTrxKind::System);
-            assert!(stream.try_next().await.unwrap().is_none());
+            let headers = read_recovery_headers(planned.stream).await.unwrap();
+            assert_eq!(headers.len(), 1);
+            assert_eq!(headers[0].cts, cts);
+            assert_eq!(headers[0].trx_kind, RedoTrxKind::System);
 
             assert_eq!(finalizer.next_file_seq, 1);
             assert_eq!(finalizer.log_write_io_depth, 7);
@@ -5269,7 +5274,7 @@ mod tests {
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
             let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
-            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
+            let mut stream = planner.plan_catalog_scan(TrxID::new(0), 1).unwrap().stream;
             while let Some(pod) = stream.try_next().await.unwrap() {
                 println!(
                     "log {}, header={:?}, payload={:?}",

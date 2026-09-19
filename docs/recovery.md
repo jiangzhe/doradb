@@ -241,67 +241,74 @@ The decoder/coordinator consumes redo in its canonical order. Eligible hot-row
 operations are grouped by table and page and run on the existing finite-job
 thread pool. Each page has at most one submitted batch and one pending batch;
 its operations preserve consumed order, including page-local space allocation.
-A batch captures the table layout and acquires its page once. Independent pages,
-including pages in the same transaction or table, may execute concurrently.
-There are no foreground readers or surviving transactions during startup, and
+Independent pages, including pages in the same transaction or table, may execute
+concurrently. There are no foreground readers or surviving transactions during startup, and
 secondary indexes consume only final row images after the global replay drain.
 No per-row recovery timestamps are needed.
 
 Recovery owns temporary insertion history separately from buffer frames to
-reject duplicate inserts, including reinsertion after deletion. The bitmap moves
-exclusively between page history, an active entry, and its job/completion result.
-Idle entries retire immediately while their history remains available for later
-redo. Empty created pages also retain history for final index reconstruction.
+reject duplicate inserts, including reinsertion after deletion. Each page's
+replay job has exclusive access to that history, which remains available for
+later redo after the job completes. Empty created pages also retain history.
 DROP drains that table and removes its history before a PageID can be reused.
 
 Page creation, catalog replay, cold deletes, and DDL remain serial. Eligible
 CreateTable, DropTable, CreateIndex, and DropIndex wait for their table's pending
 and submitted work before changing metadata; skipped DDL does not add a barrier.
-The normal FIFO ready queue continues making progress for already-parsed work
-on other tables, whose completion is not a barrier condition. DataCheckpoint and
-silent-watermark handling retain their existing filters and semantics.
+Already-parsed work on other tables continues making progress without becoming
+part of that table's barrier. DataCheckpoint and silent-watermark handling retain
+their existing filters and semantics.
 
-`EngineConfig.recovery` owns startup recovery settings through `RecoveryConfig`.
-Its default settings are:
+### Decoding and Payload Ownership
 
-| Setting | Default |
-| --- | --- |
-| `io_depth` | 32 direct-IO read-ahead requests |
-| `disable_dml_validation` | `false`; catalog and row DML validation enabled |
-| `max_in_flight_batches` | `None`: twice the pool worker count |
-| `max_active_pages` | `None`: four times the effective submission limit |
-| `max_batch_ops` | 256 operations |
+Startup recovery and catalog scans use different in-memory representations of
+the same redo format. Both validate a complete group before exposing any record
+and must agree on accepted input, decoded meaning, and integrity-error categories.
+Filtering or replacement within a group never bypasses validation. A malformed
+group publishes no transactions and terminates the stream. Exact encodings and
+validation rules belong to the source's
+[group and transaction format contracts](../doradb-storage/src/log/block_group.rs).
 
-Explicit limits and I/O depth must be positive. Engine configuration validation
-resolves automatic limits into `Some` values with saturating arithmetic before
-filesystem changes or worker startup. The automatic page limit follows an
-explicit submission override. On an already validated configuration, set a limit
-back to `None` to recompute it after changing pool sizing. These settings are
-fixed for one startup and do not change storage formats. Named defaults live in
-`conf::DEFAULT_RECOVERY_*` constants.
+Admission copies eligible hot-row payloads into independent page batches.
+Workers borrow those batches while applying changes to page-owned storage, so
+slow page jobs cannot retain unrelated input groups. A batch may span transactions
+and groups. Catalog and DDL redo, including DML carried with DDL, retain owned
+payloads for their replay handlers.
 
-The former `TrxSysConfig.recovery_io_depth` and
-`TrxSysConfig.recovery_disable_dml_validation` settings are now
-`RecoveryConfig.io_depth` and `RecoveryConfig.disable_dml_validation`.
-Writer and catalog checkpoint scan settings remain in `TrxSysConfig`.
+### Admission and Storage Reuse
 
-Admission bounds the number of outstanding batches, active pages, and operations
-in each batch. Each batch reserves `max_batch_ops` operation slots. Payload sizes
-do not change admission or force global draining; retained memory depends on
-payload sizes and has no explicit byte budget. Decoded groups, the current
-unadmitted operation, recovered pages, retained insertion history, and allocator
-overhead are additional costs. Submission slots are released only when completion
-is collected. Full batches dispatch at the operation limit; partial batches
-dispatch at transaction boundaries and whenever progress is needed, without
-waiting for EOF. Eligible batches are submitted in FIFO order.
+Recovery bounds outstanding batches, active pages, and each batch's operation
+count and used storage. Partial batches are submitted at transaction boundaries
+and whenever progress requires them. A single operation larger than the byte
+target runs alone, ensuring it can make progress. Submission capacity remains
+occupied until the coordinator collects the completion.
 
-While waiting for redo input, recovery collects completions and pumps pending
-work without cancelling the pinned group-read future. EOF drains all jobs before
-validation, index reconstruction, or redo repair. Every replay error discards
-pending work and drains accepted jobs; Fatal observed during drain outranks an
-ordinary error and preserves its original poison reason. Bootstrap cancellation
-leaves accepted captures pool-owned, and registry rollback drains the pool with
-storage and eviction still running.
+Successful completion returns batch storage for reuse independently of page
+identity and insertion history. Retained idle capacity is bounded, unusually
+large allocations can be discarded, and idle storage is released before index
+reconstruction. These transport controls do not bound total recovery memory:
+input groups, replay history, recovered pages, and allocator overhead are
+additional costs.
+
+Recovery settings are fixed for one startup and do not change persistent
+formats. See [recovery configuration](benchmark-tool.md#recovery-settings) for
+defaults and usage, and the
+[batch implementation](../doradb-storage/src/recovery/packed.rs) for storage
+layout and reuse policy.
+
+### Progress and Failure
+
+Recovery continues collecting completions and scheduling pending work while
+waiting for redo input. Worker completions do not cancel or restart the ongoing
+log read. End of input drains all jobs before validation, index reconstruction,
+or redo repair.
+
+On failure, recovery discards pending work and settles accepted jobs. A Fatal
+error observed during settlement takes precedence over an ordinary error and
+preserves its original poison reason. Cancellation leaves accepted jobs owning
+their inputs; bootstrap teardown keeps storage and eviction alive until those
+jobs finish. See [Shutdown and Engine Poison](shutdown-and-poison.md#production-wait-classification)
+for the completion and cleanup contract.
 
 ## Secondary-Index Reconstruction
 

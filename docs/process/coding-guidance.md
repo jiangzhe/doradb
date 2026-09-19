@@ -60,7 +60,7 @@ We rely on tooling to enforce style.
 ## 4. Testing
 
 *   **Unit Test Structure**: Prefer inline `#[cfg(test)] mod tests` beside the code under test. Use `tests.rs` when a module is already organized that way.
-*   **Test-Only Code**: Keep test helpers close to tests and behind `#[cfg(test)]`. If another module needs them, use a narrow `#[cfg(test)] pub(crate)` re-export instead of widening the production API.
+*   **Test-Only Code**: Prefer exercising production paths directly. When shared setup or inspection is necessary, use helper functions inside the `#[cfg(test)]` tests module rather than adding test-only methods to production types. If another module needs them, use a narrow `#[cfg(test)] pub(crate)` re-export instead of widening the production API.
 *   **Production Shape First**: Do not widen or complicate production structs, traits, or control flow solely for tests. Prefer production execution paths and minimal `#[cfg(test)]` hooks when extra test control is required.
 *   **Unit Test Dedup Review**: Every unit-test update should include a final pass that extracts common reusable utilities when new or changed tests copy-paste setup, execution, or assertions.
 *   **Unit Test Dedup Patterns**: Extract helper functions for repeated object construction, round-trip flows such as `encode -> decode -> verify`, and common assertion sequences. Use table-driven tests with a case struct or array plus loop when cases share logic and differ only by input or expected output.
