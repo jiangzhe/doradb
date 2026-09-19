@@ -6,6 +6,7 @@
 //! drops its observers and bootstrap rollback drains the pool before storage.
 
 use super::RowReplayState;
+use super::packed::{BatchPool, PackedPageBatch, ReplayOp};
 use crate::buffer::PoolGuards;
 use crate::completion::Completion;
 use crate::conf::RecoveryConfig;
@@ -13,8 +14,7 @@ use crate::error::{
     CompletionResult, DataIntegrityError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
     RuntimeResult,
 };
-use crate::id::{PageID, TableID, TrxID};
-use crate::log::redo::RowRedo;
+use crate::id::{PageID, TableID};
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
@@ -28,6 +28,8 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::mem;
 use std::sync::Arc;
+#[cfg(test)]
+pub(super) use tests::recycled_snapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PageKey {
@@ -41,14 +43,6 @@ type BatchCompletionFuture = BoxFuture<'static, BatchCompletion>;
 struct BatchCompletion {
     page_key: PageKey,
     result: CompletionResult<RuntimeOrFatalResult<BatchOutput>>,
-}
-
-/// One owned hot-row operation in consumed redo order.
-pub(crate) struct ReplayOp {
-    /// Original commit timestamp, retained for validation and diagnostics.
-    pub(crate) cts: TrxID,
-    /// Owned row payload; never cloned for dispatch.
-    pub(crate) row: RowRedo,
 }
 
 /// Successful hot-row mutations in a replay batch or collected recovery work.
@@ -73,7 +67,7 @@ struct ActivePage {
     table: Arc<Table>,
     // None while the outstanding job/completion owns the bitmap.
     state: Option<RowReplayState>,
-    pending: Vec<ReplayOp>,
+    pending: Option<PackedPageBatch>,
     ready_queued: bool,
 }
 
@@ -86,12 +80,14 @@ struct TableWork {
 struct BatchOutput {
     state: RowReplayState,
     counts: RowReplayCounts,
+    batch: PackedPageBatch,
 }
 
 struct ReplayLimits {
     tasks: usize,
     pages: usize,
     batch_ops: usize,
+    batch_bytes: usize,
 }
 
 impl ReplayLimits {
@@ -105,6 +101,7 @@ impl ReplayLimits {
                 .max_active_pages
                 .expect("validated recovery active-page limit"),
             batch_ops: config.max_batch_ops,
+            batch_bytes: config.target_batch_bytes,
         }
     }
 }
@@ -118,6 +115,7 @@ pub(super) struct ReplayDispatcher {
     ready: VecDeque<PageKey>,
     in_flight: FuturesUnordered<BatchCompletionFuture>,
     limits: ReplayLimits,
+    recycled: BatchPool,
     pool: QuiescentGuard<ThreadPool>,
     guards: PoolGuards,
     disable_validation: bool,
@@ -134,13 +132,20 @@ impl ReplayDispatcher {
         guards: PoolGuards,
         config: &RecoveryConfig,
     ) -> Self {
+        let limits = ReplayLimits::new(config);
+        let recycled = BatchPool::new(
+            config.target_batch_bytes,
+            config.max_recycled_bytes,
+            limits.pages.saturating_add(limits.tasks),
+        );
         Self {
             page_history: FastHashMap::default(),
             active_pages: FastHashMap::default(),
             active_tables: FastHashMap::default(),
             ready: VecDeque::new(),
             in_flight: FuturesUnordered::new(),
-            limits: ReplayLimits::new(config),
+            limits,
+            recycled,
             pool,
             guards,
             disable_validation: config.disable_dml_validation,
@@ -156,17 +161,26 @@ impl ReplayDispatcher {
         &mut self,
         table: &Arc<Table>,
         page_id: PageID,
-        op: ReplayOp,
+        op: ReplayOp<'_>,
     ) -> RuntimeOrFatalResult<()> {
         let key = PageKey {
             table_id: table.table_id(),
             page_id,
         };
+        let op_bytes = op.used_bytes();
         loop {
             self.reap()?;
             let can_activate = self.active_pages.len() < self.limits.pages;
             let page = match self.active_pages.entry(key) {
-                Entry::Occupied(entry) if entry.get().pending.len() < self.limits.batch_ops => {
+                Entry::Occupied(entry)
+                    if match &entry.get().pending {
+                        None => true,
+                        Some(batch) => {
+                            batch.len() < self.limits.batch_ops
+                                && batch.used_bytes() + op_bytes <= self.limits.batch_bytes
+                        }
+                    } =>
+                {
                     Some(entry.into_mut())
                 }
                 Entry::Vacant(entry) if can_activate => {
@@ -177,23 +191,23 @@ impl ReplayDispatcher {
                         .and_then(|pages| pages.remove(&key.page_id))
                         .ok_or_else(|| {
                             Report::new(DataIntegrityError::InvalidRootInvariant)
-                                .attach(format!("missing row replay state: table_id={}, page_id={page_id}, row_id={}, cts={}", key.table_id, op.row.row_id, op.cts))
+                                .attach(format!("missing row replay state: table_id={}, page_id={page_id}, row_id={}, cts={}", key.table_id, op.row_id, op.cts))
                                 .change_context(RuntimeError::Recovery)
                         })?;
                     Some(entry.insert(ActivePage {
                         table: Arc::clone(table),
                         state: Some(state),
-                        pending: Vec::new(),
+                        pending: None,
                         ready_queued: false,
                     }))
                 }
                 _ => None,
             };
             if let Some(page) = page {
-                if page.pending.is_empty() {
-                    page.pending = Vec::with_capacity(self.limits.batch_ops);
-                }
-                page.pending.push(op);
+                let batch = page.pending.get_or_insert_with(|| self.recycled.acquire());
+                batch.append(&op, self.limits.batch_bytes);
+                let flush = batch.len() == self.limits.batch_ops
+                    || batch.used_bytes() >= self.limits.batch_bytes;
                 self.active_tables
                     .entry(key.table_id)
                     .or_default()
@@ -202,7 +216,7 @@ impl ReplayDispatcher {
                     page.ready_queued = true;
                     self.ready.push_back(key);
                 }
-                if page.pending.len() == self.limits.batch_ops {
+                if flush {
                     self.progress()?;
                 }
                 break;
@@ -232,7 +246,10 @@ impl ReplayDispatcher {
                 .expect("recovery ready page exists");
             page.ready_queued = false;
             let state = page.state.take().expect("recovery ready page owns history");
-            let batch = mem::take(&mut page.pending);
+            let batch = page
+                .pending
+                .take()
+                .expect("recovery ready page owns pending batch");
             let work = self
                 .active_tables
                 .get_mut(&key.table_id)
@@ -303,7 +320,7 @@ impl ReplayDispatcher {
             .get_mut(&key)
             .expect("recovery completion page exists");
         // This completion exclusively returns the state taken at submission.
-        if page.pending.is_empty() {
+        if page.pending.is_none() {
             self.active_pages.remove(&key);
             self.page_history
                 .entry(key.table_id)
@@ -314,6 +331,7 @@ impl ReplayDispatcher {
             page.ready_queued = true;
             self.ready.push_back(key);
         }
+        self.recycled.recycle(output.batch);
         #[cfg(test)]
         if let Some(hook) = &self.test_hook {
             hook.collected.send(key).unwrap();
@@ -370,13 +388,22 @@ impl ReplayDispatcher {
         loop {
             self.progress()?;
             if self.active_tables.is_empty() {
+                self.recycled.clear();
                 return Ok(());
             }
             self.wait_one().await?;
         }
     }
 
-    /// Keep one pinned input future alive across every worker completion wake.
+    /// Wait for input while collecting completions and scheduling pending replay.
+    ///
+    /// The same input future stays pinned across worker completions; collecting a
+    /// completion never cancels or restarts the input operation. Unless a worker
+    /// error or cancellation ends the wait, input is driven to completion.
+    ///
+    /// A successful return means the input operation completed. Processing or
+    /// replaying its returned value belongs to the caller, as do draining at EOF
+    /// and settling accepted work after an error.
     pub(super) async fn read_next<T>(
         &mut self,
         input: impl Future<Output = RuntimeResult<T>>,
@@ -399,7 +426,7 @@ impl ReplayDispatcher {
     pub(super) async fn settle(&mut self, mut error: RuntimeOrFatalError) -> RuntimeOrFatalError {
         self.ready.clear();
         for page in self.active_pages.values_mut() {
-            page.pending = Vec::new();
+            page.pending = None;
             page.ready_queued = false;
         }
         for work in self.active_tables.values_mut() {
@@ -412,6 +439,7 @@ impl ReplayDispatcher {
         }
         self.active_pages.clear();
         self.active_tables.clear();
+        self.recycled.clear();
         error
     }
 
@@ -442,7 +470,7 @@ async fn replay_page_batch(
     table: Arc<Table>,
     guards: PoolGuards,
     mut state: RowReplayState,
-    batch: Vec<ReplayOp>,
+    batch: PackedPageBatch,
     disable_validation: bool,
     #[cfg(test)] test_hook: Option<tests::BatchHook>,
 ) -> RuntimeOrFatalResult<BatchOutput> {
@@ -462,7 +490,11 @@ async fn replay_page_batch(
     if let Some(hook) = &test_hook {
         hook.finished.send(key).unwrap();
     }
-    Ok(BatchOutput { state, counts })
+    Ok(BatchOutput {
+        state,
+        counts,
+        batch,
+    })
 }
 
 /// Keep the page identity available even when the job fails.
@@ -484,7 +516,10 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::FatalError;
     use crate::id::RowID;
+    use crate::id::TrxID;
+    use crate::log::redo::RowRedo;
     use crate::log::redo::RowRedoKind;
+    use crate::recovery::packed::{OwnedReplayOp, decode_test_op, pool_snapshot};
     use crate::row::ops::UpdateCol;
     use crate::row::{RowPage, RowRead};
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine_config};
@@ -690,10 +725,14 @@ mod tests {
 
         async fn insert(&mut self, index: usize, slot: u64) {
             let (page, first) = self.pages[index];
-            self.dispatch
-                .admit(&self.table, page, insert(page, first + slot, "initial"))
-                .await
-                .unwrap();
+            admit_test_op(
+                &mut self.dispatch,
+                &self.table,
+                page,
+                insert(page, first + slot, "initial"),
+            )
+            .await
+            .unwrap();
         }
 
         fn assert_idle(&self) {
@@ -707,6 +746,24 @@ mod tests {
     /// Copy the test-thread bootstrap hook into the new dispatcher.
     pub(super) fn installed_hook() -> Option<BatchHook> {
         BATCH_HOOK.with(|hook| hook.borrow().clone())
+    }
+
+    /// Observe idle storage independently of page histories in lifecycle tests.
+    pub(in crate::recovery) fn recycled_snapshot(dispatch: &ReplayDispatcher) -> (usize, usize) {
+        pool_snapshot(&dispatch.recycled)
+    }
+
+    async fn admit_test_op(
+        dispatch: &mut ReplayDispatcher,
+        table: &Arc<Table>,
+        page: PageID,
+        op: OwnedReplayOp,
+    ) -> RuntimeOrFatalResult<()> {
+        let cts = op.cts;
+        let (group, row) = decode_test_op(op);
+        dispatch
+            .admit(table, page, group.operation(&row, cts))
+            .await
     }
 
     async fn observed_input(
@@ -736,8 +793,8 @@ mod tests {
         assert_eq!(engine.recovery_report().work.hot_inserts, 1);
     }
 
-    fn insert(page: PageID, row_id: RowID, value: &str) -> ReplayOp {
-        ReplayOp {
+    fn insert(page: PageID, row_id: RowID, value: &str) -> OwnedReplayOp {
+        OwnedReplayOp {
             cts: TrxID::new(10),
             row: RowRedo {
                 row_id,
@@ -749,8 +806,8 @@ mod tests {
         }
     }
 
-    fn update(page: PageID, row_id: RowID, value: &str) -> ReplayOp {
-        ReplayOp {
+    fn update(page: PageID, row_id: RowID, value: &str) -> OwnedReplayOp {
+        OwnedReplayOp {
             cts: TrxID::new(11),
             row: RowRedo {
                 row_id,
@@ -770,6 +827,13 @@ mod tests {
             .attach("injected parser/DDL failure")
             .change_context(RuntimeError::Recovery)
             .into()
+    }
+
+    fn insert_bytes(value: &str) -> usize {
+        let op = insert(PageID::new(100), RowID::new(0), value);
+        let cts = op.cts;
+        let (group, row) = decode_test_op(op);
+        group.operation(&row, cts).used_bytes()
     }
 
     #[test]
@@ -813,23 +877,23 @@ mod tests {
             }
             assert!(f.dispatch.active_pages[&key].state.is_none());
             // A successor remains pending while its predecessor owns the bitmap.
-            f.dispatch
-                .admit(
-                    &f.table,
-                    page,
-                    update(page, first + 69, "a larger replacement value"),
-                )
-                .await
-                .unwrap();
+            admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                update(page, first + 69, "a larger replacement value"),
+            )
+            .await
+            .unwrap();
             assert_eq!(f.dispatch.in_flight.len(), 1);
-            let deletion = ReplayOp {
+            let deletion = OwnedReplayOp {
                 cts: TrxID::new(12),
                 row: RowRedo {
                     row_id: first + 69,
                     kind: RowRedoKind::Delete(Some(page)),
                 },
             };
-            let mut admission = Box::pin(f.dispatch.admit(&f.table, page, deletion));
+            let mut admission = Box::pin(admit_test_op(&mut f.dispatch, &f.table, page, deletion));
             assert!(admission.as_mut().now_or_never().is_none());
             drop(held);
             admission.await.unwrap();
@@ -850,14 +914,13 @@ mod tests {
                     deletes: 1
                 }
             );
-            let result = f
-                .dispatch
-                .admit(
-                    &f.table,
-                    page,
-                    insert(page, first + 69, "duplicate after deletion"),
-                )
-                .await;
+            let result = admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                insert(page, first + 69, "duplicate after deletion"),
+            )
+            .await;
             let error = match result {
                 Err(error) => error,
                 Ok(()) => f.dispatch.drain_all().await.unwrap_err(),
@@ -893,14 +956,16 @@ mod tests {
                             page_id: f.pages[0].0,
                         }]
                             .pending
-                            .len(),
+                            .as_ref()
+                            .map_or(0, PackedPageBatch::len),
                         2
                     );
                     assert_eq!(f.dispatch.in_flight.len(), 1);
                 }
                 let index = usize::from(pressure != "batch");
                 let (page, first) = f.pages[index];
-                let mut admission = Box::pin(f.dispatch.admit(
+                let mut admission = Box::pin(admit_test_op(
+                    &mut f.dispatch,
                     &f.table,
                     page,
                     insert(page, first + 3, "initial"),
@@ -1014,16 +1079,26 @@ mod tests {
                 page_id: page,
             };
             let large_value = "x".repeat(2048);
-            f.dispatch
-                .admit(&f.table, page, insert(page, first, &large_value))
-                .now_or_never()
-                .expect("payload size must not wait for the blocked page")
-                .unwrap();
-            assert_eq!(f.dispatch.active_pages[&key].pending.len(), 1);
+            admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                insert(page, first, &large_value),
+            )
+            .now_or_never()
+            .expect("payload size must not wait for the blocked page")
+            .unwrap();
+            assert_eq!(
+                f.dispatch.active_pages[&key]
+                    .pending
+                    .as_ref()
+                    .map_or(0, PackedPageBatch::len),
+                1
+            );
             assert_eq!(f.dispatch.in_flight.len(), 1);
             // The second operation fills the batch despite its smaller payload.
             f.insert(1, 1).await;
-            assert!(f.dispatch.active_pages[&key].pending.is_empty());
+            assert!(f.dispatch.active_pages[&key].pending.is_none());
             assert_eq!(f.dispatch.in_flight.len(), 2);
             assert!(f.dispatch.active_pages[&key].state.is_none());
             drop(held1);
@@ -1109,10 +1184,14 @@ mod tests {
             let (page, first) = f.pages[0];
             f.clear_dirty(0).await;
             f.insert(0, 0).await;
-            f.dispatch
-                .admit(&f.table, page, update(page, first + 1, "never inserted"))
-                .await
-                .unwrap();
+            admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                update(page, first + 1, "never inserted"),
+            )
+            .await
+            .unwrap();
             let error = f.dispatch.drain_all().await.unwrap_err();
             assert!(format!("{error:?}").contains("missing inserted state"));
             f.dispatch.settle(error).await;
@@ -1234,10 +1313,11 @@ mod tests {
                 assert!(f.dispatch.ready.len() <= 2);
                 assert!(f.dispatch.in_flight.len() <= 1);
                 assert!(
-                    f.dispatch
-                        .active_pages
-                        .values()
-                        .all(|page| page.pending.len() <= f.dispatch.limits.batch_ops)
+                    f.dispatch.active_pages.values().all(|page| page
+                        .pending
+                        .as_ref()
+                        .map_or(0, PackedPageBatch::len)
+                        <= f.dispatch.limits.batch_ops)
                 );
             }
             // Admission pressure made progress long before EOF, despite every
@@ -1246,10 +1326,14 @@ mod tests {
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
             for &(page, row) in &f.pages {
-                f.dispatch
-                    .admit(&f.table, page, update(page, row, "later transaction"))
-                    .await
-                    .unwrap();
+                admit_test_op(
+                    &mut f.dispatch,
+                    &f.table,
+                    page,
+                    update(page, row, "later transaction"),
+                )
+                .await
+                .unwrap();
             }
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
@@ -1283,7 +1367,8 @@ mod tests {
             }
             gate.started.recv_async().await.unwrap();
             let (page, first) = f.pages[0];
-            let mut next = Box::pin(f.dispatch.admit(
+            let mut next = Box::pin(admit_test_op(
+                &mut f.dispatch,
                 &f.table,
                 page,
                 insert(page, first + 4, "next batch"),
@@ -1301,7 +1386,8 @@ mod tests {
                     page_id: page,
                 }]
                     .pending
-                    .len(),
+                    .as_ref()
+                    .map_or(0, PackedPageBatch::len),
                 1
             );
             gate.release.send(()).unwrap();
@@ -1316,6 +1402,124 @@ mod tests {
                     deletes: 0
                 }
             );
+        });
+    }
+
+    #[test]
+    fn byte_target_flushes_partial_batch_before_next_row() {
+        smol::block_on(async {
+            let mut f = Fixture::with_config(
+                1,
+                1,
+                RecoveryConfig::default().target_batch_bytes(insert_bytes("initial") * 2 - 1),
+            )
+            .await;
+            let gate = Gate::new();
+            f.dispatch.test_hook = Some(gate.hook.clone());
+            f.insert(0, 0).await;
+            assert_eq!(f.dispatch.in_flight.len(), 0);
+            f.insert(0, 1).await;
+            gate.started.recv_async().await.unwrap();
+            let page = &f.dispatch.active_pages[&PageKey {
+                table_id: f.table.table_id(),
+                page_id: f.pages[0].0,
+            }];
+            assert_eq!(page.pending.as_ref().unwrap().len(), 1);
+            assert_eq!(f.dispatch.in_flight.len(), 1);
+            gate.release.send(()).unwrap();
+            gate.release.send(()).unwrap();
+            f.dispatch.drain_all().await.unwrap();
+            assert_eq!(f.dispatch.counts.inserts, 2);
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
+        });
+    }
+
+    #[test]
+    fn exact_fit_and_oversized_operations_dispatch_without_byte_credit_waits() {
+        smol::block_on(async {
+            for target in [insert_bytes("initial"), insert_bytes("initial") - 1] {
+                let mut f = Fixture::with_config(
+                    1,
+                    1,
+                    RecoveryConfig::default().target_batch_bytes(target),
+                )
+                .await;
+                let gate = Gate::new();
+                f.dispatch.test_hook = Some(gate.hook.clone());
+                f.insert(0, 0).await;
+                gate.started.recv_async().await.unwrap();
+                assert_eq!(f.dispatch.in_flight.len(), 1);
+                assert!(
+                    f.dispatch
+                        .active_pages
+                        .values()
+                        .all(|page| page.pending.is_none())
+                );
+                gate.release.send(()).unwrap();
+                f.dispatch.drain_all().await.unwrap();
+                assert_eq!(f.dispatch.counts.inserts, 1);
+            }
+        });
+    }
+
+    #[test]
+    fn collected_storage_recycles_across_pages_without_borrowed_group_or_page_bytes() {
+        smol::block_on(async {
+            let mut f = Fixture::new(2, 1).await;
+            let gate = Gate::new();
+            f.dispatch.test_hook = Some(gate.hook.clone());
+            let (page, first) = f.pages[0];
+            let initial = "a".repeat(512);
+            // This helper releases its source group before the accepted job runs.
+            admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                insert(page, first, &initial),
+            )
+            .await
+            .unwrap();
+            f.dispatch.pump();
+            gate.started.recv_async().await.unwrap();
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
+            gate.release.send(()).unwrap();
+            gate.finished.recv_async().await.unwrap();
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
+            f.dispatch.drain(f.table.table_id()).await.unwrap();
+            let retained = pool_snapshot(&f.dispatch.recycled);
+            assert_eq!(retained.0, 1);
+            assert!(retained.1 > 512);
+            f.dispatch.test_hook = None;
+            let (page, first) = f.pages[1];
+            admit_test_op(
+                &mut f.dispatch,
+                &f.table,
+                page,
+                insert(page, first, &"b".repeat(512)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
+            f.dispatch.drain(f.table.table_id()).await.unwrap();
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), retained);
+            assert_eq!(
+                f.lock(0)
+                    .await
+                    .page()
+                    .row(0)
+                    .val(&f.table.metadata().col, 1),
+                Val::from(initial.as_str())
+            );
+            assert_eq!(
+                f.lock(1)
+                    .await
+                    .page()
+                    .row(0)
+                    .val(&f.table.metadata().col, 1),
+                Val::from("b".repeat(512).as_str())
+            );
+            f.dispatch.drain_all().await.unwrap();
+            assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
         });
     }
 }

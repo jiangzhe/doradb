@@ -28,9 +28,11 @@ normal directory-management tools for the host environment.
 
 **Record the allocator when reporting benchmark results.** Moving allocations
 between threads can change allocator contention enough to reverse a performance
-comparison. During parallel recovery, the coordinator allocates decoded row
-values and replay workers free them. With glibc, these concurrent allocations
-and frees caused substantial allocator-lock contention in serial decode/refill.
+comparison. In the original owning parallel recovery pipeline, the coordinator allocated
+decoded row values and workers freed them. Glibc profiles showed substantial
+allocator-lock CPU attribution during serial decode/refill. Recovery now uses
+flat page-owned batches returned through completion for coordinator recycling;
+measure that ownership policy independently of allocator selection.
 
 In the 10-million-row unindexed comparison for
 [Task 000309](tasks/000309-pipelined-recovery-with-parallel-page-replay.md#allocator-impact-2026-09-18),
@@ -124,18 +126,32 @@ result records the complete normalized engine configuration, including both
 effective table-scan counts. Normalized result documents must include the
 `table_scan` table.
 
-`[engine.recovery]` accepts `io_depth`, `disable_dml_validation`,
-`max_in_flight_batches`, `max_active_pages`, and `max_batch_ops`. All counts
-must be positive. When omitted from the merged overlay,
-submission capacity defaults to twice the configured pool worker count, and
-active-page capacity defaults to four times the effective submission capacity.
-Resolved results require a `recovery` table with concrete limits. Replay memory
-depends on payload sizes; there is no byte budget. The old
-`transaction.recovery_io_depth` and
-`transaction.recovery_disable_dml_validation` keys are rejected; use
-`recovery.io_depth` and `recovery.disable_dml_validation`.
-The removed `recovery.max_batch_bytes` and `recovery.max_buffered_bytes` keys
-are also rejected.
+### Recovery settings
+
+`[engine.recovery]` accepts these startup controls:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `io_depth` | 32 | Outstanding direct-I/O read-ahead requests. |
+| `disable_dml_validation` | `false` | Disable catalog and row DML shape, type, and nullability checks. |
+| `max_in_flight_batches` | Twice the pool worker count | Submitted batches whose completions have not been collected. |
+| `max_active_pages` | Four times the effective submission limit | Pages with pending or submitted replay work. |
+| `max_batch_ops` | 256 | Maximum operations per replay batch. |
+| `target_batch_bytes` | `"256 KiB"` | Used-storage flush target, including operation/value/update descriptors and payload. A larger individual operation runs alone. |
+| `max_recycled_bytes` | `"16 MiB"` | Aggregate allocated capacity retained in idle batches; zero disables reuse. |
+
+I/O depth, explicit batch/page/operation limits, and the batch-byte target must
+be positive. Automatic sizing uses the merged engine configuration, so the
+default active-page limit follows an explicit submission override. Resolved
+results record concrete limits and integer byte counts; byte inputs in plans
+use strings such as `"256 KiB"`.
+
+These controls do not bound total recovery memory or RSS. Active batches may
+have spare capacity, and input groups, replay history, recovered pages, and
+allocator overhead are additional costs. The
+[recovery design](recovery.md#hot-page-replay-state) explains ownership and
+progress guarantees. Rust callers configure the same controls through
+[`RecoveryConfig`](../doradb-storage/src/conf/recovery.rs).
 
 For example, retain automatic submission and page sizing while reducing batches:
 
@@ -143,7 +159,11 @@ For example, retain automatic submission and page sizing while reducing batches:
 [engine.recovery]
 io_depth = 8
 max_batch_ops = 128
+target_batch_bytes = "256 KiB"
+max_recycled_bytes = "16 MiB"
 ```
+
+### Workload defaults
 
 `[workload_defaults]` accepts `threads`, `sessions`, `value_size`, `batch_size`,
 and `include_stats`. Defaults are one thread, sessions equal to threads,

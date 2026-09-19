@@ -154,6 +154,10 @@ pub struct RecoveryConfigOverlay {
     pub max_active_pages: Option<usize>,
     /// Maximum operations in one replay batch.
     pub max_batch_ops: Option<usize>,
+    /// Used batch storage flush target, expressed as a byte-size string.
+    pub target_batch_bytes: Option<Byte>,
+    /// Idle batch capacity cap; zero disables recycling.
+    pub max_recycled_bytes: Option<Byte>,
 }
 
 impl RecoveryConfigOverlay {
@@ -167,6 +171,8 @@ impl RecoveryConfigOverlay {
         replace(&mut self.max_in_flight_batches, other.max_in_flight_batches);
         replace(&mut self.max_active_pages, other.max_active_pages);
         replace(&mut self.max_batch_ops, other.max_batch_ops);
+        replace(&mut self.target_batch_bytes, other.target_batch_bytes);
+        replace(&mut self.max_recycled_bytes, other.max_recycled_bytes);
     }
 }
 
@@ -305,6 +311,8 @@ impl ResolvedEngineConfig {
                     .max_active_pages
                     .expect("validated recovery active-page limit"),
                 max_batch_ops: config.recovery.max_batch_ops,
+                target_batch_bytes: config.recovery.target_batch_bytes,
+                max_recycled_bytes: config.recovery.max_recycled_bytes,
             },
             mandatory_runtime: ResolvedMandatoryRuntimeConfig {
                 concurrency_limit: config.mandatory_runtime.concurrency_limit,
@@ -383,6 +391,10 @@ pub struct ResolvedRecoveryConfig {
     pub max_active_pages: usize,
     /// Maximum operations in one replay batch.
     pub max_batch_ops: usize,
+    /// Used batch storage flush target in bytes.
+    pub target_batch_bytes: usize,
+    /// Maximum retained idle vector capacity in bytes.
+    pub max_recycled_bytes: usize,
 }
 
 /// Serializable normalized mandatory-runtime configuration.
@@ -498,6 +510,13 @@ pub fn resolve_engine_config(
     }
     if let Some(value) = overlay.recovery.max_batch_ops {
         recovery = recovery.max_batch_ops(value);
+    }
+
+    if let Some(value) = overlay.recovery.target_batch_bytes {
+        recovery = recovery.target_batch_bytes(byte_usize(value, "recovery.target_batch_bytes")?);
+    }
+    if let Some(value) = overlay.recovery.max_recycled_bytes {
+        recovery = recovery.max_recycled_bytes(byte_usize(value, "recovery.max_recycled_bytes")?);
     }
 
     let index_buffer = apply_evictable_buffer_overlay(
@@ -735,6 +754,8 @@ mod tests {
                 max_in_flight_batches: 6,
                 max_active_pages: 7,
                 max_batch_ops: 11,
+                target_batch_bytes: 256 * 1024,
+                max_recycled_bytes: 16 * 1024 * 1024,
             }
         );
         let encoded = toml::to_string(&resolved).unwrap();
@@ -773,6 +794,35 @@ mod tests {
     }
 
     #[test]
+    fn recovery_byte_overlays_merge_normalize_and_allow_zero_recycling() {
+        let temp = TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay = toml::from_str(
+            r#"[recovery]
+            target_batch_bytes = "32 KiB"
+            max_recycled_bytes = "1 MiB"
+        "#,
+        )
+        .unwrap();
+        overlay.merge(
+            toml::from_str(
+                r#"[recovery]
+            max_recycled_bytes = "0 B"
+        "#,
+            )
+            .unwrap(),
+        );
+        let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(config.recovery.target_batch_bytes, 32768);
+        assert_eq!(resolved.recovery.target_batch_bytes, 32768);
+        assert_eq!(config.recovery.max_recycled_bytes, 0);
+        assert_eq!(resolved.recovery.max_recycled_bytes, 0);
+        assert_eq!(
+            toml::from_str::<ResolvedEngineConfig>(&toml::to_string(&resolved).unwrap()).unwrap(),
+            resolved
+        );
+    }
+
+    #[test]
     fn recovery_overlay_rejects_invalid_limits() {
         let temp = TempDir::new().unwrap();
         for field in [
@@ -780,6 +830,7 @@ mod tests {
             "max_in_flight_batches = 0",
             "max_active_pages = 0",
             "max_batch_ops = 0",
+            "target_batch_bytes = \"0 B\"",
         ] {
             let overlay = toml::from_str(&format!("[recovery]\n{field}\n")).unwrap();
             assert!(

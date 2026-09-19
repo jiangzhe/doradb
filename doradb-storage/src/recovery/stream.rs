@@ -1,3 +1,4 @@
+use super::decode::DecodedGroup;
 use crate::stats::{RecoveryRedoMetrics, recovery_add_count, recovery_add_duration};
 use std::time::Instant;
 
@@ -10,7 +11,7 @@ use crate::io::{
     Backend, BackendError, CompletedSubmission, DirectBuf, IOBuf, IOSubmission, Operation,
     STORAGE_SECTOR_SIZE, StorageBackend, SubmissionDriver, SubmitAttempt,
 };
-use crate::log::block_group::{TrxLog, block_count_for_payload};
+use crate::log::block_group::{TrxLog, block_count_for_payload, validate_group_trx};
 use crate::log::format::{
     REDO_DEFAULT_DATA_START_OFFSET, RedoBlockHeader, RedoGroupStartExtension, RedoSuperBlock,
     is_zero_redo_block, select_redo_super_block,
@@ -30,6 +31,11 @@ use std::panic::resume_unwind;
 use std::path::PathBuf;
 use std::thread::{JoinHandle, panicking};
 use std::time::Duration;
+
+#[cfg(test)]
+pub(super) use tests::decode_owning_group;
+#[cfg(test)]
+pub(crate) use tests::read_recovery_headers;
 
 const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -125,6 +131,9 @@ pub(crate) enum RedoRetentionSegmentState {
 ///
 /// The group owns an assembled logical payload and enforces the commit
 /// timestamp range advertised by the group-start block.
+/// See the [group contract](crate::log::block_group::LogBlockGroup) and the
+/// transaction format on [`TrxLog`]. This iterator validates one frame per call;
+/// [`RedoLogStream`] drains it before publishing any transaction from the group.
 pub(crate) struct TrxLogIterator {
     /// Unconsumed logical body bytes.
     data: Vec<u8>,
@@ -155,23 +164,13 @@ impl TrxLogIterator {
             return Ok(None);
         }
         let (offset, res) = TrxLog::deser(&self.data[..], self.offset)?;
-        // Defensive progress check: a zero-byte parser result would make replay
-        // loop forever on corrupt input.
-        if offset == self.offset {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("block=redo-group, trx parser consumed zero bytes"));
-        }
-        let cts = res.header.cts;
-        // The header range is a cheap cross-check that every transaction record
-        // belongs to this group without requiring exact min/max recomputation.
-        if cts < self.min_cts || cts > self.max_cts {
-            return Err(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "block=redo-group, cts={cts}, min_cts={}, max_cts={}",
-                    self.min_cts, self.max_cts
-                )),
-            );
-        }
+        validate_group_trx(
+            self.offset,
+            offset,
+            res.header.cts,
+            self.min_cts,
+            self.max_cts,
+        )?;
         self.offset = offset;
         Ok(Some(res))
     }
@@ -314,9 +313,8 @@ impl RedoReplayPlanner {
         let planned = self.plan_replay_segments(&suffix, floor)?;
 
         let segments_selected = planned.stream_segments.len() as u64;
-        let mut stream = RedoLogStream::from_planned_segments(planned.stream_segments, read_depth)
+        let stream = RecoveryLogStream::from_planned_segments(planned.stream_segments, read_depth)
             .attach("phase=plan_recovery_redo_read_ahead")?;
-        stream.metrics = Some(StreamMetrics::default());
         Ok(PlannedRedoRecovery {
             segments_discovered: self.discovered.len() as u64,
             segments_selected,
@@ -494,7 +492,7 @@ pub(crate) struct PlannedRedoRecovery {
     /// Highest CTS from sealed skipped segments below the replay floor.
     pub(crate) skipped_max_recovered_cts: Option<TrxID>,
     /// Stream over the planned durable redo prefix.
-    pub(crate) stream: RedoLogStream,
+    pub(crate) stream: RecoveryLogStream,
     /// Repair and writable-file policy to apply after stream replay.
     pub(crate) repair_policy: RedoRecoveryRepairPolicy,
 }
@@ -534,54 +532,34 @@ struct StreamMetrics {
     saturated: bool,
 }
 
-/// Buffered stream of transaction redo records across a sequence of redo files.
+/// Owning transaction adapter used by catalog checkpoint scans.
+///
+/// Enforces whole-group validation and terminal failure from the
+/// [group contract](crate::log::block_group::LogBlockGroup), using [`TrxLog`]'s
+/// owning decoder. Buffered records are exposed only after the iterator reaches
+/// the end of the group; a later malformed frame discards the entire buffer.
 pub(crate) struct RedoLogStream {
-    metrics: Option<StreamMetrics>,
-    /// Direct-IO read-ahead worker for the planned logical stream.
-    reader: Option<RedoReadAheadHandle>,
-    /// Parser state for the current redo segment.
-    current_segment: Option<SegmentReadState>,
-    /// Decoded records ready for recovery to consume.
+    groups: RedoGroupReader,
     buffer: VecDeque<TrxLog>,
-    /// Terminal state for the logical stream.
-    state: RedoLogStreamState,
-    /// Accepted-prefix metadata for scanned unsealed segments.
-    unsealed_terminals: Vec<UnsealedSegmentTerminal>,
 }
 
 impl RedoLogStream {
-    /// Create a stream over an already planned redo segment sequence.
-    #[inline]
     fn from_planned_segments(
         segments: Vec<RedoLogSegment>,
         read_depth: usize,
     ) -> RuntimeResult<Self> {
-        let state = if segments.is_empty() {
-            RedoLogStreamState::Ended
-        } else {
-            RedoLogStreamState::Active
-        };
-        let reader = if state == RedoLogStreamState::Ended {
-            None
-        } else {
-            Some(RedoReadAheadWorker::spawn(segments, read_depth)?)
-        };
         Ok(Self {
-            reader,
-            current_segment: None,
+            groups: RedoGroupReader::from_planned_segments(segments, read_depth)?,
             buffer: VecDeque::new(),
-            state,
-            unsealed_terminals: Vec::new(),
-            metrics: None,
         })
     }
 
     /// Refill the in-memory queue from the direct-IO stream.
     #[inline]
     async fn fill_buffer(&mut self) -> RuntimeResult<()> {
-        let started = self.metrics.as_ref().map(|_| Instant::now());
+        let started = self.groups.metrics.as_ref().map(|_| Instant::now());
         let result = self.fill_buffer_inner().await;
-        if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+        if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
             recovery_add_duration(
                 &mut metrics.redo.stream_refill_elapsed,
                 started.elapsed(),
@@ -592,9 +570,9 @@ impl RedoLogStream {
     }
 
     async fn fill_buffer_inner(&mut self) -> RuntimeResult<()> {
-        while self.state == RedoLogStreamState::Active {
-            if let Some(mut iter) = self.read_next_group().await? {
-                let started = self.metrics.as_ref().map(|_| Instant::now());
+        while self.groups.state == RedoLogStreamState::Active {
+            if let Some(mut iter) = self.groups.read_next_group().await? {
+                let started = self.groups.metrics.as_ref().map(|_| Instant::now());
                 let payload_bytes = iter.data.len() as u64;
                 let before = self.buffer.len();
                 loop {
@@ -602,14 +580,15 @@ impl RedoLogStream {
                         Ok(Some(res)) => self.buffer.push_back(res),
                         Ok(None) => break,
                         Err(err) => {
-                            return Err(self.fail_stream(
+                            self.buffer.clear();
+                            return Err(self.groups.fail_stream(
                                 err.change_context(RuntimeError::RedoLogAccess)
                                     .attach("operation=decode_redo_group"),
                             ));
                         }
                     }
                 }
-                if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
+                if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
                     recovery_add_duration(
                         &mut metrics.redo.group_decode_elapsed,
                         started.elapsed(),
@@ -637,7 +616,7 @@ impl RedoLogStream {
     #[inline]
     pub(crate) async fn try_next(&mut self) -> RuntimeResult<Option<TrxLog>> {
         assert!(
-            self.state != RedoLogStreamState::Failed,
+            self.groups.state != RedoLogStreamState::Failed,
             "redo read-protocol invariant violated: stream read after terminal error"
         );
         match self.buffer.pop_front() {
@@ -647,6 +626,125 @@ impl RedoLogStream {
                 Ok(self.buffer.pop_front())
             }
         }
+    }
+}
+
+/// Startup adapter publishing only completely validated packed groups.
+///
+/// Enforces the same [group contract](crate::log::block_group::LogBlockGroup) as
+/// [`RedoLogStream`], delegating transaction validation to [`DecodedGroup::decode`].
+pub(crate) struct RecoveryLogStream {
+    groups: RedoGroupReader,
+}
+
+impl RecoveryLogStream {
+    #[inline]
+    fn from_planned_segments(
+        segments: Vec<RedoLogSegment>,
+        read_depth: usize,
+    ) -> RuntimeResult<Self> {
+        let mut groups = RedoGroupReader::from_planned_segments(segments, read_depth)?;
+        groups.metrics = Some(StreamMetrics::default());
+        Ok(Self { groups })
+    }
+
+    /// Read and validate one whole group before exposing any transaction from it.
+    pub(super) async fn try_next(&mut self) -> RuntimeResult<Option<DecodedGroup>> {
+        let started = Instant::now();
+        let result = self.read_group().await;
+        if let Some(metrics) = &mut self.groups.metrics {
+            recovery_add_duration(
+                &mut metrics.redo.stream_refill_elapsed,
+                started.elapsed(),
+                &mut metrics.saturated,
+            );
+        }
+        result
+    }
+
+    async fn read_group(&mut self) -> RuntimeResult<Option<DecodedGroup>> {
+        let Some(iter) = self.groups.read_next_group().await? else {
+            return Ok(None);
+        };
+        let payload_bytes = iter.data.len() as u64;
+        let started = Instant::now();
+        let group = DecodedGroup::decode(iter.data, iter.min_cts, iter.max_cts).map_err(|err| {
+            self.groups.fail_stream(
+                err.change_context(RuntimeError::RedoLogAccess)
+                    .attach("operation=decode_redo_group"),
+            )
+        })?;
+        if let Some(metrics) = &mut self.groups.metrics {
+            recovery_add_duration(
+                &mut metrics.redo.group_decode_elapsed,
+                started.elapsed(),
+                &mut metrics.saturated,
+            );
+            recovery_add_count(&mut metrics.redo.groups_decoded, 1, &mut metrics.saturated);
+            recovery_add_count(
+                &mut metrics.redo.transactions_decoded,
+                group.transactions.len() as u64,
+                &mut metrics.saturated,
+            );
+            recovery_add_count(
+                &mut metrics.redo.validated_payload_bytes,
+                payload_bytes,
+                &mut metrics.saturated,
+            );
+        }
+        Ok(Some(group))
+    }
+
+    /// Returns startup measurements after stream termination.
+    #[inline]
+    pub(crate) fn recovery_metrics(&self) -> (RecoveryRedoMetrics, bool) {
+        self.groups.recovery_metrics()
+    }
+
+    /// Take accepted-prefix metadata for startup repair.
+    #[inline]
+    pub(crate) fn take_unsealed_terminals(&mut self) -> Vec<UnsealedSegmentTerminal> {
+        self.groups.take_unsealed_terminals()
+    }
+}
+
+/// Buffered stream of transaction redo records across a sequence of redo files.
+struct RedoGroupReader {
+    metrics: Option<StreamMetrics>,
+    /// Direct-IO read-ahead worker for the planned logical stream.
+    reader: Option<RedoReadAheadHandle>,
+    /// Parser state for the current redo segment.
+    current_segment: Option<SegmentReadState>,
+    /// Terminal state for the logical stream.
+    state: RedoLogStreamState,
+    /// Accepted-prefix metadata for scanned unsealed segments.
+    unsealed_terminals: Vec<UnsealedSegmentTerminal>,
+}
+
+impl RedoGroupReader {
+    /// Create a stream over an already planned redo segment sequence.
+    #[inline]
+    fn from_planned_segments(
+        segments: Vec<RedoLogSegment>,
+        read_depth: usize,
+    ) -> RuntimeResult<Self> {
+        let state = if segments.is_empty() {
+            RedoLogStreamState::Ended
+        } else {
+            RedoLogStreamState::Active
+        };
+        let reader = if state == RedoLogStreamState::Ended {
+            None
+        } else {
+            Some(RedoReadAheadWorker::spawn(segments, read_depth)?)
+        };
+        Ok(Self {
+            reader,
+            current_segment: None,
+            state,
+            unsealed_terminals: Vec::new(),
+            metrics: None,
+        })
     }
 
     #[inline]
@@ -926,7 +1024,6 @@ impl RedoLogStream {
 
     #[inline]
     fn fail_stream(&mut self, err: Report<RuntimeError>) -> Report<RuntimeError> {
-        self.buffer.clear();
         self.current_segment = None;
         self.stop_reader();
         self.state = RedoLogStreamState::Failed;
@@ -1884,8 +1981,9 @@ fn append_block_payload(
 mod tests {
     use super::*;
     use crate::buffer::test_page_id;
+    use crate::catalog::USER_TABLE_ID_START;
     use crate::error::{IoError, IoResult, RuntimeError};
-    use crate::id::{RowID, TableID, TrxID};
+    use crate::id::{PageID, RowID, TableID, TrxID};
     use crate::io::{
         BackendError, BackendResult, BackendToken, DirectBuf, IOBuf, StdIoResult,
         SubmittedIoCleanup,
@@ -1898,9 +1996,13 @@ mod tests {
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
+    use crate::recovery::decode::{DecodedTable, DecodedTrxKind, assert_group_matches_logs};
+    use crate::recovery::packed::ReplayKind;
+    use crate::row::RowValues;
     use crate::serde::Ser;
     use crate::thread::fail_spawn_named;
     use crate::value::Val;
+    use crate::value::ValRef;
     use futures::FutureExt;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
@@ -1997,6 +2099,82 @@ mod tests {
         }
     }
 
+    /// Inspect startup results without exposing recovery-private decoded storage.
+    pub(crate) async fn read_recovery_headers(
+        mut stream: RecoveryLogStream,
+    ) -> RuntimeResult<Vec<RedoHeader>> {
+        let mut headers = Vec::new();
+        while let Some(group) = stream.try_next().await? {
+            headers.extend(group.transactions.into_iter().map(|trx| trx.header));
+        }
+        Ok(headers)
+    }
+
+    /// Drain the production owning iterator independently of the packed transaction directory.
+    pub(in crate::recovery) fn decode_owning_group(
+        wire: &[u8],
+        min_cts: TrxID,
+        max_cts: TrxID,
+    ) -> DataIntegrityResult<Vec<TrxLog>> {
+        let mut iter = TrxLogIterator::new(wire.to_vec(), min_cts, max_cts);
+        let mut logs = Vec::new();
+        while let Some(log) = iter.try_next()? {
+            logs.push(log);
+        }
+        assert_eq!(iter.offset, wire.len());
+        Ok(logs)
+    }
+
+    async fn assert_stream_group_parity(
+        blocks: &[DirectBuf],
+        expected_error: Option<DataIntegrityError>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = write_stream_log_file(
+            &dir.path().join("parity.log"),
+            STORAGE_SECTOR_SIZE,
+            blocks.len(),
+            blocks,
+            TestSegmentSeal::Open,
+        );
+        let planner = RedoReplayPlanner::new(vec![descriptor]);
+        let mut packed = planner.plan_recovery(TrxID::new(0), 2).unwrap().stream;
+        let mut owning = planner.plan_catalog_scan(TrxID::new(0), 2).unwrap().stream;
+        if let Some(expected) = expected_error {
+            let packed_error = packed.try_next().await.unwrap_err();
+            let owning_error = owning.try_next().await.unwrap_err();
+            assert_eq!(
+                packed_error.downcast_ref::<DataIntegrityError>(),
+                Some(&expected)
+            );
+            assert_eq!(
+                owning_error.downcast_ref::<DataIntegrityError>(),
+                Some(&expected)
+            );
+            assert!(owning.buffer.is_empty());
+            assert!(
+                AssertUnwindSafe(packed.try_next())
+                    .catch_unwind()
+                    .await
+                    .is_err()
+            );
+            assert!(
+                AssertUnwindSafe(owning.try_next())
+                    .catch_unwind()
+                    .await
+                    .is_err()
+            );
+        } else {
+            let mut logs = Vec::new();
+            while let Some(log) = owning.try_next().await.unwrap() {
+                logs.push(log);
+            }
+            let group = packed.try_next().await.unwrap().unwrap();
+            assert_group_matches_logs(&group, &logs);
+            assert!(packed.try_next().await.unwrap().is_none());
+        }
+    }
+
     fn simple_trx_log(cts: TrxID) -> TrxLog {
         TrxLog::new(
             RedoHeader {
@@ -2071,7 +2249,7 @@ mod tests {
         data_block_count: usize,
         blocks: &[DirectBuf],
         seal: TestSegmentSeal,
-    ) -> RedoLogStream {
+    ) -> RecoveryLogStream {
         let descriptor =
             write_stream_log_file(path, log_block_size, data_block_count, blocks, seal);
         let planner = RedoReplayPlanner::new(vec![descriptor]);
@@ -2089,7 +2267,7 @@ mod tests {
         }
     }
 
-    fn injected_stream(items: Vec<RedoReadItem>) -> RedoLogStream {
+    fn injected_stream(items: Vec<RedoReadItem>) -> RecoveryLogStream {
         let capacity = items.len().max(1);
         let (items_tx, items_rx) = flume::bounded(capacity);
         for item in items {
@@ -2098,22 +2276,23 @@ mod tests {
         drop(items_tx);
         let (recycle_tx, _recycle_rx) = flume::bounded(capacity);
         let (stop_tx, _stop_rx) = flume::bounded(1);
-        RedoLogStream {
-            reader: Some(RedoReadAheadHandle {
-                items: items_rx,
-                recycle: recycle_tx,
-                stop: stop_tx,
-                join: None,
-            }),
-            current_segment: None,
-            buffer: VecDeque::new(),
-            state: RedoLogStreamState::Active,
-            unsealed_terminals: Vec::new(),
-            metrics: None,
+        RecoveryLogStream {
+            groups: RedoGroupReader {
+                reader: Some(RedoReadAheadHandle {
+                    items: items_rx,
+                    recycle: recycle_tx,
+                    stop: stop_tx,
+                    join: None,
+                }),
+                current_segment: None,
+                state: RedoLogStreamState::Active,
+                unsealed_terminals: Vec::new(),
+                metrics: None,
+            },
         }
     }
 
-    async fn assert_stream_corrupted(stream: &mut RedoLogStream) {
+    async fn assert_stream_corrupted(stream: &mut RecoveryLogStream) {
         let err = stream.try_next().await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<DataIntegrityError>().copied(),
@@ -2123,7 +2302,7 @@ mod tests {
     }
 
     async fn assert_unsealed_terminal(
-        stream: &mut RedoLogStream,
+        stream: &mut RecoveryLogStream,
         terminal_reason: UnsealedSegmentTerminalReason,
         accepted_end_offset: usize,
         redo_range: Option<(TrxID, TrxID)>,
@@ -2136,7 +2315,7 @@ mod tests {
         assert_eq!(terminals[0].redo_range, redo_range);
     }
 
-    async fn assert_read_after_failed(stream: &mut RedoLogStream) {
+    async fn assert_read_after_failed(stream: &mut RecoveryLogStream) {
         let panic = AssertUnwindSafe(stream.try_next())
             .catch_unwind()
             .await
@@ -2480,7 +2659,7 @@ mod tests {
             );
 
             let recovered = stream.try_next().await.unwrap().unwrap();
-            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert_eq!(recovered.transactions[0].header.cts, TrxID::new(5));
             assert_unsealed_terminal(
                 &mut stream,
                 UnsealedSegmentTerminalReason::MalformedGroupStartTail,
@@ -2589,7 +2768,7 @@ mod tests {
 
         let planned = planner.plan_catalog_scan(TrxID::new(5), 1).unwrap();
 
-        assert!(planned.stream.metrics.is_none());
+        assert!(planned.stream.groups.metrics.is_none());
         assert_eq!(
             planned.sealed_segments,
             vec![
@@ -2646,7 +2825,7 @@ mod tests {
             let mut stream = planned.stream;
 
             let recovered = stream.try_next().await.unwrap().unwrap();
-            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert_eq!(recovered.transactions[0].header.cts, TrxID::new(5));
             assert_unsealed_terminal(
                 &mut stream,
                 UnsealedSegmentTerminalReason::ZeroTail,
@@ -2921,7 +3100,7 @@ mod tests {
             );
 
             let recovered = stream.try_next().await.unwrap().unwrap();
-            assert_eq!(recovered.header.cts, TrxID::new(5));
+            assert_eq!(recovered.transactions[0].header.cts, TrxID::new(5));
             assert!(stream.try_next().await.unwrap().is_none());
         });
     }
@@ -3110,6 +3289,7 @@ mod tests {
                     dml: BTreeMap::new(),
                 },
             );
+            let mut payload_bytes = log1.ser_len() as u64;
             let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
 
             let mut rows = BTreeMap::new();
@@ -3130,6 +3310,7 @@ mod tests {
                 },
                 RedoLogs { ddl: None, dml },
             );
+            payload_bytes += log2.ser_len() as u64;
             assert!(group.append_trx_log(log2).is_none());
             let blocks = group
                 .finish_with(|count| {
@@ -3148,19 +3329,16 @@ mod tests {
                 &blocks,
                 TestSegmentSeal::Open,
             );
-            let log1 = stream.try_next().await.unwrap().unwrap();
-            assert!(log1.header.trx_kind == RedoTrxKind::System);
-            let log2 = stream.try_next().await.unwrap().unwrap();
-            assert!(log2.header.trx_kind == RedoTrxKind::User);
+            let group = stream.try_next().await.unwrap().unwrap();
+            assert_eq!(group.transactions.len(), 2);
+            assert_eq!(group.transactions[0].header.trx_kind, RedoTrxKind::System);
+            assert_eq!(group.transactions[1].header.trx_kind, RedoTrxKind::User);
             assert!(stream.try_next().await.unwrap().is_none());
             let (metrics, saturated) = stream.recovery_metrics();
             assert!(!saturated);
             assert_eq!(metrics.transactions_decoded, 2);
             assert_eq!(metrics.groups_decoded, 1);
-            assert_eq!(
-                metrics.validated_payload_bytes,
-                (log1.ser_len() + log2.ser_len()) as u64
-            );
+            assert_eq!(metrics.validated_payload_bytes, payload_bytes);
         });
     }
 
@@ -3213,8 +3391,8 @@ mod tests {
             let first = stream.try_next().await.unwrap().unwrap();
             let second = stream.try_next().await.unwrap().unwrap();
 
-            assert_eq!(first.header.cts, TrxID::new(1));
-            assert_eq!(second.header.cts, TrxID::new(2));
+            assert_eq!(first.transactions[0].header.cts, TrxID::new(1));
+            assert_eq!(second.transactions[0].header.cts, TrxID::new(2));
             assert!(stream.try_next().await.unwrap().is_none());
             let (metrics, saturated) = stream.recovery_metrics();
             assert!(!saturated);
@@ -3227,8 +3405,103 @@ mod tests {
             );
             assert_eq!(
                 metrics.validated_payload_bytes,
-                (first.ser_len() + second.ser_len()) as u64
+                (simple_trx_log(TrxID::new(1)).ser_len() + simple_trx_log(TrxID::new(2)).ser_len())
+                    as u64
             );
+        });
+    }
+
+    #[test]
+    fn both_adapters_reject_a_whole_group_and_remain_terminal() {
+        smol::block_on(async {
+            let first = simple_trx_log(TrxID::new(1));
+            let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, first).unwrap();
+            assert!(
+                group
+                    .append_trx_log(simple_trx_log(TrxID::new(2)))
+                    .is_none()
+            );
+            let mut blocks = group
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                        .collect()
+                })
+                .unwrap();
+            assert_stream_group_parity(&blocks, None).await;
+            // The first transaction is valid; every mutation corrupts the second.
+            let body = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+            let second = body + simple_trx_log(TrxID::new(1)).ser_len();
+            let original = blocks[0].as_bytes().to_vec();
+            for (offset, bytes) in [
+                (0, u64::MAX.to_le_bytes().to_vec()),
+                (8, 3u64.to_le_bytes().to_vec()), // CTS outside the group bounds.
+                (16, vec![255]),                  // Unknown transaction kind.
+                (18, u64::MAX.to_le_bytes().to_vec()), // Impossible table count.
+            ] {
+                blocks[0].as_bytes_mut().copy_from_slice(&original);
+                blocks[0].as_bytes_mut()[second + offset..second + offset + bytes.len()]
+                    .copy_from_slice(&bytes);
+                patch_redo_block_checksum(blocks[0].as_bytes_mut());
+                assert_stream_group_parity(&blocks, Some(DataIntegrityError::InvalidPayload)).await;
+            }
+        });
+    }
+
+    #[test]
+    fn packed_adapter_keeps_values_crossing_physical_blocks() {
+        smol::block_on(async {
+            let bytes: Vec<u8> = (0..65535).map(|i| (i * 37) as u8).collect();
+            let mut redo = RedoLogs::default();
+            redo.insert_dml(
+                USER_TABLE_ID_START,
+                RowRedo {
+                    row_id: RowID::new(1),
+                    kind: RowRedoKind::Insert(PageID::new(10), vec![Val::from(bytes.as_slice())]),
+                },
+            );
+            let log = TrxLog::new(
+                RedoHeader {
+                    cts: TrxID::new(1),
+                    trx_kind: RedoTrxKind::System,
+                },
+                redo,
+            );
+            let blocks = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log)
+                .unwrap()
+                .finish_with(|count| {
+                    (0..count)
+                        .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
+                        .collect()
+                })
+                .unwrap();
+            assert!(blocks.len() > 1);
+            assert_stream_group_parity(&blocks, None).await;
+            let dir = tempfile::tempdir().unwrap();
+            let descriptor = write_stream_log_file(
+                &dir.path().join("large.log"),
+                STORAGE_SECTOR_SIZE,
+                blocks.len(),
+                &blocks,
+                TestSegmentSeal::Open,
+            );
+            let mut stream = RedoReplayPlanner::new(vec![descriptor])
+                .plan_recovery(TrxID::new(0), 2)
+                .unwrap()
+                .stream;
+            let group = stream.try_next().await.unwrap().unwrap();
+            let DecodedTrxKind::Dml(tables) = &group.transactions[0].kind else {
+                panic!()
+            };
+            let DecodedTable::User(rows) = &tables[&USER_TABLE_ID_START] else {
+                panic!()
+            };
+            let op = group.operation(rows.first_key_value().unwrap().1, TrxID::new(1));
+            let ReplayKind::Insert(row) = op.kind else {
+                panic!()
+            };
+            assert_eq!(row.value(0), ValRef::VarByte(&bytes));
+            assert!(stream.try_next().await.unwrap().is_none());
         });
     }
 }

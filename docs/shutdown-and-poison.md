@@ -153,6 +153,10 @@ Each subsystem documents its exact progress source and cleanup owner.
 | Service progress and lifecycle coordination | Follow their own progress policy; unrelated poison is not a stop signal | Their owner coordinates admission closure, drain, and worker stop |
 | Generic events, completions, latches, and gates | No built-in poison policy | No built-in shutdown policy |
 
+Recovery batch storage becomes reusable only after successful completion is
+collected. Failed or cancelled bootstrap still drains accepted page jobs before
+stopping their storage dependencies; see [Recovery](recovery.md#hot-page-replay-state).
+
 Clean shutdown interrupts only wait families that explicitly observe it.
 Maintenance observations check health before shutdown and retain an already
 visible Fatal report. Ordinary lock and row-prepare waits remain owned by their

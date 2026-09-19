@@ -1,3 +1,11 @@
+//! Owning redo payloads and their serializers/deserializers.
+//!
+//! The shared [transaction format contract](crate::log::block_group::TrxLog)
+//! specifies field order, tags, collections, and accepted encodings for every
+//! payload here and for packed recovery decoding. The enclosing
+//! [group contract](crate::log::block_group::LogBlockGroup) defines framing and
+//! group validation responsibilities.
+
 use crate::catalog::{CatalogSelectKey, IndexID, IndexSlot};
 use crate::error::DataIntegrityError;
 use crate::id::{PageID, RowID, TableID, TrxID};
@@ -109,12 +117,7 @@ impl Deser for RowRedoKind {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        ensure_deser_remaining(input, start_idx, mem::size_of::<u8>() * 2, "row redo kind")?;
-        let (idx, code) = input.deser_u8(start_idx)?;
-        let code = RowRedoCode::try_from(code).map_err(|_| {
-            Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("invalid row redo code {code}"))
-        })?;
+        let (idx, code) = read_row_redo_code(input, start_idx)?;
         match code {
             RowRedoCode::Insert => {
                 ensure_deser_remaining(
@@ -544,6 +547,9 @@ impl Ser<'_> for RedoLogs {
     }
 }
 
+/// Decode the nested payload from the
+/// [transaction format contract](crate::log::block_group::TrxLog).
+/// The enclosing frame decoder checks exact consumption.
 impl Deser for RedoLogs {
     const MIN_BYTES_HINT: MinBytesHint =
         min_bytes_hint(mem::size_of::<u8>() + mem::size_of::<u64>());
@@ -753,6 +759,21 @@ impl Deser for TableDML {
         let (idx, rows) = BTreeMap::<RowID, RowRedo>::deser(data, start_idx)?;
         Ok((idx, TableDML { rows }))
     }
+}
+
+/// Read a row operation tag after checking the minimum width of a row kind.
+#[inline]
+pub(crate) fn read_row_redo_code<S: Serde + ?Sized>(
+    input: &S,
+    start_idx: usize,
+) -> DeserResult<(usize, RowRedoCode)> {
+    ensure_deser_remaining(input, start_idx, mem::size_of::<u8>() * 2, "row redo kind")?;
+    let (idx, code) = input.deser_u8(start_idx)?;
+    let code = RowRedoCode::try_from(code).map_err(|_| {
+        Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!("invalid row redo code {code}"))
+    })?;
+    Ok((idx, code))
 }
 
 #[inline]

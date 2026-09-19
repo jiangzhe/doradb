@@ -3106,7 +3106,7 @@ mod tests {
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
-            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
+            let mut stream = planner.plan_catalog_scan(TrxID::new(0), 1).unwrap().stream;
             while let Some(log) = stream.try_next().await.unwrap() {
                 if let Some(ddl) = log.payload.ddl.as_deref()
                     && matches!(
@@ -3259,7 +3259,7 @@ mod tests {
             let file_prefix = file_prefix.to_str().unwrap();
             let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
-            let mut stream = planner.plan_recovery(TrxID::new(0), 1).unwrap().stream;
+            let mut stream = planner.plan_catalog_scan(TrxID::new(0), 1).unwrap().stream;
             let mut expected_start = RowID::new(0);
             let mut create_row_page_logs = 0usize;
             while let Some(log) = stream.try_next().await.unwrap() {

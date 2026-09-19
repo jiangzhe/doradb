@@ -7,8 +7,7 @@ use crate::error::{
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::IndexInsert;
-use crate::log::redo::RowRedoKind;
-use crate::recovery::{ReplayOp, RowReplayCounts, RowReplayState};
+use crate::recovery::{PackedPageBatch, ReplayKind, ReplayOp, RowReplayCounts, RowReplayState};
 use crate::row::ops::ReadRow;
 use crate::row::{RowPage, RowRead};
 use crate::stats::recovery_add_count;
@@ -23,7 +22,7 @@ impl Table {
         &self,
         guards: &PoolGuards,
         replay: &mut RowReplayState,
-        ops: &[ReplayOp],
+        ops: &PackedPageBatch,
         disable_dml_validation: bool,
     ) -> RuntimeOrFatalResult<RowReplayCounts> {
         let page_id = replay.page_id();
@@ -58,17 +57,17 @@ impl Table {
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         replay: &mut RowReplayState,
-        ops: &[ReplayOp],
+        ops: &PackedPageBatch,
         disable_dml_validation: bool,
         counts: &mut RowReplayCounts,
     ) -> RuntimeResult<()> {
         let page_id = replay.page_id();
-        for op in ops {
+        for op in ops.operations() {
             self.recover_row_op_to_page(
                 metadata,
                 page_guard,
                 replay,
-                op,
+                &op,
                 disable_dml_validation,
                 counts,
             )
@@ -76,7 +75,7 @@ impl Table {
             .attach_with(|| {
                 format!(
                     "operation=recover_row_batch, kind={:?}, table_id={}, page_id={page_id}, row_id={}, cts={}",
-                    op.row.kind.code(), self.table_id(), op.row.row_id, op.cts
+                    op.kind.code(), self.table_id(), op.row_id, op.cts
                 )
             })?;
         }
@@ -89,51 +88,34 @@ impl Table {
         metadata: &TableMetadata,
         page_guard: &mut PageExclusiveGuard<RowPage>,
         replay: &mut RowReplayState,
-        op: &ReplayOp,
+        op: &ReplayOp<'_>,
         disable_dml_validation: bool,
         counts: &mut RowReplayCounts,
     ) -> DataIntegrityResult<()> {
-        let row_id = op.row.row_id;
+        let row_id = op.row_id;
         let cts = op.cts;
-        match &op.row.kind {
-            RowRedoKind::Insert(_, cols) => {
+        match &op.kind {
+            ReplayKind::Insert(cols) => {
                 if !disable_dml_validation {
                     DmlValidator::new(metadata)
-                        .validate_full_row(cols.as_slice())
+                        .validate_full_row(cols)
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
-                self.recover_row_insert_to_page(
-                    metadata,
-                    page_guard,
-                    replay,
-                    row_id,
-                    cols.as_slice(),
-                    cts,
-                )?;
+                self.recover_row_insert_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
                 counts.inserts += 1;
             }
-            RowRedoKind::Update(_, cols) => {
+            ReplayKind::Update(cols) => {
                 if !disable_dml_validation {
                     DmlValidator::new(metadata)
-                        .validate_sparse_update(cols.as_slice())
+                        .validate_sparse_update(cols)
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
-                self.recover_row_update_to_page(
-                    metadata,
-                    page_guard,
-                    replay,
-                    row_id,
-                    cols.as_slice(),
-                    cts,
-                )?;
+                self.recover_row_update_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
                 counts.updates += 1;
             }
-            RowRedoKind::Delete(_) => {
+            ReplayKind::Delete => {
                 self.recover_row_delete_to_page(page_guard, replay, row_id, cts)?;
                 counts.deletes += 1;
-            }
-            RowRedoKind::DeleteByPrimaryKey(_) | RowRedoKind::UpdateByPrimaryKey(..) => {
-                unreachable!("catalog redo in hot-page batch")
             }
         }
         Ok(())
@@ -283,7 +265,8 @@ mod tests {
     use crate::id::TrxID;
     use crate::index::IndexInsert;
     use crate::log::redo::{RowRedo, RowRedoKind};
-    use crate::recovery::{ReplayOp, RowReplayState};
+    use crate::recovery::RowReplayState;
+    use crate::recovery::{OwnedReplayOp, pack_test_ops};
     use crate::row::ops::UpdateCol;
     use crate::row::tests::BufferValues;
     use crate::row::{RowPage, RowRead, RowValues, UpdateValues};
@@ -543,12 +526,12 @@ mod tests {
                     }],
                 ),
             ] {
-                let ops = [ReplayOp {
+                let ops = [OwnedReplayOp {
                     cts: TrxID::new(10),
                     row: RowRedo { row_id, kind },
                 }];
                 let err = table
-                    .recover_row_batch(&guards, &mut replay, &ops, false)
+                    .recover_row_batch(&guards, &mut replay, &pack_test_ops(ops), false)
                     .await
                     .unwrap_err();
                 let RuntimeOrFatalError::Runtime(err) = err else {
@@ -592,7 +575,7 @@ mod tests {
                 let ops: Vec<_> = kinds
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, kind)| ReplayOp {
+                    .map(|(idx, kind)| OwnedReplayOp {
                         cts: TrxID::new(20 + idx as u64),
                         row: RowRedo {
                             row_id: current_row,
@@ -601,7 +584,12 @@ mod tests {
                     })
                     .collect();
                 let counts = table
-                    .recover_row_batch(&guards, &mut replay, &ops, disable_validation)
+                    .recover_row_batch(
+                        &guards,
+                        &mut replay,
+                        &pack_test_ops(ops),
+                        disable_validation,
+                    )
                     .await
                     .unwrap();
                 assert_eq!(counts.inserts, 1);
@@ -822,6 +810,137 @@ mod tests {
             .unwrap();
             assert!(engine.inner().core.catalog().get_table(table_id).is_none());
             wait_path_exists(&table_file_path, false).await;
+        });
+    }
+
+    #[test]
+    fn packed_recovery_matches_owning_writes_for_every_page_value_type() {
+        use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
+        use crate::value::ValKind;
+        use ordered_float::OrderedFloat;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = evictable_test_engine(&temp, 64u64 * 1024 * 1024, "packed-types").await;
+            let mut session = engine.new_session().unwrap();
+            let values = vec![
+                Val::Null,
+                Val::I8(-127),
+                Val::U8(254),
+                Val::I16(-1234),
+                Val::U16(65534),
+                Val::I32(-123456),
+                Val::U32(0x87654321),
+                Val::F32(OrderedFloat(f32::from_bits(0xffc12345))),
+                Val::I64(i64::MIN),
+                Val::U64(u64::MAX),
+                Val::F64(OrderedFloat(-0.0)),
+                Val::from(""),
+                Val::from("short"),
+                Val::from("outlined bytes with a substantial payload"),
+            ];
+            let updates: Vec<_> = values
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| UpdateCol {
+                    idx,
+                    val: match value {
+                        Val::Null => Val::U32(99),
+                        Val::I8(v) => Val::I8(v.wrapping_add(1)),
+                        Val::U8(v) => Val::U8(v.wrapping_add(1)),
+                        Val::I16(v) => Val::I16(v.wrapping_add(1)),
+                        Val::U16(v) => Val::U16(v.wrapping_add(1)),
+                        Val::I32(v) => Val::I32(v.wrapping_add(1)),
+                        Val::U32(v) => Val::U32(v.wrapping_add(1)),
+                        Val::I64(v) => Val::I64(v.wrapping_add(1)),
+                        Val::U64(v) => Val::U64(v.wrapping_add(1)),
+                        Val::F32(_) => Val::F32(OrderedFloat(-0.0)),
+                        Val::F64(_) => Val::F64(OrderedFloat(f64::from_bits(0xfff8123456789abc))),
+                        Val::VarByte(v) if v.len() <= 6 => Val::from("updated outlined bytes"),
+                        Val::VarByte(_) => Val::Null,
+                    },
+                })
+                .collect();
+            let columns = values
+                .iter()
+                .map(|v| {
+                    StorageColumnSpec::new(
+                        v.kind().unwrap_or(ValKind::U32),
+                        StorageColumnFlags::NULLABLE,
+                    )
+                })
+                .collect();
+            let table_id = session
+                .create_table(StorageTableSpec::new(columns), vec![])
+                .await
+                .unwrap()
+                .table_id();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let guards = session.pool_guards();
+            let mut reference = table
+                .row_store
+                .get_insert_page_exclusive(&guards, 2)
+                .await
+                .unwrap();
+            let mut reference_state = replay_state(&reference);
+            let first = reference.page().header.start_row_id;
+            table
+                .recover_row_insert_to_page(
+                    &table.metadata(),
+                    &mut reference,
+                    &mut reference_state,
+                    first,
+                    values.as_slice(),
+                    TrxID::new(10),
+                )
+                .unwrap();
+            table
+                .recover_row_update_to_page(
+                    &table.metadata(),
+                    &mut reference,
+                    &reference_state,
+                    first,
+                    updates.as_slice(),
+                    TrxID::new(11),
+                )
+                .unwrap();
+            let page_id = reference.page_id();
+            let mut replay = replay_state(&reference);
+            drop(reference);
+            let batch = pack_test_ops([
+                OwnedReplayOp {
+                    cts: TrxID::new(10),
+                    row: RowRedo {
+                        row_id: first + 1,
+                        kind: RowRedoKind::Insert(page_id, values),
+                    },
+                },
+                OwnedReplayOp {
+                    cts: TrxID::new(11),
+                    row: RowRedo {
+                        row_id: first + 1,
+                        kind: RowRedoKind::Update(page_id, updates),
+                    },
+                },
+            ]);
+            table
+                .recover_row_batch(&guards, &mut replay, &batch, false)
+                .await
+                .unwrap();
+            drop(batch);
+            let page = table
+                .row_store
+                .must_get_row_page_exclusive(&guards, page_id)
+                .await
+                .unwrap();
+            let expected = page.page().row(0).clone_vals(&table.metadata().col);
+            let actual = page.page().row(1).clone_vals(&table.metadata().col);
+            for (a, b) in actual.iter().zip(&expected) {
+                match (a, b) {
+                    (Val::F32(a), Val::F32(b)) => assert_eq!(a.0.to_bits(), b.0.to_bits()),
+                    (Val::F64(a), Val::F64(b)) => assert_eq!(a.0.to_bits(), b.0.to_bits()),
+                    (a, b) => assert_eq!(a, b),
+                }
+            }
         });
     }
 }
