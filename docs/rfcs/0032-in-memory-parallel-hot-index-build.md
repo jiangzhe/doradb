@@ -4,6 +4,7 @@ title: In-Memory Parallel Hot-Index Build
 status: proposal
 tags: [storage, index, recovery, ddl, parallelism]
 created: 2026-09-19
+github_issue: 1084
 ---
 
 # RFC-0032: In-Memory Parallel Hot-Index Build
