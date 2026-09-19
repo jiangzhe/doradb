@@ -6,10 +6,10 @@ Investigate the allocation and reclamation bottleneck in parallel recovery, esta
 
 ## Reference
 
-- [Task 000309 allocator investigation](../tasks/000309-pipelined-recovery-with-parallel-page-replay.md#allocator-impact-2026-09-18): 10-million-row unindexed recovery measurements, Samply attribution, and coordinator-disposal diagnostic prototype.
-- [Benchmark allocator guidance](../benchmark-tool.md#allocator-impact): allocator identity, comparison controls, and profiling methodology.
-- [Backlog 000122](000122-allocation-deallocation-performance-hot-paths.md): related general storage hot-path allocation work. This follow-up is specific to recovery payload ownership and does not inherit that item's preference for a global allocator switch.
-- [Backlog 000110](000110-unify-hot-row-mem-scan-index-build-recovery.md): parallel hot-index construction; a separate recovery phase from the unindexed replay bottleneck here.
+- [Task 000309 allocator investigation](../../tasks/000309-pipelined-recovery-with-parallel-page-replay.md#allocator-impact-2026-09-18): 10-million-row unindexed recovery measurements, Samply attribution, and coordinator-disposal diagnostic prototype.
+- [Benchmark allocator guidance](../../benchmark-tool.md#allocator-impact): allocator identity, comparison controls, and profiling methodology.
+- [Backlog 000122](../000122-allocation-deallocation-performance-hot-paths.md): related general storage hot-path allocation work. This follow-up is specific to recovery payload ownership and does not inherit that item's preference for a global allocator switch.
+- [Backlog 000110](../000110-unify-hot-row-mem-scan-index-build-recovery.md): parallel hot-index construction; a separate recovery phase from the unindexed replay bottleneck here.
 - Relevant code: `doradb-storage/src/recovery/dispatch.rs` (`ReplayOp`, `BatchOutput`, `replay_page_batch`, completion collection), `doradb-storage/src/recovery/mod.rs` (decode/admission), and `doradb-storage/src/table/recover.rs` (row application and payload lifetimes).
 - User follow-up on 2026-09-18: investigate whether batched reclamation explains jemalloc's advantage more than multiple arenas or thread-local caching, compare other allocators, and prioritize recovery-owned batches with bulk recycling.
 
@@ -53,3 +53,11 @@ The baseline is commit `381921109c997c4ef108aafbab2080b3f86ea9c9`; pipeline meas
 
 The disposal-only prototype and allocator matrix are separate experiments; do not compare their medians as a controlled head-to-head ranking. No jemalloc Samply capture was collected in the original matrix. A recovery-local design should be evaluated independently of global allocator selection.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via task 000311: recovery-owned page batches and bounded recycling address the identified allocation/free ownership bottleneck, with matched glibc and jemalloc measurements, production-path correctness tests, and failure/lifetime validation. Default-allocator replay improved 43.6% in the controlled 10-million-row comparison; the refined jemalloc implementation measured near parity with owning replay. The user accepted closure because the cause was identified and addressed; additional allocator comparisons and deeper mechanism isolation are not a current priority and are not claimed as completed. The separate component-level redo-format follow-up remains in backlog 000203.
+- Closed By: backlog close
+- Reference: [Task 000311](../../tasks/000311-recovery-owned-page-batches-and-recycling.md); [redo-format follow-up 000203](../000203-redo-value-component-and-contiguous-payloads.md).
+
+- Closed At: 2026-09-19

@@ -7,7 +7,7 @@ Redesign the redo wire format so a value collection is a serialization/deseriali
 ## Reference
 
 - [Task 000311](../tasks/000311-recovery-owned-page-batches-and-recycling.md): packed group decoding, independent page batches, and measured admission costs.
-- [Backlog 000202](000202-recovery-payload-allocation-bottleneck-bulk-recycling.md): related allocator and ownership investigation; this follow-up addresses the wire format and value codec.
+- [Backlog 000202](closed/000202-recovery-payload-allocation-bottleneck-bulk-recycling.md): completed recovery ownership work; this follow-up addresses the wire format and value codec.
 - [Transaction/group format contract](../../doradb-storage/src/log/block_group.rs), [row redo codec](../../doradb-storage/src/log/redo.rs), [value codec](../../doradb-storage/src/value.rs), and [format version](../../doradb-storage/src/log/format.rs).
 - [Packed decoder](../../doradb-storage/src/recovery/decode.rs) and [page-batch append](../../doradb-storage/src/recovery/packed.rs).
 - User direction on 2026-09-19: treat values as a serialization/deserialization component, make individual value encoding contextual, and reject old redo versions instead of maintaining compatibility.
@@ -46,6 +46,8 @@ Illustrative layout; exact framing and widths remain design decisions:
 ```
 
 The task-000311 primary benchmark has one U64 and one VarByte per row, so it already performs one variable-payload copy per row. Multiple variable values are necessary to evaluate the proposed bulk-copy benefit. The new format still requires value interpretation and the group-to-batch and batch-to-page payload copies; it does not imply zero-copy replay.
+
+Task 000311's refined jemalloc profiles attributed about 0.213 coordinator CPU seconds to batch append, including only 0.011 seconds in payload memcpy. Descriptor iteration, writes, rebasing, and bookkeeping therefore belong in the format evaluation as well as contiguous payload copying.
 
 [Backlog 000130](000130-large-redo-transaction-streaming-replay.md) tracks large-transaction streaming separately. This format follow-up does not require shared group ownership or worker-side decoding.
 
