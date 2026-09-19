@@ -11,8 +11,8 @@ Analyze the background, codebase, scope, and possible solutions before creating 
 | Task | Bug fixes, small features, focused refactoring | `docs/tasks/<6digits>-<description>.md` | [Task](../tasks/000000-template.md) |
 | RFC | Architectural changes, new subsystems, complex implementations | `docs/rfcs/<4digits>-<description>.md` | [RFC](../rfcs/0000-template.md) |
 
-- **Tasks:** [$task-create](../../.codex/skills/task-create/SKILL.md) → [$issue-task](../../.codex/skills/issue-task/SKILL.md) → implement → [$task-resolve](../../.codex/skills/task-resolve/SKILL.md).
-- **RFCs:** [$rfc-create](../../.codex/skills/rfc-create/SKILL.md): draft (`draft`) → formalize (`proposal`/`accepted`) → [$issue-rfc](../../.codex/skills/issue-rfc/SKILL.md) → break into tasks → implement → [$rfc-resolve](../../.codex/skills/rfc-resolve/SKILL.md) (`implemented`/`superseded`).
+- **Tasks:** [$task-create](../../.agents/skills/task-create/SKILL.md) → [$issue-task](../../.agents/skills/issue-task/SKILL.md) → implement → [$task-resolve](../../.agents/skills/task-resolve/SKILL.md).
+- **RFCs:** [$rfc-create](../../.agents/skills/rfc-create/SKILL.md): draft (`draft`) → formalize (`proposal`/`accepted`) → [$issue-rfc](../../.agents/skills/issue-rfc/SKILL.md) → break into tasks → implement → [$rfc-resolve](../../.agents/skills/rfc-resolve/SKILL.md) (`implemented`/`superseded`).
 - **Branches:** Create a task branch, rebase it onto `main`, and push it upstream before implementation; keep implementation changes on that branch.
 - **Resolution:** Always check whether a task belongs to an RFC; if so, synchronize the RFC's `Implementation Phases` during `$task-resolve`.
 
