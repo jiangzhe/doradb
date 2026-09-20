@@ -1,0 +1,44 @@
+# Backlog: Test architecture, quality auditing, and reproducible model validation
+
+## Summary
+
+Design and implement the repository-wide follow-up to the unit-test quality audit: explicit test layers and a critical-invariant coverage map, a test-quality review/reporting workflow, and reproducible model and fault testing. Keep these three related improvements in one planning item. Task `000312` separately tracks stronger behavioral checks, fixture deduplication, and removal of benchmark-style unit tests.
+
+## Reference
+
+- User discussion on 2026-09-20: full unit-test audit at commit `43bfa11`, followed by the request to handle stronger behavioral checks and fixture deduplication now and record the remaining improvements as one backlog item.
+- Related task: `docs/tasks/000312-strengthen-storage-test-contracts-and-deduplicate-fixtures.md`. This backlog remains open after that bounded task is implemented.
+- `docs/process/coding-guidance.md`, testing section; `docs/process/unit-test.md`; `docs/process/dev-checklist.md`.
+- `.config/nextest.toml`, `.github/workflows/build.yml`, `tools/coverage_focus.rs`, and `tools/style_audit.rs`.
+- `doradb-storage/src/lock/state.rs`: lifecycle reference model; `doradb-storage/src/recovery/decode.rs`: differential decode and corruption checks; `doradb-storage/src/root.rs`: process-exit marker tests; `doradb-storage/src/session/managed_table_ops.rs`: seeded recovery model.
+- Related open [backlog 000112](000112-proptest-critical-storage-invariants.md) already owns the concrete proptest/generator follow-up. Coordinate or consolidate its scope during planning; do not implement a competing framework.
+- Closed [backlog 000027](closed/000027-coverage-focus-threshold-and-delta-gating.md) and [backlog 000028](closed/000028-coverage-focus-optional-branch-coverage-report.md) record prior decisions to keep coverage report-only and avoid requiring branch coverage.
+- [Backlog 000197](000197-investigate-benchmark-update-template-lifecycle-timeout.md) remains a separate unresolved benchmark flake investigation.
+
+## Deferred From (Optional)
+
+
+## Deferral Context (Optional)
+
+
+## Scope Hint
+
+1. Define component-contract, subsystem-protocol, and public-engine/recovery test responsibilities, fixture ownership, and appropriate runtime budgets. Build a maintained map for selected critical invariants such as rollback/index consistency, snapshot visibility, checkpoint publication/reachability, recovery, and cancellation/poison cleanup.
+2. Establish a review and reporting workflow for changed tests: state the invariant, distinct scenario, independent expected result, and deterministic state/schedule setup; report duplicate helper/procedure candidates, ineffective-check candidates, and source-aware coverage that separates test code. Preserve human review for semantic decisions and intentional overlap.
+3. Extend reproducible model and fault testing using existing good examples and the related proptest item: seed and operation-trace replay, useful failure minimization, and selected abrupt-exit/fault boundaries around commit and checkpoint. Evaluate selective mutation testing as evidence for assertion strength rather than adopting it as an unconditional whole-suite gate.
+4. Apply the task/RFC complexity gate when this item is planned. Preserve the current supported nextest/backend contract unless a later approved design explicitly changes it.
+
+## Acceptance Hint
+
+The agreed test-layer and fixture-ownership rules are documented and demonstrated by concrete tests; selected critical invariants map to named tests and explicit gaps; a repeatable audit/reporting workflow distinguishes production coverage from test execution and produces actionable review candidates; and selected model/fault tests can replay failing seeds and traces with a practical reduction strategy. Resolve overlap with backlog 000112 explicitly. Preserve prior coverage-policy decisions unless the user approves revisiting them. Evaluate success using distinct behaviors protected, assertion effectiveness, reproducibility, and fixture reuse rather than a target test-code ratio.
+
+## Notes (Optional)
+
+Audit context to preserve:
+
+- The default workspace run passed 2,120 tests and the alternate libaio storage run passed 1,971 tests. These are single-run baselines, not proof of flake absence.
+- `cargo warloc` reported 114,367 test-code lines (48.8% of repository Rust code), but a minimal reproducer showed test-only struct fields can cause following production code to be misclassified. Do not use this percentage as a deletion target or a trusted audit denominator.
+- Fresh storage-source LCOV was approximately 94.4% including test code and 89.6% after excluding syntax-identified test modules/helpers. The latter is an estimate; design a reliable source-aware report before using coverage for stronger decisions.
+- Existing policies already call for deduplication, table-driven cases, and semantic synchronization. The missing layer is consistent behavioral review and maintained invariant ownership, not merely additional prose.
+- Existing reference-model, independent-wire-byte, differential-decoder, and process-exit tests provide local patterns to build on. Other random tests use unrecorded randomness; many restart tests destroy the engine normally before reopening.
+- The initial task should establish concrete behavioral checks and remove confirmed fixture/procedure copies. This broader follow-up should reuse the resulting conventions and avoid a universal scenario DSL or an undifferentiated central test-support module.

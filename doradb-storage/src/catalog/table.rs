@@ -2706,6 +2706,28 @@ pub(crate) mod tests {
         PoisonBeforeCatalogCommit,
     }
 
+    struct CreateTableFailureGuard<'a> {
+        controller: &'a TableDdlTestController,
+        previous: Option<CreateTableTestFailure>,
+    }
+
+    impl<'a> CreateTableFailureGuard<'a> {
+        fn install(engine: &'a Engine, failure: CreateTableTestFailure) -> Self {
+            let controller = &engine.inner().table_ddl_test;
+            let previous = controller.create_failure.lock().replace(failure);
+            Self {
+                controller,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for CreateTableFailureGuard<'_> {
+        fn drop(&mut self) {
+            self.controller.set_create_failure(self.previous);
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum TableDdlTestPhase {
         CreateBeforeFirstEffect,
@@ -3055,6 +3077,51 @@ pub(crate) mod tests {
             engine.inner().poisoner.poison_error().is_some(),
             before.poisoned
         );
+    }
+
+    async fn assert_create_table_phase_failure(failure: CreateTableTestFailure, log_stem: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, log_stem).await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let table_id = engine.inner().core.catalog().curr_next_table_id();
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+        let (table_spec, index_specs) = drop_table_test_spec();
+
+        let err = {
+            let _failure = CreateTableFailureGuard::install(&engine, failure);
+            session
+                .create_table(table_spec, index_specs)
+                .await
+                .unwrap_err()
+        };
+        assert_eq!(
+            err.report().downcast_ref::<RuntimeError>().copied(),
+            Some(RuntimeError::CatalogAccess),
+            "failure={failure:?}, error={err:?}"
+        );
+        // Catalog staging also proves error handoff and DDL lock cleanup.
+        if failure == CreateTableTestFailure::AfterCatalogStaged {
+            let report = format!("{err:?}");
+            assert!(
+                report.contains("operation=create_table, phase=wait_mandatory_completion"),
+                "{report}"
+            );
+            assert!(!has_ddl_lock_resource(
+                &engine,
+                session_id,
+                LockResource::TableMetadata(table_id)
+            ));
+            assert!(!has_ddl_lock_resource(
+                &engine,
+                session_id,
+                LockResource::TableData(table_id)
+            ));
+        }
+        assert_no_user_table_publication(&engine, table_id);
+        assert!(engine.inner().poisoner.poison_error().is_none());
+        assert!(!session.in_trx().unwrap());
+        wait_path_exists(&table_file_path, false).await;
     }
 
     #[test]
@@ -3983,50 +4050,10 @@ pub(crate) mod tests {
 
     #[test]
     fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
-                "create_fail_catalog",
-            ))
-            .await
-            .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let table_id = engine.inner().core.catalog().curr_next_table_id();
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            let (table_spec, index_specs) = drop_table_test_spec();
-
-            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterCatalogStaged));
-            let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(&engine, None);
-
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::CatalogAccess)
-            );
-            let report = format!("{err:?}");
-            assert!(
-                report.contains("operation=create_table, phase=wait_mandatory_completion"),
-                "{report}"
-            );
-            assert_no_user_table_publication(&engine, table_id);
-            assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!has_ddl_lock_resource(
-                &engine,
-                session_id,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_ddl_lock_resource(
-                &engine,
-                session_id,
-                LockResource::TableData(table_id),
-            ));
-            assert!(!session.in_trx().unwrap());
-            wait_path_exists(&table_file_path, false).await;
-        });
+        smol::block_on(assert_create_table_phase_failure(
+            CreateTableTestFailure::AfterCatalogStaged,
+            "create_fail_catalog",
+        ));
     }
 
     #[test]
@@ -4074,66 +4101,18 @@ pub(crate) mod tests {
 
     #[test]
     fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes_file() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
-                "create_fail_after_file",
-            ))
-            .await
-            .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let table_id = engine.inner().core.catalog().curr_next_table_id();
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            let (table_spec, index_specs) = drop_table_test_spec();
-
-            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterFilePublished));
-            let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(&engine, None);
-
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::CatalogAccess)
-            );
-            assert_no_user_table_publication(&engine, table_id);
-            assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!session.in_trx().unwrap());
-            wait_path_exists(&table_file_path, false).await;
-        });
+        smol::block_on(assert_create_table_phase_failure(
+            CreateTableTestFailure::AfterFilePublished,
+            "create_fail_after_file",
+        ));
     }
 
     #[test]
     fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_file() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
-                "create_fail_runtime",
-            ))
-            .await
-            .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let table_id = engine.inner().core.catalog().curr_next_table_id();
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            let (table_spec, index_specs) = drop_table_test_spec();
-
-            set_create_table_failure(&engine, Some(CreateTableTestFailure::AfterRuntimeBuilt));
-            let res = session.create_table(table_spec, index_specs).await;
-            set_create_table_failure(&engine, None);
-
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::CatalogAccess)
-            );
-            assert_no_user_table_publication(&engine, table_id);
-            assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!session.in_trx().unwrap());
-            wait_path_exists(&table_file_path, false).await;
-        });
+        smol::block_on(assert_create_table_phase_failure(
+            CreateTableTestFailure::AfterRuntimeBuilt,
+            "create_fail_runtime",
+        ));
     }
 
     #[test]

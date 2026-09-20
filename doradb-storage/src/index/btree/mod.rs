@@ -1914,7 +1914,6 @@ mod tests {
     use std::sync::{Arc, Barrier, mpsc};
     use std::task::Poll;
     use std::thread;
-    use std::time::Instant;
 
     const WIDE_KEY_LEN: usize = 1000;
     const WIDE_HEIGHT2_ROWS: u64 = 2_500;
@@ -2020,39 +2019,93 @@ mod tests {
     }
 
     async fn run_lookup_against_map(hints_enabled: bool) {
-        let pool = owned_index_pool(64 * 1024 * 1024);
-        let pool_guard = (*pool).create_base_guard();
-        let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, TrxID::new(200))
-            .await
-            .expect("test btree construction should succeed");
-        let mut map = BTreeMap::new();
-
-        let between = Uniform::new(0u64, 10_000_000).unwrap();
-        let mut rng = ChaCha8Rng::seed_from_u64(0u64);
-        for i in 0..LOOKUP_ROWS {
-            let k = between.sample(&mut rng);
-            let res1 = tree
-                .insert(
-                    &pool_guard,
-                    &k.to_be_bytes(),
-                    BTreeU64::from(i as u64),
-                    false,
-                    TrxID::new(201),
-                )
+        const SEED: u64 = 0;
+        const KEY_LIMIT: u64 = 10_000_000;
+        let between = Uniform::new(0u64, KEY_LIMIT).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+        let sparse: Vec<u64> = (0..LOOKUP_ROWS).map(|_| between.sample(&mut rng)).collect();
+        let dense: Vec<u64> = (0..512).chain((0..512).rev()).collect();
+        for (case, keys) in [("sparse", sparse), ("dense", dense)] {
+            let pool = owned_index_pool(64 * 1024 * 1024);
+            let pool_guard = (*pool).create_base_guard();
+            let tree = BTree::new(pool.guard(), &pool_guard, hints_enabled, TrxID::new(200))
                 .await
                 .unwrap();
-            let res2 = map.entry(k).or_insert_with(|| i as u64);
-            assert_eq!(res1.is_ok(), *res2 == i as u64);
-        }
-
-        for _ in 0..LOOKUP_PROBES {
-            let k = between.sample(&mut rng);
-            let res1 = tree
-                .lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
-                .await
-                .unwrap();
-            let res2 = map.get(&k).copied().map(BTreeU64::from);
-            assert_eq!(res1, res2);
+            let mut map = BTreeMap::new();
+            for (i, k) in keys.into_iter().enumerate() {
+                let value = i as u64;
+                let expected = match map.get(&k) {
+                    Some(&retained) => BTreeInsert::DuplicateKey(BTreeU64::from(retained)),
+                    None => {
+                        map.insert(k, value);
+                        BTreeInsert::Ok(false)
+                    }
+                };
+                assert_eq!(
+                    tree.insert(
+                        &pool_guard,
+                        &k.to_be_bytes(),
+                        BTreeU64::from(value),
+                        false,
+                        TrxID::new(201)
+                    )
+                    .await
+                    .unwrap(),
+                    expected,
+                    "insert: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+            }
+            // Check every retained value; sparse random probes mostly miss.
+            for (&k, &value) in &map {
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await
+                        .unwrap(),
+                    Some(BTreeU64::from(value)),
+                    "retained: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+            }
+            for (&k, &value) in map.iter().step_by(7) {
+                assert_eq!(
+                    tree.insert(
+                        &pool_guard,
+                        &k.to_be_bytes(),
+                        BTreeU64::from(value + LOOKUP_ROWS as u64),
+                        false,
+                        TrxID::new(202)
+                    )
+                    .await
+                    .unwrap(),
+                    BTreeInsert::DuplicateKey(BTreeU64::from(value)),
+                    "duplicate: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await
+                        .unwrap(),
+                    Some(BTreeU64::from(value)),
+                    "after duplicate: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+            }
+            for k in [KEY_LIMIT, KEY_LIMIT + 1, u64::MAX - 1, u64::MAX] {
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await
+                        .unwrap(),
+                    None,
+                    "absent: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+            }
+            for _ in 0..LOOKUP_PROBES {
+                let k = between.sample(&mut rng);
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(&pool_guard, &k.to_be_bytes())
+                        .await
+                        .unwrap(),
+                    map.get(&k).copied().map(BTreeU64::from),
+                    "probe: case={case}, seed={SEED}, hints={hints_enabled}, key={k}"
+                );
+            }
         }
     }
 
@@ -2839,83 +2892,6 @@ mod tests {
             );
             replacement.destory(&guard).await.unwrap();
         });
-    }
-
-    #[test]
-    fn test_btree_with_stdmap() {
-        smol::block_on(async {
-            const ROWS: u64 = 10_000;
-            const MAX_VALUE: u64 = 100_000;
-            let pool = owned_index_pool(20 * 1024 * 1024);
-            let pool_guard = (*pool).create_base_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(1))
-                    .await
-                    .expect("test btree construction should succeed");
-
-                let start = Instant::now();
-                // insert with random distribution.
-                {
-                    let between = Uniform::new(0u64, MAX_VALUE).unwrap();
-                    let mut thd_rng = rand::rng();
-                    for i in 0..ROWS {
-                        let k = between.sample(&mut thd_rng);
-                        tree.insert(
-                            &pool_guard,
-                            &k.to_be_bytes(),
-                            BTreeU64::from(i),
-                            false,
-                            TrxID::new(100),
-                        )
-                        .await
-                        .unwrap();
-                    }
-                }
-                let dur = start.elapsed();
-
-                let qps = ROWS as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
-                let op_nanos = dur.as_nanos() as f64 / ROWS as f64;
-                println!(
-                    "btree rand insert: dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
-                    dur.as_millis(),
-                    ROWS,
-                    qps,
-                    op_nanos
-                );
-
-                let start = Instant::now();
-
-                // lookup with random distribution.
-                {
-                    let between = Uniform::new(0, MAX_VALUE).unwrap();
-                    let mut thd_rng = rand::rng();
-                    for i in 0..ROWS {
-                        let k = between.sample(&mut thd_rng);
-                        tree.insert(
-                            &pool_guard,
-                            &k.to_be_bytes(),
-                            BTreeU64::from(i),
-                            false,
-                            TrxID::new(100),
-                        )
-                        .await
-                        .unwrap();
-                    }
-                }
-
-                let dur = start.elapsed();
-
-                let qps = ROWS as f64 * 1_000_000_000f64 / dur.as_nanos() as f64;
-                let op_nanos = dur.as_nanos() as f64 / ROWS as f64;
-                println!(
-                    "btree rand lookup: dur={}ms, total_count={}, qps={:.2}, op={:.2}ns",
-                    dur.as_millis(),
-                    ROWS,
-                    qps,
-                    op_nanos
-                );
-            }
-        })
     }
 
     #[test]

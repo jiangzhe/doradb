@@ -1967,10 +1967,7 @@ pub(crate) mod tests {
         StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, TableMetadata, tests::table2,
     };
-    use crate::conf::{
-        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, MandatoryRuntimeConfig,
-        RecoveryConfig, TrxSysConfig,
-    };
+    use crate::conf::MandatoryRuntimeConfig;
     use crate::engine::Engine;
     use crate::error::LifecycleError;
     use crate::file::cow_file::tests::old_root_drop_count;
@@ -1984,24 +1981,21 @@ pub(crate) mod tests {
     };
     use crate::table::tests::{
         assert_freeze_created, expect_delete_committed, insert_one_row, insert_rows,
-        trx_update_row_by_id,
+        lightweight_test_engine, lightweight_test_engine_config, non_unique_disk_tree_prefix_scan,
+        table_for_internal_assertion, trx_update_row_by_id,
     };
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
     use smol::{Timer, future::race};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::path::PathBuf;
+
     use std::sync::Arc;
     use std::sync::mpsc::sync_channel;
     use std::task::Poll;
     use std::thread::spawn;
     use std::time::Duration;
     use tempfile::TempDir;
-
-    const LIGHTWEIGHT_TEST_BUFFER_BYTES: usize = 16 * 1024 * 1024;
-    const LIGHTWEIGHT_TEST_MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
-    const LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(super) enum CreateIndexTestFailure {
@@ -2279,58 +2273,6 @@ pub(crate) mod tests {
         ActiveRoot::new(root_ts, 128, Arc::new(metadata))
     }
 
-    async fn lightweight_test_engine(temp_dir: &TempDir, log_file_stem: &str) -> Engine {
-        Engine::bootstrap(lightweight_test_engine_config(
-            temp_dir.path().to_path_buf(),
-            log_file_stem,
-        ))
-        .await
-        .unwrap()
-    }
-
-    fn table_for_internal_assertion(engine: &Engine, table_id: TableID) -> Arc<Table> {
-        engine
-            .inner()
-            .core
-            .catalog()
-            .get_table(table_id)
-            .expect("test table should exist")
-    }
-
-    fn lightweight_test_engine_config(
-        main_dir: impl Into<PathBuf>,
-        log_file_stem: &str,
-    ) -> EngineConfig {
-        EngineConfig::default()
-            .storage_root(main_dir)
-            .meta_buffer(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-            .index_buffer(
-                EvictableBufferPoolConfig::default()
-                    .swap_file("index.swp")
-                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
-            )
-            .data_buffer(
-                EvictableBufferPoolConfig::default()
-                    .max_mem_size(LIGHTWEIGHT_TEST_BUFFER_BYTES)
-                    .max_file_size(LIGHTWEIGHT_TEST_MAX_FILE_BYTES),
-            )
-            .recovery(RecoveryConfig::default().io_depth(1))
-            .trx(
-                TrxSysConfig::default()
-                    .log_write_io_depth(1)
-                    .catalog_checkpoint_scan_io_depth(1)
-                    .log_file_stem(log_file_stem)
-                    .purge_threads(1),
-            )
-            .file(
-                FileSystemConfig::default()
-                    .io_depth(1)
-                    .readonly_buffer_size(LIGHTWEIGHT_TEST_READONLY_BUFFER_BYTES)
-                    .data_dir("."),
-            )
-    }
-
     async fn update_one_row(
         table_id: TableID,
         session: &mut Session,
@@ -2528,28 +2470,8 @@ pub(crate) mod tests {
         rows
     }
 
-    async fn non_unique_disk_tree_prefix_scan(
-        table: &Table,
-        guards: &PoolGuards,
-        key: &SelectKey,
-    ) -> Vec<RowID> {
-        let index_slot = key.index_slot;
-        let root = active_secondary_root(table, index_slot);
-        let layout = table.layout_snapshot();
-        let index = layout.secondary_index(index_slot).unwrap();
-        let range = index.key_encoder().encode_non_unique_equal_range(&key.vals);
-        let tree = index
-            .disk_runtime()
-            .open_non_unique_at(root, guards.disk_guard())
-            .unwrap();
-        let mut stream = tree.scan_candidate_stream(&range);
-        let mut rows = Vec::new();
-        while let Some(batch) = stream.next_batch().await.unwrap() {
-            rows.extend(batch.into_iter().map(|candidate| candidate.row_id));
-        }
-        rows
-    }
-
+    // DDL must retain slot identity, allocation state, and metadata identity;
+    // table checkpoint assertions instead include the column-block root.
     fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
         let after = table.file().active_root_unchecked();
         assert_eq!(after.slot_no, before.slot_no);

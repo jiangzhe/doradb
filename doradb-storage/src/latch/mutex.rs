@@ -206,12 +206,9 @@ impl<'a, T: fmt::Display + 'a> fmt::Display for MutexGuard<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::stream::{FuturesUnordered, StreamExt};
     use std::cell::UnsafeCell;
-    use std::env::var;
     use std::sync::Arc;
     use std::thread::spawn;
-    use std::time::Instant;
 
     struct Counter {
         data: UnsafeCell<usize>,
@@ -262,37 +259,6 @@ mod tests {
     }
     // SAFETY: shared references are synchronized by `RawMutex`.
     unsafe impl Sync for Counter {}
-
-    struct ParkingLotCounter {
-        data: UnsafeCell<usize>,
-        mu: ParkingLotRawMutex,
-    }
-
-    impl ParkingLotCounter {
-        #[inline]
-        fn new() -> Self {
-            ParkingLotCounter {
-                data: UnsafeCell::new(0),
-                mu: ParkingLotRawMutex::INIT,
-            }
-        }
-
-        #[inline]
-        fn inc(&self) -> usize {
-            // SAFETY: this helper holds the parking_lot raw mutex while it
-            // mutates and reads the counter.
-            unsafe {
-                self.mu.lock();
-                *self.data.get() += 1;
-                let v = *self.data.get();
-                self.mu.unlock();
-                v
-            }
-        }
-    }
-
-    // SAFETY: shared references are synchronized by `parking_lot::RawMutex`.
-    unsafe impl Sync for ParkingLotCounter {}
 
     #[test]
     fn test_mutex_ops() {
@@ -349,161 +315,5 @@ mod tests {
         }
         println!("val={:?}", counter.val());
         assert!(counter.val() == 100);
-    }
-
-    #[test]
-    fn test_raw_mutex_single_thread() {
-        const COUNT: usize = 1_000_000;
-        smol::block_on(async {
-            let counter = Counter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc();
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "sync inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
-        });
-
-        smol::block_on(async {
-            let counter = Counter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc_async().await;
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "async inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
-        });
-
-        smol::block_on(async {
-            let counter = ParkingLotCounter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc();
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "parkinglot inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
-        });
-
-        smol::block_on(async {})
-    }
-
-    #[test]
-    fn test_raw_mutex_multi_threads() {
-        const COUNT: usize = 500_000;
-
-        let threads = var("RAW_MUTEX_THREADS")
-            .map_err(|_| ())
-            .and_then(|s| s.parse::<usize>().map_err(|_| ()))
-            .unwrap_or(4usize);
-
-        let sys_threads = var("RAW_MUTEX_SYS_THREADS")
-            .map_err(|_| ())
-            .and_then(|s| s.parse::<usize>().map_err(|_| ()))
-            .unwrap_or(1usize);
-        assert!(threads.is_multiple_of(sys_threads));
-
-        // sync lock
-        let start = Instant::now();
-        let mut handles = Vec::with_capacity(threads);
-        let c1 = Arc::new(Counter::new());
-        for _ in 0..threads {
-            let c1 = Arc::clone(&c1);
-            let handle = spawn(move || {
-                smol::block_on(async {
-                    for _ in 0..COUNT {
-                        if c1.inc() >= COUNT {
-                            break;
-                        }
-                    }
-                })
-            });
-            handles.push(handle);
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let dur = start.elapsed();
-        println!(
-            "sync inc, threads={}, dur={:?}, tps={}",
-            threads,
-            dur,
-            COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
-        );
-
-        // async lock with lightweight tasks.
-        let tasks_per_thread = threads / sys_threads;
-        let start = Instant::now();
-        let mut handles = Vec::with_capacity(sys_threads);
-        for _ in 0..sys_threads {
-            let c2 = Arc::new(Counter::new());
-            let h = spawn(move || {
-                smol::block_on(async {
-                    let mut futs = FuturesUnordered::new();
-                    for _ in 0..tasks_per_thread {
-                        let c2 = Arc::clone(&c2);
-                        let task = smol::spawn(async move {
-                            for _ in 0..COUNT {
-                                if c2.inc_async().await >= COUNT {
-                                    break;
-                                }
-                            }
-                        });
-                        futs.push(task);
-                    }
-                    while futs.next().await.is_some() {}
-                })
-            });
-            handles.push(h);
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let dur = start.elapsed();
-        println!(
-            "async inc, sys_threads={}, threads={}, dur={:?}, tps={}",
-            sys_threads,
-            threads,
-            dur,
-            COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
-        );
-
-        let mut handles = Vec::with_capacity(threads);
-        let start = Instant::now();
-        let c3 = Arc::new(ParkingLotCounter::new());
-        for _ in 0..threads {
-            let c3 = Arc::clone(&c3);
-            let handle = spawn(move || {
-                smol::block_on(async {
-                    for _ in 0..COUNT {
-                        if c3.inc() >= COUNT {
-                            break;
-                        }
-                    }
-                })
-            });
-            handles.push(handle);
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-        let dur = start.elapsed();
-        println!(
-            "parking_lot inc, threads={}, dur={:?}, tps={}",
-            threads,
-            dur,
-            COUNT as f64 * 1_000_000_000f64 / dur.as_nanos() as f64
-        );
     }
 }

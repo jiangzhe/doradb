@@ -1315,15 +1315,13 @@ pub(crate) mod tests {
         DiscloseResultExt, Error, FatalError, OperationError, Result, RuntimeOrFatalResult,
         RuntimeResult,
     };
-    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
+    use crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE;
+    use crate::file::cow_file::tests::rewrite_page_with_checksum;
+
     use crate::file::table_file::ActiveRoot;
     use crate::file::{FileKind, SparseFile};
     use crate::id::{BlockID, PageID, RowID, SessionID, TableID, TrxID};
-    use crate::index::{
-        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex,
-        IndexBatchStream, IndexInsert, IndexMask, RowLocation,
-    };
+    use crate::index::{ColumnBlockIndex, IndexBatchStream, IndexInsert, IndexMask, RowLocation};
     use crate::io::{
         IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     };
@@ -1346,9 +1344,9 @@ pub(crate) mod tests {
     use crate::trx::{Transaction, TrxRuntime};
     use crate::value::{Val, ValKind};
     use smol::Timer;
-    use std::fs::OpenOptions;
+
     use std::future::Future;
-    use std::io::{Error as IoError, Read, Seek, SeekFrom, Write};
+    use std::io::Error as IoError;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -3222,7 +3220,8 @@ pub(crate) mod tests {
         panic!("path existence did not become {expected}: {path}");
     }
 
-    /// Asserts root metadata unchanged in tests.
+    /// Checks checkpoint root state, including the column-block root.
+    /// Catalog index DDL separately checks slot/allocation/metadata identity.
     pub(crate) fn assert_root_metadata_unchanged(before: &ActiveRoot, table: &Table) {
         let after = table.file().active_root_unchecked();
         assert_eq!(after.root_ts, before.root_ts);
@@ -3235,134 +3234,6 @@ pub(crate) mod tests {
             before.column_block_index_root
         );
         assert_eq!(after.secondary_index_slots, before.secondary_index_slots);
-    }
-
-    /// Corrupts page checksum for an integrity test.
-    pub(crate) fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&byte).unwrap();
-        file.flush().unwrap();
-    }
-
-    /// Rewrites page with checksum for an integrity test.
-    pub(crate) fn rewrite_page_with_checksum(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        rewrite: impl FnOnce(&mut [u8]),
-    ) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
-        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.read_exact(&mut page).unwrap();
-        rewrite(&mut page);
-        write_block_checksum(&mut page);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&page).unwrap();
-        file.flush().unwrap();
-    }
-
-    /// Corrupts leaf delete codec for an integrity test.
-    pub(crate) fn corrupt_leaf_delete_codec(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        prefix_idx: usize,
-    ) {
-        rewrite_page_with_checksum(path, page_id, |page| {
-            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
-            page[byte_offset] = 0xFF;
-        });
-    }
-
-    /// Corrupts leaf row codec for an integrity test.
-    pub(crate) fn corrupt_leaf_row_codec(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        prefix_idx: usize,
-    ) {
-        rewrite_page_with_checksum(path, page_id, |page| {
-            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 32;
-            page[byte_offset] = 0;
-        });
-    }
-
-    /// Corrupts leaf block id for an integrity test.
-    pub(crate) fn corrupt_leaf_block_id(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        prefix_idx: usize,
-    ) {
-        rewrite_page_with_checksum(path, page_id, |page| {
-            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
-            page[byte_offset..byte_offset + 8].copy_from_slice(&SUPER_BLOCK_ID.to_le_bytes());
-        });
-    }
-
-    /// Corrupts leaf short delete section header for an integrity test.
-    pub(crate) fn corrupt_leaf_short_delete_section_header(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        prefix_idx: usize,
-    ) {
-        const LEAF_ENTRY_ENTRY_LEN_OFFSET: usize = 28;
-        const LEAF_ENTRY_ROW_SECTION_LEN_OFFSET: usize = 30;
-        const LEAF_ENTRY_HEADER_SIZE: usize = 32;
-        const TRUNCATED_DELETE_SECTION_LEN: usize = 4;
-
-        rewrite_page_with_checksum(path, page_id, |page| {
-            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
-            let row_section_len = u16::from_le_bytes(
-                page[byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET
-                    ..byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET + 2]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let truncated_entry_len =
-                (LEAF_ENTRY_HEADER_SIZE + row_section_len + TRUNCATED_DELETE_SECTION_LEN) as u16;
-            page[byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET
-                ..byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET + 2]
-                .copy_from_slice(&truncated_entry_len.to_le_bytes());
-        });
-    }
-
-    /// Provides test-only access to `leaf_entry_payload_offset`.
-    pub(crate) fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
-        const SEARCH_TYPE_PLAIN: u8 = 1;
-        const SEARCH_TYPE_DELTA_U32: u8 = 2;
-        const SEARCH_TYPE_DELTA_U16: u8 = 3;
-
-        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-        let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
-        let (prefix_size, entry_offset_offset) = match search_type {
-            SEARCH_TYPE_PLAIN => (10usize, 8usize),
-            SEARCH_TYPE_DELTA_U32 => (6usize, 4usize),
-            SEARCH_TYPE_DELTA_U16 => (4usize, 2usize),
-            _ => panic!("invalid leaf search type {search_type}"),
-        };
-        let prefix_offset =
-            payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + prefix_idx * prefix_size;
-        let entry_offset = u16::from_le_bytes(
-            page[prefix_offset + entry_offset_offset..prefix_offset + entry_offset_offset + 2]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
     }
 
     /// Corrupts lwc row shape fingerprint for an integrity test.
