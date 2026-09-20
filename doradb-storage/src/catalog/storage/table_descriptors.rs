@@ -339,6 +339,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect descriptor decoding at payload boundaries.
+    /// Expected: Valid payloads preserve metadata and opaque bytes.
     #[test]
     fn descriptor_row_decode_accepts_payload_boundaries() {
         for len in [0, 63_999, MAX_TABLE_DESCRIPTOR_BYTES] {
@@ -348,10 +350,12 @@ mod tests {
             assert_eq!(descriptor.descriptor_revision, 3);
             assert_eq!(descriptor.compiled_storage_epoch, 4);
             assert_eq!(descriptor.storage_schema_fingerprint, [5; 32]);
-            assert_eq!(descriptor.payload.len(), len);
+            assert_eq!(&*descriptor.payload, vec![0xff; len]);
         }
     }
 
+    /// Purpose: Reject malformed durable descriptor envelopes.
+    /// Expected: Invalid field shape, ownership, types, and payload bounds fail decoding.
     #[test]
     fn descriptor_row_decode_rejects_each_malformed_field() {
         assert_invalid(&[]);
@@ -383,6 +387,9 @@ mod tests {
         assert_invalid(&descriptor_vals(vec![0; MAX_TABLE_DESCRIPTOR_BYTES + 1]));
     }
 
+    /// Purpose: Keep managed descriptors consistent with their storage metadata.
+    /// Expected: Matching stamps validate while identity, epoch, or schema mismatches are
+    /// rejected.
     #[test]
     fn descriptor_stamp_validation_rejects_each_mismatch() {
         let metadata = TableMetadata::try_new(

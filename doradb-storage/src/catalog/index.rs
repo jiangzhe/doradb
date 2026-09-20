@@ -2496,8 +2496,7 @@ pub(crate) mod tests {
         assert!(Arc::ptr_eq(&after.metadata, &before.metadata));
     }
 
-    #[test]
-    fn classify_create_index_root_proof_variants() {
+    fn active_index_ddl_root() -> ActiveRoot {
         let active_metadata = TableMetadata::try_new_with_index_slot_count(
             columns(),
             vec![
@@ -2516,7 +2515,15 @@ pub(crate) mod tests {
             IndexSlot::new(2),
         )
         .unwrap();
-        let active_root = root_with_metadata(active_metadata, TrxID::new(20));
+        root_with_metadata(active_metadata, TrxID::new(20))
+    }
+
+    /// Purpose: Distinguish durable and provisional index creation during recovery.
+    /// Expected: Root evidence separates completed creation, retained allocation, and work
+    /// beyond the durable boundary.
+    #[test]
+    fn classify_create_index_root_proof_variants() {
+        let active_root = active_index_ddl_root();
         assert_eq!(
             classify_index_ddl_root(
                 IndexDdlKind::Create,
@@ -2569,27 +2576,12 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Require durable index retirement before treating a replayed drop as complete.
+    /// Expected: An active index remains provisional while a covered retired slot proves
+    /// completion.
     #[test]
     fn classify_drop_index_requires_inactive_empty_slot() {
-        let active_metadata = TableMetadata::try_new_with_index_slot_count(
-            columns(),
-            vec![
-                ActiveIndexSpec::new(
-                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
-                    StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
-                ),
-                ActiveIndexSpec::new(
-                    IndexRef::new(IndexID::new(1), IndexSlot::new(1)),
-                    StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(1)],
-                        StorageIndexFlags::empty(),
-                    ),
-                ),
-            ],
-            IndexSlot::new(2),
-        )
-        .unwrap();
-        let active_root = root_with_metadata(active_metadata, TrxID::new(20));
+        let active_root = active_index_ddl_root();
         assert_eq!(
             classify_index_ddl_root(
                 IndexDdlKind::Drop,
@@ -2627,6 +2619,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Interpret the empty cold-root sentinel consistently.
+    /// Expected: Pivot metadata does not make an empty root contain rows.
     #[test]
     fn create_index_cold_root_shape_accepts_empty_root() {
         assert!(!create_index_cold_root_has_rows(
@@ -2639,12 +2633,16 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Require coherent row boundaries for nonempty cold roots.
+    /// Expected: A missing row boundary triggers the root-shape invariant.
     #[test]
     #[should_panic(expected = "non-empty cold root with pivot_row_id == 0")]
     fn create_index_cold_root_shape_panics_on_non_empty_root_without_pivot() {
         let _ = create_index_cold_root_has_rows(BlockID::new(99), RowID::new(0));
     }
 
+    /// Purpose: Accept a stable captured cold/hot boundary during index construction.
+    /// Expected: Matching runtime and captured boundaries satisfy the consistency invariant.
     #[test]
     fn create_index_block_index_snapshot_accepts_exact_match() {
         assert_create_index_block_index_snapshot(
@@ -2654,6 +2652,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Detect changes to a captured index construction boundary.
+    /// Expected: Boundary mismatches trigger the invariant and identify the conflicting
+    /// snapshots.
     #[test]
     fn create_index_block_index_snapshot_panics_with_boundary_diagnostic() {
         for runtime in [
@@ -2690,6 +2691,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Preserve the different ordering needs of cold and hot index construction.
+    /// Expected: Cold entries are sorted for durable construction while hot entry order is
+    /// preserved.
     #[test]
     fn create_index_key_validator_only_sorts_non_unique_cold_entries() {
         let row = |key: &[u8], row_id| CreateIndexRowEntry {
@@ -2708,6 +2712,8 @@ pub(crate) mod tests {
         assert_eq!(hot_rows[1].key.as_bytes(), b"hot-a");
     }
 
+    /// Purpose: Enforce uniqueness while preparing cold index entries.
+    /// Expected: Duplicate cold keys are rejected before index construction.
     #[test]
     fn create_index_key_validator_rejects_unique_cold_duplicate() {
         let row = |row_id| CreateIndexRowEntry {
@@ -2721,6 +2727,8 @@ pub(crate) mod tests {
         assert_eq!(*err.current_context(), OperationError::DuplicateKey);
     }
 
+    /// Purpose: Build a usable non-unique index over existing hot rows.
+    /// Expected: The published runtime finds existing matches and incorporates later inserts.
     #[test]
     fn test_create_index_builds_non_unique_hot_runtime() {
         smol::block_on(async {
@@ -2809,6 +2817,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep accepted index creation independent of its observer's lifetime.
+    /// Expected: Creation publishes a coherent, usable index even if the caller stops waiting.
     #[test]
     fn test_abandoned_create_index_future_after_acceptance_is_inert() {
         smol::block_on(async {
@@ -2868,6 +2878,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep accepted index removal independent of its observer's lifetime.
+    /// Expected: Removal completes coherently without poisoning the engine when the caller
+    /// stops waiting.
     #[test]
     fn test_abandoned_drop_index_future_after_acceptance_is_inert() {
         smol::block_on(async {
@@ -2919,6 +2932,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prevent accepted index DDL from starving transaction cleanup.
+    /// Expected: DDL and cleanup both finish despite constrained runner capacity.
     #[test]
     fn test_terminal_cleanup_progresses_during_accepted_index_ddl_on_one_runner() {
         smol::block_on(async {
@@ -3038,6 +3053,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Supervise accepted index DDL panics before any effects occur.
+    /// Expected: The panic poisons the engine and retains operation ownership for supervision.
     #[test]
     fn test_create_index_execution_panic_before_first_effect_is_supervised() {
         smol::block_on(async {
@@ -3082,6 +3099,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep index layout and history publication atomic with respect to purge.
+    /// Expected: Purge cannot observe a partially published metadata transition.
     #[test]
     fn test_index_layout_history_publication_excludes_metadata_purge() {
         smol::block_on(async {
@@ -3181,6 +3200,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Contain index construction failures before publication.
+    /// Expected: Failed builds reclaim unpublished resources and preserve current table state.
     #[test]
     fn test_create_index_build_failures_destroy_unpublished_runtime() {
         smol::block_on(async {
@@ -3191,6 +3212,27 @@ pub(crate) mod tests {
         });
     }
 
+    async fn updated_hot_row(table_id: TableID, session: &mut Session) -> RowID {
+        let row_id =
+            insert_one_row(table_id, session, vec![Val::from(1), Val::from("alpha")]).await;
+        assert_eq!(
+            update_one_row(
+                table_id,
+                session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await,
+            row_id
+        );
+        row_id
+    }
+
+    /// Purpose: Exclude obsolete hot keys from newly built non-unique indexes.
+    /// Expected: Only the current key resolves to the unchanged live row identity.
     #[test]
     fn test_create_non_unique_index_uses_only_current_hot_key() {
         smol::block_on(async {
@@ -3199,25 +3241,7 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
-            let row_id = insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(1), Val::from("alpha")],
-            )
-            .await;
-            assert_eq!(
-                update_one_row(
-                    table_id,
-                    &mut session,
-                    &single_key(1),
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("bravo"),
-                    }],
-                )
-                .await,
-                row_id
-            );
+            let row_id = updated_hot_row(table_id, &mut session).await;
             assert_eq!(
                 session
                     .create_index(
@@ -3257,6 +3281,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Respect cold-to-hot row replacement when building a non-unique index.
+    /// Expected: The current replacement is indexed and the obsolete cold key is excluded.
     #[test]
     fn test_create_non_unique_index_uses_current_cold_to_hot_replacement() {
         smol::block_on(async {
@@ -3356,6 +3382,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Exclude obsolete hot keys from newly built unique indexes.
+    /// Expected: Unique lookup resolves the current key to the unchanged live row identity.
     #[test]
     fn test_create_unique_index_uses_only_current_hot_key() {
         smol::block_on(async {
@@ -3365,25 +3393,7 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
-            let row_id = insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(1), Val::from("alpha")],
-            )
-            .await;
-            assert_eq!(
-                update_one_row(
-                    table_id,
-                    &mut session,
-                    &single_key(1),
-                    vec![UpdateCol {
-                        idx: 1,
-                        val: Val::from("bravo"),
-                    }],
-                )
-                .await,
-                row_id
-            );
+            let row_id = updated_hot_row(table_id, &mut session).await;
             assert_eq!(
                 session
                     .create_index(
@@ -3418,6 +3428,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Build a usable non-unique index over checkpointed rows.
+    /// Expected: Disk lookup finds exactly the matching persisted rows and excludes absent
+    /// keys.
     #[test]
     fn test_create_index_builds_non_unique_cold_disk_tree() {
         smol::block_on(async {
@@ -3426,7 +3439,16 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 10, 8, "cold").await;
+            let mut expected_rows = Vec::new();
+            let mut trx = session.begin_trx().unwrap();
+            for key in 10..18 {
+                expected_rows.push(
+                    trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("cold")])
+                        .await
+                        .unwrap(),
+                );
+            }
+            trx.commit().await.unwrap();
             assert_freeze_created(
                 session
                     .freeze_table(table.table_id(), usize::MAX)
@@ -3452,10 +3474,23 @@ pub(crate) mod tests {
                 non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key("cold"))
                     .await;
             rows.sort_unstable();
-            assert_eq!(rows.len(), 8);
+            expected_rows.sort_unstable();
+            assert_eq!(rows, expected_rows);
+            assert!(
+                non_unique_disk_tree_prefix_scan(
+                    &table,
+                    &session.pool_guards(),
+                    &name_key("missing"),
+                )
+                .await
+                .is_empty()
+            );
         });
     }
 
+    /// Purpose: Use a consistent cold/hot boundary throughout index construction.
+    /// Expected: Disk and memory entries partition the source rows without omissions or
+    /// duplication.
     #[test]
     fn test_create_index_uses_one_cold_hot_boundary() {
         smol::block_on(async {
@@ -3558,6 +3593,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect index DDL's predecessor root while earlier readers remain active.
+    /// Expected: The root is retained until the reader horizon permits reclamation.
     #[test]
     fn test_create_index_retains_old_root_until_purge_horizon() {
         smol::block_on(async {
@@ -3604,6 +3641,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject unique-index creation over duplicate hot keys.
+    /// Expected: Duplicate detection leaves catalog, runtime, and durable table state
+    /// unchanged.
     #[test]
     fn test_create_unique_index_rejects_duplicate_hot_rows_without_publish() {
         smol::block_on(async {
@@ -3634,6 +3674,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce uniqueness across cold rows and the cold/hot boundary.
+    /// Expected: Cold/cold and cold/hot duplicates prevent publication without changing table
+    /// state.
     #[test]
     fn test_create_unique_index_rejects_cold_duplicates_without_publish() {
         smol::block_on(async {
@@ -3652,6 +3695,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject unsupported user-table primary keys through index DDL.
+    /// Expected: The invalid request is diagnosed without changing table state or index
+    /// allocation.
     #[test]
     fn test_create_index_rejects_primary_key_without_publish() {
         smol::block_on(async {
@@ -3685,6 +3731,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Exclude committed cold deletions from unique-index construction.
+    /// Expected: Deleted duplicates do not prevent creation or appear in unique lookup.
     #[test]
     fn test_create_unique_index_skips_committed_cold_delete_marker() {
         smol::block_on(async {
@@ -3727,6 +3775,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep index creation outside active user transactions.
+    /// Expected: Creation is rejected without changing table state or disrupting the existing
+    /// transaction.
     #[test]
     fn test_create_index_rejects_active_transaction() {
         smol::block_on(async {
@@ -3758,6 +3809,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover a published non-unique disk index.
+    /// Expected: The recovered index preserves its allocation and finds the persisted row.
     #[test]
     fn test_create_index_recovery_loads_published_index() {
         smol::block_on(async {
@@ -3826,6 +3879,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover reusable index slots from checkpointed retirement.
+    /// Expected: A retired slot can serve a fresh identity without growing the allocation.
     #[test]
     fn test_recovery_reconstructs_checkpoint_covered_slot_for_reuse() {
         smol::block_on(async {
@@ -3923,8 +3978,11 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Remove uniqueness restrictions when their indexes are dropped.
+    /// Expected: Previously rejected duplicates become admissible only after the relevant index
+    /// is removed.
     #[test]
-    fn test_drop_unique_and_primary_indexes_remove_uniqueness_enforcement() {
+    fn test_drop_unique_indexes_remove_uniqueness_enforcement() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "create_index_lightweight").await;
@@ -3947,30 +4005,36 @@ pub(crate) mod tests {
                     .unwrap(),
                 crate::IndexID::new(1)
             );
+            let secondary_duplicate = vec![Val::from(2), Val::from("same")];
+            let original_duplicate = vec![Val::from(1), Val::from("different")];
+            for values in [&secondary_duplicate, &original_duplicate] {
+                let mut trx = session.begin_trx().unwrap();
+                let error = trx
+                    .table_insert_mvcc(table_id, values.clone())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.report().downcast_ref::<OperationError>(),
+                    Some(&OperationError::DuplicateKey)
+                );
+                trx.rollback().await.unwrap();
+            }
             session
                 .drop_index(table_id, crate::IndexID::new(1))
                 .await
                 .unwrap();
-            insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(2), Val::from("same")],
-            )
-            .await;
+            insert_one_row(table_id, &mut session, secondary_duplicate).await;
 
             session
                 .drop_index(table_id, crate::IndexID::new(0))
                 .await
                 .unwrap();
-            insert_one_row(
-                table_id,
-                &mut session,
-                vec![Val::from(1), Val::from("different")],
-            )
-            .await;
+            insert_one_row(table_id, &mut session, original_duplicate).await;
         });
     }
 
+    /// Purpose: Reject index removal without valid transaction and index admission.
+    /// Expected: Invalid removal requests preserve catalog, runtime, and durable table state.
     #[test]
     fn test_drop_index_rejects_active_transaction_and_missing_slots() {
         smol::block_on(async {
@@ -4024,6 +4088,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Separate retired runtime ownership from retained logical metadata.
+    /// Expected: Pinned layouts delay runtime cleanup; logical metadata alone does not.
     #[test]
     fn test_drop_index_runtime_install_retires_removed_runtime_until_pinned_layout_drops() {
         smol::block_on(async {
@@ -4115,6 +4181,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep maintenance and DDL on the current runtime layout.
+    /// Expected: Current index changes proceed while retained predecessor metadata remains
+    /// unchanged.
     #[test]
     fn test_maintenance_and_ddl_use_current_layout_with_retained_predecessor_metadata() {
         smol::block_on(async {
@@ -4192,6 +4261,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require durable retirement and runtime cleanup before slot reuse.
+    /// Expected: Targeted cleanup enables reuse of the lowest eligible slot with a fresh
+    /// identity.
     #[test]
     fn test_checkpoint_and_scheduled_cleanup_gate_lowest_slot_reuse() {
         smol::block_on(async {
@@ -4290,6 +4362,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prevent runtime cleanup from bypassing durable index retirement.
+    /// Expected: A cleaned slot remains unavailable for reuse until catalog checkpointing
+    /// covers its retirement.
     #[test]
     fn test_runtime_cleanup_before_checkpoint_still_blocks_slot_reuse() {
         smol::block_on(async {

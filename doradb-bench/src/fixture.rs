@@ -1238,11 +1238,10 @@ mod tests {
         primary.placement
     }
 
-    /// Purpose: Track exact row placement through partial/full freezing, checkpointing, successful
-    /// inserts, and index creation.
-    /// Expected: Partial checkpoint placement becomes unknown; full checkpoint yields eight cold
-    /// rows, later inserts add three hot rows, and index creation consumes its eligibility while
-    /// recording ID 17.
+    /// Purpose: Keep row placement and index-creation eligibility consistent with fixture
+    /// transitions.
+    /// Expected: Checkpointing, successful inserts, and index creation update placement
+    /// knowledge and eligibility coherently.
     #[test]
     fn exact_placement_tracks_successes_full_checkpoint_and_hot_tail() {
         let mut state = loaded_runtime(8);
@@ -1305,9 +1304,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Bind CREATE INDEX against missing, empty, malformed, indexed, multi-table, or
-    /// inexact runtime fixtures.
-    /// Expected: Every invalid fixture and overflowing or mismatched placement count is rejected.
+    /// Purpose: Require a committed, unindexed fixture with exact placement for index creation.
+    /// Expected: Missing prerequisites, incompatible fixtures, and inconsistent placement are
+    /// rejected.
     #[test]
     fn create_runtime_requires_ordinary_committed_exact_fixture() {
         assert!(
@@ -1355,10 +1354,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Validate planned fixture requirements after creating a three-table unique-index
-    /// pool.
-    /// Expected: A minimum-three pool is accepted; an incompatible index shape and a committed-load
-    /// requirement are rejected.
+    /// Purpose: Match planned fixture capabilities to workload requirements.
+    /// Expected: Compatible table pools are accepted while unsupported index and load
+    /// requirements are rejected.
     #[test]
     fn plan_fixture_validates_shape_load_and_pool_capabilities() {
         let shape = PrimaryTableShape {
@@ -1394,10 +1392,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Build runtime bindings across an unsuccessful insert followed by a committed
-    /// successful insert.
-    /// Expected: No-row/no-fence state fails; committed binding preserves attempted range [0, 2),
-    /// fence 11, and the two original table IDs.
+    /// Purpose: Require committed row evidence before exposing a loaded runtime binding.
+    /// Expected: Valid bindings retain the attempted range, commit fence, and table identities.
     #[test]
     fn runtime_committed_binding_requires_rows_range_and_fence() {
         let shape = PrimaryTableShape {
@@ -1443,10 +1439,9 @@ mod tests {
         assert_eq!(&*ids, &[TableID::new(7), TableID::new(8)]);
     }
 
-    /// Purpose: Validate planned prefix freezing and checkpoint consumption after loading eight
-    /// rows.
-    /// Expected: Missing data, a prefix covering all rows, repeated freeze, and frozen binding
-    /// after checkpoint are rejected.
+    /// Purpose: Enforce planned prerequisites and consumption rules for freezing and
+    /// checkpointing.
+    /// Expected: Invalid freeze requests and reuse of consumed frozen state are rejected.
     #[test]
     fn plan_freeze_and_checkpoint_are_ordered_consuming_transitions() {
         let shape = PrimaryTableShape {
@@ -1494,9 +1489,9 @@ mod tests {
         assert!(state.validate(FixtureRequirement::FrozenPrimary).is_err());
     }
 
-    /// Purpose: Publish a runtime prefix-freeze summary and consume it with checkpointing.
-    /// Expected: The valid candidate retains eight rows, the frozen binding preserves the exact
-    /// summary, and a second checkpoint or frozen bind fails.
+    /// Purpose: Preserve runtime freeze metadata until checkpointing consumes it.
+    /// Expected: Frozen bindings retain the summary and become unavailable after checkpoint
+    /// completion.
     #[test]
     fn runtime_freeze_summary_is_bound_and_consumed_exactly_once() {
         let shape = PrimaryTableShape {

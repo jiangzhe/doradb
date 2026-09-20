@@ -67,10 +67,9 @@ mod tests {
     use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
 
-    /// Purpose: Accept explicit plan execution and reject missing required inputs or legacy
-    /// subcommands.
-    /// Expected: Long and short options preserve root and plan paths; missing plan or root without
-    /// an environment fallback, and cleanup/prepare/run subcommands fail parsing.
+    /// Purpose: Restrict benchmark execution to explicit plans with a storage root.
+    /// Expected: Supported options preserve paths while incomplete and legacy invocations are
+    /// rejected.
     #[test]
     fn plan_is_the_only_execution_surface() {
         Cli::command().debug_assert();
@@ -96,9 +95,9 @@ mod tests {
         assert!(Cli::try_parse_from(["doradb-bench", "--root", "root", "run"]).is_err());
     }
 
-    /// Purpose: Validate worker counts at equal, smaller, and excessive thread-to-session ratios.
-    /// Expected: One thread with one or two sessions is accepted; two threads with one session
-    /// returns the exact ratio error.
+    /// Purpose: Keep executor concurrency within the available public sessions.
+    /// Expected: Valid worker allocations are accepted and excess workers are rejected with a
+    /// clear diagnostic.
     #[test]
     fn worker_threads_must_not_exceed_sessions() {
         validate_workers(1, 1).unwrap();

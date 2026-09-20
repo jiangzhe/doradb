@@ -153,6 +153,9 @@ mod tests {
     use crate::id::{RowID, TrxID};
     use std::array;
 
+    /// Purpose: Distinguish logical catalog changes from physical checkpoint work.
+    /// Expected: Unchanged cardinality does not hide edits, and reads alone do not imply table
+    /// changes.
     #[test]
     fn report_splits_changed_tables_from_table_io() {
         let roots = array::from_fn(|idx| {

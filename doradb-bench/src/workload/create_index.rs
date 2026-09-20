@@ -266,10 +266,9 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    /// Purpose: Measure index creation with mocked wall/CPU clocks and injected timing or CREATE
-    /// failures.
-    /// Expected: Success returns value 17, wall time 37 ns, and CPU time 23 ns; all failure cases
-    /// error, CREATE keeps precedence, and CPU-start failure prevents invocation.
+    /// Purpose: Isolate index-creation timing while preserving failure precedence.
+    /// Expected: Measurements exclude surrounding work, clock initialization gates execution,
+    /// and creation errors retain priority.
     #[test]
     fn create_clocks_exclude_setup_cleanup_and_verification_and_preserve_errors() {
         smol::block_on(async {
@@ -336,11 +335,10 @@ mod tests {
         });
     }
 
-    /// Purpose: Verify a newly created non-unique index after dropping an older index on the same
-    /// table.
-    /// Expected: The returned index ID differs from the old ID; wrong count/index/table fails
-    /// without publishing verification, while valid verification counts all three duplicate rows
-    /// and returns the correct fixture effect.
+    /// Purpose: Verify index creation using its returned identity and complete row
+    /// multiplicity.
+    /// Expected: Valid verification preserves duplicates while mismatched identity or counts
+    /// prevent publication and release participants.
     #[test]
     fn verification_uses_returned_stable_id_and_closes_failed_participants() {
         smol::block_on(async {

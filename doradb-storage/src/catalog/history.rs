@@ -875,6 +875,9 @@ mod tests {
         (entry, table, initial_cts, drop_cts, replay_floor)
     }
 
+    /// Purpose: Protect snapshot visibility across metadata changes, table removal, and purge.
+    /// Expected: Version and tombstone boundaries remain strict, and retained metadata survives
+    /// purge without pinning runtimes.
     #[test]
     fn metadata_history_resolves_strict_boundaries_and_tombstones() {
         smol::block_on(async {
@@ -1058,6 +1061,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Allow dropped runtime reclamation before tombstone history reclamation.
+    /// Expected: The snapshot horizon protects visibility while the replay floor survives until
+    /// explicit cleanup.
     #[test]
     fn dropped_runtime_can_become_floor_before_tombstone_history_purge() {
         smol::block_on(async {
@@ -1096,6 +1102,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Allow tombstone reclamation before dropped runtime reclamation.
+    /// Expected: Purging history preserves runtime cleanup obligations and the retained replay
+    /// floor.
     #[test]
     fn tombstone_history_can_purge_before_dropped_runtime_becomes_floor() {
         smol::block_on(async {
@@ -1127,6 +1136,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect metadata still visible to an active reader.
+    /// Expected: Purge retains the reader's predecessor until the visibility horizon advances.
     #[test]
     fn metadata_history_purge_retains_active_horizon_predecessor() {
         smol::block_on(async {
@@ -1179,6 +1190,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Rebuild current metadata independently of pre-crash history.
+    /// Expected: Recovery preserves retired slots without restoring historical versions or
+    /// retired runtimes.
     #[test]
     fn recovery_builds_one_zero_cts_current_baseline() {
         smol::block_on(async {

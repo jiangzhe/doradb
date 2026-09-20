@@ -2690,6 +2690,7 @@ pub(crate) mod tests {
     use crate::trx::purge::PurgeTestEvent;
     use crate::trx::tests as trx_tests;
     use crate::value::{Val, ValKind};
+    use std::future::Future;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -3124,6 +3125,9 @@ pub(crate) mod tests {
         wait_path_exists(&table_file_path, false).await;
     }
 
+    /// Purpose: Preserve table metadata through its durable representation.
+    /// Expected: Encoding consumes the advertised space and decoding restores the original
+    /// metadata.
     #[test]
     fn test_table_metadata_serde() {
         let metadata = TableMetadata::try_new(
@@ -3149,6 +3153,9 @@ pub(crate) mod tests {
         assert_eq!(metadata, brief.metadata);
     }
 
+    /// Purpose: Derive coherent allocation and primary-key metadata for dense indexes.
+    /// Expected: Allocated slots match active indexes and primary-key metadata identifies its
+    /// key column.
     #[test]
     fn test_table_metadata_dense_indexes_derive_index_slot_count() {
         let metadata = TableMetadata::try_new(
@@ -3173,6 +3180,9 @@ pub(crate) mod tests {
         assert_eq!(primary_key.spec().keys[0].column_id, ColumnID::new(0));
     }
 
+    /// Purpose: Protect stable identifier allocation at domain boundaries.
+    /// Expected: Allocation spans the valid domain and rejects exhaustion or invalid state
+    /// without wrapping.
     #[test]
     fn test_stable_id_allocators_cover_full_u32_domain() {
         let mut next_column_id = 0;
@@ -3205,6 +3215,9 @@ pub(crate) mod tests {
         assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
     }
 
+    /// Purpose: Validate allocator bounds and physical slot capacity in persisted metadata.
+    /// Expected: Invalid high-water marks are rejected and exhausted slot capacity cannot be
+    /// extended.
     #[test]
     fn test_canonical_metadata_rejects_allocator_and_slot_boundary_violations() {
         let column = TableColumnMetadata {
@@ -3257,6 +3270,8 @@ pub(crate) mod tests {
         assert_eq!(*err.current_context(), OperationError::InvalidMetadata);
     }
 
+    /// Purpose: Prevent storage epoch exhaustion from mutating metadata.
+    /// Expected: The exhausted epoch rejects index creation without installing an index.
     #[test]
     fn test_storage_epoch_overflow_fails_before_metadata_change() {
         let mut metadata = TableMetadata::try_new(
@@ -3278,6 +3293,9 @@ pub(crate) mod tests {
         assert_eq!(metadata.idx.active_index_count(), 0);
     }
 
+    /// Purpose: Stabilize fingerprints around the active storage schema.
+    /// Expected: Canonical fingerprints ignore allocation bookkeeping but distinguish index key
+    /// ordering.
     #[test]
     fn test_storage_schema_fingerprint_is_canonical() {
         let metadata = TableMetadata::try_new(
@@ -3336,6 +3354,9 @@ pub(crate) mod tests {
         assert_ne!(fingerprint, reordered.storage_schema_fingerprint());
     }
 
+    /// Purpose: Enforce primary-key shape independently of nullable secondary keys.
+    /// Expected: Primary-key mismatches are classified precisely while secondary-key
+    /// nullability remains respected.
     #[test]
     fn test_primary_key_spec_validates_select_key() {
         let metadata = TableMetadata::try_new(
@@ -3389,6 +3410,9 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Reuse immutable column layout across index-only schema changes.
+    /// Expected: Index creation and removal update index state without duplicating column
+    /// layout.
     #[test]
     fn test_table_metadata_index_only_changes_share_column_layout() {
         let metadata = TableMetadata::try_new(
@@ -3423,6 +3447,9 @@ pub(crate) mod tests {
         assert_eq!(dropped.idx.active_index_count(), 0);
     }
 
+    /// Purpose: Preserve physical slot identity across sparse index metadata.
+    /// Expected: Active index traversal and insert keys retain sparse slots without filling
+    /// allocation holes.
     #[test]
     fn test_table_metadata_sparse_active_indexes_preserve_index_slot() {
         let metadata = TableMetadata::try_new_with_index_slot_count(
@@ -3467,6 +3494,8 @@ pub(crate) mod tests {
         assert_eq!(keys[1].index_slot, IndexSlot::new(2));
     }
 
+    /// Purpose: Reject conflicting or out-of-range physical index slots.
+    /// Expected: Invalid slot assignments prevent metadata construction.
     #[test]
     fn test_table_metadata_rejects_invalid_index_slots() {
         let columns = vec![StorageColumnSpec::new(
@@ -3506,6 +3535,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Keep dense metadata from declaring conflicting primary keys.
+    /// Expected: Ambiguous primary-key definitions are rejected as invalid metadata.
     #[test]
     fn test_table_metadata_rejects_multiple_primary_keys() {
         let columns = vec![
@@ -3525,6 +3556,8 @@ pub(crate) mod tests {
         assert_invalid_metadata(err.disclose(), "multiple primary keys");
     }
 
+    /// Purpose: Keep sparse metadata from declaring conflicting primary keys.
+    /// Expected: Allocation holes do not permit ambiguous primary-key definitions.
     #[test]
     fn test_table_metadata_rejects_sparse_multiple_primary_keys() {
         let columns = vec![
@@ -3551,6 +3584,8 @@ pub(crate) mod tests {
         assert_invalid_metadata(err.disclose(), "multiple primary keys");
     }
 
+    /// Purpose: Require non-nullable columns in primary keys.
+    /// Expected: Nullable primary-key definitions are rejected with column context.
     #[test]
     fn test_table_metadata_rejects_nullable_primary_key_column() {
         let err = TableMetadata::try_new(
@@ -3571,6 +3606,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Classify invalid index definitions as request errors.
+    /// Expected: Empty keys and invalid column references are rejected with index context.
     #[test]
     fn test_table_metadata_rejects_invalid_index_specs_as_operation_errors() {
         let columns = vec![StorageColumnSpec::new(
@@ -3616,6 +3653,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Extend sparse index allocation without repurposing existing holes.
+    /// Expected: The new index occupies the next allocated slot and preserves earlier slot
+    /// identities.
     #[test]
     fn test_table_metadata_create_index_allocates_sparse_next_slot() {
         let metadata = TableMetadata::try_new_with_index_slot_count(
@@ -3663,6 +3703,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Validate new index definitions before extending metadata.
+    /// Expected: Empty keys and out-of-range columns prevent index creation.
     #[test]
     fn test_table_metadata_create_index_rejects_invalid_spec() {
         let metadata = TableMetadata::try_new(
@@ -3689,6 +3731,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Prevent index creation beyond physical slot capacity.
+    /// Expected: Exhausted slot allocation is rejected without wrapping.
     #[test]
     fn test_table_metadata_create_index_rejects_next_index_overflow() {
         let metadata = TableMetadata::try_new_with_index_slot_count(
@@ -3711,6 +3755,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Preserve allocation history when removing an active index.
+    /// Expected: Removal retains sparse capacity while updating active indexes and indexed
+    /// columns.
     #[test]
     fn test_table_metadata_drop_index_preserves_sparse_allocation() {
         let metadata = TableMetadata::try_new_with_index_slot_count(
@@ -3753,6 +3800,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Retain transaction-owned metadata protection across repeated reads.
+    /// Expected: Reads reuse metadata protection without acquiring table-data locks.
     #[test]
     fn test_first_read_acquires_metadata_lock_for_transaction_owner() {
         smol::block_on(async {
@@ -3803,6 +3852,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse transaction-owned locks across statements.
+    /// Expected: Writes share their metadata and data admission locks until transaction cleanup
+    /// releases them.
     #[test]
     fn test_statement_write_locks_are_transaction_owned_and_cached() {
         smol::block_on(async {
@@ -3843,6 +3895,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep concurrent table creation identities and publications independent.
+    /// Expected: Each creation receives a distinct identity with complete catalog, runtime, and
+    /// file publication.
     #[test]
     fn test_concurrent_create_table_publishes_distinct_tables() {
         smol::block_on(async {
@@ -3911,6 +3966,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve requested index definitions in table creation outcomes.
+    /// Expected: Outcomes retain input order and index identity, including tables without
+    /// indexes.
     #[test]
     fn test_create_table_outcome_returns_finalized_index_ids_in_input_order() {
         smol::block_on(async {
@@ -3949,12 +4007,22 @@ pub(crate) mod tests {
             assert_eq!(outcome.index_ids(), [IndexID::new(0), IndexID::new(1)]);
             let table = table_for_internal_assertion(&engine, outcome.table_id());
             let metadata = table.metadata();
+            let expected_specs = [(1, StorageIndexFlags::UK), (0, StorageIndexFlags::empty())];
             for (input_ordinal, index_id) in outcome.index_ids().iter().copied().enumerate() {
                 let index = metadata
                     .idx
                     .resolve_index_id(index_id)
                     .expect("outcome index id must resolve in installed metadata");
                 assert_eq!(index.slot().as_usize(), input_ordinal);
+                let spec = metadata.idx.index_spec(index.slot()).unwrap();
+                let (column, flags) = expected_specs[input_ordinal];
+                assert_eq!(spec.keys.len(), 1, "input index {input_ordinal}");
+                assert_eq!(
+                    spec.keys[0].column_ordinal,
+                    ColumnOrdinal::new(column),
+                    "input index {input_ordinal}"
+                );
+                assert_eq!(spec.flags, flags, "input index {input_ordinal}");
             }
 
             let (table_id, index_ids) = outcome.into_parts();
@@ -3963,91 +4031,137 @@ pub(crate) mod tests {
         });
     }
 
+    async fn assert_create_table_rejected(index_spec: StorageIndexSpec, diagnostic: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "create_invalid_metadata").await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let table_id = engine.inner().core.catalog().curr_next_table_id();
+        let path = engine.inner().table_fs.user_table_file_path(table_id);
+        let error = session
+            .create_table(
+                StorageTableSpec::new(vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )]),
+                vec![index_spec],
+            )
+            .await
+            .unwrap_err();
+        assert_invalid_metadata(error, diagnostic);
+        assert_eq!(engine.inner().core.catalog().curr_next_table_id(), table_id);
+        assert_no_user_table_publication(&engine, table_id);
+        for resource in [
+            LockResource::TableMetadata(table_id),
+            LockResource::TableData(table_id),
+        ] {
+            assert!(
+                !has_ddl_lock_resource(&engine, session_id, resource),
+                "{resource:?}"
+            );
+        }
+        assert!(engine.inner().poisoner.poison_error().is_none());
+        assert!(!session.in_trx().unwrap());
+        wait_path_exists(&path, false).await;
+    }
+
+    async fn assert_table_lock_cancellation(
+        engine: &Engine,
+        table_id: TableID,
+        owner: LockOwner,
+        lock: impl Future<Output = Result<(), Error>>,
+    ) {
+        let mut lock = Box::pin(lock);
+        assert!(matches!(
+            futures::poll!(lock.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            engine,
+            owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Granted,
+        ));
+        assert!(has_lock_entry(
+            engine,
+            owner,
+            LockResource::TableData(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+        drop(lock);
+        wait_for_no_lock_resource(engine, owner, LockResource::TableMetadata(table_id)).await;
+        wait_for_no_lock_resource(engine, owner, LockResource::TableData(table_id)).await;
+    }
+
+    fn assert_table_lock_not_found(
+        engine: &Engine,
+        table_id: TableID,
+        owner: LockOwner,
+        error: Error,
+    ) {
+        assert_eq!(
+            error.report().downcast_ref::<OperationError>(),
+            Some(&OperationError::TableNotFound),
+            "{error:?}",
+        );
+        for resource in [
+            LockResource::TableMetadata(table_id),
+            LockResource::TableData(table_id),
+        ] {
+            assert!(
+                !has_lock_resource(engine, owner, resource),
+                "owner={owner:?}, resource={resource:?}"
+            );
+        }
+    }
+
+    fn assert_ddl_metadata_lock(
+        engine: &Engine,
+        table_id: TableID,
+        session_id: SessionID,
+        state: LockDebugEntryState,
+    ) {
+        let owner = ddl_lock_owner(engine, session_id, LockResource::TableMetadata(table_id))
+            .expect("DROP must have requested its metadata lock");
+        assert!(
+            has_lock_entry(
+                engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+                state,
+            ),
+            "DROP metadata lock state: table_id={table_id}, state={state:?}"
+        );
+    }
+
+    /// Purpose: Reject invalid table definitions before resource acquisition.
+    /// Expected: Rejection leaves allocation, publication, lock ownership, and engine health
+    /// unchanged.
     #[test]
     fn test_create_table_rejects_invalid_metadata_before_file_creation() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
-                "create_invalid_metadata",
-            ))
-            .await
-            .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let table_id = engine.inner().core.catalog().curr_next_table_id();
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-
-            let err = session
-                .create_table(
-                    StorageTableSpec::new(vec![StorageColumnSpec::new(
-                        ValKind::I32,
-                        StorageColumnFlags::empty(),
-                    )]),
-                    vec![StorageIndexSpec::new(vec![], StorageIndexFlags::UK)],
-                )
-                .await
-                .unwrap_err();
-
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::InvalidMetadata)
-            );
-            assert_no_user_table_publication(&engine, table_id);
-            assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!has_ddl_lock_resource(
-                &engine,
-                session_id,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_ddl_lock_resource(
-                &engine,
-                session_id,
-                LockResource::TableData(table_id),
-            ));
-            assert!(!session.in_trx().unwrap());
-            wait_path_exists(&table_file_path, false).await;
-        });
+        smol::block_on(assert_create_table_rejected(
+            StorageIndexSpec::new(vec![], StorageIndexFlags::UK),
+            "has no key columns",
+        ));
     }
 
+    /// Purpose: Reject unsupported user-table primary keys before resource acquisition.
+    /// Expected: Rejection explains the unsupported definition and leaves no allocation or
+    /// publication effects.
     #[test]
     fn test_create_table_rejects_primary_key_before_file_creation() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_test_engine_config(
-                main_dir,
-                "create_pk_rejected",
-            ))
-            .await
-            .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let table_id = engine.inner().core.catalog().curr_next_table_id();
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-
-            let err = session
-                .create_table(
-                    StorageTableSpec::new(vec![StorageColumnSpec::new(
-                        ValKind::I32,
-                        StorageColumnFlags::empty(),
-                    )]),
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::PK,
-                    )],
-                )
-                .await
-                .unwrap_err();
-
-            assert_invalid_metadata(err, "create_table does not support user-table primary keys");
-            assert_no_user_table_publication(&engine, table_id);
-            assert!(engine.inner().poisoner.poison_error().is_none());
-            assert!(!session.in_trx().unwrap());
-            wait_path_exists(&table_file_path, false).await;
-        });
+        smol::block_on(assert_create_table_rejected(
+            StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+            "create_table does not support user-table primary keys",
+        ));
     }
 
+    /// Purpose: Recover cleanly from table creation failure after catalog staging.
+    /// Expected: Rollback removes unpublished resources and releases DDL ownership while
+    /// preserving the failure context.
     #[test]
     fn test_create_table_catalog_staging_failure_rolls_back_and_deletes_file() {
         smol::block_on(assert_create_table_phase_failure(
@@ -4056,6 +4170,9 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Contain table-file publication failure during table creation.
+    /// Expected: The underlying I/O failure remains identifiable while rollback removes
+    /// unpublished resources.
     #[test]
     fn test_create_table_file_publish_failure_rolls_back_catalog_and_deletes_file() {
         smol::block_on(async {
@@ -4099,6 +4216,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover from table creation failure after file publication.
+    /// Expected: Rollback removes the published file without exposing a table or poisoning the
+    /// engine.
     #[test]
     fn test_create_table_after_file_published_failure_rolls_back_catalog_and_deletes_file() {
         smol::block_on(assert_create_table_phase_failure(
@@ -4107,6 +4227,9 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Recover from table creation failure after runtime construction.
+    /// Expected: The built runtime remains unpublished and rollback removes its file without
+    /// poisoning the engine.
     #[test]
     fn test_create_table_runtime_failure_after_file_publish_rolls_back_and_deletes_file() {
         smol::block_on(assert_create_table_phase_failure(
@@ -4115,6 +4238,10 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Preserve recovery ownership when table creation fails fatally at catalog
+    /// commit.
+    /// Expected: The engine retains the fatal failure and leftover file until recovery removes
+    /// the unpublished table's file.
     #[test]
     fn test_create_table_catalog_commit_error_after_file_publish_poisons_and_keeps_file() {
         smol::block_on(async {
@@ -4169,6 +4296,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect transaction-level shared table access from external writers.
+    /// Expected: The writer waits for data admission until the shared-lock transaction releases
+    /// ownership.
     #[test]
     fn test_transaction_shared_table_lock_blocks_external_row_writer() {
         smol::block_on(async {
@@ -4226,6 +4356,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse transaction-level exclusive admission across repeated lock requests.
+    /// Expected: Weaker or repeated requests reuse held locks and commit releases the
+    /// transaction's ownership.
     #[test]
     fn test_transaction_exclusive_table_lock_uses_cache_and_releases_on_commit() {
         smol::block_on(async {
@@ -4267,6 +4400,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Respect session-level shared table admission within local transactions.
+    /// Expected: Reads remain permitted while conflicting local writes fail without queuing an
+    /// incompatible lock.
     #[test]
     fn test_session_shared_table_lock_allows_reads_but_rejects_same_session_writes() {
         smol::block_on(async {
@@ -4320,6 +4456,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep session table-lock acquisition outside active transactions.
+    /// Expected: The conflicting session request is rejected without preventing transaction
+    /// cleanup.
     #[test]
     fn test_session_table_lock_rejects_active_transaction_before_acquisition() {
         smol::block_on(async {
@@ -4348,6 +4487,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Clean up cancelled session lock acquisition while data admission waits.
+    /// Expected: Cancellation releases fresh metadata ownership and removes the pending data
+    /// request.
     #[test]
     fn test_session_table_lock_cancellation_releases_fresh_metadata() {
         smol::block_on(async {
@@ -4367,39 +4509,20 @@ pub(crate) mod tests {
 
             let mut session = engine.new_session().unwrap();
             let session_owner = LockOwner::session_explicit(session.id());
-            let mut lock_fut = Box::pin(session.lock_table(table_id, TableLockMode::Shared));
-            assert!(matches!(
-                futures::poll!(lock_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert!(has_lock_entry(
+            assert_table_lock_cancellation(
                 &engine,
+                table_id,
                 session_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-                LockDebugEntryState::Granted,
-            ));
-            assert!(has_lock_entry(
-                &engine,
-                session_owner,
-                LockResource::TableData(table_id),
-                LockMode::Shared,
-                LockDebugEntryState::Waiting,
-            ));
-
-            drop(lock_fut);
-            wait_for_no_lock_resource(
-                &engine,
-                session_owner,
-                LockResource::TableMetadata(table_id),
+                session.lock_table(table_id, TableLockMode::Shared),
             )
             .await;
-            wait_for_no_lock_resource(&engine, session_owner, LockResource::TableData(table_id))
-                .await;
             blocker.close(engine.inner().core.lock_manager());
         });
     }
 
+    /// Purpose: Clean up transaction admission rejected by its session's shared lock.
+    /// Expected: Failed acquisition removes fresh transaction coverage while preserving session
+    /// ownership.
     #[test]
     fn test_transaction_table_lock_failure_releases_fresh_metadata() {
         smol::block_on(async {
@@ -4440,6 +4563,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Clean up cancelled transaction lock acquisition while data admission waits.
+    /// Expected: Cancellation removes pending requests, fresh ownership, and cached transaction
+    /// coverage.
     #[test]
     fn test_transaction_table_lock_cancellation_releases_fresh_metadata() {
         smol::block_on(async {
@@ -4460,30 +4586,13 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             let trx_owner = trx_tests::lock_owner(&trx).unwrap();
-            let mut lock_fut = Box::pin(trx.lock_table(table_id, TableLockMode::Shared));
-            assert!(matches!(
-                futures::poll!(lock_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert!(has_lock_entry(
+            assert_table_lock_cancellation(
                 &engine,
+                table_id,
                 trx_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Shared,
-                LockDebugEntryState::Granted,
-            ));
-            assert!(has_lock_entry(
-                &engine,
-                trx_owner,
-                LockResource::TableData(table_id),
-                LockMode::Shared,
-                LockDebugEntryState::Waiting,
-            ));
-
-            drop(lock_fut);
-            wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableMetadata(table_id))
-                .await;
-            wait_for_no_lock_resource(&engine, trx_owner, LockResource::TableData(table_id)).await;
+                trx.lock_table(table_id, TableLockMode::Shared),
+            )
+            .await;
             assert!(
                 !trx_tests::transaction_lock_covers(
                     &trx,
@@ -4497,6 +4606,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Extend session-level exclusive admission to local transaction writes.
+    /// Expected: Local writes proceed while external writers remain blocked until explicit
+    /// session unlock.
     #[test]
     fn test_session_exclusive_table_lock_covers_same_session_writer() {
         smol::block_on(async {
@@ -4580,6 +4692,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject repeated drop admission for an already-dropping table.
+    /// Expected: Rejection preserves the existing lifecycle and logical state without poisoning
+    /// the engine.
     #[test]
     fn test_drop_table_rejects_already_dropping_lifecycle_without_poison() {
         smol::block_on(async {
@@ -4607,6 +4722,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep table removal outside active user transactions.
+    /// Expected: The request is rejected without changing table state or disrupting transaction
+    /// cleanup.
     #[test]
     fn test_drop_table_rejects_active_transaction() {
         smol::block_on(async {
@@ -4629,6 +4747,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Restrict table removal to existing user tables.
+    /// Expected: Catalog and missing user identities are rejected without affecting a live user
+    /// table.
     #[test]
     fn test_drop_table_returns_not_found_for_missing_table() {
         smol::block_on(async {
@@ -4657,6 +4778,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Contain catalog integrity failure after table-drop admission.
+    /// Expected: The engine is poisoned with the integrity cause preserved and the table
+    /// remains closed to checkpoint work.
     #[test]
     fn test_drop_table_missing_catalog_row_returns_typed_integrity_and_poisons() {
         smol::block_on(async {
@@ -4706,6 +4830,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Supervise accepted table creation panics before resource effects.
+    /// Expected: The panic poisons the engine and retained operation ownership prevents
+    /// premature shutdown.
     #[test]
     fn test_create_table_execution_panic_before_first_effect_is_supervised() {
         smol::block_on(async {
@@ -4756,6 +4883,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Retain private transaction ownership after an accepted DDL panic.
+    /// Expected: The failed operation remains supervised with its active transaction attached.
     #[test]
     fn test_create_table_execution_panic_parks_active_private_transaction() {
         smol::block_on(async {
@@ -4792,6 +4921,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prevent table removal from conflicting with its session's explicit locks.
+    /// Expected: Rejection preserves table and lock state until explicit unlock permits
+    /// removal.
     #[test]
     fn test_drop_table_rejects_same_session_explicit_table_lock() {
         smol::block_on(async {
@@ -4852,6 +4984,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep checkpoint-delayed table removal from obstructing unrelated drops.
+    /// Expected: Another table can be removed while the original drop waits for checkpoint
+    /// completion.
     #[test]
     fn test_drop_waiting_on_checkpoint_does_not_block_other_table_drop() {
         smol::block_on(async {
@@ -4893,6 +5028,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep checkpoint-delayed table removal from obstructing table creation.
+    /// Expected: Another table can be fully published while the original drop waits for
+    /// checkpoint completion.
     #[test]
     fn test_drop_waiting_on_checkpoint_does_not_block_create_table() {
         smol::block_on(async {
@@ -4948,6 +5086,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Revalidate session table-lock admission after a concurrent drop.
+    /// Expected: The waiting request observes the table's absence and leaves no lock ownership
+    /// behind.
     #[test]
     fn test_drop_table_normally_grants_waiting_session_table_lock() {
         smol::block_on(async {
@@ -4965,19 +5106,13 @@ pub(crate) mod tests {
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            let drop_owner = ddl_lock_owner(
+            wait_for_table_terminal(&table, TableTerminal::Dropping).await;
+            assert_ddl_metadata_lock(
                 &engine,
+                table_id,
                 drop_session_id,
-                LockResource::TableMetadata(table_id),
-            )
-            .expect("drop DDL owner should hold metadata X");
-            assert!(has_lock_entry(
-                &engine,
-                drop_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
                 LockDebugEntryState::Granted,
-            ));
+            );
 
             let mut lock_session = engine.new_session().unwrap();
             let lock_owner = LockOwner::session_explicit(lock_session.id());
@@ -4999,24 +5134,13 @@ pub(crate) mod tests {
             drop(table);
             drop_fut.await.unwrap();
             let err = lock_fut.await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert!(!has_lock_resource(
-                &engine,
-                lock_owner,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_lock_resource(
-                &engine,
-                lock_owner,
-                LockResource::TableData(table_id),
-            ));
+            assert_table_lock_not_found(&engine, table_id, lock_owner, err);
             purge_blocker.rollback().await.unwrap();
         });
     }
 
+    /// Purpose: Keep accepted table creation independent of early observer cancellation.
+    /// Expected: Creation completes as a usable table without poisoning the engine.
     #[test]
     fn test_abandoned_create_future_before_first_effect_is_inert() {
         smol::block_on(async {
@@ -5051,6 +5175,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep accepted table removal independent of early observer cancellation.
+    /// Expected: Removal completes without poisoning the engine and later admission observes
+    /// the table's absence.
     #[test]
     fn test_abandoned_drop_future_before_first_effect_is_inert() {
         smol::block_on(async {
@@ -5085,11 +5212,29 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve prepared lock authority throughout accepted table DDL.
+    /// Expected: Creation and removal retain their required target and catalog locks without
+    /// pending ownership after staging.
     #[test]
     fn test_accepted_table_ddl_owns_exact_prepared_lock_sets() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
+            // Keep the oracle independent of the production target-list helpers.
+            let create_targets = [
+                TABLE_ID_TABLES,
+                TABLE_ID_COLUMNS,
+                TABLE_ID_INDEXES,
+                TABLE_ID_TABLE_DESCRIPTORS,
+            ];
+            let drop_targets = [
+                TABLE_ID_TABLES,
+                TABLE_ID_COLUMNS,
+                TABLE_ID_INDEXES,
+                TABLE_ID_TABLE_DESCRIPTORS,
+                TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
+                TABLE_ID_TABLE_BINDINGS,
+            ];
 
             let create_table_id = engine.inner().core.catalog().curr_next_table_id();
             let (create_entered, create_release) = engine
@@ -5112,10 +5257,7 @@ pub(crate) mod tests {
                 LockResource::TableMetadata(create_table_id),
             )
             .expect("accepted CREATE should retain its operation owner");
-            assert_eq!(
-                lock_entry_count(&engine, create_owner),
-                1 + 2 * create_table_catalog_write_targets().len()
-            );
+            assert_eq!(lock_entry_count(&engine, create_owner), 9);
             assert!(has_lock_entry(
                 &engine,
                 create_owner,
@@ -5123,7 +5265,7 @@ pub(crate) mod tests {
                 LockMode::Exclusive,
                 LockDebugEntryState::Granted,
             ));
-            for &catalog_table_id in create_table_catalog_write_targets() {
+            for catalog_table_id in create_targets {
                 assert!(has_lock_entry(
                     &engine,
                     create_owner,
@@ -5145,10 +5287,7 @@ pub(crate) mod tests {
                 .install_gate(TableDdlTestPhase::CreateCatalogStaged);
             create_release.send_async(()).await.unwrap();
             create_staged.recv_async().await.unwrap();
-            assert_eq!(
-                lock_entry_count(&engine, create_owner),
-                1 + 2 * create_table_catalog_write_targets().len()
-            );
+            assert_eq!(lock_entry_count(&engine, create_owner), 9);
             assert!(
                 debug_snapshot(engine.inner().lock_manager())
                     .entries
@@ -5196,7 +5335,7 @@ pub(crate) mod tests {
                 LockMode::Exclusive,
                 LockDebugEntryState::Granted,
             ));
-            for &catalog_table_id in drop_table_catalog_write_targets() {
+            for catalog_table_id in drop_targets {
                 assert!(has_lock_entry(
                     &engine,
                     drop_owner,
@@ -5234,6 +5373,10 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve accepted table removal after lifecycle closure despite observer
+    /// cancellation.
+    /// Expected: Drop admission stays closed while checkpoint work drains, then removal
+    /// completes without poisoning the engine.
     #[test]
     fn test_abandoned_drop_future_after_acceptance_is_inert() {
         smol::block_on(async {
@@ -5292,6 +5435,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Revalidate transaction table-lock admission after a concurrent drop.
+    /// Expected: The waiting transaction observes the table's absence and leaves no lock
+    /// ownership behind.
     #[test]
     fn test_drop_table_normally_grants_waiting_transaction_table_lock() {
         smol::block_on(async {
@@ -5307,19 +5453,13 @@ pub(crate) mod tests {
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
-            let drop_owner = ddl_lock_owner(
+            wait_for_table_terminal(&table, TableTerminal::Dropping).await;
+            assert_ddl_metadata_lock(
                 &engine,
+                table_id,
                 drop_session_id,
-                LockResource::TableMetadata(table_id),
-            )
-            .expect("drop DDL owner should hold metadata X");
-            assert!(has_lock_entry(
-                &engine,
-                drop_owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
                 LockDebugEntryState::Granted,
-            ));
+            );
 
             let mut lock_session = engine.new_session().unwrap();
             let mut trx = lock_session.begin_trx().unwrap();
@@ -5342,25 +5482,15 @@ pub(crate) mod tests {
             drop(table);
             drop_fut.await.unwrap();
             let err = lock_fut.await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert!(!has_lock_resource(
-                &engine,
-                lock_owner,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_lock_resource(
-                &engine,
-                lock_owner,
-                LockResource::TableData(table_id),
-            ));
+            assert_table_lock_not_found(&engine, table_id, lock_owner, err);
 
             trx.rollback().await.unwrap();
         });
     }
 
+    /// Purpose: Reject foreground access to a dropped table whose runtime is retained.
+    /// Expected: Locking and maintenance observe logical absence without retaining lock
+    /// resources.
     #[test]
     fn test_explicit_table_lock_after_drop_returns_not_found_without_locks() {
         smol::block_on(async {
@@ -5380,20 +5510,7 @@ pub(crate) mod tests {
                 .lock_table(table_id, TableLockMode::Shared)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert!(!has_lock_resource(
-                &engine,
-                session_owner,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_lock_resource(
-                &engine,
-                session_owner,
-                LockResource::TableData(table_id),
-            ));
+            assert_table_lock_not_found(&engine, table_id, session_owner, err);
 
             for err in [
                 lock_session
@@ -5402,20 +5519,7 @@ pub(crate) mod tests {
                     .unwrap_err(),
                 lock_session.checkpoint_table(table_id).await.unwrap_err(),
             ] {
-                assert_eq!(
-                    err.report().downcast_ref::<OperationError>().copied(),
-                    Some(OperationError::TableNotFound)
-                );
-                assert!(!has_lock_resource(
-                    &engine,
-                    session_owner,
-                    LockResource::TableMetadata(table_id),
-                ));
-                assert!(!has_lock_resource(
-                    &engine,
-                    session_owner,
-                    LockResource::TableData(table_id),
-                ));
+                assert_table_lock_not_found(&engine, table_id, session_owner, err);
             }
             assert_eq!(table.lifecycle.inspect_terminal(), TableTerminal::Dropped);
 
@@ -5426,20 +5530,7 @@ pub(crate) mod tests {
                 .lock_table(table_id, TableLockMode::Exclusive)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::TableNotFound)
-            );
-            assert!(!has_lock_resource(
-                &engine,
-                trx_owner,
-                LockResource::TableMetadata(table_id),
-            ));
-            assert!(!has_lock_resource(
-                &engine,
-                trx_owner,
-                LockResource::TableData(table_id),
-            ));
+            assert_table_lock_not_found(&engine, table_id, trx_owner, err);
             trx.rollback().await.unwrap();
             drop(table);
             horizon.rollback().await.unwrap();
@@ -5447,6 +5538,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Remove a table's logical catalog presence while deferring physical cleanup.
+    /// Expected: Related catalog rows disappear, unrelated tables remain intact, and stale
+    /// operations cannot regain access.
     #[test]
     fn test_drop_table_logical_cascade() {
         smol::block_on(async {
@@ -5585,6 +5679,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Separate dropped runtime reclamation from durable file cleanup.
+    /// Expected: Eligible purge retains recovery obligations until catalog checkpointing
+    /// permits final cleanup.
     #[test]
     fn test_drop_table_first_eligible_purge_destroys_runtime_without_restore() {
         smol::block_on(async {
@@ -5687,6 +5784,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve redo failure context when table removal fails after lifecycle closure.
+    /// Expected: The fatal I/O cause remains identifiable while logical state is preserved and
+    /// admission stays closed.
     #[test]
     fn test_drop_table_commit_poison_preserves_source_error() {
         smol::block_on(async {
@@ -5738,6 +5838,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Finish session cleanup before returning a fatal insert-commit failure.
+    /// Expected: Redo failure poisons the engine without leaving an active operation
+    /// registered.
     #[test]
     fn test_user_insert_commit_poison_rolls_back_session_before_return() {
         smol::block_on(async {
@@ -5775,6 +5878,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Respect transaction metadata protection after a scan stream is released.
+    /// Expected: Table removal waits for the reader transaction to release its metadata lock.
     #[test]
     fn test_drop_table_waits_for_active_metadata_reader() {
         smol::block_on(async {
@@ -5792,17 +5897,27 @@ pub(crate) mod tests {
             drop(reader_stream);
 
             let mut drop_session = engine.new_session().unwrap();
+            let drop_session_id = drop_session.id();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            assert_ddl_metadata_lock(
+                &engine,
+                table_id,
+                drop_session_id,
+                LockDebugEntryState::Waiting,
+            );
 
             assert_eq!(reader_trx.commit().await.unwrap(), TrxID::new(0));
             drop_fut.await.unwrap();
         });
     }
 
+    /// Purpose: Respect active writer admission during table removal.
+    /// Expected: Table removal waits for the writer transaction to commit and release its
+    /// locks.
     #[test]
     fn test_drop_table_waits_for_active_table_writer() {
         smol::block_on(async {
@@ -5817,17 +5932,27 @@ pub(crate) mod tests {
                 .unwrap();
 
             let mut drop_session = engine.new_session().unwrap();
+            let drop_session_id = drop_session.id();
             let mut drop_fut = Box::pin(drop_session.drop_table(table_id));
             assert!(matches!(
                 futures::poll!(drop_fut.as_mut()),
                 std::task::Poll::Pending
             ));
+            assert_ddl_metadata_lock(
+                &engine,
+                table_id,
+                drop_session_id,
+                LockDebugEntryState::Waiting,
+            );
 
             assert!(writer_trx.commit().await.unwrap() > TrxID::new(0));
             drop_fut.await.unwrap();
         });
     }
 
+    /// Purpose: Retain catalog checkpoint progress after logical table removal.
+    /// Expected: Checkpoint scanning covers creation and removal without requiring a live table
+    /// runtime.
     #[test]
     fn test_catalog_checkpoint_scan_allows_runtime_removed_drop_table() {
         smol::block_on(async {
@@ -5858,6 +5983,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Persist table absence through catalog checkpointing and restart.
+    /// Expected: The dropped table's file is reclaimed and recovery does not restore the table.
     #[test]
     fn test_drop_table_catalog_checkpoint_cleans_absent_leftover_file() {
         smol::block_on(async {

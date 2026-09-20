@@ -340,6 +340,9 @@ mod tests {
         vec![Val::from(7u64), Val::from(key), Val::from(TableID::new(42))]
     }
 
+    /// Purpose: Protect durable binding lookup and reverse-lookup structure.
+    /// Expected: The schema supports unique namespace-key bindings and non-unique table
+    /// ownership lookup.
     #[test]
     fn binding_schema_has_roleless_columns_and_both_indexes() {
         let definition = catalog_definition_of_table_bindings();
@@ -366,6 +369,8 @@ mod tests {
         assert_eq!(indexes[1].keys[0].column_ordinal.as_usize(), 2);
     }
 
+    /// Purpose: Preserve opaque binding keys at valid size boundaries.
+    /// Expected: Decoding and re-encoding retain key bytes and binding ownership.
     #[test]
     fn binding_row_decode_accepts_opaque_key_boundaries() {
         for key in [
@@ -384,6 +389,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject malformed durable binding rows.
+    /// Expected: Invalid row shape, field types, ownership, and key bounds fail decoding.
     #[test]
     fn binding_row_decode_rejects_malformed_values() {
         for values in [

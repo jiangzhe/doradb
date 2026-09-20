@@ -51,10 +51,8 @@ impl From<CallbackError<Infallible>> for BenchError {
 mod tests {
     use super::*;
 
-    /// Purpose: Convert an application callback error without replacing or reallocating its owned
-    /// message.
-    /// Expected: The Message variant retains both application marker text and its original
-    /// allocation address.
+    /// Purpose: Preserve ownership when converting application callback errors.
+    /// Expected: Conversion retains the original message and allocation.
     #[test]
     fn callback_user_error_preserves_owned_payload() {
         let message = String::from("application marker");
