@@ -310,7 +310,7 @@ mod tests {
     use crate::buffer::guard::PageOptimisticGuard;
     use crate::buffer::test_page_id;
     use crate::index::RowPageIndexNode;
-    use crate::quiescent::QuiescentBox;
+    use crate::quiescent::{QuiescentBox, test_with_before_drop_hook};
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
@@ -895,15 +895,19 @@ mod tests {
             };
             let (started_tx, started_rx) = mpsc::channel();
             let (dropped_tx, dropped_rx) = mpsc::channel();
+            let arena_identity = pool.arena.identity();
             let handle = thread::spawn(move || {
-                started_tx.send(()).unwrap();
-                drop(pool);
+                test_with_before_drop_hook(
+                    arena_identity,
+                    move || started_tx.send(()).unwrap(),
+                    || drop(pool),
+                );
                 dropped_tx.send(()).unwrap();
             });
 
             started_rx.recv().unwrap();
-            // This timeout is a negative assertion after the teardown thread
-            // starts; releasing the guard is the only progress predicate.
+            // The arena owner has reached its guard wait; releasing the page
+            // guard is the only progress predicate for this negative assertion.
             assert_eq!(
                 dropped_rx.recv_timeout(Duration::from_millis(50)),
                 Err(RecvTimeoutError::Timeout)

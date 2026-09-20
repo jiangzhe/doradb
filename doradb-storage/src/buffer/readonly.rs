@@ -1376,7 +1376,7 @@ pub(crate) mod tests {
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
-    use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use smol::Timer;
@@ -3153,7 +3153,7 @@ pub(crate) mod tests {
     }
 
     /// Purpose: Keep an accepted read alive during owner teardown.
-    /// Expected: The detached load publishes its mapping before the remaining ownership drains.
+    /// Expected: Owner teardown waits for the detached read to complete after caller guards drain.
     #[test]
     fn test_readonly_pool_detached_miss_load_survives_pool_drop() {
         smol::block_on(async {
@@ -3178,7 +3178,6 @@ pub(crate) mod tests {
                 &global,
             );
             let pool_guard = pool.create_base_guard();
-            let observe = global.guard();
 
             let pool_for_loader = (*pool).clone();
             let loader_guard = pool_guard.clone();
@@ -3189,35 +3188,46 @@ pub(crate) mod tests {
                     .unwrap();
             });
             read_hook.wait_started(1).await;
-            assert!(key_state_is_loading(&observe, &key));
+            // Observe completion without retaining a pool guard that could mask
+            // premature release of the detached read's ownership.
+            let inflight = {
+                let entry = global.inflights.get(&key).unwrap();
+                let InflightBlockState::Loading { inflight, .. } = entry.value() else {
+                    panic!("accepted read must remain inflight");
+                };
+                Arc::clone(inflight)
+            };
+            assert!(inflight.completed_result().is_none());
             assert!(loader.cancel().await.is_none());
             drop(pool_guard);
 
             let (started_tx, started_rx) = mpsc::channel();
             let (dropped_tx, dropped_rx) = mpsc::channel();
+            let global_identity = global.owner.as_ref().unwrap().owner_identity();
             let teardown = thread::spawn(move || {
                 drop(pool);
-                started_tx.send(()).unwrap();
-                drop(global);
+                test_with_before_drop_hook(
+                    global_identity,
+                    move || started_tx.send(()).unwrap(),
+                    || drop(global),
+                );
                 dropped_tx.send(()).unwrap();
             });
 
             started_rx.recv().unwrap();
+            // The global owner has reached its guard wait while the detached
+            // read remains blocked; only releasing the read permits teardown.
             assert_eq!(
                 dropped_rx.recv_timeout(Duration::from_millis(50)),
                 Err(RecvTimeoutError::Timeout)
             );
+            assert!(inflight.completed_result().is_none());
 
             read_hook.release();
-            wait_for(|| {
-                !observe.inflights.contains_key(&key) && observe.mappings.contains_key(&key)
-            })
-            .await;
-            assert!(observe.mappings.contains_key(&key));
-            drop(observe);
+            inflight.wait_result().await.unwrap();
+            dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             teardown.join().unwrap();
             assert_eq!(read_hook.call_count(), 1);
-            dropped_rx.recv().unwrap();
             drop(table_file);
             drop(fs);
         });
