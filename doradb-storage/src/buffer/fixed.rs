@@ -311,8 +311,7 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::index::RowPageIndexNode;
     use crate::quiescent::QuiescentBox;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
 
@@ -328,6 +327,54 @@ mod tests {
         let page_id = g.page_id();
         drop(g);
         page_id
+    }
+
+    fn single_page_pool() -> QuiescentBox<FixedBufferPool> {
+        let pool_bytes = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
+        QuiescentBox::new(FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap())
+    }
+
+    async fn row_page_facade(
+        pool: &FixedBufferPool,
+        pool_guard: &PoolGuard,
+        page_id: PageID,
+    ) -> FacadePageGuard<RowPageIndexNode> {
+        pool.get_page::<RowPageIndexNode>(pool_guard, page_id, LatchFallbackMode::Spin)
+            .await
+            .expect("buffer-pool read failed in test")
+    }
+
+    async fn facade_before_slot_reuse(
+        pool: &FixedBufferPool,
+        pool_guard: &PoolGuard,
+        page_id: PageID,
+    ) -> FacadePageGuard<RowPageIndexNode> {
+        let page = row_page_facade(pool, pool_guard, page_id)
+            .await
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        let versioned = page.versioned_page_id();
+        drop(page);
+        let stale = pool
+            .get_page_versioned::<RowPageIndexNode>(
+                pool_guard,
+                versioned,
+                LatchFallbackMode::Shared,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let page = row_page_facade(pool, pool_guard, page_id)
+            .await
+            .lock_exclusive_async()
+            .await
+            .unwrap();
+        pool.deallocate_page(page);
+        let replacement = allocate_test_row_page(pool, pool_guard).await;
+        assert_eq!(replacement, page_id, "fixture must reuse the captured slot");
+        assert_ne!(pool.arena.frame(page_id).generation(), versioned.generation);
+        stale
     }
 
     fn bump_generation_for_stale_guard(pool: &FixedBufferPool, page_id: PageID) -> u64 {
@@ -364,13 +411,12 @@ mod tests {
         (g, page_id, held_version)
     }
 
+    /// Purpose: Preserve exhaustion details at the fixed-pool allocation boundary.
+    /// Expected: Allocation reports runtime context with the resource cause and pool diagnostics.
     #[test]
     fn test_fixed_buffer_pool_allocation_reports_runtime_context() {
         smol::block_on(async {
-            let pool_bytes = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
-            );
+            let pool = single_page_pool();
             let pool_guard = pool.create_base_guard();
             let page = pool
                 .allocate_page::<Page>(&pool_guard)
@@ -394,13 +440,12 @@ mod tests {
         });
     }
 
+    /// Purpose: Report duplicate explicit allocation at the fixed-pool boundary.
+    /// Expected: The runtime report retains the duplicate-allocation cause and target-page context.
     #[test]
     fn test_fixed_buffer_pool_allocate_at_reports_runtime_context() {
         smol::block_on(async {
-            let pool_bytes = mem::size_of::<BufferFrame>() + mem::size_of::<Page>();
-            let pool = QuiescentBox::new(
-                FixedBufferPool::with_capacity(PoolRole::Meta, pool_bytes).unwrap(),
-            );
+            let pool = single_page_pool();
             let pool_guard = pool.create_base_guard();
             let page_id = test_page_id(0);
             let page = pool
@@ -424,6 +469,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect fixed-pool allocation, coupled access, and slot reuse.
+    /// Expected: Live pages remain accessible while retired identities and stale guards are rejected.
     #[test]
     fn test_fixed_buffer_pool() {
         smol::block_on(async {
@@ -488,7 +535,8 @@ mod tests {
                         LatchFallbackMode::Shared,
                     )
                     .await;
-                let c = c.unwrap();
+                let c = c.unwrap().unwrap();
+                assert_eq!(c.page_id(), page_id);
                 drop(c);
             }
             {
@@ -573,6 +621,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Classify fixed-pool reads as resident cache accesses.
+    /// Expected: A resident read records a hit without a miss or storage read.
     #[test]
     fn test_fixed_buffer_pool_stats_track_resident_hits_only() {
         smol::block_on(async {
@@ -601,22 +651,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shared facade conversions across valid access and slot reuse.
+    /// Expected: Shared access preserves identity, requires the proper latch state, and rejects stale generations.
     #[test]
     fn test_facade_page_guard_lock_shared_and_try_into_shared() {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::create_base_guard(&pool);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = g.page_id();
-            drop(g);
+            let page_id = allocate_test_row_page(&pool, &pool_guard).await;
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test");
+            let g = row_page_facade(&pool, &pool_guard, page_id).await;
             let g = g.lock_shared_async().await;
             assert!(g.is_some());
             let g = g.unwrap();
@@ -629,67 +673,25 @@ mod tests {
             assert_eq!(g.page_id(), page_id);
             drop(g);
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test");
+            let g = row_page_facade(&pool, &pool_guard, page_id).await;
             assert!(g.try_into_shared().is_none());
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test")
-                .lock_exclusive_async()
-                .await
-                .unwrap();
-            let versioned = g.versioned_page_id();
-            drop(g);
-
-            let stale_guard = pool
-                .get_page_versioned::<RowPageIndexNode>(
-                    &pool_guard,
-                    versioned,
-                    LatchFallbackMode::Shared,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test")
-                .lock_exclusive_async()
-                .await
-                .unwrap();
-            pool.deallocate_page(g);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            assert_eq!(g.page_id(), page_id);
-            drop(g);
+            let stale_guard = facade_before_slot_reuse(&pool, &pool_guard, page_id).await;
 
             assert!(stale_guard.lock_shared_async().await.is_none());
         })
     }
 
+    /// Purpose: Protect exclusive facade conversions across valid access and slot reuse.
+    /// Expected: Exclusive access preserves identity, requires the proper latch state, and rejects stale generations.
     #[test]
     fn test_facade_page_guard_lock_exclusive_and_try_into_exclusive() {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::create_base_guard(&pool);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = g.page_id();
-            drop(g);
+            let page_id = allocate_test_row_page(&pool, &pool_guard).await;
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test");
+            let g = row_page_facade(&pool, &pool_guard, page_id).await;
             let g = g.lock_exclusive_async().await;
             assert!(g.is_some());
             let g = g.unwrap();
@@ -706,51 +708,17 @@ mod tests {
             assert!(g.is_some());
             drop(g);
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test");
+            let g = row_page_facade(&pool, &pool_guard, page_id).await;
             assert!(g.try_into_exclusive().is_none());
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test")
-                .lock_exclusive_async()
-                .await
-                .unwrap();
-            let versioned = g.versioned_page_id();
-            drop(g);
-
-            let stale_guard = pool
-                .get_page_versioned::<RowPageIndexNode>(
-                    &pool_guard,
-                    versioned,
-                    LatchFallbackMode::Shared,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
-                .await
-                .expect("buffer-pool read failed in test")
-                .lock_exclusive_async()
-                .await
-                .unwrap();
-            pool.deallocate_page(g);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            assert_eq!(g.page_id(), page_id);
-            drop(g);
+            let stale_guard = facade_before_slot_reuse(&pool, &pool_guard, page_id).await;
 
             assert!(stale_guard.lock_exclusive_async().await.is_none());
         })
     }
 
+    /// Purpose: Reject nonblocking facade upgrades after the frame generation changes.
+    /// Expected: Stale upgrades fail without advancing the latch version.
     #[test]
     fn test_facade_page_guard_try_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
@@ -771,6 +739,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Reject verified facade upgrades after the frame generation changes.
+    /// Expected: Shared and exclusive verification fail without retaining an exclusive version change.
     #[test]
     fn test_facade_page_guard_verify_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
@@ -786,6 +756,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Invalidate optimistic guards after either latch mutation or frame reuse.
+    /// Expected: Validation rejects both forms of staleness and conversions preserve the captured version.
     #[test]
     fn test_page_optimistic_guard_validation_checks_version_and_generation() {
         smol::block_on(async {
@@ -824,6 +796,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Check optimistic guard identity when acquiring stronger access.
+    /// Expected: Current guards upgrade successfully while stale generations fail without advancing the latch version.
     #[test]
     fn test_page_optimistic_guard_checked_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
@@ -863,23 +837,18 @@ mod tests {
         })
     }
 
+    /// Purpose: Reject blocking exclusive acquisition from a shared facade.
+    /// Expected: The incompatible latch state triggers the conversion assertion.
     #[test]
     #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
     fn test_facade_page_guard_lock_exclusive_async_panics_on_shared_state() {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::create_base_guard(&pool);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = g.page_id();
-            drop(g);
+            let page_id = allocate_test_row_page(&pool, &pool_guard).await;
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+            let g = row_page_facade(&pool, &pool_guard, page_id)
                 .await
-                .expect("buffer-pool read failed in test")
                 .lock_shared_async()
                 .await
                 .unwrap();
@@ -889,23 +858,18 @@ mod tests {
         })
     }
 
+    /// Purpose: Reject blocking shared acquisition from an exclusive facade.
+    /// Expected: The incompatible latch state triggers the conversion assertion.
     #[test]
     #[should_panic(expected = "block until exclusive by shared lock is not allowed")]
     fn test_facade_page_guard_lock_shared_async_panics_on_exclusive_state() {
         smol::block_on(async {
             let pool = test_pool();
             let pool_guard = FixedBufferPool::create_base_guard(&pool);
-            let g = pool
-                .allocate_page::<RowPageIndexNode>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = g.page_id();
-            drop(g);
+            let page_id = allocate_test_row_page(&pool, &pool_guard).await;
 
-            let g = pool
-                .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Spin)
+            let g = row_page_facade(&pool, &pool_guard, page_id)
                 .await
-                .expect("buffer-pool read failed in test")
                 .lock_exclusive_async()
                 .await
                 .unwrap();
@@ -915,6 +879,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Keep fixed-pool storage alive while a page guard is outstanding.
+    /// Expected: Owner teardown waits for the last guard to be released.
     #[test]
     fn test_fixed_buffer_pool_drop_waits_for_outstanding_guard() {
         smol::block_on(async {
@@ -927,24 +893,31 @@ mod tests {
                     .await
                     .expect("test page allocation should succeed")
             };
-            let dropped = Arc::new(AtomicBool::new(false));
-            let dropped_flag = Arc::clone(&dropped);
-
+            let (started_tx, started_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
             let handle = thread::spawn(move || {
+                started_tx.send(()).unwrap();
                 drop(pool);
-                dropped_flag.store(true, Ordering::SeqCst);
+                dropped_tx.send(()).unwrap();
             });
 
-            thread::sleep(Duration::from_millis(50));
-            assert!(!dropped.load(Ordering::SeqCst));
+            started_rx.recv().unwrap();
+            // This timeout is a negative assertion after the teardown thread
+            // starts; releasing the guard is the only progress predicate.
+            assert_eq!(
+                dropped_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            );
             assert_eq!(guard.page_id(), 0);
 
             drop(guard);
             handle.join().unwrap();
-            assert!(dropped.load(Ordering::SeqCst));
+            dropped_rx.recv().unwrap();
         });
     }
 
+    /// Purpose: Enforce fixed-pool ownership on page lookup.
+    /// Expected: A foreign pool guard triggers the identity assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_fixed_buffer_pool_panics_on_foreign_guard() {

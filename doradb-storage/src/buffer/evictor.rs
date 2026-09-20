@@ -1214,6 +1214,24 @@ mod tests {
         )
     }
 
+    fn scheduler_with_residency(resident: [usize; 3]) -> SharedEvictor {
+        let domains = [
+            SharedEvictionDomainId::Readonly,
+            SharedEvictionDomainId::Mem,
+            SharedEvictionDomainId::Index,
+        ]
+        .into_iter()
+        .zip(resident)
+        .map(|(id, count)| SharedEvictionDomain::new(id, MockRuntime::new(count, 8), test_policy()))
+        .collect();
+        SharedEvictor::new(
+            domains,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Event::new()),
+            SharedPoolEvictorStatsHandle::default(),
+        )
+    }
+
     fn frame_page_bytes(capacity: usize) -> usize {
         capacity * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
@@ -1329,6 +1347,8 @@ mod tests {
         drop(pool_guard);
     }
 
+    /// Purpose: Track allocation failures within the rolling sample window.
+    /// Expected: The failure rate reflects the retained samples as older observations expire.
     #[test]
     fn test_failure_rate_tracker_window() {
         let tracker = FailureRateTracker::new(4);
@@ -1343,6 +1363,8 @@ mod tests {
         assert!((tracker.failure_rate() - 0.5).abs() < 1e-9);
     }
 
+    /// Purpose: Trigger eviction under memory pressure and stop after headroom recovers.
+    /// Expected: Low free capacity requests reclamation while sufficient headroom suppresses it.
     #[test]
     fn test_arbiter_decide_pressure_delta_and_hysteresis() {
         let arbiter = EvictionArbiterBuilder::new()
@@ -1362,6 +1384,8 @@ mod tests {
         assert!(no_evict.is_none());
     }
 
+    /// Purpose: Trigger eviction from allocation failures despite available capacity.
+    /// Expected: High failure rates request reclamation and inflight work reduces the requested batch.
     #[test]
     fn test_arbiter_decide_failure_rate_trigger_and_dynamic_batch() {
         let arbiter = EvictionArbiterBuilder::new()
@@ -1373,14 +1397,17 @@ mod tests {
             .build(100);
 
         // Plenty of free frames, but failure rate is high so eviction still triggers.
-        let decision = arbiter.decide(50, 100, 0, 0.9, 1).unwrap();
-        assert!(decision.batch_size >= 20);
+        let without_inflight = arbiter.decide(50, 100, 0, 0.9, 1).unwrap();
+        assert!((20..=40).contains(&without_inflight.batch_size));
 
         // Inflight evictions reduce effective batch.
         let decision = arbiter.decide(50, 100, 8, 0.9, 1).unwrap();
-        assert!(decision.batch_size < 40);
+        assert_eq!(decision.batch_size, without_inflight.batch_size - 8);
+        assert!(arbiter.decide(50, 100, 40, 0.9, 1).is_none());
     }
 
+    /// Purpose: Normalize invalid eviction-policy configuration.
+    /// Expected: Nonfinite ratios and unusable bounds become valid policy settings.
     #[test]
     fn test_arbiter_builder_normalizes_invalid_inputs() {
         let arbiter = EvictionArbiterBuilder::new()
@@ -1401,6 +1428,8 @@ mod tests {
         assert_eq!(arbiter.max_batch, 1);
     }
 
+    /// Purpose: Honor explicit eviction-policy settings over ratio defaults.
+    /// Expected: Absolute settings take precedence and reversed batch bounds remain valid.
     #[test]
     fn test_arbiter_builder_respects_explicit_values() {
         let arbiter = EvictionArbiterBuilder::new()
@@ -1423,65 +1452,29 @@ mod tests {
         assert_eq!(arbiter.max_batch, 9);
     }
 
+    /// Purpose: Select a pressured domain among idle peers.
+    /// Expected: The evictor selects the ready domain and advances its rotation cursor.
     #[test]
     fn test_shared_evictor_skips_idle_domains() {
-        let mut evictor = SharedEvictor::new(
-            vec![
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Readonly,
-                    MockRuntime::new(4, 8),
-                    test_policy(),
-                ),
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Mem,
-                    MockRuntime::new(7, 8),
-                    test_policy(),
-                ),
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Index,
-                    MockRuntime::new(3, 8),
-                    test_policy(),
-                ),
-            ],
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Event::new()),
-            SharedPoolEvictorStatsHandle::default(),
-        );
+        let mut evictor = scheduler_with_residency([4, 7, 3]);
 
         assert_eq!(evictor.next_ready_domain_index(), Some(1));
         assert_eq!(evictor.next_domain, 2);
     }
 
+    /// Purpose: Distribute eviction opportunities among ready domains.
+    /// Expected: Selection rotates between pressured domains while skipping idle peers.
     #[test]
     fn test_shared_evictor_rotates_across_ready_domains() {
-        let mut evictor = SharedEvictor::new(
-            vec![
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Readonly,
-                    MockRuntime::new(7, 8),
-                    test_policy(),
-                ),
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Mem,
-                    MockRuntime::new(7, 8),
-                    test_policy(),
-                ),
-                SharedEvictionDomain::new(
-                    SharedEvictionDomainId::Index,
-                    MockRuntime::new(4, 8),
-                    test_policy(),
-                ),
-            ],
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(Event::new()),
-            SharedPoolEvictorStatsHandle::default(),
-        );
+        let mut evictor = scheduler_with_residency([7, 7, 4]);
 
         assert_eq!(evictor.next_ready_domain_index(), Some(0));
         assert_eq!(evictor.next_ready_domain_index(), Some(1));
         assert_eq!(evictor.next_ready_domain_index(), Some(0));
     }
 
+    /// Purpose: Attribute shared-evictor activity to the domain under pressure.
+    /// Expected: Only the pressured domain records eviction runs.
     #[test]
     fn test_shared_evictor_stats_track_isolated_domain_pressure() {
         smol::block_on(async {
@@ -1535,6 +1528,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Make progress when all shared eviction domains face pressure.
+    /// Expected: Every domain records eviction activity and its workload completes.
     #[test]
     fn test_shared_evictor_makes_progress_across_concurrent_domains() {
         smol::block_on(async {

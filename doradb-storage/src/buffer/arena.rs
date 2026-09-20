@@ -351,6 +351,8 @@ mod tests {
         page
     }
 
+    /// Purpose: Allow metadata access and arena ownership to cross thread boundaries.
+    /// Expected: The version map remains accessible and guard ownership drains after cross-thread use.
     #[test]
     fn test_arena_shared_metadata_future_and_owner_cross_threads() {
         let arena = QuiescentBox::new(QuiescentArena::new(1).unwrap());
@@ -387,6 +389,8 @@ mod tests {
         .unwrap();
     }
 
+    /// Purpose: Protect row metadata while its frame is pinned and after slot reuse.
+    /// Expected: Metadata guards pin the context and reject retired, replaced, or out-of-range identities.
     #[test]
     fn test_row_metadata_latch_pins_context_and_rejects_reuse() {
         smol::block_on(async {
@@ -432,6 +436,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Revalidate metadata identity after waiting and release cancelled acquisitions.
+    /// Expected: Retirement or reuse invalidates a waiting lookup, and cancellation releases the latch and keepalive.
     #[test]
     fn test_row_metadata_wait_revalidates_identity_and_cancellation_drains() {
         smol::block_on(async {
@@ -467,6 +473,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce pool ownership when accessing row metadata.
+    /// Expected: A guard from another arena triggers the identity assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_row_metadata_rejects_foreign_pool_guard() {
@@ -481,6 +489,8 @@ mod tests {
         ));
     }
 
+    /// Purpose: Require runtime metadata for an initialized row identity.
+    /// Expected: Missing context triggers an assertion without leaving the frame latched.
     #[test]
     fn test_row_metadata_matching_identity_requires_runtime_context() {
         let arena = QuiescentArena::new(1).unwrap();
@@ -497,6 +507,8 @@ mod tests {
         assert!(arena.try_lock_page_exclusive(&root, id.page_id).is_some());
     }
 
+    /// Purpose: Enforce ownership when constructing an arena guard.
+    /// Expected: A foreign pool guard triggers the identity assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_arena_guard_panics_on_foreign_guard() {
@@ -506,6 +518,8 @@ mod tests {
         let _ = arena1.arena_guard(foreign_guard);
     }
 
+    /// Purpose: Distinguish new base guards from clones of an existing keepalive root.
+    /// Expected: Clones share one root while independent guards drain separately on release.
     #[test]
     fn test_base_guard_creation_and_clone_lifecycle() {
         let arena = QuiescentArena::new(1).unwrap();

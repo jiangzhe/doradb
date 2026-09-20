@@ -1380,13 +1380,13 @@ pub(crate) mod tests {
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use smol::Timer;
-    use smol::future::yield_now;
     use std::io::Error as StdIoError;
     use std::ops::Deref;
     use std::os::fd::{AsRawFd, RawFd};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1737,6 +1737,13 @@ pub(crate) mod tests {
         panic!("condition was not satisfied before timeout");
     }
 
+    async fn wait_for_miss_joins(pool: &ReadonlyBufferPool, expected: usize) {
+        // The controlled read remains blocked, so every follower must attach
+        // to its live completion instead of racing with publication or failure.
+        wait_for(|| pool.stats().miss_joins >= expected).await;
+        assert_eq!(pool.stats().miss_joins, expected);
+    }
+
     #[inline]
     fn test_user_file_id(offset: TableID) -> FileID {
         FileID::from(test_user_table_id(offset.as_u64()))
@@ -1754,12 +1761,15 @@ pub(crate) mod tests {
             .is_some_and(|state| matches!(&*state, InflightBlockState::WriteBlocked))
     }
 
-    fn assert_completion_data_integrity(err: RuntimeOrFatalError) {
+    fn assert_completion_data_integrity(err: RuntimeOrFatalError, expected: DataIntegrityError) {
         let RuntimeOrFatalError::Runtime(err) = err else {
             panic!("expected Runtime error, got {err:?}");
         };
         assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-        assert!(err.downcast_ref::<DataIntegrityError>().is_some());
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>().copied(),
+            Some(expected)
+        );
         let report = format!("{err:?}");
         assert!(report.contains("wait for"), "{report}");
         assert!(report.contains("buffer_pool_type=readonly"), "{report}");
@@ -1895,10 +1905,14 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
         let payload_start = write_block_header(&mut buf, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
         let payload_end = payload_start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE;
-        let header = ColumnBlockNodeHeader::new(0, 0, RowID::new(0), TrxID::new(1));
+        let header = ColumnBlockNodeHeader::new(1, 1, RowID::new(0), TrxID::new(1));
         let header_bytes = layout::bytes_of(&header);
         buf[payload_start..payload_start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(header_bytes);
         buf[payload_start + COLUMN_BLOCK_HEADER_SIZE..payload_end].fill(0);
+        // One branch entry routes the lower row bound to a non-superblock child.
+        let entry_start = payload_start + COLUMN_BLOCK_HEADER_SIZE;
+        buf[entry_start..entry_start + 8].copy_from_slice(&0u64.to_le_bytes());
+        buf[entry_start + 8..entry_start + 16].copy_from_slice(&11u64.to_le_bytes());
         write_block_checksum(&mut buf);
         buf
     }
@@ -1915,14 +1929,68 @@ pub(crate) mod tests {
         buf
     }
 
+    async fn assert_invalid_page_not_cached(
+        case: &str,
+        table_id: TableID,
+        block_id: BlockID,
+        mut page: Vec<u8>,
+        validator: ReadonlyBlockValidator,
+        corrupt: impl FnOnce(&mut [u8]),
+        expected: DataIntegrityError,
+    ) {
+        // A validator that rejects every input must not satisfy a corruption test.
+        validator(&page, FileKind::TableFile, block_id)
+            .unwrap_or_else(|err| panic!("{case}: valid fixture rejected: {err:?}"));
+        corrupt(&mut page);
+
+        let (_temp_dir, fs) = build_test_fs();
+        let table_file = fs
+            .create_table_file(table_id, make_metadata(), false)
+            .unwrap();
+        let table_file = commit_table_file(&fs, table_file).await;
+        write_page_bytes(&fs, &table_file, block_id, &page).await;
+        let global = owned_global_pool(frame_page_bytes(4));
+        let pool = owned_readonly_pool(
+            FileID::from(table_id),
+            FileKind::TableFile,
+            Arc::clone(table_file.sparse_file()),
+            &global,
+        );
+        let pool_guard = pool.create_base_guard();
+        let key = BlockKey::new(FileID::from(table_id), block_id);
+        let free_before = global.residency.free.lock().len();
+        let err = match pool
+            .read_validated_block(&pool_guard, block_id, validator)
+            .await
+        {
+            Ok(_) => panic!("{case}: corrupt block was admitted"),
+            Err(err) => err,
+        };
+        assert_completion_data_integrity(err, expected);
+        assert_eq!(global.try_get_frame_id(&key), None, "{case}");
+        assert_eq!(global.allocated(), 0, "{case}");
+        assert_eq!(global.residency.free.lock().len(), free_before, "{case}");
+        wait_for(|| !global.inflights.contains_key(&key)).await;
+    }
+
+    fn corrupt_checksum(page: &mut [u8]) {
+        let last_idx = page.len() - 1;
+        page[last_idx] ^= 0xFF;
+    }
+
+    /// Purpose: Allow repeated shutdown before the read-only worker starts.
+    /// Expected: Repeated shutdown completes and leaves the pool shut down.
     #[test]
     fn test_global_readonly_pool_shutdown_is_idempotent_before_worker_start() {
         let pool = owned_global_pool(frame_page_bytes(2));
 
         pool.signal_shutdown();
         pool.signal_shutdown();
+        assert!(pool.shutdown_flag.load(Ordering::Acquire));
     }
 
+    /// Purpose: Distinguish cold loads from warm read-only cache accesses.
+    /// Expected: A cold read records storage I/O while a warm hit returns the same payload without another read.
     #[test]
     fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
         smol::block_on(async {
@@ -1971,6 +2039,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share read-only pool counters across file-specific wrappers.
+    /// Expected: A load through one wrapper is visible through every wrapper of the same pool.
     #[test]
     fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
         smol::block_on(async {
@@ -2016,6 +2086,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Track physical block identity through publication and invalidation.
+    /// Expected: Publication installs the mapping and invalidation removes it while releasing the frame.
     #[test]
     fn test_global_readonly_mapping_and_invalidation() {
         smol::block_on(async {
@@ -2024,6 +2096,7 @@ pub(crate) mod tests {
             let key = BlockKey::new(test_file_id(7), test_block_id(11));
 
             assert_eq!(global.allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
             let frame_id = publish_test_frame(&global, key).await;
             assert_eq!(global.allocated(), 1);
             assert_eq!(global.try_get_frame_id(&key), Some(frame_id));
@@ -2037,9 +2110,13 @@ pub(crate) mod tests {
                 Some(frame_id)
             );
             assert_eq!(global.allocated(), 0);
+            assert_eq!(global.try_get_frame_id(&key), None);
+            assert_eq!(global.arena.frame(frame_id).persisted_block_key(), None);
         });
     }
 
+    /// Purpose: Reuse caller keepalive ownership during read-only load and invalidation.
+    /// Expected: Both operations preserve the existing base-guard root without creating another root.
     #[test]
     fn test_readonly_miss_and_invalidation_reuse_caller_base_guard() {
         smol::block_on(async {
@@ -2076,6 +2153,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Retry reservation when a free frame is temporarily latched.
+    /// Expected: Contention preserves the free-list entry and releasing the latch allows reservation.
     #[test]
     fn test_readonly_reservation_retries_transient_free_frame_latch_contention() {
         smol::block_on(async {
@@ -2118,6 +2197,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect an existing mapping from conflicting publication.
+    /// Expected: Publication asserts with identity diagnostics and rolls back the losing reservation.
     #[test]
     fn test_readonly_publish_conflict_panics_and_rolls_back_reservation() {
         smol::block_on(async {
@@ -2169,6 +2250,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Exclude stale cached data while a block is being written.
+    /// Expected: The barrier removes resident state and blocks the key until its lease is released.
     #[test]
     fn test_readonly_write_barrier_invalidates_resident_mapping() {
         smol::block_on(async {
@@ -2194,6 +2277,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject a write barrier while the same block is loading.
+    /// Expected: The inflight-load error preserves the existing load state.
     #[test]
     fn test_readonly_write_barrier_rejects_same_key_inflight_load() {
         let global = owned_global_pool(64 * 1024 * 1024);
@@ -2217,6 +2302,8 @@ pub(crate) mod tests {
         global.inflights.remove(&key);
     }
 
+    /// Purpose: Allow a write barrier after an earlier load has completed.
+    /// Expected: The completed load is replaced by a write lease that cleans up on release.
     #[test]
     fn test_readonly_write_barrier_replaces_completed_same_key_load() {
         let global = owned_global_pool(64 * 1024 * 1024);
@@ -2239,6 +2326,8 @@ pub(crate) mod tests {
         assert!(!global.inflights.contains_key(&key));
     }
 
+    /// Purpose: Refresh cached bytes when a physical block key is reused.
+    /// Expected: A read after the write barrier returns the replacement payload.
     #[test]
     fn test_readonly_write_barrier_prevents_stale_physical_key_alias() {
         smol::block_on(async {
@@ -2279,6 +2368,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject reads during an active write barrier.
+    /// Expected: Reads report the write-blocked cause without I/O and succeed after lease release.
     #[test]
     fn test_readonly_read_returns_error_while_write_blocked() {
         smol::block_on(async {
@@ -2325,6 +2416,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep write exclusion alive after the initiating waiter is cancelled.
+    /// Expected: Readers remain blocked until the actual write completes and then observe its payload.
     #[test]
     fn test_readonly_write_barrier_survives_cancelled_write_waiter() {
         smol::block_on(async {
@@ -2358,8 +2451,7 @@ pub(crate) mod tests {
             write_hook.wait_started(1).await;
             assert!(key_state_is_write_blocked(&global, &key));
 
-            drop(writer);
-            yield_now().await;
+            assert!(writer.cancel().await.is_none());
             assert!(key_state_is_write_blocked(&global, &key));
 
             let err = match disk_pool.read_raw_block(&pool_guard, block_id).await {
@@ -2387,6 +2479,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve terminal read completion when its submission is dropped.
+    /// Expected: Submission cleanup retains the original completion error and identity.
     #[test]
     fn test_read_submission_terminal_completion_is_one_shot() {
         smol::block_on(async {
@@ -2446,6 +2540,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce the minimum usable read-only pool capacity.
+    /// Expected: An undersized pool reports the capacity resource error.
     #[test]
     fn test_global_readonly_pool_rejects_too_small_capacity() {
         let bytes = (MIN_READONLY_POOL_PAGES - 1)
@@ -2459,6 +2555,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Separate catalog and user blocks with matching block identifiers.
+    /// Expected: Distinct file identities retain independent resident mappings.
     #[test]
     fn test_readonly_cache_file_ids_keep_catalog_and_user_pages_isolated() {
         smol::block_on(async {
@@ -2478,6 +2576,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect replacement mappings from stale invalidation.
+    /// Expected: An old residency cannot remove a newer generation in the same frame.
     #[test]
     fn test_stale_residency_cannot_remove_newer_same_frame_generation() {
         smol::block_on(async {
@@ -2502,6 +2602,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require residency ownership when dropping an evicted read-only page.
+    /// Expected: A missing resident entry triggers the eviction assertion.
     #[test]
     #[should_panic(expected = "readonly evictor failed to move resident frame to free list")]
     fn test_readonly_evictor_panics_when_residency_entry_missing() {
@@ -2524,6 +2626,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce read-only pool ownership on frame lookup.
+    /// Expected: A foreign pool guard triggers the identity assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_global_readonly_pool_panics_on_foreign_guard() {
@@ -2541,6 +2645,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover from a mapping whose frame has been retired.
+    /// Expected: Lookup reloads the persisted payload into a current mapping and records a cache miss.
     #[test]
     fn test_readonly_pool_reloads_when_mapping_points_to_uninitialized_frame() {
         smol::block_on(async {
@@ -2596,6 +2702,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Bind persisted-block validation to each admitted residency.
+    /// Expected: Reload validates once, warm hits reuse admission, and invalidation requires fresh validation.
     #[test]
     fn test_readonly_pool_validated_reload_counts_miss_then_warm_hit() {
         smol::block_on(async {
@@ -2703,6 +2811,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse a resident block after its initial read-only miss.
+    /// Expected: Repeated reads return the persisted payload from one resident frame.
     #[test]
     fn test_readonly_pool_miss_load_and_hit() {
         smol::block_on(async {
@@ -2740,6 +2850,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Avoid duplicate I/O when reservation discovers an existing mapping.
+    /// Expected: The load completes with the resident frame and returns unused reservation capacity.
     #[test]
     fn test_readonly_pool_aborts_duplicate_load_after_reservation_when_mapping_exists() {
         smol::block_on(async {
@@ -2803,6 +2915,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share one read-only miss among concurrent readers.
+    /// Expected: All readers join one storage read and receive the same persisted payload.
     #[test]
     fn test_readonly_pool_dedup_concurrent_miss() {
         smol::block_on(async {
@@ -2812,6 +2926,11 @@ pub(crate) mod tests {
                 .unwrap();
             let table_file = commit_table_file(&fs, table_file).await;
             write_payload(&fs, &table_file, test_block_id(5), b"world").await;
+            let read_hook = Arc::new(ControlledReadHook::for_page(
+                table_file.sparse_file().as_raw_fd(),
+                test_block_id(5),
+            ));
+            let _hook = install_storage_backend_test_hook(read_hook.clone());
 
             let global = owned_global_pool(frame_page_bytes(8));
             let pool = owned_readonly_pool(
@@ -2831,18 +2950,24 @@ pub(crate) mod tests {
                         .read_raw_block(&pool_guard, test_block_id(5))
                         .await
                         .expect("buffer-pool read failed in test");
-                    g.page()[0]
+                    g.page()[..5].to_vec()
                 }));
             }
+            read_hook.wait_started(1).await;
+            wait_for_miss_joins(&global, 15).await;
+            read_hook.release();
             for task in tasks {
-                assert_eq!(task.await, b'w');
+                assert_eq!(task.await, b"world");
             }
+            assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 1);
             drop(table_file);
             drop(fs);
         });
     }
 
+    /// Purpose: Keep raw and validated load classes separate for an inflight block.
+    /// Expected: A validated follower reports a class conflict while the original raw load succeeds.
     #[test]
     fn test_readonly_pool_rejects_raw_validated_inflight_overlap() {
         smol::block_on(async {
@@ -2906,6 +3031,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve a shared miss after its initiating reader is cancelled.
+    /// Expected: A joined follower receives the payload from the original read and inflight state drains.
     #[test]
     fn test_readonly_pool_cancelled_loader_keeps_shared_miss_attempt_alive() {
         smol::block_on(async {
@@ -2942,7 +3069,7 @@ pub(crate) mod tests {
             read_hook.wait_started(1).await;
             assert!(key_state_is_loading(&global, &key));
 
-            drop(loader);
+            assert!(loader.cancel().await.is_none());
 
             let pool_for_waiter = (*pool).clone();
             let waiter_guard = pool_guard.clone();
@@ -2953,7 +3080,7 @@ pub(crate) mod tests {
                     .unwrap();
                 g.page()[..5].to_vec()
             });
-            yield_now().await;
+            wait_for_miss_joins(&global, 1).await;
 
             read_hook.release();
 
@@ -2967,6 +3094,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Complete a detached miss after its only reader is cancelled.
+    /// Expected: The read publishes a usable mapping and clears inflight ownership.
     #[test]
     fn test_readonly_pool_cancelled_single_loader_does_not_leak_completed_inflight() {
         smol::block_on(async {
@@ -3003,7 +3132,7 @@ pub(crate) mod tests {
             read_hook.wait_started(1).await;
             assert!(key_state_is_loading(&global, &key));
 
-            drop(loader);
+            assert!(loader.cancel().await.is_none());
             read_hook.release();
 
             wait_for(|| {
@@ -3023,6 +3152,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep an accepted read alive during owner teardown.
+    /// Expected: The detached load publishes its mapping before the remaining ownership drains.
     #[test]
     fn test_readonly_pool_detached_miss_load_survives_pool_drop() {
         smol::block_on(async {
@@ -3059,19 +3190,23 @@ pub(crate) mod tests {
             });
             read_hook.wait_started(1).await;
             assert!(key_state_is_loading(&observe, &key));
-            drop(loader);
+            assert!(loader.cancel().await.is_none());
             drop(pool_guard);
 
-            let dropped = Arc::new(AtomicBool::new(false));
-            let dropped_flag = Arc::clone(&dropped);
+            let (started_tx, started_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
             let teardown = thread::spawn(move || {
                 drop(pool);
+                started_tx.send(()).unwrap();
                 drop(global);
-                dropped_flag.store(true, Ordering::SeqCst);
+                dropped_tx.send(()).unwrap();
             });
 
-            thread::sleep(Duration::from_millis(50));
-            assert!(!dropped.load(Ordering::SeqCst));
+            started_rx.recv().unwrap();
+            assert_eq!(
+                dropped_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            );
 
             read_hook.release();
             wait_for(|| {
@@ -3082,12 +3217,14 @@ pub(crate) mod tests {
             drop(observe);
             teardown.join().unwrap();
             assert_eq!(read_hook.call_count(), 1);
-            assert!(dropped.load(Ordering::SeqCst));
+            dropped_rx.recv().unwrap();
             drop(table_file);
             drop(fs);
         });
     }
 
+    /// Purpose: Release a detached reservation blocked on capacity during teardown.
+    /// Expected: Shutdown settles the pending load with its lifecycle cause and permits owner destruction.
     #[test]
     fn test_readonly_pool_drop_unblocks_detached_reserve_waiter() {
         smol::block_on(async {
@@ -3160,6 +3297,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share a failed physical read among joined readers.
+    /// Expected: Every waiter receives the I/O cause and the failed load leaves no resident or inflight state.
     #[test]
     fn test_readonly_pool_shared_io_failure_propagates_to_all_waiters() {
         smol::block_on(async {
@@ -3201,7 +3340,7 @@ pub(crate) mod tests {
             });
 
             read_hook.wait_started(1).await;
-            Timer::after(Duration::from_millis(10)).await;
+            wait_for_miss_joins(&global, 1).await;
             read_hook.release();
 
             let err1 = match waiter1.await {
@@ -3217,7 +3356,10 @@ pub(crate) mod tests {
                     panic!("expected Runtime error, got {err:?}");
                 };
                 assert_eq!(err.current_context(), &RuntimeError::BufferPageAccess);
-                assert!(err.downcast_ref::<IoError>().is_some());
+                assert_eq!(
+                    err.downcast_ref::<IoError>().copied().map(IoError::kind),
+                    Some(StdIoError::from_raw_os_error(libc::EIO).kind())
+                );
                 let output = format!("{err:?}");
                 assert!(output.contains("buffer_pool_type=readonly"), "{output}");
                 assert!(output.contains("buffer_pool_role=disk"), "{output}");
@@ -3234,6 +3376,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share persisted-block validation failure among joined readers.
+    /// Expected: Every waiter receives the integrity cause without publication and the failed read is counted once.
     #[test]
     fn test_readonly_pool_shared_validated_load_propagates_validation_failure() {
         smol::block_on(async {
@@ -3287,7 +3431,7 @@ pub(crate) mod tests {
             });
 
             read_hook.wait_started(1).await;
-            Timer::after(Duration::from_millis(10)).await;
+            wait_for_miss_joins(&global, 1).await;
             read_hook.release();
 
             let err1 = match waiter1.await {
@@ -3298,8 +3442,8 @@ pub(crate) mod tests {
                 Ok(_) => panic!("expected persisted LWC corruption"),
                 Err(err) => err,
             };
-            assert_completion_data_integrity(err1);
-            assert_completion_data_integrity(err2);
+            assert_completion_data_integrity(err1, DataIntegrityError::ChecksumMismatch);
+            assert_completion_data_integrity(err2, DataIntegrityError::ChecksumMismatch);
             assert_eq!(read_hook.call_count(), 1);
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
@@ -3312,165 +3456,76 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject checksum corruption in a cold LWC block.
+    /// Expected: The integrity failure leaves no resident mapping or allocated frame.
     #[test]
     fn test_readonly_pool_validated_lwc_miss_rejects_corruption_without_mapping() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs
-                .create_table_file(test_user_table_id(107), make_metadata(), false)
-                .unwrap();
-            let table_file = commit_table_file(&fs, table_file).await;
-
-            let mut page = build_valid_persisted_lwc_block();
-            let last_idx = page.len() - 1;
-            page[last_idx] ^= 0xFF;
-            write_page_bytes(&fs, &table_file, test_block_id(9), &page).await;
-
-            let global = owned_global_pool(frame_page_bytes(4));
-            let pool = owned_readonly_pool(
-                test_user_file_id(TableID::new(107)),
-                FileKind::TableFile,
-                Arc::clone(table_file.sparse_file()),
-                &global,
-            );
-            let pool_guard = pool.create_base_guard();
-            let key = BlockKey::new(test_user_file_id(TableID::new(107)), test_block_id(9));
-
-            let err = match pool
-                .read_validated_block(&pool_guard, test_block_id(9), validate_persisted_lwc_block)
-                .await
-            {
-                Ok(_) => panic!("expected persisted LWC corruption"),
-                Err(err) => err,
-            };
-            assert_completion_data_integrity(err);
-            assert_eq!(global.try_get_frame_id(&key), None);
-            assert_eq!(global.allocated(), 0);
-        });
+        smol::block_on(assert_invalid_page_not_cached(
+            "LWC checksum",
+            test_user_table_id(107),
+            test_block_id(9),
+            build_valid_persisted_lwc_block(),
+            validate_persisted_lwc_block,
+            corrupt_checksum,
+            DataIntegrityError::ChecksumMismatch,
+        ));
     }
 
+    /// Purpose: Validate LWC offsets even when the persisted checksum is valid.
+    /// Expected: An out-of-bounds payload layout fails admission without publishing a mapping.
     #[test]
     fn test_readonly_pool_validated_lwc_miss_rejects_invalid_offsets_without_mapping() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs
-                .create_table_file(test_user_table_id(116), make_metadata(), false)
-                .unwrap();
-            let table_file = commit_table_file(&fs, table_file).await;
-
-            let mut page = build_valid_persisted_lwc_block();
-            {
+        smol::block_on(assert_invalid_page_not_cached(
+            "LWC offsets with a valid checksum",
+            test_user_table_id(116),
+            test_block_id(10),
+            build_valid_persisted_lwc_block(),
+            validate_persisted_lwc_block,
+            |page| {
                 let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
                 let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
                 let page_view = LwcBlock::from_bytes_mut(&mut page[payload_start..payload_end]);
                 let invalid_end = (page_view.body.len() as u16).saturating_add(1);
                 page_view.header = LwcBlockHeader::new(1, 1, 1, 0);
                 page_view.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
-            }
-            write_block_checksum(&mut page);
-            write_page_bytes(&fs, &table_file, test_block_id(10), &page).await;
-
-            let global = owned_global_pool(frame_page_bytes(4));
-            let pool = owned_readonly_pool(
-                test_user_file_id(TableID::new(116)),
-                FileKind::TableFile,
-                Arc::clone(table_file.sparse_file()),
-                &global,
-            );
-            let pool_guard = pool.create_base_guard();
-            let key = BlockKey::new(test_user_file_id(TableID::new(116)), test_block_id(10));
-
-            let err = match pool
-                .read_validated_block(&pool_guard, test_block_id(10), validate_persisted_lwc_block)
-                .await
-            {
-                Ok(_) => panic!("expected persisted LWC invalid-payload corruption"),
-                Err(err) => err,
-            };
-            assert_completion_data_integrity(err);
-            assert_eq!(global.try_get_frame_id(&key), None);
-            assert_eq!(global.allocated(), 0);
-        });
+                write_block_checksum(page);
+            },
+            DataIntegrityError::InvalidPayload,
+        ));
     }
 
+    /// Purpose: Reject checksum corruption in a cold column-index block.
+    /// Expected: The integrity failure leaves the column-index block unmapped and releases its frame.
     #[test]
     fn test_readonly_pool_validated_column_index_miss_rejects_corruption_without_mapping() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs
-                .create_table_file(test_user_table_id(108), make_metadata(), false)
-                .unwrap();
-            let table_file = commit_table_file(&fs, table_file).await;
-
-            let mut page = build_valid_persisted_column_block_page();
-            let last_idx = page.len() - 1;
-            page[last_idx] ^= 0xFF;
-            write_page_bytes(&fs, &table_file, test_block_id(10), &page).await;
-
-            let global = owned_global_pool(frame_page_bytes(4));
-            let pool = owned_readonly_pool(
-                test_user_file_id(TableID::new(108)),
-                FileKind::TableFile,
-                Arc::clone(table_file.sparse_file()),
-                &global,
-            );
-            let pool_guard = pool.create_base_guard();
-            let key = BlockKey::new(test_user_file_id(TableID::new(108)), test_block_id(10));
-
-            let err = match pool
-                .read_validated_block(
-                    &pool_guard,
-                    test_block_id(10),
-                    validate_persisted_column_block_index_page,
-                )
-                .await
-            {
-                Ok(_) => panic!("expected persisted column-block corruption"),
-                Err(err) => err,
-            };
-            assert_completion_data_integrity(err);
-            assert_eq!(global.try_get_frame_id(&key), None);
-            assert_eq!(global.allocated(), 0);
-        });
+        smol::block_on(assert_invalid_page_not_cached(
+            "column-index checksum",
+            test_user_table_id(108),
+            test_block_id(10),
+            build_valid_persisted_column_block_page(),
+            validate_persisted_column_block_index_page,
+            corrupt_checksum,
+            DataIntegrityError::ChecksumMismatch,
+        ));
     }
 
+    /// Purpose: Reject checksum corruption in a cold deletion-blob block.
+    /// Expected: The integrity failure leaves the blob unmapped and releases its frame.
     #[test]
     fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table_file = fs
-                .create_table_file(test_user_table_id(109), make_metadata(), false)
-                .unwrap();
-            let table_file = commit_table_file(&fs, table_file).await;
-
-            let mut page = build_valid_persisted_blob_page();
-            let last_idx = page.len() - 1;
-            page[last_idx] ^= 0xFF;
-            write_page_bytes(&fs, &table_file, test_block_id(11), &page).await;
-
-            let global = owned_global_pool(frame_page_bytes(4));
-            let pool = owned_readonly_pool(
-                test_user_file_id(TableID::new(109)),
-                FileKind::TableFile,
-                Arc::clone(table_file.sparse_file()),
-                &global,
-            );
-            let pool_guard = pool.create_base_guard();
-            let key = BlockKey::new(test_user_file_id(TableID::new(109)), test_block_id(11));
-
-            let err = match pool
-                .read_validated_block(&pool_guard, test_block_id(11), validate_persisted_blob_page)
-                .await
-            {
-                Ok(_) => panic!("expected persisted deletion-blob corruption"),
-                Err(err) => err,
-            };
-            assert_completion_data_integrity(err);
-            assert_eq!(global.try_get_frame_id(&key), None);
-            assert_eq!(global.allocated(), 0);
-        });
+        smol::block_on(assert_invalid_page_not_cached(
+            "deletion-blob checksum",
+            test_user_table_id(109),
+            test_block_id(11),
+            build_valid_persisted_blob_page(),
+            validate_persisted_blob_page,
+            corrupt_checksum,
+            DataIntegrityError::ChecksumMismatch,
+        ));
     }
 
+    /// Purpose: Reclaim read-only cache capacity without writing cached pages.
+    /// Expected: Cache pressure removes a mapping and reloading an evicted block restores its persisted payload.
     #[test]
     fn test_readonly_pool_drop_only_eviction_and_reload() {
         smol::block_on(async {
@@ -3574,17 +3629,33 @@ pub(crate) mod tests {
                 .count();
             assert!(mapped_count < loaded_count);
 
-            // Reload the first page after cache pressure; this should still return correct data.
+            // Select a block proven absent, rather than assuming the clock
+            // chose the first block in a particular background schedule.
+            let evicted = (0..=capacity)
+                .find(|i| {
+                    let key = BlockKey::new(
+                        table_file.sparse_file().file_id(),
+                        BlockID::from(base_page_id + *i as u64),
+                    );
+                    pool.try_get_frame_id(&key).is_none()
+                })
+                .expect("cache pressure must evict a loaded block");
+            let reload_start = pool.stats();
             let g = pool
                 .read_raw_block(
                     table_file.file_kind(),
                     table_file.sparse_file(),
                     &pool_guard,
-                    BlockID::from(base_page_id),
+                    BlockID::from(base_page_id + evicted as u64),
                 )
                 .await
                 .expect("buffer-pool read failed in test");
-            assert_eq!(&g.page()[..6], b"page-0");
+            let expected = format!("page-{evicted}");
+            assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
+            let delta = pool.stats().delta_since(reload_start);
+            assert_eq!(delta.cache_misses, 1);
+            assert_eq!(delta.queued_reads, 1);
+            assert_eq!(pool.stats().queued_writes, 0);
             drop(g);
             drop(pool_guard);
             drop(pool);
@@ -3593,6 +3664,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep file-backed read-only access valid across owner teardown order.
+    /// Expected: A retained block remains readable after the table owner is released and teardown completes.
     #[test]
     fn test_readonly_pool_lifecycle_drop_order_with_table_fs() {
         smol::block_on(async {
@@ -3617,11 +3690,14 @@ pub(crate) mod tests {
                 .await
                 .expect("buffer-pool read failed in test");
             assert_eq!(&g.page()[..10], b"drop-order");
-            drop(g);
             drop(table_file);
+            assert_eq!(&g.page()[..10], b"drop-order");
+            drop(g);
         });
     }
 
+    /// Purpose: Expose raw read-only blocks through the immutable guard interface.
+    /// Expected: The returned guard has the read-only type and exposes the persisted payload.
     #[test]
     fn test_readonly_pool_read_raw_block_returns_immutable_guard_type() {
         smol::block_on(async {
@@ -3648,6 +3724,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Apply custom eviction settings to the read-only pool.
+    /// Expected: Residency failure tracking and eviction decisions honor the supplied policy.
     #[test]
     fn test_global_readonly_pool_uses_custom_arbiter_builder() {
         let temp_dir = TempDir::new().unwrap();
