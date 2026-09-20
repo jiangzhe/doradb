@@ -3739,7 +3739,7 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
@@ -3749,6 +3749,8 @@ mod tests {
     // Tests below inspect the existing ColumnBlockIndex public orchestration
     // boundary over persisted DataIntegrity, buffer/file IO, and rewrite Internal.
     use crate::error::{DataIntegrityError, DiscloseError, Error};
+    use crate::file::cow_file::SUPER_BLOCK_ID;
+    use crate::file::cow_file::tests::rewrite_page_with_checksum;
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
     use crate::file::{FileKind, build_test_fs};
@@ -3756,7 +3758,94 @@ mod tests {
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
+    use std::path::Path;
     use std::sync::Arc;
+
+    /// Corrupts leaf delete codec for an integrity test.
+    pub(crate) fn corrupt_leaf_delete_codec(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
+            page[byte_offset] = 0xFF;
+        });
+    }
+
+    /// Corrupts leaf row codec for an integrity test.
+    pub(crate) fn corrupt_leaf_row_codec(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 32;
+            page[byte_offset] = 0;
+        });
+    }
+
+    /// Corrupts leaf block id for an integrity test.
+    pub(crate) fn corrupt_leaf_block_id(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+            page[byte_offset..byte_offset + 8].copy_from_slice(&SUPER_BLOCK_ID.to_le_bytes());
+        });
+    }
+
+    /// Corrupts leaf short delete section header for an integrity test.
+    pub(crate) fn corrupt_leaf_short_delete_section_header(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        const LEAF_ENTRY_ENTRY_LEN_OFFSET: usize = 28;
+        const LEAF_ENTRY_ROW_SECTION_LEN_OFFSET: usize = 30;
+        const LEAF_ENTRY_HEADER_SIZE: usize = 32;
+        const TRUNCATED_DELETE_SECTION_LEN: usize = 4;
+
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let byte_offset = leaf_entry_payload_offset(page, prefix_idx);
+            let row_section_len = u16::from_le_bytes(
+                page[byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET
+                    ..byte_offset + LEAF_ENTRY_ROW_SECTION_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let truncated_entry_len =
+                (LEAF_ENTRY_HEADER_SIZE + row_section_len + TRUNCATED_DELETE_SECTION_LEN) as u16;
+            page[byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET
+                ..byte_offset + LEAF_ENTRY_ENTRY_LEN_OFFSET + 2]
+                .copy_from_slice(&truncated_entry_len.to_le_bytes());
+        });
+    }
+
+    fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
+        const SEARCH_TYPE_PLAIN: u8 = 1;
+        const SEARCH_TYPE_DELTA_U32: u8 = 2;
+        const SEARCH_TYPE_DELTA_U16: u8 = 3;
+
+        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
+        let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
+        let (prefix_size, entry_offset_offset) = match search_type {
+            SEARCH_TYPE_PLAIN => (10usize, 8usize),
+            SEARCH_TYPE_DELTA_U32 => (6usize, 4usize),
+            SEARCH_TYPE_DELTA_U16 => (4usize, 2usize),
+            _ => panic!("invalid leaf search type {search_type}"),
+        };
+        let prefix_offset =
+            payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + prefix_idx * prefix_size;
+        let entry_offset = u16::from_le_bytes(
+            page[prefix_offset + entry_offset_offset..prefix_offset + entry_offset_offset + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
+    }
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()

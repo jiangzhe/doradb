@@ -27,9 +27,14 @@ pub(crate) use block_index::BlockIndex;
 pub(crate) use borrowed_stream::BorrowedIndexMutationStream;
 pub(crate) use btree::{BTREE_NODE_USABLE_SIZE, BTreeKey, BTreeKeyEncoder, KeyRange};
 #[cfg(test)]
+pub(crate) use column_block_index::tests::{
+    corrupt_leaf_block_id, corrupt_leaf_delete_codec, corrupt_leaf_row_codec,
+    corrupt_leaf_short_delete_section_header,
+};
+#[cfg(test)]
 pub(crate) use column_block_index::{
-    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
-    ColumnBlockNodeHeader, validate_persisted_column_block_index_page,
+    COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE, ColumnBlockNodeHeader,
+    validate_persisted_column_block_index_page,
 };
 pub(crate) use column_block_index::{
     ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnBlockScanEntry,

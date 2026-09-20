@@ -1026,6 +1026,10 @@ fn value_fbp<T: BitPackable, const BITS: usize>(input: &[u8], min: T, idx: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{RngExt, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
+    use std::any::type_name;
+    use std::fmt::Debug;
 
     const LEN: usize = 1000;
 
@@ -1049,12 +1053,14 @@ mod tests {
     fn setup<T: FromU64 + BitPackable>(
         input_size: usize,
         n_bits: usize,
+        seed: u64,
     ) -> (Vec<T>, Vec<u8>, Vec<T>) {
-        let max = 1 << n_bits;
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let max = 1u64 << n_bits;
         let output_size = (n_bits * input_size).div_ceil(8);
         let input = (0..input_size)
             .map(|_| {
-                let val = rand::random_range(0..max);
+                let val = rng.random_range(0..max);
                 T::from_u64(val)
             })
             .collect();
@@ -1064,348 +1070,120 @@ mod tests {
         (input, compressed, decompressed)
     }
 
+    fn assert_bitpack_round_trip<T: BitPackable + Debug + PartialEq>(
+        input: &[T],
+        n_bits: usize,
+        seed: u64,
+    ) {
+        type Pack<T> = fn(&[T], &mut [u8]);
+        type Unpack<T> = fn(&[u8], &mut [T]);
+        type Extend<T> = fn(&[u8], usize, T, &mut Vec<T>);
+        let (pack, unpack, extend): (Pack<T>, Unpack<T>, Extend<T>) = match n_bits {
+            1 => (b1_pack, b1_unpack, for_b1_unpack_extend),
+            2 => (b2_pack, b2_unpack, for_b2_unpack_extend),
+            4 => (b4_pack, b4_unpack, for_b4_unpack_extend),
+            8 => (b8_pack, b8_unpack, |src, _, min, dst| {
+                for_b8_unpack_extend(src, min, dst)
+            }),
+            16 => (b16_pack, b16_unpack, |src, _, min, dst| {
+                for_b16_unpack_extend(src, min, dst)
+            }),
+            32 => (b32_pack, b32_unpack, |src, _, min, dst| {
+                for_b32_unpack_extend(src, min, dst)
+            }),
+            _ => panic!("unsupported width: {n_bits}"),
+        };
+        let len = input.len();
+        let context = format!(
+            "type={}, width={n_bits}, len={len}, seed={seed}",
+            type_name::<T>()
+        );
+        let mut compressed = vec![0; (n_bits * len).div_ceil(8)];
+        let mut decompressed = vec![T::ZERO; len];
+        pack(input, &mut compressed);
+        unpack(&compressed, &mut decompressed);
+        assert_eq!(input, decompressed, "unpack: {context}");
+        let mut extended = Vec::new();
+        extend(&compressed, len, T::ZERO, &mut extended);
+        assert_eq!(input, extended, "extend: {context}");
+    }
+
+    fn assert_bitpack_widths<T: FromU64 + BitPackable + Debug + PartialEq>(widths: &[usize]) {
+        const SEED: u64 = 312;
+        for &n_bits in widths {
+            for len in [0, 1, 2, 3, 7, 8, 9, LEN - 1, LEN] {
+                let (input, _, _) = setup::<T>(len, n_bits, SEED);
+                assert_bitpack_round_trip(&input, n_bits, SEED);
+            }
+            let max = T::from_u64((1u64 << n_bits) - 1);
+            assert_bitpack_round_trip(&[T::ZERO, max, max, T::ZERO, max], n_bits, SEED);
+        }
+    }
+
     #[test]
     fn test_bitpack_i8() {
-        let (input, mut compressed, mut decompressed) = setup::<i8>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i8>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i8>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<i8>(&[1, 2, 4]);
     }
 
     #[test]
     fn test_bitpack_u8() {
-        let (input, mut compressed, mut decompressed) = setup::<u8>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u8>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-        for i in 2i32..4 {
-            let input: Vec<i32> = (1..i).collect();
-            let mut compressed = vec![0u8; (input.len() * 2).div_ceil(8)];
-            let mut decompressed = vec![0i32; input.len()];
-            b2_pack(&input, &mut compressed);
-            b2_unpack(&compressed, &mut decompressed);
-            assert_eq!(input, decompressed);
-            let mut res = vec![];
-            for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-            assert_eq!(input, res);
-        }
-
-        let (input, mut compressed, mut decompressed) = setup::<u8>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-        for i in 2i32..16 {
-            let input: Vec<i32> = (1..i).collect();
-            let mut compressed = vec![0u8; (input.len() * 4).div_ceil(8)];
-            let mut decompressed = vec![0i32; input.len()];
-            b4_pack(&input, &mut compressed);
-            b4_unpack(&compressed, &mut decompressed);
-            assert_eq!(input, decompressed);
-            let mut res = vec![];
-            for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-            assert_eq!(input, res);
+        assert_bitpack_widths::<u8>(&[1, 2, 4]);
+        // Retain the original deterministic partial-byte i32 cases.
+        for (n_bits, end) in [(2, 4), (4, 16)] {
+            for i in 2..end {
+                let input: Vec<i32> = (1..i).collect();
+                assert_bitpack_round_trip(&input, n_bits, 312);
+            }
         }
     }
 
     #[test]
     fn test_bitpack_i16() {
-        let (input, mut compressed, mut decompressed) = setup::<i16>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i16>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i16>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i16>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<i16>(&[1, 2, 4, 8]);
     }
 
     #[test]
     fn test_bitpack_u16() {
-        let (input, mut compressed, mut decompressed) = setup::<u16>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u16>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u16>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u16>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<u16>(&[1, 2, 4, 8]);
     }
 
     #[test]
     fn test_bitpack_i32() {
-        let (input, mut compressed, mut decompressed) = setup::<i32>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i32>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i32>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i32>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i32>(LEN, 16);
-        b16_pack(&input, &mut compressed);
-        b16_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b16_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<i32>(&[1, 2, 4, 8, 16]);
     }
 
     #[test]
     fn test_bitpack_u32() {
-        let (input, mut compressed, mut decompressed) = setup::<u32>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u32>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u32>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u32>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u32>(LEN, 16);
-        b16_pack(&input, &mut compressed);
-        b16_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b16_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<u32>(&[1, 2, 4, 8, 16]);
     }
 
     #[test]
     fn test_bitpack_i64() {
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 16);
-        b16_pack(&input, &mut compressed);
-        b16_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b16_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<i64>(LEN, 32);
-        b32_pack(&input, &mut compressed);
-        b32_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b32_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<i64>(&[1, 2, 4, 8, 16, 32]);
     }
 
     #[test]
     fn test_bitpack_u64() {
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 1);
-        b1_pack(&input, &mut compressed);
-        b1_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b1_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 2);
-        b2_pack(&input, &mut compressed);
-        b2_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b2_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 4);
-        b4_pack(&input, &mut compressed);
-        b4_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b4_unpack_extend(&compressed, input.len(), 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 8);
-        b8_pack(&input, &mut compressed);
-        b8_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b8_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 16);
-        b16_pack(&input, &mut compressed);
-        b16_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b16_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
-
-        let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 32);
-        b32_pack(&input, &mut compressed);
-        b32_unpack(&compressed, &mut decompressed);
-        assert_eq!(input, decompressed);
-        let mut res = vec![];
-        for_b32_unpack_extend(&compressed, 0, &mut res);
-        assert_eq!(input, res);
+        assert_bitpack_widths::<u64>(&[1, 2, 4, 8, 16, 32]);
     }
 
     #[test]
     fn test_for_bitpack() {
-        for _ in 0..100 {
-            let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 32);
+        for seed in 0..100 {
+            let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 32, seed);
             let min = input.iter().min().copied().unwrap();
             for_b32_pack(&input, min, &mut compressed);
             for_b32_unpack(&compressed, min, &mut decompressed);
-            assert_eq!(input, decompressed);
+            assert_eq!(
+                input, decompressed,
+                "type=u64, width=32, len={LEN}, seed={seed}, min={min}"
+            );
+            let mut extended = Vec::new();
+            for_b32_unpack_extend(&compressed, min, &mut extended);
+            assert_eq!(
+                input, extended,
+                "type=u64, width=32, len={LEN}, seed={seed}, min={min}"
+            );
         }
     }
 

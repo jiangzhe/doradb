@@ -1423,11 +1423,12 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::RuntimeOrFatalError;
     use crate::error::{
-        CompletionErrorBridge, DataIntegrityError, Error, ErrorKind, InternalError, RuntimeError,
+        CompletionErrorBridge, DataIntegrityError, ErrorKind, InternalError, RuntimeError,
         RuntimeOrFatalResult,
     };
-    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+    use crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE;
+    use crate::file::cow_file::tests::{corrupt_page_checksum, rewrite_page_with_checksum};
+
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, RowLocation};
@@ -1449,8 +1450,8 @@ mod tests {
     use crate::serde::Ser;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
     use crate::table::tests::{
-        assert_freeze_created, trx_delete_row_by_id, trx_select_row_mvcc_by_id,
-        trx_update_row_by_id,
+        assert_freeze_created, assert_table_data_integrity, trx_delete_row_by_id,
+        trx_select_row_mvcc_by_id, trx_update_row_by_id,
     };
     use crate::table::{DeleteMarker, Table, TableRedoReplayFloor};
     use crate::trx::MIN_SNAPSHOT_TS;
@@ -1461,8 +1462,8 @@ mod tests {
     use std::time::Duration;
 
     use std::collections::BTreeMap;
-    use std::fs::{self, File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::fs::{self, File};
+    use std::io::{Seek, SeekFrom, Write};
     use std::iter::repeat_n;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1474,30 +1475,7 @@ mod tests {
     const CORRUPTION_RECOVERY_LOG_BLOCK_SIZE: usize = 4096;
     const CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE: usize = 128 * 1024;
 
-    fn assert_table_data_integrity(
-        err: Error,
-        block_kind: &str,
-        block_id: BlockID,
-        expected: DataIntegrityError,
-    ) {
-        let report = format!("{err:?}");
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(expected),
-            "{report}"
-        );
-        assert!(!report.contains("propagate from other threads"), "{report}");
-        assert!(
-            err.report()
-                .downcast_ref::<CompletionErrorBridge>()
-                .is_none(),
-            "{report}"
-        );
-        assert!(report.contains("table_file"), "{report}");
-        assert!(report.contains(block_kind), "{report}");
-        assert!(report.contains(&format!("block_id={block_id}")), "{report}");
-    }
-
+    // Keep the runtime carrier assertion separate from the public table error contract.
     fn assert_table_runtime_data_integrity(
         err: RuntimeOrFatalError,
         block_kind: &str,
@@ -2196,45 +2174,6 @@ mod tests {
         );
         drop(session);
         drop(table);
-    }
-
-    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&byte).unwrap();
-        file.flush().unwrap();
-    }
-
-    fn rewrite_page_with_checksum(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        rewrite: impl FnOnce(&mut [u8]),
-    ) {
-        let page_id = page_id.into();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
-        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.read_exact(&mut page).unwrap();
-        rewrite(&mut page);
-        write_block_checksum(&mut page);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&page).unwrap();
-        file.flush().unwrap();
     }
 
     fn corrupt_blob_header_kind(

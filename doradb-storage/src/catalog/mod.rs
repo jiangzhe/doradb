@@ -1611,17 +1611,14 @@ pub(crate) mod tests {
     use crate::conf::{EngineConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error};
-    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
-    use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-    use crate::index::{COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_LEAF_HEADER_SIZE, ColumnBlockIndex};
+    use crate::file::cow_file::tests::corrupt_page_checksum;
+    use crate::index::{ColumnBlockIndex, corrupt_leaf_delete_codec};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
     use std::cell::Cell;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Seek, SeekFrom, Write};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     thread_local! {
@@ -1905,73 +1902,6 @@ pub(crate) mod tests {
         if CURRENT_TABLE_LOOKUPS.get().0 == Some(table_id) {
             FULL_CURRENT_TABLE_LOOKUPS.set(FULL_CURRENT_TABLE_LOOKUPS.get() + 1);
         }
-    }
-
-    fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: u64) {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        let mut byte = [0u8; 1];
-        file.read_exact(&mut byte).unwrap();
-        byte[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&byte).unwrap();
-        file.flush().unwrap();
-    }
-
-    fn rewrite_page_with_checksum(
-        path: impl AsRef<Path>,
-        page_id: u64,
-        rewrite: impl FnOnce(&mut [u8]),
-    ) {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
-        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.read_exact(&mut page).unwrap();
-        rewrite(&mut page);
-        write_block_checksum(&mut page);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&page).unwrap();
-        file.flush().unwrap();
-    }
-
-    fn corrupt_leaf_delete_codec(path: impl AsRef<Path>, page_id: u64, prefix_idx: usize) {
-        rewrite_page_with_checksum(path, page_id, |page| {
-            let byte_offset = leaf_entry_payload_offset(page, prefix_idx) + 35;
-            page[byte_offset] = 0xFF;
-        });
-    }
-
-    fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
-        const SEARCH_TYPE_PLAIN: u8 = 1;
-        const SEARCH_TYPE_DELTA_U32: u8 = 2;
-        const SEARCH_TYPE_DELTA_U16: u8 = 3;
-
-        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-        let search_type = page[payload_start + COLUMN_BLOCK_HEADER_SIZE];
-        let (prefix_size, entry_offset_offset) = match search_type {
-            SEARCH_TYPE_PLAIN => (10usize, 8usize),
-            SEARCH_TYPE_DELTA_U32 => (6usize, 4usize),
-            SEARCH_TYPE_DELTA_U16 => (4usize, 2usize),
-            _ => panic!("invalid leaf search type {search_type}"),
-        };
-        let prefix_offset =
-            payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + prefix_idx * prefix_size;
-        let entry_offset = u16::from_le_bytes(
-            page[prefix_offset + entry_offset_offset..prefix_offset + entry_offset_offset + 2]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        payload_start + COLUMN_BLOCK_LEAF_HEADER_SIZE + entry_offset
     }
 
     fn assert_catalog_data_integrity(err: Error) {

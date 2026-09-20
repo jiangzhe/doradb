@@ -3596,8 +3596,10 @@ mod tests {
         CallbackError, CallbackResult, DataIntegrityError, Error, ErrorKind, FatalError, IoError,
         OperationError, Result, RuntimeError,
     };
+    use crate::file::cow_file::tests::corrupt_page_checksum;
     use crate::id::{PageID, RowID, TableID, TrxID};
     use crate::index::{LwcRowLocation, RowLocation};
+    use crate::index::{corrupt_leaf_block_id, corrupt_leaf_row_codec};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::latch::LatchFallbackMode;
     use crate::lock::tests::LockDebugEntryState;

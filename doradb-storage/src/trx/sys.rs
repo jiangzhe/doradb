@@ -1879,15 +1879,17 @@ impl MandatoryInternalTask for FailedPrecommitCleanupJob {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::CallbackResult;
     use crate::catalog::tests::table2;
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig};
     use crate::engine::Engine;
     use crate::error::ResourceError;
     use crate::id::{PageID, RowID, TableID};
-    use crate::log::LogSync;
     use crate::log::format::{REDO_DEFAULT_DATA_START_OFFSET, REDO_SUPER_BLOCK_SLOT_SIZE};
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::log::{LogSync, discover_redo_log_files};
     use crate::recovery::stream::RedoSegmentCtsRange;
+    use crate::row::ops::ScanRowDecision;
     use crate::session::tests::SessionTestExt;
     use crate::thread::{SpawnTestEvent, observe_spawn_named};
     use crate::trx::{PrecommitTrxPayload, RetiredRowPageBatch, SharedTrxStatus};
@@ -2366,17 +2368,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_log_rotate() {
-        // 2000 rows, 200 bytes each row, 4M log file size.
-        // log file is 1MB, so it will rotate at least 4 times.
-        // Due to alignment of direct IO, the write amplification might
-        // be higher and produce more files.
-        const COUNT: usize = 2000;
+        const COUNT: i32 = 128;
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
+            let config = || {
                 EngineConfig::default()
-                    .storage_root(main_dir)
+                    .storage_root(temp_dir.path())
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
                             .max_mem_size(128usize * 1024 * 1024)
@@ -2385,23 +2382,52 @@ pub(crate) mod tests {
                     .trx(
                         TrxSysConfig::default()
                             .log_file_stem("redo_rotate")
-                            .log_file_max_size(1024u64 * 1024),
-                    ),
-            )
-            .await
-            .unwrap();
+                            .log_block_size(4096usize)
+                            .log_file_max_size(128usize * 1024),
+                    )
+            };
+            let engine = Engine::bootstrap(config()).await.unwrap();
+            let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
             let table_id = table2(&engine).await;
-
+            let expected: Vec<_> = (0..COUNT)
+                .map(|i| (i, format!("row-{i:03}-{}", "x".repeat(180))))
+                .collect();
             let mut session = engine.new_session().unwrap();
-            let s = [1u8; 196];
-            for i in 0..COUNT {
+            for (key, value) in &expected {
                 let mut trx = session.begin_trx().unwrap();
-                let insert = vec![Val::from(i as i32), Val::from(&s[..])];
+                let insert = vec![Val::from(*key), Val::from(value.as_str())];
                 trx.table_insert_mvcc(table_id, insert).await.unwrap();
                 trx.commit().await.unwrap();
             }
             drop(session);
             drop(engine);
+
+            let segments = discover_redo_log_files(&file_prefix, 0, false).unwrap();
+            assert!(segments.len() > 1, "redo did not rotate: {segments:?}");
+            for pair in segments.windows(2) {
+                assert_eq!(pair[1].seq, pair[0].seq + 1, "segments={segments:?}");
+            }
+            let recovered = Engine::bootstrap(config()).await.unwrap();
+            let mut session = recovered.new_session().unwrap();
+            let mut trx = session.begin_trx().unwrap();
+            let mut stream = trx
+                .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                    Ok(ScanRowDecision::Include)
+                })
+                .await
+                .unwrap();
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next().await.unwrap() {
+                rows.push((
+                    row[0].as_i32().unwrap(),
+                    row[1].as_str().unwrap().to_owned(),
+                ));
+            }
+            drop(stream);
+            rows.sort_unstable();
+            assert_eq!(rows.len(), expected.len());
+            assert_eq!(rows, expected);
+            trx.commit().await.unwrap();
         });
     }
 

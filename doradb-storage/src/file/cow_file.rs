@@ -1096,16 +1096,62 @@ fn remove_file_by_fd(fd: RawFd) -> IoResult<()> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::COW_FILE_PAGE_SIZE;
     use super::{ActiveRoot, MutableCowRoot, SUPER_BLOCK_ID, validate_active_meta_block_id};
     use crate::bitmap::AllocMap;
     use crate::error::DataIntegrityError;
     use crate::file::FileKind;
+    use crate::file::block_integrity::write_block_checksum;
     use crate::id::{BlockID, TrxID};
     use crate::map::FastHashMap;
     use std::collections::BTreeSet;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
     use std::sync::{Mutex, OnceLock};
 
     static OLD_ROOT_DROPS: OnceLock<Mutex<FastHashMap<usize, usize>>> = OnceLock::new();
+
+    /// Corrupts page checksum for an integrity test.
+    pub(crate) fn corrupt_page_checksum(path: impl AsRef<Path>, page_id: impl Into<u64>) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64 + (COW_FILE_PAGE_SIZE as u64 - 1);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.flush().unwrap();
+    }
+
+    /// Rewrites page with checksum for an integrity test.
+    pub(crate) fn rewrite_page_with_checksum(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        rewrite: impl FnOnce(&mut [u8]),
+    ) {
+        let page_id = page_id.into();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let offset = page_id * COW_FILE_PAGE_SIZE as u64;
+        let mut page = vec![0u8; COW_FILE_PAGE_SIZE];
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.read_exact(&mut page).unwrap();
+        rewrite(&mut page);
+        write_block_checksum(&mut page);
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(&page).unwrap();
+        file.flush().unwrap();
+    }
 
     /// Returns root drop count for tests.
     #[inline]

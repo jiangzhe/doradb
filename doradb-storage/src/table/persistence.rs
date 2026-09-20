@@ -2619,6 +2619,7 @@ mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
+    use crate::index::{corrupt_leaf_delete_codec, corrupt_leaf_short_delete_section_header};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol};

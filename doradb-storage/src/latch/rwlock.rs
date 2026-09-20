@@ -274,14 +274,25 @@ impl Drop for WriteGuardRollback<'_> {
 mod tests {
     use super::*;
     use futures::future::join3;
-    use parking_lot::RawRwLock as ParkingLotRawRwLock;
     use parking_lot::lock_api::RawRwLock as RawRwLockApi;
     use smol::Timer;
     use smol::future::or;
     use std::cell::UnsafeCell;
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Wake, Waker};
     use std::thread::spawn;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     struct Counter {
         data: UnsafeCell<usize>,
@@ -328,72 +339,48 @@ mod tests {
     // SAFETY: shared references are synchronized by `RawRwLock`.
     unsafe impl Sync for Counter {}
 
-    struct ParkingLotCounter {
-        data: UnsafeCell<usize>,
-        mu: ParkingLotRawRwLock,
-    }
-    impl ParkingLotCounter {
-        #[inline]
-        fn new() -> Self {
-            ParkingLotCounter {
-                data: UnsafeCell::new(0),
-                mu: ParkingLotRawRwLock::INIT,
-            }
-        }
-
-        #[inline]
-        fn inc(&self) {
-            // SAFETY: this helper holds the parking_lot exclusive raw lock while
-            // mutating the counter.
-            unsafe {
-                self.mu.lock_exclusive();
-                *self.data.get() += 1;
-                self.mu.unlock_exclusive();
-            }
-        }
-    }
-
     #[test]
     fn test_raw_rwlock_ops() {
-        smol::block_on(async {
-            let rw = Arc::new(RawRwLock::new());
+        for exclusive in [false, true] {
+            let rw = RawRwLock::new();
             rw.lock_exclusive();
             assert!(rw.is_locked());
             assert!(rw.is_locked_exclusive());
             assert!(!rw.try_lock_shared());
             assert!(!rw.try_lock_exclusive());
-            {
-                let rw = Arc::clone(&rw);
-                smol::spawn(async move {
+
+            let notified = Arc::new(WakeFlag(AtomicBool::new(false)));
+            let waker = Waker::from(Arc::clone(&notified));
+            let mut cx = Context::from_waker(&waker);
+            let mut waiter = pin!(async {
+                if exclusive {
                     rw.lock_exclusive_async().await;
-                    // SAFETY: this task unlocks only after it has acquired the
-                    // exclusive lock above.
-                    unsafe {
-                        rw.unlock_exclusive();
-                    }
-                })
-                .detach();
-            }
-            {
-                let rw = Arc::clone(&rw);
-                smol::spawn(async move {
+                } else {
                     rw.lock_shared_async().await;
-                    // SAFETY: this task unlocks only after it has acquired the
-                    // shared lock above.
-                    unsafe {
-                        rw.unlock_shared();
-                    }
-                })
-                .detach();
-            }
-            Timer::after(Duration::from_millis(100)).await;
-            // SAFETY: the test still owns the original exclusive lock acquired
-            // before spawning the waiters.
+                }
+            });
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            assert!(!notified.0.swap(false, Ordering::SeqCst));
+            // SAFETY: the initial exclusive acquisition above is still held.
+            unsafe { rw.unlock_exclusive() };
+            assert!(
+                notified.0.swap(false, Ordering::SeqCst),
+                "exclusive={exclusive}: waiter was not woken"
+            );
+            assert!(waiter.as_mut().poll(&mut cx).is_ready());
+            assert!(rw.is_locked());
+            assert_eq!(rw.is_locked_exclusive(), exclusive);
+            // SAFETY: the ready future acquired exactly the matching lock mode.
             unsafe {
-                rw.unlock_exclusive();
+                if exclusive {
+                    rw.unlock_exclusive();
+                } else {
+                    rw.unlock_shared();
+                }
             }
-            Timer::after(Duration::from_millis(100)).await;
-        })
+            assert!(!rw.is_locked());
+            assert!(!rw.is_locked_exclusive());
+        }
     }
 
     #[test]
@@ -488,52 +475,6 @@ mod tests {
                 })
                 .await;
             }
-        });
-    }
-
-    #[test]
-    fn test_raw_rwlock_single_thread() {
-        const COUNT: usize = 200_000;
-        smol::block_on(async {
-            let counter = Counter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc();
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "sync inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
-        });
-
-        smol::block_on(async {
-            let counter = Counter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc_async().await;
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "async inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
-        });
-
-        smol::block_on(async {
-            let counter = ParkingLotCounter::new();
-            let start = Instant::now();
-            for _ in 0..COUNT {
-                counter.inc();
-            }
-            let dur1 = start.elapsed();
-            println!(
-                "parking_lot inc, dur={:?}, tps={}",
-                dur1,
-                COUNT as f64 * 1_000_000_000f64 / dur1.as_nanos() as f64
-            );
         });
     }
 }
