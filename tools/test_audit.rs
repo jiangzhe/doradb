@@ -503,7 +503,7 @@ fn collect_snapshot(root: &Path, selection: &Selection) -> Result<Snapshot, Stri
                 "diff",
                 "--cached",
                 "--name-only",
-                "--diff-filter=ACMR",
+                "--diff-filter=ACMRT",
                 "-z",
                 "--",
                 "*.rs",
@@ -524,7 +524,7 @@ fn collect_snapshot(root: &Path, selection: &Selection) -> Result<Snapshot, Stri
                 &[
                     "diff",
                     "--name-only",
-                    "--diff-filter=ACMR",
+                    "--diff-filter=ACMRT",
                     "-z",
                     commit.trim(),
                     "--",
@@ -1306,6 +1306,8 @@ fn render_reports(file_count: usize, records: &[TestRecord]) -> (String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     const VALID: &str = "/// Purpose: Protect a boundary.\n/// Expected: Value equals 7.\n#[test]\nfn case() { assert_eq!(7, 7); }\n";
@@ -1843,6 +1845,43 @@ fn invalid() {}
                 .sources
                 .contains_key("added.rs")
         );
+    }
+
+    /// Purpose: Enforce contracts when a tracked Rust symlink becomes a regular source file.
+    /// Expected: Unstaged diff and staged/diff type changes select the replacement, fail missing contracts, and pass documented replacements.
+    #[cfg(unix)]
+    #[test]
+    fn type_changes_select_regular_rust_replacements() {
+        let repo = Repo::new();
+        repo.write("target.txt", VALID);
+        symlink("target.txt", repo.root().join("case.rs")).unwrap();
+        let base = repo.commit();
+        fs::remove_file(repo.root().join("case.rs")).unwrap();
+        let undocumented = "#[test]\nfn undocumented() {}\n";
+        repo.write("case.rs", undocumented);
+
+        let expected = BTreeSet::from(["case.rs".to_string()]);
+        let selection = Selection::Diff(base.clone());
+        let snapshot = collect_snapshot(repo.root(), &selection).unwrap();
+        assert_eq!(snapshot.selected, expected);
+        assert_eq!(snapshot.sources["case.rs"], undocumented);
+        assert_eq!(repo.audit(selection, "unstaged").unwrap(), 1);
+
+        repo.git(&["add", "case.rs"]);
+        assert_eq!(
+            repo.git(&["diff", "--cached", "--name-status", "--", "case.rs"]),
+            "T\tcase.rs\n"
+        );
+        for (source, expected_code) in [(undocumented, 1), (VALID, 0)] {
+            repo.write("case.rs", source);
+            repo.git(&["add", "case.rs"]);
+            for selection in [Selection::Staged, Selection::Diff(base.clone())] {
+                let snapshot = collect_snapshot(repo.root(), &selection).unwrap();
+                assert_eq!(snapshot.selected, expected, "{selection:?}");
+                assert_eq!(snapshot.sources["case.rs"], source, "{selection:?}");
+                assert_eq!(repo.audit(selection, "reports").unwrap(), expected_code);
+            }
+        }
     }
 
     /// Purpose: Reject ambiguous staged snapshots when Git contains unmerged entries.
