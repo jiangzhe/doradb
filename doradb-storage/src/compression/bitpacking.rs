@@ -1032,6 +1032,27 @@ mod tests {
     use std::fmt::Debug;
 
     const LEN: usize = 1000;
+    const SEED: u64 = 312;
+    const BOUNDARY_LENGTHS: &[usize] = &[
+        0,
+        1,
+        2,
+        3,
+        7,
+        8,
+        9,
+        15,
+        16,
+        31,
+        32,
+        63,
+        64,
+        65,
+        127,
+        128,
+        LEN - 1,
+        LEN,
+    ];
 
     trait FromU64: Sized {
         fn from_u64(val: u64) -> Self;
@@ -1050,30 +1071,39 @@ mod tests {
     }
     impl_from_u64_ex!(i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
 
-    fn setup<T: FromU64 + BitPackable>(
-        input_size: usize,
-        n_bits: usize,
-        seed: u64,
-    ) -> (Vec<T>, Vec<u8>, Vec<T>) {
+    fn random_bitpack_input<T: FromU64>(input_size: usize, n_bits: usize, seed: u64) -> Vec<T> {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let max = 1u64 << n_bits;
-        let output_size = (n_bits * input_size).div_ceil(8);
-        let input = (0..input_size)
+        (0..input_size)
             .map(|_| {
                 let val = rng.random_range(0..max);
                 T::from_u64(val)
             })
-            .collect();
-        // compressed size is at most half of original size.
-        let compressed = vec![0u8; output_size];
-        let decompressed = vec![T::ZERO; input_size];
-        (input, compressed, decompressed)
+            .collect()
+    }
+
+    fn assert_extension<T: Copy + Debug + PartialEq>(
+        input: &[T],
+        prefix: T,
+        context: &str,
+        extend: impl Fn(&mut Vec<T>),
+    ) {
+        for mut result in [Vec::new(), vec![prefix]] {
+            let prefix_len = result.len();
+            let mut expected = result.clone();
+            expected.extend_from_slice(input);
+            extend(&mut result);
+            assert_eq!(
+                result, expected,
+                "extend: {context}, prefix_len={prefix_len}"
+            );
+        }
     }
 
     fn assert_bitpack_round_trip<T: BitPackable + Debug + PartialEq>(
         input: &[T],
         n_bits: usize,
-        seed: u64,
+        case: &str,
     ) {
         type Pack<T> = fn(&[T], &mut [u8]);
         type Unpack<T> = fn(&[u8], &mut [T]);
@@ -1095,7 +1125,7 @@ mod tests {
         };
         let len = input.len();
         let context = format!(
-            "type={}, width={n_bits}, len={len}, seed={seed}",
+            "type={}, width={n_bits}, len={len}, {case}",
             type_name::<T>()
         );
         let mut compressed = vec![0; (n_bits * len).div_ceil(8)];
@@ -1103,90 +1133,131 @@ mod tests {
         pack(input, &mut compressed);
         unpack(&compressed, &mut decompressed);
         assert_eq!(input, decompressed, "unpack: {context}");
-        let mut extended = Vec::new();
-        extend(&compressed, len, T::ZERO, &mut extended);
-        assert_eq!(input, extended, "extend: {context}");
+        assert_extension(input, T::ZERO, &context, |result| {
+            extend(&compressed, len, T::ZERO, result);
+        });
     }
 
     fn assert_bitpack_widths<T: FromU64 + BitPackable + Debug + PartialEq>(widths: &[usize]) {
-        const SEED: u64 = 312;
         for &n_bits in widths {
-            for len in [0, 1, 2, 3, 7, 8, 9, LEN - 1, LEN] {
-                let (input, _, _) = setup::<T>(len, n_bits, SEED);
-                assert_bitpack_round_trip(&input, n_bits, SEED);
+            for &len in BOUNDARY_LENGTHS {
+                let input = random_bitpack_input::<T>(len, n_bits, SEED);
+                assert_bitpack_round_trip(&input, n_bits, &format!("random, seed={SEED}"));
             }
             let max = T::from_u64((1u64 << n_bits) - 1);
-            assert_bitpack_round_trip(&[T::ZERO, max, max, T::ZERO, max], n_bits, SEED);
+            assert_bitpack_round_trip(&[T::ZERO, max, max, T::ZERO, max], n_bits, "zero_max");
         }
     }
 
+    fn assert_for_b1_extension<T: BitPackable + Debug + PartialEq>(
+        compressed: &[u8],
+        input: &[T],
+        min: T,
+        case: &str,
+    ) {
+        let context = format!(
+            "type={}, len={}, min={min:?}, {case}",
+            type_name::<T>(),
+            input.len()
+        );
+        assert_extension(input, min, &context, |result| {
+            for_b1_unpack_extend(compressed, input.len(), min, result);
+        });
+    }
+
+    fn assert_for_b1_round_trip<T: BitPackable + Debug + PartialEq>(
+        input: &[T],
+        min: T,
+        case: &str,
+    ) {
+        let mut compressed = vec![0; input.len().div_ceil(8)];
+        for_b1_pack(input, min, &mut compressed);
+        assert_for_b1_extension(&compressed, input, min, case);
+    }
+
+    /// Purpose: Protect i8 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_i8() {
         assert_bitpack_widths::<i8>(&[1, 2, 4]);
     }
 
+    /// Purpose: Protect u8 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_u8() {
         assert_bitpack_widths::<u8>(&[1, 2, 4]);
-        // Retain the original deterministic partial-byte i32 cases.
-        for (n_bits, end) in [(2, 4), (4, 16)] {
-            for i in 2..end {
-                let input: Vec<i32> = (1..i).collect();
-                assert_bitpack_round_trip(&input, n_bits, 312);
-            }
-        }
     }
 
+    /// Purpose: Protect i16 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_i16() {
         assert_bitpack_widths::<i16>(&[1, 2, 4, 8]);
     }
 
+    /// Purpose: Protect u16 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_u16() {
         assert_bitpack_widths::<u16>(&[1, 2, 4, 8]);
     }
 
+    /// Purpose: Protect i32 bitpacking across widths, length boundaries, and increasing inputs.
+    /// Expected: Unpacking and extension preserve values without exposing padding.
     #[test]
     fn test_bitpack_i32() {
         assert_bitpack_widths::<i32>(&[1, 2, 4, 8, 16]);
+        for (n_bits, end) in [(2, 4), (4, 16)] {
+            for i in 2..end {
+                let input: Vec<i32> = (1..i).collect();
+                assert_bitpack_round_trip(&input, n_bits, "increasing");
+            }
+        }
     }
 
+    /// Purpose: Protect u32 bitpacking across compressed widths and byte/chunk boundaries.
+    /// Expected: Unpacking restores values; extension appends them while preserving the prefix.
     #[test]
     fn test_bitpack_u32() {
         assert_bitpack_widths::<u32>(&[1, 2, 4, 8, 16]);
     }
 
+    /// Purpose: Protect i64 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_i64() {
         assert_bitpack_widths::<i64>(&[1, 2, 4, 8, 16, 32]);
     }
 
+    /// Purpose: Protect u64 bitpacking across compressed widths and length boundaries.
+    /// Expected: Unpacking and extension recover the original values.
     #[test]
     fn test_bitpack_u64() {
         assert_bitpack_widths::<u64>(&[1, 2, 4, 8, 16, 32]);
     }
 
+    /// Purpose: Protect frame-of-reference bitpacking with varied inputs and bases.
+    /// Expected: Unpacking and extension restore the original values from their deltas.
     #[test]
     fn test_for_bitpack() {
         for seed in 0..100 {
-            let (input, mut compressed, mut decompressed) = setup::<u64>(LEN, 32, seed);
+            let input = random_bitpack_input::<u64>(LEN, 32, seed);
+            let mut compressed = vec![0; LEN * 4];
+            let mut decompressed = vec![0; LEN];
             let min = input.iter().min().copied().unwrap();
             for_b32_pack(&input, min, &mut compressed);
             for_b32_unpack(&compressed, min, &mut decompressed);
-            assert_eq!(
-                input, decompressed,
-                "type=u64, width=32, len={LEN}, seed={seed}, min={min}"
-            );
-            let mut extended = Vec::new();
-            for_b32_unpack_extend(&compressed, min, &mut extended);
-            assert_eq!(
-                input, extended,
-                "type=u64, width=32, len={LEN}, seed={seed}, min={min}"
-            );
+            let context = format!("type=u64, width=32, len={LEN}, seed={seed}, min={min}");
+            assert_eq!(input, decompressed, "unpack: {context}");
+            assert_extension(&input, u64::MAX, &context, |result| {
+                for_b32_unpack_extend(&compressed, min, result);
+            });
         }
     }
 
+    /// Purpose: Protect forward progress of the frame-of-reference delta iterator.
+    /// Expected: Iteration yields each rebased value in order and stops at exhaustion.
     #[test]
     fn test_for_bitpacking32_iter_advances() {
         let data = [1u32.to_le_bytes(), 5u32.to_le_bytes()];
@@ -1199,147 +1270,95 @@ mod tests {
         assert_eq!(iter.next(), Some(11));
         assert_eq!(iter.next(), Some(15));
         assert_eq!(iter.next(), None);
+        assert_eq!(iter.next(), None);
     }
 
-    #[test]
-    fn test_for_b1_unpack_extend_basic() {
-        // Test with different lengths
-        let lengths: [usize; 14] = [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 127, 128, 1000];
-
-        for &len in &lengths {
-            // Generate random data with values 0 or 1 (since bits=1)
-            let input: Vec<u32> = (0..len).map(|_| rand::random_range(0..2)).collect();
-
-            // Calculate compressed size
-            let compressed_len = len.div_ceil(8);
-            let mut compressed = vec![0u8; compressed_len];
-
-            // Pack the data
-            for_b1_pack(&input, 0, &mut compressed);
-
-            // Unpack using extend
-            let mut result = Vec::new();
-            for_b1_unpack_extend(&compressed, len, 0, &mut result);
-
-            // Verify
-            assert_eq!(input, result, "Failed for length {}", len);
-        }
-    }
-
+    /// Purpose: Protect one-bit frame-of-reference extension with nonzero bases.
+    /// Expected: Extension restores the original values at each tested length boundary.
     #[test]
     fn test_for_b1_unpack_extend_with_min() {
-        // Test with non-zero min value (Frame of Reference)
-        let lengths: [usize; 11] = [0, 1, 7, 8, 15, 16, 63, 64, 65, 127, 128];
         let min_values = [5, 10, 100, 1000];
-
-        for &len in &lengths {
+        for &len in BOUNDARY_LENGTHS {
+            let deltas = random_bitpack_input::<u32>(len, 1, SEED);
             for &min_val in &min_values {
-                // Generate random data with values in [min_val, min_val+1]
-                let input: Vec<u32> = (0..len)
-                    .map(|_| min_val + rand::random_range(0..2))
-                    .collect();
-
-                let compressed_len = len.div_ceil(8);
-                let mut compressed = vec![0u8; compressed_len];
-
-                // Pack with FOR
-                for_b1_pack(&input, min_val, &mut compressed);
-
-                // Unpack using extend
-                let mut result = Vec::new();
-                for_b1_unpack_extend(&compressed, len, min_val, &mut result);
-
-                assert_eq!(
-                    input, result,
-                    "Failed for length {} with min {}",
-                    len, min_val
-                );
+                let input: Vec<_> = deltas.iter().map(|delta| min_val + delta).collect();
+                assert_for_b1_round_trip(&input, min_val, &format!("seed={SEED}"));
             }
         }
     }
 
+    /// Purpose: Protect one-bit extension near the limits of every supported integer type.
+    /// Expected: Signed, unsigned, and pointer-sized values survive rebasing without loss.
     #[test]
     fn test_for_b1_unpack_extend_all_types() {
-        // Test all BitPackable types
         let len: usize = 100;
-
-        // Helper macro to test a specific type
         macro_rules! test_type {
-            ($t:ty, $max:expr) => {
-                let input: Vec<$t> = (0..len)
-                    .map(|_| {
-                        // For isize/usize, we need to handle differently as they don't implement SampleUniform
-                        if stringify!($t) == "isize" || stringify!($t) == "usize" {
-                            // Generate random u64 and convert
-                            let val: u64 = rand::random_range(0..$max);
-                            val as $t
-                        } else {
-                            rand::random_range(0..$max) as $t
-                        }
-                    })
-                    .collect();
-
-                let compressed_len = len.div_ceil(8);
-                let mut compressed = vec![0u8; compressed_len];
-
-                for_b1_pack(&input, <$t>::ZERO, &mut compressed);
-
-                let mut result = Vec::new();
-                for_b1_unpack_extend(&compressed, len, <$t>::ZERO, &mut result);
-
-                assert_eq!(input, result, "Failed for type {}", stringify!($t));
+            ($t:ty) => {
+                for (case, min) in [("minimum", <$t>::MIN), ("maximum", <$t>::MAX - 1)] {
+                    let input: Vec<$t> = [0, 1, 1, 0, 1, 0, 0, 1]
+                        .into_iter()
+                        .cycle()
+                        .take(len)
+                        .map(|delta| min + delta)
+                        .collect();
+                    assert_for_b1_round_trip(&input, min, case);
+                }
             };
         }
 
-        test_type!(i8, 2);
-        test_type!(u8, 2);
-        test_type!(i16, 2);
-        test_type!(u16, 2);
-        test_type!(i32, 2);
-        test_type!(u32, 2);
-        test_type!(i64, 2);
-        test_type!(u64, 2);
-        // Skip isize and usize for now as they have platform-dependent size
-        // and random_range doesn't support them directly
+        test_type!(i8);
+        test_type!(u8);
+        test_type!(i16);
+        test_type!(u16);
+        test_type!(i32);
+        test_type!(u32);
+        test_type!(i64);
+        test_type!(u64);
+        test_type!(isize);
+        test_type!(usize);
     }
 
+    /// Purpose: Protect one-bit wire layout and extension at partial-byte boundaries.
+    /// Expected: Packing matches fixed wire bytes; extension preserves values and ignores padding.
     #[test]
     fn test_for_b1_unpack_extend_edge_cases() {
-        // Test specific edge cases
-
-        // Case 1: All zeros
         let len = 67;
-        let input = vec![0u32; len];
-        let compressed_len = len.div_ceil(8);
-        let mut compressed = vec![0u8; compressed_len];
+        let cases = [
+            ("zeros", vec![0u32; len], [0; 9]),
+            (
+                "ones",
+                vec![1; len],
+                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07],
+            ),
+            (
+                "alternating",
+                (0..len).map(|i| (i % 2) as u32).collect(),
+                [0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x02],
+            ),
+            (
+                "asymmetric",
+                [1, 0, 1, 1, 0, 0, 0, 1]
+                    .into_iter()
+                    .cycle()
+                    .take(len)
+                    .collect(),
+                [0x8d, 0x8d, 0x8d, 0x8d, 0x8d, 0x8d, 0x8d, 0x8d, 0x05],
+            ),
+            (
+                "chunk_byte_order",
+                (0..len).map(|i| u32::from(i % 3 == 0)).collect(),
+                [0x49, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49, 0x92, 0x04],
+            ),
+        ];
+        for (case, input, mut wire) in cases {
+            let mut compressed = vec![0; len.div_ceil(8)];
+            for_b1_pack(&input, 0, &mut compressed);
+            assert_eq!(compressed, wire, "wire layout: {case}");
+            assert_for_b1_extension(&wire, &input, 0, case);
 
-        for_b1_pack(&input, 0, &mut compressed);
-
-        let mut result = Vec::new();
-        for_b1_unpack_extend(&compressed, len, 0, &mut result);
-
-        assert_eq!(input, result);
-
-        // Case 2: All ones
-        let input = vec![1u32; len];
-        let mut compressed = vec![0u8; compressed_len];
-
-        for_b1_pack(&input, 0, &mut compressed);
-
-        let mut result = Vec::new();
-        for_b1_unpack_extend(&compressed, len, 0, &mut result);
-
-        assert_eq!(input, result);
-
-        // Case 3: Alternating pattern
-        let input: Vec<u32> = (0..len).map(|i| (i % 2) as u32).collect();
-        let mut compressed = vec![0u8; compressed_len];
-
-        for_b1_pack(&input, 0, &mut compressed);
-
-        let mut result = Vec::new();
-        for_b1_unpack_extend(&compressed, len, 0, &mut result);
-
-        assert_eq!(input, result);
+            // Unused high bits in the last byte must not become logical values.
+            wire[8] |= 0b1111_1000;
+            assert_for_b1_extension(&wire, &input, 0, &format!("{case}, nonzero padding"));
+        }
     }
 }
