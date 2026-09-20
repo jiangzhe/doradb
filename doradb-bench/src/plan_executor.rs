@@ -1028,6 +1028,10 @@ mod tests {
     {
     }
 
+    /// Purpose: Render profiler pause and resume notices for PID 42, phase three, and checkpoint-
+    /// table.
+    /// Expected: The complete output matches the fixed protocol records, attach instructions, and
+    /// SIGCONT resume command.
     #[test]
     fn profiler_protocol_records_are_stable() {
         let mut output = Vec::new();
@@ -1042,6 +1046,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Inject independent write and flush failures while emitting a profiler pause notice.
+    /// Expected: Each failure preserves its cause and identifies the failed operation and process
+    /// 42 in the exact error text.
     #[test]
     fn profiler_pause_notice_maps_write_and_flush_failures() {
         let write_error = write_pausing_notice(&mut WriteFailure, 42, 3, "trx-noop").unwrap_err();
@@ -1058,6 +1065,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Check the associated configuration and outcome contracts shared by related executor
+    /// families.
+    /// Expected: Compile-time generic bounds accept the declared noop, insert, DDL, lookup, and
+    /// stream executor pairings.
     #[test]
     fn related_executor_identities_share_associated_types() {
         assert_shared_config::<StmtNoopExecutor, TrxNoopExecutor>();
@@ -1070,6 +1081,9 @@ mod tests {
         assert_shared_outcome::<LookupSeqExecutor, IndexStreamExecutor>();
     }
 
+    /// Purpose: Compare the registered executor identities with their corresponding workload
+    /// spellings.
+    /// Expected: All 17 checked identities equal the explicit ordered list of workload names.
     #[test]
     fn executor_identities_match_resolved_workload_names() {
         assert_eq!(
@@ -1114,6 +1128,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Spawn two tasks that rendezvous while two executor worker threads are actively
+    /// driven.
+    /// Expected: Both task and rendezvous results identify two distinct worker threads; watchdog
+    /// failures release the rendezvous for cleanup.
     #[test]
     fn run_spawner_uses_distinct_driven_executor_workers() {
         struct Rendezvous {

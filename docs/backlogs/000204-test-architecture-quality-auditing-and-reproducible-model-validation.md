@@ -8,6 +8,7 @@ Design and implement the repository-wide follow-up to the unit-test quality audi
 
 - User discussion on 2026-09-20: full unit-test audit at commit `43bfa11`, followed by the request to handle stronger behavioral checks and fixture deduplication now and record the remaining improvements as one backlog item.
 - Related task: `docs/tasks/000312-strengthen-storage-test-contracts-and-deduplicate-fixtures.md`. This backlog remains open after that bounded task is implemented.
+- Completed foundation: `docs/tasks/000313-enforce-test-contracts-and-deterministic-audit-inventory.md`. This is a partial contribution; this backlog and related backlog 000112 remain open.
 - `docs/process/coding-guidance.md`, testing section; `docs/process/unit-test.md`; `docs/process/dev-checklist.md`.
 - `.config/nextest.toml`, `.github/workflows/build.yml`, `tools/coverage_focus.rs`, and `tools/style_audit.rs`.
 - `doradb-storage/src/lock/state.rs`: lifecycle reference model; `doradb-storage/src/recovery/decode.rs`: differential decode and corruption checks; `doradb-storage/src/root.rs`: process-exit marker tests; `doradb-storage/src/session/managed_table_ops.rs`: seeded recovery model.
@@ -18,6 +19,7 @@ Design and implement the repository-wide follow-up to the unit-test quality audi
 ## Deferred From (Optional)
 
 - `docs/tasks/000312-strengthen-storage-test-contracts-and-deduplicate-fixtures.md` (standalone; no parent RFC).
+- `docs/tasks/000313-enforce-test-contracts-and-deterministic-audit-inventory.md` (standalone; contract-audit foundation only).
 
 ## Deferral Context (Optional)
 
@@ -46,3 +48,11 @@ Audit context to preserve:
 - Existing policies already call for deduplication, table-driven cases, and semantic synchronization. The missing layer is consistent behavioral review and maintained invariant ownership, not merely additional prose.
 - Existing reference-model, independent-wire-byte, differential-decoder, and process-exit tests provide local patterns to build on. Other random tests use unrecorded randomness; many restart tests destroy the engine normally before reopening.
 - The initial task should establish concrete behavioral checks and remove confirmed fixture/procedure copies. This broader follow-up should reuse the resulting conventions and avoid a universal scenario DSL or an undifferentiated central test-support module.
+
+Task 000313 contribution (2026-09-20):
+
+- Completed literal Purpose/Expected contracts, deterministic full source inventories, exact duplicate-contract candidates, and shared whole-file enforcement through style review, the staged pre-commit gate, and complete-event CI. All 57 source-visible pilot tests are documented; no existing storage tests were removed.
+- Semantic review preserved scalar/AVX2 and public/private lifecycle distinctions and replaced a timing-based rwlock release with two explicitly polled pending writers. Default and libaio suites and focused pilot coverage passed.
+- Defer reason: repository-wide test layers, invariant mapping, production-only coverage, independent models, replay/minimization, and fault infrastructure were explicit non-goals of the bounded foundation.
+- Findings: the lock lifecycle procedures have fixed seeded operation streams and compare logical indexes with physical manager state, but reuse production mode-coverage logic and copy accepted modes into their model. Their current contracts protect lifecycle/index consistency, not independent lock-mode semantics; seed documentation alone does not strengthen the oracle.
+- Direction hint: build later semantic/model reviews on the inventory and assertion-review convention. Add independent expected-state transitions and trace evidence where appropriate, coordinated with backlog 000112, while retaining feature/backend and owner/lifecycle distinctions. Exact contract equality is neither exhaustive overlap detection nor deletion authority.

@@ -129,6 +129,22 @@ mod tests {
         stderr
     }
 
+    #[track_caller]
+    fn assert_plan_rejected_before_root_creation(plan: &str, expected_error: &str) {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("invalid.toml");
+        fs::write(&source, plan).unwrap();
+        let root = temp.path().join("invalid-root");
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
+        let stderr = assert_failure(output);
+        assert!(
+            stderr.contains(expected_error),
+            "expected {expected_error:?}: {stderr}"
+        );
+        assert!(!root.exists());
+    }
+
     fn execute_plan(temp: &TempDir, name: &str, phases: &str) -> (PathBuf, InvocationReport) {
         let source = temp.path().join(format!("{name}.toml"));
         let log_sync = if phases.contains("\"recovery\"") {
@@ -253,6 +269,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Replay managed binding resolution with and without full schemas across four
+    /// sessions after creating a four-table pool.
+    /// Expected: Each measured run reports exactly 17 successful resolutions and samples with
+    /// internal metrics; preparation creates four tables and two runs aggregate 34 samples.
     #[test]
     fn managed_binding_resolution_repeats_with_exact_results_and_samples() {
         for full in [false, true] {
@@ -288,6 +308,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
+    /// Purpose: Reject missing plans and removed CLI subcommands without creating or deleting a
+    /// storage root.
+    /// Expected: Missing-plan and cleanup/prepare/run invocations fail; the missing-plan root stays
+    /// absent and rejected cleanup preserves an existing root.
     #[test]
     fn required_plan_is_the_only_cli_contract() {
         let temp = TempDir::new().unwrap();
@@ -307,6 +331,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(root.exists());
     }
 
+    /// Purpose: Execute a plan using the root environment variable, then override that variable
+    /// with an explicit root option.
+    /// Expected: The first result is written under the environment root, the second under the
+    /// explicit root, and the overridden environment root is never created.
     #[test]
     fn root_environment_and_explicit_precedence_are_retained() {
         let temp = TempDir::new().unwrap();
@@ -345,6 +373,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(!ignored_environment_root.exists());
     }
 
+    /// Purpose: Replay lookup, table-scan, materialized index-scan, and streaming index reads over
+    /// eight known rows, then execute an index create/drop cycle.
+    /// Expected: Every read run and aggregate matches fixed operation, hit, row, and latency-sample
+    /// counts for its named case; index DDL records two operations and one sample.
     #[test]
     fn dependent_read_and_index_ddl_plans_execute_with_exact_equations() {
         let temp = TempDir::new().unwrap();
@@ -352,53 +384,98 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
             (
                 "lookup-seq",
                 "unique",
-                "lookup-seq",
                 "num = 7, batch_size = 2",
+                WorkloadCounters {
+                    operations: 7,
+                    found: 7,
+                    rows_returned: 7,
+                    ..WorkloadCounters::default()
+                },
+                LatencyUnit::LookupBatchTransaction,
+                4,
             ),
             (
                 "lookup-rand",
                 "unique",
-                "lookup-rand",
                 "num = 7, seed = 9, batch_size = 2",
+                WorkloadCounters {
+                    operations: 7,
+                    found: 7,
+                    rows_returned: 7,
+                    ..WorkloadCounters::default()
+                },
+                LatencyUnit::LookupBatchTransaction,
+                4,
             ),
             (
                 "table-scan",
                 "none",
-                "table-scan",
                 "num = 2, batch_size = 1",
+                WorkloadCounters {
+                    operations: 2,
+                    rows_returned: 16,
+                    ..WorkloadCounters::default()
+                },
+                LatencyUnit::TableScanBatchTransaction,
+                2,
             ),
             (
                 "index-scan",
                 "non-unique",
-                "index-scan",
                 "num = 3, range = 2, seed = 9, batch_size = 2",
+                WorkloadCounters {
+                    operations: 3,
+                    found: 3,
+                    rows_returned: 6,
+                    ..WorkloadCounters::default()
+                },
+                LatencyUnit::IndexScanBatchTransaction,
+                2,
             ),
             (
                 "index-stream",
                 "non-unique",
-                "index-stream",
                 "num = 3, range = 2, seed = 9",
+                WorkloadCounters {
+                    operations: 3,
+                    rows_returned: 6,
+                    ..WorkloadCounters::default()
+                },
+                LatencyUnit::IndexStreamTransaction,
+                3,
             ),
         ];
-        for (name, index, workload, controls) in read_cases {
+        for (name, index, controls, counters, unit, samples) in read_cases {
             let phases = format!(
                 "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"{index}\" }}\n\
              [[phase]]\nworkload = {{ type = \"insert-seq\", num = 8, batch_size = 4 }}\n\
              [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
-             workload = {{ type = \"{workload}\", {controls} }}\n"
+             workload = {{ type = \"{name}\", {controls} }}\n"
             );
             let (_root, report) = execute_plan(&temp, name, &phases);
-            assert_eq!(report.measured_runs.len(), 2);
-            assert_eq!(report.aggregate.measured_runs, 2);
+            assert_eq!(report.measured_runs.len(), 2, "{name}");
+            for (run_index, run) in report.measured_runs.iter().enumerate() {
+                assert_eq!(run.counters, counters, "{name} run {run_index}");
+                assert_eq!(run.latency.unit, unit, "{name} run {run_index}");
+                assert_eq!(run.latency.sample_count, samples, "{name} run {run_index}");
+            }
+            assert_eq!(report.aggregate.measured_runs, 2, "{name}");
             assert_eq!(
-                report.aggregate.counters.operations,
-                report
-                    .measured_runs
-                    .iter()
-                    .map(|run| run.counters.operations)
-                    .sum::<u64>()
+                report.aggregate.counters,
+                WorkloadCounters {
+                    operations: counters.operations * 2,
+                    found: counters.found * 2,
+                    rows_returned: counters.rows_returned * 2,
+                    ..WorkloadCounters::default()
+                },
+                "{name} aggregate"
             );
-            assert!(report.aggregate.latency.sample_count > 0);
+            assert_eq!(report.aggregate.latency.unit, unit, "{name} aggregate");
+            assert_eq!(
+                report.aggregate.latency.sample_count,
+                samples * 2,
+                "{name} aggregate"
+            );
         }
 
         let phases = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
@@ -407,8 +484,16 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         let (_root, report) = execute_plan(&temp, "index-ddl", phases);
         assert_eq!(report.aggregate.counters.operations, 2);
         assert_eq!(report.aggregate.latency.sample_count, 1);
+        assert_eq!(
+            report.aggregate.latency.unit,
+            LatencyUnit::IndexCreateDropCycle
+        );
     }
 
+    /// Purpose: Compare sequential-partition and sixteen-partition-target scans over the same
+    /// eight-row fixture with warmup and replay.
+    /// Expected: Both targets return 16 rows and two lifecycle samples per run; actual partitions
+    /// are positive, equal one for target one, and below sixteen for the larger target.
     #[test]
     fn parallel_table_scan_matches_target_one_cardinality_and_reports_actual_partitions() {
         let temp = TempDir::new().unwrap();
@@ -456,6 +541,11 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
+    /// Purpose: Replay seeded unique-key updates and non-unique payload updates with multiple
+    /// sessions.
+    /// Expected: Unique runs retain the same positive update count; both modes report only
+    /// successful update counters, with six or eight transaction samples per run and matching
+    /// aggregate samples.
     #[test]
     fn random_index_updates_replay_unique_keys_and_non_unique_payloads() {
         let temp = TempDir::new().unwrap();
@@ -493,6 +583,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 16);
     }
 
+    /// Purpose: Execute the checked-in random-update plan through the public benchmark CLI.
+    /// Expected: The summary identifies update-rand; all three runs report positive successful
+    /// updates and twelve transaction samples, totaling 36 samples.
     #[test]
     fn checked_in_update_template_executes_end_to_end() {
         let temp = TempDir::new().unwrap();
@@ -516,6 +609,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 36);
     }
 
+    /// Purpose: Execute the checked-in parallel-scan plan and validate its published summary and
+    /// partition metrics.
+    /// Expected: Three runs each report two scans, 20,000 rows, two samples, and positive actual
+    /// partitions for target four; the aggregate reports six scans and 60,000 rows.
     #[test]
     fn checked_in_parallel_scan_template_executes_end_to_end() {
         let temp = TempDir::new().unwrap();
@@ -550,6 +647,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 6);
     }
 
+    /// Purpose: Complete seeded shared session-lock operations over four tables across warmup and
+    /// two measured runs.
+    /// Expected: The subprocess exits successfully with the canonical report and exactly sixteen
+    /// measured operations and lifecycle samples.
     #[test]
     fn multi_table_lock_plan_replays_and_releases_all_claims() {
         let temp = TempDir::new().unwrap();
@@ -561,6 +662,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 16);
     }
 
+    /// Purpose: Execute named nested, conversion, enqueue, cancellation, promotion, first-touch,
+    /// and scope-close lock scenarios through the CLI.
+    /// Expected: Every scenario completes successfully and reports one operation and one lifecycle
+    /// sample with scenario-specific count diagnostics.
     #[test]
     fn specialized_lock_plans_coordinate_and_drain_participants() {
         let temp = TempDir::new().unwrap();
@@ -586,23 +691,23 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
+    /// Purpose: Validate a lookup plan whose preparation creates an index but loads no rows.
+    /// Expected: Execution fails with the loaded-data requirement before creating the root and
+    /// emits no success summary.
     #[test]
     fn invalid_dependent_plan_fails_before_root_creation() {
-        let temp = TempDir::new().unwrap();
-        let source = temp.path().join("invalid.toml");
-        fs::write(
-            &source,
+        assert_plan_rejected_before_root_creation(
             "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
          [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lookup-seq\", num = 1 }\n",
-        )
-        .unwrap();
-        let root = temp.path().join("invalid-root");
-        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
-        assert!(assert_failure(output).contains("requires loaded benchmark data"));
-        assert!(!root.exists());
+            "requires loaded benchmark data",
+        );
     }
 
+    /// Purpose: Create unique and non-unique indexes over hot, checkpointed, and mixed fixtures,
+    /// including seeded duplicate keys.
+    /// Expected: Reports match exact placement and table/index row counts, selected index and stats
+    /// modes, and one creation sample; duplicate non-unique rows survive, while unique creation
+    /// fails without success output or artifact.
     #[test]
     fn create_index_verifies_all_placements_modes_and_duplicate_multiplicity() {
         use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
@@ -697,6 +802,11 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
     }
 
+    /// Purpose: Checkpoint a proper frozen prefix of an eight-row table and inspect the CLI summary
+    /// and serialized breakdown.
+    /// Expected: Preparation retains nonempty proper-prefix metrics; the measured checkpoint
+    /// reports one lifecycle sample, attempts equal retries plus one, positive attempt time, and
+    /// matching summary counts.
     #[test]
     fn single_table_checkpoint_plan_publishes_canonical_metrics() {
         let temp = TempDir::new().unwrap();
@@ -752,6 +862,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         )));
     }
 
+    /// Purpose: Exercise named hot and checkpointed prefix-freeze requests that cannot install a
+    /// nonempty proper prefix.
+    /// Expected: Each case fails with the proper-prefix error, retains its root, and publishes
+    /// neither a success summary nor benchmark-result.toml.
     #[test]
     fn whole_page_freeze_failure_retains_root_without_success_artifact() {
         let temp = TempDir::new().unwrap();
@@ -796,6 +910,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
+    /// Purpose: Fully checkpoint a table, append eight large rows, then freeze and checkpoint a
+    /// prefix before freezing the remaining suffix.
+    /// Expected: Prefix and suffix both retain positive row and page counts, and their approximate
+    /// row counts sum to the eight appended rows.
     #[test]
     fn prefix_freeze_after_full_checkpoint_preserves_hot_suffix() {
         let temp = TempDir::new().unwrap();
@@ -829,6 +947,11 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(prefix_pages > 0 && suffix_pages > 0);
     }
 
+    /// Purpose: Recover named empty, sequential, seeded-random, indexed, and checkpointed fixtures
+    /// and round-trip their public reports.
+    /// Expected: Each recovery reports one operation/sample, verified table and row counts,
+    /// matching index coverage and redo accounting, stats selected by the plan, and an equal TOML
+    /// round-trip while retaining the root.
     #[test]
     fn recovery_verifies_empty_loaded_indexed_random_and_checkpoint_fixtures() {
         use doradb_bench::measurement::InternalMetricKind;
@@ -946,28 +1069,40 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
+    /// Purpose: Validate recovery configured with nondurable transaction logging.
+    /// Expected: The CLI rejects the plan with the fsync/fdatasync requirement before creating the
+    /// root or publishing a success summary.
     #[test]
     fn recovery_rejects_nondurable_plans_before_creating_root() {
-        let temp = TempDir::new().unwrap();
-        let source = temp.path().join("invalid.toml");
-        fs::write(&source, "[engine.transaction]\nlog_sync = 'none'\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'recovery' }").unwrap();
-        let root = temp.path().join("retained");
-        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
-        assert!(assert_failure(output).contains("fsync or fdatasync"));
-        assert!(!root.exists());
+        assert_plan_rejected_before_root_creation(
+            "[engine.transaction]\nlog_sync = 'none'\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'recovery' }",
+            "fsync or fdatasync",
+        );
     }
 
+    /// Purpose: Pause a recovery subprocess after old-engine teardown and resume it through
+    /// successful reopen.
+    /// Expected: The stopped process holds no file descriptor under the retained root and has no
+    /// result yet; one pause/resume pair precedes a successful report verifying all 512 rows.
     #[test]
     fn recovery_profiler_pause_follows_old_engine_teardown() {
         recovery_profiler_case(false);
     }
 
+    /// Purpose: Corrupt the storage marker while recovery is stopped after old-engine teardown,
+    /// then resume reopen.
+    /// Expected: The pause/resume protocol occurs exactly once, reopen fails, the root remains, and
+    /// no success summary or result file is published.
     #[test]
     fn recovery_reopen_failure_retains_root_without_success_output() {
         recovery_profiler_case(true);
     }
 
+    /// Purpose: Observe the public profiler pause after preparation and resume a benchmark with one
+    /// warmup and two measured runs.
+    /// Expected: The process is stopped with no success output or result before SIGCONT; afterward
+    /// it exits successfully and reports the pause flag, requested run counts, one prepare phase,
+    /// and four measured operations.
     #[test]
     fn profiler_pause_stops_before_benchmark_and_resumes_to_success() {
         let temp = TempDir::new().unwrap();

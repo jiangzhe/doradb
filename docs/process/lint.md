@@ -35,7 +35,11 @@ tools/style_audit.rs
 
 This command checks working-tree `.rs` files changed against
 `merge-base(origin/main, HEAD)` and reports formatting, clippy, and repository
-style violations. Scope-local structure checks also inspect the immediate items
+style and test-contract violations. After formatting and Clippy pass, it invokes
+`tools/test_audit.rs check --force-path` with the exact selected files; contract
+semantics and reports belong exclusively to that executable. Source extraction
+or child execution failure also fails the style gate. Scope-local structure
+checks also inspect the immediate items
 inside each file's top-level inline `#[cfg(test)] mod tests` module. File-level
 test-module placement and uniqueness checks remain limited to the file root.
 
@@ -53,6 +57,10 @@ tools/style_audit.rs --force-path <file-or-dir>
 
 Directory targets check only direct `.rs` children and do not recurse.
 
+After mechanical gates pass, complete the assertion and overlap review in
+[Unit Testing](unit-test.md#test-contracts-and-inventory). A mechanically valid
+contract does not establish that its assertions prove the described behavior.
+
 4. Run tests:
 
 ```bash
@@ -65,13 +73,17 @@ Repository hook (`.githooks/pre-commit`) enforces:
 
 1. no tracked unstaged changes or non-ignored untracked files
 2. `cargo fmt`
-3. `cargo clippy --workspace --all-targets -- -D warnings`
-4. `cargo deny check`
-5. `tools/error_audit.rs --write docs/public-error-audit.csv`
+3. `tools/test_audit.rs check --staged`, after formatting confirms no rewrites
+4. `cargo clippy --workspace --all-targets -- -D warnings`
+5. `cargo deny check`
+6. `tools/error_audit.rs --write docs/public-error-audit.csv`
 
 Stage or stash all non-ignored working-tree files before committing. This ensures
 the formatter, public-error audit, and unsafe inventory inspect the same source
 state as the Git index. Ignored build artifacts do not block commits.
+The test auditor independently reads index blobs, excluding the root `tools/`
+directory. Every test in a selected Rust file needs a contract, even if the
+staged edit only changes production code. There is no test-contract bypass switch.
 
 The public-error audit runs for every commit. If its tracked CSV changes, the
 hook prints the diff and requires the refreshed audit to be staged.
@@ -83,6 +95,17 @@ conditional unsafe-baseline refresh; the standard gates and public-error audit
 still run.
 
 ## CI Enforcement
+
+The build workflow calls the reusable `test-audit.yml` workflow only when
+`changes.outputs.run_build == 'true'`, using the existing build-change filter.
+It checks out the event source head with full history, runs the auditor and
+style-delegation tests, and checks contracts against the PR merge base or push's
+previous commit. Missing, all-zero, or unresolvable bases fail.
+
+Fresh CSV/Markdown artifacts are uploaded after auditor exit 0 or 1; extraction
+and execution failures do not publish stale reports. Aggregate `verify` accepts
+the intentional skip when no build changes are detected and requires audit
+success when `run_build` is true.
 
 CI build workflow runs strict clippy for both the default backend and the
 alternate `libaio` backend:

@@ -64,30 +64,41 @@ pub(crate) fn validate_batch_size(batch_size: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
     use clap::{CommandFactory, Parser};
 
+    /// Purpose: Accept explicit plan execution and reject missing required inputs or legacy
+    /// subcommands.
+    /// Expected: Long and short options preserve root and plan paths; missing plan or root without
+    /// an environment fallback, and cleanup/prepare/run subcommands fail parsing.
     #[test]
     fn plan_is_the_only_execution_surface() {
         Cli::command().debug_assert();
-        let plan =
-            Cli::try_parse_from(["doradb-bench", "--root", "root", "--plan", "p.toml"]).unwrap();
-        assert_eq!(plan.root, PathBuf::from("root"));
-        assert_eq!(plan.plan, PathBuf::from("p.toml"));
+        for (name, root_option, plan_option) in [
+            ("long-options", "--root", "--plan"),
+            ("short-options", "-r", "-p"),
+        ] {
+            let plan =
+                Cli::try_parse_from(["doradb-bench", root_option, "root", plan_option, "p.toml"])
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(plan.root, PathBuf::from("root"), "{name}");
+            assert_eq!(plan.plan, PathBuf::from("p.toml"), "{name}");
+        }
 
         assert!(Cli::try_parse_from(["doradb-bench", "--root", "root"]).is_err());
-        assert!(Cli::try_parse_from(["doradb-bench", "--plan", "p.toml"]).is_err());
+        let missing_root = Cli::command()
+            .mut_arg("root", |arg| arg.env(None::<&str>))
+            .try_get_matches_from(["doradb-bench", "--plan", "p.toml"])
+            .unwrap_err();
+        assert_eq!(missing_root.kind(), ErrorKind::MissingRequiredArgument);
         assert!(Cli::try_parse_from(["doradb-bench", "--root", "root", "cleanup"]).is_err());
         assert!(Cli::try_parse_from(["doradb-bench", "--root", "root", "prepare"]).is_err());
         assert!(Cli::try_parse_from(["doradb-bench", "--root", "root", "run"]).is_err());
     }
 
-    #[test]
-    fn short_options_select_plan_execution() {
-        let plan = Cli::try_parse_from(["doradb-bench", "-r", "root", "-p", "p.toml"]).unwrap();
-        assert_eq!(plan.root, PathBuf::from("root"));
-        assert_eq!(plan.plan, PathBuf::from("p.toml"));
-    }
-
+    /// Purpose: Validate worker counts at equal, smaller, and excessive thread-to-session ratios.
+    /// Expected: One thread with one or two sessions is accepted; two threads with one session
+    /// returns the exact ratio error.
     #[test]
     fn worker_threads_must_not_exceed_sessions() {
         validate_workers(1, 1).unwrap();

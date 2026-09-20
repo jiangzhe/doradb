@@ -620,6 +620,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Accumulate attempt and retry-wait durations at zero and u64 boundaries.
+    /// Expected: Boundary sums are exact, and overflowing each duration category returns its
+    /// labeled error.
     #[test]
     fn checkpoint_elapsed_accumulation_checks_overflow() {
         for label in [
@@ -636,6 +639,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Drive two delayed checkpoint outcomes followed by publication using a mock clock.
+    /// Expected: The exact delay reasons are waited on; three attempts total 30 ns, two waits total
+    /// 40 ns, and one lifecycle sample totals 70 ns.
     #[test]
     fn checkpoint_accounts_attempts_waits_and_one_total_sample() {
         let table_id = TableID::new(7);
@@ -679,6 +685,9 @@ mod tests {
         assert_eq!(latency.sum_nanos, 70);
     }
 
+    /// Purpose: Execute a successful preparation checkpoint with latency sampling disabled.
+    /// Expected: The outcome records one ten-nanosecond attempt, no retries or retry-wait time,
+    /// and no latency sample.
     #[test]
     fn checkpoint_prepare_retains_breakdown_without_a_latency_sample() {
         let table_id = TableID::new(7);
@@ -700,10 +709,16 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(result.metrics.attempt_count, 1);
+        assert_eq!(result.metrics.attempt_elapsed_nanos, 10);
         assert_eq!(result.metrics.retry_wait_count, 0);
+        assert_eq!(result.metrics.retry_wait_elapsed_nanos, 0);
         assert_eq!(result.measurement.latency.sample_count(), 0);
     }
 
+    /// Purpose: Execute checkpoint outcomes representing silent publication, table-drop
+    /// cancellation, or a public error.
+    /// Expected: Every named outcome is rejected rather than recorded as a successful benchmark
+    /// checkpoint.
     #[test]
     fn checkpoint_rejects_silent_publication_and_public_errors() {
         let table_id = TableID::new(7);
@@ -736,6 +751,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Cancel the benchmark run before requesting a checkpoint attempt.
+    /// Expected: The operation fails without consuming the queued checkpoint outcome or issuing a
+    /// retry wait.
     #[test]
     fn checkpoint_does_not_start_after_run_cancellation() {
         let table_id = TableID::new(7);
@@ -763,6 +781,8 @@ mod tests {
         assert!(session.waits.is_empty());
     }
 
+    /// Purpose: Cancel a checkpoint after an event confirms entry into a blocked retry wait.
+    /// Expected: The pending operation completes with an error before the hang watchdog expires.
     #[test]
     fn checkpoint_retry_wait_stops_after_run_cancellation() {
         smol::block_on(async {

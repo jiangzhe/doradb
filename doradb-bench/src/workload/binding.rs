@@ -396,6 +396,11 @@ mod tests {
     use std::path::Path;
     use tempfile::Builder;
 
+    /// Purpose: Prepare managed bindings, validate narrow/full resolutions, and execute a pre-
+    /// cancelled binding workload.
+    /// Expected: Wrong binding states, missing/mismatched metadata, and duplicate fixture
+    /// publication fail; cancellation records no operations, samples, or fixture, and sessions
+    /// finish cleanly.
     #[test]
     fn binding_fixture_rejects_wrong_results_and_cancellation_drains() {
         smol::block_on(async {

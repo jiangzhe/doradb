@@ -7,6 +7,16 @@ document is the source of truth for intended behavior when one exists.
 
 - [ ] Compare the tests against the task document and confirm the specified
       behavior, edge cases, and failure modes are covered.
+- [ ] Run the test-contract gate through `tools/style_audit.rs`; all tests in
+      each changed Rust file need nonempty `Purpose:` and `Expected:` documentation.
+- [ ] After mechanical gates pass, review changed tests and related inventory
+      entries against actual assertions, independent expected results, input
+      boundaries, deterministic state setup, seeds, and synchronization predicates.
+- [ ] Review exact duplicate-contract candidates plus nearby tests and shared
+      procedures with different wording. Before consolidation or deletion, account
+      for features/backends, public/component contracts, owner/lifecycle differences,
+      and independent oracles. Preserve named cases and case-specific diagnostics;
+      record why overlap remains or how each consolidated behavior is preserved.
 - [ ] Run the normal validation pass:
       `cargo nextest run --workspace`.
 - [ ] Run focused coverage for changed code with:

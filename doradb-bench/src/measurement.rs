@@ -1137,6 +1137,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    /// Purpose: Convert process CPU times and compute deltas across valid, negative, overflowing,
+    /// and decreasing inputs.
+    /// Expected: One second plus two nanoseconds becomes 1000000002; invalid times and negative
+    /// deltas fail, and live process CPU readings are nondecreasing.
     #[test]
     fn process_cpu_conversion_and_deltas_are_checked() {
         assert_eq!(
@@ -1182,6 +1186,9 @@ mod tests {
         assert!(process_cpu_delta(first, process_cpu_nanos().unwrap()).is_ok());
     }
 
+    /// Purpose: Compare equal and reversed raw timestamps using a mock measurement clock.
+    /// Expected: Equal timestamps yield zero elapsed nanoseconds and reversed timestamps return an
+    /// error.
     #[test]
     fn raw_timestamp_order_is_checked() {
         let (clock, _mock) = Clock::mock();
@@ -1192,6 +1199,8 @@ mod tests {
         assert!(clock.raw_delta_nanos(13, 12).is_err());
     }
 
+    /// Purpose: Convert durations at zero, one, and the largest representable u64 nanosecond count.
+    /// Expected: Boundary values round-trip exactly; one nanosecond beyond u64::MAX is rejected.
     #[test]
     fn duration_nanoseconds_conversion_checks_bounds() {
         for nanos in [0, 1, u64::MAX] {
@@ -1201,6 +1210,10 @@ mod tests {
         assert!(duration_nanos(too_large).is_err());
     }
 
+    /// Purpose: Advance the mock wall clock by 17 nanoseconds and compare timestamps in both
+    /// directions.
+    /// Expected: Equal timestamps yield zero, forward elapsed time is exactly 17, and reversal
+    /// fails.
     #[test]
     fn wall_timestamp_order_is_checked() {
         let (clock, mock) = MeasurementClock::mock();
@@ -1212,6 +1225,9 @@ mod tests {
         assert!(clock.wall_delta_nanos(end, start).is_err());
     }
 
+    /// Purpose: Merge latency samples [10, 20] and [30, 40] before computing a lifecycle summary.
+    /// Expected: The summary contains four samples, sum 100, average 25, and a 95th percentile of
+    /// at least 40 nanoseconds.
     #[test]
     fn merged_distribution_calculates_direct_percentiles() {
         let mut left = LatencyDistribution::new().unwrap();
@@ -1230,12 +1246,17 @@ mod tests {
         assert!(summary.p95_nanos >= 40);
     }
 
+    /// Purpose: Record a latency one nanosecond beyond the supported one-hour histogram limit.
+    /// Expected: Recording the out-of-range value returns an error.
     #[test]
     fn histogram_rejects_values_over_one_hour() {
         let mut distribution = LatencyDistribution::new().unwrap();
         assert!(distribution.record(HIGHEST_LATENCY_NANOS + 1).is_err());
     }
 
+    /// Purpose: Fill the latency sum to u64::MAX, then try recording and merging another sample.
+    /// Expected: Both overflowing updates fail without changing the summary or its single recorded
+    /// sample.
     #[test]
     fn latency_sum_overflow_rejects_record_and_merge() {
         let mut full = LatencyDistribution::new().unwrap();
@@ -1253,6 +1274,8 @@ mod tests {
         assert_eq!(full.histogram.len(), 1);
     }
 
+    /// Purpose: Merge updated-row counts normally and at the u64 overflow boundary.
+    /// Expected: Two plus three rows becomes five; adding one to u64::MAX fails.
     #[test]
     fn updated_row_counter_merge_is_checked() {
         let mut counters = WorkloadCounters {
@@ -1277,6 +1300,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Aggregate one operation over one second and another operation over three seconds.
+    /// Expected: Total elapsed time is four seconds and throughput is 0.5 operations per second.
     #[test]
     fn aggregate_uses_total_wall_duration() {
         let mut latency = LatencyDistribution::new().unwrap();
@@ -1307,6 +1332,8 @@ mod tests {
         assert_eq!(result.operations_per_second, 0.5);
     }
 
+    /// Purpose: Add a measured run after accumulating u64::MAX nanoseconds of wall time.
+    /// Expected: Adding one more nanosecond returns the measured-wall-duration overflow diagnostic.
     #[test]
     fn aggregate_wall_duration_overflow_is_checked() {
         let mut latency = LatencyDistribution::new().unwrap();
@@ -1325,6 +1352,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Serialize internal metric values at unsigned boundaries and decode invalid numeric
+    /// representations.
+    /// Expected: Zero, one, and u64::MAX remain numeric and round-trip; negative, overflowing, and
+    /// quoted values are rejected.
     #[test]
     fn metrics_serialize_as_unsigned_integers() {
         for value in [0, 1, u64::MAX] {
@@ -1346,6 +1377,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Round-trip scan, freeze, checkpoint, and catalog metrics through their tagged TOML
+    /// representations.
+    /// Expected: All metric records retain their values; the obsolete catalog tag and unknown
+    /// freeze fields fail decoding.
     #[test]
     fn workload_metrics_round_trip_strictly() {
         let cases = vec![
@@ -1435,6 +1470,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Read resident pages from statm text and convert them to bytes with checked
+    /// multiplication.
+    /// Expected: Seven 4096-byte pages produce 28672 bytes; missing, malformed, or overflowing
+    /// resident-page values fail.
     #[test]
     fn process_rss_parser_checks_shape_and_overflow() {
         assert_eq!(parse_statm_rss("100 7 2 1\n", 4_096).unwrap(), 28_672);
@@ -1443,6 +1482,10 @@ mod tests {
         assert!(parse_statm_rss("1 2\n", usize::MAX).is_err());
     }
 
+    /// Purpose: Start and stop the real process RSS sampler and inspect its returned peak
+    /// accounting.
+    /// Expected: The sampled peak is at least the baseline, and peak-above-baseline equals their
+    /// saturating difference.
     #[test]
     fn process_rss_sampler_synchronizes_and_returns_a_nondecreasing_peak() {
         let sample = ProcessRssSampler::start().unwrap().stop().unwrap();
@@ -1453,6 +1496,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Read RSS from a statm path that does not exist inside a temporary directory.
+    /// Expected: The error identifies the failed process-RSS read.
     #[test]
     fn process_rss_reader_rejects_unavailable_input() {
         let temp = TempDir::new().unwrap();
@@ -1460,6 +1505,10 @@ mod tests {
         assert!(error.to_string().contains("failed to read process RSS"));
     }
 
+    /// Purpose: Convert recovery report, phase, and redo durations at and beyond u64 nanosecond
+    /// limits.
+    /// Expected: Maximum values are preserved numerically and round-trip; overflowing durations at
+    /// each tested level are rejected.
     #[test]
     fn recovery_duration_conversion_and_numeric_round_trip_check_bounds() {
         let duration = Duration::from_nanos(u64::MAX);
@@ -1496,6 +1545,9 @@ mod tests {
         assert!(RecoveryReport::from_storage(&storage).is_err());
     }
 
+    /// Purpose: Convert distinct top-level recovery timing values from the storage report.
+    /// Expected: Total, engine, catalog, transaction, and runtime fields preserve 110, 11, 22, 33,
+    /// and 44 nanoseconds respectively.
     #[test]
     fn recovery_report_duration_conversion_preserves_field_mapping() {
         let storage = StorageRecoveryReport {
@@ -1518,6 +1570,9 @@ mod tests {
         assert_eq!(report.runtime_startup_elapsed_nanos, 44);
     }
 
+    /// Purpose: Convert ten distinct storage recovery phase durations.
+    /// Expected: Each named phase retains its assigned nanosecond value from one through ten
+    /// without swapping fields.
     #[test]
     fn recovery_phase_duration_conversion_preserves_field_mapping() {
         let storage = StorageRecoveryPhaseTimings {
@@ -1545,6 +1600,10 @@ mod tests {
         assert_eq!(phases.other_elapsed_nanos, 10);
     }
 
+    /// Purpose: Validate redo consumed/payload byte relationships at zero, equality, ordinary
+    /// values, and u64 boundaries.
+    /// Expected: Payload sizes at or below consumed bytes pass; larger payloads return the exact
+    /// accounting error.
     #[test]
     fn recovery_redo_payload_cannot_exceed_consumed_bytes() {
         for (consumed_bytes, validated_payload_bytes, valid) in [
@@ -1580,6 +1639,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Overflow bootstrap, phase, replay, refill, and row-accounting sums independently.
+    /// Expected: Every named case returns recovery metric sum overflow rather than wrapping.
     #[test]
     fn recovery_accounting_sums_reject_overflow() {
         let empty = RecoveryReport::from_storage(&StorageRecoveryReport::default()).unwrap();
@@ -1613,6 +1674,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Convert recovery reports with saturation, unaccounted row operations, and
+    /// inconsistent refill timing.
+    /// Expected: The empty and balanced skipped-row reports pass; saturation and mismatched row or
+    /// timing totals fail.
     #[test]
     fn recovery_conversion_rejects_saturation_and_inconsistent_accounting() {
         let mut report = StorageRecoveryReport::default();

@@ -1,0 +1,56 @@
+name: test-audit
+
+on:
+  workflow_call:
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout event source revision
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        fetch-depth: 0
+    - name: Setup audit Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: nightly-2026-05-22
+    - name: Test audit tooling
+      run: |
+        cargo +nightly-2026-05-22 -Zscript test --manifest-path tools/test_audit.rs
+        cargo +nightly-2026-05-22 -Zscript test --manifest-path tools/style_audit.rs
+    - name: Check complete event test contracts
+      id: audit
+      env:
+        TEST_AUDIT_EVENT: ${{ github.event_name }}
+        TEST_AUDIT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        base="$TEST_AUDIT_BASE"
+        if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+          echo "test-audit: missing or all-zero event base" >&2
+          exit 2
+        fi
+        if [[ "$TEST_AUDIT_EVENT" == "pull_request" ]]; then
+          base="$(git merge-base "$base" HEAD)"
+        fi
+
+        code=0
+        tools/test_audit.rs check --diff-base "$base" || code=$?
+        if [[ "$code" == 0 || "$code" == 1 ]]; then
+          # Only these exit codes guarantee freshly extracted reports.
+          echo 'fresh_reports=true' >> "$GITHUB_OUTPUT"
+        fi
+        exit "$code"
+    - name: Upload test inventory
+      if: ${{ always() && steps.audit.outputs.fresh_reports == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-inventory
+        if-no-files-found: error
+        path: |
+          target/test-audit/test-inventory.csv
+          target/test-audit/test-inventory.md

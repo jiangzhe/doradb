@@ -273,7 +273,8 @@ impl Drop for WriteGuardRollback<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::join3;
+    use futures::future::join;
+    use futures::poll;
     use parking_lot::lock_api::RawRwLock as RawRwLockApi;
     use smol::Timer;
     use smol::future::or;
@@ -339,6 +340,8 @@ mod tests {
     // SAFETY: shared references are synchronized by `RawRwLock`.
     unsafe impl Sync for Counter {}
 
+    /// Purpose: Poll shared and exclusive waiters while an exclusive lock is held, then release it.
+    /// Expected: Try-locks fail while held; each waiter is pending, receives a wake, acquires its mode, and unlocks cleanly.
     #[test]
     fn test_raw_rwlock_ops() {
         for exclusive in [false, true] {
@@ -383,6 +386,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Exercise exclusive increments from ten threads through the synchronous lock path.
+    /// Expected: After all threads join, the counter contains exactly 100 increments.
     #[test]
     fn test_raw_rwlock_sync() {
         let counter = Arc::new(Counter::new());
@@ -404,6 +409,8 @@ mod tests {
         assert!(counter.val() == 100);
     }
 
+    /// Purpose: Exercise exclusive increments from ten threads through the asynchronous lock path.
+    /// Expected: After all async workers finish and threads join, the counter contains exactly 100 increments.
     #[test]
     fn test_raw_rwlock_async() {
         let counter = Arc::new(Counter::new());
@@ -426,6 +433,8 @@ mod tests {
         assert!(counter.val() == 100);
     }
 
+    /// Purpose: Register two pending writers before releasing the initial exclusive lock in 128 schedules.
+    /// Expected: Both writers acquire and release within the hang watchdog, leaving the lock unlocked.
     #[test]
     fn test_raw_rwlock_async_waiting_writers_progress_after_single_unlock() {
         const ITERS: usize = 128;
@@ -455,19 +464,16 @@ mod tests {
                         }
                     }
                 };
-                let release = {
-                    let rw = Arc::clone(&rw);
-                    async move {
-                        Timer::after(Duration::from_millis(1)).await;
-                        // SAFETY: the test still owns the initial exclusive
-                        // lock until this release path runs.
-                        unsafe {
-                            rw.unlock_exclusive();
-                        }
-                    }
-                };
+                let mut waiter1 = pin!(waiter1);
+                let mut waiter2 = pin!(waiter2);
+                assert!(poll!(waiter1.as_mut()).is_pending());
+                assert!(poll!(waiter2.as_mut()).is_pending());
+                // SAFETY: both waiters are pending, and this test still owns
+                // the initial exclusive acquisition.
+                unsafe { rw.unlock_exclusive() };
                 let all = async {
-                    join3(waiter1, waiter2, release).await;
+                    join(waiter1, waiter2).await;
+                    assert!(!rw.is_locked());
                 };
                 or(all, async {
                     Timer::after(Duration::from_secs(1)).await;

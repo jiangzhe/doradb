@@ -446,6 +446,10 @@ mod tests {
         KeyRange { start: 0, len: 3 }
     }
 
+    /// Purpose: Merge distinct counter and latency contributions, including an overflowing
+    /// operation count.
+    /// Expected: Merged counters contain five operations, five updated rows, one found result, and
+    /// two latency samples; operation overflow returns the named counter error.
     #[test]
     fn shared_measurement_merge_is_checked_and_additive() {
         let mut aggregate = SessionMeasurement {
@@ -473,8 +477,26 @@ mod tests {
         assert_eq!(aggregate.counters.updated_rows, 5);
         assert_eq!(aggregate.counters.found, 1);
         assert_eq!(aggregate.latency.sample_count(), 2);
+
+        let overflow = SessionMeasurement {
+            counters: WorkloadCounters {
+                operations: u64::MAX,
+                ..WorkloadCounters::default()
+            },
+            latency: LatencyDistribution::new().unwrap(),
+        };
+        assert_eq!(
+            merge_measurement(&mut aggregate, overflow)
+                .unwrap_err()
+                .to_string(),
+            "workload counter overflow: operations"
+        );
     }
 
+    /// Purpose: Validate sample counts, operation counters, read-hit expectations, and fixture-
+    /// effect shapes.
+    /// Expected: Matching zero-sample/simple/read shapes pass; wrong totals, unexpected updates,
+    /// hit mismatches, and nonempty fixture effects fail.
     #[test]
     fn shared_verification_helpers_reject_wrong_shapes() {
         let latency = LatencyDistribution::new().unwrap();
@@ -509,6 +531,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Check absent bindings and extract an explicitly supplied two-table pool.
+    /// Expected: No-binding validation succeeds, missing primary/pool bindings fail, and pool
+    /// extraction retains table IDs seven and eight.
     #[test]
     fn shared_binding_helpers_enforce_binding_shapes() {
         require_no_binding(FixtureBinding::None, "none").unwrap();
@@ -523,6 +548,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Split ten consecutive keys beginning at 100 among four sessions.
+    /// Expected: The four plans have counts [3, 3, 2, 2] and starts [100, 103, 106, 108].
     #[test]
     fn partition_rows_across_sessions() {
         let plans = build_session_plans(
@@ -544,6 +571,8 @@ mod tests {
         assert_eq!(plans[3].key_start, 108);
     }
 
+    /// Purpose: Attempt to partition a nonempty key range across zero sessions.
+    /// Expected: Session-plan construction returns an error.
     #[test]
     fn reject_zero_sessions() {
         assert!(
@@ -558,48 +587,44 @@ mod tests {
         );
     }
 
+    /// Purpose: Bound a transaction batch by both configured size and remaining operations.
+    /// Expected: Configured/remaining sizes of three and ten in either order produce a batch of
+    /// three.
     #[test]
     fn effective_batch_size_uses_configured_limit() {
         assert_eq!(effective_batch_size(3, 10).unwrap(), 3);
         assert_eq!(effective_batch_size(10, 3).unwrap(), 3);
     }
 
+    /// Purpose: Generate 64 random insert keys with replacement for unindexed and non-unique modes.
+    /// Expected: Seed 42 reproduces the sequence, and seed two produces repeated keys in each mode.
     #[test]
-    fn random_insert_none_is_deterministic() {
+    fn random_insert_with_replacement_is_seeded_and_allows_duplicates() {
         let plan = SessionPlan {
             session_index: 0,
             key_start: 10,
             number: 64,
         };
-        let first = generate_insert_keys(true, IndexMode::None, 42, &plan).unwrap();
-        let second = generate_insert_keys(true, IndexMode::None, 42, &plan).unwrap();
-        assert_eq!(first, second);
+        for (name, index) in [
+            ("unindexed", IndexMode::None),
+            ("non-unique", IndexMode::NonUnique),
+        ] {
+            let generate = |seed| {
+                generate_insert_keys(true, index, seed, &plan)
+                    .unwrap_or_else(|error| panic!("{name}, seed {seed}: {error}"))
+            };
+            assert_eq!(generate(42), generate(42), "{name}: seeded replay");
+            let keys = generate(2);
+            let unique: HashSet<_> = keys.iter().copied().collect();
+            assert!(
+                unique.len() < keys.len(),
+                "{name}: seed two must produce duplicates"
+            );
+        }
     }
 
-    #[test]
-    fn random_insert_none_can_generate_duplicates() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            number: 64,
-        };
-        let keys = generate_insert_keys(true, IndexMode::None, 2, &plan).unwrap();
-        let unique: HashSet<_> = keys.iter().copied().collect();
-        assert!(unique.len() < keys.len());
-    }
-
-    #[test]
-    fn random_insert_non_unique_can_generate_duplicates() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 10,
-            number: 64,
-        };
-        let keys = generate_insert_keys(true, IndexMode::NonUnique, 2, &plan).unwrap();
-        let unique: HashSet<_> = keys.iter().copied().collect();
-        assert!(unique.len() < keys.len());
-    }
-
+    /// Purpose: Generate unindexed random inserts whose two-key range begins at u64::MAX.
+    /// Expected: Key generation returns an overflow error instead of wrapping the range.
     #[test]
     fn random_insert_none_rejects_key_overflow() {
         let plan = SessionPlan {
@@ -610,6 +635,9 @@ mod tests {
         assert!(generate_insert_keys(true, IndexMode::None, 0, &plan).is_err());
     }
 
+    /// Purpose: Generate unique-index permutations of keys 10 through 73 using seeds 42 and 43.
+    /// Expected: Repeated seed 42 reproduces the sequence, seed 43 changes it, and every key
+    /// appears exactly once.
     #[test]
     fn random_insert_unique_is_seeded_duplicate_free_coverage() {
         let plan = SessionPlan {
@@ -630,6 +658,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Generate 64 table selections from a three-table pool using seeds 11 and 12.
+    /// Expected: Seed 11 repeats exactly, seed 12 differs, all indexes are below three, and
+    /// selections include duplicates.
     #[test]
     fn random_table_indexes_are_seeded_bounded_and_with_replacement() {
         let plan = SessionPlan {
@@ -652,6 +683,8 @@ mod tests {
         assert!(first.iter().copied().collect::<HashSet<_>>().len() < first.len());
     }
 
+    /// Purpose: Generate four random table selections when only one table exists.
+    /// Expected: Every generated index is zero.
     #[test]
     fn random_table_indexes_support_one_table() {
         let plan = SessionPlan {
@@ -663,6 +696,8 @@ mod tests {
         assert!((0..plan.number).all(|_| generator.next_index() == 0));
     }
 
+    /// Purpose: Generate sequential unindexed inserts for four keys beginning at ten.
+    /// Expected: The generated sequence is exactly [10, 11, 12, 13].
     #[test]
     fn sequential_insert_uses_ordered_keys() {
         let plan = SessionPlan {
@@ -676,6 +711,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Generate a 31-byte payload twice for the same inputs and once with a changed key.
+    /// Expected: Repeated inputs produce equal 31-byte payloads; changing key seven to eight
+    /// changes the bytes.
     #[test]
     fn payload_generation_is_deterministic_and_sized() {
         let first = generate_payload(7, 11, 31);
@@ -685,32 +723,31 @@ mod tests {
         assert_ne!(first, generate_payload(8, 11, 31));
     }
 
+    /// Purpose: Wrap sequential reads over three loaded keys from the range start or session offset four.
+    /// Expected: Eight reads from the start yield [0, 1, 2, 0, 1, 2, 0, 1]; four offset reads yield [1, 2, 0, 1].
     #[test]
-    fn sequential_reads_wrap_over_loaded_range() {
-        let plan = SessionPlan {
-            session_index: 0,
-            key_start: 0,
-            number: 8,
-        };
-        assert_eq!(
-            generate_sequential_read_keys(loaded_range(), &plan).unwrap(),
-            vec![0, 1, 2, 0, 1, 2, 0, 1]
-        );
+    fn sequential_reads_wrap_and_preserve_session_offsets() {
+        for (name, session_index, key_start, number, expected) in [
+            ("range-start", 0, 0, 8, vec![0, 1, 2, 0, 1, 2, 0, 1]),
+            ("session-offset", 1, 4, 4, vec![1, 2, 0, 1]),
+        ] {
+            let plan = SessionPlan {
+                session_index,
+                key_start,
+                number,
+            };
+            assert_eq!(
+                generate_sequential_read_keys(loaded_range(), &plan)
+                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                expected,
+                "{name}"
+            );
+        }
     }
 
-    #[test]
-    fn sequential_reads_use_plan_start_as_request_offset() {
-        let plan = SessionPlan {
-            session_index: 1,
-            key_start: 4,
-            number: 4,
-        };
-        assert_eq!(
-            generate_sequential_read_keys(loaded_range(), &plan).unwrap(),
-            vec![1, 2, 0, 1]
-        );
-    }
-
+    /// Purpose: Generate 16 random reads over three loaded keys using seeds 11 and 12.
+    /// Expected: Seed 11 repeats exactly, seed 12 differs, and every key lies inside the loaded
+    /// range.
     #[test]
     fn random_reads_are_seeded_and_bounded() {
         let plan = SessionPlan {
@@ -726,6 +763,10 @@ mod tests {
         assert!(first.iter().all(|key| *key < loaded_range().len));
     }
 
+    /// Purpose: Generate three-row scan ranges within loaded keys 10 through 17 using seeds 11 and
+    /// 12.
+    /// Expected: Repeated seeds reproduce ranges, changed seeds differ, every range fits, and the
+    /// last valid endpoint is exercised.
     #[test]
     fn random_scan_ranges_are_seeded_and_bounded() {
         let loaded_range = KeyRange { start: 10, len: 8 };
@@ -760,6 +801,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Generate random scans whose length equals the entire loaded range.
+    /// Expected: Both requested scans equal the full range starting at ten with length eight.
     #[test]
     fn full_random_scan_range_has_one_valid_start() {
         let loaded_range = KeyRange { start: 10, len: 8 };
@@ -773,6 +816,8 @@ mod tests {
         assert_eq!(ranges.next_range().unwrap(), loaded_range);
     }
 
+    /// Purpose: Construct scan generators with zero length or length greater than the loaded range.
+    /// Expected: Both invalid scan lengths are rejected.
     #[test]
     fn random_scan_range_rejects_invalid_lengths() {
         let plan = SessionPlan {
@@ -784,6 +829,8 @@ mod tests {
         assert!(RandomScanRangeGenerator::new(0, loaded_range(), 4, &plan).is_err());
     }
 
+    /// Purpose: Generate sequential and random reads when no loaded keys exist.
+    /// Expected: Both generation paths return errors for the empty loaded range.
     #[test]
     fn read_generation_rejects_empty_loaded_range() {
         let plan = SessionPlan {

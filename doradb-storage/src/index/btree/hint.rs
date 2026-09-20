@@ -184,6 +184,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Verify the persisted little-endian hint layout.
+    /// Expected: Slot 3 contains [4, 3, 2, 1] and reads back as 0x01020304.
     #[test]
     fn test_btree_hints_store_little_endian_heads() {
         let mut hints = BTreeHints::new_zeroed();
@@ -193,18 +195,24 @@ mod tests {
         assert_eq!(hints.heads()[3], 0x0102_0304);
     }
 
+    /// Purpose: Check AVX2 hint bounds at duplicates, endpoints, gaps, and the signed-bit boundary.
+    /// Expected: SIMD and persisted searches match the explicit lower/upper positions in every probe.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn test_btree_search_hints_avx2() {
         assert_hint_bounds();
     }
 
+    /// Purpose: Check scalar hint bounds at duplicates, endpoints, gaps, and the signed-bit boundary.
+    /// Expected: Scalar and persisted searches match the explicit lower/upper positions in every probe.
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     #[test]
     fn test_btree_search_hints_scalar() {
         assert_hint_bounds();
     }
 
+    /// Purpose: Compare AVX2 bounds with independent counts for 1,000 ChaCha8 cases seeded with 312.
+    /// Expected: Every stored and sampled key matches counts of heads below and at-or-below it, with seed/case diagnostics.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn test_btree_search_hints_consistency() {

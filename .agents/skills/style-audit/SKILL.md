@@ -38,13 +38,26 @@ targets check only direct `.rs` children and do not recurse.
    - branch-diff modes run `cargo fmt --all -- --check`;
    - forced-path mode runs `rustfmt --edition 2024 --check <forced files>`;
    - `cargo clippy --workspace --all-targets -- -D warnings`;
+   - delegated `tools/test_audit.rs check --force-path` for exactly the selected
+     files after formatting and Clippy pass; every source-visible test in each
+     file needs literal, nonempty `Purpose:` and `Expected:` documentation above
+     other attributes, even when only production code changed;
    - Rust style structure checks.
    - top-level private `#[cfg(test)] use` imports must move into the
      `#[cfg(test)]` module that directly uses them.
 3. If formatting or clippy fails, stop and report that gate failure. Do not continue with manual style review.
 4. If verifier diagnostics exist, report a concise summary grouped by file and rule.
 5. If no branch-diff or forced-path Rust files exist, report that no Rust style audit was needed.
-6. Do not edit files, run `cargo fmt`, run `cargo clippy --fix`, stage files, or otherwise mutate tracked repository state.
+6. After mechanical gates pass, follow the test-audit skill's
+   [Semantic Review](../test-audit/SKILL.md#semantic-review) for assertions,
+   deterministic setup, and overlapping scenarios. Reuse the exact selected
+   files and source snapshot plus the fresh `target/test-audit/` inventory.
+   Start at that review section; do not rerun the auditor or select a new scope.
+7. Do not edit files, run `cargo fmt`, run `cargo clippy --fix`, stage files, or otherwise mutate tracked repository state.
+
+Reports are ignored derived artifacts. Source comments are authoritative; do
+not edit inventories as approvals. `documented` means structurally valid only.
+Child contract violations and extraction/execution errors fail the verifier.
 
 ## Report Format
 
@@ -54,6 +67,8 @@ Keep the output short:
 - include the number of Rust files checked and whether they were branch-diff
   or forced-path targets;
 - list each violation as `path:line rule - message`;
+- summarize assertion/overlap findings and retained conditional or lifecycle
+  coverage, with actionable source locations;
 - include fmt/clippy command output only when that gate fails, trimmed to the actionable part.
 
 ## Fallback
