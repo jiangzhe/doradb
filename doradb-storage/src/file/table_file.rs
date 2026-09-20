@@ -831,10 +831,11 @@ mod tests {
     };
     use crate::error::RuntimeOrFatalError;
     use crate::error::{
-        DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, Result,
+        DataIntegrityError, DiscloseError, DiscloseResultExt, Error, ErrorKind, IoError, Result,
         RuntimeError,
     };
-    use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use crate::file::cow_file::tests::corrupt_page_checksum;
+    use crate::file::fs::FileSystem;
     use crate::file::{BlockKey, FileKind, build_test_fs, build_test_fs_in, test_block_id};
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
@@ -842,7 +843,7 @@ mod tests {
     use crate::value::ValKind;
     use std::any::Any;
     use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{ErrorKind as IoErrorKind, Seek, SeekFrom, Write};
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     struct TestLwcBlock {
@@ -957,6 +958,55 @@ mod tests {
         buf
     }
 
+    async fn committed_table_file(fs: &FileSystem, table_id: TableID) -> Arc<TableFile> {
+        let mutable = fs
+            .create_table_file(table_id, build_test_metadata(), false)
+            .unwrap();
+        let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
+        assert!(old_root.is_none());
+        table_file
+    }
+
+    fn lwc_block(start: u64, end: u64, payload: &[u8]) -> TestLwcBlock {
+        TestLwcBlock {
+            shape: ColumnBlockEntryShape::new(
+                RowID::new(start),
+                RowID::new(end),
+                (start..end).map(RowID::new).collect(),
+                Vec::new(),
+            ),
+            buf: page_buf(payload),
+        }
+    }
+
+    async fn cache_free_blocks(
+        table_file: &Arc<TableFile>,
+        pool: &QuiescentGuard<ReadonlyBufferPool>,
+        count: usize,
+    ) -> Vec<BlockID> {
+        let block_ids = first_unallocated_blocks(table_file.active_root_unchecked(), count);
+        assert_eq!(block_ids.len(), count);
+        let guard = pool.create_base_guard();
+        for &block_id in &block_ids {
+            let cached = pool
+                .read_raw_block(
+                    table_file.file_kind(),
+                    table_file.sparse_file(),
+                    &guard,
+                    block_id,
+                )
+                .await
+                .unwrap();
+            drop(cached);
+            let key = BlockKey::new(table_file.sparse_file().file_id(), block_id);
+            assert!(
+                pool.try_get_frame_id(&key).is_some(),
+                "missing cached block {block_id}"
+            );
+        }
+        block_ids
+    }
+
     fn first_unallocated_blocks(root: &ActiveRoot, count: usize) -> Vec<BlockID> {
         (1..root.alloc_map.len())
             .filter(|idx| !root.alloc_map.is_allocated(*idx))
@@ -992,24 +1042,52 @@ mod tests {
         assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 
+    fn assert_read_io_error(err: RuntimeOrFatalError, expected: IoErrorKind) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected a buffer read error, got {err:?}");
+        };
+        assert_eq!(*err.current_context(), RuntimeError::BufferPageAccess);
+        assert_eq!(
+            err.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(expected),
+            "{err:?}"
+        );
+    }
+
+    async fn check_meta_corruption(
+        table_id: TableID,
+        corrupt: impl FnOnce(&str, BlockID),
+        expected: DataIntegrityError,
+    ) {
+        let (temp_dir, fs) = build_test_fs();
+        let path = fs.user_table_file_path(table_id);
+        let table_file = committed_table_file(&fs, table_id).await;
+        let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
+        drop(table_file);
+        drop(fs);
+        corrupt(&path, active_meta_block_id);
+
+        let fs = build_test_fs_in(temp_dir.path());
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let err = match fs
+            .open_table_file(table_id, global.guard(), &global.create_base_guard())
+            .await
+        {
+            Ok(_) => panic!("expected table metadata corruption: {expected:?}"),
+            Err(err) => err,
+        };
+        assert_table_meta_corruption(err.disclose(), active_meta_block_id, expected);
+        assert_eq!(global.allocated(), 0);
+    }
+
+    /// Purpose: Protect table-file publication, payload access, and secondary-root updates.
+    /// Expected: Persisted data and roots remain readable while invalid root updates are rejected.
     #[test]
     fn test_table_file() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = Arc::new(
-                TableMetadata::try_new(
-                    vec![
-                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
-                    ],
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::PK,
-                    )],
-                )
-                .expect("valid table metadata"),
-            );
+            let metadata = build_test_metadata();
             let table_id = test_user_table_id(41);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
@@ -1126,16 +1204,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Restrict table-file rollback to allocations owned by the current mutable fork.
+    /// Expected: Fresh blocks are reclaimed once; inherited blocks and repeated rollback are rejected.
     #[test]
     fn test_mutable_table_file_rolls_back_only_current_fork_allocations() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(143);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
@@ -1193,30 +1270,23 @@ mod tests {
         });
     }
 
+    /// Purpose: Invalidate cached table pages when a reused block is written.
+    /// Expected: Allocation retains the cached mapping and the completed write removes it.
     #[test]
     fn test_mutable_table_file_write_block_invalidates_readonly_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(147);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.create_base_guard();
-            let block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
+            let block_id = cache_free_blocks(&table_file, disk_pool.global_pool(), 1)
+                .await
                 .pop()
                 .unwrap();
             let key = BlockKey::new(FileID::from(table_id), block_id);
-            let cached = disk_pool
-                .read_raw_block(&disk_pool_guard, block_id)
-                .await
-                .unwrap();
-            drop(cached);
-            assert!(global.try_get_frame_id(&key).is_some());
 
             let mut mutable = MutableTableFile::fork(
                 &table_file,
@@ -1239,30 +1309,23 @@ mod tests {
         });
     }
 
+    /// Purpose: Invalidate cached metadata when a table commit reuses a free block.
+    /// Expected: Publication selects the reused block and removes its stale readonly mapping.
     #[test]
     fn test_mutable_table_file_commit_invalidates_reused_meta_block() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(148);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
-            let disk_pool_guard = disk_pool.create_base_guard();
-            let meta_block_id = first_unallocated_blocks(table_file.active_root_unchecked(), 1)
+            let meta_block_id = cache_free_blocks(&table_file, disk_pool.global_pool(), 1)
+                .await
                 .pop()
                 .unwrap();
             let key = BlockKey::new(FileID::from(table_id), meta_block_id);
-            let cached = disk_pool
-                .read_raw_block(&disk_pool_guard, meta_block_id)
-                .await
-                .unwrap();
-            drop(cached);
-            assert!(global.try_get_frame_id(&key).is_some());
 
             let mutable = MutableTableFile::fork(
                 &table_file,
@@ -1283,54 +1346,25 @@ mod tests {
         });
     }
 
+    /// Purpose: Invalidate reused pages during LWC and column-index persistence.
+    /// Expected: Newly allocated data and index blocks lose their stale readonly mappings.
     #[test]
     fn test_mutable_table_file_lwc_and_column_index_writes_invalidate_readonly_mapping() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(149);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let disk_pool_guard = disk_pool.create_base_guard();
             let before_root = table_file.active_root_unchecked().clone();
-            let cached_blocks = first_unallocated_blocks(&before_root, 8);
-            for block_id in &cached_blocks {
-                let cached = disk_pool
-                    .read_raw_block(&disk_pool_guard, *block_id)
-                    .await
-                    .unwrap();
-                drop(cached);
-                assert!(
-                    global
-                        .try_get_frame_id(&BlockKey::new(FileID::from(table_id), *block_id))
-                        .is_some()
-                );
-            }
+            let cached_blocks = cache_free_blocks(&table_file, disk_pool.global_pool(), 8).await;
 
             let lwc_blocks = vec![
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(0),
-                        RowID::new(10),
-                        (0..10).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"reuse-lwc-1"),
-                },
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(10),
-                        RowID::new(20),
-                        (10..20).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"reuse-lwc-2"),
-                },
+                lwc_block(0, 10, b"reuse-lwc-1"),
+                lwc_block(10, 20, b"reuse-lwc-2"),
             ];
             let mut mutable = MutableTableFile::fork(
                 &table_file,
@@ -1371,16 +1405,14 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject readonly-buffer requests beyond the end of a table file.
+    /// Expected: The read preserves the unexpected-end I/O error within buffer-access context.
     #[test]
     fn test_readonly_buffer_read_propagates_io_failure() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_id = test_user_table_id(145);
-            let table_file = fs
-                .create_table_file(table_id, build_test_metadata(), false)
-                .unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
@@ -1389,30 +1421,21 @@ mod tests {
             let res = disk_pool
                 .read_validated_block(&disk_pool_guard, out_of_range_page_id, accept_any_page)
                 .await;
-            assert!(res.is_err());
+            let err = res.err().expect("reading beyond the file must fail");
+            assert_read_io_error(err, IoErrorKind::UnexpectedEof);
 
             drop(table_file);
             drop(fs);
         });
     }
 
+    /// Purpose: Reject table-file reads after the owning file system shuts down.
+    /// Expected: A new readonly-buffer request reports the closed request channel as an I/O error.
     #[test]
     fn test_table_file_system() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
-            let metadata = Arc::new(
-                TableMetadata::try_new(
-                    vec![
-                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
-                    ],
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::PK,
-                    )],
-                )
-                .expect("valid table metadata"),
-            );
+            let metadata = build_test_metadata();
             let table_id = test_user_table_id(42);
             let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
             let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
@@ -1440,7 +1463,10 @@ mod tests {
                     accept_any_page,
                 )
                 .await;
-            assert!(res.is_err());
+            let err = res
+                .err()
+                .expect("reading after file-system shutdown must fail");
+            assert_read_io_error(err, IoErrorKind::BrokenPipe);
 
             drop(disk_pool_guard);
             drop(disk_pool);
@@ -1450,112 +1476,49 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect checksum corruption in the active table meta block.
+    /// Expected: Reopening reports a checksum failure with table and block context.
     #[test]
     fn test_table_file_rejects_meta_checksum_corruption() {
-        smol::block_on(async {
-            let (temp_dir, fs) = build_test_fs();
-            let table_id = test_user_table_id(146);
-            let path = fs.user_table_file_path(table_id);
-            let table_file = fs
-                .create_table_file(table_id, build_test_metadata(), false)
-                .unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
-            drop(table_file);
-            drop(fs);
-
-            let checksum_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
-                + (COW_FILE_PAGE_SIZE - BLOCK_INTEGRITY_TRAILER_SIZE) as u64;
-            overwrite_file_bytes(&path, checksum_offset, &[0xff]);
-
-            let fs = build_test_fs_in(temp_dir.path());
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let err = match fs
-                .open_table_file(table_id, global.guard(), &global.create_base_guard())
-                .await
-            {
-                Ok(_) => panic!("expected table meta checksum corruption"),
-                Err(err) => err,
-            };
-            assert_table_meta_corruption(
-                err.disclose(),
-                active_meta_block_id,
-                DataIntegrityError::ChecksumMismatch,
-            );
-        });
+        smol::block_on(check_meta_corruption(
+            test_user_table_id(146),
+            |path, block_id| corrupt_page_checksum(path, block_id),
+            DataIntegrityError::ChecksumMismatch,
+        ));
     }
 
+    /// Purpose: Detect an incompatible version in the active table meta block.
+    /// Expected: Reopening reports a version failure with table and block context.
     #[test]
     fn test_table_file_rejects_meta_version_mismatch() {
-        smol::block_on(async {
-            let (temp_dir, fs) = build_test_fs();
-            let table_id = test_user_table_id(147);
-            let path = fs.user_table_file_path(table_id);
-            let table_file = fs
-                .create_table_file(table_id, build_test_metadata(), false)
-                .unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let active_meta_block_id = table_file.active_root_unchecked().meta_block_id;
-            drop(table_file);
-            drop(fs);
-
-            let version_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
-                + TABLE_META_BLOCK_MAGIC_WORD.len() as u64;
-            overwrite_file_bytes(
-                &path,
-                version_offset,
-                &(TABLE_META_BLOCK_VERSION + 1).to_le_bytes(),
-            );
-
-            let fs = build_test_fs_in(temp_dir.path());
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let err = match fs
-                .open_table_file(table_id, global.guard(), &global.create_base_guard())
-                .await
-            {
-                Ok(_) => panic!("expected table meta version corruption"),
-                Err(err) => err,
-            };
-            assert_table_meta_corruption(
-                err.disclose(),
-                active_meta_block_id,
-                DataIntegrityError::InvalidVersion,
-            );
-        });
+        smol::block_on(check_meta_corruption(
+            test_user_table_id(147),
+            |path, block_id| {
+                let version_offset = u64::from(block_id) * COW_FILE_PAGE_SIZE as u64
+                    + TABLE_META_BLOCK_MAGIC_WORD.len() as u64;
+                overwrite_file_bytes(
+                    path,
+                    version_offset,
+                    &(TABLE_META_BLOCK_VERSION + 1).to_le_bytes(),
+                );
+            },
+            DataIntegrityError::InvalidVersion,
+        ));
     }
 
+    /// Purpose: Publish consecutive LWC blocks through the table's column index.
+    /// Expected: The index locates persisted payloads and publication advances the recovery boundaries.
     #[test]
     fn test_persist_lwc_blocks_appends_entries() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(43);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let lwc_blocks = vec![
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(0),
-                        RowID::new(10),
-                        (0..10).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"lwc-page-1"),
-                },
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(10),
-                        RowID::new(20),
-                        (10..20).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"lwc-page-2"),
-                },
+                lwc_block(0, 10, b"lwc-page-1"),
+                lwc_block(10, 20, b"lwc-page-2"),
             ];
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -1617,6 +1580,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce ordered, nonoverlapping row ranges during LWC persistence.
+    /// Expected: A regressing block start triggers the column-index invariant assertion.
     #[test]
     #[should_panic(
         expected = "column block-index invariant violated: LWC block start row regressed"
@@ -1625,31 +1590,12 @@ mod tests {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(44);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
 
             let lwc_blocks = vec![
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(0),
-                        RowID::new(10),
-                        (0..10).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"lwc-overlap-1"),
-                },
-                TestLwcBlock {
-                    shape: ColumnBlockEntryShape::new(
-                        RowID::new(5),
-                        RowID::new(15),
-                        (5..15).map(RowID::new).collect(),
-                        Vec::new(),
-                    ),
-                    buf: page_buf(b"lwc-overlap-2"),
-                },
+                lwc_block(0, 10, b"lwc-overlap-1"),
+                lwc_block(5, 15, b"lwc-overlap-2"),
             ];
 
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
@@ -1671,17 +1617,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce exclusive mutable ownership of a table file.
+    /// Expected: Forking while another mutable fork exists triggers the ownership assertion.
     #[test]
     #[should_panic(expected = "concurrent mutable CoW file modification is not allowed")]
     fn test_mutable_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(45);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
@@ -1700,16 +1645,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Release exclusive table-file ownership when a mutable fork is dropped.
+    /// Expected: A subsequent mutable fork can be created without an ownership panic.
     #[test]
     fn test_mutable_table_file_allows_fork_after_drop() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
-            let metadata = build_test_metadata();
             let table_id = test_user_table_id(46);
-            let table_file = fs.create_table_file(table_id, metadata, false).unwrap();
-            let (table_file, old_root) = table_file.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, table_id, &table_file);
 
@@ -1730,16 +1674,14 @@ mod tests {
         });
     }
 
+    /// Purpose: Distinguish abandoned and committed capacity growth in table files.
+    /// Expected: Reopening removes an unpublished tail and preserves committed expansion.
     #[test]
     fn test_table_file_growth_repairs_abandoned_tail_and_reopens_committed_capacity() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_id = test_user_table_id(147);
-            let mutable = fs
-                .create_table_file(table_id, build_test_metadata(), false)
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
             let mut abandoned = MutableTableFile::fork(
@@ -1812,6 +1754,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject a table root whose column-index block is absent from the allocation map.
+    /// Expected: Validation reports a root invariant failure identifying the column-index root.
     #[test]
     fn test_validate_table_root_rejects_unallocated_top_level_roots() {
         let metadata = build_test_metadata();
@@ -1841,16 +1785,14 @@ mod tests {
         assert!(format!("{err:?}").contains("column_block_index_root"));
     }
 
+    /// Purpose: Detect table files truncated below their published allocation capacity.
+    /// Expected: Reopening reports the capacity mismatch without extending the damaged file.
     #[test]
     fn test_table_file_reopen_rejects_shorter_than_published_capacity() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_id = test_user_table_id(148);
-            let mutable = fs
-                .create_table_file(table_id, build_test_metadata(), false)
-                .unwrap();
-            let (table_file, old_root) = mutable.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let table_file = committed_table_file(&fs, table_id).await;
             drop(table_file);
 
             let path = fs.user_table_file_path(table_id);

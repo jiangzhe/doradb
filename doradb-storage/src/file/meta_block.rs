@@ -477,6 +477,24 @@ mod tests {
         data
     }
 
+    fn roundtrip_table_meta(active_root: &ActiveRoot) -> MetaBlock {
+        let ser_view = active_root.meta_block_ser_view();
+        let mut data = vec![0u8; ser_view.ser_len()];
+        assert_eq!(ser_view.ser(&mut data[..], 0), data.len());
+        let (end, decoded) = MetaBlock::deser(&data[..], 0).unwrap();
+        assert_eq!(end, data.len());
+        decoded
+    }
+
+    fn serialize_catalog_meta(meta: &MultiTableMetaBlock, alloc_map: &AllocMap) -> Vec<u8> {
+        let ser_view = MultiTableMetaBlockSerView::new(meta, alloc_map);
+        let mut data = vec![0u8; ser_view.ser_len()];
+        assert_eq!(ser_view.ser(&mut data[..], 0), data.len());
+        data
+    }
+
+    /// Purpose: Preserve a table's active-root metadata through serialization.
+    /// Expected: Decoding retains the schema, roots, allocation map, and recovery boundaries.
     #[test]
     fn test_meta_block_serde() {
         let metadata = Arc::new(
@@ -493,14 +511,14 @@ mod tests {
             .expect("valid table metadata"),
         );
         let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
+        active_root.pivot_row_id = RowID::new(97);
+        active_root.heap_redo_start_ts = TrxID::new(13);
+        active_root.deletion_cutoff_ts = TrxID::new(5);
+        active_root.column_block_index_root = BlockID::new(19);
+        assert!(active_root.alloc_map.allocate_at(11));
+        assert!(active_root.alloc_map.allocate_at(19));
         active_root.secondary_index_slots = vec![active_slot(0, 11)];
-        let ser_view = active_root.meta_block_ser_view();
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        let meta_block = roundtrip_table_meta(&active_root);
         assert_eq!(meta_block.schema, *active_root.metadata);
         assert_eq!(
             meta_block.column_block_index_root,
@@ -522,6 +540,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Support metadata serialization for tables without secondary indexes.
+    /// Expected: Decoding preserves the schema and empty secondary-index slots.
     #[test]
     fn test_meta_block_serde_without_secondary_indexes() {
         let metadata = Arc::new(
@@ -535,17 +555,13 @@ mod tests {
             .expect("valid table metadata"),
         );
         let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
-        let ser_view = active_root.meta_block_ser_view();
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        let meta_block = roundtrip_table_meta(&active_root);
         assert_eq!(meta_block.schema, *active_root.metadata);
         assert!(meta_block.secondary_index_slots.is_empty());
     }
 
+    /// Purpose: Preserve multiple active secondary-index roots through metadata serialization.
+    /// Expected: Decoding retains each root in its original slot.
     #[test]
     fn test_meta_block_serde_multiple_secondary_roots() {
         let metadata = Arc::new(
@@ -566,19 +582,15 @@ mod tests {
         );
         let mut active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         active_root.secondary_index_slots = vec![active_slot(0, 11), active_slot(1, 12)];
-        let ser_view = active_root.meta_block_ser_view();
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        let meta_block = roundtrip_table_meta(&active_root);
         assert_eq!(
             meta_block.secondary_index_slots,
             active_root.secondary_index_slots
         );
     }
 
+    /// Purpose: Preserve vacant secondary-index slots between active roots.
+    /// Expected: Decoding retains schema vacancies and the original root-slot layout.
     #[test]
     fn test_meta_block_serde_sparse_secondary_roots() {
         let metadata = sparse_secondary_root_metadata();
@@ -588,13 +600,7 @@ mod tests {
             SecondaryIndexSlot::Vacant,
             active_slot(2, 12),
         ];
-        let ser_view = active_root.meta_block_ser_view();
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let (_, meta_block) = MetaBlock::deser(&data[..], 0).unwrap();
+        let meta_block = roundtrip_table_meta(&active_root);
         assert_eq!(meta_block.schema.idx.index_slot_count_u32(), 3);
         assert!(
             meta_block
@@ -609,6 +615,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject persisted secondary roots assigned to inactive schema slots.
+    /// Expected: Metadata decoding reports an invalid payload.
     #[test]
     fn test_meta_block_deser_rejects_inactive_secondary_root() {
         let metadata = sparse_secondary_root_metadata();
@@ -619,8 +627,12 @@ mod tests {
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("slot=1"), "{report}");
     }
 
+    /// Purpose: Reject metadata whose secondary-root count disagrees with its schema.
+    /// Expected: Metadata decoding reports an invalid payload.
     #[test]
     fn test_meta_block_deser_rejects_secondary_root_count_mismatch() {
         let metadata = Arc::new(
@@ -637,29 +649,16 @@ mod tests {
             .expect("valid table metadata"),
         );
         let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
-        let schema = active_root.metadata.ser_view();
-
-        let ser_len = mem::size_of::<RowID>()
-            + mem::size_of::<TrxID>()
-            + mem::size_of::<TrxID>()
-            + active_root.alloc_map.ser_len()
-            + schema.ser_len()
-            + mem::size_of::<BlockID>()
-            + Vec::<SecondaryIndexSlot>::new().ser_len();
-        let mut data = vec![0u8; ser_len];
-        let mut idx = data.ser_u64(0, active_root.pivot_row_id.as_u64());
-        idx = data.ser_u64(idx, active_root.heap_redo_start_ts.as_u64());
-        idx = data.ser_u64(idx, active_root.deletion_cutoff_ts.as_u64());
-        idx = active_root.alloc_map.ser(&mut data[..], idx);
-        idx = schema.ser(&mut data[..], idx);
-        idx = data.ser_u64(idx, active_root.column_block_index_root.into());
-        idx = Vec::<SecondaryIndexSlot>::new().ser(&mut data[..], idx);
-        assert_eq!(idx, ser_len);
+        let data = serialize_meta_block_with_secondary_slots(&active_root, &[]);
 
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("index_slot_count 1"), "{report}");
     }
 
+    /// Purpose: Preserve catalog metadata with both empty and published table roots.
+    /// Expected: Decoding retains table identity, root states, and the redo-log boundary.
     #[test]
     fn test_multi_table_meta_block_serde_explicit_root_states() {
         let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START + 9);
@@ -672,13 +671,10 @@ mod tests {
 
         let alloc_map = AllocMap::new(128);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
-        let ser_view = MultiTableMetaBlockSerView::new(&meta, &alloc_map);
-        let ser_len = ser_view.ser_len();
-        let mut data = vec![0u8; ser_len];
-        let res_idx = ser_view.ser(&mut data[..], 0);
-        assert_eq!(res_idx, ser_len);
-
-        let (_, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
+        let data = serialize_catalog_meta(&meta, &alloc_map);
+        let (end, decoded) = MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
+        assert_eq!(end, data.len());
+        assert_eq!(decoded.alloc_map, alloc_map);
         assert_eq!(decoded.next_table_id, meta.next_table_id);
         assert_eq!(decoded.first_redo_log_seq, 7);
         assert_eq!(
@@ -700,6 +696,8 @@ mod tests {
         assert_eq!(decoded.table_roots.len(), CATALOG_TABLE_ROOT_DESC_COUNT);
     }
 
+    /// Purpose: Reject malformed catalog root-state encodings.
+    /// Expected: Unknown states and published roots with an invalid block identifier fail decoding.
     #[test]
     fn test_multi_table_meta_block_rejects_invalid_root_state_encoding() {
         let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START + 9);
@@ -710,20 +708,24 @@ mod tests {
         );
         let alloc_map = AllocMap::new(128);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
-        let ser_view = MultiTableMetaBlockSerView::new(&meta, &alloc_map);
-        let mut data = vec![0u8; ser_view.ser_len()];
-        let end = ser_view.ser(&mut data[..], 0);
-        assert_eq!(end, data.len());
+        let data = serialize_catalog_meta(&meta, &alloc_map);
+        MultiTableMetaBlockData::deser(&data[..], 0).unwrap();
 
         let first_state_offset =
             mem::size_of::<u64>() + mem::size_of::<u32>() * 2 + mem::size_of::<TableID>();
         let mut unknown_state = data.clone();
         unknown_state[first_state_offset] = 2;
-        assert!(MultiTableMetaBlockData::deser(&unknown_state[..], 0).is_err());
+        let err = MultiTableMetaBlockData::deser(&unknown_state[..], 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("state tag 2"), "{report}");
 
         let mut zero_present_root = data;
         let root_offset = first_state_offset + mem::size_of::<u8>();
         zero_present_root[root_offset..root_offset + mem::size_of::<u64>()].fill(0);
-        assert!(MultiTableMetaBlockData::deser(&zero_present_root[..], 0).is_err());
+        let err = MultiTableMetaBlockData::deser(&zero_present_root[..], 0).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        let report = format!("{err:?}");
+        assert!(report.contains("block zero"), "{report}");
     }
 }

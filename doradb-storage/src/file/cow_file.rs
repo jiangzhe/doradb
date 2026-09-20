@@ -1175,6 +1175,18 @@ pub(crate) mod tests {
         *drops.entry(ptr).or_default() += 1;
     }
 
+    fn mutable_root(alloc_map: AllocMap, meta_block_id: BlockID) -> MutableCowRoot<()> {
+        MutableCowRoot::from_root(ActiveRoot::from_parts(
+            0,
+            TrxID::new(1),
+            meta_block_id,
+            alloc_map,
+            (),
+        ))
+    }
+
+    /// Purpose: Reject active roots whose allocation map omits the reserved super block.
+    /// Expected: Validation reports a root invariant failure with allocation context.
     #[test]
     fn validate_active_root_rejects_unallocated_reserved_super_block() {
         let alloc_map = AllocMap::new(8);
@@ -1198,6 +1210,8 @@ pub(crate) mod tests {
         assert!(report.contains("alloc_map_len=8"), "{report}");
     }
 
+    /// Purpose: Preserve the current meta block when rebuilding reachability allocations.
+    /// Expected: Reserved, reachable, and current meta blocks survive while other allocations are reclaimed.
     #[test]
     fn rebuild_alloc_map_keeps_current_meta_block_allocated() {
         let alloc_map = AllocMap::new(16);
@@ -1206,13 +1220,7 @@ pub(crate) mod tests {
         assert!(alloc_map.allocate_at(usize::from(BlockID::new(3))));
         assert!(alloc_map.allocate_at(usize::from(BlockID::new(7))));
 
-        let mut root = MutableCowRoot::from_root(ActiveRoot::from_parts(
-            0,
-            TrxID::new(1),
-            BlockID::new(7),
-            alloc_map,
-            (),
-        ));
+        let mut root = mutable_root(alloc_map, BlockID::new(7));
         root.unpublished_blocks.insert(BlockID::new(3));
         root.unpublished_blocks.insert(BlockID::new(7));
 
@@ -1245,6 +1253,8 @@ pub(crate) mod tests {
         assert!(root.unpublished_blocks.contains(&BlockID::new(7)));
     }
 
+    /// Purpose: Enforce the allocation boundary for the current meta block during rebuilding.
+    /// Expected: A meta block outside the allocation map triggers the invariant assertion.
     #[test]
     #[should_panic(
         expected = "CoW allocation invariant violated: meta block exceeds allocation map"
@@ -1253,13 +1263,7 @@ pub(crate) mod tests {
         let alloc_map = AllocMap::new(8);
         assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
 
-        let mut root = MutableCowRoot::from_root(ActiveRoot::from_parts(
-            0,
-            TrxID::new(1),
-            BlockID::new(8),
-            alloc_map,
-            (),
-        ));
+        let mut root = mutable_root(alloc_map, BlockID::new(8));
         root.rebuild_alloc_map_from_reachable(&BTreeSet::new());
     }
 }

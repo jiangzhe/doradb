@@ -227,6 +227,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect payload access through a valid integrity envelope.
+    /// Expected: Validation accepts the envelope and exposes the written payload.
     #[test]
     fn test_block_integrity_roundtrip() {
         let spec = BlockIntegritySpec::new(*b"TSTMETA\0", 7);
@@ -239,6 +241,8 @@ mod tests {
         assert_eq!(&payload[..5], b"hello");
     }
 
+    /// Purpose: Detect corruption of an integrity envelope's checksum trailer.
+    /// Expected: Validation reports a checksum mismatch with comparison context.
     #[test]
     fn test_block_integrity_rejects_bad_checksum() {
         let spec = BlockIntegritySpec::new(*b"TSTMETA\0", 7);
@@ -261,6 +265,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect checksum validation for blocks without an integrity header.
+    /// Expected: Intact blocks pass and payload corruption reports a checksum mismatch.
     #[test]
     fn test_block_integrity_checksum_only_trailer() {
         let mut buf = vec![0u8; 4096];
@@ -281,6 +287,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Diagnose undersized blocks and incompatible integrity headers.
+    /// Expected: Rejections preserve the failure classification and relevant boundary context.
     #[test]
     fn test_block_integrity_reports_rejected_envelope_details() {
         let spec = BlockIntegritySpec::new(*b"TSTMETA\0", 7);
