@@ -229,6 +229,8 @@ mod tests {
     use crate::file::table_file::TABLE_FILE_MAGIC_WORD;
     use crate::file::test_block_id;
 
+    /// Purpose: Preserve super-block header and root-pointer metadata through serialization.
+    /// Expected: Decoding recovers the original header and meta-block identifier.
     #[test]
     fn test_super_block_serde() {
         let header = SuperBlockHeader {

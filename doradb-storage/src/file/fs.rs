@@ -2185,15 +2185,14 @@ pub(crate) mod tests {
     use crate::value::ValKind;
     use crate::{DiskPool, IndexPool, MemPool, MetaPool};
     use event_listener::Event;
-    use smol::Timer;
     use std::fs::{OpenOptions, create_dir, write};
     use std::io::Error as StdIoError;
     use std::num::NonZeroUsize;
     use std::ops::Deref;
     use std::os::fd::AsRawFd;
+    use std::pin::pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
     use tempfile::TempDir;
 
     const TEST_META_POOL_BYTES: usize = 32 * 1024 * 1024;
@@ -2202,8 +2201,6 @@ pub(crate) mod tests {
     const TEST_DATA_POOL_BYTES: usize = 64 * 1024 * 1024;
     const TEST_DATA_MAX_FILE_BYTES: usize = 128 * 1024 * 1024;
     const TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
-    const TEST_WAIT_RETRIES: usize = 2000;
-    const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(1);
 
     /// Test fixture for test file system.
     pub(crate) struct TestFileSystem {
@@ -2736,16 +2733,6 @@ pub(crate) mod tests {
         ops.iter().map(StorageBackendOp::kind).collect()
     }
 
-    async fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..TEST_WAIT_RETRIES {
-            if predicate() {
-                return;
-            }
-            Timer::after(TEST_WAIT_INTERVAL).await;
-        }
-        panic!("condition was not satisfied before timeout");
-    }
-
     fn create_sparse_for_test(path: &Path) -> Arc<SparseFile> {
         Arc::new(
             SparseFile::create_or_trunc(
@@ -2796,6 +2783,8 @@ pub(crate) mod tests {
         identity
     }
 
+    /// Purpose: Preserve memory still exposed to a backend during failed I/O cleanup.
+    /// Expected: Quarantine retains submitted writes but drops bufferless sync entries.
     #[test]
     fn test_submitted_io_quarantine_leaks_memory_bound_entries_only() {
         let temp_dir = TempDir::new().unwrap();
@@ -2846,6 +2835,8 @@ pub(crate) mod tests {
         assert_eq!(sync_drops.load(Ordering::SeqCst), 1);
     }
 
+    /// Purpose: Settle submitted sync waiters after backend failure with or without prior poison.
+    /// Expected: Completion preserves the backend failure, cleanup runs, and the first poison remains authoritative.
     #[test]
     fn test_backend_progress_failure_completes_submitted_sync_waiter() {
         for prior_poison in [false, true] {
@@ -2920,6 +2911,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Drain staged and queued sync requests after backend submission failure.
+    /// Expected: Waiters share the fatal report and unsubmitted resources are released without backend cleanup.
     #[test]
     fn test_backend_progress_failure_fails_staged_and_queued_sync_waiters() {
         smol::block_on(async {
@@ -3018,6 +3011,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allow repeated shutdown of the same file system.
+    /// Expected: Repeated shutdown returns without a panic.
     #[test]
     fn test_table_file_system_shutdown_is_idempotent() {
         let (_temp_dir, fs) = build_test_fs();
@@ -3026,6 +3021,8 @@ pub(crate) mod tests {
         fs.shutdown();
     }
 
+    /// Purpose: Recover from a failed initial catalog-file publication.
+    /// Expected: Failure preserves I/O context, removes the new file, and permits a clean retry.
     #[test]
     fn test_open_or_create_multi_table_file_removes_new_file_after_initial_commit_failure() {
         smol::block_on(async {
@@ -3078,6 +3075,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Order table-file commit durability after root writes.
+    /// Expected: The backend receives root writes followed by fsync on the table file.
     #[test]
     fn test_user_table_commit_submits_backend_fsync_after_root_writes() {
         smol::block_on(async {
@@ -3106,6 +3105,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve the active table root when commit durability fails.
+    /// Expected: The commit reports fsync failure with I/O context and leaves root identity unchanged.
     #[test]
     fn test_user_table_commit_fsync_failure_keeps_active_root() {
         smol::block_on(async {
@@ -3159,6 +3160,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require successful durability of stale-tail repair before opening a table file.
+    /// Expected: Repair sync failure blocks opening with context and a later retry sees repaired capacity.
     #[test]
     fn test_user_table_stale_tail_repair_fsync_failure_prevents_open() {
         smol::block_on(async {
@@ -3210,6 +3213,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Order catalog-file commit durability after root writes.
+    /// Expected: The backend receives catalog root writes followed by fsync.
     #[test]
     fn test_catalog_commit_submits_backend_fsync_after_root_writes() {
         smol::block_on(async {
@@ -3245,6 +3250,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce a table-file growth ceiling between geometric expansion steps.
+    /// Expected: Growth clamps to the ceiling and exhaustion preserves capacity with a resource error.
     #[test]
     fn test_table_file_growth_clamps_to_configured_non_power_of_two_ceiling() {
         smol::block_on(async {
@@ -3303,6 +3310,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse published table capacity after the configured growth ceiling is lowered.
+    /// Expected: Reopening retains expanded capacity and existing free pages remain allocatable.
     #[test]
     fn test_open_expanded_table_file_above_lowered_ceiling_uses_existing_free_pages() {
         smol::block_on(async {
@@ -3369,6 +3378,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prioritize a queued table read when background writes exhaust I/O depth.
+    /// Expected: The read precedes the deferred write, returns its payload, and records the service turns.
     #[test]
     fn test_storage_service_reconsiders_table_reads_before_deferred_background_writes() {
         smol::block_on(async {
@@ -3416,7 +3427,7 @@ pub(crate) mod tests {
 
             let read_stats_start = readonly_pool.stats();
             let readonly_probe = readonly_pool.clone();
-            let readonly_task = smol::spawn(async move {
+            let mut readonly_task = pin!(async move {
                 let g = readonly_pool
                     .read_raw_block(
                         reopened.file_kind(),
@@ -3428,14 +3439,17 @@ pub(crate) mod tests {
                     .unwrap();
                 g.page()[..10].to_vec()
             });
-            wait_until(|| {
+            // This is the first read on an empty ingress lane. Poll it through
+            // dispatch on this task so the counter cannot be observed between
+            // submission construction and enqueueing the request.
+            assert!(futures::poll!(readonly_task.as_mut()).is_pending());
+            assert_eq!(
                 readonly_probe
                     .stats()
                     .delta_since(read_stats_start)
-                    .queued_reads
-                    == 1
-            })
-            .await;
+                    .queued_reads,
+                1
+            );
 
             hook.release();
             hook.wait_for_submit_count(2).await;
@@ -3458,6 +3472,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prioritize a queued pool read when background writes exhaust I/O depth.
+    /// Expected: The reload precedes the deferred write, returns its payload, and records the service turns.
     #[test]
     fn test_storage_service_reconsiders_pool_reads_before_deferred_background_writes() {
         smol::block_on(async {
@@ -3489,7 +3505,7 @@ pub(crate) mod tests {
             let read_stats_start = mem_pool.stats();
             let mem_pool_probe = mem_pool.clone();
             let pool_guard = mem_pool.create_base_guard();
-            let reload_task = smol::spawn(async move {
+            let mut reload_task = pin!(async move {
                 let g = mem_pool
                     .get_page::<Page>(&pool_guard, reload_page_id, LatchFallbackMode::Shared)
                     .await
@@ -3497,14 +3513,17 @@ pub(crate) mod tests {
                 let g = g.lock_shared_async().await.unwrap();
                 g.page()[..9].to_vec()
             });
-            wait_until(|| {
+            // The reload owns the first request on this ingress lane. Finish
+            // polling its dispatch before releasing the blocked write, since
+            // the queued-read counter advances before the channel send.
+            assert!(futures::poll!(reload_task.as_mut()).is_pending());
+            assert_eq!(
                 mem_pool_probe
                     .stats()
                     .delta_since(read_stats_start)
-                    .queued_reads
-                    == 1
-            })
-            .await;
+                    .queued_reads,
+                1
+            );
 
             hook.release();
             hook.wait_for_submit_count(2).await;
@@ -3527,24 +3546,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect the filename assigned to the first user table.
+    /// Expected: Committing the table creates a file with the fixed-width hexadecimal name.
     #[test]
     fn test_user_table_file_uses_hex_name() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
 
-            let metadata = Arc::new(
-                TableMetadata::try_new(
-                    vec![StorageColumnSpec::new(
-                        ValKind::U32,
-                        StorageColumnFlags::empty(),
-                    )],
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::PK,
-                    )],
-                )
-                .expect("valid table metadata"),
-            );
+            let metadata = make_metadata();
             let mutable = fs
                 .create_table_file(USER_TABLE_ID_START, Arc::clone(&metadata), false)
                 .unwrap();
@@ -3563,24 +3572,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allow deletion of both existing and already removed user-table files.
+    /// Expected: Deletion removes the file and repeated deletion succeeds.
     #[test]
     fn test_delete_user_table_file_is_idempotent() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let table_id = USER_TABLE_ID_START + 9;
-            let metadata = Arc::new(
-                TableMetadata::try_new(
-                    vec![StorageColumnSpec::new(
-                        ValKind::U32,
-                        StorageColumnFlags::empty(),
-                    )],
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::PK,
-                    )],
-                )
-                .expect("valid table metadata"),
-            );
+            let metadata = make_metadata();
             let mutable = fs
                 .create_table_file(table_id, Arc::clone(&metadata), false)
                 .unwrap();
@@ -3596,6 +3595,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Limit checkpoint cleanup to absent user tables below the checkpoint frontier.
+    /// Expected: Obsolete files are removed while catalog, checkpointed, and future files remain.
     #[test]
     fn test_cleanup_checkpoint_absent_user_table_files_filters_catalog_and_future_ids() {
         let (_temp_dir, fs) = build_test_fs();
@@ -3624,6 +3625,8 @@ pub(crate) mod tests {
         assert!(future_path.exists());
     }
 
+    /// Purpose: Exclude directories bearing table filenames from checkpoint cleanup.
+    /// Expected: Cleanup preserves matching directories while removing obsolete regular files.
     #[test]
     fn test_cleanup_checkpoint_absent_user_table_files_skips_non_files() {
         let (_temp_dir, fs) = build_test_fs();
@@ -3644,6 +3647,8 @@ pub(crate) mod tests {
         assert!(!absent_path.exists());
     }
 
+    /// Purpose: Preserve files still owned by recovered tables or deferred drops during cleanup.
+    /// Expected: Recovery removes orphan files and retains catalog and owned table files.
     #[test]
     fn test_cleanup_recovery_absent_user_table_files_keeps_recovered_and_deferred_drop_files() {
         let (_temp_dir, fs) = build_test_fs();
@@ -3671,6 +3676,8 @@ pub(crate) mod tests {
         assert!(!orphan_path.exists());
     }
 
+    /// Purpose: Honor default and custom catalog filenames in file-system configuration.
+    /// Expected: The resolved catalog path uses the selected filename.
     #[test]
     fn test_catalog_file_name_default_and_custom_path() {
         let (temp_dir, fs) = build_test_fs();
@@ -3688,6 +3695,8 @@ pub(crate) mod tests {
         drop(temp_dir);
     }
 
+    /// Purpose: Reject catalog filenames with an invalid extension or directory components.
+    /// Expected: Engine bootstrap reports the catalog-filename configuration error.
     #[test]
     fn test_catalog_file_name_validation() {
         let temp_dir = TempDir::new().unwrap();
@@ -3731,6 +3740,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Resolve the default data directory and reject paths escaping the storage root.
+    /// Expected: An empty path stays under the storage root and parent traversal fails configuration.
     #[test]
     fn test_data_dir_validation() {
         let temp_dir = TempDir::new().unwrap();
@@ -3762,6 +3773,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Reject data-directory paths that cannot be represented as UTF-8 on Unix.
+    /// Expected: Engine bootstrap reports the path-encoding configuration error.
     #[cfg(unix)]
     #[test]
     fn test_data_dir_rejects_non_utf8_path() {

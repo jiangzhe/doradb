@@ -852,13 +852,14 @@ mod tests {
     };
     use crate::compression::BitPackable;
     use crate::error::FatalError;
-    use crate::error::{DiscloseResultExt, MultiDomainResultExt, RuntimeError};
+    use crate::error::{DiscloseResultExt, Error, MultiDomainResultExt, RuntimeError};
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
     use crate::id::TrxID;
     use crate::io::BackendError;
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
+    use std::fmt::Debug;
     use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
     use std::mem;
     use std::sync::Arc;
@@ -903,24 +904,151 @@ mod tests {
     }
 
     fn prepare_table_write_submission(
-        table_file: Arc<TableFile>,
-        block_id: BlockID,
-    ) -> (WriteSubmission, Arc<Completion<()>>) {
-        WriteSubmission::prepare(
+        state_machine: &mut TableFsStateMachine,
+        table_file: &Arc<TableFile>,
+    ) -> (PreparedWriteSubmission, Arc<Completion<()>>) {
+        let block_id = BlockID::new(1);
+        let (submission, waiter) = WriteSubmission::prepare(
             BlockKey::new(table_file.sparse_file().file_id(), block_id),
             Arc::clone(table_file.sparse_file()),
             usize::from(block_id) * STORAGE_SECTOR_SIZE,
             DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
             None,
-        )
+        );
+        let mut queue = IOQueue::with_capacity(1);
+        assert!(
+            state_machine
+                .prepare_write_request(submission, 1, &mut queue)
+                .is_none()
+        );
+        let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
+            panic!("expected one prepared table write submission");
+        };
+        assert_eq!(submission.operation.len(), STORAGE_SECTOR_SIZE);
+        assert_eq!(queue.len(), 0);
+        (submission, waiter)
     }
 
     fn prepare_table_sync_submission(
+        state_machine: &mut TableFsStateMachine,
         table_file: &Arc<TableFile>,
-    ) -> (SyncSubmission, Arc<Completion<()>>) {
-        SyncSubmission::prepare_fsync(Arc::clone(table_file.sparse_file()))
+    ) -> (PreparedSyncSubmission, Arc<Completion<()>>) {
+        let (submission, waiter) =
+            SyncSubmission::prepare_fsync(Arc::clone(table_file.sparse_file()));
+        let mut queue = IOQueue::with_capacity(1);
+        assert!(
+            state_machine
+                .prepare_sync_request(submission, 1, &mut queue)
+                .is_none()
+        );
+        let Some(TableFsSubmission::Sync(submission)) = queue.pop_front() else {
+            panic!("expected one prepared table fsync submission");
+        };
+        assert_eq!(queue.len(), 0);
+        (submission, waiter)
     }
 
+    fn assert_id_serialization<T>()
+    where
+        T: From<u64> + for<'a> Ser<'a> + Deser + PartialEq + Debug,
+    {
+        let value = T::from(1234);
+        assert_eq!(value.ser_len(), mem::size_of::<u64>());
+        let mut out = [0u8; 8];
+        assert_eq!(value.ser(&mut out[..], 0), out.len());
+        assert_eq!(out, 1234u64.to_le_bytes());
+        let (end, decoded) = T::deser(&out[..], 0).unwrap();
+        assert_eq!(end, out.len());
+        assert_eq!(decoded, value);
+    }
+
+    async fn assert_io_completion_error(
+        waiter: &Completion<()>,
+        context: &'static str,
+        expected_kind: IoErrorKind,
+    ) -> Error {
+        let err = waiter
+            .wait_result()
+            .await
+            .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
+            .attach(context)
+            .disclose()
+            .expect_err("invalid I/O completion must fail");
+        assert_eq!(
+            err.report()
+                .downcast_ref::<IoError>()
+                .copied()
+                .map(IoError::kind),
+            Some(expected_kind),
+            "{context}: {err:?}",
+        );
+        assert!(format!("{err:?}").contains(context), "{context}: {err:?}");
+        err
+    }
+
+    async fn check_write_completion(result: usize, expected_error: Option<IoErrorKind>) {
+        let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = prepare_table_write_submission(&mut state_machine, &table_file);
+        let kind = state_machine.on_complete(TableFsSubmission::Write(submission), Ok(result));
+        assert_eq!(kind, IOKind::Write);
+        if let Some(expected_kind) = expected_error {
+            assert_io_completion_error(
+                &waiter,
+                "wait for table file background write",
+                expected_kind,
+            )
+            .await;
+        } else {
+            waiter
+                .wait_result()
+                .await
+                .expect("full write should succeed");
+        }
+        drop(table_file);
+        drop(fs);
+    }
+
+    async fn check_failed_sync_completion(
+        result: StdIoResult<usize>,
+        expected_kind: IoErrorKind,
+    ) -> Error {
+        let (_temp_dir, fs, table_file) = committed_test_table_file().await;
+        let mut state_machine = TableFsStateMachine::new();
+        let (submission, waiter) = prepare_table_sync_submission(&mut state_machine, &table_file);
+        let kind = state_machine.on_complete(TableFsSubmission::Sync(submission), result);
+        assert_eq!(kind, IOKind::Fsync);
+        let err = assert_io_completion_error(
+            &waiter,
+            "wait for table file background fsync",
+            expected_kind,
+        )
+        .await;
+        drop(table_file);
+        drop(fs);
+        err
+    }
+
+    fn assert_id_bit_packing<T: BitPackable + From<u64> + PartialEq + Debug>() {
+        let min = T::from(10);
+        let value = T::from(42);
+        assert_eq!(T::ZERO, T::from(0));
+        assert_eq!(value.sub_to_u64(min), 32);
+        assert_eq!(value.sub_to_u32(min), 32);
+        assert_eq!(value.sub_to_u16(min), 32);
+        assert_eq!(value.sub_to_u8(min), 32);
+        assert_eq!(min.add_from_u32(5), T::from(15));
+        assert_eq!(min.add_from_u16(6), T::from(16));
+        assert_eq!(min.add_from_u8(7), T::from(17));
+
+        let wrap_min = T::from(u64::MAX - 2);
+        let wrap_value = T::from(1);
+        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
+        assert_eq!(wrap_min.add_from_u32(5), T::from(2));
+    }
+
+    /// Purpose: Preserve block identifiers across integer accessors and conversions.
+    /// Expected: Every supported conversion retains the identifier's value.
     #[test]
     fn test_block_id_accessors_and_conversions() {
         let block_id = BlockID::new(42);
@@ -933,6 +1061,8 @@ mod tests {
         assert_eq!(usize::from(block_id), 42);
     }
 
+    /// Purpose: Protect the byte order of block identifiers.
+    /// Expected: Byte encoding matches the identifier's little-endian representation.
     #[test]
     fn test_block_id_bytes_roundtrip() {
         let block_id = BlockID::new(0xfedc_ba98_7654_3210);
@@ -940,6 +1070,8 @@ mod tests {
         assert_eq!(bytes, 0xfedc_ba98_7654_3210u64.to_le_bytes());
     }
 
+    /// Purpose: Protect offset arithmetic on block identifiers.
+    /// Expected: Value and assignment operators produce the expected identifier offsets.
     #[test]
     fn test_block_id_arithmetic() {
         let block_id = BlockID::new(10);
@@ -953,6 +1085,8 @@ mod tests {
         assert_eq!(next, BlockID::new(12));
     }
 
+    /// Purpose: Compare block identifiers with signed integers in either operand order.
+    /// Expected: Equal nonnegative values match and negative values remain unequal.
     #[test]
     fn test_block_id_partial_eq_signed() {
         let block_id = BlockID::new(7);
@@ -962,44 +1096,29 @@ mod tests {
         assert_ne!(-1i32, block_id);
     }
 
+    /// Purpose: Protect the textual representation of block identifiers.
+    /// Expected: Display renders the identifier as its decimal value.
     #[test]
     fn test_block_id_display() {
         assert_eq!(format!("{}", BlockID::new(99)), "99");
     }
 
+    /// Purpose: Preserve block identifiers through binary serialization.
+    /// Expected: Encoding and decoding consume the fixed-width representation without value loss.
     #[test]
     fn test_block_id_serde_roundtrip() {
-        let block_id = BlockID::new(1234);
-        assert_eq!(block_id.ser_len(), mem::size_of::<u64>());
-
-        let mut out = vec![0; block_id.ser_len()];
-        let end = block_id.ser(&mut out[..], 0);
-        assert_eq!(end, out.len());
-
-        let (end, deser) = BlockID::deser(&out[..], 0).unwrap();
-        assert_eq!(end, out.len());
-        assert_eq!(deser, block_id);
+        assert_id_serialization::<BlockID>();
     }
 
+    /// Purpose: Protect block-identifier arithmetic used by bit packing.
+    /// Expected: The zero identity and offset operations follow unsigned wrapping semantics.
     #[test]
     fn test_block_id_bit_packable_contract() {
-        let min = BlockID::new(10);
-        let value = BlockID::new(42);
-        assert_eq!(BlockID::ZERO, BlockID::new(0));
-        assert_eq!(value.sub_to_u64(min), 32);
-        assert_eq!(value.sub_to_u32(min), 32);
-        assert_eq!(value.sub_to_u16(min), 32);
-        assert_eq!(value.sub_to_u8(min), 32);
-        assert_eq!(min.add_from_u32(5), BlockID::new(15));
-        assert_eq!(min.add_from_u16(6), BlockID::new(16));
-        assert_eq!(min.add_from_u8(7), BlockID::new(17));
-
-        let wrap_min = BlockID::new(u64::MAX - 2);
-        let wrap_value = BlockID::new(1);
-        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
-        assert_eq!(wrap_min.add_from_u32(5), BlockID::new(2));
+        assert_id_bit_packing::<BlockID>();
     }
 
+    /// Purpose: Preserve file identifiers across integer accessors and conversions.
+    /// Expected: Every supported conversion retains the identifier's value.
     #[test]
     fn test_file_id_accessors_and_conversions() {
         let file_id = FileID::new(42);
@@ -1011,6 +1130,8 @@ mod tests {
         assert_eq!(usize::from(file_id), 42);
     }
 
+    /// Purpose: Compare file identifiers with signed and unsigned integers symmetrically.
+    /// Expected: Equal nonnegative values match and negative values remain unequal.
     #[test]
     fn test_file_id_partial_eq_signed_and_unsigned() {
         let file_id = FileID::new(7);
@@ -1022,68 +1143,61 @@ mod tests {
         assert_ne!(-1i32, file_id);
     }
 
+    /// Purpose: Protect the textual representation of file identifiers.
+    /// Expected: Display renders the identifier as its decimal value.
     #[test]
     fn test_file_id_display() {
         assert_eq!(format!("{}", FileID::new(99)), "99");
     }
 
+    /// Purpose: Preserve file identifiers through binary serialization.
+    /// Expected: Encoding and decoding consume the fixed-width representation without value loss.
     #[test]
     fn test_file_id_serde_roundtrip() {
-        let file_id = FileID::new(1234);
-        assert_eq!(file_id.ser_len(), mem::size_of::<u64>());
-
-        let mut out = vec![0; file_id.ser_len()];
-        let end = file_id.ser(&mut out[..], 0);
-        assert_eq!(end, out.len());
-
-        let (end, deser) = FileID::deser(&out[..], 0).unwrap();
-        assert_eq!(end, out.len());
-        assert_eq!(deser, file_id);
+        assert_id_serialization::<FileID>();
     }
 
+    /// Purpose: Protect file-identifier arithmetic used by bit packing.
+    /// Expected: The zero identity and offset operations follow unsigned wrapping semantics.
     #[test]
     fn test_file_id_bit_packable_contract() {
-        let min = FileID::new(10);
-        let value = FileID::new(42);
-        assert_eq!(FileID::ZERO, FileID::new(0));
-        assert_eq!(value.sub_to_u64(min), 32);
-        assert_eq!(value.sub_to_u32(min), 32);
-        assert_eq!(value.sub_to_u16(min), 32);
-        assert_eq!(value.sub_to_u8(min), 32);
-        assert_eq!(min.add_from_u32(5), FileID::new(15));
-        assert_eq!(min.add_from_u16(6), FileID::new(16));
-        assert_eq!(min.add_from_u8(7), FileID::new(17));
-
-        let wrap_min = FileID::new(u64::MAX - 2);
-        let wrap_value = FileID::new(1);
-        assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
-        assert_eq!(wrap_min.add_from_u32(5), FileID::new(2));
+        assert_id_bit_packing::<FileID>();
     }
 
+    /// Purpose: Support nonnegative signed inputs in the test file-identifier helper.
+    /// Expected: Boundary and positive inputs retain their identifier values.
     #[test]
     fn test_test_file_id_accepts_non_negative_values() {
         assert_eq!(test_file_id(0), FileID::new(0));
         assert_eq!(test_file_id(17), FileID::new(17));
     }
 
+    /// Purpose: Prevent negative signed inputs from becoming test file identifiers.
+    /// Expected: The helper panics with the nonnegative-input invariant diagnostic.
     #[test]
     #[should_panic(expected = "test FileID must be non-negative")]
     fn test_test_file_id_panics_on_negative_values() {
         let _ = test_file_id(-1);
     }
 
+    /// Purpose: Support nonnegative signed inputs in the test block-identifier helper.
+    /// Expected: Boundary and positive inputs retain their identifier values.
     #[test]
     fn test_test_block_id_accepts_non_negative_values() {
         assert_eq!(test_block_id(0), BlockID::new(0));
         assert_eq!(test_block_id(17), BlockID::new(17));
     }
 
+    /// Purpose: Prevent negative signed inputs from becoming test block identifiers.
+    /// Expected: The helper panics with the nonnegative-input invariant diagnostic.
     #[test]
     #[should_panic(expected = "test BlockID must be non-negative")]
     fn test_test_block_id_panics_on_negative_values() {
         let _ = test_block_id(-1);
     }
 
+    /// Purpose: Protect sparse-file opening before and after creation.
+    /// Expected: A missing file reports an open failure and a created file can be reopened.
     #[test]
     fn test_sparse_file_open_and_create() {
         let temp_dir = TempDir::new().unwrap();
@@ -1101,6 +1215,8 @@ mod tests {
         drop(file);
     }
 
+    /// Purpose: Diagnose sparse-file creation beneath a missing parent directory.
+    /// Expected: Failure retains the not-found classification and creation context.
     #[test]
     fn test_sparse_file_create_missing_parent_maps_create_failed() {
         let temp_dir = TempDir::new().unwrap();
@@ -1118,6 +1234,8 @@ mod tests {
         assert!(format!("{err:?}").contains("op=file_create"));
     }
 
+    /// Purpose: Reject sparse-file paths containing an embedded null character.
+    /// Expected: Opening and creation preserve invalid-filename, source-error, and path context.
     #[test]
     fn test_sparse_file_invalid_path_maps_invalid_filename_io_error() {
         let invalid_path = "bad\0path";
@@ -1138,6 +1256,8 @@ mod tests {
         assert!(format!("{err:?}").contains("path=bad\0path"));
     }
 
+    /// Purpose: Enforce sparse-file allocation capacity.
+    /// Expected: Allocation through capacity succeeds and further allocation reports exhaustion.
     #[test]
     fn test_sparse_file_alloc_exhaustion_maps_capacity_exceeded() {
         let temp_dir = TempDir::new().unwrap();
@@ -1154,6 +1274,8 @@ mod tests {
         }));
     }
 
+    /// Purpose: Protect logical sizing and sparse allocation during file resizing.
+    /// Expected: Growth preserves a sparse tail, smaller extensions do not shrink, and truncation does.
     #[test]
     fn test_sparse_file_resize_tracks_logical_length_and_preserves_sparse_tail() {
         let temp_dir = TempDir::new().unwrap();
@@ -1182,77 +1304,25 @@ mod tests {
         assert_eq!(file.size().unwrap().0, initial_len);
     }
 
+    /// Purpose: Complete table-file writes when the backend reports the full request length.
+    /// Expected: The write completion settles its waiter successfully.
     #[test]
     fn test_table_fs_write_completion_succeeds_on_full_write() {
-        smol::block_on(async {
-            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
-            let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) =
-                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(1));
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_write_request(submission, 1, &mut queue)
-                    .is_none()
-            );
-
-            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
-                panic!("expected one prepared table write submission");
-            };
-            let expected_len = submission.operation.len();
-            let kind =
-                state_machine.on_complete(TableFsSubmission::Write(submission), Ok(expected_len));
-
-            assert_eq!(kind, IOKind::Write);
-            assert!(waiter.wait_result().await.is_ok());
-            drop(table_file);
-            drop(fs);
-        });
+        smol::block_on(check_write_completion(STORAGE_SECTOR_SIZE, None));
     }
 
+    /// Purpose: Reject table-file completions that wrote less than the requested length.
+    /// Expected: The waiter receives an unexpected-end error with the caller's write context.
     #[test]
     fn test_table_fs_write_completion_rejects_short_write() {
-        smol::block_on(async {
-            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
-            let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) =
-                prepare_table_write_submission(Arc::clone(&table_file), BlockID::new(1));
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_write_request(submission, 1, &mut queue)
-                    .is_none()
-            );
-
-            let Some(TableFsSubmission::Write(submission)) = queue.pop_front() else {
-                panic!("expected one prepared table write submission");
-            };
-            let expected_len = submission.operation.len();
-            assert!(expected_len > 0);
-
-            let kind = state_machine
-                .on_complete(TableFsSubmission::Write(submission), Ok(expected_len - 1));
-
-            assert_eq!(kind, IOKind::Write);
-            let wait_result = waiter
-                .wait_result()
-                .await
-                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
-                .attach("wait for table file background write")
-                .disclose();
-            assert!(wait_result.as_ref().is_err_and(|err| {
-                err.report()
-                    .downcast_ref::<IoError>()
-                    .copied()
-                    .map(IoError::kind)
-                    == Some(IoErrorKind::UnexpectedEof)
-                    && format!("{err:?}").contains("wait for table file background write")
-            }));
-            drop(table_file);
-            drop(fs);
-        });
+        smol::block_on(check_write_completion(
+            STORAGE_SECTOR_SIZE - 1,
+            Some(IoErrorKind::UnexpectedEof),
+        ));
     }
 
+    /// Purpose: Preserve file ownership across preparation and completion of a sync request.
+    /// Expected: A bufferless fsync retains its file until successful completion settles the waiter.
     #[test]
     fn test_table_fs_sync_submission_prepares_fsync_and_retains_file() {
         smol::block_on(async {
@@ -1261,18 +1331,11 @@ mod tests {
             let fd = sparse_file.as_raw_fd();
             let initial_count = Arc::strong_count(&sparse_file);
             let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) = prepare_table_sync_submission(&table_file);
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_sync_request(submission, 1, &mut queue)
-                    .is_none()
-            );
+            let (submission, waiter) =
+                prepare_table_sync_submission(&mut state_machine, &table_file);
             assert_eq!(Arc::strong_count(&sparse_file), initial_count + 1);
 
-            let Some(TableFsSubmission::Sync(mut submission)) = queue.pop_front() else {
-                panic!("expected one prepared table fsync submission");
-            };
+            let mut submission = submission;
             assert_eq!(submission.operation.kind(), IOKind::Fsync);
             assert_eq!(submission.operation.fd(), fd);
             assert_eq!(submission.operation.offset(), 0);
@@ -1291,106 +1354,42 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject an invalid successful backend result for a table-file sync.
+    /// Expected: The waiter receives an I/O error with the caller's sync context.
     #[test]
     fn test_table_fs_sync_completion_rejects_nonzero_success() {
-        smol::block_on(async {
-            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
-            let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) = prepare_table_sync_submission(&table_file);
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_sync_request(submission, 1, &mut queue)
-                    .is_none()
-            );
-
-            let Some(TableFsSubmission::Sync(submission)) = queue.pop_front() else {
-                panic!("expected one prepared table fsync submission");
-            };
-            let kind = state_machine.on_complete(TableFsSubmission::Sync(submission), Ok(1));
-
-            assert_eq!(kind, IOKind::Fsync);
-            let wait_result = waiter
-                .wait_result()
-                .await
-                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
-                .attach("wait for table file background fsync")
-                .disclose();
-            let err = wait_result.expect_err("nonzero fsync completion should fail");
-            assert_eq!(
-                err.report()
-                    .downcast_ref::<IoError>()
-                    .copied()
-                    .map(IoError::kind),
-                Some(IoErrorKind::Other)
-            );
-            assert!(
-                format!("{err:?}").contains("wait for table file background fsync"),
-                "unexpected error: {err:?}"
-            );
-            drop(table_file);
-            drop(fs);
-        });
+        let err = smol::block_on(check_failed_sync_completion(Ok(1), IoErrorKind::Other));
+        let report = format!("{err:?}");
+        assert!(
+            report.contains("actual_result=1, expected_result=0"),
+            "{report}"
+        );
     }
 
+    /// Purpose: Propagate backend I/O failures from table-file sync completions.
+    /// Expected: The waiter receives the I/O failure with the caller's sync context.
     #[test]
     fn test_table_fs_sync_completion_reports_io_failure() {
-        smol::block_on(async {
-            let (_temp_dir, fs, table_file) = committed_test_table_file().await;
-            let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) = prepare_table_sync_submission(&table_file);
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_sync_request(submission, 1, &mut queue)
-                    .is_none()
-            );
-
-            let Some(TableFsSubmission::Sync(submission)) = queue.pop_front() else {
-                panic!("expected one prepared table fsync submission");
-            };
-            let kind = state_machine.on_complete(
-                TableFsSubmission::Sync(submission),
-                Err(StdIoError::from_raw_os_error(libc::EIO)),
-            );
-
-            assert_eq!(kind, IOKind::Fsync);
-            let wait_result = waiter
-                .wait_result()
-                .await
-                .map_err(|report| report.into_quad(RuntimeError::FileRootAccess))
-                .attach("wait for table file background fsync")
-                .disclose();
-            let err = wait_result.expect_err("backend fsync completion should fail");
-            assert!(
-                err.report().downcast_ref::<IoError>().is_some(),
-                "unexpected error: {err:?}"
-            );
-            assert!(
-                format!("{err:?}").contains("wait for table file background fsync"),
-                "unexpected error: {err:?}"
-            );
-            drop(table_file);
-            drop(fs);
-        });
+        let backend_error = StdIoError::from_raw_os_error(libc::EIO);
+        let expected_kind = backend_error.kind();
+        let expected_message = backend_error.to_string();
+        let err = smol::block_on(check_failed_sync_completion(
+            Err(backend_error),
+            expected_kind,
+        ));
+        assert!(format!("{err:?}").contains(&expected_message), "{err:?}");
     }
 
+    /// Purpose: Preserve fatal backend failures when a sync request fails before submission.
+    /// Expected: The waiter retains fatal, I/O, and backend diagnostics without runtime reclassification.
     #[test]
     fn test_table_fs_pre_submit_sync_failure_preserves_backend_context() {
         smol::block_on(async {
             let (_temp_dir, fs, table_file) = committed_test_table_file().await;
             let mut state_machine = TableFsStateMachine::new();
-            let (submission, waiter) = prepare_table_sync_submission(&table_file);
-            let mut queue = IOQueue::with_capacity(1);
-            assert!(
-                state_machine
-                    .prepare_sync_request(submission, 1, &mut queue)
-                    .is_none()
-            );
+            let (submission, waiter) =
+                prepare_table_sync_submission(&mut state_machine, &table_file);
 
-            let Some(submission) = queue.pop_front() else {
-                panic!("expected one prepared table fsync submission");
-            };
             let backend_report = SharedFatalError::capture(
                 BackendError::submit(
                     "test_backend",
@@ -1402,7 +1401,8 @@ mod tests {
                 .to_report()
                 .change_context(FatalError::StorageIo),
             );
-            let kind = state_machine.fail_submission_with_fatal(submission, &backend_report);
+            let kind = state_machine
+                .fail_submission_with_fatal(TableFsSubmission::Sync(submission), &backend_report);
 
             assert_eq!(kind, IOKind::Fsync);
             let completion = waiter

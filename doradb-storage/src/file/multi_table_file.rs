@@ -726,7 +726,8 @@ mod tests {
     use crate::buffer::global_readonly_pool_scope;
     use crate::error::RuntimeOrFatalError;
     use crate::error::{DataIntegrityError, DiscloseResultExt, Result, RuntimeError};
-    use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use crate::file::cow_file::tests::corrupt_page_checksum;
+    use crate::file::fs::FileSystem;
     use crate::file::test_block_id;
     use crate::file::{build_test_fs, build_test_fs_in};
     use crate::io::IOBuf;
@@ -788,6 +789,41 @@ mod tests {
         assert!(report.contains(&format!("block_id={page_id}")), "{report}");
     }
 
+    async fn open_catalog_file(
+        fs: &FileSystem,
+        pool: QuiescentGuard<ReadonlyBufferPool>,
+    ) -> Arc<MultiTableFile> {
+        let guard = pool.create_base_guard();
+        fs.open_or_create_multi_table_file(pool, &guard)
+            .await
+            .unwrap()
+    }
+
+    async fn check_meta_corruption(
+        corrupt: impl FnOnce(&str, BlockID),
+        expected: DataIntegrityError,
+    ) {
+        let (dir, fs) = build_test_fs();
+        let path = fs.catalog_mtb_file_path();
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let mtb = open_catalog_file(&fs, global.guard()).await;
+        let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
+        drop(mtb);
+        drop(fs);
+        corrupt(&path, active_meta_block_id);
+
+        let fs = build_test_fs_in(dir.path());
+        let err = match fs
+            .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
+            .await
+        {
+            Ok(_) => panic!("expected catalog metadata corruption: {expected:?}"),
+            Err(err) => err,
+        };
+        assert_multi_table_meta_corruption(err, active_meta_block_id, expected);
+        assert_eq!(global.allocated(), 0);
+    }
+
     async fn publish_checkpoint_for_test(
         mtb: &Arc<MultiTableFile>,
         background_writes: &IOClient<BackgroundWriteRequest>,
@@ -810,10 +846,13 @@ mod tests {
         drop(old_root);
     }
 
+    /// Purpose: Reject catalog descriptors with mismatched table slots or unallocated roots.
+    /// Expected: Validation reports the offending descriptor's root invariant failure.
     #[test]
     fn test_validate_multi_table_root_rejects_invalid_catalog_descriptors() {
         let meta_block_id = test_block_id(1);
         let alloc_map = AllocMap::new(MULTI_TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
         assert!(alloc_map.allocate_at(usize::from(meta_block_id)));
         let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START);
 
@@ -824,8 +863,12 @@ mod tests {
             err.current_context(),
             &DataIntegrityError::InvalidRootInvariant
         );
+        let report = format!("{err:?}");
+        assert!(report.contains("descriptor_slot=0"), "{report}");
+        assert!(report.contains("root_state=Empty"), "{report}");
 
         let alloc_map = AllocMap::new(MULTI_TABLE_FILE_INITIAL_SIZE / COW_FILE_PAGE_SIZE);
+        assert!(alloc_map.allocate_at(usize::from(SUPER_BLOCK_ID)));
         assert!(alloc_map.allocate_at(usize::from(meta_block_id)));
         let mut meta = MultiTableMetaBlock::new(USER_TABLE_ID_START);
         meta.table_roots[0] = CatalogTableRootDesc::published(
@@ -839,8 +882,13 @@ mod tests {
             err.current_context(),
             &DataIntegrityError::InvalidRootInvariant
         );
+        let report = format!("{err:?}");
+        assert!(report.contains("descriptor_slot=0"), "{report}");
+        assert!(report.contains("root_block_id=2"), "{report}");
     }
 
+    /// Purpose: Enforce the inline capacity of catalog metadata allocation maps.
+    /// Expected: Oversized metadata reports storage capacity exhaustion with payload context.
     #[test]
     fn test_multi_table_meta_rejects_allocation_map_beyond_inline_capacity() {
         let mut root = MultiTableActiveRoot::new();
@@ -857,6 +905,8 @@ mod tests {
         assert!(report.contains("payload too large"), "{report}");
     }
 
+    /// Purpose: Enforce allocation ownership when reclaiming a displaced catalog meta block.
+    /// Expected: Reclaiming an unallocated block triggers the allocation invariant assertion.
     #[test]
     #[should_panic(
         expected = "CoW allocation invariant violated: displaced meta block is not allocated"
@@ -865,10 +915,7 @@ mod tests {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
             let displaced_meta_block_id = (1..mtb.active_root_unchecked().alloc_map.len())
                 .rev()
                 .map(BlockID::from)
@@ -886,6 +933,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Persist a catalog checkpoint from a newly initialized multi-table file.
+    /// Expected: Reopening recovers the published table roots and catalog recovery metadata.
     #[test]
     fn test_multi_table_file_open_publish_and_reload() {
         smol::block_on(async {
@@ -894,10 +943,7 @@ mod tests {
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
 
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
             let s0 = mtb.load_snapshot();
             assert_eq!(s0.catalog_replay_start_ts, MIN_SNAPSHOT_TS);
             assert_eq!(s0.meta.next_table_id, USER_TABLE_ID_START);
@@ -924,10 +970,7 @@ mod tests {
             assert_ne!(meta_block_id_0, meta_block_id_1);
             drop(mtb);
 
-            let mtb2 = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb2 = open_catalog_file(&fs, global.guard()).await;
             let s1 = mtb2.load_snapshot();
             assert_eq!(s1.catalog_replay_start_ts, TrxID::new(7));
             assert_eq!(s1.meta.next_table_id, USER_TABLE_ID_START + 16);
@@ -940,16 +983,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Retain the redo-log marker across a catalog metadata checkpoint.
+    /// Expected: The marker survives checkpoint publication and reopening with a new file system.
     #[test]
     fn test_multi_table_file_metadata_checkpoint_preserves_first_redo_log_seq() {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             publish_first_redo_log_seq_for_test(&mtb, background_writes, 3)
                 .await
@@ -976,16 +1018,15 @@ mod tests {
             drop(fs);
 
             let fs = build_test_fs_in(dir.path());
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
             let reloaded = mtb.load_snapshot();
             assert_eq!(reloaded.catalog_replay_start_ts, TrxID::new(8));
             assert_eq!(reloaded.meta.first_redo_log_seq, 3);
         });
     }
 
+    /// Purpose: Distinguish abandoned and committed capacity growth in catalog files.
+    /// Expected: Reopening removes an unpublished tail and preserves committed expansion.
     #[test]
     fn test_multi_table_file_growth_repairs_abandoned_tail_and_reopens_committed_capacity() {
         smol::block_on(async {
@@ -1057,6 +1098,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect catalog files truncated below their published allocation capacity.
+    /// Expected: Reopening reports a root invariant failure without extending the damaged file.
     #[test]
     fn test_multi_table_file_reopen_rejects_shorter_than_published_capacity() {
         smol::block_on(async {
@@ -1093,16 +1136,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect copy-on-write placement of successive catalog metadata checkpoints.
+    /// Expected: Each publication uses a different meta block from the preceding active root.
     #[test]
     fn test_multi_table_file_meta_block_copy_on_write() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             let mut roots = [CatalogTableRootDesc::default(); CATALOG_TABLE_ROOT_DESC_COUNT];
             for (idx, root) in roots.iter_mut().enumerate() {
@@ -1134,16 +1176,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject a catalog file when both super-block versions are incompatible.
+    /// Expected: Opening fails without retaining readonly-buffer allocations.
     #[test]
     fn test_multi_table_file_rejects_super_block_version_mismatch() {
         smol::block_on(async {
             let (dir, fs) = build_test_fs();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
             drop(mtb);
             drop(fs);
 
@@ -1172,87 +1213,36 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect an incompatible version in the active catalog meta block.
+    /// Expected: Opening reports the version failure with block context and releases read buffers.
     #[test]
     fn test_multi_table_file_rejects_meta_version_mismatch() {
-        smol::block_on(async {
-            let (dir, fs) = build_test_fs();
-            let path = fs.catalog_mtb_file_path();
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
-            let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
-            drop(mtb);
-            drop(fs);
-
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            // overwrite meta-block version to simulate format mismatch.
-            let meta_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64;
-            file.seek(SeekFrom::Start(
-                meta_offset + MULTI_TABLE_META_BLOCK_MAGIC_WORD.len() as u64,
-            ))
-            .unwrap();
-            file.write_all(&(CATALOG_MTB_VERSION + 1).to_le_bytes())
-                .unwrap();
-            file.sync_all().unwrap();
-
-            let fs = build_test_fs_in(dir.path());
-            let err = match fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-            {
-                Ok(_) => panic!("expected multi-table meta version corruption"),
-                Err(err) => err,
-            };
-            assert_multi_table_meta_corruption(
-                err,
-                active_meta_block_id,
-                DataIntegrityError::InvalidVersion,
-            );
-            assert_eq!(global.allocated(), 0);
-        });
+        smol::block_on(check_meta_corruption(
+            |path, block_id| {
+                let version_offset = u64::from(block_id) * COW_FILE_PAGE_SIZE as u64
+                    + MULTI_TABLE_META_BLOCK_MAGIC_WORD.len() as u64;
+                overwrite_file_bytes(
+                    path,
+                    version_offset,
+                    &(CATALOG_MTB_VERSION + 1).to_le_bytes(),
+                );
+            },
+            DataIntegrityError::InvalidVersion,
+        ));
     }
 
+    /// Purpose: Detect checksum corruption in the active catalog meta block.
+    /// Expected: Opening reports the checksum failure with block context and releases read buffers.
     #[test]
     fn test_multi_table_file_rejects_meta_checksum_corruption() {
-        smol::block_on(async {
-            let (dir, fs) = build_test_fs();
-            let path = fs.catalog_mtb_file_path();
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
-            let active_meta_block_id = mtb.active_root_unchecked().meta_block_id;
-            drop(mtb);
-            drop(fs);
-
-            let checksum_offset = u64::from(active_meta_block_id) * COW_FILE_PAGE_SIZE as u64
-                + (COW_FILE_PAGE_SIZE - BLOCK_INTEGRITY_TRAILER_SIZE) as u64;
-            overwrite_file_bytes(&path, checksum_offset, &[0xff]);
-
-            let fs = build_test_fs_in(dir.path());
-            let err = match fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-            {
-                Ok(_) => panic!("expected multi-table meta checksum corruption"),
-                Err(err) => err,
-            };
-            assert_multi_table_meta_corruption(
-                err,
-                active_meta_block_id,
-                DataIntegrityError::ChecksumMismatch,
-            );
-            assert_eq!(global.allocated(), 0);
-        });
+        smol::block_on(check_meta_corruption(
+            |path, block_id| corrupt_page_checksum(path, block_id),
+            DataIntegrityError::ChecksumMismatch,
+        ));
     }
 
+    /// Purpose: Recover a catalog checkpoint when the newest super slot is invalid.
+    /// Expected: Reopening loads the older valid snapshot without retaining read buffers.
     #[test]
     fn test_multi_table_file_falls_back_to_older_valid_super_slot() {
         smol::block_on(async {
@@ -1260,10 +1250,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             let roots_v1 = from_fn(|idx| {
                 CatalogTableRootDesc::published(
@@ -1305,10 +1292,7 @@ mod tests {
             overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
 
             let fs = build_test_fs_in(dir.path());
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
             let snapshot = mtb.load_snapshot();
             assert_eq!(
                 snapshot.catalog_replay_start_ts,
@@ -1319,6 +1303,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Prevent fallback from masking an invalid newest catalog metadata root.
+    /// Expected: Opening reports that root's invariant failure and releases read buffers.
     #[test]
     fn test_multi_table_file_does_not_fall_back_when_newest_meta_root_is_invalid() {
         smol::block_on(async {
@@ -1326,10 +1312,7 @@ mod tests {
             let background_writes = fs.background_writes();
             let path = fs.catalog_mtb_file_path();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             let roots_v1 = from_fn(|idx| {
                 CatalogTableRootDesc::published(
@@ -1409,31 +1392,29 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce exclusive mutable ownership of a catalog file.
+    /// Expected: Forking while another mutable fork exists triggers the ownership assertion.
     #[test]
     #[should_panic(expected = "concurrent mutable CoW file modification is not allowed")]
     fn test_multi_table_file_rejects_concurrent_fork() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             let _first = MutableMultiTableFile::fork(&mtb, fs.background_writes());
             let _second = MutableMultiTableFile::fork(&mtb, fs.background_writes());
         });
     }
 
+    /// Purpose: Release exclusive catalog-file ownership when a mutable fork is dropped.
+    /// Expected: A subsequent mutable fork can be created without an ownership panic.
     #[test]
     fn test_multi_table_file_allows_fork_after_drop() {
         smol::block_on(async {
             let (_dir, fs) = build_test_fs();
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let mtb = fs
-                .open_or_create_multi_table_file(global.guard(), &global.create_base_guard())
-                .await
-                .unwrap();
+            let mtb = open_catalog_file(&fs, global.guard()).await;
 
             let first = MutableMultiTableFile::fork(&mtb, fs.background_writes());
             drop(first);
