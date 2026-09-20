@@ -557,6 +557,9 @@ mod tests {
         ]
     }
 
+    /// Purpose: Enforce parent integrity across catalog satellites.
+    /// Expected: Orphaned rows are rejected with diagnostics identifying the satellite and
+    /// missing parent.
     #[test]
     fn test_live_parent_validation_rejects_each_satellite_orphan() {
         smol::block_on(async {
@@ -596,6 +599,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Accept coherent catalog relationships under authorized access.
+    /// Expected: Complete relationships validate while missing parents remain integrity
+    /// failures.
     #[test]
     fn test_live_parent_validation_accepts_complete_view_and_checked_parent() {
         smol::block_on(async {
@@ -648,6 +654,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Require managed definitions for bound tables.
+    /// Expected: Bindings to unmanaged tables are rejected even when their numeric parent
+    /// exists.
     #[test]
     fn test_live_parent_validation_rejects_binding_without_descriptor() {
         smol::block_on(async {
@@ -687,6 +696,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Require lock authority for current catalog parent lookup.
+    /// Expected: Unauthorized lookup fails with a diagnostic explaining the missing authority.
     #[test]
     fn test_locked_current_lookup_rejects_missing_lock_authority() {
         smol::block_on(async {
@@ -713,6 +724,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect residual bindings when validating table removal.
+    /// Expected: Reverse lookup exposes a remaining binding as an integrity failure.
     #[test]
     fn test_drop_absence_detects_binding_by_reverse_table_id_index() {
         smol::block_on(async {

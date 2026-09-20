@@ -67,6 +67,9 @@ mod tests {
     use super::*;
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
 
+    /// Purpose: Protect built-in catalog identity and durable slot routing.
+    /// Expected: Built-in identities retain their fixed mapping and out-of-range identities
+    /// cannot alias them.
     #[test]
     fn builtin_layout_preserves_six_durable_ids_and_exact_routing() {
         assert_eq!(BUILTIN_CATALOG_TABLE_COUNT, 6);

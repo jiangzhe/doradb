@@ -562,6 +562,9 @@ mod tests {
     use crate::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec, ValKind};
     use std::collections::HashSet;
 
+    /// Purpose: Protect managed definition recovery from inconsistent descriptor envelopes.
+    /// Expected: Valid definitions recover coherently; incompatible or oversized descriptors
+    /// are rejected.
     #[test]
     fn managed_definition_recovery_validates_envelope_and_derives_projection() {
         let table_id = TableID::new(7);
@@ -603,6 +606,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Preserve descriptor updates across borrowing and ownership transfer.
+    /// Expected: The change and opaque descriptor remain intact.
     #[test]
     fn descriptor_update_exposes_and_consumes_both_parts() {
         let update = DescriptorUpdate::new(42, &b"\xff\0"[..]);
@@ -613,6 +618,9 @@ mod tests {
         assert_eq!(&*descriptor, [0xff, 0]);
     }
 
+    /// Purpose: Preserve managed creation data and namespace-qualified bindings.
+    /// Expected: Access and ownership transfer retain storage definitions, bindings, and opaque
+    /// bytes.
     #[test]
     fn managed_create_bundle_and_binding_accessors_preserve_opaque_bytes() {
         let binding = TableBinding::new(BindingNamespaceID::new(9), &b"\0name\xff"[..]);
@@ -643,6 +651,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect definition-version identity across table and epoch changes.
+    /// Expected: Equal versions coalesce while changes to either identity component remain
+    /// distinct.
     #[test]
     fn definition_version_is_opaque_and_hashes_as_one_token() {
         let version = TableDefinitionVersion::new(TableID::new(7), 3);
@@ -653,6 +664,9 @@ mod tests {
         assert_eq!(versions.len(), 3);
     }
 
+    /// Purpose: Preserve resolved binding identity and optional definition snapshots.
+    /// Expected: Access and ownership transfer retain coherent identity and snapshot
+    /// availability.
     #[test]
     fn resolved_binding_consumes_coherent_optional_snapshot() {
         let schema = StorageTableDefinition::new(vec![], vec![]);
@@ -681,6 +695,9 @@ mod tests {
         assert!(narrow.full_schema().is_none());
     }
 
+    /// Purpose: Enforce binding-key bounds and namespace-local uniqueness.
+    /// Expected: Valid boundary keys are accepted; oversized keys and duplicates within a
+    /// namespace are rejected.
     #[test]
     fn table_binding_validation_accepts_boundaries_and_rejects_duplicates() {
         validate_table_bindings(&[

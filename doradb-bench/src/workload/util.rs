@@ -446,10 +446,10 @@ mod tests {
         KeyRange { start: 0, len: 3 }
     }
 
-    /// Purpose: Merge distinct counter and latency contributions, including an overflowing
-    /// operation count.
-    /// Expected: Merged counters contain five operations, five updated rows, one found result, and
-    /// two latency samples; operation overflow returns the named counter error.
+    /// Purpose: Combine workload measurements without losing contributions or allowing
+    /// overflow.
+    /// Expected: Counters and latency samples accumulate correctly while overflowing totals are
+    /// rejected.
     #[test]
     fn shared_measurement_merge_is_checked_and_additive() {
         let mut aggregate = SessionMeasurement {
@@ -493,10 +493,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Validate sample counts, operation counters, read-hit expectations, and fixture-
-    /// effect shapes.
-    /// Expected: Matching zero-sample/simple/read shapes pass; wrong totals, unexpected updates,
-    /// hit mismatches, and nonempty fixture effects fail.
+    /// Purpose: Require workload outcomes to satisfy their measurement and fixture contracts.
+    /// Expected: Consistent outcomes pass while incompatible counters, samples, read results,
+    /// or fixture effects fail.
     #[test]
     fn shared_verification_helpers_reject_wrong_shapes() {
         let latency = LatencyDistribution::new().unwrap();
@@ -531,9 +530,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Check absent bindings and extract an explicitly supplied two-table pool.
-    /// Expected: No-binding validation succeeds, missing primary/pool bindings fail, and pool
-    /// extraction retains table IDs seven and eight.
+    /// Purpose: Enforce workload-specific fixture binding requirements.
+    /// Expected: Missing required bindings fail while compatible bindings preserve table
+    /// identities.
     #[test]
     fn shared_binding_helpers_enforce_binding_shapes() {
         require_no_binding(FixtureBinding::None, "none").unwrap();
@@ -548,8 +547,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Split ten consecutive keys beginning at 100 among four sessions.
-    /// Expected: The four plans have counts [3, 3, 2, 2] and starts [100, 103, 106, 108].
+    /// Purpose: Distribute consecutive keys evenly across sessions without losing coverage.
+    /// Expected: Session ranges remain contiguous and nonoverlapping with balanced operation
+    /// budgets.
     #[test]
     fn partition_rows_across_sessions() {
         let plans = build_session_plans(
@@ -571,8 +571,8 @@ mod tests {
         assert_eq!(plans[3].key_start, 108);
     }
 
-    /// Purpose: Attempt to partition a nonempty key range across zero sessions.
-    /// Expected: Session-plan construction returns an error.
+    /// Purpose: Require available sessions before partitioning work.
+    /// Expected: An empty session pool prevents session-plan construction.
     #[test]
     fn reject_zero_sessions() {
         assert!(
@@ -587,17 +587,17 @@ mod tests {
         );
     }
 
-    /// Purpose: Bound a transaction batch by both configured size and remaining operations.
-    /// Expected: Configured/remaining sizes of three and ten in either order produce a batch of
-    /// three.
+    /// Purpose: Bound transaction batches by configuration and remaining work.
+    /// Expected: The tighter constraint determines the effective batch size.
     #[test]
     fn effective_batch_size_uses_configured_limit() {
         assert_eq!(effective_batch_size(3, 10).unwrap(), 3);
         assert_eq!(effective_batch_size(10, 3).unwrap(), 3);
     }
 
-    /// Purpose: Generate 64 random insert keys with replacement for unindexed and non-unique modes.
-    /// Expected: Seed 42 reproduces the sequence, and seed two produces repeated keys in each mode.
+    /// Purpose: Preserve sampling with replacement for random inserts without uniqueness
+    /// constraints.
+    /// Expected: Seeds reproduce the key sequence while duplicate keys remain possible.
     #[test]
     fn random_insert_with_replacement_is_seeded_and_allows_duplicates() {
         let plan = SessionPlan {
@@ -623,8 +623,8 @@ mod tests {
         }
     }
 
-    /// Purpose: Generate unindexed random inserts whose two-key range begins at u64::MAX.
-    /// Expected: Key generation returns an overflow error instead of wrapping the range.
+    /// Purpose: Prevent random insert ranges from exceeding the key domain.
+    /// Expected: Unrepresentable ranges fail generation without wrapping.
     #[test]
     fn random_insert_none_rejects_key_overflow() {
         let plan = SessionPlan {
@@ -635,9 +635,8 @@ mod tests {
         assert!(generate_insert_keys(true, IndexMode::None, 0, &plan).is_err());
     }
 
-    /// Purpose: Generate unique-index permutations of keys 10 through 73 using seeds 42 and 43.
-    /// Expected: Repeated seed 42 reproduces the sequence, seed 43 changes it, and every key
-    /// appears exactly once.
+    /// Purpose: Generate reproducible unique insert permutations over the complete key range.
+    /// Expected: Seeds control ordering while every key is covered without duplication.
     #[test]
     fn random_insert_unique_is_seeded_duplicate_free_coverage() {
         let plan = SessionPlan {
@@ -658,9 +657,9 @@ mod tests {
         }
     }
 
-    /// Purpose: Generate 64 table selections from a three-table pool using seeds 11 and 12.
-    /// Expected: Seed 11 repeats exactly, seed 12 differs, all indexes are below three, and
-    /// selections include duplicates.
+    /// Purpose: Generate reproducible table selections with replacement.
+    /// Expected: Seeds control selection while repeated choices remain within the prepared
+    /// pool.
     #[test]
     fn random_table_indexes_are_seeded_bounded_and_with_replacement() {
         let plan = SessionPlan {
@@ -683,8 +682,8 @@ mod tests {
         assert!(first.iter().copied().collect::<HashSet<_>>().len() < first.len());
     }
 
-    /// Purpose: Generate four random table selections when only one table exists.
-    /// Expected: Every generated index is zero.
+    /// Purpose: Support random selection from a singleton table pool.
+    /// Expected: Every selection resolves to the sole available table.
     #[test]
     fn random_table_indexes_support_one_table() {
         let plan = SessionPlan {
@@ -696,8 +695,8 @@ mod tests {
         assert!((0..plan.number).all(|_| generator.next_index() == 0));
     }
 
-    /// Purpose: Generate sequential unindexed inserts for four keys beginning at ten.
-    /// Expected: The generated sequence is exactly [10, 11, 12, 13].
+    /// Purpose: Preserve key order in sequential insert generation.
+    /// Expected: Generated keys cover the requested contiguous range in order.
     #[test]
     fn sequential_insert_uses_ordered_keys() {
         let plan = SessionPlan {
@@ -711,9 +710,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Generate a 31-byte payload twice for the same inputs and once with a changed key.
-    /// Expected: Repeated inputs produce equal 31-byte payloads; changing key seven to eight
-    /// changes the bytes.
+    /// Purpose: Generate reproducible payloads with the requested size and key identity.
+    /// Expected: Identical inputs reproduce bytes while changing the key changes the payload.
     #[test]
     fn payload_generation_is_deterministic_and_sized() {
         let first = generate_payload(7, 11, 31);
@@ -723,8 +721,8 @@ mod tests {
         assert_ne!(first, generate_payload(8, 11, 31));
     }
 
-    /// Purpose: Wrap sequential reads over three loaded keys from the range start or session offset four.
-    /// Expected: Eight reads from the start yield [0, 1, 2, 0, 1, 2, 0, 1]; four offset reads yield [1, 2, 0, 1].
+    /// Purpose: Preserve session position when cycling sequential reads over loaded keys.
+    /// Expected: Reads wrap within the loaded range while retaining their starting offset.
     #[test]
     fn sequential_reads_wrap_and_preserve_session_offsets() {
         for (name, session_index, key_start, number, expected) in [
@@ -745,8 +743,8 @@ mod tests {
         }
     }
 
-    /// Purpose: Generate 16 random reads over three loaded keys using seeds 11 and 12.
-    /// Expected: Seed 11 repeats exactly, seed 12 differs, and every key lies inside the loaded
+    /// Purpose: Generate reproducible random reads within loaded data.
+    /// Expected: Seeds control the sequence and every generated key remains inside the loaded
     /// range.
     #[test]
     fn random_reads_are_seeded_and_bounded() {
@@ -763,10 +761,9 @@ mod tests {
         assert!(first.iter().all(|key| *key < loaded_range().len));
     }
 
-    /// Purpose: Generate three-row scan ranges within loaded keys 10 through 17 using seeds 11 and
-    /// 12.
-    /// Expected: Repeated seeds reproduce ranges, changed seeds differ, every range fits, and the
-    /// last valid endpoint is exercised.
+    /// Purpose: Generate reproducible scan ranges across the full valid start domain.
+    /// Expected: Seeds control range selection and all ranges fit, including the final valid
+    /// boundary.
     #[test]
     fn random_scan_ranges_are_seeded_and_bounded() {
         let loaded_range = KeyRange { start: 10, len: 8 };
@@ -801,8 +798,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Generate random scans whose length equals the entire loaded range.
-    /// Expected: Both requested scans equal the full range starting at ten with length eight.
+    /// Purpose: Keep full-width random scans within the loaded key range.
+    /// Expected: Every generated scan covers the complete loaded range.
     #[test]
     fn full_random_scan_range_has_one_valid_start() {
         let loaded_range = KeyRange { start: 10, len: 8 };
@@ -816,8 +813,8 @@ mod tests {
         assert_eq!(ranges.next_range().unwrap(), loaded_range);
     }
 
-    /// Purpose: Construct scan generators with zero length or length greater than the loaded range.
-    /// Expected: Both invalid scan lengths are rejected.
+    /// Purpose: Restrict random scans to meaningful lengths within loaded data.
+    /// Expected: Empty and oversized scan ranges are rejected.
     #[test]
     fn random_scan_range_rejects_invalid_lengths() {
         let plan = SessionPlan {
@@ -829,8 +826,8 @@ mod tests {
         assert!(RandomScanRangeGenerator::new(0, loaded_range(), 4, &plan).is_err());
     }
 
-    /// Purpose: Generate sequential and random reads when no loaded keys exist.
-    /// Expected: Both generation paths return errors for the empty loaded range.
+    /// Purpose: Require loaded keys before generating read requests.
+    /// Expected: Sequential and random generation reject an empty loaded range.
     #[test]
     fn read_generation_rejects_empty_loaded_range() {
         let plan = SessionPlan {

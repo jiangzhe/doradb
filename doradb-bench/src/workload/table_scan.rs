@@ -556,10 +556,9 @@ fn record_latency(
 mod tests {
     use super::*;
 
-    /// Purpose: Validate scan result accounting and increments at operation and returned-row
-    /// overflow boundaries.
-    /// Expected: The two-operation/16-row shape passes; unexpected found results, row mismatches,
-    /// and both overflow cases fail.
+    /// Purpose: Keep scan accounting consistent and representable.
+    /// Expected: Valid scan totals pass while inconsistent result counters and overflowing
+    /// increments are rejected.
     #[test]
     fn scan_counter_equations_and_overflow_are_checked() {
         let counters = WorkloadCounters {
@@ -584,9 +583,8 @@ mod tests {
         assert!(add_scan_success(&mut overflowing, 1).is_err());
     }
 
-    /// Purpose: Merge two parallel-scan session outcomes with the same target but different actual
-    /// partition counts.
-    /// Expected: The second merge returns the exact partition-metrics mismatch error.
+    /// Purpose: Require consistent partition diagnostics across parallel scan outcomes.
+    /// Expected: Conflicting actual partition counts prevent outcome merging.
     #[test]
     fn parallel_outcome_merge_requires_stable_partition_metrics() {
         let mut aggregate = ParallelTableScanSessionOutcome::empty().unwrap();

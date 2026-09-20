@@ -217,6 +217,9 @@ mod tests {
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
+    /// Purpose: Preserve logical redo semantics for advancing replay watermarks.
+    /// Expected: Watermark advances emit the required row changes; unchanged watermarks retain
+    /// their marker without redundant DML.
     #[test]
     fn test_sys_trx_silent_watermark_emits_monotonic_logical_redo() {
         smol::block_on(async {

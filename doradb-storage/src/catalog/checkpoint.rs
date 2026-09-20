@@ -845,79 +845,76 @@ mod tests {
         dml
     }
 
-    fn assert_malformed_drop_table_redo(err: Report<DataIntegrityError>, expected: &str) {
-        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("malformed drop-table redo"), "{report}");
-        assert!(report.contains(expected), "{report}");
-    }
-
+    /// Purpose: Identify catalog deletion redo belonging to the dropped table.
+    /// Expected: Only a deletion for the requested table is recognized.
     #[test]
-    fn test_drop_table_has_catalog_table_delete_matches_table_key() {
+    fn test_drop_table_has_catalog_table_delete_matches_only_requested_table() {
         let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(CatalogSelectKey::new(
-            CatalogIndexNo::new(0),
-            vec![Val::from(table_id.as_u64())],
-        ));
-
-        assert!(drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
+        for (case, deleted_table, expected) in [
+            ("matching table key", Some(42u64), true),
+            ("missing catalog deletion", None, false),
+            ("different table key", Some(43u64), false),
+        ] {
+            let dml = deleted_table.map_or_else(BTreeMap::new, |deleted_table| {
+                catalog_tables_delete_dml(CatalogSelectKey::new(
+                    CatalogIndexNo::new(0),
+                    vec![Val::from(deleted_table)],
+                ))
+            });
+            let actual = drop_table_has_catalog_table_delete(table_id, &dml)
+                .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            assert_eq!(actual, expected, "case={case}");
+        }
     }
 
+    /// Purpose: Reject malformed catalog deletion keys during drop replay.
+    /// Expected: Invalid key structure is rejected with a diagnostic identifying the defect.
     #[test]
-    fn test_drop_table_has_catalog_table_delete_missing_is_false() {
-        let table_id = TableID::new(42);
-        let dml = BTreeMap::new();
-
-        assert!(!drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
+    fn test_drop_table_has_catalog_table_delete_rejects_malformed_keys() {
+        for (case, slot, values, diagnostic) in [
+            (
+                "wrong index slot",
+                1,
+                vec![Val::from(42u64)],
+                "index_slot=1",
+            ),
+            (
+                "wrong value count",
+                0,
+                vec![Val::from(42u64), Val::from(1u64)],
+                "key_value_count=2",
+            ),
+            (
+                "wrong value type",
+                0,
+                vec![Val::from(42u32)],
+                "key value is not u64",
+            ),
+        ] {
+            let dml =
+                catalog_tables_delete_dml(CatalogSelectKey::new(CatalogIndexNo::new(slot), values));
+            let error =
+                drop_table_has_catalog_table_delete(TableID::new(42), &dml).expect_err(case);
+            let report = format!("{error:?}");
+            assert_eq!(
+                error.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "{case}: {report}"
+            );
+            assert!(
+                report.contains("malformed drop-table redo"),
+                "{case}: {report}"
+            );
+            assert!(
+                report.contains(diagnostic),
+                "{case}: expected {diagnostic}: {report}"
+            );
+        }
     }
 
-    #[test]
-    fn test_drop_table_has_catalog_table_delete_different_table_is_false() {
-        let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(CatalogSelectKey::new(
-            CatalogIndexNo::new(0),
-            vec![Val::from(TableID::new(43).as_u64())],
-        ));
-
-        assert!(!drop_table_has_catalog_table_delete(table_id, &dml).unwrap());
-    }
-
-    #[test]
-    fn test_drop_table_has_catalog_table_delete_rejects_wrong_index_slot() {
-        let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(CatalogSelectKey::new(
-            CatalogIndexNo::new(1),
-            vec![Val::from(table_id.as_u64())],
-        ));
-        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
-
-        assert_malformed_drop_table_redo(err, "index_slot=1");
-    }
-
-    #[test]
-    fn test_drop_table_has_catalog_table_delete_rejects_value_count_mismatch() {
-        let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(CatalogSelectKey::new(
-            CatalogIndexNo::new(0),
-            vec![Val::from(table_id.as_u64()), Val::from(1u64)],
-        ));
-        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
-
-        assert_malformed_drop_table_redo(err, "key_value_count=2");
-    }
-
-    #[test]
-    fn test_drop_table_has_catalog_table_delete_rejects_value_type_mismatch() {
-        let table_id = TableID::new(42);
-        let dml = catalog_tables_delete_dml(CatalogSelectKey::new(
-            CatalogIndexNo::new(0),
-            vec![Val::from(42u32)],
-        ));
-        let err = drop_table_has_catalog_table_delete(table_id, &dml).unwrap_err();
-
-        assert_malformed_drop_table_redo(err, "key value is not u64");
-    }
-
+    /// Purpose: Protect mutual exclusion between checkpoints and metadata changes.
+    /// Expected: Metadata changes wait for checkpoints and retain exclusive access until
+    /// release.
     #[test]
     fn test_catalog_metadata_change_waits_for_active_checkpoint() {
         smol::block_on(async {
@@ -944,6 +941,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Prevent checkpointing during an active metadata change.
+    /// Expected: Checkpoint admission resumes only after metadata ownership is released.
     #[test]
     fn test_catalog_checkpoint_waits_for_active_metadata_change() {
         smol::block_on(async {
@@ -962,6 +961,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Prevent overlapping catalog checkpoints.
+    /// Expected: A waiting checkpoint proceeds only after the current checkpoint releases
+    /// ownership.
     #[test]
     fn test_catalog_checkpoint_waits_for_active_checkpoint() {
         smol::block_on(async {
@@ -980,6 +982,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect queued metadata changes from checkpoint starvation.
+    /// Expected: A pending metadata change takes priority over a later checkpoint.
     #[test]
     fn test_catalog_checkpoint_waits_behind_pending_metadata_change() {
         smol::block_on(async {
@@ -1010,6 +1014,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve checkpoint admission when a queued metadata change is cancelled.
+    /// Expected: Cancellation removes the pending metadata claim without obstructing later
+    /// checkpoints.
     #[test]
     fn test_catalog_pending_metadata_change_cancellation_reopens_checkpoint() {
         smol::block_on(async {
@@ -1029,6 +1036,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Keep redo retention within checkpointed catalog progress.
+    /// Expected: Replay advancement and retained segment eligibility respect the catalog-safe
+    /// boundary.
     #[test]
     fn test_catalog_checkpoint_batch_builds_catalog_safe_progress() {
         let replay_start_ts = TrxID::new(10);
@@ -1087,6 +1097,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Avoid reporting retention progress without durable catalog work.
+    /// Expected: An uncovered replay range produces no retention progress.
     #[test]
     fn test_catalog_checkpoint_batch_without_durable_work_has_no_progress() {
         let replay_start_ts = TrxID::new(10);
@@ -1106,6 +1118,9 @@ mod tests {
         assert!(batch.redo_retention_progress().is_none());
     }
 
+    /// Purpose: Preserve metadata waiter progress after cancellation of the pending owner.
+    /// Expected: Another metadata waiter can acquire the gate once the checkpoint releases
+    /// ownership.
     #[test]
     fn test_catalog_second_metadata_change_completes_after_pending_waiter_cancelled() {
         smol::block_on(async {

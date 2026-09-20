@@ -300,6 +300,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep catalog table deletion scoped to the requested identity.
+    /// Expected: Deletion distinguishes present and absent targets while preserving unrelated
+    /// tables.
     #[test]
     fn test_tables_delete_by_id() {
         smol::block_on(async {
@@ -398,6 +401,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Keep catalog lookup independent of non-metadata pool access.
+    /// Expected: Metadata pool access alone is sufficient to resolve an existing table.
     #[test]
     fn test_catalog_lookup_uses_meta_guard_only() {
         smol::block_on(async {

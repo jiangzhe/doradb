@@ -117,10 +117,9 @@ mod tests {
         result
     }
 
-    /// Purpose: Fingerprint row multisets across order, multiplicity, key/payload changes, and
-    /// field-boundary ambiguities.
-    /// Expected: Reordering preserves the digest; content or multiplicity changes alter it, empty
-    /// input is zero, and one row matches an independently assembled BLAKE3 encoding.
+    /// Purpose: Fingerprint row multisets independently of traversal order.
+    /// Expected: Canonical encoding preserves content and multiplicity distinctions while
+    /// ignoring row order.
     #[test]
     fn fingerprints_preserve_content_and_multiplicity_without_order() {
         let first = (0, &b"hello"[..]);
@@ -147,10 +146,10 @@ mod tests {
         );
     }
 
-    /// Purpose: Reject malformed fingerprint rows and row-count overflow while permitting digest
-    /// arithmetic to wrap.
-    /// Expected: Bad shapes/types fail, count overflow preserves the entire fingerprint, and a
-    /// wrapping digest update equals the expected digest minus one.
+    /// Purpose: Protect fingerprint validity while distinguishing checked counts from modular
+    /// digest arithmetic.
+    /// Expected: Malformed rows fail, count overflow preserves state, and digest accumulation
+    /// wraps as specified.
     #[test]
     fn fingerprint_rejects_bad_values_and_checked_count_overflow() {
         for row in [

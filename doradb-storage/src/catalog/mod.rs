@@ -1612,7 +1612,7 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error};
     use crate::file::cow_file::tests::corrupt_page_checksum;
-    use crate::index::{ColumnBlockIndex, corrupt_leaf_delete_codec};
+    use crate::index::{ColumnBlockIndex, ColumnLeafEntry, corrupt_leaf_delete_codec};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
@@ -1904,11 +1904,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn assert_catalog_data_integrity(err: Error) {
+    fn assert_catalog_data_integrity(err: Error, expected: DataIntegrityError) {
         let report = format!("{err:?}");
-        assert!(
-            err.report().downcast_ref::<DataIntegrityError>().is_some(),
-            "{report}"
+        assert_eq!(
+            err.report().downcast_ref::<DataIntegrityError>(),
+            Some(&expected),
+            "{report}",
         );
         assert!(!report.contains("propagate from other threads"), "{report}");
         assert!(
@@ -1919,6 +1920,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Protect the separation between user and catalog table identities.
+    /// Expected: The identity ranges remain disjoint and built-in slot mappings remain
+    /// consistent.
     #[test]
     fn test_catalog_table_id_boundary_predicates() {
         let last_user = TableID::new(USER_TABLE_ID_LIMIT.as_u64() - 1);
@@ -1944,6 +1948,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Prevent user table allocation from entering the catalog identity range.
+    /// Expected: Crossing the reserved boundary triggers the allocator invariant.
     #[test]
     #[should_panic(expected = "user table id allocator overflowed into catalog table range")]
     fn test_next_table_id_panics_at_catalog_boundary() {
@@ -1964,6 +1970,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep index DDL reconciliation from hiding column-definition changes.
+    /// Expected: Incompatible column attributes prevent reconciliation.
     #[test]
     fn test_index_ddl_metadata_reconcilable_rejects_column_attribute_mismatch() {
         let catalog_metadata = TableMetadata::try_new(
@@ -1995,6 +2003,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Allow recovery when durable index metadata leads the catalog.
+    /// Expected: Compatible file-ahead metadata remains reconcilable.
     #[test]
     fn test_index_ddl_metadata_reconcilable_allows_file_ahead_of_catalog() {
         let columns = || {
@@ -2023,6 +2033,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Reject catalog index allocation beyond its durable file state.
+    /// Expected: Reconciliation reports an integrity failure identifying the conflicting
+    /// allocation boundaries.
     #[test]
     fn test_index_ddl_metadata_reconcilable_errors_when_catalog_ahead_of_file() {
         let columns = || {
@@ -2058,6 +2071,9 @@ pub(crate) mod tests {
         assert!(report.contains("file_index_slot_count=1"), "{report}");
     }
 
+    /// Purpose: Keep catalog persistence in its shared durable file.
+    /// Expected: Bootstrap creates the shared catalog file without individual catalog table
+    /// files.
     #[test]
     fn test_bootstrap_creates_catalog_mtb_without_catalog_tbl_files() {
         smol::block_on(async {
@@ -2068,12 +2084,23 @@ pub(crate) mod tests {
 
             let data_dir = temp_dir.path();
             assert!(data_dir.join("catalog.mtb").exists());
-            for table_id in 0..4u64 {
-                assert!(!data_dir.join(format!("{table_id}.tbl")).exists());
+            for table_id in [
+                TABLE_ID_TABLES,
+                TABLE_ID_COLUMNS,
+                TABLE_ID_INDEXES,
+                TABLE_ID_TABLE_DESCRIPTORS,
+                TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS,
+                TABLE_ID_TABLE_BINDINGS,
+            ] {
+                let path = data_dir.join(format!("{table_id:016x}.tbl"));
+                assert!(!path.exists(), "unexpected catalog table file: {path:?}");
             }
         });
     }
 
+    /// Purpose: Preserve user table allocation progress across restart.
+    /// Expected: Recovered allocation continues monotonically without reusing an assigned
+    /// identity.
     #[test]
     fn test_next_table_id_monotonic_across_restart() {
         smol::block_on(async {
@@ -2123,6 +2150,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve index allocation across redo recovery and catalog checkpoints.
+    /// Expected: Allocated slots and active index identities survive both recovery paths.
     #[test]
     fn test_index_slot_count_persists_across_restart_and_catalog_checkpoint() {
         smol::block_on(async {
@@ -2235,6 +2264,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep redo-floor snapshots independent of runtime ownership.
+    /// Expected: Snapshots capture the live replay state without extending table runtime
+    /// ownership.
     #[test]
     fn test_redo_floor_snapshot_does_not_retain_live_table_runtime() {
         smol::block_on(async {
@@ -2262,6 +2294,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Distinguish catalog publication from a checkpoint with no new work.
+    /// Expected: Publication advances durable catalog state; an immediate repeat preserves it.
     #[test]
     fn test_session_catalog_checkpoint_publish_and_noop() {
         smol::block_on(async {
@@ -2320,63 +2354,50 @@ pub(crate) mod tests {
         });
     }
 
+    async fn checkpointed_catalog_leaf(main_dir: PathBuf, log_stem: &str) -> ColumnLeafEntry {
+        let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
+        let _ = table1(&engine).await;
+        engine
+            .new_session()
+            .unwrap()
+            .checkpoint_catalog()
+            .await
+            .unwrap();
+        let storage = &engine.inner().core.catalog().storage;
+        let snapshot = storage.checkpoint_snapshot();
+        let root = snapshot.meta.table_roots[0];
+        assert_eq!(root.table_id, TABLE_ID_TABLES);
+        let entry = {
+            let disk_guard = storage.disk_pool.create_base_guard();
+            let index = ColumnBlockIndex::new(
+                root.checkpoint_root_block_id().unwrap(),
+                root.pivot_row_id(),
+                storage.mtb.file_kind(),
+                storage.mtb.sparse_file(),
+                &storage.disk_pool,
+                &disk_guard,
+            );
+            let entries = index.collect_leaf_entries().await.unwrap();
+            assert_eq!(entries.len(), 1);
+            entries.into_iter().next().unwrap()
+        };
+        drop(engine);
+        entry
+    }
+
+    /// Purpose: Reject checksum corruption in checkpointed catalog data during recovery.
+    /// Expected: The checksum failure remains identifiable across the public error boundary.
     #[test]
     fn test_catalog_bootstrap_fails_on_corrupted_checkpoint_lwc_block() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = open_catalog_test_engine(
-                main_dir.clone(),
-                Some("catalog-checkpoint-corrupt-bootstrap"),
-            )
-            .await;
+            let entry =
+                checkpointed_catalog_leaf(main_dir.clone(), "catalog-checkpoint-corrupt-bootstrap")
+                    .await;
 
-            let _ = table1(&engine).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            let root = snap
-                .meta
-                .table_roots
-                .iter()
-                .copied()
-                .find(|root| root.checkpoint_root_block_id().is_some())
-                .expect("catalog checkpoint should publish at least one root");
-            let root_block_id = root.checkpoint_root_block_id().unwrap();
-            let block_id = {
-                let disk_pool_guard = engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .disk_pool
-                    .create_base_guard();
-                let index = ColumnBlockIndex::new(
-                    root_block_id,
-                    root.pivot_row_id(),
-                    engine.inner().core.catalog().storage.mtb.file_kind(),
-                    engine.inner().core.catalog().storage.mtb.sparse_file(),
-                    &engine.inner().core.catalog().storage.disk_pool,
-                    &disk_pool_guard,
-                );
-                let entry = index
-                    .collect_leaf_entries()
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                    .expect("catalog checkpoint should publish at least one LWC block");
-                entry.block_id()
-            };
-            drop(engine);
-
-            corrupt_page_checksum(main_dir.join("catalog.mtb"), u64::from(block_id));
+            corrupt_page_checksum(main_dir.join("catalog.mtb"), u64::from(entry.block_id()));
 
             let err = expect_catalog_test_engine_error(
                 main_dir,
@@ -2384,64 +2405,23 @@ pub(crate) mod tests {
                 "expected catalog bootstrap corruption failure",
             )
             .await;
-            assert_catalog_data_integrity(err);
+            assert_catalog_data_integrity(err, DataIntegrityError::ChecksumMismatch);
         });
     }
 
+    /// Purpose: Reject malformed catalog deletion metadata during recovery.
+    /// Expected: The payload failure remains identifiable across the public error boundary.
     #[test]
     fn test_catalog_bootstrap_fails_on_invalid_v2_delete_metadata() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
 
-            let engine = open_catalog_test_engine(
+            let entry = checkpointed_catalog_leaf(
                 main_dir.clone(),
-                Some("catalog-checkpoint-invalid-delete-metadata"),
+                "catalog-checkpoint-invalid-delete-metadata",
             )
             .await;
-
-            let _ = table1(&engine).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            let root = snap
-                .meta
-                .table_roots
-                .iter()
-                .copied()
-                .find(|root| root.checkpoint_root_block_id().is_some())
-                .expect("catalog checkpoint should publish at least one root");
-            let root_block_id = root.checkpoint_root_block_id().unwrap();
-            let entry = {
-                let disk_pool_guard = engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .disk_pool
-                    .create_base_guard();
-                let index = ColumnBlockIndex::new(
-                    root_block_id,
-                    root.pivot_row_id(),
-                    engine.inner().core.catalog().storage.mtb.file_kind(),
-                    engine.inner().core.catalog().storage.mtb.sparse_file(),
-                    &engine.inner().core.catalog().storage.disk_pool,
-                    &disk_pool_guard,
-                );
-                index
-                    .collect_leaf_entries()
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                    .expect("catalog checkpoint should publish at least one leaf entry")
-            };
-            drop(engine);
 
             corrupt_leaf_delete_codec(
                 main_dir.join("catalog.mtb"),
@@ -2455,10 +2435,12 @@ pub(crate) mod tests {
                 "expected catalog bootstrap invalid-metadata failure",
             )
             .await;
-            assert_catalog_data_integrity(err);
+            assert_catalog_data_integrity(err, DataIntegrityError::InvalidPayload);
         });
     }
 
+    /// Purpose: Advance catalog replay after user DML without catalog changes.
+    /// Expected: Replay progresses while catalog roots and allocation state remain unchanged.
     #[test]
     fn test_session_catalog_checkpoint_heartbeat_without_catalog_ops() {
         smol::block_on(async {
@@ -2499,6 +2481,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cover the full durable catalog range without replaying completed work.
+    /// Expected: Checkpointing consumes durable DDL and leaves repeated scans with no further
+    /// progress.
     #[test]
     fn test_catalog_checkpoint_scan_apply_full_range() {
         smol::block_on(async {
@@ -2569,6 +2554,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Support catalog heartbeats across mixed user-table checkpoint states.
+    /// Expected: Replay advances independently of user-table persistence while preserving
+    /// unchanged catalog state.
     #[test]
     fn test_session_catalog_checkpoint_heartbeat_with_mixed_user_table_checkpoint_states() {
         smol::block_on(async {

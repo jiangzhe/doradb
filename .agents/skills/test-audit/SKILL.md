@@ -77,6 +77,23 @@ For source-discovery boundaries, field rules, and gradual adoption, use
 In particular, `documented` means structurally valid, not behaviorally verified.
 Conditions are source-local and unevaluated; macros are not expanded.
 
+## Contract Writing Principle
+
+Keep `Purpose:` and `Expected:` concise and focused on intent. `Purpose:` names
+the protected behavior and distinguishing scenario; `Expected:` states the
+semantic guarantee. Prefer a short sentence per field. Describe boundaries,
+errors, and lifecycle distinctions conceptually; leave concrete inputs, returned
+values, IDs, counts, timestamps, byte sequences, and diagnostic strings in the
+test body. Do not narrate execution steps or enumerate assertions.
+
+```rust
+/// Purpose: Protect descriptor decoding at payload boundaries.
+/// Expected: Valid payloads preserve metadata and opaque bytes.
+```
+
+This is a semantic review principle, not a numeric-content or length restriction
+for the mechanical auditor.
+
 ## Semantic Review
 
 When style-audit has already passed its mechanical gates for the same selected
@@ -84,10 +101,11 @@ files and source snapshot, reuse those gates and its fresh inventory. If a
 deduplication request needs a candidate report, run the optional analysis for
 the same selected files and snapshot. Do not broaden to all inventoried files.
 
-- Connect each reviewed test's Purpose and Expected fields to its actual
-  assertions or explicit oracle. Check input boundaries, errors, cleanup, and
-  final state. Identify expectations derived from the implementation itself
-  that could reproduce the same defect instead of detecting it.
+- Review contracts against the writing principle above, then connect each
+  test's Purpose and Expected fields to its actual assertions or explicit oracle.
+  Check input boundaries, errors, cleanup, and final state. Identify expectations
+  derived from the implementation itself that could reproduce the same defect
+  instead of detecting it.
 - Examine state and schedule setup. Record seeds, operation-generation details,
   and synchronization predicates where relevant. A documented seed alone does
   not establish reproducibility; elapsed time should not establish readiness.

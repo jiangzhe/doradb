@@ -1028,10 +1028,9 @@ mod tests {
     {
     }
 
-    /// Purpose: Render profiler pause and resume notices for PID 42, phase three, and checkpoint-
-    /// table.
-    /// Expected: The complete output matches the fixed protocol records, attach instructions, and
-    /// SIGCONT resume command.
+    /// Purpose: Protect the public profiler pause and resume protocol.
+    /// Expected: Notices retain stable records, workload context, and actionable attach and
+    /// resume instructions.
     #[test]
     fn profiler_protocol_records_are_stable() {
         let mut output = Vec::new();
@@ -1046,9 +1045,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Inject independent write and flush failures while emitting a profiler pause notice.
-    /// Expected: Each failure preserves its cause and identifies the failed operation and process
-    /// 42 in the exact error text.
+    /// Purpose: Preserve context when profiler notice delivery fails.
+    /// Expected: Write and flush errors retain their cause and identify the affected operation
+    /// and process.
     #[test]
     fn profiler_pause_notice_maps_write_and_flush_failures() {
         let write_error = write_pausing_notice(&mut WriteFailure, 42, 3, "trx-noop").unwrap_err();
@@ -1065,10 +1064,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Check the associated configuration and outcome contracts shared by related executor
-    /// families.
-    /// Expected: Compile-time generic bounds accept the declared noop, insert, DDL, lookup, and
-    /// stream executor pairings.
+    /// Purpose: Preserve type compatibility within related executor families.
+    /// Expected: Related executors satisfy their shared configuration and outcome type
+    /// contracts.
     #[test]
     fn related_executor_identities_share_associated_types() {
         assert_shared_config::<StmtNoopExecutor, TrxNoopExecutor>();
@@ -1081,9 +1079,9 @@ mod tests {
         assert_shared_outcome::<LookupSeqExecutor, IndexStreamExecutor>();
     }
 
-    /// Purpose: Compare the registered executor identities with their corresponding workload
-    /// spellings.
-    /// Expected: All 17 checked identities equal the explicit ordered list of workload names.
+    /// Purpose: Keep executor identities aligned with public workload names.
+    /// Expected: Registered executors retain the expected workload spelling and identity
+    /// mapping.
     #[test]
     fn executor_identities_match_resolved_workload_names() {
         assert_eq!(
@@ -1128,10 +1126,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Spawn two tasks that rendezvous while two executor worker threads are actively
-    /// driven.
-    /// Expected: Both task and rendezvous results identify two distinct worker threads; watchdog
-    /// failures release the rendezvous for cleanup.
+    /// Purpose: Support concurrent task progress across executor workers.
+    /// Expected: Rendezvousing tasks execute on distinct driven worker threads.
     #[test]
     fn run_spawner_uses_distinct_driven_executor_workers() {
         struct Rendezvous {

@@ -256,6 +256,9 @@ mod tests {
     use crate::session::tests::SessionTestExt;
     use tempfile::TempDir;
 
+    /// Purpose: Keep catalog column deletion scoped and idempotent.
+    /// Expected: Deletion affects only the target table and repeated deletion reports no
+    /// further changes.
     #[test]
     fn test_columns_delete_by_table_id_counts_and_is_idempotent() {
         smol::block_on(async {

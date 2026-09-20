@@ -1484,6 +1484,7 @@ pub(crate) mod tests {
         StorageColumnSpec, StorageTableDefinition, StorageTableSpec, TableBinding,
     };
     use crate::catalog::{CatalogIndexNo, CatalogSelectKey};
+    use crate::engine::Engine;
     use crate::error::{
         DataIntegrityError, DiscloseResultExt, Result, RuntimeError, RuntimeOrFatalError,
     };
@@ -1670,11 +1671,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn catalog_column_insert(
-        table_id: TableID,
-        column_no: u16,
-        _name_len: usize,
-    ) -> CatalogRedoEntry {
+    fn catalog_column_insert(table_id: TableID, column_no: u16) -> CatalogRedoEntry {
         CatalogRedoEntry {
             table_id: TABLE_ID_COLUMNS,
             kind: RowRedoKind::Insert(
@@ -1690,12 +1687,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn catalog_column_row_record(
-        row_id: RowID,
-        table_id: TableID,
-        column_no: u16,
-        _name_len: usize,
-    ) -> RowRecord {
+    fn catalog_column_row_record(row_id: RowID, table_id: TableID, column_no: u16) -> RowRecord {
         RowRecord {
             row_id,
             vals: vec![
@@ -1903,6 +1895,9 @@ pub(crate) mod tests {
         assert_eq!(current_replay_start_ts, replay_start_ts);
     }
 
+    /// Purpose: Keep catalog row identity unambiguous and non-nullable.
+    /// Expected: Each checked catalog definition has an unambiguous primary key over required
+    /// columns.
     #[test]
     fn test_static_catalog_definitions_expose_one_primary_key() {
         for CatalogDefinition { table_id, metadata } in [
@@ -1931,6 +1926,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Preserve precise integrity errors from catalog leaf validation.
+    /// Expected: Malformed catalog data is rejected with context identifying the affected row
+    /// or field.
     #[test]
     fn test_catalog_leaf_validators_return_data_integrity_reports() {
         let err = catalog_table_slot_checked(TABLE_ID_TABLES, 0).unwrap_err();
@@ -1955,6 +1953,9 @@ pub(crate) mod tests {
         assert!(report.contains("index 1"), "{report}");
     }
 
+    /// Purpose: Validate catalog root identity even when the root is empty.
+    /// Expected: Bootstrap rejects a root assigned to the wrong catalog slot with boundary
+    /// context.
     #[test]
     fn test_bootstrap_rejects_empty_catalog_root_table_id_mismatch() {
         smol::block_on(async {
@@ -2003,6 +2004,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep checkpoint redo within the built-in catalog identity range.
+    /// Expected: Out-of-range redo is rejected without advancing catalog replay.
     #[test]
     fn test_catalog_checkpoint_rejects_out_of_range_redo_table_id() {
         smol::block_on(async {
@@ -2069,6 +2072,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect parent integrity in the projected catalog checkpoint.
+    /// Expected: An orphaned row prevents publication and leaves durable catalog state
+    /// unchanged.
     #[test]
     fn test_catalog_checkpoint_rejects_projected_orphan_before_publication() {
         smol::block_on(async {
@@ -2082,8 +2088,7 @@ pub(crate) mod tests {
             let before = storage.checkpoint_snapshot();
             let before_watermarks = storage.checkpointed_silent_watermarks();
             let orphan = USER_TABLE_ID_START + 77;
-            let batch =
-                checkpoint_batch_with_ops(storage, vec![catalog_column_insert(orphan, 0, 0)]);
+            let batch = checkpoint_batch_with_ops(storage, vec![catalog_column_insert(orphan, 0)]);
 
             let prepared = storage
                 .prepare_checkpoint_batch(
@@ -2119,6 +2124,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require primary-key addressing for checkpointed catalog deletion.
+    /// Expected: Non-primary deletion keys are rejected without advancing replay.
     #[test]
     fn test_catalog_checkpoint_rejects_delete_key_non_primary_key() {
         smol::block_on(async {
@@ -2131,6 +2138,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require complete primary-key shape for checkpointed deletion.
+    /// Expected: Incorrect key arity is rejected without advancing replay.
     #[test]
     fn test_catalog_checkpoint_rejects_delete_key_value_count_mismatch() {
         smol::block_on(async {
@@ -2146,6 +2155,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep direct catalog block construction independent of metadata-page allocation.
+    /// Expected: Valid rows build directly and oversized rows fail without consuming metadata
+    /// pages.
     #[test]
     fn test_catalog_lwc_direct_building_does_not_allocate_meta_pages() {
         smol::block_on(async {
@@ -2160,8 +2172,8 @@ pub(crate) mod tests {
 
             let allocated_before = storage.meta_pool.allocated();
             let rows = vec![
-                catalog_column_row_record(RowID::new(0), table_id, 0, 16),
-                catalog_column_row_record(RowID::new(1), table_id, 1, 24),
+                catalog_column_row_record(RowID::new(0), table_id, 0),
+                catalog_column_row_record(RowID::new(1), table_id, 1),
             ];
             let blocks = build_lwc_blocks_from_row_records(metadata, &rows)
                 .expect("small rows should build directly");
@@ -2197,6 +2209,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Validate catalog row types and nullability before trusted block construction.
+    /// Expected: Invalid values are rejected with column context before reaching the trusted
+    /// builder.
     #[test]
     fn test_catalog_lwc_rows_are_validated_before_trusted_builder() {
         let metadata = TableMetadata::try_new(
@@ -2232,6 +2247,26 @@ pub(crate) mod tests {
         }
     }
 
+    async fn assert_catalog_root_load_error(
+        storage: &CatalogStorage,
+        root: CatalogTableRootDesc,
+        expected: DataIntegrityError,
+    ) -> String {
+        let table = storage.get_catalog_table(root.table_id).unwrap();
+        let disk_guard = storage.disk_pool.create_base_guard();
+        let measurement = catalog_measurement(storage);
+        let error = storage
+            .load_rows_from_root(table.metadata(), &disk_guard, root, &measurement)
+            .await
+            .unwrap_err();
+        let report = expect_runtime_report(error);
+        assert_eq!(*report.current_context(), RuntimeError::CatalogAccess);
+        assert_eq!(report.downcast_ref::<DataIntegrityError>(), Some(&expected));
+        format!("{report:?}")
+    }
+
+    /// Purpose: Require compact catalog roots during loading.
+    /// Expected: Persisted deletion deltas are diagnosed as an invalid catalog root.
     #[test]
     fn test_catalog_root_loader_rejects_delete_deltas() {
         smol::block_on(async {
@@ -2256,21 +2291,12 @@ pub(crate) mod tests {
             )
             .await;
 
-            let disk_pool_guard = storage.disk_pool.create_base_guard();
-            let measurement = catalog_measurement(storage);
-            let err = storage
-                .load_rows_from_root(table.metadata(), &disk_pool_guard, root, &measurement)
-                .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidRootInvariant)
-            );
-            let report = format!("{err:?}");
+            let report = assert_catalog_root_load_error(
+                storage,
+                root,
+                DataIntegrityError::InvalidRootInvariant,
+            )
+            .await;
             assert!(
                 report.contains("catalog root contains delete deltas"),
                 "{report}"
@@ -2283,6 +2309,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect catalog root loading from ambiguous row identity.
+    /// Expected: Duplicate primary keys prevent the root from loading.
     #[test]
     fn test_catalog_root_loader_rejects_duplicate_primary_keys() {
         smol::block_on(async {
@@ -2313,26 +2341,16 @@ pub(crate) mod tests {
             )
             .await;
 
-            let disk_pool_guard = storage.disk_pool.create_base_guard();
-            let measurement = catalog_measurement(storage);
-            let err = storage
-                .load_rows_from_root(table.metadata(), &disk_pool_guard, root, &measurement)
-                .await
-                .unwrap_err();
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-
-            assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-            let report = format!("{err:?}");
+            let report =
+                assert_catalog_root_load_error(storage, root, DataIntegrityError::InvalidPayload)
+                    .await;
             assert!(report.contains("duplicate primary key"), "{report}");
         });
     }
 
+    /// Purpose: Reclaim displaced metadata during metadata-only checkpoints.
+    /// Expected: Publication preserves allocation balance and recoverable progress while
+    /// releasing obsolete metadata.
     #[test]
     fn test_catalog_metadata_only_checkpoint_reclaims_displaced_meta_block() {
         smol::block_on(async {
@@ -2378,6 +2396,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Advance redo retention independently of catalog checkpoint contents.
+    /// Expected: The marker advances monotonically without changing replay, table roots, or
+    /// table allocation.
     #[test]
     fn test_catalog_publish_first_redo_log_seq_preserves_checkpoint_metadata() {
         smol::block_on(async {
@@ -2450,6 +2471,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Validate roots during metadata-only catalog checkpoints.
+    /// Expected: Cached and uncached roots are validated without rewriting table data or
+    /// growing durable allocation.
     #[test]
     fn test_catalog_metadata_only_checkpoint_validates_roots_without_rewrite() {
         smol::block_on(async {
@@ -2588,6 +2612,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Avoid redundant decoding during projected catalog integrity validation.
+    /// Expected: Projected validation reuses decoded roots without a redundant pass.
     #[test]
     fn test_catalog_checkpoint_decodes_projected_shared_schema_roots_once() {
         smol::block_on(async {
@@ -2626,6 +2652,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Avoid table-root work for checkpoint mutations that cancel out.
+    /// Expected: Only displaced metadata is reclaimed while table contents and allocation
+    /// balance remain unchanged.
     #[test]
     fn test_catalog_checkpoint_canceled_ops_use_meta_only_reclamation() {
         smol::block_on(async {
@@ -2685,6 +2714,23 @@ pub(crate) mod tests {
         });
     }
 
+    async fn assert_checkpoint_table_row(
+        engine: &Engine,
+        batch: CatalogCheckpointBatch,
+        expected: Vec<Val>,
+    ) {
+        let catalog = engine.inner().core.catalog();
+        catalog
+            .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
+            .await
+            .unwrap();
+        let rows = assert_compact_catalog_root(&catalog.storage, TABLE_ID_TABLES).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals, expected);
+    }
+
+    /// Purpose: Apply checkpoint updates to rows inserted in the same batch.
+    /// Expected: The compact result preserves the updated row without duplicate identities.
     #[test]
     fn test_catalog_checkpoint_update_by_primary_key_updates_same_batch_insert() {
         smol::block_on(async {
@@ -2719,25 +2765,13 @@ pub(crate) mod tests {
                 ],
             );
 
-            engine
-                .inner()
-                .core
-                .catalog()
-                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
-                .await
-                .unwrap();
-
-            let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
-            let matching_rows = rows
-                .iter()
-                .filter(|row| row.vals[0] == Val::from(table_id))
-                .collect::<Vec<_>>();
-            assert_eq!(matching_rows.len(), 1);
-            assert_eq!(matching_rows[0].vals[4], Val::from(7u32));
-            assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
+            assert_checkpoint_table_row(&engine, batch, catalog_table_vals(table_id, 7)).await;
         });
     }
 
+    /// Purpose: Keep catalog primary keys immutable during checkpoint updates.
+    /// Expected: Updates targeting primary-key columns are rejected even when the value is
+    /// unchanged.
     #[test]
     fn test_catalog_checkpoint_update_by_primary_key_rejects_primary_key_column() {
         smol::block_on(async {
@@ -2796,6 +2830,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Apply checkpoint updates to rows already persisted in the base root.
+    /// Expected: The compact result preserves the update and untouched fields without duplicate
+    /// identities.
     #[test]
     fn test_catalog_checkpoint_update_by_primary_key_replaces_existing_row() {
         smol::block_on(async {
@@ -2813,6 +2850,11 @@ pub(crate) mod tests {
                 .unwrap();
 
             let storage = &engine.inner().core.catalog().storage;
+            let mut expected = catalog_root_rows(storage, TABLE_ID_TABLES)
+                .await
+                .remove(0)
+                .vals;
+            expected[4] = Val::from(9u32);
             let batch = checkpoint_batch_with_ops(
                 storage,
                 vec![CatalogRedoEntry {
@@ -2827,25 +2869,12 @@ pub(crate) mod tests {
                 }],
             );
 
-            engine
-                .inner()
-                .core
-                .catalog()
-                .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
-                .await
-                .unwrap();
-
-            let rows = catalog_root_rows(storage, TABLE_ID_TABLES).await;
-            let matching_rows = rows
-                .iter()
-                .filter(|row| row.vals[0] == Val::from(table_id))
-                .collect::<Vec<_>>();
-            assert_eq!(matching_rows.len(), 1);
-            assert_eq!(matching_rows[0].vals[4], Val::from(9u32));
-            assert_compact_catalog_root(storage, TABLE_ID_TABLES).await;
+            assert_checkpoint_table_row(&engine, batch, expected).await;
         });
     }
 
+    /// Purpose: Prevent catalog reclamation from accepting unallocated root references.
+    /// Expected: Invalid allocation metadata is rejected without changing the published root.
     #[test]
     fn test_catalog_reclamation_rejects_unallocated_root_descriptor_before_publish() {
         smol::block_on(async {
@@ -2902,6 +2931,43 @@ pub(crate) mod tests {
         });
     }
 
+    async fn assert_canceled_insert_keeps_root(
+        engine: &Engine,
+        root: CatalogTableRootDesc,
+        table_id: TableID,
+        cts: TrxID,
+    ) {
+        let storage = &engine.inner().core.catalog().storage;
+        let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+        let table_ops = vec![
+            RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
+            RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                CatalogIndexNo::new(0),
+                vec![Val::from(table_id)],
+            )),
+        ];
+        let mut mutable =
+            MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+        let mut measurement = catalog_measurement(storage);
+        let (next_root, blocks_changed) = storage
+            .apply_table_ops(
+                &mut mutable,
+                TABLE_ID_TABLES,
+                table.metadata(),
+                root,
+                &table_ops,
+                cts,
+                engine.inner().core.pools.pool_guards().disk_guard(),
+                &mut measurement,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_root, root);
+        assert!(!blocks_changed);
+    }
+
+    /// Purpose: Avoid materializing an empty root for a cancelled insertion.
+    /// Expected: The empty root is preserved without block changes.
     #[test]
     fn test_catalog_checkpoint_apply_table_ops_keeps_empty_root_for_canceled_insert_batch() {
         smol::block_on(async {
@@ -2911,43 +2977,14 @@ pub(crate) mod tests {
                 open_catalog_test_engine(main_dir, Some("catalog-checkpoint-canceled-empty-root"))
                     .await;
 
-            let storage = &engine.inner().core.catalog().storage;
-            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
             let root = CatalogTableRootDesc::empty(TABLE_ID_TABLES);
             let table_id = USER_TABLE_ID_START + 42;
-            let table_ops = vec![
-                RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
-                RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
-                    CatalogIndexNo::new(0),
-                    vec![Val::from(table_id)],
-                )),
-            ];
-            let mut mutable =
-                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-            let mut measurement = CatalogCheckpointMeasurement::new(
-                &storage.checkpoint_snapshot().meta.table_roots,
-                0,
-            );
-
-            let (next_root, blocks_changed) = storage
-                .apply_table_ops(
-                    &mut mutable,
-                    TABLE_ID_TABLES,
-                    table.metadata(),
-                    root,
-                    &table_ops,
-                    TrxID::new(7),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                    &mut measurement,
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(next_root.state, CatalogTableRootState::Empty);
-            assert!(!blocks_changed);
+            assert_canceled_insert_keeps_root(&engine, root, table_id, TrxID::new(7)).await;
         });
     }
 
+    /// Purpose: Avoid rewriting an existing root for a cancelled new key.
+    /// Expected: The published root is preserved without block changes.
     #[test]
     fn test_catalog_checkpoint_apply_table_ops_keeps_existing_root_for_canceled_insert_batch() {
         smol::block_on(async {
@@ -2968,44 +3005,16 @@ pub(crate) mod tests {
                 .unwrap();
 
             let storage = &engine.inner().core.catalog().storage;
-            let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
             let root = storage.checkpoint_snapshot().meta.table_roots[0];
             assert!(root.checkpoint_root_block_id().is_some());
 
             let table_id = USER_TABLE_ID_START + 4242;
-            let table_ops = vec![
-                RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
-                RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
-                    CatalogIndexNo::new(0),
-                    vec![Val::from(table_id)],
-                )),
-            ];
-            let mut mutable =
-                MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-            let mut measurement = CatalogCheckpointMeasurement::new(
-                &storage.checkpoint_snapshot().meta.table_roots,
-                0,
-            );
-
-            let (next_root, blocks_changed) = storage
-                .apply_table_ops(
-                    &mut mutable,
-                    TABLE_ID_TABLES,
-                    table.metadata(),
-                    root,
-                    &table_ops,
-                    TrxID::new(8),
-                    engine.inner().core.pools.pool_guards().disk_guard(),
-                    &mut measurement,
-                )
-                .await
-                .unwrap();
-
-            assert_eq!(next_root.state, root.state);
-            assert!(!blocks_changed);
+            assert_canceled_insert_keeps_root(&engine, root, table_id, TrxID::new(8)).await;
         });
     }
 
+    /// Purpose: Reuse cached catalog index blocks across repeated collection.
+    /// Expected: Repeated collection reuses cached blocks without allocating additional frames.
     #[test]
     fn test_catalog_checkpoint_collect_index_entries_uses_readonly_cache() {
         smol::block_on(async {
@@ -3081,6 +3090,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve recoverable catalog state through compact root replacement.
+    /// Expected: The new compact root retains catalog contents while the displaced root is
+    /// reclaimed.
     #[test]
     fn test_catalog_checkpoint_rewrites_changed_table_as_compact_root() {
         smol::block_on(async {
@@ -3182,6 +3194,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve compact catalog layout across block-spanning appends.
+    /// Expected: Dense row identities and contiguous block coverage preserve every appended
+    /// column in key order.
     #[test]
     fn test_catalog_checkpoint_compact_rewrite_uses_dense_row_ids_after_large_append() {
         smol::block_on(async {
@@ -3207,7 +3222,7 @@ pub(crate) mod tests {
                                     catalog_table_vals(table_id, 0),
                                 ),
                             },
-                            catalog_column_insert(table_id, 0, 30_000),
+                            catalog_column_insert(table_id, 0),
                         ],
                     ),
                     engine.inner().core.pools.pool_guards().disk_guard(),
@@ -3231,8 +3246,9 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(entries1.len(), 1);
 
-            let second_batch = (1..=4)
-                .map(|column_no| catalog_column_insert(table_id, column_no, 15_000))
+            // Two varying integer columns exceed one 64 KiB block even when bit-packed.
+            let second_batch = (1..=32768)
+                .map(|column_no| catalog_column_insert(table_id, column_no))
                 .collect();
             engine
                 .inner()
@@ -3249,8 +3265,12 @@ pub(crate) mod tests {
             let columns_root2 = snap2.meta.table_roots[1];
             let measurement2 = CatalogCheckpointMeasurement::new(&snap2.meta.table_roots, 0);
             let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
-            assert_eq!(rows.len(), 5);
-            assert_eq!(columns_root2.pivot_row_id(), RowID::new(5));
+            assert_eq!(rows.len(), 32769);
+            for (column_id, row) in rows.iter().enumerate() {
+                assert_eq!(row.vals[0], Val::from(table_id));
+                assert_eq!(row.vals[1], Val::from(column_id as u32));
+            }
+            assert_eq!(columns_root2.pivot_row_id(), RowID::new(32769));
             let entries2 = storage
                 .collect_index_entries(
                     &disk_pool_guard,
@@ -3264,6 +3284,12 @@ pub(crate) mod tests {
             assert!(
                 columns_root2.state != columns_root1.state,
                 "changed catalog tables should publish a rewritten compact root"
+            );
+            assert!(
+                entries2.len() > entries1.len(),
+                "large append must span more LWC blocks: before={}, after={}",
+                entries1.len(),
+                entries2.len()
             );
             assert_eq!(entries2[0].start_row_id, RowID::new(0));
             for pair in entries2.windows(2) {

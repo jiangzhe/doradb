@@ -388,6 +388,9 @@ pub(super) fn index_object_from_vals(vals: &[Val]) -> DataIntegrityResult<IndexO
 mod tests {
     use super::*;
 
+    /// Purpose: Protect durable index-key encoding from ambiguous representations.
+    /// Expected: Valid keys preserve canonical encoding and order; malformed or ambiguous
+    /// payloads are rejected.
     #[test]
     fn key_spec_codec_rejects_ambiguous_payloads() {
         let keys = [TableIndexKeySpec {

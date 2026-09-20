@@ -323,6 +323,8 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// Purpose: Reject binding collisions before staging managed table metadata.
+    /// Expected: A conflicting binding leaves the candidate table and descriptor unpublished.
     #[test]
     fn test_create_binding_collision_precedes_numeric_and_descriptor_dml() {
         smol::block_on(async {

@@ -448,7 +448,7 @@ mod tests {
     use crate::id::{RowID, TableID};
     use crate::value::ValKind;
 
-    fn catalog_column_vals(table_id: TableID, column_no: u16, _name_len: usize) -> Vec<Val> {
+    fn catalog_column_vals(table_id: TableID, column_no: u16) -> Vec<Val> {
         vec![
             Val::from(table_id),
             Val::from(u32::from(column_no)),
@@ -488,6 +488,9 @@ mod tests {
         CatalogFoldedRows::from_base_rows(metadata, rows).unwrap()
     }
 
+    /// Purpose: Keep catalog merge-key encoding canonical across key shapes and input forms.
+    /// Expected: Rows and selectors produce the same specified encoding for simple and
+    /// composite keys.
     #[test]
     fn test_catalog_merge_key_builder_encodes_single_and_composite_keys() {
         let tables_metadata = &catalog_definition_of_tables().metadata;
@@ -503,11 +506,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables_key, tables_select_key);
+        assert_eq!(tables_key.as_bytes(), &[0, 0, 0, 0, 0, 0, 0, 1]);
 
         let columns_metadata = &catalog_definition_of_columns().metadata;
         let columns_table_id = USER_TABLE_ID_START + 2;
         let columns_no = 7u16;
-        let columns_vals = catalog_column_vals(columns_table_id, columns_no, 8);
+        let columns_vals = catalog_column_vals(columns_table_id, columns_no);
         let columns_key_builder = CatalogMergeKeyBuilder::new(columns_metadata).unwrap();
         let columns_key = columns_key_builder.key_from_row(&columns_vals).unwrap();
         let columns_select_key = columns_key_builder
@@ -523,8 +527,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(columns_key, columns_select_key);
+        assert_eq!(
+            columns_key.as_bytes(),
+            &[0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 7]
+        );
     }
 
+    /// Purpose: Preserve final row state when folding catalog mutations.
+    /// Expected: Valid mutation sequences retain the final values and eliminate cancelled
+    /// insertions.
     #[test]
     fn test_catalog_fold_valid_state_transitions() {
         let metadata = &catalog_definition_of_tables().metadata;
@@ -584,6 +595,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Preserve primary-key ordering when merging catalog rows.
+    /// Expected: Materialized rows are ordered by key without changing their contents.
     #[test]
     fn test_catalog_fold_materializes_primary_key_order() {
         let metadata = &catalog_definition_of_tables().metadata;
@@ -606,6 +619,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Base catalog rewrite decisions on final root changes.
+    /// Expected: Cancelled new rows avoid rewrites while changes to persisted rows require
+    /// them.
     #[test]
     fn test_catalog_fold_should_rewrite_tracks_final_root_change() {
         let metadata = &catalog_definition_of_tables().metadata;
@@ -640,6 +656,8 @@ mod tests {
         assert!(folded.should_rewrite());
     }
 
+    /// Purpose: Reject catalog mutations inconsistent with the folded row state.
+    /// Expected: Duplicate insertion and mutation of absent or deleted rows fail validation.
     #[test]
     fn test_catalog_fold_rejects_invalid_state_transitions() {
         let metadata = &catalog_definition_of_tables().metadata;
@@ -697,6 +715,9 @@ mod tests {
         assert!(folded.fold_delete(&base_key).is_err());
     }
 
+    /// Purpose: Require indexed columns when deriving a catalog merge key.
+    /// Expected: Incomplete candidate rows are rejected with a diagnostic identifying the
+    /// missing column.
     #[test]
     fn test_catalog_key_candidate_row_requires_index_column() {
         let metadata = &catalog_definition_of_tables().metadata;

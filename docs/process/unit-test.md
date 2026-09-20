@@ -28,9 +28,15 @@ Every source-visible test in a changed Rust file needs literal documentation
 with exactly one nonempty `Purpose:` and `Expected:` field, above all attributes.
 Wrapped lines continue the preceding field.
 
+Keep both fields concise and intent-focused: name the protected behavior and
+scenario in `Purpose:`, and its semantic guarantee in `Expected:`. Leave fixture
+values and assertion details in the test body. See the
+[contract writing principle](../../.agents/skills/test-audit/SKILL.md#contract-writing-principle)
+for semantic review guidance.
+
 ```rust
-/// Purpose: Verify the persisted little-endian hint layout.
-/// Expected: Slot 3 contains [4, 3, 2, 1] and reads back as 0x01020304.
+/// Purpose: Protect the persisted hint byte order.
+/// Expected: Hints use the specified byte order and decode without loss.
 #[test]
 fn test_btree_hints_store_little_endian_heads() {
     // Assertions must establish the stated expectation.

@@ -551,10 +551,9 @@ mod tests {
         ranges
     }
 
-    /// Purpose: Fail an update callback after a preceding row update within the same three-row
-    /// transaction.
-    /// Expected: The exact source-domain error is preserved, a new transaction can start, and all
-    /// three rows retain their original payloads.
+    /// Purpose: Roll back partial update progress when an application callback fails.
+    /// Expected: The original error survives, earlier row changes are undone, and transaction
+    /// ownership is released.
     #[test]
     fn update_callback_failure_rolls_back_preceding_rows_and_releases_transaction() {
         smol::block_on(async {
@@ -629,9 +628,10 @@ mod tests {
         });
     }
 
-    /// Purpose: Distribute two update operations and ten loaded keys across four sessions.
-    /// Expected: Operation budgets total two with starts [100, 103, 106, 108], while key shards
-    /// cover the full range with lengths [3, 3, 2, 2].
+    /// Purpose: Preserve loaded-key coverage when distributing sparse update budgets across
+    /// sessions.
+    /// Expected: Shards cover the full range without overlap and session budgets sum to the
+    /// requested work.
     #[test]
     fn update_shards_cover_the_loaded_range_and_budgets_remain_additive() {
         let loaded = KeyRange {
@@ -657,10 +657,9 @@ mod tests {
         assert_eq!(shards.last().unwrap().end().unwrap(), loaded.end().unwrap());
     }
 
-    /// Purpose: Generate update ranges with fixed seeds, a partial final batch, and a shard
-    /// narrower than the batch limit.
-    /// Expected: Seed seven repeats, seed eight differs, ranges stay inside the shard, and widths
-    /// are [3, 3, 2] or [3, 2] for the named cases.
+    /// Purpose: Generate reproducible update ranges within session shards and batch limits.
+    /// Expected: Seeds control range selection while shard boundaries and partial batches
+    /// retain valid widths.
     #[test]
     fn update_ranges_are_seeded_bounded_and_preserve_chunk_widths() {
         let shard = KeyRange { start: 10, len: 8 };
@@ -689,10 +688,9 @@ mod tests {
         );
     }
 
-    /// Purpose: Map keys between original and alternate replay domains and distinguish update
-    /// payload variants.
-    /// Expected: Each key maps back through the same offset; both payloads have 16 bytes, differ,
-    /// and carry variant markers zero and one.
+    /// Purpose: Keep update replay domains reversible and payload variants distinguishable.
+    /// Expected: Key mapping preserves offsets while payload variants retain their size and
+    /// distinct identity.
     #[test]
     fn replay_mapping_and_payload_variants_are_disjoint_and_stable() {
         let original = KeyRange { start: 10, len: 5 };
@@ -712,9 +710,9 @@ mod tests {
         assert_eq!(second[0], 1);
     }
 
-    /// Purpose: Apply seed-five update ranges to a seed-two non-unique insert-key multiset.
-    /// Expected: The sampled ranges include both zero matching rows and more matching rows than the
-    /// key-range width.
+    /// Purpose: Exercise update cardinality independently of non-unique key-range width.
+    /// Expected: Generated ranges cover both absent matches and duplicate multiplicity beyond
+    /// the range width.
     #[test]
     fn non_unique_ranges_cover_empty_and_above_width_outcomes() {
         let inserted_keys = generate_insert_keys(

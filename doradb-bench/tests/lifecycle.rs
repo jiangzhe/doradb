@@ -269,10 +269,9 @@ mod tests {
         }
     }
 
-    /// Purpose: Replay managed binding resolution with and without full schemas across four
-    /// sessions after creating a four-table pool.
-    /// Expected: Each measured run reports exactly 17 successful resolutions and samples with
-    /// internal metrics; preparation creates four tables and two runs aggregate 34 samples.
+    /// Purpose: Support repeated managed-binding resolution with optional schema loading.
+    /// Expected: Prepared bindings resolve successfully across sessions with consistent run and
+    /// aggregate accounting.
     #[test]
     fn managed_binding_resolution_repeats_with_exact_results_and_samples() {
         for full in [false, true] {
@@ -308,10 +307,8 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
-    /// Purpose: Reject missing plans and removed CLI subcommands without creating or deleting a
-    /// storage root.
-    /// Expected: Missing-plan and cleanup/prepare/run invocations fail; the missing-plan root stays
-    /// absent and rejected cleanup preserves an existing root.
+    /// Purpose: Reject incomplete and obsolete CLI invocations before touching storage.
+    /// Expected: Invalid commands neither create missing roots nor remove existing ones.
     #[test]
     fn required_plan_is_the_only_cli_contract() {
         let temp = TempDir::new().unwrap();
@@ -331,10 +328,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(root.exists());
     }
 
-    /// Purpose: Execute a plan using the root environment variable, then override that variable
-    /// with an explicit root option.
-    /// Expected: The first result is written under the environment root, the second under the
-    /// explicit root, and the overridden environment root is never created.
+    /// Purpose: Preserve environment fallback and explicit storage-root precedence.
+    /// Expected: Results use the selected root without creating the overridden environment
+    /// path.
     #[test]
     fn root_environment_and_explicit_precedence_are_retained() {
         let temp = TempDir::new().unwrap();
@@ -373,10 +369,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(!ignored_environment_root.exists());
     }
 
-    /// Purpose: Replay lookup, table-scan, materialized index-scan, and streaming index reads over
-    /// eight known rows, then execute an index create/drop cycle.
-    /// Expected: Every read run and aggregate matches fixed operation, hit, row, and latency-sample
-    /// counts for its named case; index DDL records two operations and one sample.
+    /// Purpose: Preserve workload accounting across dependent reads and index DDL.
+    /// Expected: Run and aggregate results match each workload's operation, row, hit, and
+    /// latency contracts.
     #[test]
     fn dependent_read_and_index_ddl_plans_execute_with_exact_equations() {
         let temp = TempDir::new().unwrap();
@@ -490,10 +485,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Compare sequential-partition and sixteen-partition-target scans over the same
-    /// eight-row fixture with warmup and replay.
-    /// Expected: Both targets return 16 rows and two lifecycle samples per run; actual partitions
-    /// are positive, equal one for target one, and below sixteen for the larger target.
+    /// Purpose: Preserve scan cardinality when changing the requested parallelism.
+    /// Expected: Partition targets affect reported planning while returned rows and lifecycle
+    /// accounting remain consistent.
     #[test]
     fn parallel_table_scan_matches_target_one_cardinality_and_reports_actual_partitions() {
         let temp = TempDir::new().unwrap();
@@ -541,11 +535,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Replay seeded unique-key updates and non-unique payload updates with multiple
-    /// sessions.
-    /// Expected: Unique runs retain the same positive update count; both modes report only
-    /// successful update counters, with six or eight transaction samples per run and matching
-    /// aggregate samples.
+    /// Purpose: Preserve replayable updates for unique keys and non-unique payloads.
+    /// Expected: Repeated runs retain successful update accounting and consistent transaction
+    /// sample totals.
     #[test]
     fn random_index_updates_replay_unique_keys_and_non_unique_payloads() {
         let temp = TempDir::new().unwrap();
@@ -583,9 +575,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 16);
     }
 
-    /// Purpose: Execute the checked-in random-update plan through the public benchmark CLI.
-    /// Expected: The summary identifies update-rand; all three runs report positive successful
-    /// updates and twelve transaction samples, totaling 36 samples.
+    /// Purpose: Keep the shipped random-update template executable through the public CLI.
+    /// Expected: Every measured run reports successful updates with consistent transaction and
+    /// aggregate samples.
     #[test]
     fn checked_in_update_template_executes_end_to_end() {
         let temp = TempDir::new().unwrap();
@@ -609,10 +601,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 36);
     }
 
-    /// Purpose: Execute the checked-in parallel-scan plan and validate its published summary and
-    /// partition metrics.
-    /// Expected: Three runs each report two scans, 20,000 rows, two samples, and positive actual
-    /// partitions for target four; the aggregate reports six scans and 60,000 rows.
+    /// Purpose: Keep the shipped parallel-scan template executable through the public CLI.
+    /// Expected: Published results preserve scan cardinality, partition diagnostics, and
+    /// aggregate sample accounting.
     #[test]
     fn checked_in_parallel_scan_template_executes_end_to_end() {
         let temp = TempDir::new().unwrap();
@@ -647,10 +638,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 6);
     }
 
-    /// Purpose: Complete seeded shared session-lock operations over four tables across warmup and
-    /// two measured runs.
-    /// Expected: The subprocess exits successfully with the canonical report and exactly sixteen
-    /// measured operations and lifecycle samples.
+    /// Purpose: Complete repeated table-pool locking without retaining ownership.
+    /// Expected: The CLI drains lock lifecycles and publishes consistent operation and sample
+    /// totals.
     #[test]
     fn multi_table_lock_plan_replays_and_releases_all_claims() {
         let temp = TempDir::new().unwrap();
@@ -662,10 +652,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 16);
     }
 
-    /// Purpose: Execute named nested, conversion, enqueue, cancellation, promotion, first-touch,
-    /// and scope-close lock scenarios through the CLI.
-    /// Expected: Every scenario completes successfully and reports one operation and one lifecycle
-    /// sample with scenario-specific count diagnostics.
+    /// Purpose: Complete specialized lock scenarios through the public CLI.
+    /// Expected: Coordinated participants drain successfully with consistent operation and
+    /// lifecycle accounting.
     #[test]
     fn specialized_lock_plans_coordinate_and_drain_participants() {
         let temp = TempDir::new().unwrap();
@@ -691,9 +680,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
-    /// Purpose: Validate a lookup plan whose preparation creates an index but loads no rows.
-    /// Expected: Execution fails with the loaded-data requirement before creating the root and
-    /// emits no success summary.
+    /// Purpose: Reject dependent reads without committed preparation before acquiring storage.
+    /// Expected: The CLI reports the missing load requirement without creating a root or
+    /// success output.
     #[test]
     fn invalid_dependent_plan_fails_before_root_creation() {
         assert_plan_rejected_before_root_creation(
@@ -703,11 +692,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Create unique and non-unique indexes over hot, checkpointed, and mixed fixtures,
-    /// including seeded duplicate keys.
-    /// Expected: Reports match exact placement and table/index row counts, selected index and stats
-    /// modes, and one creation sample; duplicate non-unique rows survive, while unique creation
-    /// fails without success output or artifact.
+    /// Purpose: Verify index creation across row placements and uniqueness modes.
+    /// Expected: Reports preserve placement and duplicate multiplicity while uniqueness
+    /// violations prevent success publication.
     #[test]
     fn create_index_verifies_all_placements_modes_and_duplicate_multiplicity() {
         use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
@@ -802,11 +789,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));
     }
 
-    /// Purpose: Checkpoint a proper frozen prefix of an eight-row table and inspect the CLI summary
-    /// and serialized breakdown.
-    /// Expected: Preparation retains nonempty proper-prefix metrics; the measured checkpoint
-    /// reports one lifecycle sample, attempts equal retries plus one, positive attempt time, and
-    /// matching summary counts.
+    /// Purpose: Publish coherent checkpoint metrics for a frozen table prefix.
+    /// Expected: Reports preserve freeze evidence and consistent attempt, retry, and lifecycle
+    /// accounting.
     #[test]
     fn single_table_checkpoint_plan_publishes_canonical_metrics() {
         let temp = TempDir::new().unwrap();
@@ -862,10 +847,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         )));
     }
 
-    /// Purpose: Exercise named hot and checkpointed prefix-freeze requests that cannot install a
-    /// nonempty proper prefix.
-    /// Expected: Each case fails with the proper-prefix error, retains its root, and publishes
-    /// neither a success summary nor benchmark-result.toml.
+    /// Purpose: Reject prefix freezing when page boundaries cannot preserve a nonempty suffix.
+    /// Expected: Failure identifies the invalid prefix, retains storage, and publishes no
+    /// success output.
     #[test]
     fn whole_page_freeze_failure_retains_root_without_success_artifact() {
         let temp = TempDir::new().unwrap();
@@ -910,10 +894,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
-    /// Purpose: Fully checkpoint a table, append eight large rows, then freeze and checkpoint a
-    /// prefix before freezing the remaining suffix.
-    /// Expected: Prefix and suffix both retain positive row and page counts, and their approximate
-    /// row counts sum to the eight appended rows.
+    /// Purpose: Preserve an appended hot suffix when freezing a prefix after checkpointing.
+    /// Expected: Prefix and remaining suffix stay nonempty and together account for the
+    /// appended rows.
     #[test]
     fn prefix_freeze_after_full_checkpoint_preserves_hot_suffix() {
         let temp = TempDir::new().unwrap();
@@ -947,11 +930,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(prefix_pages > 0 && suffix_pages > 0);
     }
 
-    /// Purpose: Recover named empty, sequential, seeded-random, indexed, and checkpointed fixtures
-    /// and round-trip their public reports.
-    /// Expected: Each recovery reports one operation/sample, verified table and row counts,
-    /// matching index coverage and redo accounting, stats selected by the plan, and an equal TOML
-    /// round-trip while retaining the root.
+    /// Purpose: Validate recovered state across supported fixture shapes and storage
+    /// placements.
+    /// Expected: Reports preserve verified contents, index coverage, and recovery accounting
+    /// while retaining the root.
     #[test]
     fn recovery_verifies_empty_loaded_indexed_random_and_checkpoint_fixtures() {
         use doradb_bench::measurement::InternalMetricKind;
@@ -1069,9 +1051,9 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
-    /// Purpose: Validate recovery configured with nondurable transaction logging.
-    /// Expected: The CLI rejects the plan with the fsync/fdatasync requirement before creating the
-    /// root or publishing a success summary.
+    /// Purpose: Require durable logging before admitting a recovery benchmark.
+    /// Expected: Nondurable plans fail with a durability diagnostic before root creation or
+    /// success publication.
     #[test]
     fn recovery_rejects_nondurable_plans_before_creating_root() {
         assert_plan_rejected_before_root_creation(
@@ -1080,29 +1062,25 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Pause a recovery subprocess after old-engine teardown and resume it through
-    /// successful reopen.
-    /// Expected: The stopped process holds no file descriptor under the retained root and has no
-    /// result yet; one pause/resume pair precedes a successful report verifying all 512 rows.
+    /// Purpose: Release the old engine before pausing for recovery profiling.
+    /// Expected: The paused process holds no storage descriptors and resumed recovery verifies
+    /// the retained data.
     #[test]
     fn recovery_profiler_pause_follows_old_engine_teardown() {
         recovery_profiler_case(false);
     }
 
-    /// Purpose: Corrupt the storage marker while recovery is stopped after old-engine teardown,
-    /// then resume reopen.
-    /// Expected: The pause/resume protocol occurs exactly once, reopen fails, the root remains, and
-    /// no success summary or result file is published.
+    /// Purpose: Preserve diagnostic storage when recovery fails after the profiling pause.
+    /// Expected: Reopen failure retains the root and publishes no success report or artifact.
     #[test]
     fn recovery_reopen_failure_retains_root_without_success_output() {
         recovery_profiler_case(true);
     }
 
-    /// Purpose: Observe the public profiler pause after preparation and resume a benchmark with one
-    /// warmup and two measured runs.
-    /// Expected: The process is stopped with no success output or result before SIGCONT; afterward
-    /// it exits successfully and reports the pause flag, requested run counts, one prepare phase,
-    /// and four measured operations.
+    /// Purpose: Pause after preparation without starting benchmark execution or publishing
+    /// success.
+    /// Expected: Resuming completes the configured runs and publishes results with the pause
+    /// setting preserved.
     #[test]
     fn profiler_pause_stops_before_benchmark_and_resumes_to_success() {
         let temp = TempDir::new().unwrap();

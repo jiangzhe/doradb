@@ -446,6 +446,9 @@ pub(crate) fn user_key_from_index_ref(index: IndexRef, vals: Vec<Val>) -> Resolv
 mod tests {
     use super::*;
 
+    /// Purpose: Protect index identity and slot boundaries in resolved keys.
+    /// Expected: Valid boundaries preserve identity, slot, and key data; oversized slots are
+    /// rejected.
     #[test]
     fn test_index_reference_checked_boundaries_and_exact_resolution() {
         assert_eq!(IndexID::new(0).as_u32(), 0);
@@ -480,6 +483,9 @@ mod tests {
         assert_eq!(key.vals, vec![Val::from(11u32)]);
     }
 
+    /// Purpose: Enforce the relationship between catalog index identity and physical slot.
+    /// Expected: Consistent references round-trip; mismatched identity and slot violate the
+    /// invariant.
     #[test]
     fn test_catalog_index_reference_enforces_equal_identity_and_slot() {
         let index_slot = IndexSlot::new(37);
@@ -491,6 +497,9 @@ mod tests {
         assert!(std::panic::catch_unwind(|| catalog_index_slot(invalid)).is_err());
     }
 
+    /// Purpose: Preserve table qualification when converting index arguments.
+    /// Expected: Unresolved selectors retain identity and admitted selectors retain exact
+    /// resolution.
     #[test]
     fn test_table_index_arguments_convert_to_table_qualified_selectors() {
         let table_id = TableID::new(11);

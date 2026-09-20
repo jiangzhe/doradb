@@ -531,10 +531,10 @@ mod tests {
         }
     }
 
-    /// Purpose: Publish CREATE INDEX results only after validating verification, placement,
-    /// counters, and latency.
-    /// Expected: Each invalid case leaves no artifact; valid results round-trip with raw units and
-    /// derived rates, while zero creation duration omits undefined rates.
+    /// Purpose: Publish index-creation results only when verification and accounting are
+    /// complete.
+    /// Expected: Valid reports preserve raw metrics and defined rates while invalid reports
+    /// produce no artifact.
     #[test]
     fn create_output_requires_complete_verification_and_preserves_raw_units() {
         use crate::fixture::{IndexMode, PlacementKind, RowPlacement};
@@ -628,10 +628,9 @@ mod tests {
         assert!(!summary.contains("average_cpu_cores:"));
     }
 
-    /// Purpose: Install a canonical invocation TOML artifact and validate its serialized unsigned
-    /// timing fields.
-    /// Expected: The absolute result path and decoded report match; invalid numeric forms fail and
-    /// no staging file, Markdown artifact, or failure/status fields remain.
+    /// Purpose: Publish a canonical success report with strict numeric serialization.
+    /// Expected: The installed report round-trips at its absolute path without staging residue
+    /// or unsupported output fields.
     #[test]
     fn canonical_output_round_trips_one_entity() {
         let temp = TempDir::new().unwrap();
@@ -660,10 +659,9 @@ mod tests {
         assert!(!temp.path().join("benchmark-result.md").exists());
     }
 
-    /// Purpose: Attempt to install a result where a directory already occupies the final artifact
-    /// path.
-    /// Expected: The write reports an artifact error, preserves the directory, and removes the
-    /// temporary staged file.
+    /// Purpose: Clean up failed result installation without disturbing an existing destination.
+    /// Expected: Installation failure preserves the destination directory and removes staged
+    /// output.
     #[test]
     fn output_install_failure_leaves_no_complete_artifact() {
         let temp = TempDir::new().unwrap();
@@ -678,9 +676,9 @@ mod tests {
         assert!(!staged_path(&result_toml_path(temp.path())).exists());
     }
 
-    /// Purpose: Render the standard transaction-noop summary with a canonical detailed-result path.
-    /// Expected: The complete summary matches the expected labels, units, numeric precision,
-    /// ordering, and absolute path.
+    /// Purpose: Protect the public benchmark summary format.
+    /// Expected: Labels, units, precision, ordering, and the absolute result path remain
+    /// stable.
     #[test]
     fn stdout_summary_uses_stable_labels_and_absolute_result_path() {
         let temp = TempDir::new().unwrap();
@@ -707,9 +705,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Render checkpoint results with separate attempt and retry-wait accounting.
-    /// Expected: The summary reports three attempts over seven nanoseconds and two retry waits over
-    /// two nanoseconds.
+    /// Purpose: Keep checkpoint work and retry waiting distinguishable in summaries.
+    /// Expected: Output preserves separate attempt and wait counts and durations.
     #[test]
     fn checkpoint_stdout_summary_includes_attempt_and_wait_breakdown() {
         let temp = TempDir::new().unwrap();
@@ -748,10 +745,9 @@ mod tests {
         assert!(summary.contains("checkpoint_retry_wait_elapsed_nanos: 2\n"));
     }
 
-    /// Purpose: Render parallel-scan partitions and row throughput, including zero aggregate wall
-    /// duration.
-    /// Expected: The summary reports four target/three actual partitions, eight rows, 800000000
-    /// rows per second, and zero throughput for zero elapsed time.
+    /// Purpose: Expose parallel scan partitioning and row throughput consistently.
+    /// Expected: Summaries retain partition diagnostics and handle absent elapsed time without
+    /// an undefined rate.
     #[test]
     fn parallel_scan_stdout_summary_includes_partition_and_row_throughput() {
         let temp = TempDir::new().unwrap();
