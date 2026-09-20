@@ -170,7 +170,8 @@ fn validate_data_dir(data_dir: &Path) -> ConfigResult<PathBuf> {
 mod tests {
     use super::*;
 
-    fn assert_config_report(err: Report<ConfigError>, expected: ConfigError, snippets: &[&str]) {
+    fn assert_invalid_config(config: FileSystemConfig, expected: ConfigError, snippets: &[&str]) {
+        let err = config.validate().unwrap_err();
         assert_eq!(err.current_context(), &expected);
         let output = format!("{err:?}");
         for snippet in snippets {
@@ -178,45 +179,41 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect file-system validation diagnostics and valid CoW capacity conversion.
+    /// Expected: Invalid names, paths, and sizes retain specific errors; valid sizes resolve to page limits.
     #[test]
     fn test_file_system_config_validation_reports_details() {
-        let err = FileSystemConfig::default()
-            .catalog_file_name("catalog.bin")
-            .validate()
-            .unwrap_err();
-        assert_config_report(
-            err,
+        assert_invalid_config(
+            FileSystemConfig::default().catalog_file_name("catalog.bin"),
             ConfigError::InvalidCatalogFileName,
             &["plain `.mtb` file name", "catalog.bin"],
         );
 
-        let err = validate_data_dir(Path::new("")).unwrap_err();
-        assert_config_report(err, ConfigError::PathMustNotBeEmpty, &["must not be empty"]);
+        assert_invalid_config(
+            FileSystemConfig::default().data_dir(""),
+            ConfigError::PathMustNotBeEmpty,
+            &["must not be empty"],
+        );
 
-        let err = validate_data_dir(Path::new("../data")).unwrap_err();
-        assert_config_report(
-            err,
+        assert_invalid_config(
+            FileSystemConfig::default().data_dir("../data"),
             ConfigError::PathMustNotContainParentTraversal,
             &["parent traversal", "../data"],
         );
 
         assert_eq!(
             FileSystemConfig::default().cow_file_max_size,
-            DEFAULT_COW_FILE_MAX_SIZE
+            16 * 1024 * 1024 * 1024
         );
         for invalid_size in [
             TABLE_FILE_INITIAL_SIZE - COW_FILE_PAGE_SIZE,
             TABLE_FILE_INITIAL_SIZE + 1,
         ] {
-            let err = FileSystemConfig::default()
-                .cow_file_max_size(invalid_size)
-                .validate()
-                .unwrap_err();
-            assert_config_report(
-                err,
+            assert_invalid_config(
+                FileSystemConfig::default().cow_file_max_size(invalid_size),
                 ConfigError::InvalidCowFileSize,
                 &[
-                    "file.cow_file_max_size",
+                    &format!("file.cow_file_max_size={invalid_size}"),
                     "table_initial_size",
                     "multi_table_initial_size",
                     "cow_file_page_size",
@@ -225,12 +222,15 @@ mod tests {
         }
 
         let validated = FileSystemConfig::default()
-            .cow_file_max_size(TABLE_FILE_INITIAL_SIZE * 3)
+            .io_depth(3)
+            .data_dir("tables")
+            .catalog_file_name("schema.mtb")
+            .cow_file_max_size(COW_FILE_PAGE_SIZE * 768)
             .validate()
             .unwrap();
-        assert_eq!(
-            validated.cow_file_max_pages,
-            TABLE_FILE_INITIAL_SIZE * 3 / COW_FILE_PAGE_SIZE
-        );
+        assert_eq!(validated.io_depth, 3);
+        assert_eq!(validated.data_dir, Path::new("tables"));
+        assert_eq!(validated.catalog_file_name, "schema.mtb");
+        assert_eq!(validated.cow_file_max_pages, 768);
     }
 }

@@ -300,14 +300,6 @@ fn invalid_log_file_max_size() -> Report<ConfigError> {
 mod tests {
     use super::*;
 
-    fn assert_invalid_log_block_size(err: Report<ConfigError>) {
-        assert_eq!(err.current_context(), &ConfigError::InvalidLogBlockSize);
-    }
-
-    fn assert_invalid_io_depth(err: Report<ConfigError>) {
-        assert_eq!(err.current_context(), &ConfigError::InvalidIoDepth);
-    }
-
     fn assert_invalid_purge_threads(err: Report<ConfigError>) {
         assert_eq!(err.current_context(), &ConfigError::InvalidPurgeThreads);
         let report = format!("{err:?}");
@@ -327,13 +319,25 @@ mod tests {
         assert!(report.contains("power_of_two"), "report={report}");
     }
 
-    fn assert_validate_rejects_invalid_io_depth(mut config: TrxSysConfig) {
+    fn assert_validate_rejects_invalid_io_depth(mut config: TrxSysConfig, field: &str) {
         let err = config
             .validate()
             .expect_err("zero redo IO depth must be rejected");
-        assert_invalid_io_depth(err);
+        assert_eq!(
+            err.current_context(),
+            &ConfigError::InvalidIoDepth,
+            "{field}"
+        );
+        let diagnostic = format!("{err:?}");
+        assert!(
+            diagnostic.contains(&format!("invalid {field}")),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("io_depth=0"), "{diagnostic}");
     }
 
+    /// Purpose: Preserve default sizing for separate redo IO queues and transaction GC buckets.
+    /// Expected: Default fields retain the established queue depths and bucket count.
     #[test]
     fn redo_io_depth_defaults_are_split_but_preserved() {
         let config = TrxSysConfig::default();
@@ -349,16 +353,50 @@ mod tests {
         assert_eq!(config.gc_buckets, 32);
     }
 
+    /// Purpose: Keep redo-writer and catalog-checkpoint queue-depth builders independent.
+    /// Expected: Updating either queue leaves the other unchanged and preserves explicit overrides.
     #[test]
     fn redo_io_depth_builders_are_independent() {
-        let config = TrxSysConfig::default()
-            .log_write_io_depth(2)
-            .catalog_checkpoint_scan_io_depth(4);
-
-        assert_eq!(config.log_write_io_depth, 2);
-        assert_eq!(config.catalog_checkpoint_scan_io_depth, 4);
+        for (case, config, writer_depth, scan_depth) in [
+            (
+                "writer only",
+                TrxSysConfig::default().log_write_io_depth(2),
+                2,
+                32,
+            ),
+            (
+                "scan only",
+                TrxSysConfig::default().catalog_checkpoint_scan_io_depth(4),
+                32,
+                4,
+            ),
+            (
+                "writer then scan",
+                TrxSysConfig::default()
+                    .log_write_io_depth(2)
+                    .catalog_checkpoint_scan_io_depth(4),
+                2,
+                4,
+            ),
+            (
+                "scan then writer",
+                TrxSysConfig::default()
+                    .catalog_checkpoint_scan_io_depth(4)
+                    .log_write_io_depth(2),
+                2,
+                4,
+            ),
+        ] {
+            assert_eq!(config.log_write_io_depth, writer_depth, "{case}");
+            assert_eq!(
+                config.catalog_checkpoint_scan_io_depth, scan_depth,
+                "{case}"
+            );
+        }
     }
 
+    /// Purpose: Reject transaction configurations without a purge worker.
+    /// Expected: Validation reports the purge-thread error with the rejected value and lower bound.
     #[test]
     fn validate_rejects_zero_purge_threads() {
         let mut config = TrxSysConfig::default().purge_threads(0);
@@ -368,6 +406,8 @@ mod tests {
         assert_invalid_purge_threads(err);
     }
 
+    /// Purpose: Accept positive purge-worker counts beyond the default configuration.
+    /// Expected: Validation preserves each supported worker count.
     #[test]
     fn validate_accepts_positive_purge_thread_counts() {
         for purge_threads in [1, DEFAULT_PURGE_THREADS, 65] {
@@ -377,6 +417,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Accept power-of-two GC bucket counts throughout the supported range.
+    /// Expected: Validation preserves each supported bucket count, including both boundaries.
     #[test]
     fn validate_accepts_supported_gc_bucket_counts() {
         for gc_buckets in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
@@ -386,6 +428,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject GC bucket counts outside the supported power-of-two range.
+    /// Expected: Errors identify the rejected count, supported bounds, and power-of-two requirement.
     #[test]
     fn validate_rejects_unsupported_gc_bucket_counts() {
         for gc_buckets in [0, 3, 255, 257, usize::MAX] {
@@ -397,14 +441,22 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject unusable queue depths for either redo IO role.
+    /// Expected: Each zero-depth configuration reports the IO-depth error and its owning field.
     #[test]
     fn validate_rejects_zero_redo_io_depths() {
-        assert_validate_rejects_invalid_io_depth(TrxSysConfig::default().log_write_io_depth(0));
+        assert_validate_rejects_invalid_io_depth(
+            TrxSysConfig::default().log_write_io_depth(0),
+            "log_write_io_depth",
+        );
         assert_validate_rejects_invalid_io_depth(
             TrxSysConfig::default().catalog_checkpoint_scan_io_depth(0),
+            "catalog_checkpoint_scan_io_depth",
         );
     }
 
+    /// Purpose: Reject glob metacharacters in redo log file stems.
+    /// Expected: Validation returns the log-file-stem configuration error.
     #[test]
     fn validate_rejects_invalid_log_file_stem() {
         let mut config = TrxSysConfig::default().log_file_stem("redo*.log");
@@ -415,87 +467,101 @@ mod tests {
         assert_eq!(err.current_context(), &ConfigError::InvalidLogFileStem);
     }
 
+    /// Purpose: Normalize redo block sizes around a storage-sector boundary.
+    /// Expected: Unaligned requests round up while aligned requests remain unchanged.
     #[test]
-    fn log_block_size_rounds_below_sector_to_sector_size() {
-        let config = TrxSysConfig::default().log_block_size(1usize);
-
-        assert_eq!(config.log_block_size.as_u64(), STORAGE_SECTOR_SIZE as u64);
+    fn log_block_size_normalizes_sector_boundaries() {
+        for (case, requested, expected) in [
+            ("below_sector", 1, STORAGE_SECTOR_SIZE),
+            ("aligned", STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE),
+            (
+                "above_sector",
+                STORAGE_SECTOR_SIZE + 1,
+                STORAGE_SECTOR_SIZE * 2,
+            ),
+        ] {
+            let config = TrxSysConfig::default().log_block_size(requested);
+            assert_eq!(
+                config.log_block_size.as_u64(),
+                expected as u64,
+                "{case}: requested={requested}"
+            );
+        }
     }
 
+    /// Purpose: Reject unsupported redo block sizes assigned without the builder.
+    /// Expected: Validation reports the block-size configuration error and rejected value.
     #[test]
-    fn log_block_size_preserves_sector_aligned_size() {
-        let config = TrxSysConfig::default().log_block_size(STORAGE_SECTOR_SIZE);
-
-        assert_eq!(config.log_block_size.as_u64(), STORAGE_SECTOR_SIZE as u64);
+    fn validate_rejects_direct_invalid_log_block_sizes() {
+        for (case, requested) in [
+            ("zero", 0),
+            ("below_sector", STORAGE_SECTOR_SIZE - 1),
+            ("oversized", MAX_REDO_LOG_BLOCK_SIZE + STORAGE_SECTOR_SIZE),
+        ] {
+            let mut config = TrxSysConfig {
+                log_block_size: Byte::from(requested),
+                ..TrxSysConfig::default()
+            };
+            let err = config.validate().expect_err(case);
+            assert_eq!(
+                err.current_context(),
+                &ConfigError::InvalidLogBlockSize,
+                "{case}: requested={requested}"
+            );
+            let diagnostic = format!("{err:?}");
+            assert!(
+                diagnostic.contains(&format!("log_block_size={requested}")),
+                "{case}: {diagnostic}"
+            );
+        }
     }
 
+    /// Purpose: Normalize redo file limits around data-block boundaries after metadata.
+    /// Expected: Limits reserve metadata and complete data blocks, preserving already aligned sizes.
     #[test]
-    fn log_block_size_rounds_above_sector_to_next_sector() {
-        let config = TrxSysConfig::default().log_block_size(STORAGE_SECTOR_SIZE + 1);
-
-        assert_eq!(
-            config.log_block_size.as_u64(),
-            (STORAGE_SECTOR_SIZE * 2) as u64
-        );
-    }
-
-    #[test]
-    fn validate_rejects_direct_zero_log_block_size() {
-        let mut config = TrxSysConfig {
-            log_block_size: Byte::from(0usize),
-            ..TrxSysConfig::default()
-        };
-
-        let err = config
-            .validate()
-            .expect_err("zero redo log block size must be rejected");
-
-        assert_invalid_log_block_size(err);
-    }
-
-    #[test]
-    fn validate_rejects_direct_too_large_log_block_size() {
-        let mut config = TrxSysConfig {
-            log_block_size: Byte::from(MAX_REDO_LOG_BLOCK_SIZE + STORAGE_SECTOR_SIZE),
-            ..TrxSysConfig::default()
-        };
-
-        let err = config
-            .validate()
-            .expect_err("oversized redo log block size must be rejected");
-
-        assert_invalid_log_block_size(err);
-    }
-
-    #[test]
-    fn log_file_max_size_normalizes_below_one_data_block() {
+    fn log_file_max_size_normalizes_data_region_boundaries() {
         let log_block_size = STORAGE_SECTOR_SIZE * 2;
-        let normalized = normalize_redo_file_max_size(1, log_block_size).unwrap();
-
-        assert_eq!(normalized, REDO_DEFAULT_DATA_START_OFFSET + log_block_size);
+        for (case, requested, expected) in [
+            (
+                "below_one_data_block",
+                1,
+                REDO_DEFAULT_DATA_START_OFFSET + log_block_size,
+            ),
+            (
+                "partial_data_block",
+                REDO_DEFAULT_DATA_START_OFFSET + log_block_size + STORAGE_SECTOR_SIZE,
+                REDO_DEFAULT_DATA_START_OFFSET + log_block_size * 2,
+            ),
+            (
+                "aligned_data_region",
+                REDO_DEFAULT_DATA_START_OFFSET + log_block_size * 2,
+                REDO_DEFAULT_DATA_START_OFFSET + log_block_size * 2,
+            ),
+        ] {
+            let normalized = normalize_redo_file_max_size(requested, log_block_size).expect(case);
+            assert_eq!(normalized, expected, "{case}: requested={requested}");
+        }
     }
 
+    /// Purpose: Reject redo file limits whose aligned size cannot be represented.
+    /// Expected: Unrepresentable results return the file-size configuration error instead of wrapping.
     #[test]
-    fn log_file_max_size_normalizes_data_region_to_log_block() {
-        let log_block_size = STORAGE_SECTOR_SIZE * 2;
-        let requested = REDO_DEFAULT_DATA_START_OFFSET + log_block_size + STORAGE_SECTOR_SIZE;
-        let normalized = normalize_redo_file_max_size(requested, log_block_size).unwrap();
-
-        assert_eq!(
-            normalized,
-            REDO_DEFAULT_DATA_START_OFFSET + log_block_size * 2
-        );
+    fn log_file_max_size_rejects_unrepresentable_alignment() {
+        for (case, log_block_size) in [
+            ("ordinary_blocks", STORAGE_SECTOR_SIZE * 2),
+            ("maximum_blocks", MAX_REDO_LOG_BLOCK_SIZE),
+        ] {
+            let err = normalize_redo_file_max_size(usize::MAX, log_block_size).expect_err(case);
+            assert_eq!(
+                err.current_context(),
+                &ConfigError::InvalidLogFileMaxSize,
+                "{case}"
+            );
+        }
     }
 
-    #[test]
-    fn log_file_max_size_preserves_aligned_data_region() {
-        let log_block_size = STORAGE_SECTOR_SIZE * 2;
-        let requested = REDO_DEFAULT_DATA_START_OFFSET + log_block_size * 2;
-        let normalized = normalize_redo_file_max_size(requested, log_block_size).unwrap();
-
-        assert_eq!(normalized, requested);
-    }
-
+    /// Purpose: Apply redo file-layout normalization through transaction configuration validation.
+    /// Expected: Validation preserves the block size and expands the file for metadata and data.
     #[test]
     fn validate_normalizes_redo_file_layout() {
         let log_block_size = STORAGE_SECTOR_SIZE * 2;

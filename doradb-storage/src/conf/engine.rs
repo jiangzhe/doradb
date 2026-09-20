@@ -338,8 +338,11 @@ fn validate_table_scan_partition_size(field: &'static str, value: usize) -> Conf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
     use tempfile::TempDir;
 
+    /// Purpose: Protect table-scan defaults and inclusive partition-size limits.
+    /// Expected: Boundary sizes validate; invalid fields retain specific errors and limits.
     #[test]
     fn table_scan_config_defaults_boundaries_and_validation() {
         assert_eq!(
@@ -349,12 +352,18 @@ mod tests {
                 row_pages_per_partition: 32,
             }
         );
-        for count in [1, MAX_TABLE_SCAN_UNITS_PER_PARTITION] {
-            TableScanConfig::default()
+        for count in [1, 8192] {
+            let config = TableScanConfig::default()
                 .lwc_blocks_per_partition(count)
-                .row_pages_per_partition(count)
-                .validate()
-                .unwrap();
+                .row_pages_per_partition(count);
+            config.validate().unwrap();
+            assert_eq!(
+                config,
+                TableScanConfig {
+                    lwc_blocks_per_partition: count,
+                    row_pages_per_partition: count,
+                }
+            );
         }
         for (field, config) in [
             (
@@ -385,23 +394,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalid_table_scan_config_validation_is_filesystem_pure() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("must-not-be-created");
-        let error = EngineConfig::default()
-            .storage_root(&root)
-            .table_scan(TableScanConfig::default().row_pages_per_partition(0))
-            .validate()
-            .unwrap_err();
-        assert_eq!(
-            error.operation_error(),
-            None,
-            "configuration failure must not be disclosed as an operation error"
-        );
-        assert!(!root.exists());
-    }
-
+    /// Purpose: Reject unusable sizing in the thread pool and mandatory runtime.
+    /// Expected: Zero capacity returns the error for the affected runtime configuration.
     #[test]
     fn runtime_configs_reject_zero_sizes() {
         let error = ThreadPoolConfig::default()
@@ -422,45 +416,87 @@ mod tests {
         );
     }
 
+    /// Purpose: Normalize engine configuration without creating storage.
+    /// Expected: Returned settings expose normalized redo sizing and preserve the requested root.
     #[test]
     fn engine_validation_is_pure_and_config_reflects_normalization() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("engine");
-        let config = EngineConfig::default()
-            .storage_root(&root)
-            .trx(
+        for (case, trx) in [
+            (
+                "direct fields",
+                TrxSysConfig {
+                    log_block_size: Byte::from_u64(5000),
+                    log_file_max_size: Byte::from_u64(9000),
+                    ..TrxSysConfig::default()
+                },
+            ),
+            (
+                "builders",
                 TrxSysConfig::default()
                     .log_block_size(5000u64)
                     .log_file_max_size(9000u64),
-            )
-            .validate()
-            .unwrap();
-        assert!(!root.exists());
-        assert_eq!(config.storage_root, root);
-        assert_eq!(config.trx.log_block_size.as_u64(), 8192);
-        assert!(config.trx.log_file_max_size.as_u64() >= 8192);
-        assert_eq!(config.file.catalog_file_name, "catalog.mtb");
+            ),
+        ] {
+            let config = EngineConfig::default()
+                .storage_root(&root)
+                .trx(trx)
+                .validate()
+                .unwrap();
+            assert!(!root.exists(), "{case}");
+            assert_eq!(config.storage_root, root, "{case}");
+            assert_eq!(config.trx.log_block_size.as_u64(), 8192, "{case}");
+            assert_eq!(config.trx.log_file_max_size.as_u64(), 16384, "{case}");
+            assert_eq!(config.file.catalog_file_name, "catalog.mtb", "{case}");
+        }
     }
 
+    /// Purpose: Preserve configuration errors across internal and public engine validation.
+    /// Expected: Typed causes and public configuration classification survive without storage creation.
     #[test]
     fn invalid_engine_validation_preserves_typed_and_public_errors_without_creating_root() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().join("invalid");
-        let config = EngineConfig::default()
-            .storage_root(&root)
-            .thread_pool(ThreadPoolConfig::default().worker_threads(0));
+        for (case, config, expected, detail) in [
+            (
+                "thread_pool",
+                EngineConfig::default().thread_pool(ThreadPoolConfig::default().worker_threads(0)),
+                ConfigError::InvalidThreadPoolWorkerThreads,
+                "thread_pool.worker_threads=0",
+            ),
+            (
+                "table_scan",
+                EngineConfig::default()
+                    .table_scan(TableScanConfig::default().row_pages_per_partition(0)),
+                ConfigError::InvalidTableScanPartitionSize,
+                "table_scan.row_pages_per_partition",
+            ),
+        ] {
+            let root = temp.path().join(case);
+            let config = config.storage_root(&root);
+            let typed_error = config.clone().validate_inner().unwrap_err();
+            assert_eq!(typed_error.current_context(), &expected, "{case}");
+            assert!(!root.exists(), "{case}: internal validation");
 
-        let typed_error = config.clone().validate_inner().unwrap_err();
-        assert_eq!(
-            typed_error.current_context(),
-            &ConfigError::InvalidThreadPoolWorkerThreads
-        );
-
-        let error = config.validate().unwrap_err();
-        assert_eq!(error.kind(), crate::error::ErrorKind::Config);
-        assert!(!root.exists());
+            let error = config.validate().unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Config, "{case}");
+            assert_eq!(
+                error.report().downcast_ref::<ConfigError>(),
+                Some(&expected),
+                "{case}"
+            );
+            assert_eq!(
+                error.operation_error(),
+                None,
+                "{case}: configuration failure must not be disclosed as an operation error"
+            );
+            let diagnostic = format!("{error:?}");
+            assert!(diagnostic.contains(detail), "{case}: {diagnostic}");
+            assert!(!root.exists(), "{case}: public validation");
+        }
     }
 
+    /// Purpose: Identify which engine buffer pool has invalid sizing.
+    /// Expected: Rejections retain the buffer configuration error and the owning engine field.
     #[test]
     fn evictable_pool_validation_reports_the_engine_field() {
         let invalid = EvictableBufferPoolConfig::default()
@@ -481,7 +517,11 @@ mod tests {
                 error.current_context(),
                 &ConfigError::InvalidBufferPoolConfig
             );
-            assert!(format!("{error:?}").contains(field));
+            let diagnostic = format!("{error:?}");
+            assert!(
+                diagnostic.contains(&format!("config_field={field}")),
+                "{diagnostic}"
+            );
         }
     }
 }

@@ -139,8 +139,11 @@ mod tests {
     use super::*;
     use crate::Engine;
     use crate::conf::{EngineConfig, ThreadPoolConfig};
+    use crate::error::ErrorKind;
     use tempfile::TempDir;
 
+    /// Purpose: Protect recovery defaults and automatic replay sizing from worker capacity.
+    /// Expected: Automatic limits honor overrides, saturate safely, and remain stable after validation.
     #[test]
     fn defaults_and_automatic_limits_preserve_replay_sizing() {
         let default = RecoveryConfig::default();
@@ -179,6 +182,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Support explicit recovery limits, disabled recycling, and restoring automatic sizing.
+    /// Expected: Validation preserves explicit settings; resetting limits recomputes them from workers.
     #[test]
     fn positive_limits_and_explicit_auto_reset_are_supported() {
         let mut config = RecoveryConfig::default()
@@ -190,17 +195,30 @@ mod tests {
             .target_batch_bytes(1)
             .max_recycled_bytes(0);
         config.validate(2).unwrap();
-        assert_eq!(config.io_depth, 1);
-        assert!(config.disable_dml_validation);
-        assert_eq!(config.max_batch_ops, 1);
-        assert_eq!(config.target_batch_bytes, 1);
-        assert_eq!(config.max_recycled_bytes, 0);
+        let expected = RecoveryConfig {
+            io_depth: 1,
+            disable_dml_validation: true,
+            max_in_flight_batches: Some(7),
+            max_active_pages: Some(9),
+            max_batch_ops: 1,
+            target_batch_bytes: 1,
+            max_recycled_bytes: 0,
+        };
+        assert_eq!(config, expected);
         config = config.max_in_flight_batches(None).max_active_pages(None);
         config.validate(3).unwrap();
-        assert_eq!(config.max_in_flight_batches, Some(6));
-        assert_eq!(config.max_active_pages, Some(24));
+        assert_eq!(
+            config,
+            RecoveryConfig {
+                max_in_flight_batches: Some(6),
+                max_active_pages: Some(24),
+                ..expected
+            }
+        );
     }
 
+    /// Purpose: Reject invalid recovery limits before engine bootstrap creates storage.
+    /// Expected: Bootstrap preserves the typed cause and failing field while leaving the root absent.
     #[test]
     fn invalid_limits_fail_before_bootstrap_creates_storage() {
         let temp = TempDir::new().unwrap();
@@ -238,9 +256,11 @@ mod tests {
                 Ok(_) => panic!("recovery.{field}=0 must fail bootstrap"),
                 Err(error) => error,
             };
+            assert_eq!(error.kind(), ErrorKind::Config, "recovery.{field}");
             assert_eq!(
                 error.report().downcast_ref::<ConfigError>(),
-                Some(&expected)
+                Some(&expected),
+                "recovery.{field}"
             );
             let diagnostic = format!("{error:?}");
             assert!(
@@ -248,7 +268,7 @@ mod tests {
                 "{diagnostic}"
             );
             assert!(diagnostic.contains("actual=0"), "{diagnostic}");
-            assert!(!root.exists());
+            assert!(!root.exists(), "recovery.{field}");
         }
     }
 }
