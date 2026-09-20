@@ -127,6 +127,10 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    /// Purpose: Inject count, identity, content, index, pause, and bootstrap failures across
+    /// recovery ownership transitions.
+    /// Expected: Every injected case returns an error, content/pause cases preserve their expected
+    /// messages, and any remaining owner can shut down while the storage root remains.
     #[test]
     fn recovery_errors_close_verification_state_and_preserve_owner_cleanup() {
         use crate::fixture::{PrimaryTableShape, benchmark_index_specs, benchmark_table_spec};
@@ -234,6 +238,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Advance a mock benchmark clock only during the profiler pause before an empty-
+    /// engine reopen.
+    /// Expected: The external reopen interval is zero while the independently measured storage
+    /// bootstrap duration is positive.
     #[test]
     fn external_reopen_clock_excludes_pause_and_is_independent_of_storage_time() {
         smol::block_on(async {

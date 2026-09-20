@@ -1258,6 +1258,11 @@ mod tests {
         });
     }
 
+    /// Purpose: Checkpoint and reopen a managed-table creation with latency sampling both disabled
+    /// and enabled.
+    /// Expected: Created catalog contents recover, publication/cardinality/I/O metrics match
+    /// explicit expectations, sample count follows the flag, and a post-reopen checkpoint is a
+    /// zero-work no-op.
     #[test]
     fn managed_create_checkpoint_recovers() {
         for sample_latency in [false, true] {
@@ -1265,6 +1270,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Checkpoint and reopen managed-index creation with latency sampling both disabled
+    /// and enabled.
+    /// Expected: The new index and descriptor state recover, index-case catalog changes and metrics
+    /// match expectations, and a post-reopen checkpoint is a zero-work no-op.
     #[test]
     fn managed_index_checkpoint_recovers() {
         for sample_latency in [false, true] {
@@ -1272,6 +1281,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Checkpoint and reopen a managed-table drop with latency sampling both disabled and
+    /// enabled.
+    /// Expected: Dropped catalog objects stay absent, surviving catalog state and drop-case metrics
+    /// match expectations, and a post-reopen checkpoint is a zero-work no-op.
     #[test]
     fn managed_drop_checkpoint_recovers() {
         for sample_latency in [false, true] {
@@ -1279,6 +1292,11 @@ mod tests {
         }
     }
 
+    /// Purpose: Construct the small, target, and stress catalog profiles and their deterministic
+    /// descriptors.
+    /// Expected: Table/column/binding/descriptor totals and byte budgets match explicit values;
+    /// descriptor sizes stay bounded and balanced, the drop probe is empty, and ordinal changes
+    /// alter payloads.
     #[test]
     fn profiles_have_exact_deterministic_cardinalities_and_payloads() {
         for (profile, tables, bytes) in [
@@ -1317,6 +1335,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Generate catalog bindings across 32 tables and inspect their ordinal encoding.
+    /// Expected: All keys are distinct 16-byte values; table and binding ordinals occupy separate
+    /// big-endian halves under the expected namespace.
     #[test]
     fn binding_keys_are_fixed_width_and_injective() {
         let keys = (0..32)
@@ -1333,6 +1354,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Compute post-DDL cardinalities for every catalog case and malformed drop baselines.
+    /// Expected: Each case matches its explicit final counts; table, column, binding, and
+    /// descriptor underflows return the named errors.
     #[test]
     fn case_cardinalities_preserve_payload_bytes_and_check_drop_underflow() {
         for case in CASES {
@@ -1359,6 +1383,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Validate baseline/case checkpoint reports, including measured reads of an unchanged
+    /// catalog table.
+    /// Expected: All valid reports pass even when an additional active I/O record has no
+    /// corresponding row-count change.
     #[test]
     fn report_validators_accept_baseline_and_each_case() {
         verify_baseline_report(small_cardinalities(), &baseline_report()).unwrap();
@@ -1377,6 +1405,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Mutate publication, transaction, row-change, I/O, and probe-identity fields
+    /// independently.
+    /// Expected: Baseline and case validators reject every named inconsistency with the expected
+    /// diagnostic, including unsorted/duplicate entries and changed tables without active I/O.
     #[test]
     fn report_validators_reject_invalid_publication_and_table_shapes() {
         let cases: &[InvalidCase<CatalogCheckpointReport>] = &[
@@ -1446,6 +1478,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Construct catalog preparation/checkpoint executors for each case with valid or
+    /// mismatched bindings.
+    /// Expected: Both use one worker and one operation plan; preparation requires no binding and
+    /// checkpoint requires the matching profile/case summary.
     #[test]
     fn executors_require_matching_fixture_bindings_and_one_session() {
         for case in CASES {
@@ -1499,6 +1535,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Verify catalog preparation outcomes and independently corrupt effect, samples,
+    /// summary, or counters.
+    /// Expected: The valid outcome yields the expected runtime fixture; each named invalid
+    /// preparation outcome reports its specific validation error.
     #[test]
     fn prepare_outcome_verification_checks_summary_effect_and_measurement() {
         let case = CatalogCheckpointCase::ManagedCreate;
@@ -1547,6 +1587,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Verify measured catalog checkpoint outcomes against effect, profile/case, samples,
+    /// metrics, and counters.
+    /// Expected: The valid outcome yields CheckpointCatalog; each named mismatch or missing payload
+    /// is rejected with the expected diagnostic.
     #[test]
     fn checkpoint_outcome_verification_checks_effect_metrics_and_measurement() {
         let case = CatalogCheckpointCase::ManagedCreate;
@@ -1605,6 +1649,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Merge empty, payload-bearing, and measurement-only catalog outcomes.
+    /// Expected: Measurements add while preserving the sole summary/metrics payload; merging a
+    /// second preparation or checkpoint payload fails.
     #[test]
     fn outcomes_merge_measurements_and_reject_duplicate_payloads() {
         let mut prepare = CatalogCheckpointPrepareSessionOutcome::empty().unwrap();
@@ -1643,6 +1690,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Interpret managed table creation with empty, ordinary, maximum, oversized, and
+    /// already-consumed inputs.
+    /// Expected: Valid calls preserve schema, descriptors, and bindings then consume them once;
+    /// rejected sources do not consume inputs, and oversize/repeated/consumed calls fail.
     #[test]
     fn create_table_interpreter_preserves_definition_and_consumes_once() {
         for len in [0, 32, MAX_TABLE_DESCRIPTOR_BYTES] {
@@ -1678,6 +1729,11 @@ mod tests {
         );
     }
 
+    /// Purpose: Interpret index creation against a stable column identity and a three-byte
+    /// descriptor.
+    /// Expected: The update targets column 17 and flips only the first descriptor byte without
+    /// mutating the original; wrong source, empty descriptor, missing columns, or existing indexes
+    /// fail.
     #[test]
     fn create_index_interpreter_uses_stable_id_and_replaces_only_first_byte() {
         let schema = current_schema();
@@ -1729,6 +1785,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Dispatch CREATE INDEX/DROP INDEX to a table interpreter and CREATE TABLE/DROP INDEX
+    /// to an index interpreter.
+    /// Expected: Each incompatible callback reports the exact operation-family mismatch.
     #[test]
     fn interpreters_reject_unrelated_ddl_callbacks() {
         let schema = current_schema();
@@ -1752,6 +1811,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Verify live managed-table probe bindings and map real engine callback failures.
+    /// Expected: Incorrect binding counts, keys, or table identities fail while valid bindings
+    /// pass; both callback conversions preserve the storage error kind and diagnostic.
     #[test]
     fn probe_binding_validation_rejects_count_keys_and_wrong_identity() {
         block_on(async {

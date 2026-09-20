@@ -1314,6 +1314,8 @@ mod tests {
         assert_manager_agreement(&family, &manager);
     }
 
+    /// Purpose: Construct a session lock authority before any claims exist.
+    /// Expected: Family and session owner match, the next claim is one, and claims/resources/statistics are empty.
     #[test]
     fn new_authority_starts_with_one_empty_session_root() {
         let session_id = SessionID::new(9);
@@ -1329,6 +1331,8 @@ mod tests {
         assert_eq!(authority.family.stats, FamilyLockStats::default());
     }
 
+    /// Purpose: Close a public transaction whose shared claim is covered by a session exclusive claim.
+    /// Expected: One covered publication is counted and the session exclusive claim survives transaction close.
     #[test]
     fn fixed_scope_slots_preserve_session_claim_when_transaction_closes() {
         smol::block_on(async {
@@ -1374,6 +1378,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Close a private transaction covered by an operation-owned exclusive claim.
+    /// Expected: The operation retains Exclusive, one mode-preserving release is counted, and manager state agrees.
     #[test]
     fn operation_claim_preserves_mode_when_private_transaction_closes() {
         smol::block_on(async {
@@ -1417,6 +1423,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Close a transaction holding a resource distinct from the session parent resource.
+    /// Expected: Only the child physical claim is removed; the parent stays Exclusive and manager state agrees.
     #[test]
     fn child_only_physical_claim_is_removed_while_parent_remains_on_other_resource() {
         smol::block_on(async {
@@ -1459,6 +1467,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Repeat a covered claim, release it, and reacquire the resource.
+    /// Expected: The repeat returns Existing with one physical owner; reacquisition has a new claim number.
     #[test]
     fn repeated_covered_acquire_is_local_and_reacquire_burns_identity() {
         smol::block_on(async {
@@ -1511,6 +1521,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Measure exact-cover, family-cover, and close work for a session and public transaction.
+    /// Expected: Explicit counters distinguish local hits/publications from one physical acquire/removal and zero final resources.
     #[test]
     fn logical_lock_stats_split_owner_local_and_physical_work() {
         smol::block_on(async {
@@ -1571,6 +1583,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Move a session authority through a transaction carrier and close the transaction.
+    /// Expected: The returned authority has the same allocation address.
     #[test]
     fn transaction_carrier_returns_the_same_family_allocation() {
         let manager = LockManager::new();
@@ -1582,6 +1596,8 @@ mod tests {
         assert_eq!(from_ref(authority.as_ref()), ptr);
     }
 
+    /// Purpose: Request Shared in a transaction whose family holds noncovering IntentExclusive.
+    /// Expected: The request returns LockFamilyConflict and the manager retains one granted family entry.
     #[test]
     fn same_family_noncovering_request_is_rejected_locally() {
         smol::block_on(async {
@@ -1620,6 +1636,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Publish session, operation, and transaction claims under one covering exclusive family.
+    /// Expected: Three logical claims share one manager acquire; ordered close clears all indexes with exact release counters.
     #[test]
     fn three_scope_identities_update_stats_and_manager_mirrors() {
         smol::block_on(async {
@@ -1682,6 +1700,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Convert IntentShared to IntentExclusive, then attempt an unsupported Shared conversion.
+    /// Expected: The claim number stays fixed; rejection is LockConversionNotSupported and IntentExclusive remains held.
     #[test]
     fn conversion_retains_claim_identity_and_rejection_preserves_mode() {
         smol::block_on(async {
@@ -1741,6 +1761,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Poll a blocked claim to Waiting and cancel its acquisition future.
+    /// Expected: Claim one is observed waiting; cancellation advances the next number to two and leaves no accepted claims.
     #[test]
     fn cancelled_wait_burns_claim_number_without_accepted_indexes() {
         smol::block_on(async {
@@ -1783,6 +1805,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Release and reacquire a resource, then attempt release using the stale token.
+    /// Expected: The stale release panics while the current token and one physical family entry remain intact.
     #[test]
     fn stale_claim_token_panics_before_touching_reacquired_claim() {
         smol::block_on(async {
@@ -1824,6 +1848,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Remove a physical family behind an accepted claim before releasing its token.
+    /// Expected: Release panics and preserves the logical family snapshot and claim token.
     #[test]
     fn missing_physical_family_panics_before_mutating_owner_indexes() {
         smol::block_on(async {
@@ -1855,6 +1881,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Drop a fresh-claims guard after an Existing claim and a Fresh claim.
+    /// Expected: Rollback retains the preexisting Exclusive claim, removes only the fresh claim, and leaves one physical entry.
     #[test]
     fn fresh_group_rollback_preserves_preexisting_exact_claims() {
         smol::block_on(async {
@@ -1899,6 +1927,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Inject poison at listener registration, completion selection, and pre-provisional observation.
+    /// Expected: Each hook yields Fatal StorageIo with its attachment and clears pending, scope, family, and manager state.
     #[test]
     fn pending_claim_poison_cancels_every_wait_to_accept_race() {
         for phase in [
@@ -1910,6 +1940,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Inject poison after the final health check of a previously pending claim.
+    /// Expected: Acquisition returns Fresh despite recorded poison; the claim stays held until explicit close clears the manager.
     #[test]
     fn poison_after_final_health_check_does_not_revoke_accepted_claim() {
         smol::block_on(async {
@@ -1941,6 +1973,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Poison a blocked group acquisition after accepting a fresh prefix beside an older claim.
+    /// Expected: Fatal StorageIo is preserved; rollback removes fresh/pending claims and keeps the older claim until close.
     #[test]
     fn fresh_group_poison_rolls_back_only_its_fresh_prefix() {
         smol::block_on(async {
@@ -1989,6 +2023,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Acquire an immediate physical claim followed by a family-covered transaction claim.
+    /// Expected: Both grants are Fresh without increasing poison observations, and closing both empties the manager.
     #[test]
     fn immediate_and_family_covered_acquires_skip_poison_observation() {
         smol::block_on(async {
@@ -2024,6 +2060,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Run 512 deterministic lifecycle steps for session/public-transaction owners with seed 0x258d0a274c6f91e3.
+    /// Expected: Claim acceptance and identity checks hold; scope indexes, family snapshots, and manager aggregates agree through teardown.
     #[test]
     fn public_transaction_lifecycle_model_matches_indexes_and_manager() {
         let session_id = SessionID::new(90);
@@ -2034,6 +2072,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Run 512 deterministic lifecycle steps for operation/private-transaction owners with seed 0xa6e153d488b02f79.
+    /// Expected: Claim acceptance and identity checks hold; scope indexes, family snapshots, and manager aggregates agree through teardown.
     #[test]
     fn private_transaction_lifecycle_model_matches_indexes_and_manager() {
         let session_id = SessionID::new(91);
@@ -2044,6 +2084,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Attempt to release a strong outer claim while its covered child still exists.
+    /// Expected: Release panics before changing family or manager snapshots, and both original modes remain covered.
     #[test]
     fn closing_strong_outer_claim_before_covered_child_panics_before_mutation() {
         smol::block_on(async {

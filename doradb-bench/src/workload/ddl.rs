@@ -485,6 +485,9 @@ mod tests {
     use crate::fixture::IndexMode;
     use doradb_storage::StorageIndexFlags;
 
+    /// Purpose: Build benchmark index specifications for none, unique, and non-unique modes.
+    /// Expected: None produces no index, unique sets UK without PK, and non-unique uses no index
+    /// flags.
     #[test]
     fn schema_index_specs_match_index_mode_without_primary_key() {
         assert!(benchmark_index_specs(IndexMode::None).is_empty());

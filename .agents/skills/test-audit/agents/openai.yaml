@@ -1,0 +1,4 @@
+interface:
+  display_name: "Test Audit"
+  short_description: "Review Rust test contracts and assertions"
+  default_prompt: "Use $test-audit to check current-branch Rust test contracts against merge-base(origin/main, HEAD), then review assertions and overlapping scenarios without editing source."

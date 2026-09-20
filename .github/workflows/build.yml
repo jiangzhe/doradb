@@ -84,6 +84,11 @@ jobs:
         echo "run_build=${run_build}" >> "$GITHUB_OUTPUT"
         echo "run_build=${run_build}"
 
+  test-audit:
+    needs: changes
+    if: needs.changes.outputs.run_build == 'true'
+    uses: ./.github/workflows/test-audit.yml
+
   clippy:
     needs: changes
     if: needs.changes.outputs.run_build == 'true'
@@ -196,7 +201,7 @@ jobs:
         token: ${{secrets.CODECOV_TOKEN}}
 
   verify:
-    needs: [changes, clippy, coverage, libaio, codecov]
+    needs: [changes, test-audit, clippy, coverage, libaio, codecov]
     if: ${{ always() }}
     runs-on: ubuntu-22.04
     permissions: {}
@@ -204,6 +209,7 @@ jobs:
     - name: Verify CI results
       env:
         CHANGES_RESULT: ${{ needs.changes.result }}
+        TEST_AUDIT_RESULT: ${{ needs.test-audit.result }}
         DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
         RUN_BUILD: ${{ needs.changes.outputs.run_build }}
         CLIPPY_RESULT: ${{ needs.clippy.result }}
@@ -239,6 +245,7 @@ jobs:
           fi
         }
 
+        verify_result "test-audit" "$TEST_AUDIT_RESULT"
         verify_result "clippy" "$CLIPPY_RESULT"
         verify_result "coverage" "$COVERAGE_RESULT"
         verify_result "libaio" "$LIBAIO_RESULT"

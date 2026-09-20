@@ -1894,6 +1894,10 @@ mod tests {
         validate_and_resolve_phases(raw.phases, raw.workload_defaults.resolve()?)
     }
 
+    /// Purpose: Resolve managed-binding preparation followed by repeated binding-resolution
+    /// measurements.
+    /// Expected: The workload is replay-safe with 17 samples and topology (2, 4); missing/duplicate
+    /// preparation, invalid roles/counts, and unknown controls fail.
     #[test]
     fn managed_binding_plan_validates_fixture_counts_roles_and_repetition() {
         let prepare = r#"[[phase]]
@@ -1937,6 +1941,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         }
     }
 
+    /// Purpose: Decode the supported read, scan, DDL, lock, and update workload names with their
+    /// required controls.
+    /// Expected: Each named workload parses; obsolete rand on lock-table and range on update-rand
+    /// are rejected.
     #[test]
     fn strict_schema_accepts_new_workloads_and_rejects_old_random_name() {
         for workload in [
@@ -1968,6 +1976,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(parse("[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"update-rand\", num = 1, range = 1 }").is_err());
     }
 
+    /// Purpose: Resolve explicit and defaulted parallel-table-scan plans against committed data.
+    /// Expected: Partition, count, stats, loaded-range, topology, sample, and latency fields match
+    /// expectations; missing/zero partitions and session-style controls fail decoding.
     #[test]
     fn parallel_table_scan_schema_and_resolution_are_strict() {
         for invalid in [
@@ -2019,6 +2030,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(!config.include_stats);
     }
 
+    /// Purpose: Resolve and round-trip benchmark pause flags while rejecting prepare-phase or
+    /// malformed pause settings.
+    /// Expected: Explicit booleans are retained, omission defaults to false, and prepare-phase
+    /// pause, numeric pause, or the paused spelling are rejected.
     #[test]
     fn pause_is_strict_benchmark_only_and_normalized() {
         #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -2072,6 +2087,11 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         );
     }
 
+    /// Purpose: Resolve explicit and defaulted random-update plans after compatible committed
+    /// loading.
+    /// Expected: Resolved controls, disjoint original/alternate ranges, replay policy, topology,
+    /// latency unit, and six expected samples match the supplied plan; omitted controls use
+    /// explicit defaults.
     #[test]
     fn update_plan_resolves_strict_controls_and_replay_contracts() {
         let phases = resolve(
@@ -2127,6 +2147,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(!config.include_stats);
     }
 
+    /// Purpose: Resolve random updates with missing/incompatible data, excessive sessions, empty
+    /// payloads, invalid phase roles, or overflowing domains.
+    /// Expected: Every invalid plan fails resolution, and a zero operation count fails decoding.
     #[test]
     fn update_plan_rejects_invalid_fixture_replay_and_range_contracts() {
         let invalid = [
@@ -2149,6 +2172,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         );
     }
 
+    /// Purpose: Decode maintenance workloads with valid controls and invalid zero or session-style
+    /// options.
+    /// Expected: Freeze/checkpoint controls parse; zero freeze limits, freeze threads, and
+    /// checkpoint batch sizes are rejected.
     #[test]
     fn maintenance_schema_is_strict_and_positive() {
         assert!(
@@ -2172,6 +2199,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         }
     }
 
+    /// Purpose: Resolve a four-row prefix freeze followed by a measured checkpoint of loaded data.
+    /// Expected: Both phases use one worker/session and one sample, with their own latency units
+    /// and the exact freeze/checkpoint effects.
     #[test]
     fn maintenance_plan_resolves_fixed_topology_and_consuming_effects() {
         let phases = resolve(
@@ -2201,6 +2231,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert_eq!(phases[3].fixture_effect(), &FixturePlanEffect::Checkpoint);
     }
 
+    /// Purpose: Resolve maintenance against missing, indexed, multi-table, unfrozen, or replayed
+    /// consuming fixtures.
+    /// Expected: Each invalid freeze/checkpoint fixture or warmup combination returns an error.
     #[test]
     fn maintenance_fixture_and_replay_contracts_fail_during_resolution() {
         let invalid = [
@@ -2215,6 +2248,8 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         }
     }
 
+    /// Purpose: Resolve unique lookups before loading rows or after loading an unindexed table.
+    /// Expected: Both missing committed data and incompatible index shape fail plan resolution.
     #[test]
     fn fixture_fold_rejects_reads_without_compatible_committed_load() {
         let no_load = "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lookup-seq\", num = 1 }\n";
@@ -2223,6 +2258,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(resolve(wrong_shape).is_err());
     }
 
+    /// Purpose: Resolve scope-close locking wider than its table pool and promotion with an
+    /// irrelevant unlock control.
+    /// Expected: Both the excessive scope width and irrelevant promotion option are rejected.
     #[test]
     fn lock_contracts_and_pool_width_are_checked() {
         let invalid = "[[phase]]\nworkload = { type = \"create-table\", index = \"none\", tables = 2 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"lock-table\", num = 1, scenario = \"scope-close\", width = 3 }\n";
@@ -2231,6 +2269,9 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(resolve(irrelevant).is_err());
     }
 
+    /// Purpose: Resolve excessive worker counts through both workload defaults and per-phase
+    /// overrides.
+    /// Expected: Both paths return the exact error that two threads must not exceed one session.
     #[test]
     fn worker_topology_is_validated_during_plan_resolution() {
         let defaults = WorkloadDefaults {
@@ -2250,6 +2291,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         );
     }
 
+    /// Purpose: Compute transaction batch and nonempty-session counts for uneven and sparse
+    /// operation partitions.
+    /// Expected: Five operations across two sessions with batch two yield three samples; three
+    /// operations across eight sessions yield three samples and three nonempty sessions.
     #[test]
     fn checked_sample_equations_match_partitioning() {
         assert_eq!(aggregate_batch_count(5, 2, 2).unwrap(), 3);
@@ -2257,6 +2302,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert_eq!(nonempty_session_count(3, 8).unwrap(), 3);
     }
 
+    /// Purpose: Resolve all catalog profile/case pairs under matching prepare and single-run
+    /// checkpoint phases.
+    /// Expected: Identity, stats, topology, sample, and latency contracts match; missing/mismatched
+    /// preparation, repetition, obsolete names, and invalid fields are rejected.
     #[test]
     fn catalog_checkpoint_plan_is_strict_typed_and_single_run() {
         for profile in ["small", "target", "stress"] {
@@ -2316,6 +2365,11 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         );
     }
 
+    /// Purpose: Resolve coordinator-owned recovery for empty or ordinary table fixtures and
+    /// validate durable log-sync admission.
+    /// Expected: Recovery uses no session workers, one sample, and SingleRun policy; unsupported
+    /// controls/fixtures/repetition fail, and only fsync/fdatasync plans load without creating
+    /// roots.
     #[test]
     fn recovery_plan_is_strict_single_run_and_coordinator_owned() {
         let suffix = "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"recovery\" }\n";
@@ -2386,6 +2440,11 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         }
     }
 
+    /// Purpose: Resolve unique/non-unique index creation for hot or fully checkpointed fixtures and
+    /// validate full-freeze sequencing.
+    /// Expected: Valid plans use one worker/session and one creation sample; invalid controls,
+    /// replay, fixture shapes, or inexact placement fail, while a final full checkpoint restores
+    /// eligibility.
     #[test]
     fn create_index_admission_and_full_freeze_are_strict() {
         let fixture = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 100 }\n";
@@ -2486,6 +2545,11 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(resolve(&restore).is_ok());
     }
 
+    /// Purpose: Load every named benchmark template and compare the template directory with the
+    /// supported inventory.
+    /// Expected: All 27 templates resolve to the expected workload and engine settings;
+    /// CREATE/checkpoint/update preparation and measurement controls match explicit expectations
+    /// with no extra or missing templates.
     #[test]
     fn checked_in_templates_are_the_exact_complete_workload_inventory() {
         let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");

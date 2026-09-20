@@ -50,6 +50,9 @@ if ! cmp -s "${tmp_before_fmt}" "${tmp_after_fmt}"; then
   exit 1
 fi
 
+echo "[pre-commit] Checking staged test contracts"
+tools/test_audit.rs check --staged
+
 echo "[pre-commit] Running cargo clippy --workspace --all-targets -- -D warnings"
 if ! cargo clippy --workspace --all-targets -- -D warnings >"${tmp_clippy_log}" 2>&1; then
   echo "[pre-commit] cargo clippy failed."

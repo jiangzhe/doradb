@@ -608,6 +608,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[track_caller]
+    fn assert_resolved_round_trip(resolved: &ResolvedEngineConfig) -> String {
+        let encoded = toml::to_string(resolved).unwrap();
+        let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(&decoded, resolved);
+        encoded
+    }
+
+    /// Purpose: Merge partial transaction and index-buffer overlays into existing settings.
+    /// Expected: Overridden fields take local values while untouched sibling fields retain their
+    /// prior values.
     #[test]
     fn nested_overlay_merge_preserves_siblings() {
         let mut base: EngineConfigOverlay =
@@ -633,6 +644,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Resolve non-sector-aligned redo byte settings against storage normalization.
+    /// Expected: A 5000-byte block resolves to 8192 bytes, the file limit accommodates a block, and
+    /// the CoW file limit retains its default.
     #[test]
     fn resolved_config_uses_normalized_storage_values() {
         let temp = TempDir::new().unwrap();
@@ -649,6 +663,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Resolve independent swap-file and memory/file byte limits for index and data
+    /// buffers.
+    /// Expected: Both engine and reported settings preserve the configured paths and exact binary
+    /// byte sizes.
     #[test]
     fn index_and_data_buffers_share_the_same_overlay_shape() {
         let temp = TempDir::new().unwrap();
@@ -682,6 +700,9 @@ mod tests {
         assert_eq!(resolved.data_buffer.max_mem_size_bytes, 134_217_728);
     }
 
+    /// Purpose: Decode unknown and obsolete engine-overlay fields across nested configuration
+    /// sections.
+    /// Expected: Each unsupported field or legacy section shape is rejected during TOML decoding.
     #[test]
     fn strict_nested_overlay_rejects_unknown_field() {
         assert!(toml::from_str::<EngineConfigOverlay>("[file]\nunknown = 1").is_err());
@@ -716,6 +737,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Merge explicit recovery limits and worker settings, then serialize the resolved
+    /// configuration.
+    /// Expected: Specified overrides and retained limits match the expected recovery record; round-
+    /// trip is exact, and obsolete or missing recovery fields are rejected.
     #[test]
     fn recovery_overlay_merges_resolves_and_round_trips() {
         let temp = TempDir::new().unwrap();
@@ -758,11 +783,7 @@ mod tests {
                 max_recycled_bytes: 16 * 1024 * 1024,
             }
         );
-        let encoded = toml::to_string(&resolved).unwrap();
-        assert_eq!(
-            toml::from_str::<ResolvedEngineConfig>(&encoded).unwrap(),
-            resolved
-        );
+        let encoded = assert_resolved_round_trip(&resolved);
         for field in ["max_batch_bytes", "max_buffered_bytes"] {
             let mut obsolete: toml::Value = toml::from_str(&encoded).unwrap();
             obsolete["recovery"]
@@ -779,6 +800,10 @@ mod tests {
         assert!(missing_recovery.try_into::<ResolvedEngineConfig>().is_err());
     }
 
+    /// Purpose: Derive automatic recovery limits after merging worker-count and batch-count
+    /// overrides.
+    /// Expected: Three workers yield six in-flight batches and 24 active pages; explicitly
+    /// selecting one batch reduces the automatic page limit to four.
     #[test]
     fn recovery_overlay_automatic_limits_follow_final_worker_and_batch_overrides() {
         let temp = TempDir::new().unwrap();
@@ -793,6 +818,9 @@ mod tests {
         assert_eq!(resolved.recovery.max_active_pages, 4);
     }
 
+    /// Purpose: Merge a zero-recycling override with a configured recovery batch byte target.
+    /// Expected: The engine and report retain a 32768-byte target and zero recycled bytes, and
+    /// resolved TOML round-trips exactly.
     #[test]
     fn recovery_byte_overlays_merge_normalize_and_allow_zero_recycling() {
         let temp = TempDir::new().unwrap();
@@ -816,12 +844,12 @@ mod tests {
         assert_eq!(resolved.recovery.target_batch_bytes, 32768);
         assert_eq!(config.recovery.max_recycled_bytes, 0);
         assert_eq!(resolved.recovery.max_recycled_bytes, 0);
-        assert_eq!(
-            toml::from_str::<ResolvedEngineConfig>(&toml::to_string(&resolved).unwrap()).unwrap(),
-            resolved
-        );
+        assert_resolved_round_trip(&resolved);
     }
 
+    /// Purpose: Resolve each mandatory recovery limit with a zero value.
+    /// Expected: Zero I/O depth, in-flight batches, active pages, batch operations, or target batch
+    /// bytes each fail validation.
     #[test]
     fn recovery_overlay_rejects_invalid_limits() {
         let temp = TempDir::new().unwrap();
@@ -840,6 +868,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Override thread-pool workers while preserving the mandatory-runtime concurrency
+    /// setting.
+    /// Expected: Engine and report use four workers and concurrency three; the resolved
+    /// configuration round-trips through TOML unchanged.
     #[test]
     fn thread_pool_and_mandatory_runtime_merge_and_round_trip() {
         let temp = TempDir::new().unwrap();
@@ -856,11 +888,13 @@ mod tests {
         assert_eq!(config.mandatory_runtime.concurrency_limit, 3);
         assert_eq!(resolved.thread_pool.worker_threads, 4);
         assert_eq!(resolved.mandatory_runtime.concurrency_limit, 3);
-        let encoded = toml::to_string(&resolved).unwrap();
-        let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded, resolved);
+        assert_resolved_round_trip(&resolved);
     }
 
+    /// Purpose: Merge one table-scan partition limit and validate the resolved section during TOML
+    /// round-trip.
+    /// Expected: The limits resolve to seven LWC blocks and 21 row pages; round-trip preserves them
+    /// and omitting table_scan fails decoding.
     #[test]
     fn table_scan_overlay_merges_resolves_round_trips_and_is_required() {
         let temp = TempDir::new().unwrap();
@@ -881,12 +915,8 @@ mod tests {
                 row_pages_per_partition: 21,
             }
         );
-        let encoded = toml::to_string(&resolved).unwrap();
+        let encoded = assert_resolved_round_trip(&resolved);
         assert!(encoded.contains("[table_scan]"));
-        assert_eq!(
-            toml::from_str::<ResolvedEngineConfig>(&encoded).unwrap(),
-            resolved
-        );
 
         let mut skipping_scan = false;
         let without_scan = encoded
@@ -906,6 +936,9 @@ mod tests {
         assert!(toml::from_str::<ResolvedEngineConfig>(&without_scan).is_err());
     }
 
+    /// Purpose: Resolve a metadata-buffer byte count larger than u64 can represent.
+    /// Expected: The 18446744073709551616-byte overlay is rejected instead of narrowing or
+    /// wrapping.
     #[test]
     fn byte_values_use_checked_storage_boundaries() {
         let temp = TempDir::new().unwrap();
@@ -914,6 +947,9 @@ mod tests {
         assert!(resolve_engine_config(temp.path(), &overlay).is_err());
     }
 
+    /// Purpose: Override the CoW file limit while preserving an existing catalog filename.
+    /// Expected: Engine and report use 48 MiB and custom.mtb, and resolved TOML round-trips
+    /// exactly.
     #[test]
     fn cow_file_max_size_overlay_merges_and_round_trips() {
         let temp = TempDir::new().unwrap();
@@ -929,8 +965,6 @@ mod tests {
         assert_eq!(config.file.cow_file_max_size, 48 * 1024 * 1024);
         assert_eq!(resolved.file.cow_file_max_size_bytes, 48 * 1024 * 1024);
         assert_eq!(resolved.file.catalog_file_name, "custom.mtb");
-        let encoded = toml::to_string(&resolved).unwrap();
-        let decoded: ResolvedEngineConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded, resolved);
+        assert_resolved_round_trip(&resolved);
     }
 }

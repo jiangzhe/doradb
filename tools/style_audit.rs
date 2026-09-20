@@ -7,6 +7,9 @@ edition = "2024"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "2", features = ["full", "visit"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
 ---
 
 use proc_macro2::Span;
@@ -344,7 +347,7 @@ fn run_branch_diff_audit(repo_root: &Path, diff_base: &str) -> Result<i32, Strin
     }
 
     let label = format!("branch-diff against {diff_base}");
-    audit_files(&label, &files)
+    audit_files(repo_root, &label, &files)
 }
 
 fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, String> {
@@ -367,10 +370,34 @@ fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, St
         return Ok(1);
     }
 
-    audit_files("forced-path", &files)
+    audit_files(repo_root, "forced-path", &files)
 }
 
-fn audit_files(label: &str, files: &[AuditFile]) -> Result<i32, String> {
+fn run_test_audit(repo_root: &Path, files: &[AuditFile]) -> Result<i32, String> {
+    let mut command = Command::new(repo_root.join("tools/test_audit.rs"));
+    command
+        .current_dir(repo_root)
+        .stdin(Stdio::null())
+        .arg("check");
+    for file in files {
+        command.arg("--force-path").arg(&file.full_path);
+    }
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to execute tools/test_audit.rs: {err}"))?;
+    match status.code() {
+        Some(code @ 0..=2) => Ok(code),
+        _ => Err(format!(
+            "tools/test_audit.rs terminated unexpectedly: {status}"
+        )),
+    }
+}
+
+fn audit_files(repo_root: &Path, label: &str, files: &[AuditFile]) -> Result<i32, String> {
+    let contract_code = run_test_audit(repo_root, files)?;
+    if contract_code == 2 {
+        return Ok(2);
+    }
     let mut violations = Vec::new();
     for file in files {
         let content = fs::read_to_string(&file.full_path).map_err(|e| {
@@ -384,7 +411,11 @@ fn audit_files(label: &str, files: &[AuditFile]) -> Result<i32, String> {
     }
 
     print_style_summary(label, files.len(), &violations);
-    Ok(if violations.is_empty() { 0 } else { 1 })
+    Ok(if violations.is_empty() {
+        contract_code
+    } else {
+        1
+    })
 }
 
 fn repo_root() -> Result<PathBuf, String> {
@@ -1538,6 +1569,8 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::TempDir;
 
     fn violations(source: &str) -> Vec<Violation> {
         audit_content("sample.rs", source)
@@ -1569,6 +1602,96 @@ mod tests {
         }
     }
 
+    fn delegation_repo(script: &str) -> TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("tools")).unwrap();
+        let path = root.path().join("tools/test_audit.rs");
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        root
+    }
+
+    /// Purpose: Forward the exact selected file set to the independent test auditor and preserve failures.
+    /// Expected: Paths with spaces retain argument boundaries; codes 0/1/2 propagate and missing children error.
+    #[test]
+    fn delegates_selected_files_and_propagates_failures() {
+        for code in [0, 1, 2] {
+            let repo = delegation_repo(&format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > arguments\nexit {code}\n"
+            ));
+            let files = ["a file.rs", "nested/b.rs"].map(|name| AuditFile {
+                display_path: name.into(),
+                full_path: repo.path().join(name),
+            });
+            assert_eq!(run_test_audit(repo.path(), &files).unwrap(), code);
+            assert_eq!(
+                fs::read_to_string(repo.path().join("arguments")).unwrap(),
+                format!(
+                    "check\n--force-path\n{}\n--force-path\n{}\n",
+                    files[0].full_path.display(),
+                    files[1].full_path.display()
+                )
+            );
+        }
+        let missing = tempfile::tempdir().unwrap();
+        assert!(
+            run_test_audit(missing.path(), &[])
+                .unwrap_err()
+                .contains("failed to execute")
+        );
+        let abnormal = delegation_repo("#!/bin/sh\nexit 7\n");
+        assert!(run_test_audit(abnormal.path(), &[]).is_err());
+    }
+
+    /// Purpose: Compare real direct and style-delegated checks over the same working-tree file.
+    /// Expected: Both return a contract violation and produce identical full inventories including unrelated tests.
+    #[test]
+    fn direct_and_delegated_contract_checks_agree() {
+        let source_tool = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .with_file_name("test_audit.rs");
+        let quoted_tool = source_tool.to_str().unwrap().replace('\'', "'\\''");
+        let repo = delegation_repo(&format!("#!/bin/sh\nexec '{quoted_tool}' \"$@\"\n"));
+        for args in [
+            &["init"][..],
+            &["config", "core.hooksPath", "/dev/null"][..],
+        ] {
+            assert_eq!(run_command(repo.path(), "git", args).unwrap().code, Some(0));
+        }
+        fs::write(repo.path().join("a.rs"), "#[test]\nfn case() {}\n").unwrap();
+        fs::write(repo.path().join("b.rs"), "#[test]\nfn other() {}\n").unwrap();
+        assert_eq!(
+            run_command(repo.path(), "git", &["add", "a.rs", "b.rs"])
+                .unwrap()
+                .code,
+            Some(0)
+        );
+        let direct = Command::new(&source_tool)
+            .current_dir(repo.path())
+            .args(["check", "--force-path", "a.rs", "--output-dir", "direct"])
+            .output()
+            .unwrap();
+        assert_eq!(direct.status.code(), Some(1), "{direct:?}");
+        assert!(
+            String::from_utf8_lossy(&direct.stderr)
+                .contains("a.rs:2 test-contract-missing-purpose")
+        );
+        let files = [AuditFile {
+            display_path: "a.rs".into(),
+            full_path: repo.path().join("a.rs"),
+        }];
+        assert_eq!(run_test_audit(repo.path(), &files).unwrap(), 1);
+        for name in ["test-inventory.csv", "test-inventory.md"] {
+            assert_eq!(
+                fs::read(repo.path().join("direct").join(name)).unwrap(),
+                fs::read(repo.path().join("target/test-audit").join(name)).unwrap()
+            );
+        }
+    }
+
+    /// Purpose: Check adjacent-function spacing across file, impl, trait, and inline-test scopes.
+    /// Expected: Zero or two blank lines report the second function location; exactly one is accepted.
     #[test]
     fn checks_function_spacing_in_supported_scopes() {
         let cases = [
@@ -1610,6 +1733,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Measure the gap before the next function documentation or attributes.
+    /// Expected: Named doc, attribute, and multiline cases produce exact spacing counts and source lines.
     #[test]
     fn measures_function_spacing_before_docs_and_attributes() {
         let cases: &[(&str, &[(usize, usize)])] = &[
@@ -1644,6 +1769,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Distinguish actual inter-function blank lines from comments, literals, and script manifests.
+    /// Expected: Each named source case produces exactly the expected spacing count at the preserved line.
     #[test]
     fn counts_empty_source_lines_between_functions() {
         let cases: &[(&str, &[(usize, usize)])] = &[
@@ -1674,6 +1801,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Measure spacing around section comments, including nested block comments.
+    /// Expected: Internal comment blank lines do not affect the expected outer gap diagnostics.
     #[test]
     fn checks_blank_line_runs_outside_section_comments() {
         let cases = [
@@ -1701,6 +1830,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep spacing enforcement within supported scopes and consecutive function pairs.
+    /// Expected: Nonadjacent items, nested scopes, helpers, and macro bodies yield no spacing diagnostics.
     #[test]
     fn limits_function_spacing_to_adjacent_functions_in_existing_scopes() {
         let cases = [
@@ -1722,6 +1853,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Apply ordering, adjacency, and visible documentation rules to inline tests.
+    /// Expected: The fixture reports exactly five rule categories and the misplaced attribute at line 15.
     #[test]
     fn audits_scope_rules_inside_inline_tests_module() {
         let source = r#"#[cfg(test)]
@@ -1766,6 +1899,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Accept a test module with imports, types, implementations, helpers, and tests in order.
+    /// Expected: The complete fixture yields no style violations.
     #[test]
     fn accepts_well_ordered_inline_tests_module() {
         let source = r#"#[cfg(test)]
@@ -1797,6 +1932,8 @@ mod tests {
         assert!(violations.is_empty(), "{violations:#?}");
     }
 
+    /// Purpose: Reject a helper declared after a test in an inline test module.
+    /// Expected: One top-level-order violation identifies the helper at line 6.
     #[test]
     fn requires_helpers_before_test_functions() {
         let source = r#"#[cfg(test)]
@@ -1815,6 +1952,8 @@ mod tests {
         assert!(violations[0].message.contains("appears after tests"));
     }
 
+    /// Purpose: Limit existing inline-test structural rules to their intended module depth.
+    /// Expected: A nested helper fixture yields no structural violations.
     #[test]
     fn does_not_reapply_scope_checks_to_nested_modules() {
         let source = r#"#[cfg(test)]
@@ -1834,6 +1973,8 @@ mod tests {
         assert!(violations.is_empty(), "{violations:#?}");
     }
 
+    /// Purpose: Detect an overqualified function path inside a test without duplicate traversal findings.
+    /// Expected: Exactly one qualified-path violation is emitted.
     #[test]
     fn reports_qualified_paths_inside_tests_once() {
         let source = r#"#[cfg(test)]
@@ -1856,12 +1997,16 @@ mod tests {
         assert_eq!(violations.len(), 1, "{violations:#?}");
     }
 
+    /// Purpose: Allow an external tests module declaration without imposing inline layout rules.
+    /// Expected: The external module declaration yields no style violations.
     #[test]
     fn accepts_external_tests_module_declaration() {
         let violations = violations("#[cfg(test)]\nmod tests;\n");
         assert!(violations.is_empty(), "{violations:#?}");
     }
 
+    /// Purpose: Recognize test predicates under all, any, and double negation.
+    /// Expected: Each explicit positive cfg case is recognized as a test scope.
     #[test]
     fn recognizes_positive_cfg_test_predicates() {
         assert!(cfg_matches("#[cfg(test)] mod tests {}"));
@@ -1870,6 +2015,8 @@ mod tests {
         assert!(cfg_matches("#[cfg(not(not(test)))] mod tests {}"));
     }
 
+    /// Purpose: Exclude negated test and similarly named features or predicates from test scopes.
+    /// Expected: Every explicit non-test cfg case is rejected.
     #[test]
     fn rejects_non_test_cfg_predicates() {
         assert!(!cfg_matches("#[cfg(not(test))] mod tests {}"));

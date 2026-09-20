@@ -22,6 +22,46 @@ cargo nextest run -p doradb-storage --no-default-features --features libaio
 
 Doctests are not part of routine validation.
 
+## Test Contracts and Inventory
+
+Every source-visible test in a changed Rust file needs literal documentation
+with exactly one nonempty `Purpose:` and `Expected:` field, above all attributes.
+Wrapped lines continue the preceding field.
+
+```rust
+/// Purpose: Verify the persisted little-endian hint layout.
+/// Expected: Slot 3 contains [4, 3, 2, 1] and reads back as 0x01020304.
+#[test]
+fn test_btree_hints_store_little_endian_heads() {
+    // Assertions must establish the stated expectation.
+}
+```
+
+Use [$test-audit](../../.agents/skills/test-audit/SKILL.md) for contract checks
+and semantic review, or run the auditor directly:
+
+```bash
+tools/test_audit.rs inventory
+tools/test_audit.rs check --staged
+tools/test_audit.rs check --diff-base <commit>
+tools/test_audit.rs check --force-path <file-or-dir>
+```
+
+Checks validate every test in selected files; missing contracts elsewhere do
+not fail the check. Directory targets are nonrecursive. Inventory includes
+inactive conditional tests without expanding macros. CSV/Markdown reports are
+written to `target/test-audit/`; source comments remain authoritative.
+The root `tools/` directory is excluded from inventories and automatic checks;
+use `--force-path` to audit tool files explicitly.
+For module-local deduplication candidates, add `--analyze-duplicates`; the
+informational `test-duplicate-candidates.md` report does not affect pass/fail.
+
+After the check, verify that assertions establish the documented behavior,
+including boundaries, errors, cleanup, and deterministic setup. Review shared
+scenarios and duplicate-contract candidates, preserving distinct feature,
+backend, lifecycle, and oracle coverage. Record why overlap is retained or how
+consolidation preserves it; matching text alone does not justify deleting tests.
+
 ## Test Policy
 
 -   Ensure existing tests continue to pass after code changes.
