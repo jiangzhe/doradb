@@ -241,6 +241,8 @@ mod tests {
         .expect("valid table metadata")
     }
 
+    /// Purpose: Retain the table column layout when initializing row metadata.
+    /// Expected: The version map shares the supplied column layout.
     #[test]
     fn test_row_version_map_retains_column_layout() {
         let metadata = metadata();
@@ -253,6 +255,8 @@ mod tests {
         ));
     }
 
+    /// Purpose: Reject row metadata access before initialization.
+    /// Expected: Missing row-version context triggers the metadata assertion.
     #[test]
     #[should_panic(expected = "row page requires row-version map")]
     fn test_row_version_map_requires_metadata() {

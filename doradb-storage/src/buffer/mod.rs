@@ -486,6 +486,8 @@ pub(crate) mod tests {
         PageID::new(u64::try_from(value).expect("test PageID must be non-negative"))
     }
 
+    /// Purpose: Preserve page identifiers across integer accessors and conversions.
+    /// Expected: Supported integer representations retain the identifier value.
     #[test]
     fn test_page_id_accessors_and_conversions() {
         let page_id = PageID::new(42);
@@ -498,6 +500,8 @@ pub(crate) mod tests {
         assert_eq!(usize::from(page_id), 42);
     }
 
+    /// Purpose: Protect the little-endian representation of page identifiers.
+    /// Expected: Encoded bytes match the specified byte order and decode without loss.
     #[test]
     fn test_page_id_bytes_roundtrip() {
         let page_id = PageID::new(0x0123_4567_89ab_cdef);
@@ -506,6 +510,8 @@ pub(crate) mod tests {
         assert_eq!(PageID::from_le_bytes(bytes), page_id);
     }
 
+    /// Purpose: Support page identifier arithmetic and assignment operators.
+    /// Expected: Addition and subtraction produce the expected identifiers.
     #[test]
     fn test_page_id_arithmetic() {
         let page_id = PageID::new(10);
@@ -520,6 +526,8 @@ pub(crate) mod tests {
         assert_eq!(next, PageID::new(12));
     }
 
+    /// Purpose: Compare page identifiers with signed and unsigned integers.
+    /// Expected: Equality is symmetric and negative integers cannot match a page identifier.
     #[test]
     fn test_page_id_partial_eq_signed_and_unsigned() {
         let page_id = PageID::new(7);
@@ -531,11 +539,15 @@ pub(crate) mod tests {
         assert_ne!(-1i32, page_id);
     }
 
+    /// Purpose: Expose the numeric page identifier in formatted output.
+    /// Expected: Display uses the decimal representation of the identifier.
     #[test]
     fn test_page_id_display() {
         assert_eq!(format!("{}", PageID::new(99)), "99");
     }
 
+    /// Purpose: Preserve page identifiers through the serialization interface.
+    /// Expected: Serialization consumes the declared width and deserialization restores the identifier.
     #[test]
     fn test_page_id_serde_roundtrip() {
         let page_id = PageID::new(1234);
@@ -550,6 +562,8 @@ pub(crate) mod tests {
         assert_eq!(deser, page_id);
     }
 
+    /// Purpose: Protect page identifier deltas used by bit packing.
+    /// Expected: Narrow deltas and additions preserve values with wrapping arithmetic at the unsigned boundary.
     #[test]
     fn test_page_id_bit_packable_contract() {
         let min = PageID::new(10);
@@ -569,12 +583,16 @@ pub(crate) mod tests {
         assert_eq!(wrap_min.add_from_u32(5), PageID::new(2));
     }
 
+    /// Purpose: Accept valid signed identifiers in the test fixture helper.
+    /// Expected: Zero and positive inputs retain their values as page identifiers.
     #[test]
     fn test_test_page_id_accepts_non_negative_values() {
         assert_eq!(test_page_id(0), PageID::new(0));
         assert_eq!(test_page_id(17), PageID::new(17));
     }
 
+    /// Purpose: Reject negative identifiers in the test fixture helper.
+    /// Expected: A negative input triggers the nonnegative-identifier assertion.
     #[test]
     #[should_panic(expected = "test PageID must be non-negative")]
     fn test_test_page_id_panics_on_negative_values() {

@@ -1,5 +1,7 @@
 #[cfg(test)]
-pub(crate) use self::tests::shares_root as test_sync_guards_share_root;
+pub(crate) use self::tests::{
+    shares_root as test_sync_guards_share_root, with_before_drop_hook as test_with_before_drop_hook,
+};
 use crate::buffer::PoolIdentity;
 use std::hint::spin_loop;
 use std::ops::Deref;
@@ -160,6 +162,8 @@ impl<T> Deref for QuiescentBox<T> {
 impl<T> Drop for QuiescentBox<T> {
     #[inline]
     fn drop(&mut self) {
+        #[cfg(test)]
+        tests::run_before_drop_hook(self.owner_identity());
         self.inner.as_ref().get_ref().guard_count.wait_for_zero();
     }
 }
@@ -305,6 +309,7 @@ fn guard_count_underflow() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::ptr::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -312,6 +317,21 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use std::{panic, panic::AssertUnwindSafe};
+
+    type BeforeDropHook = (PoolIdentity, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static BEFORE_DROP_HOOK: RefCell<Option<BeforeDropHook>> = const { RefCell::new(None) };
+    }
+
+    struct BeforeDropHookScope;
+
+    impl Drop for BeforeDropHookScope {
+        fn drop(&mut self) {
+            let hook = BEFORE_DROP_HOOK.with(|slot| slot.borrow_mut().take());
+            drop(hook);
+        }
+    }
 
     struct DropSpy {
         dropped: Arc<AtomicBool>,
@@ -332,6 +352,42 @@ mod tests {
         Arc::ptr_eq(&first.guard, &second.guard)
     }
 
+    /// Runs an action with a one-shot hook before the selected owner's guard wait.
+    pub(crate) fn with_before_drop_hook(
+        owner: PoolIdentity,
+        hook: impl FnOnce() + 'static,
+        action: impl FnOnce(),
+    ) {
+        BEFORE_DROP_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "quiescent drop hook already installed");
+            *slot = Some((owner, Box::new(hook)));
+        });
+        let _scope = BeforeDropHookScope;
+        action();
+    }
+
+    /// Consumes the matching hook before invoking it without a thread-local borrow.
+    pub(super) fn run_before_drop_hook(owner: PoolIdentity) {
+        // Owner teardown can also run after thread-local storage has been destroyed.
+        let hook = BEFORE_DROP_HOOK
+            .try_with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.as_ref().is_some_and(|(target, _)| *target == owner) {
+                    slot.take()
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .flatten();
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
+
+    /// Purpose: Access a quiescent owner's value through a shared guard.
+    /// Expected: Owner and guard expose the same value at a stable address.
     #[test]
     fn test_quiescent_guard_deref_and_as_ptr() {
         let owner = QuiescentBox::new(String::from("hello"));
@@ -342,6 +398,8 @@ mod tests {
         assert_eq!(guard.as_ptr(), owner_ptr);
     }
 
+    /// Purpose: Clone direct guards without changing their target allocation.
+    /// Expected: Clones share a pointer and each retains one owner keepalive.
     #[test]
     fn test_quiescent_guard_clone_keeps_same_pointer() {
         let owner = QuiescentBox::new(vec![1u64, 2, 3, 4]);
@@ -361,6 +419,8 @@ mod tests {
         assert_eq!(owner.outstanding_guard_count(), 0);
     }
 
+    /// Purpose: Transfer guards for a Sync value across threads.
+    /// Expected: Every thread reads the same value at the owner's stable address.
     #[test]
     fn test_quiescent_guard_is_send_for_sync_types() {
         let owner = QuiescentBox::new(vec![1u64, 2, 3, 4]);
@@ -378,6 +438,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject guard acquisition beyond the supported count limit.
+    /// Expected: Acquisition panics without changing the prior guard count.
     #[test]
     fn test_quiescent_guard_overflow_panics_without_mutating_count() {
         let owner = QuiescentBox::new(7u64);
@@ -391,6 +453,8 @@ mod tests {
         inner.guard_count.store(0, Ordering::Relaxed);
     }
 
+    /// Purpose: Retain an owned value while its last direct guard is outstanding.
+    /// Expected: The selected owner's wait precedes destruction until the guard is released.
     #[test]
     fn test_quiescent_box_drop_waits_for_last_guard() {
         let dropped = Arc::new(AtomicBool::new(false));
@@ -401,8 +465,23 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(owner);
+            let reached = Arc::new(AtomicBool::new(false));
+            let reached_for_hook = Arc::clone(&reached);
+            with_before_drop_hook(
+                owner.owner_identity(),
+                move || {
+                    reached_for_hook.store(true, Ordering::Release);
+                    started_tx.send(()).unwrap();
+                },
+                || {
+                    drop(QuiescentBox::new(()));
+                    assert!(
+                        !reached.load(Ordering::Acquire),
+                        "unrelated owner must not trigger the drop hook"
+                    );
+                    drop(owner);
+                },
+            );
             done_tx.send(()).unwrap();
         });
 
@@ -417,6 +496,8 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Purpose: Retain an owned value while a cloned direct guard remains on another thread.
+    /// Expected: Releasing the original guard does not permit destruction before its clone drains.
     #[test]
     fn test_quiescent_box_drop_waits_for_all_guard_clones() {
         let dropped = Arc::new(AtomicBool::new(false));
@@ -452,6 +533,8 @@ mod tests {
         owner_handle.join().unwrap();
     }
 
+    /// Purpose: Retain an owner through cloned sync guard wrappers.
+    /// Expected: Teardown completes only after the last wrapper releases its shared keepalive.
     #[test]
     fn test_quiescent_box_drop_waits_for_last_sync_guard_wrapper() {
         let owner = QuiescentBox::new(());
@@ -483,6 +566,8 @@ mod tests {
         owner_handle.join().unwrap();
     }
 
+    /// Purpose: Clone sync wrappers without acquiring additional direct guards.
+    /// Expected: Wrapper clones share one owner keepalive throughout their lifetime.
     #[test]
     fn test_sync_quiescent_guard_clones_do_not_touch_guard_count() {
         let owner = QuiescentBox::new(());
@@ -518,6 +603,8 @@ mod tests {
         drop(owner);
     }
 
+    /// Purpose: Create independent sync guard roots for one owner.
+    /// Expected: Each root owns a separate keepalive while its clones share the root.
     #[test]
     fn test_sync_quiescent_guard_fresh_roots_shard_outer_arc() {
         let owner = QuiescentBox::new(());

@@ -201,6 +201,7 @@ fn pool_guard_identity_mismatch(
 mod tests {
     use super::*;
     use crate::quiescent::{QuiescentBox, test_sync_guards_share_root};
+    use std::array::from_fn;
     use std::panic::catch_unwind;
 
     /// Returns whether two guards update the same keepalive `Arc` root.
@@ -214,12 +215,28 @@ mod tests {
         PoolGuard::new(owner.owner_identity(), owner.guard().into_sync())
     }
 
+    fn configured_guards() -> (PoolGuards, [PoolGuard; 4]) {
+        let supplied = from_fn(|_| test_guard());
+        let [meta, index, mem, disk] = &supplied;
+        let guards = PoolGuards::builder()
+            .push(PoolRole::Meta, meta.clone())
+            .push(PoolRole::Index, index.clone())
+            .push(PoolRole::Mem, mem.clone())
+            .push(PoolRole::Disk, disk.clone())
+            .build();
+        (guards, supplied)
+    }
+
+    /// Purpose: Allow a partial guard set with no configured pools.
+    /// Expected: Optional lookup returns no guard for an absent role.
     #[test]
     fn test_pool_guards_builder_empty_builds_partial() {
         let guards = PoolGuards::builder().build();
         assert!(guards.try_guard(PoolRole::Meta).is_none());
     }
 
+    /// Purpose: Prevent ambiguous ownership within a guard set.
+    /// Expected: Adding the same pool role twice triggers an assertion.
     #[test]
     fn test_pool_guards_builder_rejects_duplicate_role() {
         let result = catch_unwind(|| {
@@ -231,18 +248,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Purpose: Route optional guard lookup by pool role.
+    /// Expected: Each role resolves to its independently supplied pool identity.
     #[test]
     fn test_pool_guards_try_guard_matches_named_role() {
-        let meta_guard = test_guard();
-        let index_guard = test_guard();
-        let mem_guard = test_guard();
-        let disk_guard = test_guard();
-        let guards = PoolGuards::builder()
-            .push(PoolRole::Meta, meta_guard.clone())
-            .push(PoolRole::Index, index_guard.clone())
-            .push(PoolRole::Mem, mem_guard.clone())
-            .push(PoolRole::Disk, disk_guard.clone())
-            .build();
+        let (guards, [meta_guard, index_guard, mem_guard, disk_guard]) = configured_guards();
         assert_eq!(
             guards.try_guard(PoolRole::Meta).map(PoolGuard::identity),
             Some(meta_guard.identity())
@@ -261,20 +271,19 @@ mod tests {
         );
     }
 
+    /// Purpose: Route named guard accessors to their configured pools.
+    /// Expected: Each named accessor returns the identity supplied for that role.
     #[test]
     fn test_pool_guards_named_getters_return_configured_slots() {
-        let guards = PoolGuards::builder()
-            .push(PoolRole::Meta, test_guard())
-            .push(PoolRole::Index, test_guard())
-            .push(PoolRole::Mem, test_guard())
-            .push(PoolRole::Disk, test_guard())
-            .build();
-        let _ = guards.meta_guard();
-        let _ = guards.index_guard();
-        let _ = guards.mem_guard();
-        let _ = guards.disk_guard();
+        let (guards, [meta, index, mem, disk]) = configured_guards();
+        assert_eq!(guards.meta_guard().identity(), meta.identity());
+        assert_eq!(guards.index_guard().identity(), index.identity());
+        assert_eq!(guards.mem_guard().identity(), mem.identity());
+        assert_eq!(guards.disk_guard().identity(), disk.identity());
     }
 
+    /// Purpose: Restrict row guard lookup to the corresponding row pool role.
+    /// Expected: Metadata and memory row roles resolve to their supplied identities.
     #[test]
     fn test_pool_guards_try_row_guard_uses_named_row_role() {
         let meta_guard = test_guard();
@@ -297,6 +306,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject the sentinel role when constructing a guard set.
+    /// Expected: The invalid role triggers the builder assertion.
     #[test]
     #[should_panic(expected = "invalid pool role in pool guards builder")]
     fn test_pool_guards_builder_rejects_invalid_role() {
@@ -305,6 +316,8 @@ mod tests {
             .build();
     }
 
+    /// Purpose: Require a configured metadata guard for mandatory lookup.
+    /// Expected: An absent metadata slot triggers the missing-guard assertion.
     #[test]
     #[should_panic(expected = "missing meta pool guard")]
     fn test_pool_guards_meta_guard_panics_when_slot_missing() {
@@ -312,6 +325,8 @@ mod tests {
         let _ = guards.meta_guard();
     }
 
+    /// Purpose: Enforce pool identity when validating a guard.
+    /// Expected: A mismatched identity triggers the ownership assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_pool_guard_assert_matches_panics_on_identity_mismatch() {

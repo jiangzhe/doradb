@@ -7,7 +7,7 @@
 
 | module | files | unsafe | transmute | new_unchecked | assume_init | // SAFETY: |
 |---|---:|---:|---:|---:|---:|---:|
-| buffer | 13 | 54 | 0 | 0 | 0 | 48 |
+| buffer | 13 | 51 | 0 | 0 | 0 | 45 |
 | latch | 5 | 36 | 0 | 0 | 0 | 32 |
 | row | 4 | 6 | 0 | 0 | 0 | 6 |
 | index | 22 | 12 | 0 | 0 | 3 | 12 |
@@ -17,7 +17,7 @@
 | file | 8 | 11 | 0 | 0 | 2 | 11 |
 | log | 6 | 0 | 0 | 0 | 0 | 0 |
 | recovery | 8 | 0 | 0 | 0 | 0 | 0 |
-| **total** | **90** | **152** | **0** | **0** | **6** | **137** |
+| **total** | **90** | **149** | **0** | **0** | **6** | **134** |
 
 ## File Hotspots (top 40)
 
@@ -28,9 +28,9 @@
 | `doradb-storage/src/latch/mutex.rs` | latch | 12 | 11 |
 | `doradb-storage/src/buffer/util.rs` | buffer | 10 | 5 |
 | `doradb-storage/src/buffer/arena.rs` | buffer | 9 | 9 |
-| `doradb-storage/src/buffer/evict.rs` | buffer | 9 | 9 |
 | `doradb-storage/src/io/libaio_backend.rs` | io | 8 | 8 |
 | `doradb-storage/src/trx/undo/row.rs` | trx | 7 | 6 |
+| `doradb-storage/src/buffer/evict.rs` | buffer | 6 | 6 |
 | `doradb-storage/src/file/mod.rs` | file | 6 | 6 |
 | `doradb-storage/src/latch/hybrid.rs` | latch | 6 | 6 |
 | `doradb-storage/src/row/mod.rs` | row | 6 | 6 |

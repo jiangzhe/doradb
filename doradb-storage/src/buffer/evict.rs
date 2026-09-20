@@ -1875,7 +1875,7 @@ pub(crate) mod tests {
     use crate::buffer::test_page_id;
     use crate::buffer::{EvictionArbiterBuilder, FixedBufferPool};
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
-    use crate::component::RegistryBuilder;
+    use crate::component::{Component, RegistryBuilder};
     use crate::conf::{EngineConfig, FileSystemConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::FatalError;
@@ -1892,7 +1892,7 @@ pub(crate) mod tests {
     };
     use crate::id::RowID;
     use crate::io::BackendError;
-    use crate::quiescent::{QuiescentBox, QuiescentGuard};
+    use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
     use crate::row::RowPage;
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::ValKind;
@@ -1906,7 +1906,8 @@ pub(crate) mod tests {
     use std::slice::from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{Context, Poll};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1917,6 +1918,15 @@ pub(crate) mod tests {
     const TEST_READONLY_BUFFER_BYTES: usize = 32 * 1024 * 1024;
     const TEST_WAIT_RETRIES: usize = 100;
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     struct StartedEvictPool {
         engine: Engine,
@@ -2220,6 +2230,79 @@ pub(crate) mod tests {
         assert_eq!(failure.op(), "submit");
     }
 
+    fn build_default_raw_pool_for_test(
+        data_swap_file: PathBuf,
+    ) -> (QuiescentBox<FileSystem>, EvictableBufferPool, SparseFile) {
+        build_raw_pool_for_test(
+            EvictableBufferPoolConfig::default()
+                .swap_file(data_swap_file)
+                .max_mem_size(64usize * 1024 * 1024)
+                .max_file_size(128usize * 1024 * 1024),
+        )
+        .unwrap()
+    }
+
+    fn assert_failed_reload_reclaimed(pool: &EvictableBufferPool, page_id: PageID) {
+        assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
+        assert_eq!(pool.in_mem.count.load(Ordering::Acquire), 0);
+        assert_eq!(pool.inflight_io.reads.load(Ordering::Relaxed), 0);
+        assert!(
+            !pool.inflight_io.contains(page_id),
+            "reload {page_id} must drain"
+        );
+    }
+
+    fn assert_failed_writeback_restored(pool: &EvictableBufferPool, page_id: PageID) {
+        let frame = pool.arena.frame(page_id);
+        assert_eq!(frame.kind(), FrameKind::Hot);
+        assert!(
+            frame.is_dirty(),
+            "failed writeback {page_id} must remain dirty"
+        );
+        assert_eq!(pool.inflight_io.writes.load(Ordering::Relaxed), 0);
+        assert!(
+            !pool.inflight_io.contains(page_id),
+            "writeback {page_id} must drain"
+        );
+    }
+
+    fn assert_writeback_io_error(error: CompletionErrorBridge) {
+        let report = error.into_runtime_or_fatal(RuntimeError::BufferPageAccess);
+        let RuntimeOrFatalError::Runtime(report) = report else {
+            panic!("expected Runtime error, got {report:?}");
+        };
+        assert_eq!(report.current_context(), &RuntimeError::BufferPageAccess);
+        assert_eq!(
+            report.downcast_ref::<IoError>().copied().map(IoError::kind),
+            Some(StdIoError::from_raw_os_error(libc::EIO).kind())
+        );
+    }
+
+    fn unchecked_writeback_submission_for_test(
+        state_machine: &EvictablePoolStateMachine,
+        mut page_guard: PageExclusiveGuard<Page>,
+    ) -> EvictSubmission {
+        // Bypass preparation only for tests of broken inflight ownership, so
+        // the owning completion assertion remains the panic oracle.
+        let page_id = page_guard.page_id();
+        // SAFETY: the pointer covers one live arena page and the returned
+        // submission retains its exclusive guard until completion or drop.
+        let operation = unsafe {
+            Operation::pwrite_borrowed(
+                state_machine.file.as_raw_fd(),
+                usize::from(page_id) * PAGE_SIZE,
+                page_guard.page_mut() as *mut Page as *mut u8,
+                PAGE_SIZE,
+            )
+        };
+        EvictSubmission::Write(PageIO {
+            block_key: state_machine.block_key(page_id),
+            operation,
+            page_guard,
+            batch_done: None,
+        })
+    }
+
     fn build_state_machine_for_test(
         data_swap_file: PathBuf,
     ) -> (
@@ -2227,13 +2310,7 @@ pub(crate) mod tests {
         QuiescentBox<EvictableBufferPool>,
         EvictablePoolStateMachine,
     ) {
-        let (fs_owner, pool, storage) = build_raw_pool_for_test(
-            EvictableBufferPoolConfig::default()
-                .swap_file(data_swap_file)
-                .max_mem_size(64u64 * 1024 * 1024)
-                .max_file_size(128u64 * 1024 * 1024),
-        )
-        .unwrap();
+        let (fs_owner, pool, storage) = build_default_raw_pool_for_test(data_swap_file);
         let owner = QuiescentBox::new(pool);
         let state_machine = EvictablePoolStateMachine {
             pool: owner.guard().into_sync(),
@@ -2315,32 +2392,73 @@ pub(crate) mod tests {
         Ok((fs_owner, pool, storage))
     }
 
+    async fn assert_invalid_swap_path<C>(
+        config: EvictableBufferPoolConfig,
+        expected_field: &str,
+        expected_role: &str,
+    ) where
+        C: Component<Config = EvictableBufferPoolConfig, Error = Report<RuntimeError>>,
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let mut builder = RegistryBuilder::new();
+        builder
+            .build::<FileSystem>(
+                FileSystemConfig::default()
+                    .data_dir(temp_dir.path())
+                    .validate()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let err = builder.build::<C>(config).await.unwrap_err();
+        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+        assert_eq!(
+            err.downcast_ref::<ConfigError>().copied(),
+            Some(ConfigError::PathMustUseRequiredSuffix)
+        );
+        let output = format!("{err:?}");
+        assert!(output.contains(expected_field), "{}: {output}", C::NAME);
+        assert!(output.contains(expected_role), "{}: {output}", C::NAME);
+    }
+
+    fn assert_mem_pool_init_error(
+        config: EvictableBufferPoolConfig,
+        fs: QuiescentGuard<FileSystem>,
+    ) -> Report<RuntimeError> {
+        let err = match EvictableBufferPool::create(PoolRole::Mem, config, fs) {
+            Ok(_) => panic!("invalid memory-pool configuration should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+        let output = format!("{err:?}");
+        assert!(
+            output.contains("buffer_pool_type=evictable, buffer_pool_role=mem"),
+            "{output}"
+        );
+        err
+    }
+
+    /// Purpose: Allow repeated shutdown before evictable-pool workers start.
+    /// Expected: Repeated shutdown completes and leaves the pool shut down.
     #[test]
     fn test_evictable_buffer_pool_shutdown_is_idempotent_before_workers_start() {
         let temp_dir = TempDir::new().unwrap();
-        let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-            EvictableBufferPoolConfig::default()
-                .swap_file(temp_dir.path().join("data.swp"))
-                .max_mem_size(64u64 * 1024 * 1024)
-                .max_file_size(128u64 * 1024 * 1024),
-        )
-        .unwrap();
+        let (_fs_owner, pool, _storage) =
+            build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
 
         pool.signal_shutdown();
         pool.signal_shutdown();
+        assert!(pool.shutdown_flag.load(Ordering::Acquire));
     }
 
+    /// Purpose: Reject evictable-page reservations after shutdown.
+    /// Expected: The failure retains the shutdown lifecycle context and pool diagnostics.
     #[test]
     fn test_evictable_reserve_page_reports_shutdown_as_lifecycle() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
 
             pool.signal_shutdown();
             let err = pool
@@ -2355,17 +2473,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Report shutdown through the page-allocation boundary.
+    /// Expected: The runtime allocation report preserves its lifecycle cause and pool context.
     #[test]
     fn test_evictable_allocate_page_stacks_runtime_over_shutdown() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = pool.create_base_guard();
 
             pool.signal_shutdown();
@@ -2388,27 +2503,30 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Release a reservation blocked on capacity when shutdown begins.
+    /// Expected: The pending reservation wakes and returns the shutdown lifecycle error.
     #[test]
     fn test_evictable_reserve_page_waiter_wakes_with_lifecycle_shutdown() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             for _ in 0..pool.in_mem.max_count {
                 assert!(pool.in_mem.try_inc());
             }
 
             let mut reservation = Box::pin(pool.reserve_page());
-            let waker = noop_waker();
+            let wake = Arc::new(WakeFlag::default());
+            let waker = Waker::from(Arc::clone(&wake));
             let mut cx = Context::from_waker(&waker);
             assert!(matches!(reservation.as_mut().poll(&mut cx), Poll::Pending));
+            wake.0.store(false, Ordering::SeqCst);
 
             pool.signal_shutdown();
+            assert!(
+                wake.0.load(Ordering::SeqCst),
+                "shutdown must wake the reservation"
+            );
             let err = reservation
                 .await
                 .expect_err("shutdown should wake a blocked reservation");
@@ -2416,6 +2534,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Settle queued evictable I/O when the backend fails before preparation.
+    /// Expected: Readers and writers retain the fatal cause while reservations and inflight state are cleaned up.
     #[test]
     fn test_evictable_pool_backend_failure_fails_not_submitted_read_and_write() {
         smol::block_on(async {
@@ -2430,21 +2550,18 @@ pub(crate) mod tests {
                 make_reload_submission_for_test(&owner, &pool_guard, read_page_id, |_| {});
             state_machine.fail_request_with_fatal(PoolRequest::Read(read_req), &err);
             assert_backend_page_completion_error(&read_completion, &err);
-            assert_eq!(owner.arena.frame(read_page_id).kind(), FrameKind::Evicted);
-            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
-            assert_eq!(owner.inflight_io.reads.load(Ordering::Relaxed), 0);
-            assert!(!owner.inflight_io.map.lock().contains_key(&read_page_id));
+            assert_failed_reload_reclaimed(&owner, read_page_id);
 
             let (write_req, write_completion, write_page_id) =
                 make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
             state_machine.fail_request_with_fatal(write_req, &err);
             assert_backend_page_completion_error(&write_completion, &err);
-            assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
-            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
-            assert!(!owner.inflight_io.map.lock().contains_key(&write_page_id));
+            assert_failed_writeback_restored(&owner, write_page_id);
         });
     }
 
+    /// Purpose: Settle prepared evictable I/O after a backend failure.
+    /// Expected: Fatal completion restores frame state and releases the unsubmitted work.
     #[test]
     fn test_evictable_pool_backend_failure_fails_prepared_submissions() {
         smol::block_on(async {
@@ -2462,8 +2579,7 @@ pub(crate) mod tests {
             let kind = state_machine.fail_submission_with_fatal(read_sub, &err);
             assert_eq!(kind, StorageIOKind::Read);
             assert_backend_page_completion_error(&read_completion, &err);
-            assert_eq!(owner.arena.frame(read_page_id).kind(), FrameKind::Evicted);
-            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
+            assert_failed_reload_reclaimed(&owner, read_page_id);
 
             let (write_req, write_completion, write_page_id) =
                 make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
@@ -2471,11 +2587,12 @@ pub(crate) mod tests {
             let kind = state_machine.fail_submission_with_fatal(write_sub, &err);
             assert_eq!(kind, StorageIOKind::Write);
             assert_backend_page_completion_error(&write_completion, &err);
-            assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
-            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
+            assert_failed_writeback_restored(&owner, write_page_id);
         });
     }
 
+    /// Purpose: Settle submitted evictable I/O after a backend failure.
+    /// Expected: Fatal completion clears inflight state while read memory remains owned until submission release.
     #[test]
     fn test_evictable_pool_backend_failure_fails_submitted_read_and_write() {
         smol::block_on(async {
@@ -2498,8 +2615,7 @@ pub(crate) mod tests {
             assert!(!owner.inflight_io.map.lock().contains_key(&read_page_id));
             assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 1);
             drop(read_sub);
-            assert_eq!(owner.in_mem.count.load(Ordering::Acquire), 0);
-            assert_eq!(owner.arena.frame(read_page_id).kind(), FrameKind::Evicted);
+            assert_failed_reload_reclaimed(&owner, read_page_id);
 
             let (write_req, write_completion, write_page_id) =
                 make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
@@ -2508,14 +2624,14 @@ pub(crate) mod tests {
             let kind = state_machine.fail_submitted_with_fatal(&mut write_sub, &err);
             assert_eq!(kind, StorageIOKind::Write);
             assert_backend_page_completion_error(&write_completion, &err);
-            assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
-            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
-            assert!(!owner.inflight_io.map.lock().contains_key(&write_page_id));
+            assert_failed_writeback_restored(&owner, write_page_id);
             drop(write_sub);
             assert_eq!(owner.arena.frame(write_page_id).kind(), FrameKind::Hot);
         });
     }
 
+    /// Purpose: Protect evictable-pool allocation, slot reuse, and parent-child coupling.
+    /// Expected: Live identities remain accessible while reused identities and invalidated parents are rejected.
     #[test]
     fn test_evict_buffer_pool_simple() {
         smol::block_on(async {
@@ -2624,7 +2740,8 @@ pub(crate) mod tests {
                         LatchFallbackMode::Exclusive,
                     )
                     .await;
-                let c = c.unwrap();
+                let c = c.unwrap().unwrap();
+                assert_eq!(c.page_id(), test_page_id(1));
                 drop(c);
             }
             {
@@ -2659,6 +2776,8 @@ pub(crate) mod tests {
         })
     }
 
+    /// Purpose: Recheck frame initialization after a versioned lookup waits for a latch.
+    /// Expected: A deinitialized frame is absent even when its generation has not changed.
     #[test]
     fn test_get_page_versioned_treats_same_generation_deinit_as_absent() {
         smol::block_on(async {
@@ -2670,7 +2789,7 @@ pub(crate) mod tests {
                     .max_file_size(1024u64 * 1024 * 256),
             );
             let pool_guard = pool.create_base_guard();
-            let page_guard = pool
+            let mut page_guard = pool
                 .allocate_page::<RowPage>(&pool_guard)
                 .await
                 .expect("test page allocation should succeed");
@@ -2683,11 +2802,19 @@ pub(crate) mod tests {
             ));
             assert_pending_once(get_page_versioned.as_mut());
 
-            pool.deallocate_page(page_guard);
+            page_guard.bf_mut().set_kind(FrameKind::Uninitialized);
+            assert_eq!(page_guard.versioned_page_id(), versioned);
+            drop(page_guard);
             assert!(get_page_versioned.await.unwrap().is_none());
+            let page = pool
+                .try_lock_page_exclusive(&pool_guard, versioned.page_id)
+                .unwrap();
+            pool.deallocate_page(page);
         });
     }
 
+    /// Purpose: Reject stale facade and optimistic upgrades in an evictable pool.
+    /// Expected: Generation mismatches prevent stronger access without advancing the latch version.
     #[test]
     fn test_evictable_buffer_pool_guard_upgrades_reject_generation_mismatch() {
         smol::block_on(async {
@@ -2763,17 +2890,14 @@ pub(crate) mod tests {
         })
     }
 
+    /// Purpose: Roll back an unpublished reload reservation.
+    /// Expected: Rollback releases resident capacity and discards the provisional page image.
     #[test]
     fn test_evict_page_reservation_rollback_reclaims_page_memory() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = pool.create_base_guard();
 
             let mut page_guard = pool
@@ -2803,17 +2927,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect spill integrity when preparing dirty-page writeback.
+    /// Expected: Preparation stamps a valid checksum without changing payload bytes.
     #[test]
     fn test_evictable_writeback_preparation_stamps_checksum_trailer() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.create_base_guard();
             let mut state_machine = EvictablePoolStateMachine {
@@ -2857,18 +2978,15 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Access resident row metadata while page-image reload is pending.
+    /// Expected: Metadata becomes available after either reload outcome without initiating another read.
     #[test]
     fn test_row_metadata_waits_for_reload_completion_without_starting_a_read() {
         smol::block_on(async {
             for succeeds in [false, true] {
                 let temp = TempDir::new().unwrap();
-                let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                    EvictableBufferPoolConfig::default()
-                        .swap_file(temp.path().join("data.swp"))
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024),
-                )
-                .unwrap();
+                let (_fs_owner, pool, _storage) =
+                    build_default_raw_pool_for_test(temp.path().join("data.swp"));
                 let owner = QuiescentBox::new(pool);
                 let root = owner.create_base_guard();
                 let page = metadata_test_page(&*owner, &root).await;
@@ -2909,17 +3027,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject corrupt spill reloads while preserving retryability.
+    /// Expected: Corruption releases reservations without publication and a later valid reload succeeds.
     #[test]
     fn test_evictable_reload_rejects_checksum_mismatch_before_publish_and_can_retry() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.create_base_guard();
             let mut page_guard = owner
@@ -2970,17 +3085,14 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Evict a clean page without submitting writeback.
+    /// Expected: The page becomes evicted without queued or inflight writes.
     #[test]
     fn test_clean_evictable_eviction_drops_without_write_or_checksum_stamp() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.create_base_guard();
             let mut page_guard = owner
@@ -3005,82 +3117,36 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Settle current waiters when submitted writeback fails.
+    /// Expected: The I/O cause reaches waiters while the page remains resident and inflight state is cleared.
     #[test]
     fn test_writeback_failure_keeps_page_hot_and_surfaces_error_to_current_waiters() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
-            let owner = QuiescentBox::new(pool);
+            let (_fs_owner, owner, mut state_machine) =
+                build_state_machine_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = owner.create_base_guard();
-            let sync_pool = owner.guard().into_sync();
-            let mut state_machine = EvictablePoolStateMachine {
-                pool: sync_pool,
-                file: storage,
-            };
-
-            let mut page_guard = owner
-                .allocate_page::<Page>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = page_guard.page_id();
-            page_guard.page_mut()[0] = 0xAB;
-            page_guard.bf_mut().set_kind(FrameKind::Evicting);
-
-            let completion = Arc::new(PageIOCompletion::new());
-            {
-                let mut g = owner.inflight_io.map.lock();
-                g.insert(
-                    page_id,
-                    IOStatus {
-                        kind: IOKind::Write,
-                        completion: Some(Arc::clone(&completion)),
-                    },
-                );
-            }
-            owner.inflight_io.writes.store(1, Ordering::Relaxed);
-
-            // SAFETY: the borrowed page pointer refers to one live page-sized arena
-            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
-            let operation = unsafe {
-                Operation::pwrite_borrowed(
-                    state_machine.file.as_raw_fd(),
-                    usize::from(page_id) * PAGE_SIZE,
-                    page_guard.page_mut() as *mut Page as *mut u8,
-                    PAGE_SIZE,
-                )
-            };
-            let kind = state_machine.on_complete(
-                EvictSubmission::Write(PageIO {
-                    block_key: state_machine.block_key(page_id),
-                    operation,
-                    page_guard,
-                    batch_done: None,
-                }),
-                Err(StdIoError::from_raw_os_error(libc::EIO)),
-            );
+            let (request, completion, page_id) =
+                make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
+            let submission = prepare_pool_request_for_test(&mut state_machine, request);
+            state_machine.on_submit(&submission);
+            let mut waiter = Box::pin(completion.wait_result());
+            let wake = Arc::new(WakeFlag::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut cx = Context::from_waker(&waker);
+            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            wake.0.store(false, Ordering::SeqCst);
+            let kind = state_machine
+                .on_complete(submission, Err(StdIoError::from_raw_os_error(libc::EIO)));
 
             assert_eq!(kind, StorageIOKind::Write);
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
-            let report = completion
-                .wait_result()
-                .await
-                .unwrap_err()
-                .into_runtime_or_fatal(RuntimeError::BufferPageAccess);
-            let RuntimeOrFatalError::Runtime(report) = report else {
-                panic!("expected Runtime error, got {report:?}");
-            };
-            assert_eq!(
-                report.downcast_ref::<IoError>().copied().map(IoError::kind),
-                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
+            assert!(
+                wake.0.load(Ordering::SeqCst),
+                "failed writeback must wake its waiter"
             );
-            assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
-            assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
+            assert_writeback_io_error(waiter.await.unwrap_err());
+            assert_failed_writeback_restored(&owner, page_id);
 
             drop(state_machine);
             drop(pool_guard);
@@ -3088,73 +3154,39 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require inflight ownership when writeback completes.
+    /// Expected: Missing write ownership triggers the completion assertion.
     #[test]
     #[should_panic(expected = "inflight write entry missing during completion")]
     fn test_writeback_completion_panics_when_inflight_entry_missing() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
-            let owner = QuiescentBox::new(pool);
+            let (_fs_owner, owner, mut state_machine) =
+                build_state_machine_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = owner.create_base_guard();
-            let mut state_machine = EvictablePoolStateMachine {
-                pool: owner.guard().into_sync(),
-                file: storage,
-            };
 
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
                 .await
                 .expect("test page allocation should succeed");
-            let page_id = page_guard.page_id();
             page_guard.bf_mut().set_dirty(true);
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
-            // SAFETY: the borrowed page pointer refers to one live page-sized arena
-            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
-            let operation = unsafe {
-                Operation::pwrite_borrowed(
-                    state_machine.file.as_raw_fd(),
-                    usize::from(page_id) * PAGE_SIZE,
-                    page_guard.page_mut() as *mut Page as *mut u8,
-                    PAGE_SIZE,
-                )
-            };
+            let submission = unchecked_writeback_submission_for_test(&state_machine, page_guard);
 
-            let _ = state_machine.on_complete(
-                EvictSubmission::Write(PageIO {
-                    block_key: state_machine.block_key(page_id),
-                    operation,
-                    page_guard,
-                    batch_done: None,
-                }),
-                Ok(PAGE_SIZE),
-            );
+            let _ = state_machine.on_complete(submission, Ok(PAGE_SIZE));
         });
     }
 
+    /// Purpose: Require write ownership during failed-writeback cleanup.
+    /// Expected: An incompatible inflight entry triggers the cleanup assertion.
     #[test]
     #[should_panic(expected = "inflight write entry has invalid kind during failure cleanup")]
     fn test_writeback_failure_panics_on_non_write_inflight_entry() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
-            let owner = QuiescentBox::new(pool);
+            let (_fs_owner, owner, mut state_machine) =
+                build_state_machine_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = owner.create_base_guard();
-            let mut state_machine = EvictablePoolStateMachine {
-                pool: owner.guard().into_sync(),
-                file: storage,
-            };
 
             let mut page_guard = owner
                 .allocate_page::<Page>(&pool_guard)
@@ -3173,40 +3205,21 @@ pub(crate) mod tests {
                     },
                 );
             }
-            // SAFETY: the borrowed page pointer refers to one live page-sized arena
-            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
-            let operation = unsafe {
-                Operation::pwrite_borrowed(
-                    state_machine.file.as_raw_fd(),
-                    usize::from(page_id) * PAGE_SIZE,
-                    page_guard.page_mut() as *mut Page as *mut u8,
-                    PAGE_SIZE,
-                )
-            };
+            let submission = unchecked_writeback_submission_for_test(&state_machine, page_guard);
 
-            let _ = state_machine.on_complete(
-                EvictSubmission::Write(PageIO {
-                    block_key: state_machine.block_key(page_id),
-                    operation,
-                    page_guard,
-                    batch_done: None,
-                }),
-                Err(StdIoError::from_raw_os_error(libc::EIO)),
-            );
+            let _ = state_machine
+                .on_complete(submission, Err(StdIoError::from_raw_os_error(libc::EIO)));
         });
     }
 
+    /// Purpose: Settle writeback when dispatch cannot reach the I/O worker.
+    /// Expected: Batch waiters are released and the page remains readable with failed-write accounting.
     #[test]
     fn test_writeback_send_failure_keeps_page_hot_and_wakes_current_waiters() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, _storage) =
+                build_default_raw_pool_for_test(temp_dir.path().join("data.swp"));
             let owner = QuiescentBox::new(pool);
             let pool_guard = owner.create_base_guard();
 
@@ -3249,115 +3262,74 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve page access after writeback reports an I/O failure.
+    /// Expected: Subsequent ordinary and versioned readers can retrieve the retained payload.
     #[test]
     fn test_failed_writeback_leaves_page_accessible_to_future_readers() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
-            let owner = QuiescentBox::new(pool);
+            let (_fs_owner, owner, mut state_machine) =
+                build_state_machine_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = owner.create_base_guard();
-            let mut page_guard = owner
-                .allocate_page::<Page>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = page_guard.page_id();
-            let versioned = page_guard.versioned_page_id();
-            page_guard.page_mut()[0] = 0xAB;
-            page_guard.bf_mut().set_dirty(true);
-            page_guard.bf_mut().set_kind(FrameKind::Evicting);
-
-            let completion = Arc::new(PageIOCompletion::new());
-            {
-                let mut g = owner.inflight_io.map.lock();
-                g.insert(
-                    page_id,
-                    IOStatus {
-                        kind: IOKind::Write,
-                        completion: Some(Arc::clone(&completion)),
-                    },
-                );
-            }
-            owner.inflight_io.writes.store(1, Ordering::Relaxed);
-
-            let mut state_machine = EvictablePoolStateMachine {
-                pool: owner.guard().into_sync(),
-                file: storage,
+            let (request, completion, page_id) =
+                make_dirty_writeback_request_for_test(&owner, &pool_guard).await;
+            let submission = prepare_pool_request_for_test(&mut state_machine, request);
+            state_machine.on_submit(&submission);
+            let versioned = VersionedPageID {
+                page_id,
+                generation: owner.arena.frame(page_id).generation(),
             };
-            // SAFETY: the borrowed page pointer refers to one live page-sized arena
-            // allocation, and this test keeps `page_guard` alive in `PageIO` until completion.
-            let operation = unsafe {
-                Operation::pwrite_borrowed(
-                    state_machine.file.as_raw_fd(),
-                    usize::from(page_id) * PAGE_SIZE,
-                    page_guard.page_mut() as *mut Page as *mut u8,
-                    PAGE_SIZE,
-                )
-            };
-            let kind = state_machine.on_complete(
-                EvictSubmission::Write(PageIO {
-                    block_key: state_machine.block_key(page_id),
-                    operation,
-                    page_guard,
-                    batch_done: None,
-                }),
-                Err(StdIoError::from_raw_os_error(libc::EIO)),
-            );
+            let kind = state_machine
+                .on_complete(submission, Err(StdIoError::from_raw_os_error(libc::EIO)));
             assert_eq!(kind, StorageIOKind::Write);
-            let report = completion
-                .wait_result()
+            assert_writeback_io_error(completion.wait_result().await.unwrap_err());
+            assert_failed_writeback_restored(&owner, page_id);
+            let page = owner
+                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
                 .await
-                .unwrap_err()
-                .into_runtime_or_fatal(RuntimeError::BufferPageAccess);
-            let RuntimeOrFatalError::Runtime(report) = report else {
-                panic!("expected Runtime error, got {report:?}");
-            };
-            assert_eq!(
-                report.downcast_ref::<IoError>().copied().map(IoError::kind),
-                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
-            );
-
-            assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Hot);
-            assert!(
-                owner
-                    .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
-                    .await
-                    .is_ok()
-            );
-            assert!(
-                owner
-                    .get_page_versioned::<Page>(&pool_guard, versioned, LatchFallbackMode::Shared,)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
+                .unwrap()
+                .lock_shared_async()
+                .await
+                .unwrap();
+            assert_eq!(page.page()[0], 0xAB);
+            drop(page);
+            let page = owner
+                .get_page_versioned::<Page>(&pool_guard, versioned, LatchFallbackMode::Shared)
+                .await
+                .unwrap()
+                .unwrap()
+                .lock_shared_async()
+                .await
+                .unwrap();
+            assert_eq!(page.page()[0], 0xAB);
         });
     }
 
+    /// Purpose: Keep a failed-writeback page eligible for later clock eviction.
+    /// Expected: The restored resident page can cool, be selected again, and return to residency.
     #[test]
     fn test_failed_writeback_page_can_retry_eviction_naturally() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let (_fs_owner, pool, _storage) = build_raw_pool_for_test(
-                EvictableBufferPoolConfig::default()
-                    .swap_file(temp_dir.path().join("data.swp"))
-                    .max_mem_size(64u64 * 1024 * 1024)
-                    .max_file_size(128u64 * 1024 * 1024),
-            )
-            .unwrap();
+            let (_fs_owner, pool, mut state_machine) =
+                build_state_machine_for_test(temp_dir.path().join("data.swp"));
             let pool_guard = pool.create_base_guard();
-            let mut page_guard = pool
-                .allocate_page::<Page>(&pool_guard)
-                .await
-                .expect("test page allocation should succeed");
-            let page_id = page_guard.page_id();
-            page_guard.bf_mut().set_kind(FrameKind::Hot);
-            drop(page_guard);
+            let (request, completion, page_id) =
+                make_dirty_writeback_request_for_test(&pool, &pool_guard).await;
+            let submission = prepare_pool_request_for_test(&mut state_machine, request);
+            assert_eq!(
+                state_machine
+                    .on_complete(submission, Err(StdIoError::from_raw_os_error(libc::EIO))),
+                StorageIOKind::Write
+            );
+            let error = completion.wait_result().await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<IoError>().copied().map(IoError::kind),
+                Some(StdIoError::from_raw_os_error(libc::EIO).kind())
+            );
+            assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Hot);
+            assert!(pool.arena.frame(page_id).is_dirty());
+            assert!(!pool.inflight_io.contains(page_id));
 
             let arena_guard = pool.arena.arena_guard(pool_guard.clone());
             assert!(clock_sweep_candidate(&arena_guard, page_id).is_none());
@@ -3366,6 +3338,7 @@ pub(crate) mod tests {
             let page_guard = clock_sweep_candidate(&arena_guard, page_id)
                 .expect("hot page should remain retryable after one cool-down step");
             assert_eq!(page_guard.bf().kind(), FrameKind::Evicting);
+            assert_eq!(page_guard.page()[0], 0xAB);
 
             pool.in_mem.evict_page(page_guard);
             assert_eq!(pool.arena.frame(page_id).kind(), FrameKind::Evicted);
@@ -3383,6 +3356,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reclaim pages while allocation exceeds resident capacity.
+    /// Expected: Allocation and deallocation complete under eviction pressure without leaking allocated slots.
     #[test]
     fn test_evict_buffer_pool_full() {
         // 100 in-mem pages and 200 total pages.
@@ -3408,7 +3383,7 @@ pub(crate) mod tests {
                             .allocate_page::<RowPage>(&pool_guard)
                             .await
                             .expect("test page allocation should succeed");
-                        let _ = tx.send(g.page_id());
+                        tx.send(g.page_id()).unwrap();
                         println!("allocated page {}", i);
                     }
                     drop(tx);
@@ -3416,9 +3391,9 @@ pub(crate) mod tests {
             })
         };
 
-        thread::sleep(Duration::from_millis(50));
-        println!("wait sometime");
+        wait_for(|| pool.allocated() > pool.in_mem.max_count);
         smol::block_on(async {
+            let mut deallocated = 0;
             while let Ok(page_id) = rx.recv() {
                 let g = pool
                     .get_page::<RowPage>(&pool_guard, page_id, LatchFallbackMode::Exclusive)
@@ -3428,13 +3403,18 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 pool.deallocate_page(g);
+                deallocated += 1;
                 println!("deallocated page {}", page_id);
             }
+            assert_eq!(deallocated, 160);
         });
 
         handle1.join().unwrap();
+        assert_eq!(pool.allocated(), 0);
     }
 
+    /// Purpose: Allocate beyond the evictable pool's resident capacity.
+    /// Expected: Distinct logical pages remain allocated while resident usage stays within its limit.
     #[test]
     fn test_evict_buffer_pool_alloc() {
         // max pages 16k, max in-mem 1k
@@ -3461,10 +3441,16 @@ pub(crate) mod tests {
                     .expect("test page allocation should succeed");
                 pages.push(g.page_id());
             }
-            debug_assert!(pages.len() == 2048);
+            let unique_pages: BTreeSet<_> = pages.iter().copied().collect();
+            assert_eq!(unique_pages.len(), 2048);
+            assert_eq!(pool.allocated(), 2048);
+            assert!(pool.allocated() > pool.in_mem.max_count);
+            assert!(pool.in_mem.count.load(Ordering::Acquire) <= pool.in_mem.max_count);
         });
     }
 
+    /// Purpose: Start the workers needed for spill and reload in an engine-owned pool.
+    /// Expected: An evicted page reloads with its original payload.
     #[test]
     fn test_evictable_buffer_pool_started_scope_starts_workers_for_eviction_and_reload() {
         smol::block_on(async {
@@ -3504,6 +3490,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep evictable-pool storage alive while a page guard is outstanding.
+    /// Expected: Owner teardown waits for the last guard to be released.
     #[test]
     fn test_evictable_buffer_pool_drop_waits_for_outstanding_guard() {
         smol::block_on(async {
@@ -3522,28 +3510,43 @@ pub(crate) mod tests {
                     .await
                     .expect("test page allocation should succeed")
             };
-            let dropped = Arc::new(AtomicBool::new(false));
-            let dropped_flag = Arc::clone(&dropped);
-
+            let (started_tx, started_rx) = mpsc::channel();
+            let (dropped_tx, dropped_rx) = mpsc::channel();
+            let arena_identity = pool.arena.identity();
             let handle = thread::spawn(move || {
-                drop(pool);
-                dropped_flag.store(true, Ordering::SeqCst);
+                test_with_before_drop_hook(
+                    arena_identity,
+                    move || started_tx.send(()).unwrap(),
+                    || drop(pool),
+                );
+                dropped_tx.send(()).unwrap();
             });
 
-            thread::sleep(Duration::from_millis(50));
-            assert!(!dropped.load(Ordering::SeqCst));
+            started_rx.recv().unwrap();
+            // The arena owner has reached its guard wait; releasing the page
+            // guard is the only progress predicate for this negative assertion.
+            assert_eq!(
+                dropped_rx.recv_timeout(Duration::from_millis(50)),
+                Err(RecvTimeoutError::Timeout)
+            );
             assert_eq!(guard.page_id(), 0);
 
             drop(guard);
             handle.join().unwrap();
-            assert!(dropped.load(Ordering::SeqCst));
+            dropped_rx.recv().unwrap();
         });
     }
 
+    /// Purpose: Preserve page contents under concurrent allocation and randomized reads.
+    /// Expected: Every worker retrieves its own payloads successfully while allocation exceeds resident capacity.
     #[test]
     fn test_evict_buffer_pool_multi_threads() {
-        use rand::{RngExt, prelude::IndexedRandom};
-        // max pages 2k, max in-mem 1k
+        use rand::{RngExt, SeedableRng, prelude::IndexedRandom};
+        use rand_chacha::ChaCha8Rng;
+
+        const SEED: u64 = 0x6275_6666_6572;
+        const THREADS: usize = 10;
+        const PAGES_PER_THREAD: usize = 200;
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
@@ -3553,74 +3556,60 @@ pub(crate) mod tests {
         );
         let pool_guard = pool.create_base_guard();
 
-        println!(
-            "max_nbr={}, max_nbr_in_mem={}",
-            pool.capacity(),
-            pool.in_mem.max_count
-        );
         let mut handles = vec![];
-        for thread_id in 0..10 {
+        for thread_id in 0..THREADS {
             let pool_guard = pool_guard.clone();
             let pool_ref = pool.owner_guard();
             let handle = thread::spawn(move || {
                 smol::block_on(async {
-                    let mut rng = rand::rng();
-
+                    // Each worker's operation choices and payloads are reproducible;
+                    // thread scheduling and allocated page identifiers may still vary.
+                    let seed = SEED + thread_id as u64;
+                    let mut rng = ChaCha8Rng::seed_from_u64(seed);
                     let mut pages = vec![];
-                    for _ in 0..200 {
-                        // allocate a new page.
-                        println!("thread {} alloc page start", thread_id);
-                        let g = pool_ref
-                            .allocate_page::<RowPage>(&pool_guard)
+                    for page_index in 0..PAGES_PER_THREAD {
+                        let mut payload = [0u8; 16];
+                        payload[..8].copy_from_slice(&(thread_id as u64).to_le_bytes());
+                        payload[8..].copy_from_slice(&(page_index as u64).to_le_bytes());
+                        let mut page = pool_ref
+                            .allocate_page::<Page>(&pool_guard)
                             .await
                             .expect("test page allocation should succeed");
-                        pages.push(g.page_id());
-                        println!(
-                            "thread {} alloc page end page_id {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
-                            thread_id,
-                            g.page_id(),
-                            pool_ref.allocated(),
-                            pool_ref.in_mem.count.load(Ordering::Relaxed),
-                            pool_ref.in_mem.eviction_arbiter.target_free(),
-                            pool_ref.inflight_io.reads.load(Ordering::Relaxed),
-                            pool_ref.inflight_io.writes.load(Ordering::Relaxed),
-                        );
-                        // unlock the page.
-                        drop(g);
+                        page.page_mut()[..payload.len()].copy_from_slice(&payload);
+                        pages.push((page.page_id(), payload));
+                        drop(page);
+
                         if rng.random_bool(0.3) {
-                            // choose one page and try to lock it.
-                            let page_id = pages.choose(&mut rng).copied().unwrap();
-                            println!(
-                                "thread {} read page {}, allocated {}, in-mem {}, target_free {}, reads {}, writes {}",
-                                thread_id,
-                                page_id,
-                                pool_ref.allocated(),
-                                pool_ref.in_mem.count.load(Ordering::Relaxed),
-                                pool_ref.in_mem.eviction_arbiter.target_free(),
-                                pool_ref.inflight_io.reads.load(Ordering::Relaxed),
-                                pool_ref.inflight_io.writes.load(Ordering::Relaxed),
+                            let (page_id, expected) = pages.choose(&mut rng).copied().unwrap();
+                            let page = pool_ref
+                                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
+                                .await
+                                .unwrap_or_else(|err| {
+                                    panic!("read failed: thread={thread_id}, seed={seed}, step={page_index}, page={page_id}, error={err:?}");
+                                })
+                                .lock_shared_async()
+                                .await
+                                .expect("allocated page must remain valid");
+                            assert_eq!(
+                                &page.page()[..expected.len()],
+                                &expected,
+                                "thread={thread_id}, seed={seed}, step={page_index}, page={page_id}"
                             );
-                            let g = pool_ref
-                                .get_page::<RowPage>(
-                                    &pool_guard,
-                                    page_id,
-                                    LatchFallbackMode::Shared,
-                                )
-                                .await;
-                            println!("thread {} read page {} end", thread_id, page_id);
-                            drop(g);
                         }
                     }
-                    println!("thread {} done", thread_id);
                 })
             });
             handles.push(handle);
         }
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().unwrap();
         }
+        assert_eq!(pool.allocated(), THREADS * PAGES_PER_THREAD);
+        assert!(pool.allocated() > pool.in_mem.max_count);
     }
 
+    /// Purpose: Apply custom eviction settings to the evictable pool.
+    /// Expected: The configured thresholds, failure window, and batch policy govern eviction decisions.
     #[test]
     fn test_evict_buffer_pool_uses_custom_arbiter_builder() {
         let temp_dir = TempDir::new().unwrap();
@@ -3662,6 +3651,8 @@ pub(crate) mod tests {
         assert_eq!(decision.batch_size, 3);
     }
 
+    /// Purpose: Enforce evictable-pool ownership on page lookup.
+    /// Expected: A foreign pool guard triggers the identity assertion.
     #[test]
     #[should_panic(expected = "pool guard identity mismatch")]
     fn test_evictable_buffer_pool_panics_on_foreign_guard() {
@@ -3696,69 +3687,33 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Identify invalid data-swap paths during memory-pool construction.
+    /// Expected: The runtime initialization report retains the configuration cause and data-pool diagnostics.
     #[test]
     fn test_evictable_buffer_pool_build_reports_data_swap_file_label() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let mut builder = RegistryBuilder::new();
-            builder
-                .build::<FileSystem>(
-                    FileSystemConfig::default()
-                        .data_dir(temp_dir.path())
-                        .validate()
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let err = builder
-                .build::<MemPool>(EvictableBufferPoolConfig::default().swap_file("data.bin"))
-                .await
-                .unwrap_err();
-            assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
-            assert_eq!(
-                err.downcast_ref::<ConfigError>().copied(),
-                Some(ConfigError::PathMustUseRequiredSuffix)
-            );
-            let output = format!("{err:?}");
-            assert!(output.contains("config_field=data_swap_file, path=data.bin"));
-            assert!(output.contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
-        });
+        smol::block_on(assert_invalid_swap_path::<MemPool>(
+            EvictableBufferPoolConfig::default().swap_file("data.bin"),
+            "config_field=data_swap_file, path=data.bin",
+            "buffer_pool_type=evictable, buffer_pool_role=mem",
+        ));
     }
 
+    /// Purpose: Identify invalid index-swap paths during index-pool construction.
+    /// Expected: The runtime initialization report retains the configuration cause and index-pool diagnostics.
     #[test]
     fn test_evictable_buffer_pool_build_reports_index_swap_file_label() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let mut builder = RegistryBuilder::new();
-            builder
-                .build::<FileSystem>(
-                    FileSystemConfig::default()
-                        .data_dir(temp_dir.path())
-                        .validate()
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let err = builder
-                .build::<IndexPool>(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(TEST_INDEX_POOL_BYTES)
-                        .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
-                        .swap_file("index.bin"),
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
-            assert_eq!(
-                err.downcast_ref::<ConfigError>().copied(),
-                Some(ConfigError::PathMustUseRequiredSuffix)
-            );
-            let output = format!("{err:?}");
-            assert!(output.contains("config_field=index_swap_file, path=index.bin"));
-            assert!(output.contains("buffer_pool_type=evictable, buffer_pool_role=index"));
-        });
+        smol::block_on(assert_invalid_swap_path::<IndexPool>(
+            EvictableBufferPoolConfig::default()
+                .max_mem_size(TEST_INDEX_POOL_BYTES)
+                .max_file_size(TEST_INDEX_MAX_FILE_BYTES)
+                .swap_file("index.bin"),
+            "config_field=index_swap_file, path=index.bin",
+            "buffer_pool_type=evictable, buffer_pool_role=index",
+        ));
     }
 
+    /// Purpose: Preserve capacity failures during evictable-pool initialization.
+    /// Expected: The runtime report retains the resource cause and pool identity.
     #[test]
     fn test_evictable_buffer_pool_build_retains_resource_error_under_runtime() {
         let temp_dir = TempDir::new().unwrap();
@@ -3767,19 +3722,15 @@ pub(crate) mod tests {
             .swap_file(temp_dir.path().join("data.swp"))
             .max_mem_size(1024usize * 1024)
             .max_file_size(2usize * 1024 * 1024);
-        let err = match EvictableBufferPool::create(PoolRole::Mem, config, fs_owner.guard()) {
-            Ok(_) => panic!("undersized evictable buffer pool should fail"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+        let err = assert_mem_pool_init_error(config, fs_owner.guard());
         assert_eq!(
             err.downcast_ref::<ResourceError>().copied(),
             Some(ResourceError::BufferPoolSizeTooSmall)
         );
-        assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
     }
 
+    /// Purpose: Preserve swap-file failures during evictable-pool initialization.
+    /// Expected: The runtime report retains the filesystem cause and pool identity.
     #[test]
     fn test_evictable_buffer_pool_build_retains_io_error_under_runtime() {
         let temp_dir = TempDir::new().unwrap();
@@ -3789,19 +3740,15 @@ pub(crate) mod tests {
             .swap_file(swap_file)
             .max_mem_size(32usize * 1024 * 1024)
             .max_file_size(64usize * 1024 * 1024);
-        let err = match EvictableBufferPool::create(PoolRole::Mem, config, fs_owner.guard()) {
-            Ok(_) => panic!("swap file with a missing parent should fail"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.current_context(), &RuntimeError::BufferPoolInit);
+        let err = assert_mem_pool_init_error(config, fs_owner.guard());
         assert_eq!(
             err.downcast_ref::<IoError>().copied().map(IoError::kind),
             Some(IoErrorKind::NotFound)
         );
-        assert!(format!("{err:?}").contains("buffer_pool_type=evictable, buffer_pool_role=mem"));
     }
 
+    /// Purpose: Apply the row-metadata identity contract to both row-pool implementations.
+    /// Expected: Valid metadata respects row bounds while stale lookups fail without recording page reads.
     #[test]
     fn test_row_metadata_fixed_and_evictable_pool_identity() {
         smol::block_on(async {
@@ -3818,6 +3765,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep row metadata accessible independently of page residency.
+    /// Expected: Metadata access survives writeback without changing residency, dirty state, or I/O accounting.
     #[test]
     fn test_row_metadata_preserves_cool_evicted_and_writeback_state() {
         smol::block_on(async {
