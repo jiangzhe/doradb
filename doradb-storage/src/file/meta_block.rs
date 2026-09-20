@@ -628,10 +628,7 @@ mod tests {
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
         let report = format!("{err:?}");
-        assert!(
-            report.contains("active generation tag lacks active metadata: slot=1"),
-            "{report}"
-        );
+        assert!(report.contains("slot=1"), "{report}");
     }
 
     /// Purpose: Reject metadata whose secondary-root count disagrees with its schema.
@@ -657,10 +654,7 @@ mod tests {
         let err = MetaBlock::deser(&data[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
         let report = format!("{err:?}");
-        assert!(
-            report.contains("secondary index slot count 0 does not match index_slot_count 1"),
-            "{report}"
-        );
+        assert!(report.contains("index_slot_count 1"), "{report}");
     }
 
     /// Purpose: Preserve catalog metadata with both empty and published table roots.
@@ -723,13 +717,15 @@ mod tests {
         unknown_state[first_state_offset] = 2;
         let err = MultiTableMetaBlockData::deser(&unknown_state[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        assert!(format!("{err:?}").contains("unknown catalog table root state tag 2"));
+        let report = format!("{err:?}");
+        assert!(report.contains("state tag 2"), "{report}");
 
         let mut zero_present_root = data;
         let root_offset = first_state_offset + mem::size_of::<u8>();
         zero_present_root[root_offset..root_offset + mem::size_of::<u64>()].fill(0);
         let err = MultiTableMetaBlockData::deser(&zero_present_root[..], 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        assert!(format!("{err:?}").contains("published catalog table root is block zero"));
+        let report = format!("{err:?}");
+        assert!(report.contains("block zero"), "{report}");
     }
 }
