@@ -17,9 +17,13 @@ Design and implement the repository-wide follow-up to the unit-test quality audi
 
 ## Deferred From (Optional)
 
+- `docs/tasks/000312-strengthen-storage-test-contracts-and-deduplicate-fixtures.md` (standalone; no parent RFC).
 
 ## Deferral Context (Optional)
 
+- Defer Reason: Task 000312 delivered bounded behavioral checks and fixture deduplication. Repository-wide test architecture, quality auditing, and model/fault infrastructure require separate planning and remain outside that implemented scope.
+- Findings: The task added seeded B-tree and bitpacking checks, explicit hint bounds, observed rwlock wakeups, and normal teardown/reopen verification of rotated redo. Both supported backend suites passed with exactly the four approved timing-test removals. Coverage still includes inline tests, and normal engine reopen does not exercise abrupt process termination or generated fault histories.
+- Direction Hint: Build on the test-only ownership and reproducible local procedures established by task 000312. Define invariant ownership and reliable production-only coverage before introducing broader audit gates; coordinate generators and replay/minimization with backlog 000112 rather than creating a competing framework.
 
 ## Scope Hint
 
