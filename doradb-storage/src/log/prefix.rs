@@ -442,6 +442,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep a ready group without redo behind an unfinished redo group.
+    /// Expected: Neither group drains early; both drain in commit order after the leading write
+    /// finishes.
     #[test]
     fn test_prefix_tracker_preserves_order_with_no_log_groups() {
         let mut tracker = LogPrefixTracker::new();
@@ -474,6 +477,8 @@ mod tests {
         assert!(tracker.is_empty());
     }
 
+    /// Purpose: Release a ready prefix without waiting for a later redo write.
+    /// Expected: The group without redo drains while the unfinished successor remains queued.
     #[test]
     fn test_prefix_tracker_releases_no_log_prefix_without_later_log() {
         let mut tracker = LogPrefixTracker::new();
@@ -491,6 +496,9 @@ mod tests {
         assert_eq!(tracker.len(), 1);
     }
 
+    /// Purpose: Protect commit ordering when a ready prefix contains a failed redo group.
+    /// Expected: Only the preceding successful groups commit; the failed group and ready successors
+    /// retain the failure.
     #[test]
     fn test_prefix_tracker_stops_at_failed_redo_boundary() {
         let mut tracker = LogPrefixTracker::new();
@@ -520,6 +528,9 @@ mod tests {
         assert_eq!(ready.failed[1].max_cts, TrxID::new(32));
     }
 
+    /// Purpose: Preserve ownership of unfinished work beyond a failed redo boundary.
+    /// Expected: The failure drains without committing transactions, while unfinished successors
+    /// remain queued.
     #[test]
     fn test_prefix_tracker_keeps_unfinished_groups_after_failed_boundary() {
         let mut tracker = LogPrefixTracker::new();
@@ -546,6 +557,9 @@ mod tests {
         assert_eq!(tracker.len(), 1);
     }
 
+    /// Purpose: Preserve prefix identity when drained groups become a front sync barrier.
+    /// Expected: The barrier reuses its prefix identity and later entries remain directly
+    /// addressable.
     #[test]
     fn test_prefix_tracker_front_sync_preserves_o1_id_lookup() {
         let mut tracker = LogPrefixTracker::new();
@@ -573,6 +587,9 @@ mod tests {
         assert_eq!(group.max_cts, TrxID::new(51));
     }
 
+    /// Purpose: Preserve prefix identity across front removal and sparse storage shrinking.
+    /// Expected: Removed identities stay absent, live entries remain addressable, and new
+    /// identities remain monotonic.
     #[test]
     fn test_prefix_tracker_sparse_shrink_preserves_id_lookup() {
         let mut tracker = LogPrefixTracker::new();
@@ -593,7 +610,13 @@ mod tests {
         let cap_before = tracker.entries.capacity();
         assert!(cap_before > tracker.len());
         tracker.shrink_if_sparse(1);
-        assert!(tracker.entries.capacity() <= cap_before);
+        assert!(
+            tracker.entries.capacity() < cap_before,
+            "sparse storage must shrink: before={cap_before}, after={}",
+            tracker.entries.capacity()
+        );
+        assert_eq!(tracker.len(), 8);
+        assert!(tracker.entry_mut(popped_id).is_none());
         assert_eq!(tracker.front_id, live_id);
         assert_eq!(tracker.next_id, LogPrefixId::new(128));
 

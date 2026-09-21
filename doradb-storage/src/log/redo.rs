@@ -817,7 +817,32 @@ mod tests {
     use crate::buffer::test_page_id;
     use crate::catalog::CatalogIndexNo;
     use crate::error::DataIntegrityError;
+    use std::any::type_name;
+    use std::fmt::Debug;
 
+    fn assert_insert_redo(table: &TableDML, row_id: RowID, page_id: PageID, vals: &[Val]) {
+        let row = table.rows.get(&row_id).expect("inserted row must remain");
+        assert_eq!(row.row_id, row_id);
+        let RowRedoKind::Insert(actual_page, actual_vals) = &row.kind else {
+            panic!("expected insert for row {row_id:?}, got {:?}", row.kind);
+        };
+        assert_eq!(*actual_page, page_id, "row {row_id:?}");
+        assert_eq!(actual_vals, vals, "row {row_id:?}");
+    }
+
+    fn assert_invalid_payload<T: Deser + Debug>(bytes: &[u8]) {
+        let err = T::deser(bytes, 0).unwrap_err();
+        assert_eq!(
+            *err.current_context(),
+            DataIntegrityError::InvalidPayload,
+            "decoder={}, bytes={bytes:?}, error={err:?}",
+            type_name::<T>()
+        );
+    }
+
+    /// Purpose: Protect the persisted wire format of catalog mutations addressed by primary key.
+    /// Expected: Delete and update encodings match independently specified bytes for keys and
+    /// mutation data.
     #[test]
     fn test_catalog_keyed_row_redo_golden_bytes() {
         let key = CatalogSelectKey::new(CatalogIndexNo::new(1), vec![Val::U64(11)]);
@@ -864,6 +889,8 @@ mod tests {
         assert_eq!(update_buf.as_slice(), update_expected);
     }
 
+    /// Purpose: Protect catalog key encoding at the index-slot limits.
+    /// Expected: Both boundary slots round-trip without changing the key or redo variant.
     #[test]
     fn test_catalog_keyed_row_redo_slot_bounds() {
         for index_slot in [IndexSlot::new(0), IndexSlot::new(u16::MAX)] {
@@ -880,6 +907,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect per-row mutation folding and table separation in accumulated redo.
+    /// Expected: Updates fold into inserted values, deletes cancel inserts, and different tables
+    /// remain distinct.
     #[test]
     fn test_redo_log_insert_update_delete() {
         let mut redo_logs = RedoLogs::default();
@@ -974,6 +1004,9 @@ mod tests {
         assert_eq!(redo_logs.dml.len(), 2);
     }
 
+    /// Purpose: Protect merging redo collections with shared tables and overlapping rows.
+    /// Expected: Distinct rows survive, later mutations fold into earlier inserts, and empty merges
+    /// preserve state.
     #[test]
     fn test_redo_log_merge() {
         // 创建第一个 RedoLogs
@@ -1011,12 +1044,8 @@ mod tests {
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
         assert_eq!(table1.rows.len(), 2);
-        if let RowRedoKind::Insert(_, vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind {
-            assert_eq!(vals[0], Val::U64(42));
-        }
-        if let RowRedoKind::Insert(_, vals) = &table1.rows.get(&RowID::new(101)).unwrap().kind {
-            assert_eq!(vals[0], Val::U64(44));
-        }
+        assert_insert_redo(table1, RowID::new(100), test_page_id(1), &[Val::U64(42)]);
+        assert_insert_redo(table1, RowID::new(101), test_page_id(1), &[Val::U64(44)]);
 
         // 测试用例3：合并相同表相同行的操作
         let mut redo_logs2 = RedoLogs::default();
@@ -1034,17 +1063,20 @@ mod tests {
 
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
-        if let RowRedoKind::Insert(page_id, vals) = &table1.rows.get(&RowID::new(100)).unwrap().kind
-        {
-            assert_eq!(*page_id, test_page_id(1));
-            assert_eq!(vals[0], Val::U64(45));
-        }
+        assert_insert_redo(table1, RowID::new(100), test_page_id(1), &[Val::U64(45)]);
 
         // 测试用例4：合并空日志
         let empty_logs = RedoLogs::default();
         let tables_count = redo_logs1.dml.len();
         redo_logs1.merge(empty_logs);
         assert_eq!(redo_logs1.dml.len(), tables_count);
+        let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
+        assert_eq!(table1.rows.len(), 2);
+        assert_insert_redo(table1, RowID::new(100), test_page_id(1), &[Val::U64(45)]);
+        assert_insert_redo(table1, RowID::new(101), test_page_id(1), &[Val::U64(44)]);
+        let table2 = redo_logs1.dml.get(&TableID::new(2)).unwrap();
+        assert_eq!(table2.rows.len(), 1);
+        assert_insert_redo(table2, RowID::new(200), test_page_id(2), &[Val::U64(43)]);
 
         // 测试用例5：删除操作的合并
         let mut redo_logs2 = RedoLogs::default();
@@ -1057,8 +1089,14 @@ mod tests {
         redo_logs1.merge(redo_logs2);
         let table1 = redo_logs1.dml.get(&TableID::new(1)).unwrap();
         assert!(!table1.rows.contains_key(&RowID::new(101)));
+        assert_eq!(table1.rows.len(), 1);
+        assert_insert_redo(table1, RowID::new(100), test_page_id(1), &[Val::U64(45)]);
     }
 
+    /// Purpose: Protect row redo variants at nonzero offsets and physical-record truncation
+    /// boundaries.
+    /// Expected: Complete records preserve identity and mutation data; every truncated physical
+    /// record is rejected.
     #[test]
     fn test_row_redo_variants_round_trip_and_reject_truncation() {
         let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(7)]);
@@ -1178,6 +1216,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect physical row identity while folding updates and a subsequent delete.
+    /// Expected: Updates retain the original page and combine columns; deletion adopts its supplied
+    /// optional page.
     #[test]
     fn test_table_dml_physical_update_retains_page_and_adopts_delete_page() {
         for delete_page in [Some(test_page_id(3)), None] {
@@ -1233,6 +1274,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect table redo serialization for mixed mutations, offsets, and empty tables.
+    /// Expected: Mixed mutations round-trip intact at either offset, and an empty table stays empty.
     #[test]
     fn test_table_dml_serde() {
         // 创建测试数据
@@ -1265,56 +1308,50 @@ mod tests {
         };
         table_dml.insert(delete_entry);
 
-        // 序列化
-        let mut buf = vec![0; table_dml.ser_len()];
-        table_dml.ser(&mut buf[..], 0);
+        for start_idx in [0, 4] {
+            let expected_end = start_idx + table_dml.ser_len();
+            let mut buf = vec![0xa5; expected_end];
+            assert_eq!(table_dml.ser(&mut buf[..], start_idx), expected_end);
+            assert!(buf[..start_idx].iter().all(|&byte| byte == 0xa5));
 
-        // 反序列化
-        let (_, deserialized) = TableDML::deser(&buf[..], 0).unwrap();
+            let (end, deserialized) = TableDML::deser(&buf[..], start_idx).unwrap();
+            assert_eq!(end, expected_end);
+            // 验证结果
+            assert_eq!(deserialized.rows.len(), 3);
 
-        // 验证结果
-        assert_eq!(deserialized.rows.len(), 3);
-
-        // 验证插入操作
-        let insert_redo = deserialized.rows.get(&RowID::new(100)).unwrap();
-        assert_eq!(insert_redo.row_id, RowID::new(100));
-        match &insert_redo.kind {
-            RowRedoKind::Insert(page_id, vals) => {
-                assert_eq!(*page_id, test_page_id(1));
-                assert_eq!(vals.len(), 1);
-                assert_eq!(vals[0], Val::U64(42));
+            // 验证插入操作
+            let insert_redo = deserialized.rows.get(&RowID::new(100)).unwrap();
+            assert_eq!(insert_redo.row_id, RowID::new(100));
+            match &insert_redo.kind {
+                RowRedoKind::Insert(page_id, vals) => {
+                    assert_eq!(*page_id, test_page_id(1));
+                    assert_eq!(vals.len(), 1);
+                    assert_eq!(vals[0], Val::U64(42));
+                }
+                _ => panic!("Expected Insert kind"),
             }
-            _ => panic!("Expected Insert kind"),
-        }
 
-        // 验证更新操作
-        let update_redo = deserialized.rows.get(&RowID::new(200)).unwrap();
-        assert_eq!(update_redo.row_id, RowID::new(200));
-        match &update_redo.kind {
-            RowRedoKind::Update(page_id, cols) => {
-                assert_eq!(*page_id, test_page_id(2));
-                assert_eq!(cols.len(), 1);
-                assert_eq!(cols[0].idx, 0);
-                assert_eq!(cols[0].val, Val::U64(43));
+            // 验证更新操作
+            let update_redo = deserialized.rows.get(&RowID::new(200)).unwrap();
+            assert_eq!(update_redo.row_id, RowID::new(200));
+            match &update_redo.kind {
+                RowRedoKind::Update(page_id, cols) => {
+                    assert_eq!(*page_id, test_page_id(2));
+                    assert_eq!(cols.len(), 1);
+                    assert_eq!(cols[0].idx, 0);
+                    assert_eq!(cols[0].val, Val::U64(43));
+                }
+                _ => panic!("Expected Update kind"),
             }
-            _ => panic!("Expected Update kind"),
+
+            // 验证删除操作
+            let delete_redo = deserialized.rows.get(&RowID::new(300)).unwrap();
+            assert_eq!(delete_redo.row_id, RowID::new(300));
+            match &delete_redo.kind {
+                RowRedoKind::Delete(None) => (),
+                _ => panic!("Expected Delete kind"),
+            }
         }
-
-        // 验证删除操作
-        let delete_redo = deserialized.rows.get(&RowID::new(300)).unwrap();
-        assert_eq!(delete_redo.row_id, RowID::new(300));
-        match &delete_redo.kind {
-            RowRedoKind::Delete(None) => (),
-            _ => panic!("Expected Delete kind"),
-        }
-
-        // 测试用例4：测试序列化位置偏移
-        let mut buf = vec![0; 4 + table_dml.ser_len()]; // 添加4字节前缀
-        table_dml.ser(&mut buf[..], 4); // 从位置4开始序列化
-
-        // 验证反序列化结果
-        let (_, deserialized) = TableDML::deser(&buf[..], 4).unwrap();
-        assert_eq!(deserialized.rows.len(), 3);
 
         // 测试用例5：空TableDML的序列化和反序列化
         let empty_table_dml = TableDML::default();
@@ -1325,6 +1362,8 @@ mod tests {
         assert_eq!(deserialized.rows.len(), 0);
     }
 
+    /// Purpose: Protect serialization of catalog updates spanning multiple columns.
+    /// Expected: The update variant, primary key, and complete column changes survive decoding.
     #[test]
     fn test_row_redo_kind_update_by_primary_key_serde() {
         let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(7)]);
@@ -1367,6 +1406,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect folding of catalog updates addressed by primary key.
+    /// Expected: Updates fold into inserts or combine by column with later values winning; deletion
+    /// retains the key.
     #[test]
     fn test_table_dml_update_by_primary_key_merge() {
         let key = CatalogSelectKey::new(CatalogIndexNo::new(0), vec![Val::U64(1)]);
@@ -1450,6 +1492,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect serialization of table, index, checkpoint, and replay-watermark DDL redo.
+    /// Expected: Round trips preserve variant-specific metadata, including decoding from a nonzero
+    /// offset.
     #[test]
     fn test_ddl_redo_serde() {
         // 测试用例1：CreateTable
@@ -1598,34 +1643,26 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject unknown row mutation discriminants.
+    /// Expected: Decoding reports an invalid payload.
     #[test]
     fn test_row_redo_kind_deser_invalid_code() {
-        let buf = [255u8];
-        let res = RowRedoKind::deser(&buf[..], 0);
-        assert!(
-            res.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
+        assert_invalid_payload::<RowRedoKind>(&[255]);
     }
 
+    /// Purpose: Reject unknown DDL redo discriminants.
+    /// Expected: Decoding reports an invalid payload.
     #[test]
     fn test_ddl_redo_deser_invalid_code() {
-        let buf = [255u8];
-        let res = DDLRedo::deser(&buf[..], 0);
-        assert!(
-            res.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
+        assert_invalid_payload::<DDLRedo>(&[255]);
     }
 
+    /// Purpose: Reject unknown transaction kinds in redo headers.
+    /// Expected: Decoding reports an invalid payload.
     #[test]
     fn test_redo_header_deser_invalid_trx_kind_code() {
         let mut buf = [0u8; 9];
         buf[8] = 255;
-        let res = RedoHeader::deser(&buf[..], 0);
-        assert!(
-            res.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
+        assert_invalid_payload::<RedoHeader>(&buf);
     }
 }

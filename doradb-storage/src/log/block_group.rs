@@ -699,6 +699,9 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect transaction framing against stalled decoding and inexact consumption.
+    /// Expected: Decoding must advance and consume each frame exactly; invalid boundaries report
+    /// corrupt payloads.
     #[test]
     fn transaction_validation_rejects_nonprogress_and_inexact_consumption() {
         for end in [0, 10] {
@@ -714,6 +717,8 @@ mod tests {
         validate_trx_frame_consumed(10, 10).unwrap();
     }
 
+    /// Purpose: Reject transaction frames whose declared length exceeds the available group body.
+    /// Expected: Decoding reports an invalid payload instead of accepting an incomplete frame.
     #[test]
     fn test_trx_log_rejects_frame_exceeding_group_body() {
         let mut bytes = vec![0u8; mem::size_of::<u64>()];
@@ -724,6 +729,8 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Reject trailing bytes left inside a declared transaction frame.
+    /// Expected: Decoding reports an invalid payload when the transaction under-consumes its frame.
     #[test]
     fn test_trx_log_rejects_under_consumed_frame() {
         let log = simple_trx_log(TrxID::new(7));
@@ -737,6 +744,8 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Reject transaction data that extends beyond its declared frame.
+    /// Expected: Decoding reports an invalid payload when the transaction over-consumes its frame.
     #[test]
     fn test_trx_log_rejects_over_consumed_frame() {
         let log = simple_trx_log(TrxID::new(7));
@@ -749,6 +758,8 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Track the commit timestamp range as transactions join a redo group.
+    /// Expected: The exposed range spans the earliest and latest logged commit timestamps.
     #[test]
     fn test_log_block_group_exposes_serialized_redo_cts_range() {
         let mut group =
@@ -763,6 +774,9 @@ mod tests {
         assert_eq!(group.redo_cts_range(), (TrxID::new(7), TrxID::new(9)));
     }
 
+    /// Purpose: Protect a redo group when an appended transaction exceeds its capacity.
+    /// Expected: The rejected transaction is returned and existing group accounting remains
+    /// unchanged.
     #[test]
     fn test_log_block_group_append_rejects_over_capacity_without_mutation() {
         let first_log = simple_trx_log(TrxID::new(7));
@@ -787,6 +801,9 @@ mod tests {
         assert_eq!(group.trx_logs.len(), initial_trx_count);
     }
 
+    /// Purpose: Protect materialization of a redo group that fits in a single block.
+    /// Expected: The block has valid integrity, complete group flags, and matching payload and
+    /// timestamp metadata.
     #[test]
     fn test_log_block_group_materializes_fixed_block() {
         let log = simple_trx_log(TrxID::new(7));
@@ -816,31 +833,42 @@ mod tests {
         assert_eq!(extension.max_redo_cts, TrxID::new(7));
     }
 
+    /// Purpose: Protect caller-supplied buffer ownership during redo group materialization.
+    /// Expected: Materialization requests the required batch and returns the supplied block
+    /// allocations.
     #[test]
     fn test_log_block_group_finish_with_uses_supplied_block_batch() {
         let cts = TrxID::new(13);
         let log = large_trx_log(cts);
-        let payload_len = log.ser_len();
-        let block_count = block_count_for_payload(STORAGE_SECTOR_SIZE, payload_len).unwrap();
         let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
+        let supplied = vec![
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+            DirectBuf::zeroed(STORAGE_SECTOR_SIZE),
+        ];
+        let supplied_ptrs: Vec<_> = supplied
+            .iter()
+            .map(|block| block.as_bytes().as_ptr())
+            .collect();
         let mut requested_count = 0usize;
 
         let blocks = group
             .finish_with(|count| {
                 requested_count = count;
-                (0..count)
-                    .map(|_| DirectBuf::zeroed(STORAGE_SECTOR_SIZE))
-                    .collect()
+                supplied
             })
             .unwrap();
 
-        assert_eq!(requested_count, block_count);
-        assert_eq!(blocks.len(), block_count);
-        for block in blocks {
+        assert_eq!(requested_count, supplied_ptrs.len());
+        assert_eq!(blocks.len(), supplied_ptrs.len());
+        for (block, supplied_ptr) in blocks.iter().zip(supplied_ptrs) {
+            assert_eq!(block.as_bytes().as_ptr(), supplied_ptr);
             assert_eq!(block.capacity(), STORAGE_SECTOR_SIZE);
         }
     }
 
+    /// Purpose: Reject an allocator batch that cannot hold the requested redo group.
+    /// Expected: Materialization reports an internal encoding error with expected and actual block
+    /// counts.
     #[test]
     fn test_log_block_group_finish_with_rejects_wrong_block_count() {
         let cts = TrxID::new(13);
@@ -858,6 +886,9 @@ mod tests {
         assert!(report.contains("actual_block_count=0"), "{report}");
     }
 
+    /// Purpose: Reject supplied redo buffers whose capacity differs from the configured block size.
+    /// Expected: Materialization reports an internal encoding error with expected and actual
+    /// capacities.
     #[test]
     fn test_log_block_group_finish_with_rejects_wrong_block_capacity() {
         let log = simple_trx_log(TrxID::new(13));
@@ -880,6 +911,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect block-count transitions at start and continuation payload boundaries.
+    /// Expected: Exact fits retain their block count, overflow adds a block, and undersized blocks
+    /// are rejected.
     #[test]
     fn test_block_count_for_payload_uses_start_and_continuation_boundaries() {
         let start_capacity = redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
@@ -903,6 +937,9 @@ mod tests {
         assert!(block_count_for_payload(RedoBlockHeader::SIZE - 1, 1).is_err());
     }
 
+    /// Purpose: Protect redo payload splitting across start and continuation blocks.
+    /// Expected: Reassembled bytes match the transaction, with valid checksums, group metadata,
+    /// flags, and zero padding.
     #[test]
     fn test_log_block_group_materializes_multi_block_group() {
         let cts = TrxID::new(11);
