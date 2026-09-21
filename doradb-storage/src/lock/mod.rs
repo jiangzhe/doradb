@@ -1402,6 +1402,9 @@ pub(crate) mod tests {
     use crate::error::{OperationOrFatalError, OperationOrFatalResult};
     use crate::id::ClaimNo;
     use crate::poison::healthy_test_poisoner;
+    use futures::FutureExt;
+    use futures::future::LocalBoxFuture;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::task::Wake;
 
     /// Debug snapshot of all physical families and queued waiters.
@@ -1748,6 +1751,44 @@ pub(crate) mod tests {
         (node_id, completion)
     }
 
+    /// Establishes an exclusive holder and a polled, queued shared acquisition.
+    async fn blocked_shared_acquire<'a>(
+        manager: &'a LockManager,
+        resource: LockResource,
+        waiter: &'a mut TestLockOwner,
+    ) -> (
+        TestLockOwner,
+        LocalBoxFuture<'a, OperationResult<LockGrant>>,
+    ) {
+        let mut holder = TestLockOwner::new(trx(TrxID::new(1)));
+        holder
+            .acquire(manager, resource, LockMode::Exclusive)
+            .await
+            .unwrap();
+        let waiter_owner = waiter.scope.owner();
+        let mut acquire = waiter
+            .acquire(manager, resource, LockMode::Shared)
+            .boxed_local();
+        assert!(
+            futures::poll!(acquire.as_mut()).is_pending(),
+            "shared acquisition must wait behind the exclusive holder: resource={resource}"
+        );
+        let snapshot = debug_snapshot(manager);
+        assert!(
+            snapshot.entries.iter().any(|entry| {
+                entry.resource == resource
+                    && entry.pending_owner == Some(waiter_owner)
+                    && entry.mode == LockMode::Shared
+                    && entry.state == LockDebugEntryState::Waiting
+                    && entry.queue_order == Some(0)
+            }),
+            "blocked acquisition must have an exact queued waiter: resource={resource}, snapshot={snapshot:?}"
+        );
+        (holder, acquire)
+    }
+
+    /// Purpose: Distinguish exact lock owners within and across session families.
+    /// Expected: Owners share their session family while equality and display retain exact scope identity.
     #[test]
     fn lock_owner_identity_carries_family_and_exact_scope() {
         let session_id = SessionID::new(7);
@@ -1778,6 +1819,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Protect the specified table-data lock compatibility matrix.
+    /// Expected: Every ordered mode pair agrees with the independent compatibility table.
     #[test]
     fn table_data_compatibility_matrix_matches_rfc() {
         let resource = table_data(TableID::new(1));
@@ -1805,6 +1848,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect metadata mode admission and shared/exclusive compatibility.
+    /// Expected: Only shared holders coexist; intent modes are rejected before creating resource state.
     #[test]
     fn metadata_only_accepts_shared_and_exclusive() {
         let resource = table_metadata(TableID::new(1));
@@ -1823,8 +1868,26 @@ pub(crate) mod tests {
             LockMode::Exclusive,
             LockMode::Shared
         ));
+        assert!(!modes_are_compatible(
+            resource,
+            LockMode::Exclusive,
+            LockMode::Exclusive
+        ));
+        for resource in resource_variants(resource) {
+            let manager = LockManager::new();
+            let token = pending_token(resource, 1);
+            for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    let _ = manager.start_pending(&token, mode);
+                }));
+                assert!(panic.is_err(), "resource={resource}, mode={mode}");
+                assert_drained(&manager);
+            }
+        }
     }
 
+    /// Purpose: Acquire compatible intent locks from independent families on either resource store.
+    /// Expected: All holders coexist and closing them drains the manager.
     #[test]
     fn multiple_compatible_holders_grant_together() {
         for resource in resource_variants(table_data(TableID::new(7))) {
@@ -1858,6 +1921,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Prevent a compatible newcomer from bypassing an older conflicting waiter.
+    /// Expected: Requests wait in FIFO order and complete as preceding holders release.
     #[test]
     fn newer_compatible_request_waits_behind_older_incompatible_waiter() {
         for resource in resource_variants(table_metadata(TableID::new(9))) {
@@ -1889,6 +1954,10 @@ pub(crate) mod tests {
                 );
                 holder.close(&manager);
                 exclusive_acquire.await.unwrap();
+                assert!(
+                    futures::poll!(compatible_acquire.as_mut()).is_pending(),
+                    "compatible newcomer must remain blocked by the exclusive holder"
+                );
                 exclusive.close(&manager);
                 compatible_acquire.await.unwrap();
                 compatible.close(&manager);
@@ -1897,6 +1966,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Promote a compatible FIFO prefix after an exclusive holder releases.
+    /// Expected: Compatible waiters acquire together while the next conflicting waiter remains queued.
     #[test]
     fn release_grants_next_compatible_fifo_group() {
         for resource in resource_variants(table_data(TableID::new(11))) {
@@ -1958,6 +2029,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Release one resource held by an owner with multiple claims.
+    /// Expected: The selected resource is released while the owner's other resource remains granted.
     #[test]
     fn release_one_resource_does_not_release_other_resources() {
         smol::block_on(async {
@@ -1987,6 +2060,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Repeat weaker requests covered by an exact owner's exclusive claim.
+    /// Expected: Requests retain one physical grant in its original covering mode.
     #[test]
     fn same_owner_covered_requests_do_not_duplicate_entries() {
         for resource in resource_variants(table_data(TableID::new(5))) {
@@ -2017,6 +2092,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Acquire a family-covered child claim while an external family waits.
+    /// Expected: The child acquires locally without displacing the covering grant or external waiter.
     #[test]
     fn same_family_covered_request_grants_without_waiting() {
         for resource in resource_variants(table_data(TableID::new(60))) {
@@ -2076,6 +2153,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Reject a child request that its family's existing claim cannot cover.
+    /// Expected: A family conflict leaves the covering grant intact without enqueuing the child.
     #[test]
     fn same_family_noncovered_request_is_rejected_without_waiter() {
         for resource in resource_variants(table_data(TableID::new(61))) {
@@ -2125,6 +2204,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Exercise comparable lock upgrades with and without an external blocker.
+    /// Expected: An uncontended upgrade succeeds while a conflicting upgrade preserves the old grant without queuing.
     #[test]
     fn immediate_conversion_succeeds_only_when_it_will_not_wait() {
         for resource in resource_variants(table_data(TableID::new(6))) {
@@ -2147,10 +2228,12 @@ pub(crate) mod tests {
                     .acquire(&manager, resource, LockMode::IntentShared)
                     .await
                     .unwrap();
+                let before = debug_snapshot(&manager);
                 assert_operation_err(
                     first.acquire(&manager, resource, LockMode::Exclusive).await,
                     OperationError::LockUpgradeWouldBlock,
                 );
+                assert_eq!(debug_snapshot(&manager), before);
                 first.close(&manager);
                 second.close(&manager);
                 assert_drained(&manager);
@@ -2158,6 +2241,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Reject conversion between incomparable modes for an exact owner.
+    /// Expected: Acquisition reports an unsupported conversion and the original claim remains releasable.
     #[test]
     fn incomparable_same_owner_conversion_is_explicit_error() {
         for resource in resource_variants(table_data(TableID::new(8))) {
@@ -2168,34 +2253,30 @@ pub(crate) mod tests {
                     .acquire(&manager, resource, LockMode::IntentExclusive)
                     .await
                     .unwrap();
+                let before = debug_snapshot(&manager);
                 assert_operation_err(
                     owner.acquire(&manager, resource, LockMode::Shared).await,
                     OperationError::LockConversionNotSupported,
                 );
+                assert_eq!(debug_snapshot(&manager), before);
                 owner.close(&manager);
                 assert_drained(&manager);
             });
         }
     }
 
+    /// Purpose: Resume a conflicting asynchronous acquisition after its blocker releases.
+    /// Expected: The pending request becomes a held grant and final close drains the manager.
     #[test]
     fn async_acquire_waits_behind_conflict_and_completes_after_release() {
         for resource in resource_variants(table_metadata(TableID::new(70))) {
             smol::block_on(async {
                 let manager = LockManager::new();
-                let mut holder = TestLockOwner::new(trx(TrxID::new(1)));
-                holder
-                    .acquire(&manager, resource, LockMode::Exclusive)
-                    .await
-                    .unwrap();
                 let mut waiter = TestLockOwner::new(trx(TrxID::new(2)));
-                let mut acquire = Box::pin(waiter.acquire(&manager, resource, LockMode::Shared));
-                assert!(matches!(
-                    futures::poll!(acquire.as_mut()),
-                    std::task::Poll::Pending
-                ));
+                let (holder, acquire) =
+                    blocked_shared_acquire(&manager, resource, &mut waiter).await;
                 holder.close(&manager);
-                acquire.await.unwrap();
+                assert_eq!(acquire.await.unwrap(), LockGrant::Fresh);
 
                 let snapshot = debug_snapshot(&manager);
                 assert_eq!(
@@ -2213,24 +2294,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Cancel an acquisition while its request remains queued.
+    /// Expected: Cancellation removes the waiting family and final close leaves no resource state.
     #[test]
     fn cancelled_acquire_removes_queued_waiter() {
         for resource in resource_variants(table_metadata(TableID::new(72))) {
             smol::block_on(async {
                 let manager = LockManager::new();
-                let mut holder = TestLockOwner::new(trx(TrxID::new(1)));
-                holder
-                    .acquire(&manager, resource, LockMode::Exclusive)
-                    .await
-                    .unwrap();
                 let mut waiter = TestLockOwner::new(trx(TrxID::new(2)));
-                let mut acquire = Box::pin(waiter.acquire(&manager, resource, LockMode::Shared));
-                assert!(matches!(
-                    futures::poll!(acquire.as_mut()),
-                    std::task::Poll::Pending
-                ));
+                let (holder, acquire) =
+                    blocked_shared_acquire(&manager, resource, &mut waiter).await;
                 drop(acquire);
-                waiter.close(&manager);
                 let snapshot = debug_snapshot(&manager);
                 assert!(
                     !snapshot
@@ -2238,12 +2312,19 @@ pub(crate) mod tests {
                         .iter()
                         .any(|entry| entry.family == trx(TrxID::new(2)).family())
                 );
+                assert_eq!(
+                    count_entries(&snapshot, resource, LockDebugEntryState::Granted),
+                    1
+                );
+                waiter.close(&manager);
                 holder.close(&manager);
                 assert_drained(&manager);
             });
         }
     }
 
+    /// Purpose: Cancel a conflicting queue head ahead of a compatible waiter.
+    /// Expected: The later waiter acquires while the original compatible holder remains active.
     #[test]
     fn cancelling_front_waiter_grants_later_compatible_waiter() {
         for resource in resource_variants(table_metadata(TableID::new(51))) {
@@ -2270,7 +2351,6 @@ pub(crate) mod tests {
                 ));
 
                 drop(front_acquire);
-                front.close(&manager);
                 compatible_acquire.await.unwrap();
 
                 let snapshot = debug_snapshot(&manager);
@@ -2278,6 +2358,13 @@ pub(crate) mod tests {
                     entry.family == trx(TrxID::new(3)).family()
                         && entry.state == LockDebugEntryState::Granted
                 }));
+                assert!(
+                    !snapshot
+                        .entries
+                        .iter()
+                        .any(|entry| { entry.family == trx(TrxID::new(2)).family() })
+                );
+                front.close(&manager);
                 holder.close(&manager);
                 compatible.close(&manager);
                 assert_drained(&manager);
@@ -2285,22 +2372,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Cancel an acquisition after promotion but before its future observes the grant.
+    /// Expected: Guard cleanup removes the provisional family and drains the resource.
     #[test]
     fn pending_guard_removes_a_promoted_but_unobserved_grant() {
         for resource in resource_variants(table_metadata(TableID::new(52))) {
             smol::block_on(async {
                 let manager = LockManager::new();
-                let mut blocker = TestLockOwner::new(trx(TrxID::new(1)));
-                blocker
-                    .acquire(&manager, resource, LockMode::Exclusive)
-                    .await
-                    .unwrap();
                 let mut waiter = TestLockOwner::new(trx(TrxID::new(2)));
-                let mut acquire = Box::pin(waiter.acquire(&manager, resource, LockMode::Shared));
-                assert!(matches!(
-                    futures::poll!(acquire.as_mut()),
-                    std::task::Poll::Pending
-                ));
+                let (blocker, acquire) =
+                    blocked_shared_acquire(&manager, resource, &mut waiter).await;
                 blocker.close(&manager);
                 assert_eq!(
                     count_entries(
@@ -2312,7 +2393,6 @@ pub(crate) mod tests {
                 );
 
                 drop(acquire);
-                waiter.close(&manager);
 
                 let snapshot = debug_snapshot(&manager);
                 assert!(
@@ -2322,10 +2402,13 @@ pub(crate) mod tests {
                         .any(|entry| entry.family == trx(TrxID::new(2)).family())
                 );
                 assert_drained(&manager);
+                waiter.close(&manager);
             });
         }
     }
 
+    /// Purpose: Promote compatible FIFO nodes into provisional physical grants.
+    /// Expected: Each promoted family retains its exact waiter identity and contributes to holder counts and notifications.
     #[test]
     fn grant_waiters_installs_a_provisional_grant_for_each_fifo_node() {
         let resource = table_data(TableID::new(54));
@@ -2380,6 +2463,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Publish pending notifications when their deferred owner is dropped.
+    /// Expected: Completions stay pending while deferred and become successful on drop.
     #[test]
     fn deferred_notifications_publish_on_drop() {
         let first = Arc::new(Completion::new());
@@ -2389,11 +2474,15 @@ pub(crate) mod tests {
             notifications.push(Arc::clone(&first));
             notifications.push(Arc::clone(&second));
             assert_eq!(notifications.len(), 2);
+            assert!(first.completed_result().is_none());
+            assert!(second.completed_result().is_none());
         }
-        assert!(smol::block_on(first.wait_take_result()).is_ok());
-        assert!(smol::block_on(second.wait_take_result()).is_ok());
+        assert!(first.completed_result().unwrap().is_ok());
+        assert!(second.completed_result().unwrap().is_ok());
     }
 
+    /// Purpose: Acquire an uncontended fresh grant on either resource store.
+    /// Expected: The held grant requires no waiter allocation or pending claim identity.
     #[test]
     fn immediate_fresh_grant_allocates_no_waiter_storage() {
         for resource in resource_variants(table_metadata(TableID::new(55))) {
@@ -2428,6 +2517,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Inspect a held resource with multiple conflicting waiters.
+    /// Expected: Snapshots distinguish the holder from exact waiter identities in FIFO order.
     #[test]
     fn debug_snapshot_reports_granted_waiting_and_queue_order() {
         for resource in resource_variants(table_metadata(TableID::new(42))) {
@@ -2487,6 +2578,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Route catalog resources to fixed cells and boundary user identities to dynamic storage.
+    /// Expected: Both stores appear in ordered snapshots and resource accounting tracks independent releases.
     #[test]
     fn catalog_slots_route_twelve_resources_and_preserve_dynamic_fallback() {
         use crate::catalog::storage::layout::BUILTIN_CATALOG_TABLE_IDS;
@@ -2537,6 +2630,8 @@ pub(crate) mod tests {
         assert_drained(&manager);
     }
 
+    /// Purpose: Access other catalog resources while one fixed cell is locked.
+    /// Expected: Independent cells remain acquirable and drain without disturbing the held cell.
     #[test]
     fn catalog_cells_synchronize_and_drain_independently() {
         use crate::catalog::storage::layout::BUILTIN_CATALOG_TABLE_IDS;
@@ -2564,6 +2659,8 @@ pub(crate) mod tests {
         assert_drained(&manager);
     }
 
+    /// Purpose: Reuse catalog waiter storage across complete resource lifecycles.
+    /// Expected: Provisional grants pin live state and drained storage is reused with advanced generations.
     #[test]
     fn catalog_full_drain_retains_working_capacity_and_provisional_nodes_pin_state() {
         use crate::catalog::storage::layout::TABLE_ID_TABLE_BINDINGS;
@@ -2641,6 +2738,8 @@ pub(crate) mod tests {
         assert_eq!(manager.stats().waiter_slab_reuses, 66);
     }
 
+    /// Purpose: Exercise independent catalog container retention at capacity boundaries.
+    /// Expected: Provisional state retains storage; full drain reclaims only oversized containers and preserves reusable slots.
     #[test]
     fn catalog_full_drain_reclaims_only_containers_above_capacity_limit() {
         // Map reserve requests are additional entries and can round upward.
@@ -2725,6 +2824,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Cancel exact waiters at each queue position on both resource stores.
+    /// Expected: Position accounting identifies the cancellation and surviving nodes remain valid through drain.
     #[test]
     fn queued_cancellation_preserves_head_middle_tail_and_exact_nodes_on_both_stores() {
         for resource in resource_variants(table_data(TableID::new(80))) {
@@ -2741,6 +2842,20 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>();
                 let (token, node) = waiters[cancelled_index].take().unwrap();
                 manager.cancel_waiting(token, LockMode::Shared, node);
+                let expected_nodes = waiters
+                    .iter()
+                    .flatten()
+                    .map(|(_, node)| *node)
+                    .collect::<Vec<_>>();
+                inspect_resource(&manager, resource, |state| {
+                    assert_eq!(linked_waiter_ids(&state.wait_queue), expected_nodes);
+                    for (token, node) in waiters.iter().flatten() {
+                        state
+                            .wait_queue
+                            .assert_identity(*node, token, LockMode::Shared);
+                    }
+                })
+                .unwrap();
                 let stats = manager.stats();
                 assert_eq!(
                     [
@@ -2759,6 +2874,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Race compatible reacquisition against a peer's release and possible resource eviction.
+    /// Expected: Repeated concurrent lifecycles leave no physical families, waiters, or active resources.
     #[test]
     fn release_cancel_and_reacquire_races_preserve_resource_accounting() {
         use std::sync::Barrier;
@@ -2789,10 +2906,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Reenter a resource from promotion wakeups during explicit, drop, and unwind publication.
+    /// Expected: Wakeups run after resource synchronization is released and permit complete cleanup.
     #[test]
     fn promotion_wakes_can_reenter_resource_after_explicit_drop_and_unwind_publication() {
         use std::future::Future;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
         use std::task::{Context, Waker};
         for resource in resource_variants(table_metadata(TableID::new(82))) {
             for publication in 0..3 {
@@ -2844,6 +2962,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Inspect queued and provisional grants across mixed resource stores.
+    /// Expected: Ordered snapshots retain each active resource until its own waiters and provisional grants drain.
     #[test]
     fn mixed_snapshots_keep_queued_and_provisional_resources_until_independent_drain() {
         let manager = LockManager::new();
@@ -2891,6 +3011,8 @@ pub(crate) mod tests {
         assert_drained(&manager);
     }
 
+    /// Purpose: Race waiter cancellation and reacquisition against blocker release.
+    /// Expected: Cleanup handles either queued or provisional cancellation and drains every iteration.
     #[test]
     fn queued_or_provisional_cancellation_races_release_and_reacquisition() {
         use std::sync::Barrier;

@@ -461,6 +461,8 @@ mod tests {
     use crate::id::TableID;
     use std::mem::size_of;
 
+    /// Purpose: Protect the compact representation of typed claims and fixed scope slots.
+    /// Expected: Claim records and their container stay within the intended size budgets.
     #[test]
     fn claim_layout_is_compact() {
         assert!(size_of::<FamilyClaim<()>>() <= 16);
@@ -469,6 +471,8 @@ mod tests {
         assert_eq!(size_of::<FamilyClaimSlots>(), 64);
     }
 
+    /// Purpose: Exercise fixed claim storage as active scope classes change.
+    /// Expected: Vacated slots accept new identities while other scope claims remain unchanged.
     #[test]
     fn fixed_claim_slots_reuse_scope_classes() {
         let operation_id = OperationID::new(2);
@@ -486,6 +490,13 @@ mod tests {
         );
 
         claims.remove(LockScope::Operation(operation_id), ClaimNo::new(2));
+        assert_eq!(claims.get(LockScope::Operation(operation_id)), None);
+        let next_operation_id = OperationID::new(4);
+        claims.insert(
+            LockScope::Operation(next_operation_id),
+            ClaimNo::new(4),
+            LockMode::Shared,
+        );
         claims.insert(
             LockScope::Transaction(transaction_id),
             ClaimNo::new(3),
@@ -498,8 +509,25 @@ mod tests {
                 mode: LockMode::IntentShared,
             })
         );
+        assert_eq!(claims.get(LockScope::Operation(operation_id)), None);
+        assert_eq!(
+            claims.get(LockScope::Operation(next_operation_id)),
+            Some(ScopeClaim {
+                claim_no: ClaimNo::new(4),
+                mode: LockMode::Shared,
+            })
+        );
+        assert_eq!(
+            claims.get(LockScope::SessionExplicit),
+            Some(ScopeClaim {
+                claim_no: ClaimNo::new(1),
+                mode: LockMode::Exclusive,
+            })
+        );
     }
 
+    /// Purpose: Retain distinct scope identities within a covering lock family.
+    /// Expected: Typed claims preserve their identities and modes while contributing to the family aggregate.
     #[test]
     fn expanded_claims_retain_typed_identities_and_aggregates() {
         let resource = LockResource::TableData(TableID::new(10));
@@ -540,6 +568,13 @@ mod tests {
             Some(ScopeClaim {
                 claim_no: ClaimNo::new(2),
                 mode: LockMode::Shared,
+            })
+        );
+        assert_eq!(
+            state.get(LockScope::Transaction(transaction_id)),
+            Some(ScopeClaim {
+                claim_no: ClaimNo::new(3),
+                mode: LockMode::IntentShared,
             })
         );
     }

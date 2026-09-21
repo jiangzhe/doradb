@@ -895,6 +895,8 @@ pub(in crate::lock) mod tests {
         Arc::new(Completion::new())
     }
 
+    /// Purpose: Protect waiter storage layout on supported wide-pointer targets.
+    /// Expected: Waiter identities, nodes, and slab entries retain their intended size budgets.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn waiter_layout_is_recorded() {
@@ -904,6 +906,8 @@ pub(in crate::lock) mod tests {
         assert_eq!(size_of::<WaitNodeSlotEntry>(), 96);
     }
 
+    /// Purpose: Reuse a reclaimed waiter slot before growing the slab.
+    /// Expected: Reuse advances the generation without reallocating, and later growth uses a fresh slot.
     #[test]
     fn slab_reuses_slots_with_a_new_generation_and_retains_capacity() {
         let mut queue = WaitQueue::default();
@@ -934,6 +938,8 @@ pub(in crate::lock) mod tests {
         assert_eq!(queue_snapshot(&queue).slab.slots_len, 2);
     }
 
+    /// Purpose: Remove intrusive queue nodes at interior and endpoint positions.
+    /// Expected: Remaining nodes preserve FIFO order and removing the final node empties the queue.
     #[test]
     fn intrusive_unlink_updates_head_middle_and_tail() {
         let mut queue = WaitQueue::default();
@@ -959,6 +965,8 @@ pub(in crate::lock) mod tests {
         assert_eq!(queue.live_count(), 0);
     }
 
+    /// Purpose: Reject a stale waiter identity after its slot has been reused.
+    /// Expected: Removal panics without changing the replacement node or queue state.
     #[test]
     fn stale_id_panics_before_reused_node_mutation() {
         let mut queue = WaitQueue::default();
@@ -974,6 +982,8 @@ pub(in crate::lock) mod tests {
         assert_eq!(linked_ids(&queue), vec![reused]);
     }
 
+    /// Purpose: Reject removal when a neighbor's backlink disagrees with the target node.
+    /// Expected: Validation panics before changing neighboring links or queue accounting.
     #[test]
     fn link_mismatch_panics_before_neighbor_mutation() {
         let mut queue = WaitQueue::default();
@@ -984,12 +994,24 @@ pub(in crate::lock) mod tests {
             panic!("new waiter must be queued")
         };
         *prev = Some(ids[0]);
+        let before = queue_snapshot(&queue);
+        let phases_before = ids
+            .iter()
+            .map(|&id| queue.node(id).phase)
+            .collect::<Vec<_>>();
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = queue.remove_queued(ids[1]);
         }));
 
         assert!(panic.is_err());
+        assert_eq!(queue_snapshot(&queue), before);
+        assert_eq!(
+            ids.iter()
+                .map(|&id| queue.node(id).phase)
+                .collect::<Vec<_>>(),
+            phases_before
+        );
         let WaitNodePhase::Queued { next, .. } = queue.node(ids[0]).phase else {
             panic!("predecessor must remain queued")
         };
@@ -999,6 +1021,8 @@ pub(in crate::lock) mod tests {
         assert_eq!(queue.live_count(), 3);
     }
 
+    /// Purpose: Reject waiter removal when its slot generation cannot advance.
+    /// Expected: The exhausted slot remains occupied and the queue is unchanged.
     #[test]
     fn generation_exhaustion_leaves_the_slot_occupied() {
         let mut queue = WaitQueue::default();
@@ -1029,6 +1053,8 @@ pub(in crate::lock) mod tests {
         );
     }
 
+    /// Purpose: Reuse multiple reclaimed waiter slots through the direct free list.
+    /// Expected: Slots are reused in reverse reclamation order without leaving free entries.
     #[test]
     fn direct_free_list_reuses_last_reclaimed_slot_first() {
         let mut queue = WaitQueue::default();
@@ -1050,6 +1076,8 @@ pub(in crate::lock) mod tests {
         assert!(queue_snapshot(&queue).slab.free_order.is_empty());
     }
 
+    /// Purpose: Exercise mixed queue operations against independent sequence and free-list models.
+    /// Expected: Queue order, slot reuse, generations, and live accounting agree after every operation.
     #[test]
     fn deterministic_queue_trace_matches_a_vector_and_free_list_model() {
         let mut queue = WaitQueue::default();
@@ -1059,11 +1087,13 @@ pub(in crate::lock) mod tests {
         let mut random = 0x4d59_5df4_d0f3_3173_u64;
         let mut next_owner = 1_u64;
 
-        for _ in 0..512 {
+        for step in 0..512 {
             random = random
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            if queue_model.is_empty() || random & 3 != 0 {
+            // Use upper bits so operation and removal position are not coupled
+            // to the short cycle of the generator's lowest bits.
+            if queue_model.is_empty() || (random >> 32) & 3 != 0 {
                 let expected_slot = if free_model.is_empty() {
                     let slot = generations.len();
                     generations.push(0);
@@ -1078,11 +1108,11 @@ pub(in crate::lock) mod tests {
                     completion(),
                 );
                 next_owner += 1;
-                assert_eq!(id.slot, expected_slot);
-                assert_eq!(id.generation, generations[expected_slot]);
+                assert_eq!(id.slot, expected_slot, "step={step}, random={random:#x}");
+                assert_eq!(id.generation, generations[expected_slot], "step={step}");
                 queue_model.push(id);
             } else {
-                let index = usize::try_from(random).unwrap() % queue_model.len();
+                let index = ((random >> 16) % queue_model.len() as u64) as usize;
                 let id = queue_model.remove(index);
                 let _ = queue.remove_queued(id);
                 generations[id.slot] += 1;
@@ -1090,27 +1120,54 @@ pub(in crate::lock) mod tests {
             }
 
             let snapshot = queue_snapshot(&queue);
-            assert_eq!(snapshot.queue_order, queue_model);
-            assert_eq!(snapshot.slab.free_order, free_model);
-            assert_eq!(snapshot.slab.generations, generations);
-            assert_eq!(snapshot.slab.live_count, queue_model.len());
+            assert_eq!(snapshot.queue_order, queue_model, "step={step}");
+            assert_eq!(snapshot.slab.free_order, free_model, "step={step}");
+            assert_eq!(snapshot.slab.generations, generations, "step={step}");
+            assert_eq!(snapshot.slab.live_count, queue_model.len(), "step={step}");
         }
     }
 
+    /// Purpose: Validate the reserved claim identity attached to a waiter node.
+    /// Expected: Only the exact owner, claim number, and requested mode pass validation without mutation.
     #[test]
     fn node_identity_includes_reserved_claim_number() {
         let mut queue = WaitQueue::default();
-        let owner = owner(9);
+        let exact_owner = owner(9);
         let resource = LockResource::TableMetadata(TableID::new(9));
         let token = PendingClaimToken {
             resource,
-            owner,
+            owner: exact_owner,
             claim_no: ClaimNo::new(17),
         };
-        let id = queue.append(owner, ClaimNo::new(17), LockMode::Exclusive, completion());
+        let id = queue.append(
+            exact_owner,
+            ClaimNo::new(17),
+            LockMode::Exclusive,
+            completion(),
+        );
         queue.assert_identity(id, &token, LockMode::Exclusive);
+        let before = queue_snapshot(&queue);
+        for (case, request_owner, claim_no, mode) in [
+            ("owner", owner(10), ClaimNo::new(17), LockMode::Exclusive),
+            ("claim", exact_owner, ClaimNo::new(18), LockMode::Exclusive),
+            ("mode", exact_owner, ClaimNo::new(17), LockMode::Shared),
+        ] {
+            let invalid = PendingClaimToken {
+                resource,
+                owner: request_owner,
+                claim_no,
+            };
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                queue.assert_identity(id, &invalid, mode);
+            }));
+            assert!(panic.is_err(), "mismatched {case} must be rejected");
+            assert_eq!(queue_snapshot(&queue), before, "case={case}");
+            queue.assert_identity(id, &token, LockMode::Exclusive);
+        }
     }
 
+    /// Purpose: Drop a fresh grant guard during partial publication into local indexes.
+    /// Expected: Rollback clears family and optional scope state together with the physical grant.
     #[test]
     fn guard_drop_rolls_back_partial_local_publication_and_fresh_grant() {
         for resource in resource_variants(LockResource::TableMetadata(TableID::new(90))) {
@@ -1164,6 +1221,8 @@ pub(in crate::lock) mod tests {
         }
     }
 
+    /// Purpose: Adopt a provisional grant before transferring it into local ownership.
+    /// Expected: The held family pins its resource after waiter reclamation until guard cleanup releases it.
     #[test]
     fn adopted_exact_grant_pins_resource_until_guard_drop() {
         for resource in resource_variants(LockResource::TableMetadata(TableID::new(92))) {
