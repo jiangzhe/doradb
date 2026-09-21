@@ -1558,7 +1558,7 @@ pub(crate) struct LwcBytes<'a> {
 impl<'a> LwcBytes<'a> {
     #[inline]
     fn slice(&self, idx: usize) -> Option<&'a [u8]> {
-        if idx + 1 >= self.offsets.len() {
+        if idx >= self.len() {
             return None;
         }
         let start = u32::from_le_bytes(self.offsets[idx]) as usize;
@@ -2297,63 +2297,180 @@ mod tests {
         .row_shape_fingerprint()
     }
 
-    fn assert_invalid_payload<T>(result: DataIntegrityResult<T>) {
-        assert!(
-            result
-                .as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
+    #[track_caller]
+    fn assert_invalid_payload<T>(case: &str, result: DataIntegrityResult<T>) {
+        let err = match result {
+            Ok(_) => panic!("{case}: malformed payload was accepted"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.current_context(),
+            &DataIntegrityError::InvalidPayload,
+            "{case}: {err:?}"
         );
     }
 
-    fn assert_prepared_matches(kind: ValKind, serializer: LwcPrimitiveSer<'_>) {
-        let mut bytes = vec![0u8; serializer.ser_len()];
-        serializer.ser(&mut bytes[..], 0);
-        let ordinary = LwcData::from_bytes(kind, &bytes).unwrap();
-        let prepared = PreparedLwcData::from_bytes(kind, &bytes).unwrap();
-        assert_eq!(prepared.len(), ordinary.len());
-        for idx in 0..ordinary.len() {
-            assert_eq!(prepared.value(&bytes, idx), ordinary.value(idx));
+    fn flat_payload(len: u64, data: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![LwcCode::Flat as u8];
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn bitpacked_payload(n_bits: u8, len: u64, min: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![LwcCode::ForBitpacking as u8, n_bits];
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(min);
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn assert_decoded_values(case: &str, kind: ValKind, bytes: &[u8], expected: &[Val]) {
+        let ordinary = LwcData::from_bytes(kind, bytes)
+            .unwrap_or_else(|err| panic!("{case}: ordinary decoder failed: {err:?}"));
+        let prepared = PreparedLwcData::from_bytes(kind, bytes)
+            .unwrap_or_else(|err| panic!("{case}: prepared decoder failed: {err:?}"));
+        assert_eq!(ordinary.len(), expected.len(), "{case}: ordinary length");
+        assert_eq!(prepared.len(), expected.len(), "{case}: prepared length");
+        for (idx, value) in expected.iter().enumerate() {
+            assert_eq!(
+                ordinary.value(idx).as_ref(),
+                Some(value),
+                "{case}: ordinary row={idx}"
+            );
+            assert_eq!(
+                prepared.value(bytes, idx).as_ref(),
+                Some(value),
+                "{case}: prepared row={idx}"
+            );
         }
-        assert_eq!(prepared.value(&bytes, ordinary.len()), None);
+        for idx in [expected.len(), usize::MAX] {
+            assert_eq!(
+                ordinary.value(idx),
+                None,
+                "{case}: ordinary out-of-range row={idx}"
+            );
+            assert_eq!(
+                prepared.value(bytes, idx),
+                None,
+                "{case}: prepared out-of-range row={idx}"
+            );
+        }
+        if let LwcData::Bytes(values) = ordinary {
+            let iterated: Vec<_> = values.iter().map(Val::VarByte).collect();
+            assert_eq!(iterated, expected, "{case}: variable-byte iteration");
+        }
     }
 
-    #[test]
-    fn prepared_lwc_data_matches_supported_codecs_and_value_kinds() {
-        let i8s = [-8i8, -7, -4, -1];
-        let u8s = [1u8, 2, 4, 7];
-        let i16s = [-300i16, -299, -250, -200];
-        let u16s = [300u16, 301, 350, 400];
-        let i32s = [-70_000i32, -69_999, -60_000, -50_000];
-        let u32s = [70_000u32, 70_001, 80_000, 90_000];
-        let i64s = [-5_000_000_000i64, -4_999_999_999, -4_000_000_000];
-        let u64s = [5_000_000_000u64, 5_000_000_001, 6_000_000_000];
-        let f32s = [1.25f32, -2.5, 9.75];
-        let f64s = [1.25f64, -2.5, 9.75];
-        assert_prepared_matches(ValKind::I8, LwcPrimitiveSer::new_i8(&i8s));
-        assert_prepared_matches(ValKind::U8, LwcPrimitiveSer::new_u8(&u8s));
-        assert_prepared_matches(ValKind::I16, LwcPrimitiveSer::new_i16(&i16s));
-        assert_prepared_matches(ValKind::U16, LwcPrimitiveSer::new_u16(&u16s));
-        assert_prepared_matches(ValKind::I32, LwcPrimitiveSer::new_i32(&i32s));
-        assert_prepared_matches(ValKind::U32, LwcPrimitiveSer::new_u32(&u32s));
-        assert_prepared_matches(ValKind::I64, LwcPrimitiveSer::new_i64(&i64s));
-        assert_prepared_matches(ValKind::U64, LwcPrimitiveSer::new_u64(&u64s));
-        assert_prepared_matches(ValKind::F32, LwcPrimitiveSer::new_f32(&f32s));
-        assert_prepared_matches(ValKind::F64, LwcPrimitiveSer::new_f64(&f64s));
-        assert_prepared_matches(
-            ValKind::VarByte,
-            LwcPrimitiveSer::new_bytes_owned(vec![0, 1, 3, 6], b"abcdef".to_vec()).unwrap(),
-        );
+    fn assert_primitive_roundtrip<T: Copy + Into<Val>>(
+        kind: ValKind,
+        serializer: LwcPrimitiveSer<'_>,
+        input: &[T],
+    ) {
+        let expected: Vec<_> = input.iter().copied().map(Into::into).collect();
+        let case = format!("{kind:?}, input={expected:?}");
+        let mut bytes = vec![0u8; serializer.ser_len()];
+        assert_eq!(serializer.ser(&mut bytes[..], 0), bytes.len(), "{case}");
+        assert_decoded_values(&case, kind, &bytes, &expected);
     }
 
+    fn row_page_with_rows(
+        metadata: &TableMetadata,
+        first_row_id: RowID,
+        rows: &[Vec<Val>],
+    ) -> RowPage {
+        let mut page = RowPage::new_test_page();
+        page.init(first_row_id, rows.len(), metadata.col.as_ref());
+        for (offset, row) in rows.iter().enumerate() {
+            assert!(
+                matches!(
+                    page.insert(metadata.col.as_ref(), row),
+                    InsertRow::Ok(row_id) if row_id == first_row_id + offset as u64
+                ),
+                "row={offset}"
+            );
+        }
+        page
+    }
+
+    fn assert_persisted_rows(bytes: &[u8], col_layout: &TableColumnLayout, expected: &[Vec<Val>]) {
+        let block =
+            LwcBlock::try_from_persisted_bytes(bytes, FileKind::TableFile, test_block_id(1))
+                .unwrap();
+        assert_eq!(block.row_count(), expected.len());
+        assert_eq!(block.header.col_count() as usize, col_layout.col_count());
+        for col_idx in 0..col_layout.col_count() {
+            let column = block.column(col_layout, col_idx).unwrap();
+            assert_eq!(
+                column.data().unwrap().len(),
+                expected.len(),
+                "column={col_idx}"
+            );
+        }
+        let mut prepared = PreparedLwcBlock::new(block, col_layout).unwrap();
+        for (row_idx, row) in expected.iter().enumerate() {
+            let decoded = block.decode_full_row_values(col_layout, row_idx).unwrap();
+            assert_eq!(&decoded, row, "row={row_idx}");
+            for (col_idx, expected_value) in row.iter().enumerate() {
+                assert_eq!(
+                    decoded[col_idx].kind(),
+                    expected_value.kind(),
+                    "row={row_idx}, column={col_idx}"
+                );
+                assert_eq!(
+                    &prepared
+                        .decode_value(block, col_layout, row_idx, col_idx)
+                        .unwrap(),
+                    expected_value,
+                    "prepared row={row_idx}, column={col_idx}"
+                );
+            }
+        }
+    }
+
+    fn assert_built_rows(builder: LwcBuilder, expected: &[Vec<Val>]) {
+        let col_layout = Arc::clone(&builder.col_layout);
+        let buf = builder.build(0).unwrap();
+        assert_persisted_rows(buf.as_bytes(), col_layout.as_ref(), expected);
+    }
+
+    fn integer_stats(builder: &LwcBuilder) -> Vec<(bool, i64, i64, u64, u64)> {
+        builder
+            .stats
+            .iter()
+            .map(|stat| {
+                (
+                    stat.initialized,
+                    stat.min_i64,
+                    stat.max_i64,
+                    stat.min_u64,
+                    stat.max_u64,
+                )
+            })
+            .collect()
+    }
+
+    /// Purpose: Validate variable-byte offset origins, ordering, and payload boundaries.
+    /// Expected: Preparing malformed offsets reports an invalid payload.
     #[test]
     fn prepared_lwc_data_rejects_malformed_varbyte_offsets() {
-        let serializer = LwcPrimitiveSer::new_bytes_owned(vec![0, 1, 3], b"abc".to_vec()).unwrap();
-        let mut bytes = vec![0u8; serializer.ser_len()];
-        serializer.ser(&mut bytes[..], 0);
-        bytes[9..13].copy_from_slice(&1u32.to_le_bytes());
-        assert_invalid_payload(PreparedLwcData::from_bytes(ValKind::VarByte, &bytes));
+        for (case, offsets) in [
+            ("nonzero origin", vec![1u32, 1, 3]),
+            ("descending offsets", vec![0, 2, 1, 3]),
+            ("offset past backing data", vec![0, 4, 3]),
+            ("unreferenced trailing data", vec![0, 1, 2]),
+        ] {
+            let mut bytes = flat_payload((offsets.len() - 1) as u64, &[]);
+            for offset in offsets {
+                bytes.extend_from_slice(&offset.to_le_bytes());
+            }
+            bytes.extend_from_slice(b"abc");
+            assert_invalid_payload(case, PreparedLwcData::from_bytes(ValKind::VarByte, &bytes));
+        }
     }
 
+    /// Purpose: Keep LWC encoding inputs and results transferable to worker threads.
+    /// Expected: Builder and result types satisfy the thread-transfer and lifetime bounds.
     #[test]
     fn lwc_encode_task_types_are_send_and_static() {
         fn assert_send_static<T: Send + 'static>() {}
@@ -2362,10 +2479,13 @@ mod tests {
         assert_send_static::<InternalResult<DirectBuf>>();
     }
 
+    /// Purpose: Round-trip ordinary and prepared columns across value kinds and compression ranges.
+    /// Expected: Both decoders preserve input values and reject out-of-range access, including empty columns.
     #[test]
-    fn test_lwc_primitive_serde() {
+    fn test_lwc_primitive_decoders_roundtrip() {
         // i8
         for input in [
+            vec![-8i8, -7, -4, -1],
             vec![1i8],
             vec![1i8, 0, 1, 0, 1, 0],
             vec![1i8, 2],
@@ -2375,20 +2495,12 @@ mod tests {
             vec![1i8, 2, 4, 8, 16, 32],
             vec![1i8, 2, 4, 16, -100, 100],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_i8(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::I8, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_i8().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::I8, LwcPrimitiveSer::new_i8(&input), &input);
         }
 
         // u8
         for input in [
+            vec![1u8, 2, 4, 7],
             vec![1u8],
             vec![1u8, 2],
             vec![1u8, 2, 4],
@@ -2397,20 +2509,12 @@ mod tests {
             vec![1u8, 2, 4, 8, 16, 32],
             vec![1u8, 2, 4, 16, 100, 200, 250],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_u8(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::U8, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_u8().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::U8, LwcPrimitiveSer::new_u8(&input), &input);
         }
 
         // i16
         for input in [
+            vec![-300i16, -299, -250, -200],
             vec![-1i16, 0],
             vec![-1i16, 0, 1],
             vec![-1i16, 0, 1, 4],
@@ -2418,20 +2522,12 @@ mod tests {
             vec![-1i16, 2, 3, 4, -8, 16],
             vec![-1i16, 2, 3, 4, -8, 1 << 14],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_i16(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::I16, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_i16().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::I16, LwcPrimitiveSer::new_i16(&input), &input);
         }
 
         // u16
         for input in [
+            vec![300u16, 301, 350, 400],
             vec![1u16, 2],
             vec![1u16, 2, 3, 4],
             vec![1u16, 2, 3, 4, 8],
@@ -2439,20 +2535,12 @@ mod tests {
             vec![1u16, 2, 3, 4, 8, 16, 32],
             vec![1u16, 2, 3, 4, 8, 16, 1 << 14],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_u16(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::U16, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_u16().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::U16, LwcPrimitiveSer::new_u16(&input), &input);
         }
 
         // i32
         for input in [
+            vec![-70_000i32, -69_999, -60_000, -50_000],
             vec![1i32, 2],
             vec![1i32, 2, 3, 4],
             vec![1i32, 2, 3, 4, 8],
@@ -2462,20 +2550,12 @@ mod tests {
             vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1024],
             vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1 << 30],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_i32(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::I32, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_i32().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::I32, LwcPrimitiveSer::new_i32(&input), &input);
         }
 
         // u32
         for input in [
+            vec![70_000u32, 70_001, 80_000, 90_000],
             vec![1u32, 2],
             vec![1u32, 2, 3, 4],
             vec![1u32, 2, 3, 4, 8],
@@ -2485,33 +2565,17 @@ mod tests {
             vec![1u32, 3, 7, 15, 31, 63, 127, 1 << 14],
             vec![1u32, 3, 7, 15, 31, 63, 1 << 30],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_u32(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::U32, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_u32().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::U32, LwcPrimitiveSer::new_u32(&input), &input);
         }
 
         // f32
-        let input = vec![1.5f32, 2.25, -3.5, 0.0];
-        let lwc_ser = LwcPrimitiveSer::new_f32(&input);
-        let mut res = vec![0u8; lwc_ser.ser_len()];
-        let ser_idx = lwc_ser.ser(&mut res[..], 0);
-        assert_eq!(ser_idx, res.len());
-        let lwc_data = LwcData::from_bytes(ValKind::F32, &res).unwrap();
-        let mut output = vec![];
-        for i in 0..lwc_data.len() {
-            output.push(lwc_data.value(i).unwrap().as_f32().unwrap());
+        for input in [vec![1.5f32, 2.25, -3.5, 0.0], vec![1.25f32, -2.5, 9.75]] {
+            assert_primitive_roundtrip(ValKind::F32, LwcPrimitiveSer::new_f32(&input), &input);
         }
-        assert_eq!(input, output);
 
         // i64
         for input in [
+            vec![-5_000_000_000i64, -4_999_999_999, -4_000_000_000],
             vec![1i64, 2],
             vec![1i64, 2, 3, 4],
             vec![1i64, 2, 3, 4, 8],
@@ -2522,20 +2586,12 @@ mod tests {
             vec![-2i64, -1, 0, 1, 2, 4, 8, 1024, 65536],
             vec![-2i64, -1, 0, 1, 2, 4, 8, 1024, 1 << 60],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_i64(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::I64, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_i64().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::I64, LwcPrimitiveSer::new_i64(&input), &input);
         }
 
         // u64
         for input in [
+            vec![5_000_000_000u64, 5_000_000_001, 6_000_000_000],
             vec![],
             vec![1u64],
             vec![1, 1 << 1],
@@ -2545,165 +2601,189 @@ mod tests {
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
         ] {
-            let lwc_ser = LwcPrimitiveSer::new_u64(&input);
-            let mut res = vec![0u8; lwc_ser.ser_len()];
-            let ser_idx = lwc_ser.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let lwc_data = LwcData::from_bytes(ValKind::U64, &res).unwrap();
-            let mut output = vec![];
-            for i in 0..lwc_data.len() {
-                output.push(lwc_data.value(i).unwrap().as_u64().unwrap());
-            }
-            assert_eq!(input, output);
+            assert_primitive_roundtrip(ValKind::U64, LwcPrimitiveSer::new_u64(&input), &input);
         }
 
         // f64
-        let input = vec![1.5f64, 2.25, -3.5, 0.0, 128.5];
-        let lwc_ser = LwcPrimitiveSer::new_f64(&input);
-        let mut res = vec![0u8; lwc_ser.ser_len()];
-        let ser_idx = lwc_ser.ser(&mut res[..], 0);
-        assert_eq!(ser_idx, res.len());
-        let lwc_data = LwcData::from_bytes(ValKind::F64, &res).unwrap();
-        let mut output = vec![];
-        for i in 0..lwc_data.len() {
-            output.push(lwc_data.value(i).unwrap().as_f64().unwrap());
+        for input in [
+            vec![1.5f64, 2.25, -3.5, 0.0, 128.5],
+            vec![1.25f64, -2.5, 9.75],
+        ] {
+            assert_primitive_roundtrip(ValKind::F64, LwcPrimitiveSer::new_f64(&input), &input);
         }
-        assert_eq!(input, output);
 
-        // bytes
-        let offsets = vec![0u32, 3, 3, 7];
-        let bytes = b"abc"
-            .iter()
-            .chain(b"".iter())
-            .chain(b"defg".iter())
-            .copied()
-            .collect::<Vec<u8>>();
-        let lwc_ser = LwcPrimitiveSer::new_bytes(&offsets, &bytes).unwrap();
-        let mut res = vec![0u8; lwc_ser.ser_len()];
-        let ser_idx = lwc_ser.ser(&mut res[..], 0);
-        assert_eq!(ser_idx, res.len());
-        let lwc_data = LwcData::from_bytes(ValKind::VarByte, &res).unwrap();
-        if let LwcData::Bytes(b) = lwc_data {
-            let out: Vec<Vec<u8>> = b.iter().map(|v| v.as_bytes().to_vec()).collect();
-            assert_eq!(out, vec![b"abc".to_vec(), b"".to_vec(), b"defg".to_vec()]);
-        } else {
-            panic!("expected bytes variant");
+        for (offsets, bytes, expected) in [
+            (vec![0, 3, 3, 7], &b"abcdefg"[..], ["abc", "", "defg"]),
+            (vec![0, 1, 3, 6], &b"abcdef"[..], ["a", "bc", "def"]),
+        ] {
+            assert_primitive_roundtrip(
+                ValKind::VarByte,
+                LwcPrimitiveSer::new_bytes(&offsets, bytes).unwrap(),
+                &expected,
+            );
         }
     }
 
+    /// Purpose: Decode fixed wire fixtures independently of the primitive serializers.
+    /// Expected: Ordinary and prepared readers preserve signed values and every supported packing width.
     #[test]
-    fn test_lwc_data_from_bytes_rejects_empty_payload() {
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &[]));
+    fn test_lwc_decoders_read_known_payloads() {
+        for (case, kind, bytes, expected) in [
+            (
+                "flat signed little-endian",
+                ValKind::I16,
+                flat_payload(2, &[0xd4, 0xfe, 0xd5, 0xfe]),
+                vec![Val::I16(-300), Val::I16(-299)],
+            ),
+            (
+                "one-bit deltas",
+                ValKind::U8,
+                bitpacked_payload(1, 3, &[10], &[0b0000_0010]),
+                vec![Val::U8(10), Val::U8(11), Val::U8(10)],
+            ),
+            (
+                "two-bit deltas",
+                ValKind::U8,
+                bitpacked_payload(2, 4, &[3], &[0b1110_0100]),
+                vec![Val::U8(3), Val::U8(4), Val::U8(5), Val::U8(6)],
+            ),
+            (
+                "four-bit signed deltas",
+                ValKind::I8,
+                bitpacked_payload(4, 3, &[0xf8], &[0x10, 0x0f]),
+                vec![Val::I8(-8), Val::I8(-7), Val::I8(7)],
+            ),
+            (
+                "byte deltas",
+                ValKind::I16,
+                bitpacked_payload(8, 2, &[0xd4, 0xfe], &[0, 255]),
+                vec![Val::I16(-300), Val::I16(-45)],
+            ),
+            (
+                "word deltas",
+                ValKind::U32,
+                bitpacked_payload(16, 2, &[0; 4], &[0, 0, 255, 255]),
+                vec![Val::U32(0), Val::U32(65_535)],
+            ),
+            (
+                "double-word signed deltas",
+                ValKind::I64,
+                bitpacked_payload(32, 2, &[255; 8], &[0, 0, 0, 0, 255, 255, 255, 255]),
+                vec![Val::I64(-1), Val::I64(4_294_967_294)],
+            ),
+        ] {
+            assert_decoded_values(case, kind, &bytes, &expected);
+        }
     }
 
+    /// Purpose: Reject malformed column headers, lengths, typed elements, and packing widths.
+    /// Expected: Both readers report invalid payloads without truncating counts or ignoring excess bytes.
     #[test]
-    fn test_lwc_data_from_bytes_rejects_flat_payload_length_mismatch() {
-        let mut short_payload = vec![LwcCode::Flat as u8];
-        short_payload.extend_from_slice(&2u64.to_le_bytes());
-        short_payload.push(7);
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &short_payload));
-
-        let mut long_payload = vec![LwcCode::Flat as u8];
-        long_payload.extend_from_slice(&1u64.to_le_bytes());
-        long_payload.extend_from_slice(&[7, 8]);
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &long_payload));
+    fn test_lwc_decoders_reject_malformed_payloads() {
+        for (case, kind, bytes) in [
+            ("empty payload", ValKind::U8, vec![]),
+            ("flat truncated data", ValKind::U8, flat_payload(2, &[7])),
+            ("flat excess data", ValKind::U8, flat_payload(1, &[7, 8])),
+            (
+                "flat oversized count",
+                ValKind::U8,
+                flat_payload(1u64 << 32, &[]),
+            ),
+            (
+                "flat partial typed element",
+                ValKind::I16,
+                flat_payload(1, &[7]),
+            ),
+            (
+                "bitpacked missing data",
+                ValKind::U8,
+                bitpacked_payload(1, 1, &[0], &[]),
+            ),
+            (
+                "bitpacked excess data",
+                ValKind::U8,
+                bitpacked_payload(1, 1, &[0], &[0, 0]),
+            ),
+            (
+                "bitpacked oversized count",
+                ValKind::U8,
+                bitpacked_payload(1, 1u64 << 32, &[0], &[]),
+            ),
+            (
+                "unsupported packing width",
+                ValKind::U8,
+                bitpacked_payload(3, 1, &[0], &[0]),
+            ),
+            (
+                "truncated variable-byte offsets",
+                ValKind::VarByte,
+                flat_payload(1, &[0; 7]),
+            ),
+        ] {
+            assert_invalid_payload(
+                &format!("{case}: ordinary"),
+                LwcData::from_bytes(kind, &bytes),
+            );
+            assert_invalid_payload(
+                &format!("{case}: prepared"),
+                PreparedLwcData::from_bytes(kind, &bytes),
+            );
+        }
     }
 
+    /// Purpose: Reject variable-byte builder offsets with no origin or a nonzero origin.
+    /// Expected: Both borrowed and owned construction report builder misuse.
     #[test]
-    fn test_lwc_data_from_bytes_rejects_flat_oversized_len() {
-        let mut payload = vec![LwcCode::Flat as u8];
-        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
-
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
+    fn test_lwc_bytes_rejects_invalid_builder_offsets() {
+        for (case, offsets, data) in [
+            ("missing origin", vec![], vec![]),
+            ("nonzero origin", vec![1, 2], vec![0]),
+        ] {
+            for (mode, result) in [
+                ("borrowed", LwcPrimitiveSer::new_bytes(&offsets, &data)),
+                (
+                    "owned",
+                    LwcPrimitiveSer::new_bytes_owned(offsets.clone(), data.clone()),
+                ),
+            ] {
+                let err = match result {
+                    Ok(_) => panic!("{case}: {mode} builder accepted invalid offsets"),
+                    Err(err) => err,
+                };
+                assert_eq!(
+                    err.current_context(),
+                    &InternalError::LwcBuilderMisuse,
+                    "{case}: {mode}: {err:?}"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn test_lwc_data_from_bytes_rejects_flat_typed_partial_element() {
-        let mut payload = vec![LwcCode::Flat as u8];
-        payload.extend_from_slice(&1u64.to_le_bytes());
-        payload.push(7);
-
-        assert_invalid_payload(LwcData::from_bytes(ValKind::I16, &payload));
-    }
-
-    #[test]
-    fn test_lwc_data_from_bytes_rejects_for_bitpacking_payload_length_mismatch() {
-        let mut payload = vec![LwcCode::ForBitpacking as u8];
-        payload.push(1);
-        payload.extend_from_slice(&1u64.to_le_bytes());
-        payload.push(0);
-
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
-    }
-
-    #[test]
-    fn test_lwc_data_from_bytes_rejects_for_bitpacking_oversized_len() {
-        let mut payload = vec![LwcCode::ForBitpacking as u8];
-        payload.push(1);
-        payload.extend_from_slice(&(1u64 << 32).to_le_bytes());
-        payload.push(0);
-
-        assert_invalid_payload(LwcData::from_bytes(ValKind::U8, &payload));
-    }
-
-    #[test]
-    fn test_lwc_bytes_invalid() {
-        let err = LwcPrimitiveSer::new_bytes(&[], &[]);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| err.current_context() == &InternalError::LwcBuilderMisuse)
-        );
-
-        let err = LwcPrimitiveSer::new_bytes(&[1, 2], &[0u8]);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| err.current_context() == &InternalError::LwcBuilderMisuse)
-        );
-
-        let offsets = vec![0u32, 0];
-        let bytes = vec![];
-        let lwc_ser = LwcPrimitiveSer::new_bytes(&offsets, &bytes).unwrap();
-        let mut res = vec![0u8; lwc_ser.ser_len()];
-        lwc_ser.ser(&mut res[..], 0);
-        let err = LwcData::from_bytes(ValKind::VarByte, &res[..res.len() - 1]);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
-    }
-
+    /// Purpose: Guard variable-byte access at invalid offsets and extreme row indices.
+    /// Expected: Indexed access and iteration return no invalid slice and index arithmetic cannot overflow.
     #[test]
     fn test_lwc_bytes_out_of_range() {
-        // offsets point past the end of the backing data to exercise the
-        // defensive bounds checks inside `LwcBytes::slice` and `value_at`.
-        let offsets: &[[u8; 4]] = &[[0, 0, 0, 0], [5, 0, 0, 0]];
-        let data: &[u8] = &[1, 2, 3];
-        let bytes = LwcBytes { offsets, data };
-
-        assert_eq!(bytes.len(), 1);
-        assert!(bytes.value_at(0).is_none());
-        assert!(bytes.value_at(1).is_none());
-        assert_eq!(bytes.iter().count(), 0);
-        assert!(bytes.iter().next().is_none());
+        for (case, offsets, data, expected_len) in [
+            ("offset past data", vec![0u32, 5], vec![1, 2, 3], 1),
+            ("descending offsets", vec![3, 1], vec![1, 2, 3], 1),
+            ("missing offsets", vec![], vec![], 0),
+            ("empty column", vec![0], vec![], 0),
+        ] {
+            let offsets: Vec<_> = offsets.into_iter().map(u32::to_le_bytes).collect();
+            let bytes = LwcBytes {
+                offsets: &offsets,
+                data: &data,
+            };
+            assert_eq!(bytes.len(), expected_len, "{case}");
+            for idx in [0, expected_len, usize::MAX] {
+                assert!(bytes.value_at(idx).is_none(), "{case}: row={idx}");
+            }
+            assert!(bytes.iter().next().is_none(), "{case}: iteration");
+        }
     }
 
-    #[test]
-    fn test_for_bitpacking_invalid_bits() {
-        // Build a payload with an unsupported bit width for u8 (n_bits = 3)
-        // so persisted decoding reports an invalid payload.
-        let mut payload = vec![LwcCode::ForBitpacking as u8];
-        payload.push(3); // n_bits
-        payload.extend_from_slice(&1u64.to_le_bytes()); // len
-        payload.push(0); // min value for u8
-        payload.push(0); // data byte (div_ceil(1 * 3, 8) == 1)
-
-        let err = LwcData::from_bytes(ValKind::U8, &payload);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
-    }
-
+    /// Purpose: Round-trip a null bitmap spanning multiple bytes.
+    /// Expected: Serialization preserves the bitmap and null positions across byte boundaries.
     #[test]
     fn test_lwc_null_bitmap_serde() {
         let bytes = [0b0000_1010u8, 0b0000_0001];
@@ -2722,6 +2802,8 @@ mod tests {
         assert!(!bitmap.is_null(2));
     }
 
+    /// Purpose: Build a persisted block from a row page containing nulls and deleted rows.
+    /// Expected: Live rows retain their values and nulls with the supplied row-shape fingerprint.
     #[test]
     fn test_lwc_builder_from_row_page() {
         let metadata = TableMetadata::try_new(
@@ -2763,11 +2845,16 @@ mod tests {
 
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         assert!(builder.is_empty());
-        assert!(builder.row_count() == 0);
+        assert_eq!(builder.row_count(), 0);
         let view = page.vector_view(metadata.col.as_ref());
         let appended = builder.append_view(view, page.header.start_row_id);
         assert!(appended);
-        let expected_fingerprint = row_shape_fingerprint_for(builder.row_ids(), 100, 110);
+        let expected_ids: Vec<_> = expected_rows
+            .iter()
+            .map(|(row_id, _, _)| RowID::new(*row_id))
+            .collect();
+        assert_eq!(builder.row_ids(), expected_ids);
+        let expected_fingerprint = row_shape_fingerprint_for(&expected_ids, 100, 110);
         let buf = builder.build(expected_fingerprint).unwrap();
 
         let lwc_block = LwcBlock::try_from_persisted_bytes(
@@ -2786,6 +2873,8 @@ mod tests {
         let column1 = lwc_block.column(metadata.col.as_ref(), 1).unwrap();
         let data0 = column0.data().unwrap();
         let data1 = column1.data().unwrap();
+        assert_eq!(data0.len(), expected_rows.len());
+        assert_eq!(data1.len(), expected_rows.len());
         for (idx, (_row_id, c0, c1)) in expected_rows.iter().enumerate() {
             assert_eq!(data0.value(idx).unwrap().as_u8().unwrap(), *c0);
             if let Some(value) = c1 {
@@ -2797,6 +2886,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Compare direct row appends with row-page ingestion for mixed nullable values.
+    /// Expected: Both ingestion paths produce the same row identities and persisted bytes.
     #[test]
     fn test_lwc_builder_append_row_values_matches_row_page() {
         let metadata = TableMetadata::try_new(
@@ -2829,14 +2920,7 @@ mod tests {
                 Val::F32(OrderedFloat(3.75)),
             ],
         ];
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(10), rows.len(), metadata.col.as_ref());
-        for vals in &rows {
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), vals),
-                InsertRow::Ok(_)
-            ));
-        }
+        let page = row_page_with_rows(&metadata, RowID::new(10), &rows);
 
         let mut page_builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
@@ -2846,34 +2930,54 @@ mod tests {
             assert!(direct_builder.append_row_values(RowID::new(10 + offset as u64), vals));
         }
 
-        assert_eq!(direct_builder.row_ids(), page_builder.row_ids());
-        let fingerprint = row_shape_fingerprint_for(direct_builder.row_ids(), 10, 13);
+        let expected_ids = [RowID::new(10), RowID::new(11), RowID::new(12)];
+        assert_eq!(direct_builder.row_ids(), expected_ids);
+        assert_eq!(page_builder.row_ids(), expected_ids);
+        let fingerprint = row_shape_fingerprint_for(&expected_ids, 10, 13);
         let page_buf = page_builder.build(fingerprint).unwrap();
         let direct_buf = direct_builder.build(fingerprint).unwrap();
         assert_eq!(direct_buf.as_bytes(), page_buf.as_bytes());
+        assert_persisted_rows(direct_buf.as_bytes(), metadata.col.as_ref(), &rows);
     }
 
+    /// Purpose: Recover a mixed nullable builder after a direct append exceeds block capacity.
+    /// Expected: Rejection restores identities, values, nulls, and statistics, and subsequent appends succeed.
     #[test]
     fn test_lwc_builder_append_row_values_rolls_back_on_capacity() {
         let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::VarByte,
-                StorageColumnFlags::empty(),
-            )],
+            vec![
+                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+            ],
             vec![],
         )
         .expect("valid table metadata");
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        assert!(builder.append_row_values(RowID::new(1), &[Val::from(Vec::from(&b"ok"[..]))]));
+        let first_row = vec![Val::I16(5), Val::from("ok")];
+        assert!(builder.append_row_values(RowID::new(1), &first_row));
+        let expected_stats = vec![(true, 5, 5, 0, 0), (false, 0, 0, 0, 0)];
+        assert_eq!(integer_stats(&builder), expected_stats);
 
-        let oversized = Val::from(vec![0u8; LWC_BLOCK_PAYLOAD_SIZE]);
-        assert!(!builder.append_row_values(RowID::new(2), &[oversized]));
+        for value in [Val::I16(1000), Val::Null] {
+            let oversized = Val::from(vec![0; LWC_BLOCK_PAYLOAD_SIZE]);
+            assert!(!builder.append_row_values(RowID::new(2), &[value, oversized]));
+            assert_eq!(builder.row_count(), 1);
+            assert_eq!(builder.row_ids(), &[RowID::new(1)]);
+            assert_eq!(integer_stats(&builder), expected_stats);
+        }
 
-        assert_eq!(builder.row_count(), 1);
-        assert_eq!(builder.row_ids(), &[RowID::new(1)]);
-        assert!(builder.build(0).is_ok());
+        let next_row = vec![Val::I16(8), Val::Null];
+        assert!(builder.append_row_values(RowID::new(2), &next_row));
+        assert_eq!(builder.row_ids(), &[RowID::new(1), RowID::new(2)]);
+        assert_eq!(
+            integer_stats(&builder),
+            vec![(true, 5, 8, 0, 0), (false, 0, 0, 0, 0)]
+        );
+        assert_built_rows(builder, &[first_row, next_row]);
     }
 
+    /// Purpose: Account for the complete persisted header when admitting rows near capacity.
+    /// Expected: Admission stops before overflow and the accepted rows form a valid block.
     #[test]
     fn test_lwc_builder_capacity_includes_complete_persisted_header() {
         let metadata = TableMetadata::try_new(
@@ -2888,7 +2992,7 @@ mod tests {
         )
         .expect("valid descriptor-like metadata");
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let mut accepted = 0;
+        let mut expected_rows = Vec::new();
         for row_no in 0..100 {
             let vals = [
                 Val::U64(row_no),
@@ -2900,13 +3004,15 @@ mod tests {
             if !builder.append_row_values(RowID::new(row_no), &vals) {
                 break;
             }
-            accepted += 1;
+            expected_rows.push(vals.to_vec());
         }
-        assert!(accepted > 1);
-        assert!(accepted < 100);
-        assert!(builder.build(0).is_ok());
+        assert!(expected_rows.len() > 1);
+        assert!(expected_rows.len() < 100);
+        assert_built_rows(builder, &expected_rows);
     }
 
+    /// Purpose: Report a builder row count that exceeds the persisted field's range.
+    /// Expected: Building fails with an encoding-contract error identifying the field limit.
     #[test]
     fn test_lwc_builder_reports_reachable_row_count_encoding_contract() {
         let metadata = TableMetadata::try_new(
@@ -2937,6 +3043,8 @@ mod tests {
         assert!(report.contains("maximum=65535"), "{report}");
     }
 
+    /// Purpose: Collect nullable integer statistics from live non-null row values.
+    /// Expected: Nulls and deleted rows do not affect the recorded extrema.
     #[test]
     fn test_lwc_builder_nullable_integer_stats_skip_nulls_and_deleted_rows() {
         let metadata = TableMetadata::try_new(
@@ -2953,7 +3061,7 @@ mod tests {
         for (row_id, value) in [
             Val::Null,
             Val::I16(5),
-            Val::I16(-10),
+            Val::I16(10),
             Val::Null,
             Val::I16(1000),
             Val::I16(8),
@@ -2972,12 +3080,14 @@ mod tests {
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
 
-        let stats = builder.stats[0].snapshot();
+        let stats = &builder.stats[0];
         assert!(stats.initialized);
-        assert_eq!(stats.min_i64, -10);
-        assert_eq!(stats.max_i64, 8);
+        assert_eq!(stats.min_i64, 5);
+        assert_eq!(stats.max_i64, 10);
     }
 
+    /// Purpose: Restore a builder snapshot after appending additional row-page data.
+    /// Expected: Rollback restores row identities, column values, and statistics.
     #[test]
     fn test_lwc_builder_rollback() {
         let metadata = TableMetadata::try_new(
@@ -2988,72 +3098,40 @@ mod tests {
             vec![],
         )
         .expect("valid table metadata");
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(1), 4, metadata.col.as_ref());
-
-        for offset in 0..2u64 {
-            let c0 = Val::U8((10 + offset) as u8);
-            let c1 = Val::I16((20 + offset) as i16);
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), &[c0, c1]),
-                InsertRow::Ok(_)
-            ));
-        }
+        let rows = [
+            vec![Val::U8(10), Val::I16(20)],
+            vec![Val::U8(11), Val::I16(21)],
+        ];
+        let page = row_page_with_rows(&metadata, RowID::new(1), &rows);
 
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
 
         let snapshot = builder.snapshot_state();
-        let expected_row_count = builder.row_count();
-        let expected_row_ids_len = builder.row_ids.len();
-        let expected_stats: Vec<_> = builder
-            .stats
-            .iter()
-            .map(|stat| {
-                let snap = stat.snapshot();
-                (
-                    snap.initialized,
-                    snap.min_i64,
-                    snap.max_i64,
-                    snap.min_u64,
-                    snap.max_u64,
-                )
-            })
-            .collect();
+        let expected_stats = vec![(true, 0, 0, 10, 11), (true, 20, 21, 0, 0)];
+        assert_eq!(integer_stats(&builder), expected_stats);
 
-        for offset in 0..2u64 {
-            let c0 = Val::U8((30 + offset) as u8);
-            let c1 = Val::I16((40 + offset) as i16);
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), &[c0, c1]),
-                InsertRow::Ok(_)
-            ));
-        }
-        let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id));
+        let extra_rows = [
+            vec![Val::U8(30), Val::I16(40)],
+            vec![Val::U8(31), Val::I16(41)],
+        ];
+        let extra_page = row_page_with_rows(&metadata, RowID::new(3), &extra_rows);
+        let view = extra_page.vector_view(metadata.col.as_ref());
+        assert!(builder.append_view(view, extra_page.header.start_row_id));
 
+        assert_eq!(builder.row_count(), 4);
+        assert_ne!(integer_stats(&builder), expected_stats);
         builder.rollback(snapshot);
 
-        assert_eq!(builder.row_count(), expected_row_count);
-        assert_eq!(builder.row_ids.len(), expected_row_ids_len);
-        let restored_stats: Vec<_> = builder
-            .stats
-            .iter()
-            .map(|stat| {
-                let snap = stat.snapshot();
-                (
-                    snap.initialized,
-                    snap.min_i64,
-                    snap.max_i64,
-                    snap.min_u64,
-                    snap.max_u64,
-                )
-            })
-            .collect();
-        assert_eq!(restored_stats, expected_stats);
+        assert_eq!(builder.row_count(), 2);
+        assert_eq!(builder.row_ids(), &[RowID::new(1), RowID::new(2)]);
+        assert_eq!(integer_stats(&builder), expected_stats);
+        assert_built_rows(builder, &rows);
     }
 
+    /// Purpose: Build and decode a row page containing every supported column value kind.
+    /// Expected: Persisted columns retain their lengths, value kinds, and original values.
     #[test]
     fn test_lwc_builder_all_column_types() {
         let metadata = TableMetadata::try_new(
@@ -3073,9 +3151,6 @@ mod tests {
             vec![],
         )
         .expect("valid table metadata");
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(10), 6, metadata.col.as_ref());
-
         let rows = vec![
             vec![
                 Val::I8(-1),
@@ -3118,51 +3193,15 @@ mod tests {
             ],
         ];
 
-        for row in &rows {
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), row),
-                InsertRow::Ok(_)
-            ));
-        }
+        let page = row_page_with_rows(&metadata, RowID::new(10), &rows);
 
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         let view = page.vector_view(metadata.col.as_ref());
         assert!(builder.append_view(view, page.header.start_row_id));
-        let fingerprint = row_shape_fingerprint_for(builder.row_ids(), 10, 13);
-        let buf = builder.build(fingerprint).unwrap();
-
-        let lwc_block = LwcBlock::try_from_persisted_bytes(
-            buf.as_bytes(),
-            FileKind::TableFile,
-            test_block_id(1),
-        )
-        .unwrap();
-        assert_eq!(lwc_block.header.row_count() as usize, rows.len());
-
-        for (col_idx, expected_kind) in [
-            ValKind::I8,
-            ValKind::U8,
-            ValKind::I16,
-            ValKind::U16,
-            ValKind::I32,
-            ValKind::U32,
-            ValKind::I64,
-            ValKind::U64,
-            ValKind::F32,
-            ValKind::F64,
-            ValKind::VarByte,
-        ]
-        .iter()
-        .enumerate()
-        {
-            let column = lwc_block.column(metadata.col.as_ref(), col_idx).unwrap();
-            let data = column.data().unwrap();
-            assert_eq!(data.len(), rows.len());
-            for (row_idx, expected_row) in rows.iter().enumerate() {
-                let value = data.value(row_idx).unwrap();
-                assert_eq!(value.kind(), Some(*expected_kind));
-                assert_eq!(value, expected_row[col_idx]);
-            }
-        }
+        assert_eq!(
+            builder.row_ids(),
+            &[RowID::new(10), RowID::new(11), RowID::new(12)]
+        );
+        assert_built_rows(builder, &rows);
     }
 }
