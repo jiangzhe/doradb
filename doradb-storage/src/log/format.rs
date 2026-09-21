@@ -773,6 +773,27 @@ mod tests {
         buf
     }
 
+    fn assert_selected_slot(
+        generations: [u64; 2],
+        corrupt_slot: Option<usize>,
+        expected_slot: u32,
+        expected_generation: u64,
+    ) {
+        let mut slots: [Vec<u8>; 2] = std::array::from_fn(|slot| {
+            serialized_slot(&valid_super_block(slot as u32, generations[slot]))
+        });
+        if let Some(slot) = corrupt_slot {
+            slots[slot][64] ^= 1;
+        }
+        let file = slots.concat();
+        let selected = select_redo_super_block(&file, 7).unwrap();
+        assert_eq!(
+            (selected.slot_no, selected.generation),
+            (expected_slot, expected_generation),
+            "generations={generations:?}, corrupt_slot={corrupt_slot:?}"
+        );
+    }
+
     fn assert_integrity_error(err: Report<DataIntegrityError>, expected: DataIntegrityError) {
         assert_eq!(*err.current_context(), expected);
     }
@@ -781,6 +802,8 @@ mod tests {
         write_block_checksum(buf);
     }
 
+    /// Purpose: Protect the persisted layout of redo block headers.
+    /// Expected: Fields use their specified offsets and byte order and decode without loss.
     #[test]
     fn redo_block_header_serializes_fixed_layout() {
         let header = RedoBlockHeader {
@@ -804,6 +827,9 @@ mod tests {
         assert_eq!(parsed, header);
     }
 
+    /// Purpose: Protect the persisted layout of redo group start metadata.
+    /// Expected: Payload bounds and commit timestamps use their specified offsets and decode
+    /// without loss.
     #[test]
     fn redo_group_start_extension_serializes_fixed_layout() {
         let extension = RedoGroupStartExtension {
@@ -827,6 +853,9 @@ mod tests {
         assert_eq!(parsed, extension);
     }
 
+    /// Purpose: Protect integrity coverage across every region of a redo block.
+    /// Expected: An intact block verifies, while changes to its header, payload, or padding fail
+    /// checksum validation.
     #[test]
     fn redo_block_checksum_covers_header_payload_and_padding() {
         let mut block = vec![0u8; STORAGE_SECTOR_SIZE];
@@ -856,6 +885,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect payload capacity accounting for different redo block roles.
+    /// Expected: Start blocks reserve both headers and continuation blocks reserve only the block
+    /// header.
     #[test]
     fn redo_block_payload_capacity_uses_fixed_headers() {
         assert_eq!(
@@ -868,6 +900,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject redo headers with inconsistent flags, positions, or payload bounds.
+    /// Expected: Each malformed header reports an invalid payload.
     #[test]
     fn redo_block_validate_rejects_invalid_header_invariants() {
         let start_capacity = redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
@@ -918,6 +952,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject empty group bounds and reversed commit timestamp ranges.
+    /// Expected: Each malformed start extension reports an invalid payload.
     #[test]
     fn redo_group_start_extension_rejects_invalid_metadata() {
         let cases = [
@@ -947,6 +983,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect the open super-block layout within the standard integrity envelope.
+    /// Expected: Persisted fields occupy the specified offsets and parsing preserves the complete
+    /// super-block.
     #[test]
     fn redo_super_block_round_trips_with_standard_integrity_envelope() {
         let super_block = valid_super_block(0, 0);
@@ -977,6 +1016,9 @@ mod tests {
         assert_eq!(parsed, super_block);
     }
 
+    /// Purpose: Protect super-block parsing against corrupted identity, geometry, padding, and
+    /// integrity fields.
+    /// Expected: Each corruption produces the corresponding data-integrity classification.
     #[test]
     fn redo_super_block_rejects_invalid_fields() {
         let cases: Vec<CorruptCase> = vec![
@@ -1057,11 +1099,13 @@ mod tests {
             let mut buf = serialized_slot(&super_block);
             corrupt(&mut buf);
             let err = parse_redo_super_block(&buf, 7, 0).unwrap_err();
-            assert_integrity_error(err, expected);
-            let _ = name;
+            assert_eq!(*err.current_context(), expected, "corruption case: {name}");
         }
     }
 
+    /// Purpose: Distinguish open, sealed-empty, and sealed-nonempty super-block states.
+    /// Expected: Sealed states round-trip with advanced generation and a redo range only when
+    /// nonempty.
     #[test]
     fn redo_super_block_accepts_valid_sealed_encodings() {
         let open = valid_super_block(0, 0);
@@ -1092,8 +1136,16 @@ mod tests {
             non_empty.sealed_redo_range(),
             Some((TrxID::new(5), TrxID::new(9)))
         );
+        for (name, sealed) in [("empty", empty), ("nonempty", non_empty)] {
+            assert_eq!(sealed.generation, 1, "{name}");
+            assert_eq!(sealed.slot_no, 1, "{name}");
+            let decoded = parse_redo_super_block(&serialized_slot(&sealed), 7, 1).unwrap();
+            assert_eq!(decoded, sealed, "{name}");
+        }
     }
 
+    /// Purpose: Reject seal metadata inconsistent with file bounds or commit timestamp ranges.
+    /// Expected: Invalid open and sealed field combinations report invalid payloads.
     #[test]
     fn redo_super_block_rejects_invalid_sealed_field_combinations() {
         let open = valid_super_block(0, 0);
@@ -1148,6 +1200,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Preserve validation evidence when trusted super-block encoding fails.
+    /// Expected: Internal encoding reports retain the underlying integrity error and the failing
+    /// encoding stage.
     #[test]
     fn redo_super_block_internal_encoding_preserves_validation_source() {
         let invalid_slot_no = REDO_SUPER_BLOCK_SLOT_COUNT as u32;
@@ -1180,46 +1235,31 @@ mod tests {
         }
     }
 
+    /// Purpose: Select the current super-block when both slots are valid.
+    /// Expected: The valid slot with the newer generation wins.
     #[test]
     fn slot_selection_chooses_newest_valid_generation() {
-        let slot0 = serialized_slot(&valid_super_block(0, 0));
-        let slot1 = serialized_slot(&valid_super_block(1, 1));
-        let mut file = vec![0u8; REDO_DEFAULT_DATA_START_OFFSET];
-        file[..REDO_SUPER_BLOCK_SLOT_SIZE].copy_from_slice(&slot0);
-        file[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET].copy_from_slice(&slot1);
-
-        let selected = select_redo_super_block(&file, 7).unwrap();
-        assert_eq!(selected.slot_no, 1);
-        assert_eq!(selected.generation, 1);
+        assert_selected_slot([0, 1], None, 1, 1);
+        assert_selected_slot([1, 0], None, 0, 1);
     }
 
+    /// Purpose: Make super-block selection deterministic when valid generations tie.
+    /// Expected: The first slot wins the generation tie.
     #[test]
     fn slot_selection_keeps_first_slot_when_generation_ties() {
-        let slot0 = serialized_slot(&valid_super_block(0, 1));
-        let slot1 = serialized_slot(&valid_super_block(1, 1));
-        let mut file = vec![0u8; REDO_DEFAULT_DATA_START_OFFSET];
-        file[..REDO_SUPER_BLOCK_SLOT_SIZE].copy_from_slice(&slot0);
-        file[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET].copy_from_slice(&slot1);
-
-        let selected = select_redo_super_block(&file, 7).unwrap();
-        assert_eq!(selected.slot_no, 0);
-        assert_eq!(selected.generation, 1);
+        assert_selected_slot([1, 1], None, 0, 1);
     }
 
+    /// Purpose: Recover super-block metadata when the newer slot is corrupt.
+    /// Expected: Selection returns the intact older generation.
     #[test]
     fn slot_selection_falls_back_to_valid_older_slot() {
-        let slot0 = serialized_slot(&valid_super_block(0, 0));
-        let mut slot1 = serialized_slot(&valid_super_block(1, 1));
-        slot1[64] = 1;
-        let mut file = vec![0u8; REDO_DEFAULT_DATA_START_OFFSET];
-        file[..REDO_SUPER_BLOCK_SLOT_SIZE].copy_from_slice(&slot0);
-        file[REDO_SUPER_BLOCK_SLOT_SIZE..REDO_DEFAULT_DATA_START_OFFSET].copy_from_slice(&slot1);
-
-        let selected = select_redo_super_block(&file, 7).unwrap();
-        assert_eq!(selected.slot_no, 0);
-        assert_eq!(selected.generation, 0);
+        assert_selected_slot([0, 1], Some(1), 0, 0);
+        assert_selected_slot([1, 0], Some(0), 1, 0);
     }
 
+    /// Purpose: Reject files with no initialized super-block slot.
+    /// Expected: Selection reports invalid magic instead of accepting an empty header.
     #[test]
     fn slot_selection_rejects_all_zero_slots() {
         let file = vec![0u8; REDO_DEFAULT_DATA_START_OFFSET];

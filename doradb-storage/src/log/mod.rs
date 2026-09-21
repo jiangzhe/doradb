@@ -2588,6 +2588,14 @@ mod tests {
         release: Event,
     }
 
+    struct ReleaseRedoWriteOnDrop(ControlledRedoWriteHook);
+
+    impl Drop for ReleaseRedoWriteOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     #[derive(Clone)]
     struct ControlledRedoSyncHook {
         inner: Arc<ControlledRedoSyncHookInner>,
@@ -2851,6 +2859,61 @@ mod tests {
         );
     }
 
+    fn redo_files_for_test(sequences: &[u32]) -> (TempDir, String) {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir
+            .path()
+            .join("redo.log")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        for &seq in sequences {
+            drop(create_log_file_for_test(
+                &file_prefix,
+                seq,
+                128 * 1024,
+                4096,
+            ));
+        }
+        (temp_dir, file_prefix)
+    }
+
+    fn assert_redo_sequence_gap(
+        sequences: &[u32],
+        first_retained: u32,
+        expected_message: &str,
+    ) -> Report<RuntimeError> {
+        let (_temp_dir, file_prefix) = redo_files_for_test(sequences);
+        let err = discover_redo_log_files(&file_prefix, first_retained, false).unwrap_err();
+        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
+        let report = format!("{err:?}");
+        assert!(
+            report.contains(expected_message),
+            "sequences={sequences:?}, first_retained={first_retained}, expected={expected_message}: {report}"
+        );
+        assert!(report.contains(&file_prefix), "{report}");
+        err
+    }
+
+    fn assert_discovered_redo_sequences(
+        sequences: &[u32],
+        first_retained: u32,
+        descending: bool,
+        expected: &[u32],
+    ) {
+        let (_temp_dir, file_prefix) = redo_files_for_test(sequences);
+        let descriptors =
+            discover_redo_log_files(&file_prefix, first_retained, descending).unwrap();
+        let actual: Vec<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.seq)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "sequences={sequences:?}, first_retained={first_retained}, descending={descending}"
+        );
+    }
+
     fn oversized_redo_log_for_test(cts: TrxID) -> TrxLog {
         let mut rows = BTreeMap::new();
         let text: String = repeat_n('a', 8000).collect();
@@ -2954,6 +3017,39 @@ mod tests {
         RedoLogFinalizer::new(file_prefix, log_write_io_depth, 128 * 1024, 4096, 0)
             .finalize(purge_tx)
             .unwrap()
+    }
+
+    fn standalone_redo_log_for_test(stem: &str, io_depth: usize) -> (TempDir, RedoLog) {
+        let temp_dir = TempDir::new().unwrap();
+        let file_prefix = temp_dir.path().join(stem).to_str().unwrap().to_owned();
+        let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, io_depth);
+        (temp_dir, redo_log)
+    }
+
+    async fn assert_skipped_sealed_redo(
+        durable_end_offset: usize,
+        redo_range: Option<(TrxID, TrxID)>,
+        floor: TrxID,
+        expected_seed: Option<TrxID>,
+    ) {
+        let (_temp_dir, file_prefix) = redo_files_for_test(&[]);
+        create_sealed_log_file_for_test(&file_prefix, 0, durable_end_offset, redo_range);
+        let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
+        let (finalizer, planner, read_depth) =
+            redo_planner_and_finalizer_for_test(&file_prefix, 1, 1, 128 * 1024, 4096, logs);
+
+        let planned = planner.plan_recovery(floor, read_depth).unwrap();
+        assert_eq!(
+            planned.skipped_max_recovered_cts, expected_seed,
+            "redo_range={redo_range:?}, floor={floor:?}"
+        );
+        assert!(
+            read_recovery_headers(planned.stream)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(finalizer.next_file_seq, 1);
     }
 
     fn submit_header_write_for_test(
@@ -3333,6 +3429,44 @@ mod tests {
         assert!(poison.downcast_ref::<IoError>().is_some(), "{poison:?}");
     }
 
+    fn assert_rotated_file_seal_failure(
+        log_sync: LogSync,
+        log_file_stem: &str,
+        make_hook: impl FnOnce(RawFd) -> Arc<dyn StorageBackendTestHook>,
+        expected: FatalError,
+    ) {
+        smol::block_on(async {
+            let (_engine_temp_dir, engine) =
+                build_redo_test_engine(log_file_stem, LogSync::None).await;
+            let (temp_dir, file_prefix) = redo_files_for_test(&[]);
+            let harness_prefix = temp_dir
+                .path()
+                .join("harness_redo.log")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
+            let _install = install_storage_backend_test_hook(make_hook(ended_log_file.as_raw_fd()));
+            let (harness, mut write_driver) =
+                manual_redo_log_writer_for_seal(&engine, log_sync, harness_prefix);
+            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
+
+            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
+
+            let err = harness
+                .poisoner
+                .poison_error()
+                .expect("failed seal must poison admission");
+            assert_eq!(*err.current_context(), expected, "{log_file_stem}: {err:?}");
+            assert!(err.downcast_ref::<IoError>().is_some(), "{err:?}");
+            drop(harness);
+            engine.shutdown();
+        });
+    }
+
+    /// Purpose: Protect interpretation of sync completions and their error evidence.
+    /// Expected: Successful syncs accept only an empty result; invalid results retain fatal sync
+    /// and I/O context.
     #[test]
     fn test_redo_sync_completion_accepts_only_zero_success_result() {
         assert!(redo_io_failure(IOKind::Fsync, Ok(0), 0).is_none());
@@ -3355,6 +3489,8 @@ mod tests {
         assert!(format!("{failure:?}").contains("op_kind=fdatasync"));
     }
 
+    /// Purpose: Enforce the current-file invariant when rotating redo files.
+    /// Expected: Rotation without a current file panics with the owning invariant diagnostic.
     #[test]
     #[should_panic(expected = "redo log rotation requires a current log file")]
     fn test_rotate_log_file_asserts_current_file() {
@@ -3374,6 +3510,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Enforce the current-file invariant when enqueuing a system commit.
+    /// Expected: Committing without a current file panics with the enqueue invariant diagnostic.
     #[test]
     #[should_panic(expected = "enqueue redo group requires a current log file")]
     fn test_commit_sys_asserts_current_log_file() {
@@ -3396,6 +3534,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Handle file creation failure while a user commit rotates the redo log.
+    /// Expected: Commit ends the session transaction and poisons admission while preserving the
+    /// typed I/O cause.
     #[test]
     fn test_user_commit_rotation_create_failure_rejects_without_panic() {
         smol::block_on(async {
@@ -3476,6 +3617,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction completion after the caller drops an accepted commit future.
+    /// Expected: The session remains active while redo is held and becomes inactive after
+    /// completion is released.
     #[test]
     fn test_dropped_user_commit_future_after_handoff_finishes_session() {
         smol::block_on(async {
@@ -3524,6 +3668,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown ownership of accepted commits whose waiters were dropped.
+    /// Expected: Shutdown waits for held redo completion and drains the transaction from the active
+    /// horizon.
     #[test]
     fn test_shutdown_drains_committed_handoff_after_dropped_commit_waiter() {
         smol::block_on(async {
@@ -3568,25 +3715,36 @@ mod tests {
             drop(commit_fut);
 
             thread::scope(|scope| {
-                let (started_tx, started_rx) = mpsc::channel();
                 let (done_tx, done_rx) = mpsc::channel();
                 let shutdown_engine = &engine;
                 let shutdown = scope.spawn(move || {
-                    started_tx
-                        .send(())
-                        .expect("shutdown thread should report start");
                     shutdown_engine.shutdown();
                     done_tx.send(()).expect("shutdown should report completion");
                 });
 
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("shutdown thread should start");
-                assert!(
-                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-                    "shutdown must wait while redo final commit is blocked"
-                );
+                // Shutdown closes admission before waiting for accepted work. Poll that
+                // predicate with a bounded watchdog; poison must not satisfy it. Release
+                // the held write on unwind as well so the scoped shutdown thread can exit.
+                let _release_on_drop = ReleaseRedoWriteOnDrop(hook.clone());
+                smol::block_on(wait_for(|| {
+                    match engine.inner().acquire_admission().disclose() {
+                        Ok(_) => false,
+                        Err(err) => {
+                            assert_eq!(
+                                err.report().downcast_ref::<LifecycleError>().copied(),
+                                Some(LifecycleError::Shutdown),
+                                "{err:?}"
+                            );
+                            true
+                        }
+                    }
+                }));
+                let blocked = done_rx.recv_timeout(Duration::from_millis(20));
                 hook.release();
+                assert!(
+                    matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+                    "shutdown must wait while redo final commit is blocked: {blocked:?}"
+                );
                 done_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("shutdown should finish after redo completion");
@@ -3601,6 +3759,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject user commits after group-commit admission closes independently of queue
+    /// messages.
+    /// Expected: Commit reports shutdown and clears the session transaction state.
     #[test]
     fn test_closed_group_commit_rejects_after_shutdown_message_consumed() {
         smol::block_on(async {
@@ -3635,6 +3796,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect user transaction cleanup when redo fsync fails.
+    /// Expected: Commit reports fatal sync failure only after clearing session state and poisoning
+    /// admission.
     #[test]
     fn test_user_redo_fsync_failure_rolls_back_session_before_return() {
         smol::block_on(async {
@@ -3694,19 +3858,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Batch ready redo completions for the same file behind a shared sync.
+    /// Expected: A single sync publishes the completed prefix and accounts for every committed
+    /// transaction.
     #[test]
     fn test_wait_and_drain_buffered_completions_batches_same_file_sync() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("buffered_completion_batch", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_buffered_batch_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_buffered_batch_redo.log", 2);
             let log_fd = redo_log
                 .group_commit
                 .lock()
@@ -3792,19 +3953,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect commit ordering when redo writes complete out of order.
+    /// Expected: A ready successor remains queued without syncing or advancing persistence past
+    /// unfinished work.
     #[test]
     fn test_wait_and_drain_keeps_later_ready_group_behind_unfinished_prefix() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("buffered_completion_order", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_buffered_order_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_buffered_order_redo.log", 2);
             let log_fd = redo_log
                 .group_commit
                 .lock()
@@ -3874,19 +4032,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Classify backend progress failure while only a redo sync remains in flight.
+    /// Expected: The writer enters shutdown and poisons the engine with a redo-sync failure.
     #[test]
     fn test_sync_only_backend_wait_progress_failure_poisons_redo_sync() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("sync_only_backend_wait_failure", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_sync_only_wait_failure_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_sync_only_wait_failure_redo.log", 2);
             let log_fd = redo_log
                 .group_commit
                 .lock()
@@ -3939,19 +4093,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Drain a ready transaction prefix that requires no outstanding I/O.
+    /// Expected: The prefix empties and its commit timestamp becomes persisted without pending
+    /// requests.
     #[test]
     fn test_drain_pending_prefix_finalizes_finished_prefix_without_submitted_write() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_no_submitted_write", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let (_temp_dir, redo_log) = standalone_redo_log_for_test("standalone_redo.log", 1);
             let config = TrxSysConfig::default()
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
@@ -3990,19 +4140,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect submission ordering at the start of a redo file.
+    /// Expected: The header is submitted before the following group, which becomes persisted after
+    /// the prefix drains.
     #[test]
     fn test_log_file_boundary_header_request_precedes_following_group_request() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("header_and_group_submit", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_header_group_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_header_group_redo.log", 2);
             let config = TrxSysConfig::default()
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
@@ -4094,19 +4241,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Reuse returned redo buffers when materializing a queued multi-block group.
+    /// Expected: Pending group writes own the previously recycled allocations.
     #[test]
     fn test_fetch_io_reqs_materializes_group_with_recycled_redo_buffers() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("fetch_reuses_redo_buffer", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_reuse_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 2);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_reuse_redo.log", 2);
             let config = TrxSysConfig::default()
                 .log_block_size(4096usize)
                 .log_sync(LogSync::None);
@@ -4191,19 +4334,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect sync ownership when a ready group is followed by file rotation.
+    /// Expected: Group and seal syncs target the ended file and the drained group advances
+    /// persistence.
     #[test]
     fn test_drain_pending_prefix_syncs_boundary_ended_log_file() {
         smol::block_on(async {
             let (_engine_temp_dir, engine) =
                 build_redo_test_engine("finish_pending_switch_syncer", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_switch_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let (redo_log, _initial_header) = finish_redo_log_for_test(file_prefix, 1);
+            let (_temp_dir, redo_log) =
+                standalone_redo_log_for_test("standalone_switch_redo.log", 1);
 
             let (ended_fd, current_fd) = {
                 let mut group_commit_g = redo_log.group_commit.lock();
@@ -4267,6 +4407,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Drain a seal owned by the ordered redo prefix.
+    /// Expected: Seal processing finishes with no pending or submitted I/O.
     #[test]
     fn test_drain_pending_prefix_drains_prefix_owned_seal() {
         smol::block_on(async {
@@ -4301,6 +4443,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rotated-file sealing under the fsync policy.
+    /// Expected: The inactive slot records the sealed range and the ended file receives fsync.
     #[test]
     fn test_rotated_file_seal_writes_inactive_slot_and_fsyncs_ended_fd() {
         assert_rotated_file_seal_sync_policy(
@@ -4310,6 +4454,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect rotated-file sealing under the fdatasync policy.
+    /// Expected: The inactive slot records the sealed range and the ended file receives fdatasync.
     #[test]
     fn test_rotated_file_seal_fdatasyncs_ended_fd() {
         assert_rotated_file_seal_sync_policy(
@@ -4319,94 +4465,47 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect rotated-file sealing when sync is disabled.
+    /// Expected: The inactive slot records the sealed range without issuing a sync syscall.
     #[test]
     fn test_rotated_file_seal_with_log_sync_none_skips_sync_syscall() {
         assert_rotated_file_seal_sync_policy(LogSync::None, None, "rotated_seal_no_sync");
     }
 
+    /// Purpose: Handle failure while writing a rotated file's seal.
+    /// Expected: Seal work drains and runtime admission is poisoned with a redo-write failure.
     #[test]
     fn test_rotated_file_seal_write_failure_poisons_storage() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("rotated_seal_write_failure", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_seal_write_fail_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let harness_prefix = temp_dir
-                .path()
-                .join("standalone_seal_write_fail_harness_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
-            let hook = ControlledRedoWriteHook::new(ended_log_file.as_raw_fd(), libc::EIO);
-            hook.release();
-            let _install = install_storage_backend_test_hook(Arc::new(hook));
-            let (harness, mut write_driver) =
-                manual_redo_log_writer_for_seal(&engine, LogSync::None, harness_prefix);
-
-            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
-
-            assert!(
-                harness
-                    .poisoner
-                    .poison_error()
-                    .as_ref()
-                    .is_some_and(|err| *err.current_context() == FatalError::RedoWrite)
-            );
-
-            drop(harness);
-            engine.shutdown();
-        });
+        assert_rotated_file_seal_failure(
+            LogSync::None,
+            "rotated_seal_write_failure",
+            |fd| {
+                let hook = ControlledRedoWriteHook::new(fd, libc::EIO);
+                hook.release();
+                Arc::new(hook)
+            },
+            FatalError::RedoWrite,
+        );
     }
 
+    /// Purpose: Handle failure while syncing a rotated file's seal.
+    /// Expected: Seal work drains and runtime admission is poisoned with a redo-sync failure.
     #[test]
     fn test_rotated_file_seal_sync_failure_poisons_storage() {
-        smol::block_on(async {
-            let (_engine_temp_dir, engine) =
-                build_redo_test_engine("rotated_seal_sync_failure", LogSync::None).await;
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir
-                .path()
-                .join("standalone_seal_sync_fail_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let harness_prefix = temp_dir
-                .path()
-                .join("standalone_seal_sync_fail_harness_redo.log")
-                .to_str()
-                .unwrap()
-                .to_owned();
-            let ended_log_file = create_log_file_for_test(&file_prefix, 0, 128 * 1024, 4096);
-            let hook =
-                ControlledRedoSyncHook::new(ended_log_file.as_raw_fd(), IOKind::Fsync, libc::EIO);
-            hook.release();
-            let _install = install_storage_backend_test_hook(Arc::new(hook));
-            let (harness, mut write_driver) =
-                manual_redo_log_writer_for_seal(&engine, LogSync::Fsync, harness_prefix);
-
-            let mut sealer = LogFileSealer::new(&harness.trx_sys.config);
-            finish_prefix_seal_for_test(&harness, &mut write_driver, &mut sealer, ended_log_file);
-
-            assert!(
-                harness
-                    .poisoner
-                    .poison_error()
-                    .as_ref()
-                    .is_some_and(|err| *err.current_context() == FatalError::RedoSync)
-            );
-
-            drop(harness);
-            engine.shutdown();
-        });
+        assert_rotated_file_seal_failure(
+            LogSync::Fsync,
+            "rotated_seal_sync_failure",
+            |fd| {
+                let hook = ControlledRedoSyncHook::new(fd, IOKind::Fsync, libc::EIO);
+                hook.release();
+                Arc::new(hook)
+            },
+            FatalError::RedoSync,
+        );
     }
 
+    /// Purpose: Keep active-file sealing failure nonfatal during clean shutdown.
+    /// Expected: The failure is counted without poisoning the engine.
     #[test]
     fn test_clean_shutdown_active_seal_failure_is_best_effort() {
         smol::block_on(async {
@@ -4455,6 +4554,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Include queued system commits in the active file's shutdown seal.
+    /// Expected: Shutdown leaves a sealed generation covering the committed redo range and durable
+    /// data end.
     #[test]
     fn test_clean_shutdown_seals_active_file_after_pending_work_drains() {
         smol::block_on(async {
@@ -4487,6 +4589,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Release an unprepared seal when earlier prefix work fails.
+    /// Expected: The failed header completes with an error and the entire prefix becomes drainable.
     #[test]
     fn test_fail_prefix_entries_marks_unprepared_seal_ready() {
         smol::block_on(async {
@@ -4540,6 +4644,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Discover redo files in a directory containing pattern metacharacters.
+    /// Expected: Only the exact file prefix matches and results follow the requested sequence
+    /// order.
     #[test]
     fn test_discover_redo_log_files_escapes_directory_metacharacters() {
         let temp_dir = TempDir::new().unwrap();
@@ -4592,6 +4699,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject redo sequence advancement past the representable limit.
+    /// Expected: The integrity report identifies the terminal sequence instead of wrapping.
     #[test]
     fn test_next_redo_file_seq_returns_data_integrity_report() {
         let err = next_redo_file_seq(u32::MAX).unwrap_err();
@@ -4604,6 +4713,9 @@ mod tests {
         assert!(report.contains("terminal sequence ffffffff"), "{report}");
     }
 
+    /// Purpose: Detect an internal gap in an ordered redo descriptor list.
+    /// Expected: Validation reports a sequence-gap integrity error identifying the missing
+    /// sequence.
     #[test]
     fn test_validate_redo_log_file_sequences_returns_data_integrity_report() {
         let files = [
@@ -4626,20 +4738,14 @@ mod tests {
         assert!(report.contains("00000001"), "{report}");
     }
 
+    /// Purpose: Reject redo discovery when the initial required file is missing.
+    /// Expected: The access report identifies the missing prefix and preserves its integrity cause
+    /// through disclosure.
     #[test]
     fn test_discover_redo_log_files_rejects_missing_prefix() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
-
-        let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
-        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
+        let err = assert_redo_sequence_gap(&[1], 0, "00000000");
         let report = format!("{err:?}");
-        assert!(report.contains("00000000"), "{report}");
         assert!(report.contains("prefix"), "{report}");
-        assert!(report.contains(file_prefix), "{report}");
-
         let err = err.disclose();
         assert_eq!(err.kind(), ErrorKind::Runtime);
         assert_eq!(
@@ -4652,109 +4758,57 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject redo discovery when an interior file is missing.
+    /// Expected: The access report retains the sequence-gap cause and identifies the missing file
+    /// and prefix.
     #[test]
     fn test_discover_redo_log_files_rejects_sequence_gap() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096));
-        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
-
-        let err = discover_redo_log_files(file_prefix, 0, false).unwrap_err();
-        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
-        let report = format!("{err:?}");
-        assert!(report.contains("00000001"), "{report}");
-        assert!(report.contains(file_prefix), "{report}");
+        drop(assert_redo_sequence_gap(&[0, 2], 0, "00000001"));
     }
 
+    /// Purpose: Discover a retained redo suffix after earlier files have been removed.
+    /// Expected: The contiguous suffix beginning at the retention marker is accepted in sequence
+    /// order.
     #[test]
     fn test_discover_redo_log_files_accepts_retained_suffix_without_prefix() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
-        drop(create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096));
-
-        let descriptors = discover_redo_log_files(file_prefix, 2, false).unwrap();
-        assert_eq!(
-            descriptors
-                .iter()
-                .map(|descriptor| descriptor.seq)
-                .collect::<Vec<_>>(),
-            vec![2, 3]
-        );
+        assert_discovered_redo_sequences(&[2, 3], 2, false, &[2, 3]);
     }
 
+    /// Purpose: Exclude obsolete redo files below the retention marker.
+    /// Expected: Descending discovery returns only the retained suffix in reverse sequence order.
     #[test]
     fn test_discover_redo_log_files_excludes_obsolete_prefix_below_marker() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        for file_seq in 0..4 {
-            drop(create_log_file_for_test(
-                file_prefix,
-                file_seq,
-                128 * 1024,
-                4096,
-            ));
-        }
-
-        let descriptors = discover_redo_log_files(file_prefix, 2, true).unwrap();
-        assert_eq!(
-            descriptors
-                .iter()
-                .map(|descriptor| descriptor.seq)
-                .collect::<Vec<_>>(),
-            vec![3, 2]
-        );
+        assert_discovered_redo_sequences(&[0, 1, 2, 3], 2, true, &[3, 2]);
     }
 
+    /// Purpose: Reject a retention marker beyond every existing redo file.
+    /// Expected: Discovery reports a sequence gap identifying the required first retained file.
     #[test]
     fn test_discover_redo_log_files_rejects_empty_retained_suffix() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 0, 128 * 1024, 4096));
-        drop(create_log_file_for_test(file_prefix, 1, 128 * 1024, 4096));
-
-        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
-        let report = format!("{err:?}");
-        assert!(
-            report.contains("first retained sequence 00000002"),
-            "{report}"
-        );
+        drop(assert_redo_sequence_gap(
+            &[0, 1],
+            2,
+            "first retained sequence 00000002",
+        ));
     }
 
+    /// Purpose: Reject a retained suffix whose marker file is missing.
+    /// Expected: Discovery reports a sequence gap identifying the marker file and log prefix.
     #[test]
     fn test_discover_redo_log_files_rejects_missing_marker_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 3, 128 * 1024, 4096));
-
-        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
-        let report = format!("{err:?}");
-        assert!(report.contains("00000002"), "{report}");
-        assert!(report.contains(file_prefix), "{report}");
+        drop(assert_redo_sequence_gap(&[3], 2, "00000002"));
     }
 
+    /// Purpose: Reject an internal sequence gap within a retained redo suffix.
+    /// Expected: Discovery reports the missing retained file while preserving the integrity cause.
     #[test]
     fn test_discover_redo_log_files_rejects_gap_above_marker() {
-        let temp_dir = TempDir::new().unwrap();
-        let file_prefix = temp_dir.path().join("redo.log");
-        let file_prefix = file_prefix.to_str().unwrap();
-        drop(create_log_file_for_test(file_prefix, 2, 128 * 1024, 4096));
-        drop(create_log_file_for_test(file_prefix, 4, 128 * 1024, 4096));
-
-        let err = discover_redo_log_files(file_prefix, 2, false).unwrap_err();
-        assert_redo_discovery_data_integrity(&err, DataIntegrityError::RedoLogSequenceGap);
-        let report = format!("{err:?}");
-        assert!(report.contains("00000003"), "{report}");
-        assert!(report.contains(file_prefix), "{report}");
+        drop(assert_redo_sequence_gap(&[2, 4], 2, "00000003"));
     }
 
+    /// Purpose: Reject filenames that violate the single-stream redo naming format.
+    /// Expected: Discovery retains the invalid-name cause and describes the expected filename
+    /// format.
     #[test]
     fn test_discover_redo_log_files_rejects_invalid_single_stream_name() {
         let temp_dir = TempDir::new().unwrap();
@@ -4769,6 +4823,8 @@ mod tests {
         assert!(report.contains("<8-hex-sequence>"), "{report}");
     }
 
+    /// Purpose: Reject filenames that differ in case but encode the same redo sequence.
+    /// Expected: Discovery identifies the duplicate numeric sequence and both conflicting paths.
     #[test]
     fn test_discover_redo_log_files_rejects_duplicate_numeric_sequence() {
         let temp_dir = TempDir::new().unwrap();
@@ -4787,6 +4843,9 @@ mod tests {
         assert!(report.contains(&upper_path), "{report}");
     }
 
+    /// Purpose: Load sealed segment metadata directly from a discovered file descriptor.
+    /// Expected: Segment identity and sealed-empty state are available without opening a replay
+    /// stream.
     #[test]
     fn test_redo_segment_metadata_reads_valid_super_block_without_reader() {
         let temp_dir = TempDir::new().unwrap();
@@ -4804,6 +4863,9 @@ mod tests {
         assert!(segment.sealed_empty());
     }
 
+    /// Purpose: Stop backward planning at required redo before inspecting an older corrupt file.
+    /// Expected: Planning succeeds without a skipped timestamp seed, while consuming the required
+    /// stream detects corruption.
     #[test]
     fn test_redo_replay_plan_stops_before_invalid_obsolete_prefix() {
         smol::block_on(async {
@@ -4833,6 +4895,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reuse a replay planner to construct independent streams for an empty log set.
+    /// Expected: Each planned stream completes without yielding headers.
     #[test]
     fn test_redo_replay_planner_can_build_independent_empty_streams() {
         smol::block_on(async {
@@ -4845,57 +4909,35 @@ mod tests {
         });
     }
 
+    /// Purpose: Skip a sealed nonempty segment older than the replay boundary.
+    /// Expected: Replay is empty, the skipped maximum seeds recovery, and the next file sequence
+    /// advances.
     #[test]
     fn test_redo_replay_plan_skips_obsolete_sealed_segment_and_seeds_cts() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir.path().join("redo.log");
-            let file_prefix = file_prefix.to_str().unwrap();
-            create_sealed_log_file_for_test(
-                file_prefix,
-                0,
-                REDO_DEFAULT_DATA_START_OFFSET + 4096,
-                Some((TrxID::new(10), TrxID::new(20))),
-            );
-            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
-            let (finalizer, planner, read_depth) =
-                redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
-
-            let planned = planner.plan_recovery(TrxID::new(21), read_depth).unwrap();
-            assert_eq!(planned.skipped_max_recovered_cts, Some(TrxID::new(20)));
-            assert!(
-                read_recovery_headers(planned.stream)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(finalizer.next_file_seq, 1);
-        });
+        smol::block_on(assert_skipped_sealed_redo(
+            REDO_DEFAULT_DATA_START_OFFSET + 4096,
+            Some((TrxID::new(10), TrxID::new(20))),
+            TrxID::new(21),
+            Some(TrxID::new(20)),
+        ));
     }
 
+    /// Purpose: Skip a sealed empty segment during recovery planning.
+    /// Expected: Replay is empty without inventing a recovered timestamp, and the next file
+    /// sequence advances.
     #[test]
     fn test_redo_replay_plan_skips_sealed_empty_without_cts_seed() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let file_prefix = temp_dir.path().join("redo.log");
-            let file_prefix = file_prefix.to_str().unwrap();
-            create_sealed_log_file_for_test(file_prefix, 0, REDO_DEFAULT_DATA_START_OFFSET, None);
-            let logs = discover_redo_log_files(file_prefix, 0, false).unwrap();
-            let (finalizer, planner, read_depth) =
-                redo_planner_and_finalizer_for_test(file_prefix, 1, 1, 128 * 1024, 4096, logs);
-
-            let planned = planner.plan_recovery(TrxID::new(100), read_depth).unwrap();
-            assert_eq!(planned.skipped_max_recovered_cts, None);
-            assert!(
-                read_recovery_headers(planned.stream)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(finalizer.next_file_seq, 1);
-        });
+        smol::block_on(assert_skipped_sealed_redo(
+            REDO_DEFAULT_DATA_START_OFFSET,
+            None,
+            TrxID::new(100),
+            None,
+        ));
     }
 
+    /// Purpose: Keep a sealed segment whose maximum timestamp equals the replay boundary.
+    /// Expected: The segment remains in replay and its corrupt payload is detected rather than
+    /// silently skipped.
     #[test]
     fn test_redo_replay_plan_does_not_skip_boundary_equality() {
         smol::block_on(async {
@@ -4921,6 +4963,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Initialize a new redo file with an open super-block and reserved header space.
+    /// Expected: The first data allocation follows the headers, configured geometry persists, and
+    /// the other slot is invalid.
     #[test]
     fn test_create_log_file_writes_open_super_block() {
         let temp_dir = TempDir::new().unwrap();
@@ -4934,6 +4979,7 @@ mod tests {
 
         let bytes = fs::read(format!("{file_prefix}.00000003")).unwrap();
         let slot0 = parse_redo_super_block(&bytes[..REDO_SUPER_BLOCK_SLOT_SIZE], 3, 0).unwrap();
+        assert!(!slot0.is_sealed());
         assert_eq!(slot0.slot_no, 0);
         assert_eq!(slot0.generation, 0);
         assert_eq!(slot0.log_block_size, 4096);
@@ -4944,6 +4990,9 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidMagic);
     }
 
+    /// Purpose: Route a recovered file's seal through normal ordered-prefix processing.
+    /// Expected: Draining completes startup I/O and persists the recovered end offset and redo
+    /// timestamp range.
     #[test]
     fn test_recovery_finalizer_seals_recovered_redo_file_in_normal_prefix() {
         smol::block_on(async {
@@ -5007,6 +5056,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reinitialize an existing sealed tail selected for startup truncation.
+    /// Expected: The replacement file has an open super-block and no valid stale seal slot.
     #[test]
     fn test_redo_finalizer_recreates_existing_tail_file() {
         let temp_dir = TempDir::new().unwrap();
@@ -5048,6 +5099,9 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidMagic);
     }
 
+    /// Purpose: Protect restart across a change in redo block and file geometry.
+    /// Expected: Old records replay using persisted geometry and the next file records the current
+    /// configuration.
     #[test]
     fn test_restart_replays_old_log_with_persisted_config_and_creates_new_log_with_current_config()
     {
@@ -5178,6 +5232,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Propagate invalid redo filenames through engine bootstrap.
+    /// Expected: Startup fails with redo-access context, the original integrity cause, and filename
+    /// guidance.
     #[test]
     fn test_engine_startup_rejects_invalid_redo_file_name() {
         smol::block_on(async {
@@ -5209,6 +5266,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject legacy redo files without initialized super-blocks during startup.
+    /// Expected: Bootstrap fails with the invalid-magic integrity cause.
     #[test]
     fn test_engine_startup_rejects_legacy_zero_header_redo_file() {
         smol::block_on(async {
@@ -5234,6 +5293,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Read committed user mutations through the direct redo stream.
+    /// Expected: Every committed insert is returned in order with its original row values.
     #[test]
     fn test_direct_redo_log_stream_reader() {
         smol::block_on(async {
@@ -5258,40 +5319,48 @@ mod tests {
             .unwrap();
             let table_id = table2(&engine).await;
 
+            let expected_rows: Vec<_> = (0..SIZE)
+                .map(|i| vec![Val::from(i), Val::from(i.to_string().as_str())])
+                .collect();
             let mut session = engine.new_session().unwrap();
-            {
-                for i in 0..SIZE {
-                    let mut trx = session.begin_trx().unwrap();
-                    let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
-                    trx.table_insert_mvcc(table_id, insert).await.unwrap();
-                    trx.commit().await.unwrap();
-                }
+            for row in &expected_rows {
+                let mut trx = session.begin_trx().unwrap();
+                trx.table_insert_mvcc(table_id, row.clone()).await.unwrap();
+                trx.commit().await.unwrap();
             }
             drop(session);
 
-            let mut log_recs = 0usize;
+            let mut actual_rows = Vec::new();
+            let mut commit_timestamps = Vec::new();
             let file_prefix = engine.inner().trx_sys.config.file_prefix().unwrap();
             let logs = discover_redo_log_files(&file_prefix, 0, false).unwrap();
             let planner = RedoReplayPlanner::new(logs);
             let mut stream = planner.plan_catalog_scan(TrxID::new(0), 1).unwrap().stream;
             while let Some(pod) = stream.try_next().await.unwrap() {
-                println!(
-                    "log {}, header={:?}, payload={:?}",
-                    log_recs, pod.header, pod.payload
-                );
-                log_recs += 1;
+                if let Some(table_redo) = pod.payload.dml.get(&table_id) {
+                    assert_eq!(pod.header.trx_kind, RedoTrxKind::User);
+                    assert_eq!(table_redo.rows.len(), 1);
+                    commit_timestamps.push(pod.header.cts);
+                    for row in table_redo.rows.values() {
+                        let RowRedoKind::Insert(_, vals) = &row.kind else {
+                            panic!("expected streamed insert, got {:?}", row.kind);
+                        };
+                        actual_rows.push(vals.clone());
+                    }
+                }
             }
-            println!("total log records {}", log_recs);
+            assert_eq!(actual_rows, expected_rows);
             assert!(
-                log_recs > 0,
-                "direct redo stream should produce at least one record"
+                commit_timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+                "streamed user commits must retain their timestamp order: {commit_timestamps:?}"
             );
 
             drop(engine);
         });
     }
 
+    /// Purpose: Propagate redo-write failure to in-flight and queued commit waiters.
+    /// Expected: Both waiters retain the fatal I/O cause and runtime admission becomes poisoned.
     #[test]
     fn test_redo_write_failure_poison_runtime_and_fail_waiters() {
         smol::block_on(async {
@@ -5344,6 +5413,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Propagate redo fsync failure to in-flight and queued commit waiters.
+    /// Expected: Both waiters retain fsync failure evidence and runtime admission is poisoned.
     #[test]
     fn test_redo_fsync_failure_poison_runtime_and_fail_waiters() {
         smol::block_on(async {
@@ -5356,6 +5427,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Propagate redo fdatasync failure to in-flight and queued commit waiters.
+    /// Expected: Both waiters retain fdatasync failure evidence and runtime admission is poisoned.
     #[test]
     fn test_redo_fdatasync_failure_poison_runtime_and_fail_waiters() {
         smol::block_on(async {
@@ -5368,6 +5441,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Assign a commit timestamp to an accepted system transaction.
+    /// Expected: System commit returns a timestamp within the valid snapshot domain.
     #[test]
     fn test_commit_sys_returns_cts() {
         smol::block_on(async {
@@ -5384,6 +5459,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Allow system commit to return while its redo sync remains held.
+    /// Expected: The assigned timestamp is returned before the persisted watermark reaches it.
     #[test]
     fn test_commit_sys_returns_before_held_redo_sync() {
         smol::block_on(async {
