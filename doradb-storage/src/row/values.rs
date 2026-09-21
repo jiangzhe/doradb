@@ -158,17 +158,26 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect repeatable row and sparse-update access to separately buffered values.
+    /// Expected: Reads preserve input order and repeated ordinals while borrowing bytes independent of the source.
     #[test]
     fn test_buffer_values_repeatable_access() {
-        let input = [
+        let mut source = b"independent buffer".to_vec();
+        let values = BufferValues::new([
+            (4, ValRef::VarByte(&source)),
+            (2, ValRef::Null),
+            (4, ValRef::VarByte(b"second descriptor")),
+        ]);
+        source.fill(0xa5);
+        let expected = [
             (4, ValRef::VarByte(b"independent buffer")),
             (2, ValRef::Null),
+            (4, ValRef::VarByte(b"second descriptor")),
         ];
-        let values = BufferValues::new(input);
-        assert_eq!(RowValues::len(&values), input.len());
-        assert_eq!(UpdateValues::len(&values), input.len());
+        assert_eq!(RowValues::len(&values), expected.len());
+        assert_eq!(UpdateValues::len(&values), expected.len());
         for _ in 0..3 {
-            for (index, expected) in input.iter().enumerate() {
+            for (index, expected) in expected.iter().enumerate() {
                 assert_eq!(UpdateValues::value(&values, index), *expected);
                 assert_eq!(RowValues::value(&values, index), expected.1);
             }

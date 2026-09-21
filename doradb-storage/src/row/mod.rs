@@ -1767,7 +1767,6 @@ const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use core::str;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::catalog::{
@@ -1782,6 +1781,31 @@ pub(crate) mod tests {
 
     pub(super) fn create_row_page() -> RowPage {
         RowPage::new_test_page()
+    }
+
+    fn assert_live_row(
+        case: &str,
+        page: &RowPage,
+        layout: &TableColumnLayout,
+        row_idx: usize,
+        expected: &[Val],
+    ) {
+        let row_id = RowID::new(100 + row_idx as u64);
+        let Select::Ok(row) = page.select(row_id) else {
+            panic!("{case}: row {row_idx} must be readable");
+        };
+        assert_eq!(row.row_id(), row_id, "{case}: row {row_idx}");
+        assert!(!row.is_deleted(), "{case}: row {row_idx}");
+        assert_eq!(row.clone_vals(layout), expected, "{case}: row {row_idx}");
+        for (col_idx, value) in expected.iter().enumerate() {
+            if let Val::VarByte(bytes) = value {
+                assert_eq!(
+                    row.var(col_idx),
+                    bytes.as_bytes(),
+                    "{case}: row {row_idx}, column {col_idx}"
+                );
+            }
+        }
     }
 
     fn var_input_test_page() -> (TableMetadata, RowPage) {
@@ -1938,6 +1962,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect the physical row-page layout and checksum reservation.
+    /// Expected: Header fields, payload, and footer retain their specified sizes and offsets.
     #[test]
     fn test_row_page_layout_contract() {
         assert_eq!(mem::size_of::<RowPageHeader>(), 32);
@@ -1966,19 +1992,36 @@ pub(crate) mod tests {
         assert_eq!(mem::offset_of!(RowPage, footer), ROW_PAGE_USABLE_SIZE);
     }
 
+    /// Purpose: Protect row-capacity estimates across row widths and column counts.
+    /// Expected: Estimates match known capacities including page and bitmap overhead.
     #[test]
     fn test_estimate_max_row_count() {
-        for row_len in (100..600).step_by(100) {
+        // Known capacities for the persisted page layout, independent of the estimator.
+        for (row_len, expected) in [(100, 641), (200, 324), (300, 216), (400, 162), (500, 130)] {
             for col_count in 1..6 {
-                let row_count = estimate_max_row_count(row_len, col_count);
-                println!(
-                    "row_len={},col_count={},est_row_count={}",
-                    row_len, col_count, row_count
+                assert_eq!(
+                    estimate_max_row_count(row_len, col_count),
+                    expected,
+                    "row_len={row_len}, col_count={col_count}"
                 );
             }
         }
+        for (case, row_len, col_count, expected) in [
+            ("full null-bitmap byte", 100, 8, 641),
+            ("next null-bitmap byte", 100, 9, 635),
+            ("last fitting row", 65_468, 1, 1),
+            ("oversized row", 65_469, 1, 0),
+        ] {
+            assert_eq!(
+                estimate_max_row_count(row_len, col_count),
+                expected,
+                "{case}"
+            );
+        }
     }
 
+    /// Purpose: Protect initialization of an empty row page.
+    /// Expected: Identity and capacity are retained with aligned storage inside the payload.
     #[test]
     fn test_row_page_init() {
         let metadata = TableMetadata::try_new(
@@ -1997,7 +2040,6 @@ pub(crate) mod tests {
         .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(RowID::new(100), 105, metadata.col.as_ref());
-        println!("page header={:?}", page.header);
         assert!(page.header.start_row_id == RowID::new(100));
         assert!(page.header.max_row_count == 105);
         assert!(page.header.row_count() == 0);
@@ -2009,8 +2051,14 @@ pub(crate) mod tests {
         assert!(page.header.var_field_offset().is_multiple_of(8));
         assert_eq!(page.header.var_field_offset(), ROW_PAGE_DATA_SIZE);
         assert_eq!(page.data().len(), ROW_PAGE_DATA_SIZE);
+        assert!(page.header.fix_field_end as usize <= page.header.var_field_offset());
+        for row_idx in 0..105 {
+            assert!(page.is_deleted(row_idx), "unpublished row {row_idx}");
+        }
     }
 
+    /// Purpose: Protect the checksum footer at the variable-data capacity boundary.
+    /// Expected: Fitting rows round-trip and oversized inserts fail without modifying the footer.
     #[test]
     fn test_row_page_var_data_stops_before_checksum_footer() {
         let metadata = TableMetadata::try_new(
@@ -2026,8 +2074,20 @@ pub(crate) mod tests {
         .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(RowID::new(0), 1, metadata.col.as_ref());
+        page.footer.fill(0x5A);
 
         let max_var_len = ROW_PAGE_DATA_SIZE - page.header.fix_field_end as usize;
+        let before = page.data().to_vec();
+        let oversized = vec![0xAB; max_var_len + 1];
+        assert!(matches!(
+            page.insert(metadata.col.as_ref(), &[Val::from(oversized)]),
+            InsertRow::NoFreeSpaceOrRowID
+        ));
+        assert_eq!(page.header.row_count(), 0);
+        assert_eq!(page.header.var_field_offset(), ROW_PAGE_DATA_SIZE);
+        assert_eq!(page.data(), before);
+        assert_eq!(page.footer, [0x5A; ROW_PAGE_FOOTER_SIZE]);
+
         let value = vec![0xAB; max_var_len];
         assert!(matches!(
             page.insert(
@@ -2041,87 +2101,11 @@ pub(crate) mod tests {
             page.header.fix_field_end as usize
         );
         assert_eq!(page.row(0).var(0), &value[..]);
-        assert_eq!(page.footer, [0; ROW_PAGE_FOOTER_SIZE]);
+        assert_eq!(page.footer, [0x5A; ROW_PAGE_FOOTER_SIZE]);
     }
 
-    #[test]
-    fn test_row_page_new_row() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::I32,
-                StorageColumnFlags::empty(),
-            )],
-            vec![StorageIndexSpec::new(
-                vec![StorageIndexKey::new(0)],
-                StorageIndexFlags::PK,
-            )],
-        )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(100), 200, metadata.col.as_ref());
-        assert!(page.header.row_count() == 0);
-        assert!(page.header.col_count == 1);
-        let insert = vec![Val::U64(1u64)];
-        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
-        assert!(page.header.row_count() == 1);
-        let insert = vec![Val::U64(2u64)];
-        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
-        assert!(page.header.row_count() == 2);
-    }
-
-    #[test]
-    fn test_row_page_read_write_row() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![StorageIndexSpec::new(
-                vec![StorageIndexKey::new(0)],
-                StorageIndexFlags::UK,
-            )],
-        )
-        .expect("valid table metadata");
-        assert!(metadata.col.nullable(0));
-        assert!(!metadata.col.nullable(1));
-        let mut page = create_row_page();
-        page.init(RowID::new(100), 200, metadata.col.as_ref());
-
-        let insert = vec![Val::from(1_000_000i32), Val::from("hello")];
-        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
-
-        let row1 = page.row(0);
-        assert!(row1.row_id() == RowID::new(100));
-        assert!(row1.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 1_000_000i32);
-        assert!(row1.var(1) == b"hello");
-
-        let insert = vec![
-            Val::from(2_000_000i32),
-            Val::from("this value is not inline"),
-        ];
-        assert!(page.insert(metadata.col.as_ref(), &insert).is_ok());
-
-        let row2 = page.row(1);
-        assert!(row2.row_id() == RowID::new(101));
-        assert!(row2.val(metadata.col.as_ref(), 0).as_i32().unwrap() == 2_000_000i32);
-        let s = row2.var(1);
-        println!("len={:?}, s={:?}", s.len(), str::from_utf8(&s[..24]));
-        assert!(row2.var(1) == b"this value is not inline");
-
-        let row_id = row2.row_id();
-        let update = vec![
-            UpdateCol {
-                idx: 0,
-                val: Val::Null,
-            },
-            UpdateCol {
-                idx: 1,
-                val: Val::from("update to non-inline value"),
-            },
-        ];
-        assert!(page.update(metadata.col.as_ref(), row_id, &update).is_ok());
-    }
-
+    /// Purpose: Protect row decoding across index-only metadata changes.
+    /// Expected: Creating and dropping an index leaves decoded row values unchanged.
     #[test]
     fn test_row_page_decode_stable_across_index_only_metadata_changes() {
         let metadata = TableMetadata::try_new(
@@ -2151,71 +2135,197 @@ pub(crate) mod tests {
         assert_eq!(row.clone_vals(dropped_metadata.col.as_ref()), expected);
     }
 
+    /// Purpose: Protect row publication and CRUD across fixed, nullable, and variable-length layouts.
+    /// Expected: Writes preserve identity and neighboring rows; deletion and rejected writes preserve final state.
     #[test]
     fn test_row_page_crud() {
-        let schema = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![StorageIndexSpec::new(
-                vec![StorageIndexKey::new(2)],
-                StorageIndexFlags::PK,
-            )],
-        )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(100), 200, schema.col.as_ref());
-        let short = b"short";
-        let long = b"very loooooooooooooooooong";
-
-        let insert = vec![
-            Val::U8(1),
-            Val::U16(1000),
-            Val::U32(1_000_000),
-            Val::U64(1 << 35),
-            Val::from(&short[..]),
+        struct Case {
+            name: &'static str,
+            columns: Vec<StorageColumnSpec>,
+            index: StorageIndexSpec,
+            inserted: [Vec<Val>; 2],
+            target: usize,
+            updated: Vec<Val>,
+        }
+        let cases = [
+            Case {
+                name: "successive fixed-width rows",
+                columns: vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )],
+                index: StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::PK),
+                inserted: [vec![Val::I32(1)], vec![Val::I32(2)]],
+                target: 1,
+                updated: vec![Val::I32(3)],
+            },
+            Case {
+                name: "nullable and outlined update",
+                columns: vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::NULLABLE),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                ],
+                index: StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
+                inserted: [
+                    vec![Val::I32(1_000_000), Val::from("hello")],
+                    vec![Val::I32(2_000_000), Val::from("this value is not inline")],
+                ],
+                target: 1,
+                updated: vec![Val::Null, Val::from("update to non-inline value")],
+            },
+            Case {
+                name: "mixed widths and inline-to-outlined update",
+                columns: vec![
+                    StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                ],
+                index: StorageIndexSpec::new(vec![StorageIndexKey::new(2)], StorageIndexFlags::PK),
+                inserted: [
+                    vec![
+                        Val::U8(1),
+                        Val::U16(1000),
+                        Val::U32(1_000_000),
+                        Val::U64(1 << 35),
+                        Val::from("short"),
+                    ],
+                    vec![
+                        Val::U8(3),
+                        Val::U16(3000),
+                        Val::U32(3_000_000),
+                        Val::U64(3 << 35),
+                        Val::from("neighbor"),
+                    ],
+                ],
+                target: 0,
+                updated: vec![
+                    Val::U8(2),
+                    Val::U16(2000),
+                    Val::U32(2_000_000),
+                    Val::U64(2 << 35),
+                    Val::from("very loooooooooooooooooong"),
+                ],
+            },
         ];
-        let res = page.insert(schema.col.as_ref(), &insert);
-        assert!(matches!(res, InsertRow::Ok(id) if id == RowID::new(100)));
-        assert!(!page.row(0).is_deleted());
+        for case in cases {
+            let name = case.name;
+            let metadata = TableMetadata::try_new(case.columns, vec![case.index]).unwrap();
+            let mut page = create_row_page();
+            page.init(RowID::new(100), 2, &metadata.col);
+            assert_eq!(page.header.row_count(), 0, "{name}");
+            assert_eq!(
+                page.header.col_count as usize,
+                metadata.col.col_count(),
+                "{name}"
+            );
+            for (row_idx, values) in case.inserted.iter().enumerate() {
+                assert!(
+                    matches!(
+                        page.insert(&metadata.col, values),
+                        InsertRow::Ok(id) if id == RowID::new(100 + row_idx as u64)
+                    ),
+                    "{name}: insert row {row_idx}"
+                );
+                assert_eq!(page.header.row_count(), row_idx + 1, "{name}");
+                assert_live_row(name, &page, &metadata.col, row_idx, values);
+            }
+            let before = page.data().to_vec();
+            let var_offset = page.header.var_field_offset();
+            assert!(
+                matches!(
+                    page.insert(&metadata.col, &case.inserted[0]),
+                    InsertRow::NoFreeSpaceOrRowID
+                ),
+                "{name}: exhausted row identifiers"
+            );
+            assert_eq!(page.data(), before, "{name}");
+            assert_eq!(page.header.row_count(), 2, "{name}");
+            assert_eq!(page.header.var_field_offset(), var_offset, "{name}");
 
-        let row_id = 100;
-        let update = vec![
-            UpdateCol {
-                idx: 0,
-                val: Val::U8(2),
-            },
-            UpdateCol {
-                idx: 1,
-                val: Val::U16(2000),
-            },
-            UpdateCol {
-                idx: 2,
-                val: Val::U32(2_000_000),
-            },
-            UpdateCol {
-                idx: 3,
-                val: Val::U64(2 << 35),
-            },
-            UpdateCol {
-                idx: 4,
-                val: Val::VarByte(MemVar::from(&long[..])),
-            },
-        ];
-        let res = page.update(schema.col.as_ref(), RowID::new(row_id), &update);
-        assert!(res.is_ok());
-
-        let res = page.delete(RowID::new(row_id));
-        assert!(matches!(res, Delete::Ok));
-
-        let select = page.select(RowID::new(row_id));
-        assert!(matches!(select, Select::RowDeleted(_)));
+            let target_id = RowID::new(100 + case.target as u64);
+            let update: Vec<_> = case
+                .updated
+                .iter()
+                .enumerate()
+                .map(|(idx, val)| UpdateCol {
+                    idx,
+                    val: val.clone(),
+                })
+                .collect();
+            for missing in [RowID::new(99), RowID::new(102)] {
+                assert!(matches!(page.select(missing), Select::NotFound), "{name}");
+                assert!(
+                    matches!(
+                        page.update(&metadata.col, missing, &update),
+                        Update::NotFound
+                    ),
+                    "{name}"
+                );
+                assert!(matches!(page.delete(missing), Delete::NotFound), "{name}");
+            }
+            assert_eq!(page.data(), before, "{name}: missing-row operations");
+            assert_eq!(page.header.var_field_offset(), var_offset, "{name}");
+            assert_eq!(
+                page.header.approx_deleted.load(Ordering::Relaxed),
+                0,
+                "{name}"
+            );
+            let result = page.update(&metadata.col, target_id, &update);
+            assert!(result.is_ok(), "{name}");
+            assert!(
+                matches!(result, Update::Ok(id) if id == target_id),
+                "{name}"
+            );
+            for (row_idx, original) in case.inserted.iter().enumerate() {
+                let expected = if row_idx == case.target {
+                    &case.updated
+                } else {
+                    original
+                };
+                assert_live_row(name, &page, &metadata.col, row_idx, expected);
+            }
+            assert!(matches!(page.delete(target_id), Delete::Ok), "{name}");
+            assert!(
+                matches!(page.select(target_id), Select::RowDeleted(_)),
+                "{name}"
+            );
+            assert!(page.is_deleted(case.target), "{name}");
+            let deleted = page.data().to_vec();
+            let var_offset = page.header.var_field_offset();
+            assert!(
+                matches!(page.delete(target_id), Delete::AlreadyDeleted),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    page.update(&metadata.col, target_id, &update),
+                    Update::Deleted
+                ),
+                "{name}"
+            );
+            assert_eq!(page.data(), deleted, "{name}: operations on a deleted row");
+            assert_eq!(page.header.row_count(), 2, "{name}");
+            assert_eq!(page.header.var_field_offset(), var_offset, "{name}");
+            assert_eq!(
+                page.header.approx_deleted.load(Ordering::Relaxed),
+                1,
+                "{name}"
+            );
+            let neighbor = 1 - case.target;
+            assert_live_row(
+                name,
+                &page,
+                &metadata.col,
+                neighbor,
+                &case.inserted[neighbor],
+            );
+        }
     }
 
+    /// Purpose: Reject variable-length update inputs borrowed from the destination page.
+    /// Expected: Aliased writes panic with context before changing page data or metadata.
     #[test]
     fn test_row_page_var_input_rejects_aliases_on_update() {
         let (metadata, page) = var_input_test_page();
@@ -2261,6 +2371,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Reject variable-length insert inputs borrowed from the destination page.
+    /// Expected: Rejection preserves the reserved page state and leaves the new row unpublished.
     #[test]
     fn test_row_page_var_input_rejects_aliases_on_insert() {
         for source_idx in [0, 1] {
@@ -2281,6 +2393,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Allow external byte inputs and empty slices borrowed from the destination page.
+    /// Expected: Writes preserve input values while reusing sufficient outlined storage.
     #[test]
     fn test_row_page_var_input_accepts_external_and_empty() {
         let (metadata, first) = var_input_test_page();
@@ -2293,6 +2407,15 @@ pub(crate) mod tests {
             let input = source.var(0);
             let target = &pages[target_idx];
             let offset = target.header.var_field_offset();
+            target.update_col(
+                &metadata.col,
+                0,
+                0,
+                ValRef::VarByte(b"different bytes!"),
+                offset,
+                true,
+            );
+            assert_ne!(target.row(0).var(0), input);
             assert_eq!(
                 target.update_col(&metadata.col, 0, 0, ValRef::VarByte(input), offset, true),
                 offset
@@ -2316,6 +2439,8 @@ pub(crate) mod tests {
         assert!(!page.is_deleted(row_idx));
     }
 
+    /// Purpose: Protect borrowed and owned row writers across access modes and storage transitions.
+    /// Expected: Writers copy values faithfully and reserve equivalent space through nulling and resizing.
     #[test]
     fn test_borrowed_row_writers_and_space_parity() {
         let mut expected = vec![
@@ -2370,6 +2495,11 @@ pub(crate) mod tests {
         assert_eq!(var_len_for_insert(layout, &input), 7 + 14 + 15 + 128);
         for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {
             insert_view_case(page, layout, &expected, &input, borrowed, exclusive);
+            assert_eq!(
+                page.header.var_field_offset(),
+                ROW_PAGE_DATA_SIZE - 164,
+                "borrowed={borrowed}, exclusive={exclusive}"
+            );
         }
         input.overwrite_bytes();
         assert_view_pages(&pages, layout, &expected);
@@ -2405,29 +2535,42 @@ pub(crate) mod tests {
         }
 
         // Cross both inline thresholds, shrink/reuse, grow again, and return inline.
-        let mut previous_len = 0;
-        for len in [0, 6, 7, 14, 15, 128, 64, 7, 15, 6, 0] {
+        for (case, len, reserve) in [
+            ("empty inline", 0, 0),
+            ("maximum inline", 6, 0),
+            ("first outlined", 7, 7),
+            ("grow outlined", 14, 14),
+            ("cross owned-value inline boundary", 15, 15),
+            ("large outlined", 128, 128),
+            ("shrink outlined", 64, 0),
+            ("reuse minimum outlined", 7, 0),
+            ("regrow outlined", 15, 15),
+            ("return inline", 6, 0),
+            ("return empty", 0, 0),
+        ] {
             let bytes = vec![0xff; len];
             let update = [UpdateCol {
                 idx: first_var,
                 val: Val::from(bytes.as_slice()),
             }];
             let mut input = BufferValues::new([(first_var, ValRef::VarByte(&bytes))]);
-            let reserve = if len > PAGE_VAR_LEN_INLINE && len > previous_len {
-                len
-            } else {
-                0
-            };
             for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {
                 let before = page.header.var_field_offset();
-                assert_eq!(page.var_len_for_update(0, &input), reserve);
+                assert_eq!(
+                    page.var_len_for_update(0, &input),
+                    reserve,
+                    "{case}: borrowed={borrowed}, exclusive={exclusive}"
+                );
                 update_view_case(page, layout, &update, &input, borrowed, exclusive);
-                assert_eq!(before - page.header.var_field_offset(), reserve);
+                assert_eq!(
+                    before - page.header.var_field_offset(),
+                    reserve,
+                    "{case}: borrowed={borrowed}, exclusive={exclusive}"
+                );
             }
             expected[first_var] = update[0].val.clone();
             input.overwrite_bytes();
             assert_view_pages(&pages, layout, &expected);
-            previous_len = len;
         }
     }
 }
