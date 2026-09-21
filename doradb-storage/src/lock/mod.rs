@@ -1404,6 +1404,7 @@ pub(crate) mod tests {
     use crate::poison::healthy_test_poisoner;
     use futures::FutureExt;
     use futures::future::LocalBoxFuture;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::task::Wake;
 
     /// Debug snapshot of all physical families and queued waiters.
@@ -1876,7 +1877,7 @@ pub(crate) mod tests {
             let manager = LockManager::new();
             let token = pending_token(resource, 1);
             for mode in [LockMode::IntentShared, LockMode::IntentExclusive] {
-                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let panic = catch_unwind(AssertUnwindSafe(|| {
                     let _ = manager.start_pending(&token, mode);
                 }));
                 assert!(panic.is_err(), "resource={resource}, mode={mode}");
@@ -2910,7 +2911,6 @@ pub(crate) mod tests {
     #[test]
     fn promotion_wakes_can_reenter_resource_after_explicit_drop_and_unwind_publication() {
         use std::future::Future;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
         use std::task::{Context, Waker};
         for resource in resource_variants(table_metadata(TableID::new(82))) {
             for publication in 0..3 {
