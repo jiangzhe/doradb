@@ -21,7 +21,7 @@ use crate::obs;
 use crate::serde::Deser;
 use crate::thread as doradb_thread;
 use error_stack::{Report, ResultExt};
-use flume::{Receiver, SendTimeoutError, Sender, TryRecvError};
+use flume::{Receiver, Selector, Sender, TryRecvError};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind as IoErrorKind, Read, Result as StdIoResult};
@@ -30,14 +30,11 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::panic::resume_unwind;
 use std::path::PathBuf;
 use std::thread::{JoinHandle, panicking};
-use std::time::Duration;
 
 #[cfg(test)]
 pub(super) use tests::decode_owning_group;
 #[cfg(test)]
 pub(crate) use tests::read_recovery_headers;
-
-const REDO_READ_AHEAD_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Outcome of reading the next logical group from the redo stream.
 enum ReadGroup {
@@ -1498,18 +1495,29 @@ impl RedoReadAheadWorker {
         retained
     }
 
+    /// Waits for consumer capacity or cancellation of this startup-only reader.
+    /// A successful channel send transfers item ownership to the consumer. Stop
+    /// or disconnection drops the unsent item; the scan drains pending I/O and
+    /// the stream owner joins the worker. No live-engine poison/admission wait
+    /// is involved: stream completion, failure, or drop owns cancellation.
     #[inline]
-    fn send_item(&mut self, mut item: RedoReadItem) -> bool {
-        loop {
-            if self.stopped() {
-                return false;
-            }
-            match self.items.send_timeout(item, REDO_READ_AHEAD_SEND_TIMEOUT) {
-                Ok(()) => return true,
-                Err(SendTimeoutError::Timeout(returned)) => {
-                    item = returned;
-                }
-                Err(SendTimeoutError::Disconnected(_)) => return false,
+    fn send_item(&mut self, item: RedoReadItem) -> bool {
+        if self.stopped() {
+            return false;
+        }
+        #[cfg(test)]
+        tests::run_read_ahead_send_hook();
+        // Register both alternatives together so stopping wakes a full-queue
+        // send even while the stream owner retains the receiver during join.
+        let outcome = Selector::new()
+            .recv(&self.stop, |_| None)
+            .send(&self.items, item, |result| Some(result.is_ok()))
+            .wait();
+        match outcome {
+            Some(sent) => sent,
+            None => {
+                self.stop_requested = true;
+                false
             }
         }
     }
@@ -2007,14 +2015,31 @@ mod tests {
     use crate::value::ValRef;
     use futures::FutureExt;
     use std::any::Any;
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
     use std::num::NonZeroUsize;
     use std::panic::AssertUnwindSafe;
     use std::path::Path;
     use std::thread::spawn;
+    use std::time::Duration;
 
     const TEST_FILE_SEQ: u32 = 0;
+
+    type ReadAheadSendHook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static READ_AHEAD_SEND_HOOK: RefCell<Option<ReadAheadSendHook>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadAheadSendAction {
+        Stop,
+        DisconnectStop,
+        DisconnectOutput,
+        Resume,
+        StopAndResume,
+    }
 
     #[derive(Clone, Copy)]
     enum TestSegmentSeal {
@@ -2126,6 +2151,104 @@ mod tests {
         }
         assert_eq!(iter.offset, wire.len());
         Ok(logs)
+    }
+
+    /// Reaches this thread's one-shot send boundary after the initial stop check.
+    pub(super) fn run_read_ahead_send_hook() {
+        let hook = READ_AHEAD_SEND_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn assert_read_ahead_send_after_stop_check(action: ReadAheadSendAction) {
+        let (items_tx, items_rx) = flume::bounded(1);
+        items_tx.send(RedoReadItem::End).unwrap();
+        let (_recycle_tx, recycle_rx) = flume::bounded(1);
+        let (stop_tx, stop_rx) = flume::bounded(1);
+        let (entered_tx, entered_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = flume::bounded(1);
+        let join = spawn(move || {
+            let mut worker = RedoReadAheadWorker {
+                segments: Vec::new(),
+                read_depth: 1,
+                items: items_tx,
+                recycle: recycle_rx,
+                stop: stop_rx,
+                stop_requested: false,
+                free: Vec::new(),
+                free_block_size: None,
+            };
+            assert!(worker.items.is_full());
+            READ_AHEAD_SEND_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }));
+            });
+            let sent = worker.send_item(RedoReadItem::SegmentEnd {
+                file_seq: TEST_FILE_SEQ,
+            });
+            if matches!(
+                action,
+                ReadAheadSendAction::Stop
+                    | ReadAheadSendAction::DisconnectStop
+                    | ReadAheadSendAction::StopAndResume
+            ) {
+                assert!(worker.stopped(), "stop was not retained: {action:?}");
+                assert!(!worker.send_item(RedoReadItem::End));
+            }
+            done_tx.send(sent).unwrap();
+        });
+
+        let mut items_rx = Some(items_rx);
+        let mut stop_tx = Some(stop_tx);
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match action {
+            ReadAheadSendAction::Stop => stop_tx.as_ref().unwrap().send(()).unwrap(),
+            ReadAheadSendAction::DisconnectStop => drop(stop_tx.take()),
+            ReadAheadSendAction::DisconnectOutput => drop(items_rx.take()),
+            ReadAheadSendAction::Resume | ReadAheadSendAction::StopAndResume => {
+                assert!(matches!(
+                    items_rx.as_ref().unwrap().try_recv().unwrap(),
+                    RedoReadItem::End
+                ));
+                if matches!(action, ReadAheadSendAction::StopAndResume) {
+                    stop_tx.as_ref().unwrap().send(()).unwrap();
+                }
+            }
+        }
+        release_tx.send(()).unwrap();
+        let sent = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_else(|err| panic!("read-ahead send did not finish: {action:?}, {err:?}"));
+        join.join().unwrap();
+        match action {
+            ReadAheadSendAction::Stop | ReadAheadSendAction::DisconnectStop => {
+                assert!(!sent, "cancelled send published an item: {action:?}");
+                let items = items_rx.unwrap();
+                assert!(matches!(items.try_recv().unwrap(), RedoReadItem::End));
+                assert!(items.is_empty());
+            }
+            ReadAheadSendAction::DisconnectOutput => assert!(!sent),
+            ReadAheadSendAction::Resume | ReadAheadSendAction::StopAndResume => {
+                if matches!(action, ReadAheadSendAction::Resume) {
+                    assert!(sent);
+                }
+                let items = items_rx.unwrap();
+                // A send racing stop may win once; later sends must observe stop.
+                if sent {
+                    assert!(matches!(
+                        items.try_recv().unwrap(),
+                        RedoReadItem::SegmentEnd {
+                            file_seq: TEST_FILE_SEQ
+                        }
+                    ));
+                }
+                assert!(items.is_empty());
+            }
+        }
     }
 
     async fn assert_stream_group_parity(
@@ -2554,34 +2677,37 @@ mod tests {
         );
     }
 
-    /// Purpose: Stop read-ahead while its output queue is full.
+    /// Purpose: Stop read-ahead on cancellation or owner disconnection while its output queue is full.
     /// Expected: The worker exits without publishing another item or requiring the queue to be drained.
     #[test]
     fn test_read_ahead_send_item_stops_while_item_queue_full() {
-        let (items_tx, items_rx) = flume::bounded(1);
-        items_tx.send(RedoReadItem::End).unwrap();
-        let (_recycle_tx, recycle_rx) = flume::bounded(1);
-        let (stop_tx, stop_rx) = flume::bounded(1);
-        let (started_tx, started_rx) = flume::bounded(1);
-        let join = spawn(move || {
-            let mut worker = RedoReadAheadWorker {
-                segments: Vec::new(),
-                read_depth: 1,
-                items: items_tx,
-                recycle: recycle_rx,
-                stop: stop_rx,
-                stop_requested: false,
-                free: Vec::new(),
-                free_block_size: None,
-            };
-            started_tx.send(()).unwrap();
-            worker.send_item(RedoReadItem::End)
-        });
+        for action in [
+            ReadAheadSendAction::Stop,
+            ReadAheadSendAction::DisconnectStop,
+        ] {
+            assert_read_ahead_send_after_stop_check(action);
+        }
+    }
 
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        stop_tx.send(()).unwrap();
-        assert!(!join.join().unwrap());
-        assert_eq!(items_rx.len(), 1);
+    /// Purpose: Finish a blocked read-ahead send when the consumer disconnects.
+    /// Expected: The worker rejects the unsent item without requiring an explicit stop request.
+    #[test]
+    fn test_read_ahead_send_item_handles_output_disconnection() {
+        assert_read_ahead_send_after_stop_check(ReadAheadSendAction::DisconnectOutput);
+    }
+
+    /// Purpose: Resume read-ahead when the consumer frees output capacity.
+    /// Expected: The pending item is delivered exactly once while cancellation remains absent.
+    #[test]
+    fn test_read_ahead_send_item_resumes_when_capacity_returns() {
+        assert_read_ahead_send_after_stop_check(ReadAheadSendAction::Resume);
+    }
+
+    /// Purpose: Arbitrate a stop request racing newly available read-ahead output capacity.
+    /// Expected: At most the racing item is delivered, and subsequent sends retain cancellation.
+    #[test]
+    fn test_read_ahead_send_item_stop_races_with_capacity() {
+        assert_read_ahead_send_after_stop_check(ReadAheadSendAction::StopAndResume);
     }
 
     /// Purpose: Clean up queued redo reads when the backend wait fails.

@@ -76,6 +76,7 @@ use std::sync::{Arc, Weak};
 #[cfg(test)]
 pub(crate) use tests::{
     current_table_lookup_count, full_current_table_lookup_count, reset_current_table_lookup_count,
+    set_catalog_admission_hook,
 };
 
 /// First table id allocated to user-managed tables.
@@ -681,6 +682,8 @@ impl Catalog {
         }
         #[cfg(test)]
         tests::record_full_current_table_lookup(table_id);
+        #[cfg(test)]
+        tests::run_catalog_admission_hook(self);
         self.user_tables
             .get(&table_id)
             .and_then(|entry| entry.value().resolve_current())
@@ -1161,6 +1164,8 @@ impl Catalog {
     /// Purge metadata history against the authoritative transaction horizon.
     #[inline]
     pub(crate) fn purge_user_table_history(&self, min_active_sts: TrxID) {
+        #[cfg(test)]
+        tests::run_catalog_admission_hook(self);
         let mut table_ids = self
             .user_tables
             .iter()
@@ -1617,13 +1622,27 @@ pub(crate) mod tests {
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
     use crate::value::{Val, ValKind};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    type CatalogAdmissionHook = (TableID, Box<dyn FnOnce()>);
 
     thread_local! {
         static CURRENT_TABLE_LOOKUPS: Cell<(Option<TableID>, usize)> = const { Cell::new((None, 0)) };
         static FULL_CURRENT_TABLE_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+        static CATALOG_ADMISSION_HOOK: RefCell<Option<CatalogAdmissionHook>> = const { RefCell::new(None) };
+    }
+
+    /// Installs a one-shot notification for this thread's blocked catalog admission.
+    pub(crate) fn set_catalog_admission_hook(table_id: TableID, hook: impl FnOnce() + 'static) {
+        CATALOG_ADMISSION_HOOK.with(|slot| {
+            let previous = slot.borrow_mut().replace((table_id, Box::new(hook)));
+            assert!(
+                previous.is_none(),
+                "catalog admission hook already installed"
+            );
+        });
     }
 
     /// Starts counting all current-table lookup paths for one table on this thread.
@@ -1888,6 +1907,18 @@ pub(crate) mod tests {
         table_id
     }
 
+    /// Confirms publication blocks catalog access before notifying the test.
+    pub(super) fn run_catalog_admission_hook(catalog: &Catalog) {
+        let hook = CATALOG_ADMISSION_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some((table_id, hook)) = hook {
+            assert!(
+                catalog.user_tables.try_get(&table_id).is_locked(),
+                "catalog admission must encounter publication's write lock: table_id={table_id}"
+            );
+            hook();
+        }
+    }
+
     /// Records a lookup only for the table selected on the calling thread.
     pub(super) fn record_current_table_lookup(table_id: TableID) {
         let (target, count) = CURRENT_TABLE_LOOKUPS.get();
@@ -1918,6 +1949,37 @@ pub(crate) mod tests {
                 .is_none(),
             "{report}"
         );
+    }
+
+    async fn checkpointed_catalog_leaf(main_dir: PathBuf, log_stem: &str) -> ColumnLeafEntry {
+        let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
+        let _ = table1(&engine).await;
+        engine
+            .new_session()
+            .unwrap()
+            .checkpoint_catalog()
+            .await
+            .unwrap();
+        let storage = &engine.inner().core.catalog().storage;
+        let snapshot = storage.checkpoint_snapshot();
+        let root = snapshot.meta.table_roots[0];
+        assert_eq!(root.table_id, TABLE_ID_TABLES);
+        let entry = {
+            let disk_guard = storage.disk_pool.create_base_guard();
+            let index = ColumnBlockIndex::new(
+                root.checkpoint_root_block_id().unwrap(),
+                root.pivot_row_id(),
+                storage.mtb.file_kind(),
+                storage.mtb.sparse_file(),
+                &storage.disk_pool,
+                &disk_guard,
+            );
+            let entries = index.collect_leaf_entries().await.unwrap();
+            assert_eq!(entries.len(), 1);
+            entries.into_iter().next().unwrap()
+        };
+        drop(engine);
+        entry
     }
 
     /// Purpose: Protect the separation between user and catalog table identities.
@@ -2352,37 +2414,6 @@ pub(crate) mod tests {
             assert_eq!(snap2.catalog_replay_start_ts, snap1.catalog_replay_start_ts);
             assert_eq!(snap2.meta.table_roots, snap1.meta.table_roots);
         });
-    }
-
-    async fn checkpointed_catalog_leaf(main_dir: PathBuf, log_stem: &str) -> ColumnLeafEntry {
-        let engine = open_catalog_test_engine(main_dir, Some(log_stem)).await;
-        let _ = table1(&engine).await;
-        engine
-            .new_session()
-            .unwrap()
-            .checkpoint_catalog()
-            .await
-            .unwrap();
-        let storage = &engine.inner().core.catalog().storage;
-        let snapshot = storage.checkpoint_snapshot();
-        let root = snapshot.meta.table_roots[0];
-        assert_eq!(root.table_id, TABLE_ID_TABLES);
-        let entry = {
-            let disk_guard = storage.disk_pool.create_base_guard();
-            let index = ColumnBlockIndex::new(
-                root.checkpoint_root_block_id().unwrap(),
-                root.pivot_row_id(),
-                storage.mtb.file_kind(),
-                storage.mtb.sparse_file(),
-                &storage.disk_pool,
-                &disk_guard,
-            );
-            let entries = index.collect_leaf_entries().await.unwrap();
-            assert_eq!(entries.len(), 1);
-            entries.into_iter().next().unwrap()
-        };
-        drop(engine);
-        entry
     }
 
     /// Purpose: Reject checksum corruption in checkpointed catalog data during recovery.
