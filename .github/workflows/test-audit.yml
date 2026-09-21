@@ -12,6 +12,12 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha || github.sha }}
         fetch-depth: 0
+    - name: Setup stable Clippy for audit regression tests
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: clippy
+        cache: false
     - name: Setup audit Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:

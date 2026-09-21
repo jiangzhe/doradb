@@ -44,20 +44,37 @@ pub(crate) fn yield_now() -> YieldNow {
 #[cfg(test)]
 mod tests {
     use super::{block_on, yield_now};
-    use futures::task::noop_waker;
+    use futures::task::{ArcWake, waker_ref};
     use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
+    /// Purpose: Protect the cooperative yield future's polling boundary.
+    /// Expected: Yielding schedules a wake and the next poll completes without another wake.
     #[test]
     fn yield_now_yields_once() {
-        let waker = noop_waker();
+        struct WakeCounter(AtomicUsize);
+
+        impl ArcWake for WakeCounter {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = waker_ref(&wakes);
         let mut cx = Context::from_waker(&waker);
         let mut future = Box::pin(yield_now());
 
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
     }
 
+    /// Purpose: Exercise cooperative yielding through the blocking executor.
+    /// Expected: A yielded future is resumed to completion.
     #[test]
     fn block_on_drives_yield_now() {
         block_on(yield_now());

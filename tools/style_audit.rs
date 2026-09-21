@@ -28,7 +28,10 @@ use syn::{
 };
 
 const FMT_COMMAND: &[&str] = &["fmt", "--all", "--", "--check"];
+// Cargo's script runner exports its nightly RUSTUP_TOOLCHAIN to child processes.
+// Select stable explicitly so workspace linting uses the same channel as CI.
 const CLIPPY_COMMAND: &[&str] = &[
+    "+stable",
     "clippy",
     "--workspace",
     "--all-targets",
@@ -340,7 +343,7 @@ fn run_branch_diff_audit(repo_root: &Path, diff_base: &str) -> Result<i32, Strin
 
     if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
         print_gate_failure(
-            "cargo clippy --workspace --all-targets -- -D warnings",
+            "cargo +stable clippy --workspace --all-targets -- -D warnings",
             &result,
         );
         return Ok(1);
@@ -364,7 +367,7 @@ fn run_forced_audit(repo_root: &Path, force_paths: &[PathBuf]) -> Result<i32, St
 
     if let Some(result) = run_cargo_gate(repo_root, CLIPPY_COMMAND)? {
         print_gate_failure(
-            "cargo clippy --workspace --all-targets -- -D warnings",
+            "cargo +stable clippy --workspace --all-targets -- -D warnings",
             &result,
         );
         return Ok(1);
@@ -1609,6 +1612,53 @@ mod tests {
         fs::write(&path, script).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
         root
+    }
+
+    /// Purpose: Enforce stable Clippy diagnostics when the auditor runs under nightly Cargo.
+    /// Expected: A lint introduced after the script's pinned nightly fails the workspace gate.
+    #[test]
+    fn clippy_gate_uses_stable_from_nightly_runner() {
+        let repo = tempfile::tempdir().unwrap();
+        fs::create_dir(repo.path().join("src")).unwrap();
+        fs::write(
+            repo.path().join("Cargo.toml"),
+            r#"[package]
+name = "stable-clippy-gate-fixture"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unused_async = "allow"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub trait Work {\n\
+             fn execute(&mut self) -> impl std::future::Future<Output = u32>;\n\
+             }\n\
+             pub struct Worker;\n\
+             impl Work for Worker {\n\
+             async fn execute(&mut self) -> u32 { 42 }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let failure = run_cargo_gate(repo.path(), CLIPPY_COMMAND)
+            .unwrap()
+            .expect("stable Clippy must reject the unused async trait implementation");
+        assert_eq!(failure.code, Some(101), "{failure:?}");
+        assert!(
+            failure.stderr.contains("clippy::unused_async_trait_impl"),
+            "{failure:?}"
+        );
+        assert!(
+            failure
+                .stderr
+                .contains("unused `async` for async trait impl function"),
+            "{failure:?}"
+        );
     }
 
     /// Purpose: Forward the exact selected file set to the independent test auditor and preserve failures.

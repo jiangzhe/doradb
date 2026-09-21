@@ -440,12 +440,14 @@ mod tests {
     use crate::component::RegistryBuilder;
     use crate::error::{CompletionErrorBridge, RuntimeOrFatalError};
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
+    use futures::task::{ArcWake, waker_ref};
     use parking_lot::Mutex as ParkingMutex;
     use std::future::{poll_fn, ready};
     use std::panic;
+    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::mpsc;
-    use std::task::Poll;
+    use std::sync::{OnceLock, mpsc};
+    use std::task::{Context, Poll};
     use std::thread::scope;
     use std::time::Duration;
 
@@ -530,11 +532,12 @@ mod tests {
 
     fn assert_drained(registry: &ComponentRegistry, pool: &ThreadPool) {
         assert!(!registry.shutdown_all().is_degraded());
-        assert!(!registry.shutdown_all().is_degraded());
         assert_eq!(pool.shared.state.lock().active, 0);
         assert!(pool.executor.is_empty());
     }
 
+    /// Purpose: Protect worker execution and exclusive output ownership for both submission APIs.
+    /// Expected: Outputs move once from worker execution and retained completions do not block shutdown.
     #[test]
     fn submission_moves_output_once_from_named_worker() {
         runtime::block_on(async {
@@ -559,6 +562,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Keep a suspended async job from monopolizing the only worker.
+    /// Expected: Another job completes while the suspended job awaits its explicit release.
     #[test]
     fn pending_async_job_yields_the_only_worker() {
         runtime::block_on(async {
@@ -579,6 +584,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce the shared worker limit across synchronous and asynchronous jobs.
+    /// Expected: Concurrent execution reaches the configured capacity without exceeding it.
     #[test]
     fn configured_workers_bound_parallel_sync_and_async_execution() {
         runtime::block_on(async {
@@ -620,6 +627,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve queued and suspended jobs after their observers detach.
+    /// Expected: Accepted jobs execute and release their resources exactly once before shutdown ends.
     #[test]
     fn detached_jobs_release_inputs_outputs_and_reservations_once() {
         smol::block_on(async {
@@ -673,6 +682,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Drain running, queued, and externally suspended jobs during shutdown.
+    /// Expected: Every accepted job completes before healthy shutdown returns.
     #[test]
     fn shutdown_drains_running_queued_and_externally_pending_jobs() {
         let (registry, pool) = runtime::block_on(test_pool(1));
@@ -709,23 +720,63 @@ mod tests {
         pool.shared.poisoner.ensure_healthy().unwrap();
     }
 
+    /// Purpose: Protect cleanup of future captures retained through the final poll.
+    /// Expected: Captures are destroyed before completion is observable and admission drains.
     #[test]
     fn future_resources_drop_before_completion_and_permit_release() {
-        runtime::block_on(async {
-            let (registry, pool) = test_pool(1).await;
-            let dropped = Arc::new(AtomicUsize::new(0));
-            let input = DropCounter(Arc::clone(&dropped));
-            let completion = pool.submit_async(poll_fn(move |_| {
-                // A custom future keeps its capture even after returning Ready.
-                let _ = &input;
+        struct CleanupProbe {
+            completion: Arc<OnceLock<Arc<Completion<usize>>>>,
+            shared: Arc<ThreadPoolShared>,
+            observations: Arc<ParkingMutex<Vec<(bool, usize)>>>,
+        }
+
+        impl Future for CleanupProbe {
+            type Output = usize;
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<usize> {
                 Poll::Ready(17)
-            }));
-            assert_eq!(completion.wait_take_result().await.unwrap(), 17);
-            assert_eq!(dropped.load(Ordering::Acquire), 1);
-            assert_drained(&registry, &pool);
+            }
+        }
+
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                let pending = self.completion.get().unwrap().completed_result().is_none();
+                let active = self.shared.state.lock().active;
+                self.observations.lock().push((pending, active));
+            }
+        }
+
+        let poisoner = QuiescentBox::new(EnginePoisoner::new());
+        let pool = ThreadPool::new(&ThreadPoolConfig::default(), poisoner.guard());
+        pool.shared.start();
+        let completion_slot = Arc::new(OnceLock::new());
+        let observations = Arc::new(ParkingMutex::new(Vec::new()));
+        let completion = pool.submit_async(CleanupProbe {
+            completion: Arc::clone(&completion_slot),
+            shared: Arc::clone(&pool.shared),
+            observations: Arc::clone(&observations),
         });
+        assert!(completion_slot.set(Arc::clone(&completion)).is_ok());
+
+        // Drive the real submission wrapper only after installing its observer.
+        // Inspect state inside destruction, before another thread can hide an ordering defect.
+        assert!(pool.executor.try_tick());
+        assert_eq!(
+            *observations.lock(),
+            [(true, 1)],
+            "pending completion and held permit at drop"
+        );
+        assert!(matches!(
+            completion.try_take_result(),
+            CompletionTake::Ready(Ok(17))
+        ));
+        assert_eq!(pool.shared.state.lock().active, 0);
+        assert!(pool.executor.is_empty());
+        pool.shared.close();
     }
 
+    /// Purpose: Supervise synchronous and suspended asynchronous panics with either observer lifetime.
+    /// Expected: Panics poison the pool while accepted siblings finish and job resources are released.
     #[test]
     fn sync_and_suspended_async_panics_poison_and_drain_accepted_siblings() {
         for asynchronous in [false, true] {
@@ -798,6 +849,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Reject both submission forms after pool poison is already visible.
+    /// Expected: Rejection reuses the cached fatal error without executing submitted work.
     #[test]
     fn poison_fast_path_reuses_cached_error_without_polling() {
         runtime::block_on(async {
@@ -807,13 +860,26 @@ mod tests {
                 .poisoner
                 .poison(Report::new(FatalError::ThreadPoolTaskPanic));
             let identity = shared.test_identity();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
             for asynchronous in [false, true] {
-                let completion =
-                    submit_computation(&pool, asynchronous, || panic!("rejected job ran"));
-                assert_fatal(
-                    completion.wait_take_result().await.unwrap_err(),
-                    FatalError::ThreadPoolTaskPanic,
-                );
+                let executions = Arc::clone(&executions);
+                let input = DropCounter(Arc::clone(&drops));
+                let completion = if asynchronous {
+                    pool.submit_async(poll_fn(move |_| {
+                        let _ = &input;
+                        executions.fetch_add(1, Ordering::AcqRel);
+                        Poll::Ready(())
+                    }))
+                } else {
+                    pool.submit(move || {
+                        let _input = input;
+                        executions.fetch_add(1, Ordering::AcqRel);
+                    })
+                };
+                let error = completion.wait_take_result().await.unwrap_err();
+                assert_eq!(error.test_identity(), identity);
+                assert_fatal(error, FatalError::ThreadPoolTaskPanic);
                 assert_eq!(
                     pool.shared
                         .poisoner
@@ -824,9 +890,13 @@ mod tests {
                 );
             }
             assert_drained(&registry, &pool);
+            assert_eq!(executions.load(Ordering::Acquire), 0);
+            assert_eq!(drops.load(Ordering::Acquire), 2);
         });
     }
 
+    /// Purpose: Preserve accepted work when shutdown races with detached task spawning.
+    /// Expected: Shutdown waits for reserved work while closed admission rejects later submissions.
     #[test]
     fn reservation_before_spawn_keeps_shutdown_workers_alive() {
         smol::block_on(async {
@@ -865,10 +935,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Exercise idle shutdown and submission outside the running phase.
+    /// Expected: Idle shutdown is healthy and repeatable, while inactive admission rejects jobs.
     #[test]
     fn idle_shutdown_is_healthy_and_starting_or_draining_rejects_jobs() {
         runtime::block_on(async {
             let (registry, pool) = test_pool(2).await;
+            assert_drained(&registry, &pool);
             assert_drained(&registry, &pool);
             pool.shared.poisoner.ensure_healthy().unwrap();
             assert_fatal(
@@ -888,30 +961,50 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect drain notification on either side of listener registration.
+    /// Expected: Final release wakes a registered waiter; an earlier release needs no wake to drain.
     #[test]
     fn drain_listener_handles_final_release_before_and_after_registration() {
-        for release_first in [false, true] {
-            runtime::block_on(async {
-                let poisoner = QuiescentBox::new(EnginePoisoner::new());
-                let shared = Arc::new(ThreadPoolShared::new(poisoner.guard()));
-                shared.start();
-                let permit = shared.reserve().unwrap();
-                shared.close();
-                let mut permit = Some(permit);
-                if release_first {
-                    drop(permit.take());
-                }
-                let drain = shared.wait_for_drained_shutdown();
-                futures::pin_mut!(drain);
-                if !release_first {
-                    assert!(futures::poll!(drain.as_mut()).is_pending());
-                    drop(permit.take());
-                }
-                drain.await;
-            });
+        struct WakeCounter(AtomicUsize);
+
+        impl ArcWake for WakeCounter {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        for (case, release_first) in [
+            ("release before registration", true),
+            ("release after registration", false),
+        ] {
+            let poisoner = QuiescentBox::new(EnginePoisoner::new());
+            let shared = Arc::new(ThreadPoolShared::new(poisoner.guard()));
+            shared.start();
+            let mut permit = Some(shared.reserve().unwrap());
+            shared.close();
+            let wakes = Arc::new(WakeCounter(AtomicUsize::new(0)));
+            let waker = waker_ref(&wakes);
+            let mut cx = Context::from_waker(&waker);
+            let mut drain = Box::pin(shared.wait_for_drained_shutdown());
+            if release_first {
+                drop(permit.take());
+                assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "{case}");
+            } else {
+                assert!(drain.as_mut().poll(&mut cx).is_pending(), "{case}");
+                assert_eq!(wakes.0.load(Ordering::Relaxed), 0, "{case}");
+                drop(permit.take());
+                assert_eq!(
+                    wakes.0.load(Ordering::Relaxed),
+                    1,
+                    "{case}: final release must wake the executor"
+                );
+            }
+            assert!(drain.as_mut().poll(&mut cx).is_ready(), "{case}");
         }
     }
 
+    /// Purpose: Roll back worker startup when an initial or later thread spawn fails.
+    /// Expected: Started workers finish before the spawn error returns and later workers never start.
     #[test]
     fn startup_failure_stops_and_joins_every_started_worker() {
         for failed_worker in [1, 2] {
@@ -946,6 +1039,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Preserve shutdown cleanup when multiple pool workers panic on exit.
+    /// Expected: All workers finish before shutdown propagates the first worker's panic.
     #[test]
     fn shutdown_joins_every_worker_before_resuming_first_panic() {
         let events = Arc::new(ParkingMutex::new(Vec::new()));

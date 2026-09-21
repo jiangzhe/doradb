@@ -1312,17 +1312,35 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct PanicObservation {
+        phase: &'static str,
+        poisoned: bool,
+        active: usize,
+    }
+
     struct SyntheticPanicInternal {
-        preserved: Arc<AtomicUsize>,
-        published: Arc<AtomicUsize>,
-        dropped: Arc<AtomicUsize>,
+        runtime: QuiescentGuard<MandatoryRuntime>,
+        observations: Arc<Mutex<Vec<PanicObservation>>>,
         completion: Arc<Completion<()>>,
+    }
+
+    impl SyntheticPanicInternal {
+        fn record(&self, phase: &'static str) {
+            let poisoned = self.runtime.poisoner.ensure_healthy().is_err();
+            let (_, active) = self.runtime.internal_admission.inspect();
+            self.observations.lock().push(PanicObservation {
+                phase,
+                poisoned,
+                active,
+            });
+        }
     }
 
     impl Drop for SyntheticPanicInternal {
         #[inline]
         fn drop(&mut self) {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.record("drop");
         }
     }
 
@@ -1341,12 +1359,12 @@ mod tests {
 
         #[inline]
         fn preserve_after_panic(&mut self) {
-            self.preserved.fetch_add(1, Ordering::Relaxed);
+            self.record("preserve");
         }
 
         #[inline]
         fn publish_panic(&mut self, error: CompletionErrorBridge) {
-            self.published.fetch_add(1, Ordering::Relaxed);
+            self.record("publish");
             self.completion.complete(Err(error));
         }
     }
@@ -1498,40 +1516,106 @@ mod tests {
         }
     }
 
+    async fn test_runtime(
+        concurrency_limit: usize,
+    ) -> (ComponentRegistry, QuiescentGuard<MandatoryRuntime>) {
+        let mut builder = RegistryBuilder::new();
+        builder.build::<EnginePoisoner>(()).await.unwrap();
+        builder
+            .build::<MandatoryRuntime>(
+                MandatoryRuntimeConfig::default().concurrency_limit(concurrency_limit),
+            )
+            .await
+            .unwrap();
+        builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
+        let registry = builder.finish();
+        let mandatory = registry.dependency::<MandatoryRuntime>();
+        (registry, mandatory)
+    }
+
+    fn assert_shutdown(registry: &ComponentRegistry, mandatory: &MandatoryRuntime) {
+        mandatory.close_admission();
+        runtime::block_on(mandatory.drain_callers());
+        registry
+            .shutdown_all()
+            .propagate_or_suppress("mandatory_runtime_test");
+        assert_eq!(mandatory.admission.inspect(), (true, 0));
+        assert_eq!(mandatory.internal_admission.inspect(), (true, 0));
+        assert!(mandatory.stopping.load(Ordering::Acquire));
+        assert!(mandatory.executor.is_empty());
+    }
+
+    fn test_completion<T>() -> (CompletionProducer<T>, CompletionObserver<T>) {
+        MandatoryCompletion::endpoints(
+            MandatoryTaskMetadata::operation("test", None),
+            Arc::new(MandatoryTaskCounters::default()),
+        )
+    }
+
+    fn assert_consumed<T>(completion: &MandatoryCompletion<T>) {
+        assert!(matches!(
+            completion.completion.try_take_result(),
+            CompletionTake::Consumed
+        ));
+        assert!(matches!(
+            *completion.observation.lock(),
+            ObservationState::Consumed
+        ));
+        assert_eq!(
+            completion
+                .counters
+                .detached_observer_count
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// Purpose: Protect mandatory observer ownership of a non-cloneable completion value.
+    /// Expected: Consumption moves the output once and disarms detachment accounting.
     #[test]
     fn exclusive_completion_moves_non_clone_output_once() {
         struct NonClone(usize);
 
         runtime::block_on(async {
-            let completion = Completion::new();
-            completion.complete(Ok(NonClone(7)));
-            assert_eq!(completion.wait_take_result().await.unwrap().0, 7);
+            let (producer, observer) = test_completion();
+            let completion = Arc::clone(&observer.inner);
             assert!(matches!(
-                completion.try_take_result(),
-                CompletionTake::Consumed
+                producer.complete(Ok(NonClone(7))),
+                PublishedObserver::Attached
             ));
+            assert_eq!(observer.wait().await.unwrap().0, 7);
+            assert_consumed(&completion);
         });
     }
 
+    /// Purpose: Preserve operation failures through mandatory completion transport.
+    /// Expected: Consumption preserves the original error bridge and context without counting detachment.
     #[test]
     fn mandatory_observer_retains_operation_error() {
         runtime::block_on(async {
-            let metadata = MandatoryTaskMetadata::operation("test", None);
-            let (producer, observer) = MandatoryCompletion::<()>::endpoints(
-                metadata,
-                Arc::new(MandatoryTaskCounters::default()),
-            );
-            let _ = producer.complete(Err::<(), _>(CompletionErrorBridge::capture(
+            let (producer, observer) = test_completion::<()>();
+            let completion = Arc::clone(&observer.inner);
+            let error = CompletionErrorBridge::capture(
                 Report::new(OperationError::TableNotFound).attach("operation=test"),
-            )));
+            );
+            let identity = error.test_identity();
+            assert!(matches!(
+                producer.complete(Err(error)),
+                PublishedObserver::Attached
+            ));
             let error = observer.wait().await.unwrap_err();
+            assert_eq!(error.test_identity(), identity);
             assert_eq!(
                 error.downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
+            assert!(format!("{error:?}").contains("operation=test"));
+            assert_consumed(&completion);
         });
     }
 
+    /// Purpose: Keep runner startup owned by the mandatory worker component.
+    /// Expected: Runtime construction succeeds while worker startup reports the injected spawn failure.
     #[test]
     fn worker_component_owns_runner_startup() {
         runtime::block_on(async {
@@ -1554,6 +1638,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Release successful outputs when observers detach before or after publication.
+    /// Expected: Each unobserved output is destroyed and each detachment is counted exactly once.
     #[test]
     fn detached_success_is_dropped_once() {
         struct DropCount(Arc<AtomicUsize>);
@@ -1564,42 +1650,49 @@ mod tests {
             }
         }
 
-        let drops = Arc::new(AtomicUsize::new(0));
-        let counters = Arc::new(MandatoryTaskCounters::default());
-        let (producer, observer) = MandatoryCompletion::<DropCount>::endpoints(
-            MandatoryTaskMetadata::operation("test", None),
-            Arc::clone(&counters),
-        );
-        drop(observer);
-        let _ = producer.complete(Ok(DropCount(Arc::clone(&drops))));
-        assert_eq!(drops.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.detached_observer_count.load(Ordering::Relaxed), 1);
-
-        let (producer, observer) = MandatoryCompletion::<DropCount>::endpoints(
-            MandatoryTaskMetadata::operation("test", None),
-            Arc::clone(&counters),
-        );
-        assert!(matches!(
-            producer.complete(Ok(DropCount(Arc::clone(&drops)))),
-            PublishedObserver::Attached
-        ));
-        drop(observer);
-        assert_eq!(drops.load(Ordering::Relaxed), 2);
-        assert_eq!(counters.detached_observer_count.load(Ordering::Relaxed), 2);
+        for (case, detach_first) in [
+            ("detach before publication", true),
+            ("detach after publication", false),
+        ] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (producer, observer) = test_completion::<DropCount>();
+            let counters = Arc::clone(&observer.inner.counters);
+            let mut observer = Some(observer);
+            if detach_first {
+                drop(observer.take());
+            }
+            let published = producer.complete(Ok(DropCount(Arc::clone(&drops))));
+            assert_eq!(
+                matches!(published, PublishedObserver::Detached),
+                detach_first,
+                "{case}"
+            );
+            assert_eq!(
+                drops.load(Ordering::Relaxed),
+                usize::from(detach_first),
+                "{case}"
+            );
+            assert_eq!(
+                counters.detached_observer_count.load(Ordering::Relaxed),
+                usize::from(detach_first),
+                "{case}: publication must not count an attached observer as detached"
+            );
+            drop(observer);
+            assert_eq!(drops.load(Ordering::Relaxed), 1, "{case}");
+            assert_eq!(
+                counters.detached_observer_count.load(Ordering::Relaxed),
+                1,
+                "{case}"
+            );
+        }
     }
 
+    /// Purpose: Protect ownership transfer and normal completion of prepared operations.
+    /// Expected: Acceptance and finalization occur once with successful accounting and released capacity.
     #[test]
     fn synthetic_prepared_execution_moves_and_finishes_once() {
         let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let (registry, mandatory) = test_runtime(1).await;
             let moves = Arc::new(AtomicUsize::new(0));
             let finishes = Arc::new(AtomicUsize::new(0));
             assert_eq!(mandatory.stats(), MandatoryRuntimeStats::default());
@@ -1628,13 +1721,11 @@ mod tests {
 
             (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
+        assert_shutdown(&registry, &mandatory);
     }
 
+    /// Purpose: Preserve mandatory runner cleanup when the runner panics on exit.
+    /// Expected: Shutdown reports degradation after runner exit and retains the panic for propagation.
     #[test]
     fn mandatory_shutdown_joins_fixed_runner_before_resuming_panic() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1645,18 +1736,7 @@ mod tests {
                 panic::panic_any("fixed mandatory runner panic");
             }
         });
-        let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
-            (registry, mandatory)
-        });
+        let (registry, mandatory) = runtime::block_on(test_runtime(1));
         mandatory.close_admission();
         runtime::block_on(mandatory.drain_callers());
 
@@ -1677,20 +1757,11 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject mandatory runner teardown while accepted callers still own capacity.
+    /// Expected: Premature shutdown reports the invariant while retaining runners and internal admission.
     #[test]
     fn mandatory_shutdown_preserves_runners_until_callers_drain() {
-        let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
-            (registry, mandatory)
-        });
+        let (registry, mandatory) = runtime::block_on(test_runtime(1));
         let caller = runtime::block_on(mandatory.admission.acquire(mandatory.clone())).unwrap();
         let workers = MandatoryRuntimeWorkersOwned {
             runtime: mandatory.clone(),
@@ -1727,18 +1798,12 @@ mod tests {
         assert_eq!(handle_count, 1);
     }
 
+    /// Purpose: Distinguish ordinary task failure from successful completion after observer detachment.
+    /// Expected: Outcome and detachment counters remain independent and caller capacity is released.
     #[test]
     fn ordinary_error_and_observer_detach_are_counted_by_outcome() {
         let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let (registry, mandatory) = test_runtime(1).await;
             let moves = Arc::new(AtomicUsize::new(0));
             let finishes = Arc::new(AtomicUsize::new(0));
 
@@ -1763,17 +1828,27 @@ mod tests {
             assert_eq!(stats.completed_count, 1);
             assert_eq!(stats.error_count, 1);
             assert_eq!(stats.panic_count, 0);
+            assert_eq!(moves.load(Ordering::Relaxed), 1);
+            assert_eq!(finishes.load(Ordering::Relaxed), 1);
+            mandatory.poisoner.ensure_healthy().unwrap();
             mandatory.drain_callers().await;
 
+            let started = Arc::new(Completion::new());
+            let release = Arc::new(Completion::new());
             let observer = mandatory
-                .submit(SyntheticPrepared {
-                    moves,
-                    finishes,
-                    fail: false,
+                .submit(GatedPrepared {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
                 })
                 .await
                 .unwrap();
+            started.wait_result().await.unwrap();
             drop(observer);
+            let stats = mandatory.stats().operation;
+            assert_eq!(stats.active_count, 1);
+            assert_eq!(stats.completed_count, 1);
+            assert_eq!(stats.detached_observer_count, 1);
+            release.complete(Ok(()));
             mandatory.drain_callers().await;
 
             let stats = mandatory.stats().operation;
@@ -1786,25 +1861,15 @@ mod tests {
             assert_eq!(stats.active_count, 0);
             (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
+        assert_shutdown(&registry, &mandatory);
     }
 
+    /// Purpose: Keep internal cleanup progressing while caller admission is saturated.
+    /// Expected: Internal work completes independently and waiting callers enter only after capacity frees.
     #[test]
     fn internal_work_progresses_with_one_runner_and_saturated_caller_capacity() {
         let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let (registry, mandatory) = test_runtime(1).await;
             for _ in 0..32 {
                 let first_started = Arc::new(Completion::new());
                 let first_release = Arc::new(Completion::new());
@@ -1863,25 +1928,15 @@ mod tests {
             assert_eq!(stats.transaction_cleanup.active_count, 0);
             (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
+        assert_shutdown(&registry, &mandatory);
     }
 
+    /// Purpose: Allow independently accepted mandatory tasks to overlap on the fixed runner.
+    /// Expected: Tasks rendezvous without blocking runner progress and release all caller capacity.
     #[test]
     fn independent_accepted_tasks_overlap_without_blocking_runners() {
         let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(2))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let (registry, mandatory) = test_runtime(2).await;
             for _ in 0..32 {
                 let rendezvous = Arc::new(OverlapRendezvous::new());
                 let first = mandatory
@@ -1909,36 +1964,23 @@ mod tests {
             assert_eq!(stats.active_count, 0);
             (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
+        assert_shutdown(&registry, &mandatory);
     }
 
+    /// Purpose: Supervise an internal cleanup panic through preservation and terminal publication.
+    /// Expected: Preservation precedes poison and publication; task destruction precedes permit release.
     #[test]
     fn internal_panic_preserves_poisons_publishes_and_releases() {
-        let (registry, mandatory, dropped) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
-            let preserved = Arc::new(AtomicUsize::new(0));
-            let published = Arc::new(AtomicUsize::new(0));
-            let dropped = Arc::new(AtomicUsize::new(0));
+        let (registry, mandatory) = runtime::block_on(async {
+            let (registry, mandatory) = test_runtime(1).await;
+            let observations = Arc::new(Mutex::new(Vec::new()));
             let completion = Arc::new(Completion::new());
 
             assert!(
                 mandatory
                     .submit_internal(SyntheticPanicInternal {
-                        preserved: Arc::clone(&preserved),
-                        published: Arc::clone(&published),
-                        dropped: Arc::clone(&dropped),
+                        runtime: mandatory.clone(),
+                        observations: Arc::clone(&observations),
                         completion: Arc::clone(&completion),
                     })
                     .is_ok(),
@@ -1949,9 +1991,36 @@ mod tests {
                 error.downcast_ref::<FatalError>(),
                 Some(&FatalError::MandatoryTaskPanic)
             );
-            assert_eq!(preserved.load(Ordering::Relaxed), 1);
-            assert_eq!(published.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                mandatory
+                    .poisoner
+                    .ensure_healthy()
+                    .unwrap_err()
+                    .current_context(),
+                &FatalError::MandatoryTaskPanic
+            );
             mandatory.internal_admission.drain().await;
+            assert_eq!(
+                *observations.lock(),
+                [
+                    PanicObservation {
+                        phase: "preserve",
+                        poisoned: false,
+                        active: 1,
+                    },
+                    PanicObservation {
+                        phase: "publish",
+                        poisoned: true,
+                        active: 1,
+                    },
+                    PanicObservation {
+                        phase: "drop",
+                        poisoned: true,
+                        active: 1,
+                    },
+                ],
+                "panic phase, poison visibility, and held internal permits"
+            );
             let stats = mandatory.stats();
             assert_eq!(stats.operation, MandatoryTaskStats::default());
             assert_eq!(stats.transaction_cleanup.submitted_count, 1);
@@ -1962,31 +2031,20 @@ mod tests {
             assert_eq!(stats.transaction_cleanup.detached_observer_count, 0);
             assert_eq!(stats.transaction_cleanup.active_count, 0);
 
-            (registry, mandatory, dropped)
+            (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_shutdown(&registry, &mandatory);
     }
 
+    /// Purpose: Route accepted-operation panics through their retained owner's panic policy.
+    /// Expected: Panic handling replaces normal finalization, poisons admission, and releases ownership.
     #[test]
     fn accepted_execute_panic_invokes_policy_without_finish() {
         let dropped = Arc::new(AtomicUsize::new(0));
         let finishes = Arc::new(AtomicUsize::new(0));
         let handled = Arc::new(AtomicUsize::new(0));
         let (registry, mandatory) = runtime::block_on(async {
-            let mut builder = RegistryBuilder::new();
-            builder.build::<EnginePoisoner>(()).await.unwrap();
-            builder
-                .build::<MandatoryRuntime>(MandatoryRuntimeConfig::default().concurrency_limit(1))
-                .await
-                .unwrap();
-            builder.build::<MandatoryRuntimeWorkers>(()).await.unwrap();
-            let registry = builder.finish();
-            let mandatory = registry.dependency::<MandatoryRuntime>();
+            let (registry, mandatory) = test_runtime(1).await;
 
             let observer = mandatory
                 .submit(ExecutePanicPrepared {
@@ -2007,10 +2065,12 @@ mod tests {
             let poison = format!("{poison:?}");
             assert!(poison.contains("task_class=operation"), "{poison}");
             assert!(poison.contains("task_label=execute_panic"), "{poison}");
+            let rejected_moves = Arc::new(AtomicUsize::new(0));
+            let rejected_finishes = Arc::new(AtomicUsize::new(0));
             let rejected = mandatory
                 .submit(SyntheticPrepared {
-                    moves: Arc::new(AtomicUsize::new(0)),
-                    finishes: Arc::new(AtomicUsize::new(0)),
+                    moves: Arc::clone(&rejected_moves),
+                    finishes: Arc::clone(&rejected_finishes),
                     fail: false,
                 })
                 .await;
@@ -2027,6 +2087,9 @@ mod tests {
             );
             assert!(error.downcast_ref::<LifecycleError>().is_none());
             mandatory.drain_callers().await;
+            assert_eq!(rejected_moves.load(Ordering::Relaxed), 0);
+            assert_eq!(rejected_finishes.load(Ordering::Relaxed), 0);
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
             let stats = mandatory.stats().operation;
             assert_eq!(stats.submitted_count, 1);
             assert_eq!(stats.started_count, 1);
@@ -2038,11 +2101,7 @@ mod tests {
 
             (registry, mandatory)
         });
-        mandatory.close_admission();
-        runtime::block_on(mandatory.drain_callers());
-        registry
-            .shutdown_all()
-            .propagate_or_suppress("mandatory_runtime_test");
+        assert_shutdown(&registry, &mandatory);
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 }
