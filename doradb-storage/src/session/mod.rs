@@ -3898,6 +3898,7 @@ pub(crate) mod tests {
     };
     use crate::trx::{MIN_ACTIVE_TRX_ID, MIN_SNAPSHOT_TS, SessionOperationSnapshot, TrxInner};
     use crate::value::{Val, ValKind};
+    use event_listener::Listener;
     use futures::task::noop_waker;
     use std::cell::RefCell;
     use std::fmt::Debug;
@@ -5247,29 +5248,41 @@ pub(crate) mod tests {
             let session = engine.new_session().unwrap();
             let admitted = session.session.upgrade().unwrap().unwrap();
             assert_eq!(admitted.runtime().state().id(), session.id());
-            let (started_tx, started_rx) = mpsc::channel();
+            let shutdown_listener = admitted.runtime().shutdown_listener();
             let (done_tx, done_rx) = mpsc::channel();
 
             thread::scope(|scope| {
-                let shutdown = scope.spawn(|| {
-                    started_tx.send(()).unwrap();
-                    engine.shutdown();
+                let shutdown_engine = &engine;
+                let shutdown = scope.spawn(move || {
+                    shutdown_engine.shutdown();
                     done_tx.send(()).unwrap();
                 });
 
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("shutdown thread should start");
+                let notified = shutdown_listener.wait_timeout(Duration::from_secs(5));
+                let shutdown_started = admitted.runtime().shutdown_started();
+                let blocked = done_rx.recv_timeout(Duration::from_millis(20));
+
+                // Release admission and join before assertions so failures cannot strand shutdown.
+                drop(admitted);
+                let completed = done_rx.recv_timeout(Duration::from_secs(5));
+                let joined = shutdown.join();
+
+                assert_eq!(
+                    notified,
+                    Some(()),
+                    "shutdown should notify admission closure"
+                );
                 assert!(
-                    done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+                    shutdown_started,
+                    "shutdown must close admission before waiting"
+                );
+                assert_eq!(
+                    blocked,
+                    Err(mpsc::RecvTimeoutError::Timeout),
                     "shutdown must wait while the admitted session runtime is live"
                 );
-
-                drop(admitted);
-                done_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("shutdown should complete after admitted session runtime drops");
-                shutdown.join().unwrap();
+                completed.expect("shutdown should complete after admitted session runtime drops");
+                joined.unwrap();
             });
         });
     }
