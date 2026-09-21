@@ -5298,7 +5298,9 @@ mod tests {
     #[test]
     fn test_direct_redo_log_stream_reader() {
         smol::block_on(async {
-            const SIZE: i32 = 100;
+            // Separately awaited commits exercise multiple redo groups and reader refills;
+            // these inputs retain the original value range and both string lengths.
+            const INPUTS: [i32; 8] = [0, 1, 8, 9, 10, 11, 98, 99];
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -5307,7 +5309,8 @@ mod tests {
                     .storage_root(main_dir)
                     .trx(
                         TrxSysConfig::default()
-                            .log_file_stem(String::from("direct_redo_stream_reader.log")),
+                            .log_file_stem(String::from("direct_redo_stream_reader.log"))
+                            .log_sync(LogSync::Fsync),
                     )
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
@@ -5319,7 +5322,8 @@ mod tests {
             .unwrap();
             let table_id = table2(&engine).await;
 
-            let expected_rows: Vec<_> = (0..SIZE)
+            let expected_rows: Vec<_> = INPUTS
+                .into_iter()
                 .map(|i| vec![Val::from(i), Val::from(i.to_string().as_str())])
                 .collect();
             let mut session = engine.new_session().unwrap();

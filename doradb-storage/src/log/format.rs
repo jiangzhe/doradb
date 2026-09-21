@@ -756,6 +756,7 @@ fn is_valid_file_max_size(file_max_size: u64, log_block_size: usize) -> bool {
 mod tests {
     use super::*;
     use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
+    use std::array::from_fn;
 
     type CorruptCase = (&'static str, Box<dyn FnOnce(&mut [u8])>, DataIntegrityError);
 
@@ -779,9 +780,8 @@ mod tests {
         expected_slot: u32,
         expected_generation: u64,
     ) {
-        let mut slots: [Vec<u8>; 2] = std::array::from_fn(|slot| {
-            serialized_slot(&valid_super_block(slot as u32, generations[slot]))
-        });
+        let mut slots: [Vec<u8>; 2] =
+            from_fn(|slot| serialized_slot(&valid_super_block(slot as u32, generations[slot])));
         if let Some(slot) = corrupt_slot {
             slots[slot][64] ^= 1;
         }
