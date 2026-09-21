@@ -381,8 +381,8 @@ mod tests {
 
     fn submit_batch_with_pending(staged_len: usize, pending_sqes: usize) -> IouringSubmitBatch {
         let mut staged = VecDeque::with_capacity(staged_len);
-        for _ in 0..staged_len {
-            staged.push_back(nop_entry());
+        for idx in 0..staged_len {
+            staged.push_back(nop_entry().user_data(idx as u64));
         }
         IouringSubmitBatch {
             staged,
@@ -390,6 +390,21 @@ mod tests {
         }
     }
 
+    #[track_caller]
+    fn assert_invalid_io_depth(io_depth: usize, expected_reason: &str) {
+        let err = match IouringBackend::setup(io_depth) {
+            Ok(_) => panic!("expected invalid io depth: {io_depth}"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=io_uring"), "{report}");
+        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
+        assert!(report.contains(expected_reason), "{report}");
+    }
+
+    /// Purpose: Account for partial acceptance of pending io_uring submissions.
+    /// Expected: Only the accepted prefix is removed and the unsubmitted suffix remains pending.
     #[test]
     fn test_finish_submit_applies_successful_submit_bookkeeping() {
         let mut batch = submit_batch_with_pending(3, 3);
@@ -401,8 +416,11 @@ mod tests {
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 1);
         assert_eq!(batch.staged.len(), 1);
+        assert_eq!(batch.staged[0].get_user_data(), 2);
     }
 
+    /// Purpose: Treat an io_uring submit that accepts no entries as transient pressure.
+    /// Expected: The retry has no errno and preserves the pending batch and syscall count.
     #[test]
     fn test_finish_submit_returns_no_progress_retry_for_zero_submit() {
         let mut batch = submit_batch_with_pending(2, 2);
@@ -416,8 +434,12 @@ mod tests {
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
+        assert_eq!(batch.staged[0].get_user_data(), 0);
+        assert_eq!(batch.staged[1].get_user_data(), 1);
     }
 
+    /// Purpose: Distinguish submit-pressure errnos from unrelated syscall outcomes.
+    /// Expected: Recognized pressure codes map to retry reasons while other outcomes remain distinct.
     #[test]
     fn test_submit_retry_reason_maps_pressure_errno() {
         assert_eq!(
@@ -432,6 +454,8 @@ mod tests {
         assert_eq!(SubmitRetryReason::NoProgress.raw_errno(), None);
     }
 
+    /// Purpose: Carry io_uring submit pressure through the backend retry outcome.
+    /// Expected: The retry preserves its reason, errno, and syscall attempt count.
     #[test]
     fn test_retry_submit_carries_backend_context() {
         let outcome = retry_submit(SubmitRetryReason::Ebusy, 3);
@@ -444,6 +468,8 @@ mod tests {
         assert_eq!(outcome.call_count, 3);
     }
 
+    /// Purpose: Detect staging pressure when the io_uring submission queue is full.
+    /// Expected: A no-progress retry retains the staged entry without attempting a submit syscall.
     #[test]
     fn test_submit_batch_reports_no_progress_when_sq_full() {
         let mut backend = IouringBackend::setup(1).unwrap();
@@ -471,8 +497,11 @@ mod tests {
         assert_eq!(retry.call_count(), 0);
         assert_eq!(batch.pending_sqes, 0);
         assert_eq!(batch.staged.len(), 1);
+        assert_eq!(batch.staged[0].get_user_data(), 0);
     }
 
+    /// Purpose: Account for submission and completion activity during a blocking io_uring wait.
+    /// Expected: Statistics retain syscall attempts, elapsed time, accepted operations, and completions.
     #[test]
     fn test_record_blocking_wait_stats_counts_combined_fields() {
         let stats = BackendStatsHandle::default();
@@ -490,28 +519,18 @@ mod tests {
         assert_eq!(snapshot.wait_completions, 3);
     }
 
+    /// Purpose: Reject an unusable io_uring queue depth before backend creation.
+    /// Expected: The invalid-input report identifies the backend and rejected depth.
     #[test]
     fn test_iouring_backend_rejects_zero_depth_as_invalid_input() {
-        let err = match IouringBackend::setup(0) {
-            Ok(_) => panic!("expected invalid io depth"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
-        let report = format!("{err:?}");
-        assert!(report.contains("backend=io_uring"), "{report}");
-        assert!(report.contains("io_depth=0"), "{report}");
+        assert_invalid_io_depth(0, "reason=io depth must be non-zero");
     }
 
+    /// Purpose: Reject queue depths exceeding the io_uring entry-count representation.
+    /// Expected: The invalid-input report preserves the rejected depth without truncation.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_iouring_backend_rejects_ring_entry_overflow_as_invalid_input() {
-        let io_depth = (u32::MAX as usize) + 1;
-        let err = match IouringBackend::setup(io_depth) {
-            Ok(_) => panic!("expected invalid io depth"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
-        let report = format!("{err:?}");
-        assert!(report.contains("backend=io_uring"), "{report}");
-        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
+        assert_invalid_io_depth((u32::MAX as usize) + 1, "reason=ring entries exceed u32");
     }
 }

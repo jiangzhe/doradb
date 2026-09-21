@@ -392,6 +392,41 @@ pub(crate) mod tests {
         *IO_GETEVENTS_HOOK.lock().unwrap()
     }
 
+    #[track_caller]
+    fn assert_submit_retry_with_hook(
+        hook: IoSubmitHook,
+        reason: SubmitRetryReason,
+        errno: Option<i32>,
+    ) {
+        let ctx = LibaioBackend::setup(32).unwrap();
+        let iocb = iocb::boxed();
+        let reqs = [iocb.as_mut_ptr()];
+        let previous = set_io_submit_hook(Some(hook));
+        let result = ctx.submit_limit(&reqs, 1);
+        set_io_submit_hook(previous);
+        let SubmitAttempt::Retry(retry) = result.unwrap() else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.reason(), reason);
+        assert_eq!(retry.raw_errno(), errno);
+        assert_eq!(retry.call_count(), 1);
+    }
+
+    #[track_caller]
+    fn assert_invalid_io_depth(io_depth: usize, expected_reason: &str) {
+        let err = match LibaioBackend::setup(io_depth) {
+            Ok(_) => panic!("expected invalid io depth: {io_depth}"),
+            Err(err) => err,
+        };
+        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
+        let report = format!("{err:?}");
+        assert!(report.contains("backend=libaio"), "{report}");
+        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
+        assert!(report.contains(expected_reason), "{report}");
+    }
+
+    /// Purpose: Extend a sparse I/O file while preserving its unallocated storage.
+    /// Expected: Repeating the current extent is harmless and growth changes only the logical size.
     #[test]
     fn test_aio_file_extend() {
         let temp_dir = TempDir::new().unwrap();
@@ -403,6 +438,7 @@ pub(crate) mod tests {
         assert_eq!(logical_size, 1024 * 1024);
         assert_eq!(allocated_size, 0);
         file.extend_to(1024 * 1024).unwrap();
+        assert_eq!(file.size().unwrap(), (1024 * 1024, 0));
         file.extend_to(1024 * 1024 * 2).unwrap();
         let (logical_size, allocated_size) = file.size().unwrap();
         println!("file grown, logical size={logical_size}, allocated_size={allocated_size}");
@@ -411,6 +447,8 @@ pub(crate) mod tests {
         drop(file);
     }
 
+    /// Purpose: Round-trip aligned file data through the submission driver and libaio backend.
+    /// Expected: Write and read completions report full transfers and readback preserves the payload.
     #[test]
     fn test_submission_driver_with_libaio_backend() {
         let ctx = LibaioBackend::setup(16).unwrap();
@@ -466,92 +504,67 @@ pub(crate) mod tests {
         assert_eq!(&buf.as_bytes()[..data.len()], data);
     }
 
+    /// Purpose: Handle libaio submit pressure without treating it as a terminal failure.
+    /// Expected: The retry preserves the pressure errno and syscall attempt count.
     #[test]
     fn test_submit_limit_eagain_no_panic() {
-        let ctx = LibaioBackend::setup(32).unwrap();
-        let previous = set_io_submit_hook(Some(|_, _, _| -EAGAIN));
-        let iocb = iocb::boxed();
-        let reqs = vec![iocb.as_mut_ptr()];
-        let submit_result = ctx.submit_limit(&reqs, 1).unwrap();
-        set_io_submit_hook(previous);
-        let SubmitAttempt::Retry(retry) = submit_result else {
-            panic!("expected submit retry");
-        };
-        assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
-        assert_eq!(retry.raw_errno(), Some(EAGAIN));
-        assert_eq!(retry.call_count(), 1);
+        assert_submit_retry_with_hook(|_, _, _| -EAGAIN, SubmitRetryReason::Eagain, Some(EAGAIN));
     }
 
+    /// Purpose: Detect a libaio submit that accepts none of the requested work.
+    /// Expected: The outcome requests a no-progress retry without inventing an errno.
     #[test]
     fn test_submit_limit_zero_submit_reports_no_progress_retry() {
-        let ctx = LibaioBackend::setup(32).unwrap();
-        let previous = set_io_submit_hook(Some(|_, _, _| 0));
-        let iocb = iocb::boxed();
-        let reqs = vec![iocb.as_mut_ptr()];
-        let submit_result = ctx.submit_limit(&reqs, 1).unwrap();
-        set_io_submit_hook(previous);
-        let SubmitAttempt::Retry(retry) = submit_result else {
-            panic!("expected submit retry");
-        };
-        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
-        assert_eq!(retry.raw_errno(), None);
-        assert_eq!(retry.call_count(), 1);
+        assert_submit_retry_with_hook(|_, _, _| 0, SubmitRetryReason::NoProgress, None);
     }
 
+    /// Purpose: Reject an unusable libaio queue depth before backend creation.
+    /// Expected: The invalid-input report identifies the backend and rejected depth.
     #[test]
     fn test_libaio_backend_rejects_zero_depth_as_invalid_input() {
-        let err = match LibaioBackend::setup(0) {
-            Ok(_) => panic!("expected invalid io depth"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
-        let report = format!("{err:?}");
-        assert!(report.contains("backend=libaio"), "{report}");
-        assert!(report.contains("io_depth=0"), "{report}");
+        assert_invalid_io_depth(0, "reason=io depth must be non-zero");
     }
 
+    /// Purpose: Reject queue depths exceeding the libaio signed depth representation.
+    /// Expected: The invalid-input report preserves the rejected depth without truncation.
     #[test]
     fn test_libaio_backend_rejects_i32_overflow_as_invalid_input() {
-        let io_depth = (i32::MAX as usize) + 1;
-        let err = match LibaioBackend::setup(io_depth) {
-            Ok(_) => panic!("expected invalid io depth"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context().kind(), StdIoErrorKind::InvalidInput);
-        let report = format!("{err:?}");
-        assert!(report.contains("backend=libaio"), "{report}");
-        assert!(report.contains(&format!("io_depth={io_depth}")), "{report}");
+        assert_invalid_io_depth((i32::MAX as usize) + 1, "reason=io depth exceeds i32");
     }
 
+    /// Purpose: Prepare native libaio operations for file and data synchronization.
+    /// Expected: Each request carries its sync opcode and descriptor without binding data memory.
     #[test]
     fn test_libaio_prepare_sync_operations_use_native_opcodes() {
         let mut backend = LibaioBackend::setup(4).unwrap();
 
-        let mut fsync = Operation::fsync(17);
-        let fsync_iocb =
-            <LibaioBackend as Backend>::prepare(&mut backend, BackendToken::new(1, 2), &mut fsync);
-        assert_eq!(fsync_iocb.aio_lio_opcode, io_iocb_cmd::IO_CMD_FSYNC as u16);
-        assert_eq!(fsync_iocb.aio_fildes, 17);
-        assert_eq!(fsync_iocb.buf, null_mut());
-        assert_eq!(fsync_iocb.count, 0);
-        assert_eq!(fsync_iocb.offset, 0);
-
-        let mut fdatasync = Operation::fdatasync(19);
-        let fdatasync_iocb = <LibaioBackend as Backend>::prepare(
-            &mut backend,
-            BackendToken::new(1, 3),
-            &mut fdatasync,
-        );
-        assert_eq!(
-            fdatasync_iocb.aio_lio_opcode,
-            io_iocb_cmd::IO_CMD_FDSYNC as u16
-        );
-        assert_eq!(fdatasync_iocb.aio_fildes, 19);
-        assert_eq!(fdatasync_iocb.buf, null_mut());
-        assert_eq!(fdatasync_iocb.count, 0);
-        assert_eq!(fdatasync_iocb.offset, 0);
+        for (case, mut operation, opcode, fd, token) in [
+            (
+                "fsync",
+                Operation::fsync(17),
+                io_iocb_cmd::IO_CMD_FSYNC,
+                17,
+                BackendToken::new(1, 2),
+            ),
+            (
+                "fdatasync",
+                Operation::fdatasync(19),
+                io_iocb_cmd::IO_CMD_FDSYNC,
+                19,
+                BackendToken::new(1, 3),
+            ),
+        ] {
+            let iocb = <LibaioBackend as Backend>::prepare(&mut backend, token, &mut operation);
+            assert_eq!(iocb.aio_lio_opcode, opcode as u16, "{case}");
+            assert_eq!(iocb.aio_fildes, fd, "{case}");
+            assert_eq!(iocb.buf, null_mut(), "{case}");
+            assert_eq!(iocb.count, 0, "{case}");
+            assert_eq!(iocb.offset, 0, "{case}");
+        }
     }
 
+    /// Purpose: Retry an interrupted libaio wait while accounting for every syscall attempt.
+    /// Expected: The completion retains its token and result, and statistics include the interruption.
     #[test]
     fn test_wait_at_least_stats_count_eintr_retries() {
         fn eintr_then_one_completion(

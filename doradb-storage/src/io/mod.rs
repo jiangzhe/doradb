@@ -1183,15 +1183,24 @@ mod tests {
         }
     }
 
-    struct PreparedDropCounter {
-        token: BackendToken,
-        drops: Arc<AtomicUsize>,
+    #[derive(Debug, PartialEq, Eq)]
+    enum CleanupEvent {
+        PreparedDropped(BackendToken),
+        BackendDropped,
     }
 
-    impl Drop for PreparedDropCounter {
+    struct PreparedDropRecorder {
+        token: BackendToken,
+        events: Arc<Mutex<Vec<CleanupEvent>>>,
+    }
+
+    impl Drop for PreparedDropRecorder {
         #[inline]
         fn drop(&mut self) {
-            self.drops.fetch_add(1, Ordering::SeqCst);
+            self.events
+                .lock()
+                .unwrap()
+                .push(CleanupEvent::PreparedDropped(self.token));
         }
     }
 
@@ -1199,7 +1208,7 @@ mod tests {
         io_depth: usize,
         submit_results: VecDeque<usize>,
         inflight: VecDeque<BackendToken>,
-        prepared_drops: Arc<AtomicUsize>,
+        drop_events: Arc<Mutex<Vec<CleanupEvent>>>,
         cleanup_submitted: Arc<AtomicUsize>,
         cleanup: Option<SubmittedIoCleanup>,
     }
@@ -1210,22 +1219,31 @@ mod tests {
             io_depth: usize,
             submit_results: impl Into<VecDeque<usize>>,
             cleanup: SubmittedIoCleanup,
-            prepared_drops: Arc<AtomicUsize>,
+            drop_events: Arc<Mutex<Vec<CleanupEvent>>>,
             cleanup_submitted: Arc<AtomicUsize>,
         ) -> Self {
             Self {
                 io_depth,
                 submit_results: submit_results.into(),
                 inflight: VecDeque::new(),
-                prepared_drops,
+                drop_events,
                 cleanup_submitted,
                 cleanup: Some(cleanup),
             }
         }
     }
 
+    impl Drop for CleanupBackend {
+        fn drop(&mut self) {
+            self.drop_events
+                .lock()
+                .unwrap()
+                .push(CleanupEvent::BackendDropped);
+        }
+    }
+
     impl Backend for CleanupBackend {
-        type Prepared = PreparedDropCounter;
+        type Prepared = PreparedDropRecorder;
         type SubmitBatch = VecDeque<BackendToken>;
         type Events = ();
 
@@ -1234,7 +1252,7 @@ mod tests {
                 io_depth,
                 VecDeque::new(),
                 SubmittedIoCleanup::DropAfterBackend,
-                Arc::new(AtomicUsize::new(0)),
+                Arc::new(Mutex::new(Vec::new())),
                 Arc::new(AtomicUsize::new(0)),
             ))
         }
@@ -1250,9 +1268,9 @@ mod tests {
         fn new_events(&self) -> Self::Events {}
 
         fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            PreparedDropCounter {
+            PreparedDropRecorder {
                 token,
-                drops: Arc::clone(&self.prepared_drops),
+                events: Arc::clone(&self.drop_events),
             }
         }
 
@@ -1367,6 +1385,62 @@ mod tests {
         SubmitAttempt::Retry(SubmitRetry::new(reason, 1))
     }
 
+    #[track_caller]
+    fn stage_two_writes<B: Backend>(driver: &mut SubmissionDriver<DriverSubmission, B>, fd: RawFd) {
+        assert!(driver.push(DriverSubmission::new(1, fd, 0)).is_ok());
+        assert!(
+            driver
+                .push(DriverSubmission::new(2, fd, STORAGE_SECTOR_SIZE))
+                .is_ok()
+        );
+    }
+
+    #[track_caller]
+    fn assert_driver_completion(
+        completed: CompletedSubmission<DriverSubmission>,
+        expected_id: usize,
+    ) {
+        assert_eq!(completed.submission.op.id, expected_id);
+        assert_eq!(completed.result.unwrap(), STORAGE_SECTOR_SIZE);
+    }
+
+    #[track_caller]
+    fn expire_submit_retry(
+        reason: SubmitRetryReason,
+        call_count: usize,
+        expected_errno: Option<i32>,
+    ) -> BackendError {
+        let mut driver = SubmissionDriver::new_with_submit_retry_timeout(
+            DriverBackend::with_submit_outcomes(
+                1,
+                VecDeque::from([SubmitAttempt::Retry(SubmitRetry::new(reason, call_count))]),
+            ),
+            Duration::ZERO,
+        );
+
+        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
+        let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
+            panic!("expected submit retry");
+        };
+        assert_eq!(retry.reason(), reason);
+        assert_eq!(retry.call_count(), call_count);
+        assert_eq!(retry.raw_errno(), expected_errno);
+
+        let err = driver
+            .backoff_submit_retry_or_progress_error(retry)
+            .unwrap_err();
+        assert_eq!(err.backend(), BACKEND_NAME);
+        assert_eq!(err.op(), "submit");
+        assert_eq!(driver.pending_len(), 1);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 0);
+        let owned_ids: Vec<_> = driver.owned_submissions().map(|sub| sub.op.id).collect();
+        assert_eq!(owned_ids, vec![1]);
+        err
+    }
+
+    /// Purpose: Scope installation of a storage backend test hook to its guard lifetime.
+    /// Expected: The installed hook is visible until guard drop restores the empty hook state.
     #[test]
     fn test_install_storage_backend_test_hook_clears_hook_on_drop() {
         let hook: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
@@ -1378,6 +1452,8 @@ mod tests {
         assert!(current_storage_backend_test_hook().is_none());
     }
 
+    /// Purpose: Restore a replaced storage backend test hook when its installation guard drops.
+    /// Expected: The replacement is visible temporarily and the exact previous hook is restored.
     #[test]
     fn test_installed_storage_backend_test_hook_restores_previous_on_drop() {
         let previous: StorageBackendHook = Arc::new(NoopStorageBackendTestHook);
@@ -1397,6 +1473,8 @@ mod tests {
         assert!(Arc::ptr_eq(&cleared, &previous));
     }
 
+    /// Purpose: Drain an I/O queue when the requested count exceeds its remaining entries.
+    /// Expected: All remaining requests are returned in order and the queue becomes empty.
     #[test]
     fn test_io_queue_drain_to_clamps_to_remaining_len() {
         let mut queue = IOQueue::with_capacity(2);
@@ -1408,25 +1486,25 @@ mod tests {
         assert!(queue.is_empty());
     }
 
+    /// Purpose: Represent file and data synchronization without an I/O buffer.
+    /// Expected: Sync operations preserve their kind and descriptor while exposing no data memory.
     #[test]
     fn test_sync_operations_do_not_bind_buffers() {
-        let mut fsync = Operation::fsync(17);
-        assert_eq!(fsync.kind(), IOKind::Fsync);
-        assert_eq!(fsync.fd(), 17);
-        assert_eq!(fsync.offset(), 0);
-        assert_eq!(fsync.len(), 0);
-        assert!(fsync.buf().is_none());
-        assert!(fsync.take_buf().is_none());
-
-        let mut fdatasync = Operation::fdatasync(19);
-        assert_eq!(fdatasync.kind(), IOKind::Fdatasync);
-        assert_eq!(fdatasync.fd(), 19);
-        assert_eq!(fdatasync.offset(), 0);
-        assert_eq!(fdatasync.len(), 0);
-        assert!(fdatasync.buf().is_none());
-        assert!(fdatasync.take_buf().is_none());
+        for (mut operation, kind, fd) in [
+            (Operation::fsync(17), IOKind::Fsync, 17),
+            (Operation::fdatasync(19), IOKind::Fdatasync, 19),
+        ] {
+            assert_eq!(operation.kind(), kind, "{kind:?}");
+            assert_eq!(operation.fd(), fd, "{kind:?}");
+            assert_eq!(operation.offset(), 0, "{kind:?}");
+            assert_eq!(operation.len(), 0, "{kind:?}");
+            assert!(operation.buf().is_none(), "{kind:?}");
+            assert!(operation.take_buf().is_none(), "{kind:?}");
+        }
     }
 
+    /// Purpose: Track submission-driver ownership through submission, completion, and hook callbacks.
+    /// Expected: Completions and hooks preserve operation identity while accounting releases capacity.
     #[test]
     fn test_submission_driver_submits_and_completes_with_hooks() {
         let hook = Arc::new(RecordingHook::default());
@@ -1435,12 +1513,7 @@ mod tests {
 
         assert_eq!(driver.capacity(), 2);
         assert_eq!(driver.available_capacity(), 2);
-        assert!(driver.push(DriverSubmission::new(1, 41, 0)).is_ok());
-        assert!(
-            driver
-                .push(DriverSubmission::new(2, 41, STORAGE_SECTOR_SIZE))
-                .is_ok()
-        );
+        stage_two_writes(&mut driver, 41);
         assert_eq!(driver.pending_len(), 2);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 0);
@@ -1453,14 +1526,12 @@ mod tests {
         assert_eq!(driver.submitted_len(), 2);
 
         let first = driver.wait_at_least_one().unwrap();
-        assert_eq!(first.submission.op.id, 1);
-        assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_driver_completion(first, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
 
         let second = driver.wait_at_least_one().unwrap();
-        assert_eq!(second.submission.op.id, 2);
-        assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_driver_completion(second, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 2);
@@ -1479,36 +1550,33 @@ mod tests {
         );
     }
 
+    /// Purpose: Expose excess completions fetched by a submission-driver wait.
+    /// Expected: The remaining completion can be popped with its identity and result intact.
     #[test]
     fn test_submission_driver_wait_at_least_one_exposes_buffered_completion_pop() {
         let mut driver = SubmissionDriver::new(DriverBackend::new(2));
 
-        assert!(driver.push(DriverSubmission::new(1, 43, 0)).is_ok());
-        assert!(
-            driver
-                .push(DriverSubmission::new(2, 43, STORAGE_SECTOR_SIZE))
-                .is_ok()
-        );
+        stage_two_writes(&mut driver, 43);
         assert_eq!(
             driver.submit_ready().unwrap(),
             SubmitAttempt::Submitted(NonZeroUsize::new(2).unwrap())
         );
 
         let first = driver.wait_at_least_one().unwrap();
-        assert_eq!(first.submission.op.id, 1);
-        assert_eq!(first.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_driver_completion(first, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
 
         let second = driver
             .try_pop_completed()
             .expect("second completion should already be buffered");
-        assert_eq!(second.submission.op.id, 2);
-        assert_eq!(second.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_driver_completion(second, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
     }
 
+    /// Purpose: Poll buffered completions while accepted work still awaits the backend.
+    /// Expected: An empty poll never enters the backend wait path or changes pending ownership.
     #[test]
     fn test_submission_driver_try_pop_completed_does_not_wait() {
         let mut driver = SubmissionDriver::new(DriverBackend::wait_panics(1));
@@ -1526,6 +1594,8 @@ mod tests {
         assert_eq!(driver.submitted_len(), 1);
     }
 
+    /// Purpose: Preserve a staged batch through no-progress retry and subsequent partial submissions.
+    /// Expected: Each original submission completes in order and releases its reserved capacity.
     #[test]
     fn test_submission_driver_keeps_no_progress_retry_staged() {
         let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
@@ -1537,12 +1607,7 @@ mod tests {
             ]),
         ));
 
-        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        assert!(
-            driver
-                .push(DriverSubmission::new(2, 42, STORAGE_SECTOR_SIZE))
-                .is_ok()
-        );
+        stage_two_writes(&mut driver, 42);
 
         assert_eq!(
             driver.submit_ready().unwrap(),
@@ -1561,7 +1626,7 @@ mod tests {
         assert_eq!(driver.available_capacity(), 0);
 
         let first = driver.wait_at_least_one().unwrap();
-        assert_eq!(first.submission.op.id, 1);
+        assert_driver_completion(first, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 1);
@@ -1571,12 +1636,14 @@ mod tests {
             SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
         );
         let second = driver.wait_at_least_one().unwrap();
-        assert_eq!(second.submission.op.id, 2);
+        assert_driver_completion(second, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(driver.available_capacity(), 2);
     }
 
+    /// Purpose: Retain a staged submission through kernel submit pressure and backoff.
+    /// Expected: Retry preserves ownership and allows the original work to be submitted later.
     #[test]
     fn test_submission_driver_keeps_submit_retry_staged() {
         let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
@@ -1604,8 +1671,16 @@ mod tests {
         );
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 1);
+
+        let completed = driver.wait_at_least_one().unwrap();
+        assert_driver_completion(completed, 1);
+        assert_eq!(driver.pending_len(), 0);
+        assert_eq!(driver.submitted_len(), 0);
+        assert_eq!(driver.available_capacity(), 2);
     }
 
+    /// Purpose: Handle submit pressure while previously accepted work remains inflight.
+    /// Expected: Existing work completes normally and the staged remainder stays available for retry.
     #[test]
     fn test_submission_driver_retry_preserves_existing_inflight_work() {
         let mut driver = SubmissionDriver::new(DriverBackend::with_submit_outcomes(
@@ -1617,12 +1692,7 @@ mod tests {
             ]),
         ));
 
-        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        assert!(
-            driver
-                .push(DriverSubmission::new(2, 42, STORAGE_SECTOR_SIZE))
-                .is_ok()
-        );
+        stage_two_writes(&mut driver, 42);
 
         assert_eq!(
             driver.submit_ready().unwrap(),
@@ -1639,7 +1709,7 @@ mod tests {
         assert_eq!(driver.submitted_len(), 1);
 
         let first = driver.wait_at_least_one().unwrap();
-        assert_eq!(first.submission.op.id, 1);
+        assert_driver_completion(first, 1);
         assert_eq!(driver.pending_len(), 1);
         assert_eq!(driver.submitted_len(), 0);
 
@@ -1648,11 +1718,13 @@ mod tests {
             SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
         );
         let second = driver.wait_at_least_one().unwrap();
-        assert_eq!(second.submission.op.id, 2);
+        assert_driver_completion(second, 2);
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
     }
 
+    /// Purpose: Configure the no-progress timeout used for submission retry backoff.
+    /// Expected: Default construction uses the standard timeout and explicit construction retains overrides.
     #[test]
     fn test_submit_retry_backoff_timeout_defaults_and_customizes() {
         assert_eq!(
@@ -1665,86 +1737,41 @@ mod tests {
         );
     }
 
+    /// Purpose: Expire kernel-pressure retries with no inflight work when the timeout is exhausted.
+    /// Expected: The progress failure preserves errno and backend context while work remains staged.
     #[test]
     fn test_submission_driver_retry_without_inflight_expires_as_progress_error() {
-        let mut driver = SubmissionDriver::new_with_submit_retry_timeout(
-            DriverBackend::with_submit_outcomes(
-                1,
-                VecDeque::from([driver_submit_retry(SubmitRetryReason::Eagain)]),
-            ),
-            Duration::from_millis(0),
-        );
-
-        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
-            panic!("expected submit retry");
-        };
-        assert_eq!(retry.reason(), SubmitRetryReason::Eagain);
-        assert_eq!(retry.call_count(), 1);
-
-        let err = driver
-            .backoff_submit_retry_or_progress_error(retry)
-            .unwrap_err();
-        assert_eq!(err.backend(), BACKEND_NAME);
-        assert_eq!(err.op(), "submit");
+        let err = expire_submit_retry(SubmitRetryReason::Eagain, 1, Some(libc::EAGAIN));
         assert_eq!(err.raw_errno(), Some(libc::EAGAIN));
         assert_eq!(err.call_count(), 1);
         assert!(err.to_string().contains("submit_retry_reason=EAGAIN"));
-        assert_eq!(driver.pending_len(), 1);
-        assert_eq!(driver.submitted_len(), 0);
     }
 
+    /// Purpose: Expire no-progress retries when no syscall supplied an errno.
+    /// Expected: The failure retains its retry context without an errno and leaves work staged.
     #[test]
     fn test_submission_driver_no_progress_retry_expires_without_errno() {
-        let mut driver = SubmissionDriver::new_with_submit_retry_timeout(
-            DriverBackend::with_submit_outcomes(
-                1,
-                VecDeque::from([SubmitAttempt::Retry(SubmitRetry::new(
-                    SubmitRetryReason::NoProgress,
-                    0,
-                ))]),
-            ),
-            Duration::from_millis(0),
-        );
-
-        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        let SubmitAttempt::Retry(retry) = driver.submit_ready().unwrap() else {
-            panic!("expected submit retry");
-        };
-        assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
-        assert_eq!(retry.raw_errno(), None);
-        assert_eq!(retry.call_count(), 0);
-
-        let err = driver
-            .backoff_submit_retry_or_progress_error(retry)
-            .unwrap_err();
-        assert_eq!(err.backend(), BACKEND_NAME);
-        assert_eq!(err.op(), "submit");
+        let err = expire_submit_retry(SubmitRetryReason::NoProgress, 0, None);
         assert_eq!(err.raw_errno(), None);
         assert_eq!(err.call_count(), 0);
         assert!(err.to_string().contains("submit_retry_reason=NO_PROGRESS"));
-        assert_eq!(driver.pending_len(), 1);
-        assert_eq!(driver.submitted_len(), 0);
     }
 
+    /// Purpose: Separate staged and accepted work during fatal backend cleanup.
+    /// Expected: Staged entries drop immediately and accepted entries remain alive until backend drop.
     #[test]
     fn test_submission_driver_cleanup_retains_submitted_and_drops_staged() {
-        let prepared_drops = Arc::new(AtomicUsize::new(0));
+        let drop_events = Arc::new(Mutex::new(Vec::new()));
         let cleanup_submitted = Arc::new(AtomicUsize::new(0));
         let backend = CleanupBackend::new(
             2,
             VecDeque::from([1]),
             SubmittedIoCleanup::DropAfterBackend,
-            Arc::clone(&prepared_drops),
+            Arc::clone(&drop_events),
             Arc::clone(&cleanup_submitted),
         );
         let mut driver = SubmissionDriver::new(backend);
-        assert!(driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        assert!(
-            driver
-                .push(DriverSubmission::new(2, 42, STORAGE_SECTOR_SIZE))
-                .is_ok()
-        );
+        stage_two_writes(&mut driver, 42);
         assert_eq!(
             driver.submit_ready().unwrap(),
             SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
@@ -1755,72 +1782,67 @@ mod tests {
         assert_eq!(driver.pending_len(), 0);
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(
-            prepared_drops.load(Ordering::SeqCst),
-            1,
+            *drop_events.lock().unwrap(),
+            vec![CleanupEvent::PreparedDropped(BackendToken::new(0, 1))],
             "staged entry should drop immediately"
         );
         drop(driver);
         assert_eq!(
-            prepared_drops.load(Ordering::SeqCst),
-            2,
+            *drop_events.lock().unwrap(),
+            vec![
+                CleanupEvent::PreparedDropped(BackendToken::new(0, 1)),
+                CleanupEvent::BackendDropped,
+                CleanupEvent::PreparedDropped(BackendToken::new(0, 0)),
+            ],
             "submitted entry should drop from quarantine after backend drop"
         );
     }
 
+    /// Purpose: Respect unsafe-to-release memory during submitted-work cleanup.
+    /// Expected: Memory-bound entries are leaked while memoryless sync entries drop after backend cleanup.
     #[test]
     fn test_submission_driver_cleanup_leaks_memory_bound_submitted_entries_only() {
-        let write_drops = Arc::new(AtomicUsize::new(0));
-        let write_cleanup_submitted = Arc::new(AtomicUsize::new(0));
-        let write_backend = CleanupBackend::new(
-            1,
-            VecDeque::from([1]),
-            SubmittedIoCleanup::LeakAfterBackend {
-                backend: "cleanup_test",
-                reason: "forced leak".to_string(),
-            },
-            Arc::clone(&write_drops),
-            Arc::clone(&write_cleanup_submitted),
-        );
-        let mut write_driver = SubmissionDriver::new(write_backend);
-        assert!(write_driver.push(DriverSubmission::new(1, 42, 0)).is_ok());
-        assert_eq!(
-            write_driver.submit_ready().unwrap(),
-            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
-        );
-        assert_eq!(write_driver.cleanup_after_backend_progress_failure(), 1);
-        drop(write_driver);
-        assert_eq!(write_cleanup_submitted.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            write_drops.load(Ordering::SeqCst),
-            0,
-            "memory-bound submitted entry should be leaked"
-        );
-
-        let sync_drops = Arc::new(AtomicUsize::new(0));
-        let sync_cleanup_submitted = Arc::new(AtomicUsize::new(0));
-        let sync_backend = CleanupBackend::new(
-            1,
-            VecDeque::from([1]),
-            SubmittedIoCleanup::LeakAfterBackend {
-                backend: "cleanup_test",
-                reason: "forced leak".to_string(),
-            },
-            Arc::clone(&sync_drops),
-            Arc::clone(&sync_cleanup_submitted),
-        );
-        let mut sync_driver = SubmissionDriver::new(sync_backend);
-        assert!(sync_driver.push(DriverSubmission::sync(1, 42)).is_ok());
-        assert_eq!(
-            sync_driver.submit_ready().unwrap(),
-            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
-        );
-        assert_eq!(sync_driver.cleanup_after_backend_progress_failure(), 1);
-        drop(sync_driver);
-        assert_eq!(sync_cleanup_submitted.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            sync_drops.load(Ordering::SeqCst),
-            1,
-            "memoryless submitted entry should drop after backend cleanup"
-        );
+        for (case, submission, expected_events) in [
+            (
+                "memory-bound write",
+                DriverSubmission::new(1, 42, 0),
+                vec![CleanupEvent::BackendDropped],
+            ),
+            (
+                "memoryless sync",
+                DriverSubmission::sync(1, 42),
+                vec![
+                    CleanupEvent::BackendDropped,
+                    CleanupEvent::PreparedDropped(BackendToken::new(0, 0)),
+                ],
+            ),
+        ] {
+            let drop_events = Arc::new(Mutex::new(Vec::new()));
+            let cleanup_submitted = Arc::new(AtomicUsize::new(0));
+            let backend = CleanupBackend::new(
+                1,
+                VecDeque::from([1]),
+                SubmittedIoCleanup::LeakAfterBackend {
+                    backend: "cleanup_test",
+                    reason: "forced leak".to_string(),
+                },
+                Arc::clone(&drop_events),
+                Arc::clone(&cleanup_submitted),
+            );
+            let mut driver = SubmissionDriver::new(backend);
+            assert!(driver.push(submission).is_ok(), "{case}");
+            assert_eq!(
+                driver.submit_ready().unwrap(),
+                SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),
+                "{case}"
+            );
+            assert_eq!(driver.cleanup_after_backend_progress_failure(), 1, "{case}");
+            assert_eq!(cleanup_submitted.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(driver.pending_len(), 0, "{case}");
+            assert_eq!(driver.submitted_len(), 0, "{case}");
+            assert!(drop_events.lock().unwrap().is_empty(), "{case}");
+            drop(driver);
+            assert_eq!(*drop_events.lock().unwrap(), expected_events, "{case}");
+        }
     }
 }

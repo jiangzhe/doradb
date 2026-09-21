@@ -155,9 +155,11 @@ mod tests {
     use super::*;
     use std::mem::size_of;
 
+    /// Purpose: Protect the sizes of request and completion structures passed to libaio.
+    /// Expected: Both structures match the fixed sizes required by the kernel ABI.
     #[test]
-    fn test_libaoi_abi_size() {
-        assert!(size_of::<io_event>() == 32);
-        assert!(size_of::<iocb>() == 64);
+    fn test_libaio_abi_size() {
+        assert_eq!(size_of::<io_event>(), 32);
+        assert_eq!(size_of::<iocb>(), 64);
     }
 }
