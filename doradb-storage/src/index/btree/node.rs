@@ -2296,6 +2296,94 @@ mod tests {
         }
     }
 
+    async fn assert_node_compaction(case: &str, count: u64, ts: TrxID) {
+        let pool = test_buf_pool();
+        let guard = FixedBufferPool::create_base_guard(&pool);
+        let mut src_guard = pool.allocate_page::<BTreeNode>(&guard).await.unwrap();
+        let src = src_guard.page_mut();
+        src.init(0, ts, &[], BTreeU64::INVALID_VALUE, &[], false);
+        for i in 0..count {
+            src.insert(&i.to_be_bytes(), BTreeU64::from(i));
+        }
+        if count != 0 {
+            src.insert(&count.to_be_bytes(), BTreeU64::from(count));
+            assert_eq!(
+                src.delete(&count.to_be_bytes(), BTreeU64::from(count), true),
+                BTreeDelete::Ok
+            );
+            assert!(src.reclaimable_space() > 0, "case={case}");
+        }
+        let mut dst_guard = pool.allocate_page::<BTreeNode>(&guard).await.unwrap();
+        let dst = dst_guard.page_mut();
+        src.compact_into::<BTreeU64>(dst);
+        assert_eq!(dst.height(), 0, "case={case}");
+        assert_eq!(dst.ts(), ts, "case={case}");
+        assert_eq!(dst.count(), count as usize, "case={case}");
+        assert_eq!(dst.lower_fence_key().as_bytes(), &[], "case={case}");
+        assert_eq!(dst.upper_fence_key().as_bytes(), &[], "case={case}");
+        assert_eq!(
+            dst.free_space(),
+            src.free_space_after_compaction(),
+            "case={case}"
+        );
+        assert_eq!(dst.reclaimable_space(), 0, "case={case}");
+        for i in 0..count {
+            assert_eq!(
+                dst.key(i as usize).as_bytes(),
+                i.to_be_bytes(),
+                "case={case}, key={i}"
+            );
+            assert_eq!(
+                dst.value::<BTreeU64>(i as usize),
+                BTreeU64::from(i),
+                "case={case}, key={i}"
+            );
+        }
+    }
+
+    async fn assert_sequential_node_lookup(count: u64, hints_enabled: bool, missing_key: u64) {
+        let pool = test_buf_pool();
+        let guard = FixedBufferPool::create_base_guard(&pool);
+        let mut page = pool.allocate_page::<BTreeNode>(&guard).await.unwrap();
+        let node = page.page_mut();
+        node.init(
+            0,
+            TrxID::new(0),
+            &[],
+            BTreeU64::INVALID_VALUE,
+            &[],
+            hints_enabled,
+        );
+        for i in 0..count {
+            assert_eq!(node.insert(&i.to_be_bytes(), BTreeU64::from(i)), i as usize);
+            if hints_enabled {
+                node.update_hints();
+            }
+        }
+        if hints_enabled {
+            assert!(node.update_hints(), "fixture must exercise active hints");
+        }
+        for i in 0..count {
+            assert_eq!(
+                node.search_key(&i.to_be_bytes()),
+                Ok(i as usize),
+                "hints={hints_enabled}, key={i}"
+            );
+            assert_eq!(
+                node.value::<BTreeU64>(i as usize),
+                BTreeU64::from(i),
+                "hints={hints_enabled}, key={i}"
+            );
+        }
+        assert_eq!(
+            node.search_key(&missing_key.to_be_bytes()),
+            Err(count as usize),
+            "hints={hints_enabled}"
+        );
+    }
+
+    /// Purpose: Protect the reserved integrity footer and key-only node layout.
+    /// Expected: The footer stays reserved and zeroed, and key-only entries retain a valid persisted layout.
     #[test]
     fn test_btree_node_footer_reserved_and_nil_values() {
         let mut node =
@@ -2324,6 +2412,8 @@ mod tests {
         assert!(node.validate_persisted_layout::<BTreeNil>());
     }
 
+    /// Purpose: Protect hinted lookup when a key-only leaf exhausts its usable space.
+    /// Expected: Present and absent keys resolve to the correct positions without corrupting the node layout.
     #[test]
     fn test_btree_node_hinted_search_on_full_nil_leaf() {
         let mut node =
@@ -2348,6 +2438,8 @@ mod tests {
         assert!(node.validate_persisted_layout::<BTreeNil>());
     }
 
+    /// Purpose: Protect leaf lower-bound lookup around a compressed common prefix.
+    /// Expected: Exact, gap, shorter-prefix, and out-of-prefix probes return the correct insertion positions.
     #[test]
     fn test_btree_node_lower_bound_slot_uses_common_prefix() {
         let mut node = BTreeNodeBox::alloc(
@@ -2371,6 +2463,8 @@ mod tests {
         assert_eq!(node.lower_bound_slot_idx(b"abd"), node.count());
     }
 
+    /// Purpose: Protect branch child selection around a compressed common prefix.
+    /// Expected: Probes select the correct child across separators and prefix boundaries.
     #[test]
     fn test_btree_node_lower_bound_child_uses_common_prefix() {
         let mut node = BTreeNodeBox::alloc(
@@ -2396,6 +2490,8 @@ mod tests {
         assert_eq!(node.lower_bound_child_entry_idx(b"abd"), Some(node.count()));
     }
 
+    /// Purpose: Protect the persisted byte order of B-tree header and slot fields.
+    /// Expected: Stored fields use little-endian bytes and accessors recover the original values.
     #[test]
     fn test_btree_header_and_slot_store_little_endian_fields() {
         let mut header = BTreeHeader::new_zeroed();
@@ -2448,37 +2544,15 @@ mod tests {
         assert_eq!(slot.head_le, 0x4444_5555u32.to_le_bytes());
     }
 
+    /// Purpose: Protect insertion and lookup ordering within a leaf node.
+    /// Expected: Inserted keys occupy their sorted slots and an absent upper key resolves past the end.
     #[test]
     fn test_btree_node_insert() {
-        smol::block_on(async {
-            let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::create_base_guard(&buf_pool);
-
-            {
-                let mut page_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let node = page_guard.page_mut();
-                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], false);
-                for i in 0u64..10 {
-                    let k = i.to_be_bytes();
-                    let slot_idx = node.insert(&k, BTreeU64::from(i));
-                    println!("inserted, slot_idx={}", slot_idx);
-                }
-
-                for i in 0u64..10 {
-                    let k = i.to_be_bytes();
-                    let res = node.search_key(&k);
-                    assert_eq!(res, Ok(i as usize));
-                }
-
-                let res = node.search_key(&11u64.to_be_bytes());
-                assert_eq!(res, Err(10));
-            }
-        })
+        smol::block_on(assert_sequential_node_lookup(10, false, 11));
     }
 
+    /// Purpose: Protect conditional node deletion for matching, missing, and mismatched entries.
+    /// Expected: Only a matching entry is removed and rejected deletions leave retained entries intact.
     #[test]
     fn test_btree_node_delete() {
         smol::block_on(async {
@@ -2525,10 +2599,17 @@ mod tests {
                     node.delete(&6u64.to_be_bytes(), BTreeU64::from(7), true),
                     BTreeDelete::ValueMismatch
                 );
+                for i in (0u64..10).filter(|&i| i != 5) {
+                    let idx = node.search_key(&i.to_be_bytes()).unwrap();
+                    assert_eq!(node.value::<BTreeU64>(idx), BTreeU64::from(i));
+                }
+                assert_eq!(node.count(), 9);
             }
         })
     }
 
+    /// Purpose: Protect exact deletion against stale observations of an entry's deletion state.
+    /// Expected: A state mismatch preserves the entry and a matching deleted observation removes it.
     #[test]
     fn test_btree_node_delete_exact_checks_delete_state() {
         smol::block_on(async {
@@ -2564,6 +2645,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect fragmentation accounting for inline and out-of-line keys.
+    /// Expected: Deletion frees the slot, accounts for retained payload bytes, and preserves neighboring values.
     #[test]
     fn test_btree_node_delete_accounts_exact_reclaimable_payload() {
         let mut inline =
@@ -2608,6 +2691,8 @@ mod tests {
         assert_eq!(outline.value::<BTreeU64>(0), BTreeU64::from(2));
     }
 
+    /// Purpose: Protect insertion preparation under low and high node occupancy.
+    /// Expected: Low occupancy reclaims usable space while high occupancy requests a split without rebuilding.
     #[test]
     fn test_btree_node_prepare_insert_policy_and_reclamation() {
         let mut low_count =
@@ -2667,6 +2752,8 @@ mod tests {
         assert_eq!(high_occupancy.count(), keys.len() - 1);
     }
 
+    /// Purpose: Enforce the capacity invariant when neither compaction nor splitting can admit a key.
+    /// Expected: Insertion preparation rejects the unsplittable overflow with the designated invariant panic.
     #[test]
     #[should_panic(expected = "B-tree packed capacity exhausted without a valid split separator")]
     fn test_btree_node_prepare_insert_rejects_unsplittable_packed_capacity() {
@@ -2685,6 +2772,8 @@ mod tests {
         node.prepare_insert::<BTreeU64>(&pending_key);
     }
 
+    /// Purpose: Protect reclamation policy during repeated low-occupancy insert and delete churn.
+    /// Expected: Rebuilds are amortized across deletions and all deleted payload space remains accounted for.
     #[test]
     fn test_btree_node_reclamation_is_amortized_across_deletes() {
         let mut node =
@@ -2729,6 +2818,8 @@ mod tests {
         assert_eq!(node.count(), 2);
     }
 
+    /// Purpose: Protect a growing branch separator when contiguous free space is exhausted.
+    /// Expected: Preparation reclaims fragmentation and replacement preserves the separator's child value.
     #[test]
     fn test_btree_node_reclaims_fragmented_separator_update() {
         let mut node = BTreeNodeBox::alloc(1, TrxID::new(11), &[], BTreeU64::from(99), &[], false);
@@ -2757,6 +2848,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect node metadata, deletion state, and hinted lookup through in-place compaction.
+    /// Expected: Compaction removes fragmentation while preserving fences, metadata, and probe results.
     #[test]
     fn test_btree_node_self_compact_preserves_layout_state_and_hints() {
         let lower_fence = b"tenant/0000";
@@ -2815,6 +2908,8 @@ mod tests {
         assert!(node.validate_persisted_layout::<BTreeU64>());
     }
 
+    /// Purpose: Protect conditional value updates, including revival of a deleted entry.
+    /// Expected: Matching updates store their replacements; missing or mismatched entries remain unchanged.
     #[test]
     fn test_btree_node_update() {
         smol::block_on(async {
@@ -2841,6 +2936,7 @@ mod tests {
                     BTreeUpdate::Ok(BTreeU64::from(5))
                 );
                 assert_eq!(node.search_key(&5u64.to_be_bytes()), Ok(5));
+                assert_eq!(node.value::<BTreeU64>(5), BTreeU64::from(50));
 
                 // Test update deleted entry
                 assert_eq!(
@@ -2860,6 +2956,7 @@ mod tests {
                     BTreeUpdate::Ok(BTreeU64::from(6).deleted())
                 );
                 assert_eq!(node.search_key(&6u64.to_be_bytes()), Ok(6));
+                assert_eq!(node.value::<BTreeU64>(6), BTreeU64::from(60));
 
                 // Test update non-existent key
                 assert_eq!(
@@ -2876,100 +2973,29 @@ mod tests {
                     node.update(&7u64.to_be_bytes(), BTreeU64::from(8), BTreeU64::from(70)),
                     BTreeUpdate::ValueMismatch(BTreeU64::from(7))
                 );
+                assert_eq!(node.value::<BTreeU64>(7), BTreeU64::from(7));
+                assert_eq!(node.search_key(&15u64.to_be_bytes()), Err(10));
+                assert_eq!(node.count(), 10);
             }
         })
     }
 
+    /// Purpose: Protect copying a fragmented populated node into a compact destination.
+    /// Expected: The destination preserves metadata and every entry with the expected compacted free space.
     #[test]
     fn test_btree_node_compact_non_empty() {
-        smol::block_on(async {
-            let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::create_base_guard(&buf_pool);
-
-            {
-                // Create source leaf node with data
-                let mut src_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let src_node = src_guard.page_mut();
-                src_node.init(0, TrxID::new(1), &[], BTreeU64::INVALID_VALUE, &[], false);
-
-                // Insert test data
-                for i in 0u64..10 {
-                    let k = i.to_be_bytes();
-                    src_node.insert(&k, BTreeU64::from(i));
-                }
-
-                // Create empty destination node
-                let mut dst_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let dst_node = dst_guard.page_mut();
-
-                // Compact source to destination
-                src_node.compact_into::<BTreeU64>(dst_node);
-
-                // Verify compaction results
-                assert_eq!(dst_node.height(), 0);
-                assert_eq!(dst_node.ts(), TrxID::new(1));
-                assert_eq!(dst_node.count(), src_node.count());
-                assert_eq!(&dst_node.lower_fence_key()[..], &[0u8; 0][..]);
-                assert_eq!(&dst_node.upper_fence_key()[..], &[0u8; 0][..]);
-                assert_eq!(
-                    dst_node.free_space(),
-                    src_node.free_space_after_compaction()
-                );
-
-                // Verify all slots are copied correctly
-                for i in 0..src_node.count() {
-                    assert_eq!(dst_node.key(i), src_node.key(i));
-                    assert_eq!(dst_node.value::<BTreeU64>(i), src_node.value::<BTreeU64>(i));
-                }
-            }
-        })
+        smol::block_on(assert_node_compaction("populated", 10, TrxID::new(1)));
     }
 
+    /// Purpose: Protect compaction of an empty node into a fresh destination.
+    /// Expected: The destination retains the empty node's metadata, fences, and free space.
     #[test]
     fn test_btree_node_compact_empty() {
-        smol::block_on(async {
-            let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::create_base_guard(&buf_pool);
-
-            {
-                // Create empty source node
-                let mut src_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let src_node = src_guard.page_mut();
-                src_node.init(0, TrxID::new(3), &[], BTreeU64::INVALID_VALUE, &[], false);
-
-                // Create empty destination node
-                let mut dst_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let dst_node = dst_guard.page_mut();
-
-                // Compact source to destination
-                src_node.compact_into::<BTreeU64>(dst_node);
-
-                // Verify compaction results
-                assert_eq!(dst_node.height(), 0);
-                assert_eq!(dst_node.ts(), TrxID::new(3));
-                assert_eq!(dst_node.count(), 0);
-                assert_eq!(dst_node.lower_fence_key().as_bytes(), &[0u8; 0][..]);
-                assert_eq!(dst_node.upper_fence_key().as_bytes(), &[0u8; 0][..]);
-                assert_eq!(
-                    dst_node.free_space(),
-                    src_node.free_space_after_compaction()
-                );
-            }
-        })
+        smol::block_on(assert_node_compaction("empty", 0, TrxID::new(3)));
     }
 
+    /// Purpose: Protect space accounting as key suffixes cross the inline-storage boundary.
+    /// Expected: Estimates include the header, fences, slots, values, and out-of-line suffix bytes.
     #[test]
     fn test_space_estimation() {
         let mut mse = SpaceEstimation::new(10, 20, 20, mem::size_of::<u64>());
@@ -2980,6 +3006,8 @@ mod tests {
         assert_eq!(mse.add_key(15), mem::size_of::<BTreeHeader>() + 30 + 48 + 5);
     }
 
+    /// Purpose: Protect space estimates when merging nodes reduces prefix compression.
+    /// Expected: Separate and combined estimates account for the expected uncompressed key payload.
     #[test]
     fn test_btree_node_space_estimation() {
         smol::block_on(async {
@@ -3043,15 +3071,18 @@ mod tests {
                 estimation.add_key_range(node1, 0, node1.count());
                 assert_eq!(estimation.total_space(), node1.effective_space());
                 estimation.add_key_range(node2, 0, node2.count());
-                println!("left={}", node1.effective_space());
-                println!("right={}", node2.effective_space());
                 // Merged space can be larger than sum of two nodes, because
                 // prefix length may be reduced.
-                println!("merged={}", estimation.total_space());
+                assert_eq!(
+                    estimation.total_space(),
+                    mem::size_of::<BTreeHeader>() + 8 + 20 * 24
+                );
             }
         })
     }
 
+    /// Purpose: Protect separator replacement across inline and out-of-line key layouts.
+    /// Expected: Replacement preserves values and sorted key order across changes in key length.
     #[test]
     fn test_btree_node_update_key() {
         smol::block_on(async {
@@ -3141,37 +3172,15 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect hinted lookup after sequential insertion and hint refresh.
+    /// Expected: All inserted keys and the absent upper boundary resolve to their expected positions.
     #[test]
     fn test_btree_node_enable_hints_seq() {
-        smol::block_on(async {
-            let buf_pool = test_buf_pool();
-            let buf_pool_guard = FixedBufferPool::create_base_guard(&buf_pool);
-            {
-                let mut page_guard = buf_pool
-                    .allocate_page::<BTreeNode>(&buf_pool_guard)
-                    .await
-                    .expect("test page allocation should succeed");
-                let node = page_guard.page_mut();
-                node.init(0, TrxID::new(0), &[], BTreeU64::INVALID_VALUE, &[], true);
-                for i in 0u64..300 {
-                    let k = i.to_be_bytes();
-                    let slot_idx = node.insert(&k, BTreeU64::from(i));
-                    node.update_hints();
-                    println!("inserted, slot_idx={}", slot_idx);
-                }
-
-                for i in 0u64..300 {
-                    let k = i.to_be_bytes();
-                    let res = node.search_key(&k);
-                    assert_eq!(res, Ok(i as usize));
-                }
-
-                let res = node.search_key(&300u64.to_be_bytes());
-                assert_eq!(res, Err(300));
-            }
-        })
+        smol::block_on(assert_sequential_node_lookup(300, true, 300));
     }
 
+    /// Purpose: Protect hinted lookup over a reproducible sequence of random keys.
+    /// Expected: Every inserted key returns the value recorded in an independent ordered map.
     #[test]
     fn test_btree_node_enable_hints_rand() {
         use rand::prelude::SeedableRng;
@@ -3204,11 +3213,7 @@ mod tests {
                     let res = node.search_key(&k);
                     assert!(res.is_ok());
                     let v = node.value::<BTreeU64>(res.unwrap());
-                    if v.to_u64() == value {
-                        println!("debug-only match");
-                    } else {
-                        panic!("debug-only mismatch");
-                    }
+                    assert_eq!(v.to_u64(), value, "seed=0, key={key}");
                 }
             }
         })

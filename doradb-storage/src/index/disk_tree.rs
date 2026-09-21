@@ -2286,10 +2286,12 @@ mod tests {
         IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec,
     };
+    use crate::error::RuntimeOrFatalError;
     use crate::error::{CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError};
     use crate::file::block_integrity::checksum_offset;
     use crate::file::build_test_fs;
-    use crate::file::table_file::MutableTableFile;
+    use crate::file::fs::tests::TestFileSystem;
+    use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::{BTreeKey, KeyRange};
     use crate::index::util::tests::{drain_candidates, drain_row_ids};
     use crate::layout::LayoutError;
@@ -2302,6 +2304,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
 
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
@@ -2498,8 +2501,6 @@ mod tests {
             let should_fail = self.should_fail(&buf);
             async move {
                 if should_fail {
-                    // TODO(error-boundary): backlog 000160 should assert this
-                    // injected IO source remains visible after rewrite cleanup.
                     let source = StdIoError::other("test disk-tree write failure");
                     return Err(CompletionErrorBridge::capture(
                         Report::new(IoError::from(source.kind()))
@@ -2529,6 +2530,119 @@ mod tests {
 
     fn test_row_ids<const N: usize>(values: [u64; N]) -> Vec<RowID> {
         values.into_iter().map(RowID::new).collect()
+    }
+
+    fn assert_batch_order_panic(operation: impl FnOnce()) {
+        let panic = catch_unwind(AssertUnwindSafe(operation))
+            .expect_err("invalid batch order must violate the ordering invariant");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .expect("batch-order panic must carry a diagnostic");
+        assert!(
+            message.starts_with("DiskTree batch-order invariant violated:"),
+            "{message}"
+        );
+    }
+
+    async fn with_unique_rows(
+        table_id: u64,
+        check: impl AsyncFnOnce(
+            &UniqueDiskTreeRuntime,
+            &PoolGuard,
+            &mut MutableTableFile,
+            Option<BlockID>,
+            &[[Val; 1]; 3],
+        ),
+    ) {
+        let metadata = metadata_with_indexes();
+        let (_temp_dir, fs, table) = committed_test_table(table_id, &metadata).await;
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(table_id), &table);
+        let guard = disk_pool.create_base_guard();
+        let mut mutable = MutableTableFile::fork(
+            &table,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            guard.clone(),
+        );
+        let runtime = unique_runtime!(metadata, disk_pool);
+        let tree = runtime.open(None, &guard);
+        let keys = [[Val::from(1u32)], [Val::from(2u32)], [Val::from(3u32)]];
+        let puts = keys
+            .iter()
+            .zip([10, 20, 30])
+            .map(|(key, row_id)| UniqueDiskTreePut {
+                key,
+                row_id: RowID::new(row_id),
+            })
+            .collect::<Vec<_>>();
+        let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
+        writer.batch_put(&puts).unwrap();
+        let root = writer.finish().await.unwrap();
+        assert!(root.is_some());
+        check(&runtime, &guard, &mut mutable, root, &keys).await;
+    }
+
+    async fn failed_rewrite_counts(
+        table_id: u64,
+        fail_leaf_at: Option<usize>,
+        fail_branch_at: Option<usize>,
+    ) -> (usize, usize) {
+        let metadata = metadata_with_indexes();
+        let (_temp_dir, fs, table) = committed_test_table(table_id, &metadata).await;
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(table_id), &table);
+        let guard = disk_pool.create_base_guard();
+        let inner = MutableTableFile::fork(
+            &table,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            guard.clone(),
+        );
+        let allocated_before = inner.root().alloc_map.allocated();
+        let mut mutable = FailingDiskTreeWriteFile::new(inner, fail_leaf_at, fail_branch_at);
+        let runtime = unique_runtime!(metadata, disk_pool);
+        let tree = runtime.open(None, &guard);
+
+        const ENTRY_COUNT: u32 = 8192;
+        let keys = (0..ENTRY_COUNT)
+            .map(|idx| [Val::from(idx)])
+            .collect::<Vec<_>>();
+        let puts = keys
+            .iter()
+            .enumerate()
+            .map(|(idx, key)| UniqueDiskTreePut {
+                key,
+                row_id: RowID::from(idx) + 100,
+            })
+            .collect::<Vec<_>>();
+
+        let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
+        writer.batch_put(&puts).unwrap();
+        let err = writer.finish().await.unwrap_err();
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected injected write failure, got {err:?}");
+        };
+        assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
+        assert!(err.downcast_ref::<IoError>().is_some(), "{err:?}");
+        assert!(format!("{err:?}").contains("test disk-tree write failure"));
+        assert_eq!(mutable.allocated_blocks(), allocated_before);
+        (mutable.leaf_writes(), mutable.branch_writes())
+    }
+
+    async fn committed_test_table(
+        table_id: u64,
+        metadata: &Arc<TableMetadata>,
+    ) -> (TempDir, TestFileSystem, Arc<TableFile>) {
+        let (temp_dir, fs) = build_test_fs();
+        let table = fs
+            .create_table_file(test_user_table_id(table_id), Arc::clone(metadata), false)
+            .unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        (temp_dir, fs, table)
     }
 
     fn full_key_range() -> KeyRange {
@@ -2698,6 +2812,8 @@ mod tests {
         key
     }
 
+    /// Purpose: Protect error adaptation for truncated persisted disk-tree nodes.
+    /// Expected: The integrity error retains the layout mismatch and identifies the malformed field.
     #[test]
     fn test_disk_tree_persisted_layout_adaptation_preserves_source_domain() {
         let persisted = match persisted_disk_tree_node(&[0u8; 1]) {
@@ -2715,6 +2831,8 @@ mod tests {
         assert!(format!("{persisted:?}").contains("field=node_layout"));
     }
 
+    /// Purpose: Enforce strict ordering of logical entries before disk-tree rewriting.
+    /// Expected: Duplicate logical keys trigger the rewrite ordering invariant.
     #[test]
     #[should_panic(
         expected = "DiskTree rewrite invariant violated: logical leaf entries are not strictly sorted"
@@ -2727,6 +2845,8 @@ mod tests {
         validate_logical_entries_sorted(&entries);
     }
 
+    /// Purpose: Protect cursor setup for a disk tree without a root.
+    /// Expected: Seeking leaves the traversal stack and key buffer empty with no pending seek.
     #[test]
     fn test_empty_disk_tree_cursor_seek_skips_key_copy() {
         smol::block_on(async {
@@ -2739,16 +2859,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect point and scan reads against an absent unique disk-tree root.
+    /// Expected: Lookups and full scans report no entries.
     #[test]
     fn test_empty_unique_root_reads_empty() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(301), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(301, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(301), &table);
             let guard = disk_pool.create_base_guard();
@@ -2761,16 +2878,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect exact, prefix, and full reads against an absent non-unique disk-tree root.
+    /// Expected: All read paths report no entries.
     #[test]
     fn test_empty_non_unique_root_reads_empty() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(302), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(302, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(302), &table);
             let guard = disk_pool.create_base_guard();
@@ -2793,90 +2907,52 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique disk-tree writes and owner-conditional deletion across root versions.
+    /// Expected: Matching owners are removed, mismatched owners remain, and the prior root stays readable.
     #[test]
     fn test_unique_batch_put_lookup_scan_and_conditional_delete() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(303), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(303), &table);
-            let guard = disk_pool.create_base_guard();
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                guard.clone(),
-            );
-            let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(None, &guard);
-            let key1 = [Val::from(1u32)];
-            let key2 = [Val::from(2u32)];
-            let key3 = [Val::from(3u32)];
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
-            writer
-                .batch_put(&[
-                    UniqueDiskTreePut {
-                        key: &key1,
-                        row_id: RowID::new(10),
-                    },
-                    UniqueDiskTreePut {
-                        key: &key2,
-                        row_id: RowID::new(20),
-                    },
-                    UniqueDiskTreePut {
-                        key: &key3,
-                        row_id: RowID::new(30),
-                    },
-                ])
-                .unwrap();
-            let root = writer.finish().await.unwrap();
-            assert!(root.is_some());
+        smol::block_on(with_unique_rows(
+            303,
+            async |runtime, guard, mutable, root, keys| {
+                let [key1, key2, _key3] = keys;
+                let tree = runtime.open(root, guard);
+                assert_eq!(tree.lookup(key2).await.unwrap(), Some(RowID::new(20)));
+                let rows = unique_scan_entries(&tree)
+                    .await
+                    .into_iter()
+                    .map(|(_, row_id)| row_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(rows, test_row_ids([10, 20, 30]));
 
-            let tree = runtime.open(root, &guard);
-            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
-            let rows = unique_scan_entries(&tree)
-                .await
-                .into_iter()
-                .map(|(_, row_id)| row_id)
-                .collect::<Vec<_>>();
-            assert_eq!(rows, test_row_ids([10, 20, 30]));
-
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
-            writer
-                .batch_conditional_delete(&[
-                    UniqueDiskTreeDelete {
-                        key: &key1,
-                        expected_old_row_id: RowID::new(999),
-                    },
-                    UniqueDiskTreeDelete {
-                        key: &key2,
-                        expected_old_row_id: RowID::new(20),
-                    },
-                ])
-                .unwrap();
-            let new_root = writer.finish().await.unwrap();
-            let new_tree = runtime.open(new_root, &guard);
-            assert_eq!(new_tree.lookup(&key1).await.unwrap(), Some(RowID::new(10)));
-            assert_eq!(new_tree.lookup(&key2).await.unwrap(), None);
-            assert_eq!(tree.lookup(&key2).await.unwrap(), Some(RowID::new(20)));
-        });
+                let mut writer = tree.batch_writer(mutable, TrxID::new(3));
+                writer
+                    .batch_conditional_delete(&[
+                        UniqueDiskTreeDelete {
+                            key: key1,
+                            expected_old_row_id: RowID::new(999),
+                        },
+                        UniqueDiskTreeDelete {
+                            key: key2,
+                            expected_old_row_id: RowID::new(20),
+                        },
+                    ])
+                    .unwrap();
+                let new_root = writer.finish().await.unwrap();
+                let new_tree = runtime.open(new_root, guard);
+                assert_eq!(new_tree.lookup(key1).await.unwrap(), Some(RowID::new(10)));
+                assert_eq!(new_tree.lookup(key2).await.unwrap(), None);
+                assert_eq!(tree.lookup(key2).await.unwrap(), Some(RowID::new(20)));
+            },
+        ));
     }
 
+    /// Purpose: Protect prefix compression and copy-on-write deletion in bounded unique leaves.
+    /// Expected: Compressed leaves support ordered reads and new deletions preserve the prior root's values.
     #[test]
     fn test_unique_disk_tree_leaf_fences_enable_common_prefix() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(310, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
             let guard = disk_pool.create_base_guard();
@@ -2952,16 +3028,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect duplicate-key prefix scans across compressed finite leaf fences.
+    /// Expected: The scan returns every matching row once in row-id order.
     #[test]
     fn test_non_unique_disk_tree_prefix_scan_crosses_finite_fence_leaves() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(311, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
             let guard = disk_pool.create_base_guard();
@@ -2999,16 +3072,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect compressed branch routing in a disk tree spanning multiple levels.
+    /// Expected: Point, full, and bounded reads reach the expected entries through finite branch fences.
     #[test]
     fn test_disk_tree_branch_fences_enable_common_prefix() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(312), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(312, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(312), &table);
             let guard = disk_pool.create_base_guard();
@@ -3066,16 +3136,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect exact non-unique mutations and prefix scans across disk-tree root versions.
+    /// Expected: Only the targeted row owner changes and the prior root retains its original candidates.
     #[test]
     fn test_non_unique_batch_insert_prefix_scan_and_delete() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(304), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(304, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(304), &table);
             let guard = disk_pool.create_base_guard();
@@ -3152,16 +3219,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect selective non-unique prefix scans in a large disk tree.
+    /// Expected: The requested rows are returned without loading most of the tree's blocks.
     #[test]
     fn test_non_unique_prefix_scan_streams_from_lower_bound() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(309, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(309), &table);
             let guard = disk_pool.create_base_guard();
@@ -3211,111 +3275,38 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rewrite cleanup when a leaf write fails after earlier leaf allocation.
+    /// Expected: The rewrite retains the write-error cause and returns every newly allocated block.
     #[test]
     fn test_disk_tree_rewrite_rolls_back_leaf_allocations_on_write_failure() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(310), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(310), &table);
-            let guard = disk_pool.create_base_guard();
-            let inner = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                guard.clone(),
-            );
-            let allocated_before = inner.root().alloc_map.allocated();
-            let mut mutable = FailingDiskTreeWriteFile::new(inner, Some(1), None);
-            let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(None, &guard);
-
-            const ENTRY_COUNT: u32 = 8192;
-            let keys = (0..ENTRY_COUNT)
-                .map(|idx| [Val::from(idx)])
-                .collect::<Vec<_>>();
-            let puts = keys
-                .iter()
-                .enumerate()
-                .map(|(idx, key)| UniqueDiskTreePut {
-                    key,
-                    row_id: RowID::from(idx) + 100,
-                })
-                .collect::<Vec<_>>();
-
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
-            writer.batch_put(&puts).unwrap();
-            writer.finish().await.unwrap_err();
-            assert_eq!(mutable.leaf_writes(), 2);
-            assert_eq!(mutable.branch_writes(), 0);
-            assert_eq!(mutable.allocated_blocks(), allocated_before);
-        });
+        let counts = smol::block_on(failed_rewrite_counts(310, Some(1), None));
+        assert_eq!(
+            counts,
+            (2, 0),
+            "failure must occur on the second leaf write"
+        );
     }
 
+    /// Purpose: Protect rewrite cleanup when parent writing fails after materializing child leaves.
+    /// Expected: The rewrite retains the write-error cause and reclaims child and parent allocations.
     #[test]
     fn test_disk_tree_rewrite_rolls_back_child_allocations_on_branch_write_failure() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(311), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(311), &table);
-            let guard = disk_pool.create_base_guard();
-            let inner = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                guard.clone(),
-            );
-            let allocated_before = inner.root().alloc_map.allocated();
-            let mut mutable = FailingDiskTreeWriteFile::new(inner, None, Some(0));
-            let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(None, &guard);
-
-            const ENTRY_COUNT: u32 = 8192;
-            let keys = (0..ENTRY_COUNT)
-                .map(|idx| [Val::from(idx)])
-                .collect::<Vec<_>>();
-            let puts = keys
-                .iter()
-                .enumerate()
-                .map(|(idx, key)| UniqueDiskTreePut {
-                    key,
-                    row_id: RowID::from(idx) + 100,
-                })
-                .collect::<Vec<_>>();
-
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
-            writer.batch_put(&puts).unwrap();
-            writer.finish().await.unwrap_err();
-            assert!(
-                mutable.leaf_writes() > 1,
-                "branch failure test should materialize multiple leaves first"
-            );
-            assert_eq!(mutable.branch_writes(), 1);
-            assert_eq!(mutable.allocated_blocks(), allocated_before);
-        });
+        let (leaf_writes, branch_writes) =
+            smol::block_on(failed_rewrite_counts(311, None, Some(0)));
+        assert!(
+            leaf_writes > 1,
+            "branch failure must follow multiple child writes"
+        );
+        assert_eq!(branch_writes, 1);
     }
 
+    /// Purpose: Protect encoded unique and non-unique batch mutation APIs and their input contracts.
+    /// Expected: Valid mutations preserve ownership semantics while malformed or unordered keys are rejected.
     #[test]
     fn test_encoded_batch_writer_apis() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(305, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.create_base_guard();
@@ -3335,7 +3326,7 @@ mod tests {
 
             {
                 let mut writer = unique_tree.batch_writer(&mut mutable, TrxID::new(2));
-                let panic = catch_unwind(AssertUnwindSafe(|| {
+                assert_batch_order_panic(|| {
                     writer.batch_put_encoded(&[
                         UniqueDiskTreeEncodedPut {
                             key: &encoded_unique2,
@@ -3346,8 +3337,7 @@ mod tests {
                             row_id: RowID::new(10),
                         },
                     ]);
-                }));
-                assert!(panic.is_err());
+                });
             }
             let mut writer = unique_tree.batch_writer(&mut mutable, TrxID::new(2));
             writer.batch_put_encoded(&[
@@ -3428,7 +3418,7 @@ mod tests {
             }
             {
                 let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
-                let panic = catch_unwind(AssertUnwindSafe(|| {
+                assert_batch_order_panic(|| {
                     writer
                         .batch_insert_encoded(&[
                             NonUniqueDiskTreeEncodedExact {
@@ -3439,8 +3429,7 @@ mod tests {
                             },
                         ])
                         .unwrap();
-                }));
-                assert!(panic.is_err());
+                });
             }
             let mut writer = non_unique_tree.batch_writer(&mut mutable, TrxID::new(4));
             writer
@@ -3470,103 +3459,65 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the empty-root transition after deleting every unique disk-tree entry.
+    /// Expected: The new root is absent and reads empty while the prior root retains its entries.
     #[test]
     fn test_unique_delete_all_entries_returns_empty_root() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(306), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(306), &table);
-            let guard = disk_pool.create_base_guard();
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                guard.clone(),
-            );
-            let runtime = unique_runtime!(metadata, disk_pool);
-            let tree = runtime.open(None, &guard);
-            let key1 = [Val::from(1u32)];
-            let key2 = [Val::from(2u32)];
-            let key3 = [Val::from(3u32)];
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
-            writer
-                .batch_put(&[
-                    UniqueDiskTreePut {
-                        key: &key1,
-                        row_id: RowID::new(10),
-                    },
-                    UniqueDiskTreePut {
-                        key: &key2,
-                        row_id: RowID::new(20),
-                    },
-                    UniqueDiskTreePut {
-                        key: &key3,
-                        row_id: RowID::new(30),
-                    },
-                ])
-                .unwrap();
-            let root = writer.finish().await.unwrap();
-            assert!(root.is_some());
+        smol::block_on(with_unique_rows(
+            306,
+            async |runtime, guard, mutable, root, keys| {
+                let [key1, key2, key3] = keys;
+                let tree = runtime.open(root, guard);
+                let rows = unique_scan_entries(&tree)
+                    .await
+                    .into_iter()
+                    .map(|(_, row_id)| row_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(rows, test_row_ids([10, 20, 30]));
 
-            let tree = runtime.open(root, &guard);
-            let rows = unique_scan_entries(&tree)
-                .await
-                .into_iter()
-                .map(|(_, row_id)| row_id)
-                .collect::<Vec<_>>();
-            assert_eq!(rows, test_row_ids([10, 20, 30]));
+                let mut writer = tree.batch_writer(mutable, TrxID::new(3));
+                writer
+                    .batch_conditional_delete(&[
+                        UniqueDiskTreeDelete {
+                            key: key1,
+                            expected_old_row_id: RowID::new(10),
+                        },
+                        UniqueDiskTreeDelete {
+                            key: key2,
+                            expected_old_row_id: RowID::new(20),
+                        },
+                        UniqueDiskTreeDelete {
+                            key: key3,
+                            expected_old_row_id: RowID::new(30),
+                        },
+                    ])
+                    .unwrap();
+                let empty_root = writer.finish().await.unwrap();
+                assert_eq!(empty_root, None);
 
-            let mut writer = tree.batch_writer(&mut mutable, TrxID::new(3));
-            writer
-                .batch_conditional_delete(&[
-                    UniqueDiskTreeDelete {
-                        key: &key1,
-                        expected_old_row_id: RowID::new(10),
-                    },
-                    UniqueDiskTreeDelete {
-                        key: &key2,
-                        expected_old_row_id: RowID::new(20),
-                    },
-                    UniqueDiskTreeDelete {
-                        key: &key3,
-                        expected_old_row_id: RowID::new(30),
-                    },
-                ])
-                .unwrap();
-            let empty_root = writer.finish().await.unwrap();
-            assert_eq!(empty_root, None);
+                let empty_tree = runtime.open(empty_root, guard);
+                assert_eq!(empty_tree.lookup(key1).await.unwrap(), None);
+                assert_eq!(empty_tree.lookup(key2).await.unwrap(), None);
+                assert_eq!(empty_tree.lookup(key3).await.unwrap(), None);
+                assert!(unique_scan_entries(&empty_tree).await.is_empty());
 
-            let empty_tree = runtime.open(empty_root, &guard);
-            assert_eq!(empty_tree.lookup(&key1).await.unwrap(), None);
-            assert_eq!(empty_tree.lookup(&key2).await.unwrap(), None);
-            assert_eq!(empty_tree.lookup(&key3).await.unwrap(), None);
-            assert!(unique_scan_entries(&empty_tree).await.is_empty());
-
-            let rows = unique_scan_entries(&tree)
-                .await
-                .into_iter()
-                .map(|(_, row_id)| row_id)
-                .collect::<Vec<_>>();
-            assert_eq!(rows, test_row_ids([10, 20, 30]));
-        });
+                let rows = unique_scan_entries(&tree)
+                    .await
+                    .into_iter()
+                    .map(|(_, row_id)| row_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(rows, test_row_ids([10, 20, 30]));
+            },
+        ));
     }
 
+    /// Purpose: Protect the empty-root transition after deleting every non-unique exact entry.
+    /// Expected: The new root is absent across all read paths while the prior root retains its candidates.
     #[test]
     fn test_non_unique_delete_all_exact_entries_returns_empty_root() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(307), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(307, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(307), &table);
             let guard = disk_pool.create_base_guard();
@@ -3672,16 +3623,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect disk-tree contraction when deletion leaves sparse survivors.
+    /// Expected: Survivors occupy one new leaf and remain ordered while the prior root stays intact.
     #[test]
     fn test_unique_delete_sparse_remaining_entries_compacts_to_one_leaf() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(308), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(308, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(308), &table);
             let guard = disk_pool.create_base_guard();
@@ -3762,16 +3710,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect disk-tree reachability collection without loading referenced leaves.
+    /// Expected: Collection returns the root and every leaf while issuing only the required branch read.
     #[test]
     fn test_collect_reachable_blocks_skips_secondary_leaf_reads() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(309), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(309, &metadata).await;
             let write_global = global_readonly_pool_scope(64 * 1024 * 1024);
             let write_disk_pool =
                 table_readonly_pool(&write_global, test_user_table_id(309), &table);
@@ -3841,16 +3786,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect absorption of a fitting right sibling during a sparse-leaf rewrite.
+    /// Expected: The rewrite removes the sibling link, retains its entries, and stays within the write budget.
     #[test]
     fn test_disk_tree_rewrite_absorbs_immediate_right_sibling_without_extra_writes() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_varbyte_unique_index();
-            let table = fs
-                .create_table_file(test_user_table_id(313), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(313, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(313), &table);
             let guard = disk_pool.create_base_guard();
@@ -3956,16 +3898,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a neighboring leaf that cannot fit in a rewrite's packing budget.
+    /// Expected: The neighbor keeps its block and bounds the rewritten leaf while the target deletion takes effect.
     #[test]
     fn test_disk_tree_rewrite_keeps_non_absorbable_right_sibling_unchanged() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(314), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(314, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(314), &table);
             let guard = disk_pool.create_base_guard();
@@ -4051,16 +3990,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce ordered, duplicate-free logical keys in disk-tree put batches.
+    /// Expected: Both descending input and duplicate keys trigger the batch ordering invariant.
     #[test]
     fn test_disk_tree_batches_reject_unsorted_duplicates() {
         smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
-            let table = fs
-                .create_table_file(test_user_table_id(305), Arc::clone(&metadata), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
+            let (_temp_dir, fs, table) = committed_test_table(305, &metadata).await;
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let disk_pool = table_readonly_pool(&global, test_user_table_id(305), &table);
             let guard = disk_pool.create_base_guard();
@@ -4075,7 +4011,7 @@ mod tests {
             let key1 = [Val::from(1u32)];
             let key2 = [Val::from(2u32)];
             let mut writer = tree.batch_writer(&mut mutable, TrxID::new(2));
-            let panic = catch_unwind(AssertUnwindSafe(|| {
+            assert_batch_order_panic(|| {
                 writer
                     .batch_put(&[
                         UniqueDiskTreePut {
@@ -4088,10 +4024,9 @@ mod tests {
                         },
                     ])
                     .unwrap();
-            }));
-            assert!(panic.is_err());
+            });
 
-            let panic = catch_unwind(AssertUnwindSafe(|| {
+            assert_batch_order_panic(|| {
                 writer
                     .batch_put(&[
                         UniqueDiskTreePut {
@@ -4104,11 +4039,12 @@ mod tests {
                         },
                     ])
                     .unwrap();
-            }));
-            assert!(panic.is_err());
+            });
         });
     }
 
+    /// Purpose: Protect disk-tree checksum validation for payload and trailer corruption.
+    /// Expected: An intact block validates and either corruption reports a checksum mismatch.
     #[test]
     fn test_disk_tree_block_checksum_trailer_rejects_corruption() {
         let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);

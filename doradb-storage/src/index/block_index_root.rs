@@ -126,8 +126,37 @@ unsafe impl Sync for BlockIndexRoot {}
 mod tests {
     use super::*;
     use crate::file::test_block_id;
-    use std::sync::Arc;
+    use futures::task::{ArcWake, waker};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::task::Context;
+    use std::thread;
 
+    #[derive(Default)]
+    struct RouteWaitWake(AtomicBool);
+
+    impl ArcWake for RouteWaitWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::Release);
+        }
+    }
+
+    fn assert_published_route(pivot_row_id: RowID, root_block_id: BlockID) {
+        let expected_pivot = if root_block_id == 77 {
+            1000
+        } else {
+            assert!(root_block_id.as_u64() >= 80);
+            600 + (root_block_id.as_u64() - 80) % 800
+        };
+        assert_eq!(
+            pivot_row_id,
+            RowID::new(expected_pivot),
+            "incoherent route: root_block_id={root_block_id}"
+        );
+    }
+
+    /// Purpose: Protect row and column routing at the pivot boundary.
+    /// Expected: Rows below the pivot use the column root; the pivot itself uses the row store.
     #[test]
     fn test_root_guide_and_try_column() {
         let root = BlockIndexRoot::new(RowID::new(1000), test_block_id(77));
@@ -152,6 +181,8 @@ mod tests {
         assert_eq!(root.try_column(RowID::new(1000)), None);
     }
 
+    /// Purpose: Protect routing and epoch publication when the column root changes.
+    /// Expected: Readers observe the new pivot and root, and an earlier epoch no longer waits.
     #[test]
     fn test_root_update_column_root() {
         smol::block_on(async {
@@ -180,69 +211,87 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect notification of a pending route waiter after column-root publication.
+    /// Expected: The waiter becomes ready and the updated pivot is visible.
     #[test]
     fn test_root_route_wait_wakes_after_update() {
         smol::block_on(async {
-            let root = Arc::new(BlockIndexRoot::new(RowID::new(1000), test_block_id(77)));
+            let root = BlockIndexRoot::new(RowID::new(1000), test_block_id(77));
             let route_epoch = root.route_epoch();
-            let waiter = {
-                let root = Arc::clone(&root);
-                smol::spawn(async move {
-                    root.wait_route_since(route_epoch).await;
-                })
-            };
+            let wake = Arc::new(RouteWaitWake::default());
+            let waker = waker(Arc::clone(&wake));
+            let mut context = Context::from_waker(&waker);
+            let mut waiter = Box::pin(root.wait_route_since(route_epoch));
+            assert!(waiter.as_mut().poll(&mut context).is_pending());
+            assert!(!wake.0.load(Ordering::Acquire));
 
             root.update_column_root(RowID::new(2000), test_block_id(88))
                 .await;
-            waiter.await;
+            assert!(
+                wake.0.load(Ordering::Acquire),
+                "route update must wake the pending waiter"
+            );
+            assert!(waiter.as_mut().poll(&mut context).is_ready());
             assert!(root.route_epoch() > route_epoch);
             assert_eq!(root.pivot_row_id(), RowID::new(2000));
         });
     }
 
+    /// Purpose: Protect coherent routing snapshots while another thread updates the column root.
+    /// Expected: Column routes contain matching published pivots and roots throughout updates.
     #[test]
     fn test_root_concurrent_guide_and_update() {
         smol::block_on(async {
             let root = Arc::new(BlockIndexRoot::new(RowID::new(1000), test_block_id(77)));
             let reader_root = Arc::clone(&root);
             let writer_root = Arc::clone(&root);
+            let start = Arc::new(Barrier::new(2));
+            let reader_start = Arc::clone(&start);
 
-            let reader = smol::spawn(async move {
+            let reader = thread::spawn(move || {
+                reader_start.wait();
                 for i in 0..20_000u64 {
                     let row_id = i % 2_000;
                     match reader_root.guide(RowID::new(row_id)) {
                         BlockIndexRoute::Column {
                             pivot_row_id,
-                            root_block_id: _,
-                        } => assert!(row_id < pivot_row_id.as_u64()),
+                            root_block_id,
+                        } => {
+                            assert!(row_id < pivot_row_id.as_u64());
+                            assert_published_route(pivot_row_id, root_block_id);
+                        }
                         BlockIndexRoute::Row => {
-                            if let Some((pivot_row_id, _)) =
+                            if let Some((pivot_row_id, root_block_id)) =
                                 reader_root.try_column(RowID::new(row_id))
                             {
                                 assert!(row_id < pivot_row_id.as_u64());
+                                assert_published_route(pivot_row_id, root_block_id);
                             }
                         }
                     }
                 }
             });
 
-            let writer = smol::spawn(async move {
-                for i in 0..2_000u64 {
-                    let pivot_row_id = 600 + (i % 800);
-                    let root_block_id = BlockID::from(80 + i);
-                    writer_root
-                        .update_column_root(RowID::new(pivot_row_id), root_block_id)
-                        .await;
-                    let snapshot = writer_root
-                        .try_column(RowID::new(pivot_row_id - 1))
-                        .unwrap();
-                    assert_eq!(snapshot.0, RowID::new(pivot_row_id));
-                    assert_eq!(snapshot.1, root_block_id);
-                }
+            let writer = thread::spawn(move || {
+                smol::block_on(async move {
+                    start.wait();
+                    for i in 0..2_000u64 {
+                        let pivot_row_id = 600 + (i % 800);
+                        let root_block_id = BlockID::from(80 + i);
+                        writer_root
+                            .update_column_root(RowID::new(pivot_row_id), root_block_id)
+                            .await;
+                        let snapshot = writer_root
+                            .try_column(RowID::new(pivot_row_id - 1))
+                            .unwrap();
+                        assert_eq!(snapshot.0, RowID::new(pivot_row_id));
+                        assert_eq!(snapshot.1, root_block_id);
+                    }
+                })
             });
 
-            reader.await;
-            writer.await;
+            reader.join().unwrap();
+            writer.join().unwrap();
         });
     }
 }

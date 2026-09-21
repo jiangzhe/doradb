@@ -694,6 +694,55 @@ mod tests {
         )
     }
 
+    async fn with_persisted_blobs(
+        blobs: &[&[u8]],
+        check: impl AsyncFnOnce(ColumnDeletionBlobReader<'_>, &[BlobRef]),
+    ) {
+        let (_temp_dir, fs) = build_test_fs();
+        let table = fs
+            .create_table_file(test_user_table_id(1), metadata(), false)
+            .unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+        let disk_pool_guard = disk_pool.create_base_guard();
+        let mut mutable = MutableTableFile::fork(
+            &table,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            disk_pool_guard.clone(),
+        );
+        let mut refs = Vec::with_capacity(blobs.len());
+        {
+            let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
+            for blob in blobs {
+                refs.push(writer.append_delete_payload(blob).await.unwrap());
+            }
+            writer.finish().await.unwrap();
+        }
+        let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
+        // Keep the cache cold so reference-collection tests can measure reads.
+        let reader = ColumnDeletionBlobReader::new(
+            disk_pool.file_kind(),
+            disk_pool.sparse_file(),
+            disk_pool.global_pool(),
+            &disk_pool_guard,
+        );
+        check(reader, &refs).await;
+    }
+
+    async fn assert_blob_roundtrip(blob: &[u8]) {
+        with_persisted_blobs(&[blob], async |reader, refs| {
+            let (header, payload) = reader.read_framed_blob(refs[0]).await.unwrap();
+            assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
+            assert_eq!(payload, blob);
+        })
+        .await;
+    }
+
+    /// Purpose: Protect deletion-blob framing metadata through encoding and decoding.
+    /// Expected: A valid header round-trips without losing its payload metadata.
     #[test]
     fn test_blob_header_roundtrip() {
         let header = ColumnAuxBlobHeader::delete_payload(27);
@@ -702,6 +751,8 @@ mod tests {
         assert_eq!(decoded, header);
     }
 
+    /// Purpose: Reject deletion-blob headers that declare an empty payload.
+    /// Expected: Decoding reports an invalid-payload integrity error.
     #[test]
     fn test_blob_header_rejects_zero_payload() {
         let bytes = [1u8, 2, 3, 4, 0, 0, 0, 0];
@@ -713,236 +764,88 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect persisted deletion blobs that fit within a single page.
+    /// Expected: Reading recovers the expected framing header and original payload.
     #[test]
     fn test_blob_writer_reader_roundtrip() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.create_base_guard();
-
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                disk_pool_guard.clone(),
-            );
-            let blob = vec![9u8; 513];
-            let blob_ref = {
-                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
-                writer.finish().await.unwrap();
-                blob_ref
-            };
-            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-            let reader = ColumnDeletionBlobReader::new(
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_pool_guard,
-            );
-            let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
-            assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
-            assert_eq!(payload, blob);
-        });
+        smol::block_on(assert_blob_roundtrip(&vec![9u8; 513]));
     }
 
+    /// Purpose: Protect reference collection for a blob wholly contained in its initial block.
+    /// Expected: Collection returns the initial block without cache access or queued reads.
     #[test]
     fn test_collect_referenced_blocks_skips_single_block_read() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.create_base_guard();
-
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                disk_pool_guard.clone(),
-            );
-            let blob = vec![9u8; 513];
-            let blob_ref = {
-                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
-                writer.finish().await.unwrap();
-                blob_ref
-            };
-            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-            let reader = ColumnDeletionBlobReader::new(
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_pool_guard,
-            );
-            let before = disk_pool.global_stats();
+        let blob = vec![9u8; 513];
+        smol::block_on(with_persisted_blobs(&[&blob], async |reader, refs| {
+            let before = reader.disk_pool.stats();
             let mut blocks = Vec::new();
             reader
-                .collect_referenced_blocks_with(blob_ref, |block_id| blocks.push(block_id))
+                .collect_referenced_blocks_with(refs[0], |block_id| blocks.push(block_id))
                 .await
                 .unwrap();
-            let delta = disk_pool.global_stats().delta_since(before);
-
-            assert_eq!(blocks, vec![blob_ref.start_block_id]);
+            let delta = reader.disk_pool.stats().delta_since(before);
+            assert_eq!(blocks, vec![refs[0].start_block_id]);
             assert_eq!(delta.cache_hits, 0);
             assert_eq!(delta.cache_misses, 0);
             assert_eq!(delta.queued_reads, 0);
-        });
+        }));
     }
 
+    /// Purpose: Protect persisted deletion blobs spanning several pages.
+    /// Expected: Reading reconstructs the complete framing header and payload across page boundaries.
     #[test]
     fn test_blob_writer_reader_crosses_pages() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.create_base_guard();
-
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                disk_pool_guard.clone(),
-            );
-            let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
-            let blob_ref = {
-                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
-                writer.finish().await.unwrap();
-                blob_ref
-            };
-            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-            let reader = ColumnDeletionBlobReader::new(
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_pool_guard,
-            );
-            let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
-            assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
-            assert_eq!(payload, blob);
-        });
+        // Distinct page contents expose reordered or repeated continuation pages.
+        let blob = (0..COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113)
+            .map(|offset| (offset / COLUMN_DELETION_BLOB_PAGE_BODY_SIZE) as u8 ^ offset as u8)
+            .collect::<Vec<_>>();
+        smol::block_on(assert_blob_roundtrip(&blob));
     }
 
+    /// Purpose: Protect reference collection for a deletion blob spanning multiple blocks.
+    /// Expected: Collection returns the full set of distinct payload blocks beginning with the initial block.
     #[test]
     fn test_collect_referenced_blocks_crosses_blocks() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.create_base_guard();
-
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                disk_pool_guard.clone(),
-            );
-            let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
-            let blob_ref = {
-                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let blob_ref = writer.append_delete_payload(&blob).await.unwrap();
-                writer.finish().await.unwrap();
-                blob_ref
-            };
-            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-            let reader = ColumnDeletionBlobReader::new(
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_pool_guard,
-            );
+        let blob = vec![7u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE * 2 + 113];
+        smol::block_on(with_persisted_blobs(&[&blob], async |reader, refs| {
             let mut blocks = Vec::new();
             reader
-                .collect_referenced_blocks_with(blob_ref, |block_id| blocks.push(block_id))
+                .collect_referenced_blocks_with(refs[0], |block_id| blocks.push(block_id))
                 .await
                 .unwrap();
-
             assert_eq!(blocks.len(), 3);
-            assert_eq!(blocks[0], blob_ref.start_block_id);
+            assert_eq!(blocks[0], refs[0].start_block_id);
             assert!(blocks.iter().all(|block_id| *block_id != SUPER_BLOCK_ID));
-        });
+            let mut distinct = blocks.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), blocks.len(), "blob blocks must be distinct");
+        }));
     }
 
+    /// Purpose: Protect appending another blob after the preceding blob exactly fills a page.
+    /// Expected: The next blob starts on a different page and both payloads remain independently readable.
     #[test]
     fn test_blob_writer_starts_next_blob_on_fresh_page_after_exact_fill() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let disk_pool_guard = disk_pool.create_base_guard();
-
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                disk_pool_guard.clone(),
-            );
-            let first_blob =
-                vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];
-            let second_blob = vec![5u8; 17];
-            let (first_ref, second_ref) = {
-                let mut writer = ColumnDeletionBlobWriter::new(&mut mutable);
-                let first_ref = writer.append_delete_payload(&first_blob).await.unwrap();
-                let second_ref = writer.append_delete_payload(&second_blob).await.unwrap();
-                writer.finish().await.unwrap();
-                (first_ref, second_ref)
-            };
-            let (_table, _old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
-
-            assert_ne!(first_ref.start_block_id, SUPER_BLOCK_ID);
-            assert_eq!(first_ref.start_offset, 0);
-            assert_ne!(second_ref.start_block_id, first_ref.start_block_id);
-            assert_eq!(second_ref.start_offset, 0);
-
-            let reader = ColumnDeletionBlobReader::new(
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &disk_pool_guard,
-            );
-            let (first_header, first_payload) = reader.read_framed_blob(first_ref).await.unwrap();
-            let (second_header, second_payload) =
-                reader.read_framed_blob(second_ref).await.unwrap();
-            assert_eq!(
-                first_header,
-                ColumnAuxBlobHeader::delete_payload(first_blob.len())
-            );
-            assert_eq!(
-                second_header,
-                ColumnAuxBlobHeader::delete_payload(second_blob.len())
-            );
-            assert_eq!(first_payload, first_blob);
-            assert_eq!(second_payload, second_blob);
-        });
+        let first_blob =
+            vec![3u8; COLUMN_DELETION_BLOB_PAGE_BODY_SIZE - COLUMN_AUX_BLOB_HEADER_SIZE];
+        let second_blob = vec![5u8; 17];
+        smol::block_on(with_persisted_blobs(
+            &[&first_blob, &second_blob],
+            async |reader, refs| {
+                let [first_ref, second_ref] = refs else {
+                    panic!("expected both appended blob references");
+                };
+                assert_ne!(first_ref.start_block_id, SUPER_BLOCK_ID);
+                assert_eq!(first_ref.start_offset, 0);
+                assert_ne!(second_ref.start_block_id, first_ref.start_block_id);
+                assert_eq!(second_ref.start_offset, 0);
+                for (blob_ref, blob) in [(*first_ref, &first_blob), (*second_ref, &second_blob)] {
+                    let (header, payload) = reader.read_framed_blob(blob_ref).await.unwrap();
+                    assert_eq!(header, ColumnAuxBlobHeader::delete_payload(blob.len()));
+                    assert_eq!(payload, *blob, "blob_ref={blob_ref:?}");
+                }
+            },
+        ));
     }
 }

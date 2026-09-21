@@ -1950,6 +1950,17 @@ mod tests {
         }
     }
 
+    async fn with_wide_tree(check: impl AsyncFnOnce(&BTree, &PoolGuard, &FixedBufferPool)) {
+        let pool = owned_index_pool(128 * 1024 * 1024);
+        let guard = (*pool).create_base_guard();
+        let tree = BTree::new(pool.guard(), &guard, false, TrxID::new(200))
+            .await
+            .expect("test btree construction should succeed");
+        insert_wide_rows(&tree, &guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
+        assert_eq!(tree.height(), 2);
+        check(&tree, &guard, &pool).await;
+    }
+
     async fn delete_wide_rows(tree: &BTree, pool_guard: &PoolGuard, rows: u64, ts: TrxID) {
         for i in 0..rows {
             let key = wide_test_key(i);
@@ -2109,6 +2120,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect child routing in the retained suffix after a partial branch merge.
+    /// Expected: The right branch drops its old lower-fence child and routes retained separators correctly.
     #[test]
     fn test_btree_merge_partial_branch_suffix_drops_lower_fence_child() {
         smol::block_on(async {
@@ -2177,6 +2190,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect parent accounting when merged leaves use narrower values than branches.
+    /// Expected: Removing the separator preserves the lower child and accounts for the branch value width.
     #[test]
     fn test_btree_merge_full_deletes_parent_separator_with_branch_value_width() {
         smol::block_on(async {
@@ -2244,6 +2259,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect tree-level exact deletion against stale values and deletion states.
+    /// Expected: Mismatches preserve the entry and a matching deleted observation removes it.
     #[test]
     fn test_btree_delete_exact_checks_value_and_delete_state() {
         smol::block_on(async {
@@ -2305,6 +2322,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect root-split cleanup when the second child allocation fails.
+    /// Expected: The first allocation is reclaimed and the original root remains readable and unchanged.
     #[test]
     fn test_btree_split_root_releases_left_page_when_right_allocation_fails() {
         smol::block_on(async {
@@ -2370,6 +2389,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect insertion and conditional replacement through the combined mutation API.
+    /// Expected: Absent keys are inserted, matching values are replaced, and stale values or states are rejected.
     #[test]
     fn test_btree_replace_or_insert_semantics() {
         smol::block_on(async {
@@ -2447,6 +2468,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect combined insertion when wide absent keys force tree splits.
+    /// Expected: Insertions grow the tree and preserve the inserted values across split boundaries.
     #[test]
     fn test_btree_replace_or_insert_splits_for_absent_keys() {
         smol::block_on(async {
@@ -2485,6 +2508,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect insertion, logical deletion, revival, and conditional removal in a single leaf.
+    /// Expected: Mutation outcomes and retained values reflect matching, missing, and stale observations.
     #[test]
     fn test_btree_single_node() {
         smol::block_on(async {
@@ -2509,8 +2534,9 @@ mod tests {
                         false,
                         TrxID::new(210),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeInsert::Ok(false));
                 let res = tree
                     .insert(
                         &pool_guard,
@@ -2519,8 +2545,9 @@ mod tests {
                         false,
                         TrxID::new(220),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeInsert::Ok(false));
                 let res = tree
                     .insert(
                         &pool_guard,
@@ -2529,8 +2556,9 @@ mod tests {
                         false,
                         TrxID::new(205),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeInsert::Ok(false));
 
                 let res = tree
                     .insert(
@@ -2549,7 +2577,7 @@ mod tests {
                     .lookup_optimistic::<BTreeU64>(&pool_guard, &1u64.to_be_bytes())
                     .await
                     .unwrap();
-                assert!(res.is_some());
+                assert_eq!(res, Some(one));
                 let res = tree
                     .lookup_optimistic::<BTreeU64>(&pool_guard, &4u64.to_be_bytes())
                     .await
@@ -2564,8 +2592,9 @@ mod tests {
                         three.deleted(),
                         TrxID::new(230),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeUpdate::Ok(three));
                 let res = tree
                     .update(
                         &pool_guard,
@@ -2574,8 +2603,9 @@ mod tests {
                         five.deleted(),
                         TrxID::new(230),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeUpdate::Ok(five));
                 let res = tree
                     .update(
                         &pool_guard,
@@ -2601,8 +2631,9 @@ mod tests {
                         fifty,
                         TrxID::new(240),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeUpdate::Ok(five.deleted()));
                 let res = tree
                     .update(
                         &pool_guard,
@@ -2623,8 +2654,9 @@ mod tests {
                         true,
                         TrxID::new(250),
                     )
-                    .await;
-                assert!(res.is_ok());
+                    .await
+                    .unwrap();
+                assert_eq!(res, BTreeDelete::Ok);
                 let res = tree
                     .delete(
                         &pool_guard,
@@ -2636,90 +2668,77 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(res, BTreeDelete::ValueMismatch);
+                for (key, expected) in [(1u64, Some(one)), (3, None), (5, Some(fifty)), (7, None)] {
+                    assert_eq!(
+                        tree.lookup_optimistic::<BTreeU64>(&pool_guard, &key.to_be_bytes())
+                            .await
+                            .unwrap(),
+                        expected,
+                        "final single-leaf state: key={key}"
+                    );
+                }
             }
         })
     }
 
+    /// Purpose: Protect tree growth across multiple branch levels with wide keys.
+    /// Expected: All leaf entries remain accounted for and parent separators match child counts.
     #[test]
     fn test_btree_scale() {
-        smol::block_on(async {
-            let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).create_base_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
-                    .await
-                    .expect("test btree construction should succeed");
-
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
-                assert_eq!(tree.height(), 2);
-                let map = collect_level_stats(&tree, &pool_guard).await;
-                assert_eq!(map[&0].keys as u64, WIDE_HEIGHT2_ROWS);
-                assert_level_links(&map, tree.height());
-            }
-        })
+        smol::block_on(with_wide_tree(async |tree, pool_guard, _pool| {
+            let map = collect_level_stats(tree, pool_guard).await;
+            assert_eq!(map[&0].keys as u64, WIDE_HEIGHT2_ROWS);
+            assert_level_links(&map, tree.height());
+        }));
     }
 
+    /// Purpose: Protect complete deletion from a tree spanning multiple branch levels.
+    /// Expected: Leaves become empty while parent-to-child link counts remain consistent.
     #[test]
     fn test_btree_delete() {
-        smol::block_on(async {
-            let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).create_base_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
-                    .await
-                    .expect("test btree construction should succeed");
+        smol::block_on(with_wide_tree(async |tree, pool_guard, _pool| {
+            delete_wide_rows(tree, pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
 
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
-                assert_eq!(tree.height(), 2);
-                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
-
-                let map = collect_level_stats(&tree, &pool_guard).await;
-                assert_eq!(map[&0].keys, 0);
-                assert_level_links(&map, tree.height());
-            }
-        })
+            let map = collect_level_stats(tree, pool_guard).await;
+            assert_eq!(map[&0].keys, 0);
+            assert_level_links(&map, tree.height());
+        }));
     }
 
+    /// Purpose: Protect compaction and observation invalidation after deleting every tree entry.
+    /// Expected: Retained leaf evidence becomes invalid and the compacted empty tree keeps consistent links.
     #[test]
     fn test_btree_compact() {
-        smol::block_on(async {
-            let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).create_base_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
-                    .await
-                    .expect("test btree construction should succeed");
+        smol::block_on(with_wide_tree(async |tree, pool_guard, pool| {
+            delete_wide_rows(tree, pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
 
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
-                assert_eq!(tree.height(), 2);
-                delete_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(202)).await;
+            let (_, observation) = tree
+                .lookup_observed::<BTreeU64>(pool_guard, &wide_test_key(0))
+                .await
+                .unwrap();
+            assert!(observation.is_valid());
+            let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
+            let purge_list = tree
+                .compact_all::<BTreeU64>(pool_guard, config)
+                .await
+                .unwrap();
 
-                let (_, observation) = tree
-                    .lookup_observed::<BTreeU64>(&pool_guard, &wide_test_key(0))
-                    .await
-                    .unwrap();
-                assert!(observation.is_valid());
-                let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                let purge_list = tree
-                    .compact_all::<BTreeU64>(&pool_guard, config)
-                    .await
-                    .unwrap();
-
-                assert!(
-                    !observation.is_valid(),
-                    "leaf compaction/merge invalidates retained evidence"
-                );
-                for g in purge_list {
-                    pool.deallocate_page(g);
-                }
-
-                let map = collect_level_stats(&tree, &pool_guard).await;
-                assert_eq!(map[&0].keys, 0);
-                assert_level_links(&map, tree.height());
+            assert!(
+                !observation.is_valid(),
+                "leaf compaction/merge invalidates retained evidence"
+            );
+            for g in purge_list {
+                pool.deallocate_page(g);
             }
-        })
+
+            let map = collect_level_stats(tree, pool_guard).await;
+            assert_eq!(map[&0].keys, 0);
+            assert_level_links(&map, tree.height());
+        }));
     }
 
+    /// Purpose: Protect unhinted lookup and duplicate handling against a reproducible ordered-map oracle.
+    /// Expected: Inserted, duplicate, absent, and sampled keys agree with the independent map.
     #[test]
     fn test_btree_lookup_disable_hints() {
         smol::block_on(async {
@@ -2727,6 +2746,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect hinted lookup and duplicate handling against a reproducible ordered-map oracle.
+    /// Expected: Inserted, duplicate, absent, and sampled keys agree with the independent map.
     #[test]
     fn test_btree_lookup_enable_hints() {
         smol::block_on(async {
@@ -2734,6 +2755,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect parent search hints through splits under sequential and permuted insertion.
+    /// Expected: Every lookup and ordered leaf traversal retains the expected keys and values.
     #[test]
     fn test_btree_split_refreshes_parent_hints() {
         smol::block_on(async {
@@ -2803,6 +2826,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect lookup evidence against value restoration, page reuse, and splitting.
+    /// Expected: Mutations and lifecycle changes invalidate prior evidence even when the value is restored.
     #[test]
     fn test_btree_observed_lookup_detects_aba_and_retirement() {
         smol::block_on(async {
@@ -2894,6 +2919,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect split progress while another thread holds the parent shared latch.
+    /// Expected: Insertion waits for latch release and then publishes the requested value.
     #[test]
     fn test_btree_split() {
         smol::block_on(async {
@@ -2973,6 +3000,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect concurrent insertions into a leaf prepared to require splitting.
+    /// Expected: Every synchronized writer completes and its distinct key remains readable.
     #[test]
     fn test_btree_concurrent_split() {
         smol::block_on(async {
@@ -3029,6 +3058,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect low-occupancy tree reuse during repeated wide-key insertion and deletion.
+    /// Expected: The tree stays a single node and retains boundary values with bounded fragmentation.
     #[test]
     fn test_btree_low_count_delete_insert_churn_reclaims_without_split() {
         smol::block_on(async {
@@ -3102,36 +3133,42 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect retained data when compacting a populated tree of wide keys.
+    /// Expected: Compaction preserves every key and value without increasing the node count.
     #[test]
     fn test_btree_merge_partial() {
-        smol::block_on(async {
-            let pool = owned_index_pool(128 * 1024 * 1024);
-            let pool_guard = (*pool).create_base_guard();
-            {
-                let tree = BTree::new(pool.guard(), &pool_guard, false, TrxID::new(200))
-                    .await
-                    .expect("test btree construction should succeed");
-                insert_wide_rows(&tree, &pool_guard, WIDE_HEIGHT2_ROWS, TrxID::new(201)).await;
-                let before_space = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                let before_levels = collect_level_stats(&tree, &pool_guard).await;
+        smol::block_on(with_wide_tree(async |tree, pool_guard, pool| {
+            let before_space = tree.collect_space_statistics(pool_guard).await.unwrap();
+            let before_levels = collect_level_stats(tree, pool_guard).await;
 
-                let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
-                let purge_list = tree
-                    .compact_all::<BTreeU64>(&pool_guard, config)
-                    .await
-                    .unwrap();
-                for g in purge_list {
-                    pool.deallocate_page(g);
-                }
-
-                let after_space = tree.collect_space_statistics(&pool_guard).await.unwrap();
-                let after_levels = collect_level_stats(&tree, &pool_guard).await;
-                assert_eq!(after_levels[&0].keys, before_levels[&0].keys);
-                assert!(after_space.nodes <= before_space.nodes);
+            let config = BTreeCompactConfig::new(1.0, 1.0).unwrap();
+            let purge_list = tree
+                .compact_all::<BTreeU64>(pool_guard, config)
+                .await
+                .unwrap();
+            for g in purge_list {
+                pool.deallocate_page(g);
             }
-        })
+
+            let after_space = tree.collect_space_statistics(pool_guard).await.unwrap();
+            let after_levels = collect_level_stats(tree, pool_guard).await;
+            assert_eq!(after_levels[&0].keys, before_levels[&0].keys);
+            assert!(after_space.nodes <= before_space.nodes);
+            assert_level_links(&after_levels, tree.height());
+            for i in 0..WIDE_HEIGHT2_ROWS {
+                assert_eq!(
+                    tree.lookup_optimistic::<BTreeU64>(pool_guard, &wide_test_key(i))
+                        .await
+                        .unwrap(),
+                    Some(BTreeU64::from(i)),
+                    "retained key after compaction: {i}"
+                );
+            }
+        }));
     }
 
+    /// Purpose: Protect page reclamation when destroying trees of different heights.
+    /// Expected: Destruction returns every allocated tree page to the owning pool.
     #[test]
     fn test_btree_destory() {
         const H0_ROWS: u64 = 10;

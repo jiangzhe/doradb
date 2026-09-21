@@ -3972,6 +3972,8 @@ pub(super) mod tests {
         );
     }
 
+    /// Purpose: Protect translation from row-id deltas to dense and sparse scan ordinals.
+    /// Expected: Present deltas map to their physical positions and gaps or out-of-range deltas are absent.
     #[test]
     fn scan_row_identity_translates_dense_and_sparse_ordinals() {
         let dense = ScanRowIdentity::Dense { row_id_span: 4 };
@@ -3986,6 +3988,8 @@ pub(super) mod tests {
         assert_eq!(sparse.ordinal_for_delta(2), None);
     }
 
+    /// Purpose: Protect error adaptation for a malformed persisted column-index header.
+    /// Expected: The integrity error retains its layout cause and identifies the affected field.
     #[test]
     fn test_column_index_layout_adaptation_preserves_layout_source() {
         let err = match persisted_column_index_layout(
@@ -4004,6 +4008,8 @@ pub(super) mod tests {
         assert!(format!("{err:?}").contains("field=test_node_header"));
     }
 
+    /// Purpose: Reject an empty column-index payload even when its integrity framing is valid.
+    /// Expected: Page validation reports an invalid payload.
     #[test]
     fn test_persisted_empty_column_index_page_is_invalid_payload() {
         let mut page = DirectBuf::zeroed(COLUMN_BLOCK_PAGE_SIZE);
@@ -4019,6 +4025,8 @@ pub(super) mod tests {
         assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Protect the compact persisted leaf-entry header layout.
+    /// Expected: Header fields retain their metadata and the entry and prefix layouts have the specified sizes.
     #[test]
     fn test_leaf_entry_header_roundtrip_uses_u16_lengths() {
         let encoded = EncodedLeafEntry {
@@ -4046,6 +4054,8 @@ pub(super) mod tests {
         assert_eq!(COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE, 4);
     }
 
+    /// Purpose: Protect canonical fingerprints for dense and sparse row membership.
+    /// Expected: Repeated membership yields the same fingerprint and irrelevant sparse bounds do not change it.
     #[test]
     fn test_row_shape_fingerprint_is_deterministic_and_canonical() {
         let dense_row_ids = test_row_id_range(10, 20);
@@ -4067,6 +4077,8 @@ pub(super) mod tests {
         );
     }
 
+    /// Purpose: Protect deletion-section decoding against truncated metadata.
+    /// Expected: Decoding reports invalid payload with column-index corruption context.
     #[test]
     fn test_decode_delete_section_metadata_rejects_short_header() {
         let row_header = SectionHeader {
@@ -4092,6 +4104,8 @@ pub(super) mod tests {
         );
     }
 
+    /// Purpose: Enforce the persisted dense-row count limit before encoding.
+    /// Expected: A row span exceeding the storage field is rejected without truncation.
     #[test]
     #[should_panic(
         expected = "column block-index invariant violated: dense row span exceeds u16 storage"
@@ -4105,6 +4119,8 @@ pub(super) mod tests {
         );
     }
 
+    /// Purpose: Enforce the persisted deletion-count limit for inline delete sets.
+    /// Expected: An oversized delete set is rejected without truncating its count.
     #[test]
     #[should_panic(
         expected = "column block-index invariant violated: count 65536 exceeds u16 storage"
@@ -4117,6 +4133,8 @@ pub(super) mod tests {
         delete_set.del_count();
     }
 
+    /// Purpose: Protect block lookup for adjacent sparse and dense row entries.
+    /// Expected: Present rows resolve to their owning blocks while gaps in sparse membership remain absent.
     #[test]
     fn test_batch_insert_and_locate_sparse_membership() {
         smol::block_on(async {
@@ -4191,6 +4209,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect leaf-search encoding selection at row-id delta width boundaries.
+    /// Expected: Each boundary selects the appropriate representation and still resolves the target row.
     #[test]
     fn test_leaf_search_type_selection_and_lookup_variants() {
         smol::block_on(async {
@@ -4247,6 +4267,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect persisted membership loading and scan identities for dense and sparse entries.
+    /// Expected: Loaded row IDs and scan identities preserve the original membership and shape metadata.
     #[test]
     fn test_load_entry_row_ids_roundtrip_dense_and_sparse() {
         smol::block_on(async {
@@ -4341,6 +4363,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect physical row resolution for dense and sparse column blocks.
+    /// Expected: Present rows retain their block, ordinal, and metadata; sparse gaps remain absent.
     #[test]
     fn test_resolve_row_dense_and_sparse() {
         smol::block_on(async {
@@ -4442,6 +4466,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect persisted replacement of an inline row-id deletion set.
+    /// Expected: The new deletion set remains inline and determines durable deletion without changing row membership.
     #[test]
     fn test_batch_replace_delete_deltas_roundtrip_inline() {
         smol::block_on(async {
@@ -4545,6 +4571,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect reachability and deferred scan loading for externally stored deletion sets.
+    /// Expected: Reachable blocks include deletion storage and loaded ordinals preserve durable deletion state.
     #[test]
     fn test_collect_reachable_blocks_includes_external_delete_blob_blocks() {
         smol::block_on(async {
@@ -4640,6 +4668,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect the deletion domain when replacing an ordinal-based delete set.
+    /// Expected: Replacement preserves the ordinal domain and the requested deleted positions.
     #[test]
     fn test_batch_replace_delete_deltas_preserves_ordinal_domain() {
         smol::block_on(async {
@@ -4725,6 +4755,8 @@ pub(super) mod tests {
         });
     }
 
+    /// Purpose: Protect column-index lookups after a batch exceeds a single leaf's entry capacity.
+    /// Expected: All entries remain enumerable and lookups on both sides of the capacity boundary resolve correctly.
     #[test]
     fn test_batch_insert_splits_leaf_pages() {
         smol::block_on(async {
