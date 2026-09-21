@@ -47,7 +47,7 @@ impl ScanBuffer {
 
     /// Returns number of columns stored in this buffer.
     #[inline]
-    #[expect(dead_code, reason = "reserved column_count")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved column_count"))]
     pub(crate) fn column_count(&self) -> usize {
         self.cols.len()
     }
@@ -301,7 +301,7 @@ impl ScanBuffer {
 /// Borrowed view of one scanned column in a scan buffer.
 pub(crate) struct ScanColumn<'a> {
     /// Original table column index.
-    #[expect(dead_code, reason = "reserved col_idx")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved col_idx"))]
     pub col_idx: usize,
     /// Null bitmap for nullable columns.
     pub null_bitmap: Option<&'a [u64]>,
@@ -495,51 +495,191 @@ mod tests {
     use crate::value::{Val, ValKind};
     use std::borrow::Cow;
 
-    #[test]
-    fn test_row_page_vector_scan() {
+    fn scan_test_columns() -> Vec<StorageColumnSpec> {
+        vec![
+            StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::NULLABLE),
+            StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
+            StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::NULLABLE),
+            StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
+            StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+            StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::NULLABLE),
+            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+        ]
+    }
+
+    fn prepared_visibility_page(row_count: usize) -> (TableMetadata, RowPage) {
         let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
+            vec![StorageColumnSpec::new(
+                ValKind::I8,
+                StorageColumnFlags::empty(),
+            )],
             vec![],
         )
-        .expect("valid table metadata");
+        .unwrap();
+        let mut page = create_row_page();
+        page.init(RowID::new(0), row_count.max(1), &metadata.col);
+        for row_idx in 0..row_count {
+            assert!(matches!(
+                page.insert(&metadata.col, &[Val::I8(row_idx as i8 + 1)]),
+                InsertRow::Ok(id) if id == RowID::new(row_idx as u64)
+            ));
+        }
+        (metadata, page)
+    }
+
+    fn assert_scan_rows(
+        case: &str,
+        scanner: &ScanBuffer,
+        layout: &TableColumnLayout,
+        expected: &[Vec<Val>],
+    ) {
+        assert_eq!(scanner.len(), expected.len(), "{case}");
+        assert_eq!(scanner.column_count(), layout.col_count(), "{case}");
+        for row in expected {
+            assert_eq!(scanner.column_count(), row.len());
+        }
+        for col_idx in 0..scanner.column_count() {
+            let col = scanner.column(col_idx).unwrap();
+            assert_eq!(col.col_idx, col_idx);
+            let (kind, mut actual): (_, Vec<Val>) = match col.values {
+                ScanColumnValues::I8(vals) => {
+                    (ValKind::I8, vals.iter().copied().map(Val::I8).collect())
+                }
+                ScanColumnValues::U8(vals) => {
+                    (ValKind::U8, vals.iter().copied().map(Val::U8).collect())
+                }
+                ScanColumnValues::I16(vals) => {
+                    (ValKind::I16, vals.iter().copied().map(Val::I16).collect())
+                }
+                ScanColumnValues::U16(vals) => {
+                    (ValKind::U16, vals.iter().copied().map(Val::U16).collect())
+                }
+                ScanColumnValues::I32(vals) => {
+                    (ValKind::I32, vals.iter().copied().map(Val::I32).collect())
+                }
+                ScanColumnValues::U32(vals) => {
+                    (ValKind::U32, vals.iter().copied().map(Val::U32).collect())
+                }
+                ScanColumnValues::F32(vals) => {
+                    (ValKind::F32, vals.iter().copied().map(Val::from).collect())
+                }
+                ScanColumnValues::I64(vals) => {
+                    (ValKind::I64, vals.iter().copied().map(Val::I64).collect())
+                }
+                ScanColumnValues::U64(vals) => {
+                    (ValKind::U64, vals.iter().copied().map(Val::U64).collect())
+                }
+                ScanColumnValues::F64(vals) => {
+                    (ValKind::F64, vals.iter().copied().map(Val::from).collect())
+                }
+                ScanColumnValues::VarByte { offsets, data } => {
+                    assert_eq!(
+                        data.len(),
+                        offsets.last().map_or(0, |(_, end)| *end),
+                        "{case}: trailing payload in column {col_idx}"
+                    );
+                    (
+                        ValKind::VarByte,
+                        offsets
+                            .iter()
+                            .map(|(start, end)| Val::from(&data[*start..*end]))
+                            .collect(),
+                    )
+                }
+            };
+            assert_eq!(kind, layout.val_kind(col_idx), "{case}: column {col_idx}");
+            assert_eq!(
+                col.null_bitmap.is_some(),
+                layout.nullable(col_idx),
+                "{case}: column {col_idx}"
+            );
+            assert_eq!(actual.len(), expected.len(), "{case}: column {col_idx}");
+            if let Some(null_bitmap) = col.null_bitmap {
+                assert_eq!(null_bitmap.len(), expected.len().div_ceil(64));
+                for (row_idx, value) in actual.iter_mut().enumerate() {
+                    if null_bitmap.bitmap_get(row_idx) {
+                        *value = Val::Null;
+                    }
+                }
+                for row_idx in expected.len()..null_bitmap.len() * 64 {
+                    assert!(
+                        !null_bitmap.bitmap_get(row_idx),
+                        "{case}: stale null flag in column {col_idx}, row {row_idx}"
+                    );
+                }
+            }
+            for (row_idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                match (actual, &expected[col_idx]) {
+                    (Val::F32(actual), Val::F32(expected)) => assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{case}: column {col_idx}, row {row_idx}"
+                    ),
+                    (Val::F64(actual), Val::F64(expected)) => assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{case}: column {col_idx}, row {row_idx}"
+                    ),
+                    (actual, expected) => {
+                        assert_eq!(actual, expected, "{case}: column {col_idx}, row {row_idx}")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Purpose: Protect mixed-type vector scans with deleted rows and reusable result buffers.
+    /// Expected: Scans preserve surviving values and float bits in order; clearing removes all buffered results.
+    #[test]
+    fn test_row_page_vector_scan() {
+        let mut columns = scan_test_columns();
+        columns.push(StorageColumnSpec::new(
+            ValKind::VarByte,
+            StorageColumnFlags::empty(),
+        ));
+        let metadata = TableMetadata::try_new(columns, vec![]).expect("valid table metadata");
         let mut page = create_row_page();
         page.init(RowID::new(100), 200, metadata.col.as_ref());
-        let short = b"short";
-        let long = b"very loooooooooooooooooong";
 
-        let insert = vec![
-            Val::I8(-1),
-            Val::U8(1),
-            Val::I16(-1000),
-            Val::U16(1000),
-            Val::I32(-1_000_000),
-            Val::U32(1_000_000),
-            Val::from(1.5f32),
-            Val::I64(-(1 << 35)),
-            Val::U64(1 << 35),
-            Val::from(0.5f64),
-            Val::from(&short[..]),
-            Val::from(&long[..]),
-        ];
+        let mut expected = Vec::new();
         for row_id in 100u64..200 {
+            let ordinal = row_id - 100;
+            let short = format!("s{row_id}");
+            let long = format!("outlined value for row {row_id}");
+            let insert = vec![
+                Val::I8(ordinal as i8 - 50),
+                Val::U8(ordinal as u8),
+                Val::I16(-1000 - ordinal as i16),
+                Val::U16(1000 + ordinal as u16),
+                Val::I32(-1_000_000 - ordinal as i32),
+                Val::U32(1_000_000 + ordinal as u32),
+                Val::from(match ordinal {
+                    0 => -0.0f32,
+                    2 => f32::from_bits(0x7fc01234),
+                    _ => 1.5f32 + ordinal as f32,
+                }),
+                Val::I64(-(1 << 35) - ordinal as i64),
+                Val::U64((1 << 35) + ordinal),
+                Val::from(match ordinal {
+                    0 => -0.0f64,
+                    2 => f64::from_bits(0x7ff8000000001234),
+                    _ => 0.5f64 + ordinal as f64,
+                }),
+                Val::from(short.as_bytes()),
+                Val::from(long.as_bytes()),
+            ];
             let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
                 assert!(rid == RowID::new(row_id));
             } else {
                 panic!("insert failed");
+            }
+            if !matches!(row_id, 101 | 180) {
+                expected.push(insert);
             }
         }
         // try deleting 2 rows
@@ -554,11 +694,16 @@ mod tests {
         );
         let view = page.vector_view(metadata.col.as_ref());
         scanner.scan(view);
-        assert!(scanner.len() == 98);
+        assert_scan_rows("scanned rows", &scanner, &metadata.col, &expected);
         scanner.clear();
         assert!(scanner.is_empty());
+        assert_scan_rows("empty buffer", &scanner, &metadata.col, &[]);
+        scanner.scan(page.vector_view(metadata.col.as_ref()));
+        assert_scan_rows("scanned rows", &scanner, &metadata.col, &expected);
     }
 
+    /// Purpose: Protect nullable bitmap views across host byte orders.
+    /// Expected: Null flags remain correct, borrowing on little-endian hosts and copying otherwise.
     #[test]
     fn test_page_vector_view_col_borrows_nullable_null_bitmap() {
         let metadata = TableMetadata::try_new(
@@ -588,7 +733,14 @@ mod tests {
         assert!(!bits.bitmap_get(1));
 
         #[cfg(target_endian = "little")]
-        assert!(matches!(null_bitmap, Cow::Borrowed(_)));
+        {
+            assert!(matches!(null_bitmap, Cow::Borrowed(_)));
+            let bitmap_start = page.header.null_bitmap_list_offset as usize;
+            assert_eq!(
+                bits.as_ptr().cast::<u8>(),
+                page.data()[bitmap_start..].as_ptr()
+            );
+        }
         #[cfg(not(target_endian = "little"))]
         assert!(matches!(null_bitmap, Cow::Owned(_)));
 
@@ -596,6 +748,8 @@ mod tests {
         assert!(null_bitmap.is_none());
     }
 
+    /// Purpose: Protect nullable column alignment when vector scans omit deleted rows.
+    /// Expected: Compacted null flags and values describe the surviving rows in order.
     #[test]
     fn test_nullable_vector_scan_null_bitmap_compacts_deleted_rows() {
         let metadata = TableMetadata::try_new(
@@ -605,83 +759,101 @@ mod tests {
             )],
             vec![],
         )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(0), 8, metadata.col.as_ref());
-        for (row_id, value) in [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)]
-            .into_iter()
-            .enumerate()
-        {
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), &[value]),
-                InsertRow::Ok(inserted) if inserted == RowID::new(row_id as u64)
-            ));
+        .unwrap();
+        let values = [Val::U8(10), Val::Null, Val::U8(12), Val::Null, Val::U8(14)];
+        for (case, deleted, expected) in [
+            (
+                "delete non-null",
+                vec![2],
+                vec![
+                    vec![Val::U8(10)],
+                    vec![Val::Null],
+                    vec![Val::Null],
+                    vec![Val::U8(14)],
+                ],
+            ),
+            (
+                "delete null",
+                vec![1],
+                vec![
+                    vec![Val::U8(10)],
+                    vec![Val::U8(12)],
+                    vec![Val::Null],
+                    vec![Val::U8(14)],
+                ],
+            ),
+            (
+                "delete both",
+                vec![1, 2],
+                vec![vec![Val::U8(10)], vec![Val::Null], vec![Val::U8(14)]],
+            ),
+        ] {
+            let mut page = create_row_page();
+            page.init(RowID::new(0), 8, &metadata.col);
+            for (row_idx, value) in values.iter().enumerate() {
+                assert!(
+                    matches!(
+                        page.insert(&metadata.col, std::slice::from_ref(value)),
+                        InsertRow::Ok(id) if id == RowID::new(row_idx as u64)
+                    ),
+                    "{case}: insert row {row_idx}"
+                );
+            }
+            for row_id in deleted {
+                assert!(
+                    matches!(page.delete(RowID::new(row_id)), Delete::Ok),
+                    "{case}"
+                );
+            }
+            let mut scanner = ScanBuffer::new(&metadata.col, &[0]);
+            scanner.scan(page.vector_view(&metadata.col));
+            assert_scan_rows(case, &scanner, &metadata.col, &expected);
         }
-        assert!(matches!(page.delete(RowID::new(2)), Delete::Ok));
-
-        let mut scanner = ScanBuffer::new(metadata.col.as_ref(), &[0]);
-        scanner.scan(page.vector_view(metadata.col.as_ref()));
-
-        assert_eq!(scanner.len(), 4);
-        let col = scanner.column(0).unwrap();
-        let null_bitmap = col.null_bitmap.expect("nullable column result bitmap");
-        assert!(!null_bitmap.bitmap_get(0));
-        assert!(null_bitmap.bitmap_get(1));
-        assert!(null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
     }
 
+    /// Purpose: Protect scan-buffer truncation across value kinds and bitmap-word boundaries.
+    /// Expected: Truncation preserves the prefix and clears discarded storage so subsequent scans append correctly.
     #[test]
     fn test_scan_buffer_truncate_all_types() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
+        let metadata =
+            TableMetadata::try_new(scan_test_columns(), vec![]).expect("valid table metadata");
         let mut page = create_row_page();
-        page.init(RowID::new(0), 5, metadata.col.as_ref());
-        for row_id in 0u64..5 {
+        page.init(RowID::new(0), 70, metadata.col.as_ref());
+        let mut expected = Vec::new();
+        for row_id in 0u64..70 {
             let row_idx = row_id as usize;
-            let row_bytes = format!("row-{row_id}");
+            let row_bytes = if row_idx.is_multiple_of(2) {
+                format!("row-{row_id}")
+            } else {
+                format!("outlined row-{row_id}")
+            };
             let insert = vec![
                 Val::I8(row_idx as i8),
-                if matches!(row_idx, 0 | 3) {
+                if matches!(row_idx % 5, 0 | 3) {
                     Val::Null
                 } else {
                     Val::U8(10 + row_idx as u8)
                 },
                 Val::I16(-10 - row_idx as i16),
-                if matches!(row_idx, 2 | 3) {
+                if matches!(row_idx % 5, 2 | 3) {
                     Val::Null
                 } else {
                     Val::U16(100 + row_idx as u16)
                 },
                 Val::I32(-1000 - row_idx as i32),
-                if matches!(row_idx, 1 | 4) {
+                if matches!(row_idx % 5, 1 | 4) {
                     Val::Null
                 } else {
                     Val::U32(1000 + row_idx as u32)
                 },
                 Val::from(1.5f32 + row_idx as f32),
-                if matches!(row_idx, 0 | 2 | 4) {
+                if matches!(row_idx % 5, 0 | 2 | 4) {
                     Val::Null
                 } else {
                     Val::I64(-5000 - row_idx as i64)
                 },
                 Val::U64(5000 + row_idx as u64),
-                if row_idx == 3 {
+                if row_idx % 5 == 3 {
                     Val::Null
                 } else {
                     Val::from(10.5f64 + row_idx as f64)
@@ -694,174 +866,95 @@ mod tests {
             } else {
                 panic!("insert failed");
             }
+            expected.push(insert);
         }
         let mut scanner =
             ScanBuffer::new(metadata.col.as_ref(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let view = page.vector_view(metadata.col.as_ref());
         scanner.scan(view);
-        assert_eq!(scanner.len(), 5);
-
-        scanner.truncate(3);
-        assert_eq!(scanner.len(), 3);
-
-        let col_i8 = scanner.column(0).unwrap();
-        match col_i8.values {
-            ScanColumnValues::I8(vals) => assert_eq!(vals, &[0, 1, 2]),
-            _ => panic!("unexpected i8 column type"),
+        assert_scan_rows("scanned rows", &scanner, &metadata.col, &expected);
+        for (case, len) in [
+            ("above current length", 71),
+            ("unchanged length", 70),
+            ("partial second bitmap word", 65),
+            ("exact bitmap word", 64),
+            ("partial first bitmap word", 63),
+            ("short prefix", 3),
+        ] {
+            scanner.truncate(len);
+            assert_scan_rows(case, &scanner, &metadata.col, &expected[..len.min(70)]);
         }
-
-        let col_u8 = scanner.column(1).unwrap();
-        match col_u8.values {
-            ScanColumnValues::U8(vals) => assert_eq!(vals.len(), 3),
-            _ => panic!("unexpected u8 column type"),
-        }
-        let null_bitmap = col_u8.null_bitmap.expect("u8 null bitmap");
-        assert!(null_bitmap.bitmap_get(0));
-        assert!(!null_bitmap.bitmap_get(1));
-        assert!(!null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
-
-        let col_i16 = scanner.column(2).unwrap();
-        match col_i16.values {
-            ScanColumnValues::I16(vals) => assert_eq!(vals, &[-10, -11, -12]),
-            _ => panic!("unexpected i16 column type"),
-        }
-
-        let col_u16 = scanner.column(3).unwrap();
-        match col_u16.values {
-            ScanColumnValues::U16(vals) => assert_eq!(vals.len(), 3),
-            _ => panic!("unexpected u16 column type"),
-        }
-        let null_bitmap = col_u16.null_bitmap.expect("u16 null bitmap");
-        assert!(!null_bitmap.bitmap_get(0));
-        assert!(!null_bitmap.bitmap_get(1));
-        assert!(null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
-
-        let col_i32 = scanner.column(4).unwrap();
-        match col_i32.values {
-            ScanColumnValues::I32(vals) => assert_eq!(vals, &[-1000, -1001, -1002]),
-            _ => panic!("unexpected i32 column type"),
-        }
-
-        let col_u32 = scanner.column(5).unwrap();
-        match col_u32.values {
-            ScanColumnValues::U32(vals) => assert_eq!(vals.len(), 3),
-            _ => panic!("unexpected u32 column type"),
-        }
-        let null_bitmap = col_u32.null_bitmap.expect("u32 null bitmap");
-        assert!(!null_bitmap.bitmap_get(0));
-        assert!(null_bitmap.bitmap_get(1));
-        assert!(!null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
-
-        let col_f32 = scanner.column(6).unwrap();
-        match col_f32.values {
-            ScanColumnValues::F32(vals) => {
-                let expected = [1.5f32, 2.5f32, 3.5f32];
-                for (idx, val) in vals.iter().enumerate() {
-                    assert!((*val - expected[idx]).abs() <= f32::EPSILON);
-                }
-            }
-            _ => panic!("unexpected f32 column type"),
-        }
-
-        let col_i64 = scanner.column(7).unwrap();
-        match col_i64.values {
-            ScanColumnValues::I64(vals) => assert_eq!(vals.len(), 3),
-            _ => panic!("unexpected i64 column type"),
-        }
-        let null_bitmap = col_i64.null_bitmap.expect("i64 null bitmap");
-        assert!(null_bitmap.bitmap_get(0));
-        assert!(!null_bitmap.bitmap_get(1));
-        assert!(null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
-
-        let col_u64 = scanner.column(8).unwrap();
-        match col_u64.values {
-            ScanColumnValues::U64(vals) => assert_eq!(vals, &[5000, 5001, 5002]),
-            _ => panic!("unexpected u64 column type"),
-        }
-
-        let col_f64 = scanner.column(9).unwrap();
-        match col_f64.values {
-            ScanColumnValues::F64(vals) => assert_eq!(vals.len(), 3),
-            _ => panic!("unexpected f64 column type"),
-        }
-        let null_bitmap = col_f64.null_bitmap.expect("f64 null bitmap");
-        assert!(!null_bitmap.bitmap_get(0));
-        assert!(!null_bitmap.bitmap_get(1));
-        assert!(!null_bitmap.bitmap_get(2));
-        assert!(!null_bitmap.bitmap_get(3));
-
-        let col_varbyte = scanner.column(10).unwrap();
-        match col_varbyte.values {
-            ScanColumnValues::VarByte { offsets, data } => {
-                assert_eq!(offsets.len(), 3);
-                let values: Vec<Vec<u8>> = offsets
-                    .iter()
-                    .map(|(start, end)| data[*start..*end].to_vec())
-                    .collect();
-                assert_eq!(
-                    values,
-                    vec![b"row-0".to_vec(), b"row-1".to_vec(), b"row-2".to_vec()]
-                );
-            }
-            _ => panic!("unexpected varbyte column type"),
-        }
+        scanner.scan(page.vector_view(metadata.col.as_ref()));
+        let appended: Vec<_> = expected[..3].iter().chain(&expected).cloned().collect();
+        assert_scan_rows(
+            "append after truncation",
+            &scanner,
+            &metadata.col,
+            &appended,
+        );
+        scanner.truncate(0);
+        assert_scan_rows("empty buffer", &scanner, &metadata.col, &[]);
+        scanner.scan(page.vector_view(metadata.col.as_ref()));
+        assert_scan_rows("scanned rows", &scanner, &metadata.col, &expected);
     }
 
+    /// Purpose: Protect vector scans using prepared visibility that differs from current deletion state.
+    /// Expected: The view and scan expose exactly the rows selected by the prepared bitmap.
     #[test]
     fn test_vector_view_with_del_bitmap_uses_prepared_visibility() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::I8,
-                StorageColumnFlags::empty(),
-            )],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(0), 2, metadata.col.as_ref());
-        let insert = vec![Val::I8(1)];
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(id) if id == RowID::new(0)
-        ));
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(id) if id == RowID::new(1)
-        ));
+        let (metadata, page) = prepared_visibility_page(2);
         assert!(matches!(page.delete(RowID::new(1)), Delete::Ok));
-        let mut prepared = page.del_bitmap(page.header.row_count());
-        prepared.bitmap_unset(1);
-        let view = page
-            .vector_view_with_del_bitmap(metadata.col.as_ref(), prepared)
-            .unwrap();
-        assert_eq!(view.rows_non_deleted(), 2);
+        assert_eq!(page.vector_view(&metadata.col).rows_non_deleted(), 1);
+        for (case, prepared, expected) in [
+            (
+                "restore deleted row",
+                vec![0],
+                vec![vec![Val::I8(1)], vec![Val::I8(2)]],
+            ),
+            ("replace visible row", vec![1], vec![vec![Val::I8(2)]]),
+        ] {
+            let view = page
+                .vector_view_with_del_bitmap(metadata.col.as_ref(), prepared)
+                .unwrap();
+            assert_eq!(view.rows_non_deleted(), expected.len(), "{case}");
+            let mut scanner = ScanBuffer::new(&metadata.col, &[0]);
+            scanner.scan(view);
+            assert_scan_rows(case, &scanner, &metadata.col, &expected);
+            assert!(!page.is_deleted(0), "{case}");
+            assert!(page.is_deleted(1), "{case}");
+        }
     }
 
+    /// Purpose: Reject prepared deletion bitmaps with an incompatible shape.
+    /// Expected: Mismatched bitmap lengths return the internal misuse error.
     #[test]
     fn test_vector_view_with_del_bitmap_rejects_wrong_shape() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::I8,
-                StorageColumnFlags::empty(),
-            )],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = create_row_page();
-        page.init(RowID::new(0), 1, metadata.col.as_ref());
-        let insert = vec![Val::I8(1)];
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &insert),
-            InsertRow::Ok(id) if id == RowID::new(0)
-        ));
-        let err = match page.vector_view_with_del_bitmap(metadata.col.as_ref(), Vec::new()) {
-            Ok(_) => panic!("wrong prepared bitmap shape must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(err.current_context(), &InternalError::LwcBuilderMisuse);
+        for (case, row_count, units) in [
+            ("empty page", 0, 0),
+            ("partial word", 1, 1),
+            ("full word", 64, 1),
+            ("second word", 65, 2),
+        ] {
+            let (metadata, page) = prepared_visibility_page(row_count);
+            let view = page
+                .vector_view_with_del_bitmap(&metadata.col, vec![0; units])
+                .unwrap();
+            assert_eq!(view.rows_non_deleted(), row_count, "{case}: valid shape");
+            for invalid_units in [units.checked_sub(1), Some(units + 1)]
+                .into_iter()
+                .flatten()
+            {
+                let err =
+                    match page.vector_view_with_del_bitmap(&metadata.col, vec![0; invalid_units]) {
+                        Ok(_) => panic!("{case}: bitmap length {invalid_units} must fail"),
+                        Err(err) => err,
+                    };
+                assert_eq!(
+                    err.current_context(),
+                    &InternalError::LwcBuilderMisuse,
+                    "{case}: bitmap length {invalid_units}"
+                );
+            }
+        }
     }
 }

@@ -59,7 +59,7 @@ impl Deser for SelectKey {
 
 /// Row-page point-select result.
 pub(crate) enum Select<'a> {
-    #[expect(dead_code, reason = "reserved Select::Ok")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved Select::Ok"))]
     Ok(Row<'a>),
     #[expect(dead_code, reason = "reserved Select::RowDeleted")]
     RowDeleted(Row<'a>),
@@ -172,7 +172,7 @@ impl LinkForUniqueIndex {
 /// Row-page in-place update result.
 pub(crate) enum Update {
     // RowID may change if the update is out-of-place.
-    #[expect(dead_code, reason = "reserved Update::Ok")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "reserved Update::Ok"))]
     Ok(RowID),
     NotFound,
     Deleted,
