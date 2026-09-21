@@ -607,6 +607,7 @@ mod tests {
         TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
         TableDescriptorObject, TableDescriptors, Tables,
     };
+    use crate::conf::{EvictableBufferPoolConfig, FileSystemConfig};
     use crate::error::{
         DataIntegrityError, OperationOrFatalResult, RuntimeError, RuntimeOrFatalError,
     };
@@ -629,6 +630,7 @@ mod tests {
     use std::collections::hash_map::Entry;
     use std::fmt::Debug;
     use std::future::Future;
+    use std::path::Path;
     use std::pin::Pin;
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -983,6 +985,27 @@ mod tests {
         drop(pauses);
         assert!(!duplicate, "binding probe pause already installed for key");
         (entered_rx, release_tx)
+    }
+
+    fn managed_recovery_config(root: &Path) -> EngineConfig {
+        const BUFFER_BYTES: usize = 16 * 1024 * 1024;
+        const SWAP_BYTES: usize = 32 * 1024 * 1024;
+        EngineConfig::default()
+            .storage_root(root)
+            .meta_buffer(BUFFER_BYTES)
+            // Frame initialization scales with swap capacity, even for empty tables.
+            .index_buffer(
+                EvictableBufferPoolConfig::default()
+                    .swap_file("index.swp")
+                    .max_mem_size(BUFFER_BYTES)
+                    .max_file_size(SWAP_BYTES),
+            )
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(BUFFER_BYTES)
+                    .max_file_size(SWAP_BYTES),
+            )
+            .file(FileSystemConfig::default().readonly_buffer_size(32 * 1024 * 1024))
     }
 
     // Independent expected stable identities and bytes accompany every cross-store check.
@@ -1549,7 +1572,7 @@ mod tests {
         smol::block_on(async {
             for bindings in [0, 1, 3] {
                 let root = TempDir::new().unwrap();
-                let config = EngineConfig::default().storage_root(root.path());
+                let config = managed_recovery_config(root.path());
                 let mut engine = Engine::bootstrap(config.clone()).await.unwrap();
                 let mut session = engine.new_session().unwrap();
                 let mut model = DefinitionModel::new(vec![0, 0xff, bindings as u8], bindings);
@@ -1909,7 +1932,7 @@ mod tests {
                     ),
                 ] {
                     let root = TempDir::new().unwrap();
-                    let config = EngineConfig::default().storage_root(root.path());
+                    let config = managed_recovery_config(root.path());
                     let engine = Engine::bootstrap(config.clone()).await.unwrap();
                     let mut session = engine.new_session().unwrap();
                     let mut model = DefinitionModel::new(vec![0], 1);
@@ -2111,7 +2134,7 @@ mod tests {
     /// Expected: Both callers wait until publication releases the gate and the final definition matches the model.
     #[test]
     fn test_managed_publication_excludes_direct_current_read_and_purge() {
-        use crate::catalog::IndexDdlKind;
+        use crate::catalog::{IndexDdlKind, set_catalog_admission_hook};
         smol::block_on(async {
             for kind in [IndexDdlKind::Create, IndexDdlKind::Drop] {
                 let root = TempDir::new().unwrap();
@@ -2158,7 +2181,9 @@ mod tests {
                         let started = started_tx.clone();
                         let done = done_tx.clone();
                         scope.spawn(move || {
-                            started.send(()).unwrap();
+                            set_catalog_admission_hook(table_id, move || {
+                                started.send(()).unwrap();
+                            });
                             if purge {
                                 catalog.purge_user_table_history(MAX_SNAPSHOT_TS);
                             } else {
@@ -2168,13 +2193,20 @@ mod tests {
                             done.send(()).unwrap();
                         });
                     }
-                    started_rx.recv().unwrap();
-                    started_rx.recv().unwrap();
-                    assert!(matches!(
-                        done_rx.recv_timeout(Duration::from_millis(20)),
-                        Err(mpsc::RecvTimeoutError::Timeout)
-                    ));
+                    drop(started_tx);
+                    drop(done_tx);
+                    let admitted = started_rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .and_then(|()| started_rx.recv_timeout(Duration::from_secs(1)));
+                    let blocked =
+                        admitted.map(|()| done_rx.recv_timeout(Duration::from_millis(20)));
+                    // Release publication before asserting so failures cannot strand the workers.
                     release.send(()).unwrap();
+                    assert_eq!(
+                        blocked,
+                        Ok(Err(mpsc::RecvTimeoutError::Timeout)),
+                        "both catalog callers must reach admission and stay blocked during {kind:?} publication"
+                    );
                     done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
                     done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
                 });
