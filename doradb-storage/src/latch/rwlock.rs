@@ -273,19 +273,14 @@ impl Drop for WriteGuardRollback<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::join;
-    use futures::poll;
     use parking_lot::lock_api::RawRwLock as RawRwLockApi;
-    use smol::Timer;
-    use smol::future::or;
     use std::cell::UnsafeCell;
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    use std::task::{Context, Wake, Waker};
-    use std::thread::spawn;
-    use std::time::Duration;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
 
     struct WakeFlag(AtomicBool);
 
@@ -293,6 +288,31 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    struct WriterWakeProbe {
+        lock: Arc<RawRwLock>,
+        notified: AtomicBool,
+        woke_with_mutex_locked: AtomicBool,
+    }
+
+    impl Wake for WriterWakeProbe {
+        fn wake(self: Arc<Self>) {
+            // Event notification invokes this callback before returning. Record
+            // the mutex state here, before a later unlock can hide an early wake.
+            // Do not poll or panic inside the event listener's notification path.
+            self.woke_with_mutex_locked
+                .fetch_or(self.lock.mu.is_locked(), Ordering::SeqCst);
+            self.notified.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn poll_waiter<W: Wake + Send + Sync + 'static>(
+        waiter: Pin<&mut impl Future<Output = ()>>,
+        notified: &Arc<W>,
+    ) -> Poll<()> {
+        let waker = Waker::from(Arc::clone(notified));
+        waiter.poll(&mut Context::from_waker(&waker))
     }
 
     struct Counter {
@@ -340,8 +360,19 @@ mod tests {
     // SAFETY: shared references are synchronized by `RawRwLock`.
     unsafe impl Sync for Counter {}
 
-    /// Purpose: Poll shared and exclusive waiters while an exclusive lock is held, then release it.
-    /// Expected: Try-locks fail while held; each waiter is pending, receives a wake, acquires its mode, and unlocks cleanly.
+    fn run_counter_workers(worker: fn(&Counter)) -> usize {
+        let counter = Counter::new();
+        thread::scope(|scope| {
+            for _ in 0..10 {
+                scope.spawn(|| worker(&counter));
+            }
+        });
+        assert!(!counter.mu.is_locked(), "workers must release the rwlock");
+        counter.val()
+    }
+
+    /// Purpose: Protect shared and exclusive admission behind an active writer.
+    /// Expected: Writer release wakes blocked acquisitions, which acquire the requested mode and release cleanly.
     #[test]
     fn test_raw_rwlock_ops() {
         for exclusive in [false, true] {
@@ -353,8 +384,6 @@ mod tests {
             assert!(!rw.try_lock_exclusive());
 
             let notified = Arc::new(WakeFlag(AtomicBool::new(false)));
-            let waker = Waker::from(Arc::clone(&notified));
-            let mut cx = Context::from_waker(&waker);
             let mut waiter = pin!(async {
                 if exclusive {
                     rw.lock_exclusive_async().await;
@@ -362,7 +391,10 @@ mod tests {
                     rw.lock_shared_async().await;
                 }
             });
-            assert!(waiter.as_mut().poll(&mut cx).is_pending());
+            assert!(
+                poll_waiter(waiter.as_mut(), &notified).is_pending(),
+                "exclusive={exclusive}: acquisition must wait for the writer"
+            );
             assert!(!notified.0.swap(false, Ordering::SeqCst));
             // SAFETY: the initial exclusive acquisition above is still held.
             unsafe { rw.unlock_exclusive() };
@@ -370,7 +402,10 @@ mod tests {
                 notified.0.swap(false, Ordering::SeqCst),
                 "exclusive={exclusive}: waiter was not woken"
             );
-            assert!(waiter.as_mut().poll(&mut cx).is_ready());
+            assert!(
+                poll_waiter(waiter.as_mut(), &notified).is_ready(),
+                "exclusive={exclusive}: woken acquisition must complete"
+            );
             assert!(rw.is_locked());
             assert_eq!(rw.is_locked_exclusive(), exclusive);
             // SAFETY: the ready future acquired exactly the matching lock mode.
@@ -386,101 +421,112 @@ mod tests {
         }
     }
 
-    /// Purpose: Exercise exclusive increments from ten threads through the synchronous lock path.
-    /// Expected: After all threads join, the counter contains exactly 100 increments.
+    /// Purpose: Protect synchronous exclusive updates across worker threads.
+    /// Expected: The final counter preserves every completed increment.
     #[test]
     fn test_raw_rwlock_sync() {
-        let counter = Arc::new(Counter::new());
-        let mut threads = vec![];
-        for _ in 0..10 {
-            let counter = Arc::clone(&counter);
-            let handle = spawn(move || {
-                for _ in 0..10 {
-                    counter.inc();
-                }
-            });
-            threads.push(handle);
-        }
-
-        for th in threads {
-            th.join().unwrap();
-        }
-        println!("val={:?}", counter.val());
-        assert!(counter.val() == 100);
-    }
-
-    /// Purpose: Exercise exclusive increments from ten threads through the asynchronous lock path.
-    /// Expected: After all async workers finish and threads join, the counter contains exactly 100 increments.
-    #[test]
-    fn test_raw_rwlock_async() {
-        let counter = Arc::new(Counter::new());
-        let mut threads = vec![];
-        for _ in 0..10 {
-            let counter = Arc::clone(&counter);
-            let handle = spawn(move || {
-                smol::block_on(async {
-                    for _ in 0..10 {
-                        counter.inc_async().await;
-                    }
-                });
-            });
-            threads.push(handle);
-        }
-        for th in threads {
-            th.join().unwrap();
-        }
-        println!("val={:?}", counter.val());
-        assert!(counter.val() == 100);
-    }
-
-    /// Purpose: Register two pending writers before releasing the initial exclusive lock in 128 schedules.
-    /// Expected: Both writers acquire and release within the hang watchdog, leaving the lock unlocked.
-    #[test]
-    fn test_raw_rwlock_async_waiting_writers_progress_after_single_unlock() {
-        const ITERS: usize = 128;
-        smol::block_on(async {
-            for _ in 0..ITERS {
-                let rw = Arc::new(RawRwLock::new());
-                rw.lock_exclusive();
-                let waiter1 = {
-                    let rw = Arc::clone(&rw);
-                    async move {
-                        rw.lock_exclusive_async().await;
-                        // SAFETY: this waiter unlocks only after its acquire
-                        // completes.
-                        unsafe {
-                            rw.unlock_exclusive();
-                        }
-                    }
-                };
-                let waiter2 = {
-                    let rw = Arc::clone(&rw);
-                    async move {
-                        rw.lock_exclusive_async().await;
-                        // SAFETY: this waiter unlocks only after its acquire
-                        // completes.
-                        unsafe {
-                            rw.unlock_exclusive();
-                        }
-                    }
-                };
-                let mut waiter1 = pin!(waiter1);
-                let mut waiter2 = pin!(waiter2);
-                assert!(poll!(waiter1.as_mut()).is_pending());
-                assert!(poll!(waiter2.as_mut()).is_pending());
-                // SAFETY: both waiters are pending, and this test still owns
-                // the initial exclusive acquisition.
-                unsafe { rw.unlock_exclusive() };
-                let all = async {
-                    join(waiter1, waiter2).await;
-                    assert!(!rw.is_locked());
-                };
-                or(all, async {
-                    Timer::after(Duration::from_secs(1)).await;
-                    panic!("waiting writers failed to make progress after writer unlock");
-                })
-                .await;
+        let total = run_counter_workers(|counter| {
+            for _ in 0..10 {
+                counter.inc();
             }
         });
+        assert_eq!(total, 100);
+    }
+
+    /// Purpose: Protect asynchronous exclusive updates across worker threads.
+    /// Expected: The final counter preserves every completed increment.
+    #[test]
+    fn test_raw_rwlock_async() {
+        let total = run_counter_workers(|counter| {
+            smol::block_on(async {
+                for _ in 0..10 {
+                    counter.inc_async().await;
+                }
+            });
+        });
+        assert_eq!(total, 100);
+    }
+
+    /// Purpose: Protect notification ordering and progress of writers queued behind an exclusive owner.
+    /// Expected: Each wake observes an available writer mutex, and all queued writers complete and release the lock.
+    #[test]
+    fn test_raw_rwlock_async_waiting_writers_progress_after_single_unlock() {
+        let rw = Arc::new(RawRwLock::new());
+        rw.lock_exclusive();
+        let mut waiters = [
+            Box::pin(rw.lock_exclusive_async()),
+            Box::pin(rw.lock_exclusive_async()),
+        ];
+        let notified = [(); 2].map(|()| {
+            Arc::new(WriterWakeProbe {
+                lock: Arc::clone(&rw),
+                notified: AtomicBool::new(false),
+                woke_with_mutex_locked: AtomicBool::new(false),
+            })
+        });
+        for (index, waiter) in waiters.iter_mut().enumerate() {
+            assert!(
+                poll_waiter(waiter.as_mut(), &notified[index]).is_pending(),
+                "writer {index} must wait for the initial owner"
+            );
+            assert!(!notified[index].notified.swap(false, Ordering::SeqCst));
+        }
+
+        // SAFETY: both waiters are pending, so the initial owner still holds the lock.
+        unsafe { rw.unlock_exclusive() };
+        let notified_writers: Vec<_> = notified
+            .iter()
+            .enumerate()
+            .filter_map(|(index, probe)| {
+                probe
+                    .notified
+                    .swap(false, Ordering::SeqCst)
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(
+            notified_writers.len(),
+            1,
+            "initial release must wake a queued writer"
+        );
+        let first = notified_writers[0];
+        assert!(
+            !notified[first]
+                .woke_with_mutex_locked
+                .load(Ordering::SeqCst),
+            "initial release woke writer {first} before unlocking the raw mutex"
+        );
+        assert!(
+            poll_waiter(waiters[first].as_mut(), &notified[first]).is_ready(),
+            "writer {first} must acquire after the initial release"
+        );
+        assert!(rw.is_locked_exclusive());
+
+        let second = 1 - first;
+        assert!(
+            poll_waiter(waiters[second].as_mut(), &notified[second]).is_pending(),
+            "writer {second} must wait while writer {first} owns the lock"
+        );
+        notified[second].notified.store(false, Ordering::SeqCst);
+        // SAFETY: the first ready waiter acquired the exclusive lock above.
+        unsafe { rw.unlock_exclusive() };
+        assert!(
+            notified[second].notified.swap(false, Ordering::SeqCst),
+            "writer {first} must wake writer {second} on release"
+        );
+        assert!(
+            !notified[second]
+                .woke_with_mutex_locked
+                .load(Ordering::SeqCst),
+            "writer {first} woke writer {second} before unlocking the raw mutex"
+        );
+        assert!(
+            poll_waiter(waiters[second].as_mut(), &notified[second]).is_ready(),
+            "writer {second} must acquire after writer {first} releases"
+        );
+        assert!(rw.is_locked_exclusive());
+        // SAFETY: the second ready waiter now owns the exclusive lock.
+        unsafe { rw.unlock_exclusive() };
+        assert!(!rw.is_locked());
     }
 }

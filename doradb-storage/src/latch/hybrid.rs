@@ -532,6 +532,8 @@ impl<'a> HybridGuard<'a> {
 mod tests {
     use super::*;
 
+    /// Purpose: Preserve configuration error context for an invalid latch fallback mode.
+    /// Expected: Parsing reports the specific configuration error and retains the rejected input.
     #[test]
     fn test_latch_fallback_parse_keeps_config_domain() {
         let err = "invalid"
@@ -545,47 +547,58 @@ mod tests {
         assert!(format!("{err:?}").contains("value=invalid"));
     }
 
+    /// Purpose: Protect uncontended hybrid latch modes and exclusive version transitions.
+    /// Expected: Acquisitions preserve their modes and exclusive ownership invalidates older optimistic guards.
     #[test]
     fn test_hybrid_lock() {
         smol::block_on(async {
-            let boxed = Box::new(HybridLatch::new());
-            let latch: &'static mut HybridLatch = Box::leak(boxed);
+            let latch = HybridLatch::new();
             assert!(!latch.is_exclusive_latched());
             let ver = latch.version_acq();
-            assert!(latch.version_match(ver));
+            assert_eq!(ver, 0);
             // optimistic guard
             let opt_g1 = latch.optimistic_spin();
             assert!(opt_g1.validate());
-            drop(opt_g1);
             let read = latch.optimistic_read(|| 123usize);
             assert_eq!(read, 123);
-            // optimistic or shared
-            let opt_g2 = latch
-                .optimistic_fallback_raw(LatchFallbackMode::Shared)
-                .await;
-            assert!(opt_g2.validate());
-            drop(opt_g2);
-            let opt_g3 = latch
-                .optimistic_fallback_raw(LatchFallbackMode::Exclusive)
-                .await;
-            assert!(opt_g3.validate());
-            drop(opt_g3);
+            for mode in [
+                LatchFallbackMode::Shared,
+                LatchFallbackMode::Exclusive,
+                LatchFallbackMode::Spin,
+            ] {
+                let guard = latch.optimistic_fallback_raw(mode).await;
+                assert_eq!(guard.state(), GuardState::Optimistic, "mode={mode:?}");
+                assert!(guard.validate(), "mode={mode:?}");
+            }
             let shared_g1 = latch.shared_async_raw().await;
             assert_eq!(shared_g1.state(), GuardState::Shared);
-            drop(shared_g1);
             let shared_g2 = latch.try_shared_raw().unwrap();
             assert_eq!(shared_g2.state(), GuardState::Shared);
+            assert!(latch.try_exclusive_raw().is_none());
+            assert!(opt_g1.validate());
+            drop(shared_g1);
+            assert!(latch.try_exclusive_raw().is_none());
             drop(shared_g2);
             let exclusive_g1 = latch.exclusive_async().await;
             assert!(latch.is_exclusive_latched());
+            assert!(!opt_g1.validate());
+            assert!(latch.try_shared_raw().is_none());
+            assert!(latch.try_exclusive_raw().is_none());
             let ver2 = latch.version_acq();
-            assert!(ver2 == ver + 1);
+            assert_eq!(ver2, 1);
             drop(exclusive_g1);
             let ver3 = latch.version_acq();
-            assert!(ver3 == ver2 + 1);
+            assert_eq!(ver3, 2);
+            assert!(!opt_g1.validate());
+            assert!(!latch.is_exclusive_latched());
             let exclusive_g2 = latch.try_exclusive_raw().unwrap();
             assert_eq!(exclusive_g2.state(), GuardState::Exclusive);
+            assert_eq!(latch.version_acq(), 3);
             drop(exclusive_g2);
+            assert_eq!(latch.version_acq(), 4);
+            assert!(!latch.is_exclusive_latched());
+            assert!(!latch.lock.is_locked());
+            assert!(latch.optimistic_spin().validate());
         })
     }
 }
