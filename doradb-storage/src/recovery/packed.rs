@@ -425,19 +425,37 @@ mod tests {
 
     fn sample_batch() -> PackedPageBatch {
         use crate::log::redo::RowRedoKind;
+        use crate::row::ops::UpdateCol;
         use crate::value::Val;
-        pack_test_ops([OwnedReplayOp {
-            cts: TrxID::new(1),
-            row: RowRedo {
-                row_id: RowID::new(1),
-                kind: RowRedoKind::Insert(
-                    PageID::new(2),
-                    vec![Val::Null, Val::from("sample bytes"), Val::I32(17)],
-                ),
+        pack_test_ops([
+            OwnedReplayOp {
+                cts: TrxID::new(1),
+                row: RowRedo {
+                    row_id: RowID::new(1),
+                    kind: RowRedoKind::Insert(
+                        PageID::new(2),
+                        vec![Val::Null, Val::from("sample bytes"), Val::I32(17)],
+                    ),
+                },
             },
-        }])
+            OwnedReplayOp {
+                cts: TrxID::new(2),
+                row: RowRedo {
+                    row_id: RowID::new(1),
+                    kind: RowRedoKind::Update(
+                        PageID::new(2),
+                        vec![UpdateCol {
+                            idx: 1,
+                            val: Val::from("replacement bytes"),
+                        }],
+                    ),
+                },
+            },
+        ])
     }
 
+    /// Purpose: Protect batch recycling at retention limits and through pool reuse and clearing.
+    /// Expected: Eligible allocations are reused empty, while oversized or over-budget storage is discarded.
     #[test]
     fn recycling_uses_actual_capacity_caps_and_clears_all_lengths() {
         let batch = sample_batch();
@@ -446,6 +464,7 @@ mod tests {
         let pointers = (
             batch.ops.as_ptr(),
             batch.values.as_ptr(),
+            batch.updates.as_ptr(),
             batch.payload.as_ptr(),
         );
         let mut pool = BatchPool::new(bytes, bytes, 1);
@@ -456,11 +475,16 @@ mod tests {
         let reused = pool.acquire();
         assert_eq!(pool_snapshot(&pool), (0, 0));
         assert_eq!(reused.used_bytes(), 0);
+        assert!(reused.ops.is_empty());
+        assert!(reused.values.is_empty());
+        assert!(reused.updates.is_empty());
+        assert!(reused.payload.is_empty());
         assert_eq!(
             pointers,
             (
                 reused.ops.as_ptr(),
                 reused.values.as_ptr(),
+                reused.updates.as_ptr(),
                 reused.payload.as_ptr()
             )
         );
@@ -488,6 +512,8 @@ mod tests {
         assert_eq!(pool_snapshot(&huge), (1, bytes));
     }
 
+    /// Purpose: Account for unused vector capacity and aggregate retained storage in the batch pool.
+    /// Expected: Excess spare capacity is rejected and pooled allocations remain within the total byte budget.
     #[test]
     fn spare_capacity_and_aggregate_pool_limits_are_accounted() {
         let mut batch = sample_batch();

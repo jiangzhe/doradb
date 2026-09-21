@@ -1651,7 +1651,15 @@ mod tests {
     }
 
     async fn run_row_purge_residency_case(evicted: bool, workers: usize) {
+        let case_started = Instant::now();
+        let report_phase = |phase| {
+            eprintln!(
+                "row-purge workers={workers} evicted={evicted} phase={phase} elapsed={:?}",
+                case_started.elapsed()
+            );
+        };
         let temp = TempDir::new().unwrap();
+        report_phase("bootstrap");
         // 512 frame slots and exactly 128 resident page reservations.
         let engine = Engine::bootstrap(
             purge_test_engine_config(temp.path(), "row_metadata_purge", 2, workers).data_buffer(
@@ -1662,6 +1670,7 @@ mod tests {
         )
         .await
         .unwrap();
+        report_phase("table_setup");
         let table_id = no_index_table(&engine).await;
         let table = engine.inner().core.catalog().get_table(table_id).unwrap();
         let guards = full_pool_guards(&engine);
@@ -1677,19 +1686,35 @@ mod tests {
         let payload = vec![7u8; 48 * 1024];
         let mut rows = Vec::new();
         let mut target = TrxID::new(0);
-        for _ in 0..row_count {
+        // Batch durable commits while keeping each batch below the resident
+        // budget. The evicted case retains multiple batches in both GC buckets.
+        let batch_size = 32;
+        report_phase("insert_and_spill");
+        for batch_start in (0..row_count).step_by(batch_size) {
             let mut trx = writer.begin_trx().unwrap();
-            let row_id = trx
-                .table_insert_mvcc(table_id, vec![Val::from(payload.as_slice())])
-                .await
-                .unwrap();
-            target = trx.commit().await.unwrap();
-            let id = row_page_identity(&table, &guards, row_id).await;
-            rows.push((row_id, id));
-            if evicted {
-                test_evict_existing_page(engine.inner().pools.mem.clone(), id.page_id).await;
+            let mut row_ids = Vec::new();
+            for _ in batch_start..(batch_start + batch_size).min(row_count) {
+                let row_id = trx
+                    .table_insert_mvcc(table_id, vec![Val::from(payload.as_slice())])
+                    .await
+                    .unwrap();
+                row_ids.push(row_id);
             }
+            target = trx.commit().await.unwrap();
+            for row_id in row_ids {
+                let id = row_page_identity(&table, &guards, row_id).await;
+                rows.push((row_id, id));
+                if evicted {
+                    test_evict_existing_page(engine.inner().pools.mem.clone(), id.page_id).await;
+                }
+            }
+            eprintln!(
+                "row-purge workers={workers} evicted={evicted} phase=batch_complete rows={} elapsed={:?}",
+                rows.len(),
+                case_started.elapsed()
+            );
         }
+        report_phase("final_spill");
         if evicted {
             // Later insertion retries can revisit earlier full pages. Spill the
             // complete final set after those foreground accesses have ended.
@@ -1700,13 +1725,8 @@ mod tests {
             }
         }
         let sys = &engine.inner().trx_sys;
-        loop {
-            let handoff = sys.purge_handoff_listener();
-            if sys.purge_handoff_cts() >= target {
-                break;
-            }
-            handoff.await;
-        }
+        report_phase("handoff");
+        wait_for_purge_handoff(&writer, target).await.unwrap();
         for &(row_id, id) in &rows {
             let map = table
                 .row_store
@@ -1718,6 +1738,7 @@ mod tests {
         assert_eq!(sys.trx_sys_stats().purge_row_count, initial.purge_row_count);
         // Unrelated resident pages expose cache displacement caused by
         // any accidental row-undo reload. Setup and spill IO precede baseline.
+        report_phase("pressure");
         let pool = &engine.inner().pools.mem;
         let mut pressure = Vec::new();
         if evicted {
@@ -1734,6 +1755,7 @@ mod tests {
             .iter()
             .filter(|&&id| test_frame_kind(pool, id) == FrameKind::Evicted)
             .count();
+        report_phase("purge");
         let before = pool.stats();
         let started = Instant::now();
         snapshot.commit().await.unwrap();
@@ -1742,6 +1764,7 @@ mod tests {
             .await
             .unwrap();
         let elapsed = started.elapsed();
+        report_phase("verify");
         for &(row_id, id) in &rows {
             let map = table
                 .row_store
@@ -1777,6 +1800,10 @@ mod tests {
             sys.trx_sys_stats().purge_index_count,
             initial.purge_index_count
         );
+        report_phase("shutdown");
+        drop((reader, writer, guards, table));
+        drop(engine);
+        report_phase("complete");
     }
 
     #[inline]
@@ -1942,6 +1969,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep dropped-file cleanup ordered during initialization and insertion.
+    /// Expected: Entries are ordered by retirement timestamp and table identity.
     #[test]
     fn test_dropped_table_file_cleanup_queue_sorts_seed_and_insert() {
         let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
@@ -1962,6 +1991,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Diagnose a dropped-table runtime that still has shared owners.
+    /// Expected: The assertion reports the table identity and actual ownership count.
     #[test]
     fn test_dropped_table_runtime_uniqueness_assertion_reports_identity_and_count() {
         smol::block_on(async {
@@ -1990,6 +2021,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Drain dropped files covered by the catalog replay boundary.
+    /// Expected: Only entries older than that boundary drain; later entries stay ordered.
     #[test]
     fn test_dropped_table_file_cleanup_queue_drains_ready_prefix_only() {
         let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
@@ -2007,6 +2040,8 @@ mod tests {
         assert!(queue.files.is_empty());
     }
 
+    /// Purpose: Retain failed file cleanup for a later retry.
+    /// Expected: Failed eligible entries precede the still-pending suffix in order.
     #[test]
     fn test_dropped_table_file_cleanup_queue_prepends_failed_ready_items() {
         let mut queue = DroppedTableFileCleanupQueue::from_items(vec![
@@ -2028,6 +2063,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Combine active and committed progress with full observation requests.
+    /// Expected: Coalescing preserves the earliest causal timestamps and requested housekeeping.
     #[test]
     fn test_coalesce_purge_work_preserves_causal_minima_and_requests() {
         let (tx, rx) = flume::unbounded();
@@ -2067,6 +2104,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Combine targeted housekeeping without requesting transaction GC.
+    /// Expected: Only the requested housekeeping flags are enabled.
     #[test]
     fn test_coalesce_purge_work_keeps_targeted_housekeeping_independent() {
         let (tx, rx) = flume::unbounded();
@@ -2088,6 +2127,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Track retired index runtimes across duplicate and retry requests.
+    /// Expected: Table identities are deduplicated and runtime cleanup remains requested.
     #[test]
     fn test_coalesce_purge_work_registers_retired_index_runtime_tables() {
         let (tx, rx) = flume::unbounded();
@@ -2112,6 +2153,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Process a retired-index request whose table no longer exists.
+    /// Expected: The obsolete table identity is removed from pending cleanup.
     #[test]
     fn test_retired_index_runtime_processing_removes_absent_table() {
         smol::block_on(async {
@@ -2133,6 +2176,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Plan purge across horizon advancement and system-commit eligibility.
+    /// Expected: GC and housekeeping follow their distinct eligibility and publication rules.
     #[test]
     fn test_plan_purge_cycle_distinguishes_horizon_and_system_work() {
         let completed = TrxID::new(10);
@@ -2244,6 +2289,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Plan housekeeping without a full purge observation.
+    /// Expected: Only requested housekeeping runs and the completed horizon is unchanged.
     #[test]
     fn test_plan_targeted_housekeeping_does_not_advance_completed_horizon() {
         assert_eq!(
@@ -2281,6 +2328,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Queue system retirement work without registering a user snapshot.
+    /// Expected: The retirement payload survives handoff while active-snapshot state stays empty.
     #[test]
     fn test_gc_bucket_records_system_payload_without_active_sts() {
         let bucket = GCBucket::new();
@@ -2310,6 +2359,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Queue successive retirement ranges for the same table.
+    /// Expected: Eligible retirement ranges retain their commit order.
     #[test]
     fn test_gc_bucket_preserves_same_table_retirement_order() {
         let bucket = GCBucket::new();
@@ -2354,6 +2405,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Coalesce shutdown with pending purge work.
+    /// Expected: Stop overrides other work and produces a shutdown-only result.
     #[test]
     fn test_coalesce_purge_work_stop_wins() {
         let (tx, rx) = flume::unbounded();
@@ -2381,6 +2434,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Preserve commit handoff encountered before a queued stop.
+    /// Expected: Every preceding committed payload is analyzed and later payloads are excluded.
     #[test]
     fn test_coalesce_purge_work_analyzes_committed_before_stop() {
         let (tx, rx) = flume::unbounded();
@@ -2407,6 +2462,8 @@ mod tests {
         assert_eq!(analyzed, 3);
     }
 
+    /// Purpose: Coalesce a commit carrying active-snapshot and system progress.
+    /// Expected: Both causal timestamps survive without requesting unrelated housekeeping.
     #[test]
     fn test_coalesce_purge_work_committed_preserves_both_progress_dimensions() {
         let (_tx, rx) = flume::unbounded();
@@ -2432,6 +2489,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Remove active snapshots through bucket rollback progress.
+    /// Expected: Only changes to the oldest active snapshot produce progress notifications.
     #[test]
     fn test_gc_bucket_reports_only_changed_active_minimum() {
         let bucket = GCBucket::new();
@@ -2465,6 +2524,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Retire multiple active snapshots in one committed batch.
+    /// Expected: One transition describes the original and final minima while all commits remain queued.
     #[test]
     fn test_gc_bucket_committed_batch_reports_one_original_to_final_transition() {
         let bucket = GCBucket::new();
@@ -2493,6 +2554,8 @@ mod tests {
         assert_eq!(bucket.committed_trx_list.lock().len(), 3);
     }
 
+    /// Purpose: Record user and system commits in the same bucket batch.
+    /// Expected: Active-snapshot advancement and the earliest system commit are both retained.
     #[test]
     fn test_gc_bucket_mixed_commit_preserves_active_and_system_progress() {
         let bucket = GCBucket::new();
@@ -2517,6 +2580,8 @@ mod tests {
         assert_eq!(bucket.committed_trx_list.lock().len(), 3);
     }
 
+    /// Purpose: Combine causal progress from multiple GC buckets.
+    /// Expected: The earliest active-snapshot and system-commit timestamps are retained independently.
     #[test]
     fn test_committed_progress_merges_minima_across_buckets() {
         let mut progress = CommittedPurgeProgress::default();
@@ -2543,6 +2608,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Route committed work under different configured bucket counts.
+    /// Expected: System routing adapts to the bucket count while user routing retains its assigned bucket.
     #[test]
     fn test_system_bucket_routing_uses_runtime_bucket_count() {
         let committed = committed_system(10, 39, 19);
@@ -2554,6 +2621,8 @@ mod tests {
         assert_eq!(committed.gc_no(256), Some(1));
     }
 
+    /// Purpose: Merge out-of-order purge worker results.
+    /// Expected: Retirement output follows bucket order and preserves each bucket queue order.
     #[test]
     fn test_merge_bucket_results_orders_buckets_and_preserves_bucket_fifo() {
         let batch = |table_id, page_id| {
@@ -2581,6 +2650,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Assign GC buckets across varying worker counts.
+    /// Expected: Assignments cover all buckets with balanced load and stable worker slots.
     #[test]
     fn test_static_purge_worker_slots_cover_each_bucket_once() {
         for gc_buckets in [1, 2, DEFAULT_GC_BUCKETS, 256] {
@@ -2606,6 +2677,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Track the oldest snapshot through ordered inserts and removals.
+    /// Expected: Each operation yields the expected minimum or the empty-list sentinel.
     #[test]
     fn test_active_sts_list() {
         let mut active_sts_list = ActiveStsList::default();
@@ -2633,6 +2706,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Register user transactions with a configured GC bucket count.
+    /// Expected: Active transactions distribute in round-robin order.
     #[test]
     fn test_user_transactions_round_robin_over_configured_buckets() {
         smol::block_on(async {
@@ -2662,6 +2737,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Restart an engine with a different GC bucket count.
+    /// Expected: The restarted engine uses the new configuration without migration.
     #[test]
     fn test_gc_bucket_count_can_change_across_restart_without_migration() {
         smol::block_on(async {
@@ -2690,6 +2767,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Retire row pages whose owning table runtime is missing.
+    /// Expected: Empty work succeeds, while missing ownership poisons the engine with a purge-access error.
     #[test]
     fn test_process_retired_row_pages_poisons_on_missing_runtime() {
         smol::block_on(async {
@@ -2757,6 +2836,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Propagate a bucket access failure through purge poisoning.
+    /// Expected: The fatal report retains the runtime source and the engine records poison.
     #[test]
     fn test_purge_bucket_access_failure_preserves_runtime_source() {
         smol::block_on(async {
@@ -2815,6 +2896,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge a committed delete with no row-page identity.
+    /// Expected: The shared delete marker becomes the matching committed timestamp.
     #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
         smol::block_on(async {
@@ -2901,6 +2984,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge a delete with no row-page identity while its marker is uncommitted.
+    /// Expected: The original shared delete marker remains unpromoted.
     #[test]
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_without_page_id() {
         smol::block_on(async {
@@ -2991,6 +3076,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge a committed delete whose row-page generation is stale.
+    /// Expected: The shared delete marker becomes the matching committed timestamp.
     #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_with_missing_page_id() {
         smol::block_on(async {
@@ -3100,6 +3187,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge a delete with a stale page generation and uncommitted marker.
+    /// Expected: The original shared delete marker remains unpromoted.
     #[test]
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id() {
         smol::block_on(async {
@@ -3213,6 +3302,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Observe purge when the completed horizon has not advanced.
+    /// Expected: Housekeeping runs without bucket GC or completed-horizon publication.
     #[test]
     fn test_full_observation_at_unchanged_horizon_runs_only_requested_housekeeping() {
         smol::block_on(async {
@@ -3245,6 +3336,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Execute system-commit plans at equal, eligible, and advancing horizons.
+    /// Expected: Strict eligibility controls GC while horizon advancement controls housekeeping and publication.
     #[test]
     fn test_system_cts_plans_execute_with_strict_eligibility_and_housekeeping_scope() {
         smol::block_on(async {
@@ -3329,6 +3422,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Release the oldest snapshot by rollback after a later commit.
+    /// Expected: The later commit defers GC until rollback enables a full advancing cycle.
     #[test]
     fn test_global_blocker_rollback_runs_the_deferred_horizon_cycle() {
         smol::block_on(async {
@@ -3374,6 +3469,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Register a replacement snapshot before a pending purge scan resumes.
+    /// Expected: Publication uses the replacement snapshot rather than a stale no-active observation.
     #[test]
     fn test_stale_no_active_observation_uses_fresh_bucket_minimum() {
         smol::block_on(async {
@@ -3432,6 +3529,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Hold a remote purge bucket while local work completes.
+    /// Expected: Retirement and horizon publication wait for remote completion.
     #[test]
     fn test_dispatcher_waits_for_blocked_remote_bucket_before_retirement_and_publication() {
         smol::block_on(async {
@@ -3490,6 +3589,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Fail either a local or remote purge bucket.
+    /// Expected: The engine is poisoned without retiring pages or publishing a completed horizon.
     #[test]
     fn test_dispatcher_bucket_failures_poison_without_retirement_or_publication() {
         smol::block_on(async {
@@ -3546,6 +3647,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Run purge with only the dispatcher thread.
+    /// Expected: All buckets complete locally, the horizon is published, and shutdown joins successfully.
     #[test]
     fn test_dispatcher_without_executors_runs_every_bucket_locally_and_joins() {
         smol::block_on(async {
@@ -3610,6 +3713,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Run purge with more workers than GC buckets.
+    /// Expected: Each bucket starts and completes once and idle workers shut down successfully.
     #[test]
     fn test_more_purge_workers_than_buckets_execute_each_bucket_once_and_join() {
         smol::block_on(async {
@@ -3649,6 +3754,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Schedule purge after non-global and then global snapshot progress.
+    /// Expected: Only global progress triggers GC, with remote tasks queued before local execution.
     #[test]
     fn test_dispatcher_skips_non_global_progress_and_enqueues_remote_work_first() {
         smol::block_on(async {
@@ -3753,6 +3860,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reclaim committed insert and delete history with one purge worker.
+    /// Expected: Completion accounts for all transaction, row, and index undo work.
     #[test]
     fn test_trx_purge_one_worker() {
         use crate::catalog::tests::table1;
@@ -3826,6 +3935,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reclaim committed insert and delete history with multiple purge workers.
+    /// Expected: Completion accounts for all transaction, row, and index undo work.
     #[test]
     fn test_trx_purge_multi_threads() {
         use crate::catalog::tests::table1;
@@ -3899,20 +4010,29 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge evicted row undo with only the dispatcher worker.
+    /// Expected: Undo is reclaimed without page reads or cache access, and rows stay evicted.
     #[test]
     fn test_row_purge_evicted_without_reads() {
-        smol::block_on(async {
-            for workers in [1, 2] {
-                run_row_purge_residency_case(true, workers).await;
-            }
-        });
+        smol::block_on(run_row_purge_residency_case(true, 1));
     }
 
+    /// Purpose: Purge evicted row undo across dispatcher and executor workers.
+    /// Expected: Undo is reclaimed without page reads or cache access, and rows stay evicted.
+    #[test]
+    fn test_row_purge_evicted_without_reads_two_workers() {
+        smol::block_on(run_row_purge_residency_case(true, 2));
+    }
+
+    /// Purpose: Purge row undo while its pages remain resident.
+    /// Expected: Undo is reclaimed without reads or cache access and pages remain resident.
     #[test]
     fn test_row_purge_resident_without_cache_access() {
         smol::block_on(run_row_purge_residency_case(false, 1));
     }
 
+    /// Purpose: Purge catalog row history through resident version metadata.
+    /// Expected: Catalog undo remains available before eligibility and is cleared after purge completes.
     #[test]
     fn test_row_purge_catalog_uses_resident_version_metadata() {
         smol::block_on(async {
@@ -3953,6 +4073,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Purge deletes with valid version metadata at row-range boundaries.
+    /// Expected: Shared delete markers remain unchanged both inside and outside the metadata range.
     #[test]
     fn test_row_purge_valid_map_does_not_promote_delete_markers() {
         smol::block_on(async {
@@ -4010,6 +4132,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover row metadata for pages including a nonzero row identity.
+    /// Expected: Recovered creation timestamps match the originals and row undo is empty.
     #[test]
     fn test_recovered_row_metadata_preserves_nonzero_identity_and_create_cts() {
         smol::block_on(async {

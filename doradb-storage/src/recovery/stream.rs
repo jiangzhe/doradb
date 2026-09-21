@@ -1996,7 +1996,9 @@ mod tests {
     use crate::log::redo::{
         DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind, TableDML,
     };
-    use crate::recovery::decode::{DecodedTable, DecodedTrxKind, assert_group_matches_logs};
+    use crate::recovery::decode::{
+        DecodedRowKind, DecodedTable, DecodedTrxKind, assert_group_matches_logs,
+    };
     use crate::recovery::packed::ReplayKind;
     use crate::row::RowValues;
     use crate::serde::Ser;
@@ -2004,6 +2006,7 @@ mod tests {
     use crate::value::Val;
     use crate::value::ValRef;
     use futures::FutureExt;
+    use std::any::Any;
     use std::collections::{BTreeMap, VecDeque};
     use std::io::{Error as StdIoError, Write};
     use std::num::NonZeroUsize;
@@ -2152,17 +2155,12 @@ mod tests {
                 Some(&expected)
             );
             assert!(owning.buffer.is_empty());
-            assert!(
-                AssertUnwindSafe(packed.try_next())
-                    .catch_unwind()
-                    .await
-                    .is_err()
-            );
-            assert!(
+            assert_read_after_failed(&mut packed).await;
+            assert_terminal_panic(
                 AssertUnwindSafe(owning.try_next())
                     .catch_unwind()
                     .await
-                    .is_err()
+                    .unwrap_err(),
             );
         } else {
             let mut logs = Vec::new();
@@ -2258,6 +2256,90 @@ mod tests {
         planned.stream
     }
 
+    fn temporary_stream(
+        data_block_count: usize,
+        blocks: &[DirectBuf],
+        seal: TestSegmentSeal,
+    ) -> (tempfile::TempDir, RecoveryLogStream) {
+        let dir = tempfile::tempdir().unwrap();
+        let stream = stream_for_test_file(
+            &dir.path().join("redo.log"),
+            STORAGE_SECTOR_SIZE,
+            data_block_count,
+            blocks,
+            seal,
+        );
+        (dir, stream)
+    }
+
+    fn assert_unsealed_tail(
+        data_block_count: usize,
+        blocks: &[DirectBuf],
+        reason: UnsealedSegmentTerminalReason,
+    ) {
+        smol::block_on(async {
+            let (_dir, mut stream) =
+                temporary_stream(data_block_count, blocks, TestSegmentSeal::Open);
+            assert_unsealed_terminal(&mut stream, reason, REDO_DEFAULT_DATA_START_OFFSET, None)
+                .await;
+        });
+    }
+
+    fn assert_sealed_corruption(blocks: &[DirectBuf], min_cts: u64, max_cts: u64) {
+        smol::block_on(async {
+            let (_dir, mut stream) = temporary_stream(
+                1,
+                blocks,
+                TestSegmentSeal::Sealed {
+                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
+                    redo_range: Some((TrxID::new(min_cts), TrxID::new(max_cts))),
+                },
+            );
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    fn assert_rejected_timestamp_range(min_cts: u64, max_cts: u64) {
+        smol::block_on(async {
+            let block = block_group_with_range(
+                simple_trx_log(TrxID::new(5)),
+                TrxID::new(min_cts),
+                TrxID::new(max_cts),
+            );
+            let (_dir, mut stream) = temporary_stream(1, &[block], TestSegmentSeal::Open);
+            let err = stream.try_next().await.unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<DataIntegrityError>(),
+                Some(&DataIntegrityError::InvalidPayload),
+                "range={min_cts}..={max_cts}: {err:?}"
+            );
+            assert_read_after_failed(&mut stream).await;
+        });
+    }
+
+    fn assert_early_continuation_end(end: RedoReadItem) {
+        smol::block_on(async {
+            let mut stream = injected_stream(vec![
+                RedoReadItem::SegmentStart(injected_segment(2)),
+                RedoReadItem::Block {
+                    file_seq: TEST_FILE_SEQ,
+                    offset: REDO_DEFAULT_DATA_START_OFFSET,
+                    buf: two_block_start_only(),
+                },
+                end,
+            ]);
+            assert_stream_corrupted(&mut stream).await;
+        });
+    }
+
+    fn corrupt_group_start_checksum() -> DirectBuf {
+        let mut block =
+            block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
+        let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
+        block.as_bytes_mut()[payload_start] ^= 0x80;
+        block
+    }
+
     fn injected_segment(data_block_count: usize) -> RedoLogSegment {
         let file_max_size = REDO_DEFAULT_DATA_START_OFFSET + data_block_count * STORAGE_SECTOR_SIZE;
         RedoLogSegment {
@@ -2299,6 +2381,7 @@ mod tests {
             Some(DataIntegrityError::LogFileCorrupted),
             "{err:?}"
         );
+        assert_read_after_failed(stream).await;
     }
 
     async fn assert_unsealed_terminal(
@@ -2313,6 +2396,8 @@ mod tests {
         assert_eq!(terminals[0].terminal_reason, terminal_reason);
         assert_eq!(terminals[0].accepted_end_offset, accepted_end_offset);
         assert_eq!(terminals[0].redo_range, redo_range);
+        assert!(stream.take_unsealed_terminals().is_empty());
+        assert!(stream.try_next().await.unwrap().is_none());
     }
 
     async fn assert_read_after_failed(stream: &mut RecoveryLogStream) {
@@ -2320,6 +2405,10 @@ mod tests {
             .catch_unwind()
             .await
             .unwrap_err();
+        assert_terminal_panic(panic);
+    }
+
+    fn assert_terminal_panic(panic: Box<dyn Any + Send>) {
         let message = panic
             .downcast_ref::<String>()
             .map(String::as_str)
@@ -2396,6 +2485,8 @@ mod tests {
         block
     }
 
+    /// Purpose: Preserve failure context when either replay planner cannot start read-ahead.
+    /// Expected: Reports retain the I/O cause and background-spawn context with the owning planning phase.
     #[test]
     fn test_replay_planners_attach_owned_phase_to_read_ahead_spawn_failure() {
         for (catalog_scan, phase) in [
@@ -2431,6 +2522,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Preserve the original operating-system error from a redo read completion.
+    /// Expected: Validation returns the I/O classification and original cause with file and offset context.
     #[test]
     fn test_redo_read_completion_preserves_owned_io_error() {
         let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
@@ -2461,6 +2554,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Stop read-ahead while its output queue is full.
+    /// Expected: The worker exits without publishing another item or requiring the queue to be drained.
     #[test]
     fn test_read_ahead_send_item_stops_while_item_queue_full() {
         let (items_tx, items_rx) = flume::bounded(1);
@@ -2489,6 +2584,8 @@ mod tests {
         assert_eq!(items_rx.len(), 1);
     }
 
+    /// Purpose: Clean up queued redo reads when the backend wait fails.
+    /// Expected: Draining accounts for the abandoned read and leaves no pending or submitted requests.
     #[test]
     fn test_read_ahead_drain_cleans_pending_reads_after_wait_error() {
         let (items_tx, _items_rx) = flume::bounded(1);
@@ -2521,142 +2618,70 @@ mod tests {
         assert_eq!(driver.submitted_len(), 0);
     }
 
+    /// Purpose: Handle an unfinished redo group at an unsealed segment boundary.
+    /// Expected: The stream discards the group and reports an incomplete continuation tail at the accepted prefix.
     #[test]
     fn test_direct_stream_treats_unsealed_group_crossing_segment_end_as_incomplete_tail() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let block = two_block_start_only();
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[block],
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        assert_unsealed_tail(
+            1,
+            &[two_block_start_only()],
+            UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+        );
     }
 
+    /// Purpose: Handle a zero continuation block inside an unsealed segment.
+    /// Expected: The unfinished group is discarded and the terminal metadata identifies an incomplete tail.
     #[test]
     fn test_direct_stream_treats_in_range_zero_continuation_as_incomplete_tail() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let block = two_block_start_only();
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                2,
-                &[block],
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        assert_unsealed_tail(
+            2,
+            &[two_block_start_only()],
+            UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+        );
     }
 
+    /// Purpose: Handle a corrupt continuation checksum in an unsealed redo group.
+    /// Expected: The group is discarded as an incomplete continuation tail without advancing the accepted prefix.
     #[test]
     fn test_direct_stream_treats_bad_checksum_continuation_as_unsealed_incomplete_tail() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let blocks = [two_block_start_only(), bad_checksum_final_continuation()];
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                2,
-                &blocks,
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::IncompleteContinuationTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        assert_unsealed_tail(
+            2,
+            &[two_block_start_only(), bad_checksum_final_continuation()],
+            UnsealedSegmentTerminalReason::IncompleteContinuationTail,
+        );
     }
 
+    /// Purpose: Recognize a zero-filled group header at the end of an unsealed segment.
+    /// Expected: The stream ends cleanly and records a zero tail without accepting a group.
     #[test]
     fn test_direct_stream_treats_all_zero_group_header_as_eof() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[],
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::ZeroTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        assert_unsealed_tail(1, &[], UnsealedSegmentTerminalReason::ZeroTail);
     }
 
+    /// Purpose: Handle a malformed nonzero header in an otherwise empty unsealed segment.
+    /// Expected: The stream ends at the prior accepted prefix and records a malformed group-start tail.
     #[test]
     fn test_direct_stream_treats_unsealed_nonzero_empty_group_header_as_tail() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
-            block.as_bytes_mut()[0] = 1;
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[block],
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::MalformedGroupStartTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        let mut block = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+        block.as_bytes_mut()[0] = 1;
+        assert_unsealed_tail(
+            1,
+            &[block],
+            UnsealedSegmentTerminalReason::MalformedGroupStartTail,
+        );
     }
 
+    /// Purpose: Retain accepted-prefix metadata when a malformed tail follows a valid group.
+    /// Expected: The valid transaction survives and terminal metadata retains its end offset and declared timestamp range.
     #[test]
     fn test_direct_stream_reports_unsealed_accepted_prefix_metadata() {
         smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
             let valid =
                 block_group_with_range(simple_trx_log(TrxID::new(5)), TrxID::new(4), TrxID::new(6));
             let mut malformed_tail = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
             malformed_tail.as_bytes_mut()[0] = 1;
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                2,
-                &[valid, malformed_tail],
-                TestSegmentSeal::Open,
-            );
+            let (_dir, mut stream) =
+                temporary_stream(2, &[valid, malformed_tail], TestSegmentSeal::Open);
 
             let recovered = stream.try_next().await.unwrap().unwrap();
             assert_eq!(recovered.transactions[0].header.cts, TrxID::new(5));
@@ -2670,6 +2695,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject a redo layout with more unsealed segments than recovery permits.
+    /// Expected: Planning fails with a log-file corruption error.
     #[test]
     fn test_replay_planner_rejects_three_unsealed_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -2697,6 +2724,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject an unsealed redo segment followed by a newer sealed segment.
+    /// Expected: Planning identifies the invalid segment ordering as log-file corruption.
     #[test]
     fn test_replay_planner_rejects_unsealed_before_sealed_newer_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -2731,6 +2760,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Summarize empty and nonempty sealed segments for catalog checkpoint scanning.
+    /// Expected: The planner preserves sealed timestamp summaries, excludes open segments, and disables recovery metrics.
     #[test]
     fn test_catalog_scan_planner_reports_sealed_segment_summaries() {
         let dir = tempfile::tempdir().unwrap();
@@ -2787,6 +2818,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Recover the accepted older prefix when the final redo segments are both unsealed.
+    /// Expected: Only the older segment is replayed and counted, with repair policy and terminal metadata retained.
     #[test]
     fn test_replay_planner_final_two_unsealed_skips_newest_tail() {
         smol::block_on(async {
@@ -2846,6 +2879,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Prevent replay from continuing to later valid segments after a sealed segment is corrupt.
+    /// Expected: The initial corruption fails the stream and later reads remain failed.
     #[test]
     fn test_direct_stream_fails_closed_after_segment_error() {
         smol::block_on(async {
@@ -2884,144 +2919,66 @@ mod tests {
             let mut stream = planned.stream;
 
             assert_stream_corrupted(&mut stream).await;
-            assert_read_after_failed(&mut stream).await;
         });
     }
 
+    /// Purpose: Detect a segment-end event before the required continuation arrives.
+    /// Expected: The stream reports corruption and remains failed on subsequent reads.
     #[test]
     fn test_direct_stream_rejects_early_segment_end_while_waiting_for_continuation() {
-        smol::block_on(async {
-            let block = two_block_start_only();
-            let mut stream = injected_stream(vec![
-                RedoReadItem::SegmentStart(injected_segment(2)),
-                RedoReadItem::Block {
-                    file_seq: TEST_FILE_SEQ,
-                    offset: REDO_DEFAULT_DATA_START_OFFSET,
-                    buf: block,
-                },
-                RedoReadItem::SegmentEnd {
-                    file_seq: TEST_FILE_SEQ,
-                },
-            ]);
-
-            assert_stream_corrupted(&mut stream).await;
-            assert_read_after_failed(&mut stream).await;
+        assert_early_continuation_end(RedoReadItem::SegmentEnd {
+            file_seq: TEST_FILE_SEQ,
         });
     }
 
+    /// Purpose: Detect an input-end event before the required continuation arrives.
+    /// Expected: The unfinished group causes corruption and subsequent reads remain failed.
     #[test]
     fn test_direct_stream_rejects_early_end_while_waiting_for_continuation() {
-        smol::block_on(async {
-            let block = two_block_start_only();
-            let mut stream = injected_stream(vec![
-                RedoReadItem::SegmentStart(injected_segment(2)),
-                RedoReadItem::Block {
-                    file_seq: TEST_FILE_SEQ,
-                    offset: REDO_DEFAULT_DATA_START_OFFSET,
-                    buf: block,
-                },
-                RedoReadItem::End,
-            ]);
-
-            assert_stream_corrupted(&mut stream).await;
-            assert_read_after_failed(&mut stream).await;
-        });
+        assert_early_continuation_end(RedoReadItem::End);
     }
 
+    /// Purpose: Handle a group-start checksum failure in an unsealed segment.
+    /// Expected: The stream records a malformed tail without accepting the corrupt group.
     #[test]
     fn test_direct_stream_treats_unsealed_bad_group_start_checksum_as_tail() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut direct_buf =
-                block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
-            let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
-            direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Open,
-            );
-
-            assert_unsealed_terminal(
-                &mut stream,
-                UnsealedSegmentTerminalReason::MalformedGroupStartTail,
-                REDO_DEFAULT_DATA_START_OFFSET,
-                None,
-            )
-            .await;
-        });
+        assert_unsealed_tail(
+            1,
+            &[corrupt_group_start_checksum()],
+            UnsealedSegmentTerminalReason::MalformedGroupStartTail,
+        );
     }
 
+    /// Purpose: Validate group-start checksums inside sealed redo.
+    /// Expected: A corrupted group is rejected as log-file corruption.
     #[test]
     fn test_direct_stream_rejects_sealed_bad_group_start_checksum() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut direct_buf =
-                block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
-            let payload_start = RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE;
-            direct_buf.as_bytes_mut()[payload_start] ^= 0x80;
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Sealed {
-                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
-                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
-                },
-            );
-
-            assert_stream_corrupted(&mut stream).await;
-        });
+        assert_sealed_corruption(&[corrupt_group_start_checksum()], 1, 1);
     }
 
+    /// Purpose: Validate block padding after an otherwise valid redo payload.
+    /// Expected: Nonzero padding causes log-file corruption even in an unsealed segment.
     #[test]
     fn test_direct_stream_rejects_nonzero_padding_after_payload() {
         smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
             let mut direct_buf =
                 block_group_with_range(simple_trx_log(TrxID::new(1)), TrxID::new(1), TrxID::new(1));
             corrupt_padding_after_payload(&mut direct_buf);
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Open,
-            );
+            let (_dir, mut stream) = temporary_stream(1, &[direct_buf], TestSegmentSeal::Open);
 
             assert_stream_corrupted(&mut stream).await;
         });
     }
 
+    /// Purpose: Validate a transaction timestamp below its group's declared range.
+    /// Expected: The stream rejects the group with an invalid-payload error.
     #[test]
     fn test_direct_stream_rejects_body_cts_below_header_range() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let log = simple_trx_log(TrxID::new(5));
-            let direct_buf = block_group_with_range(log, TrxID::new(6), TrxID::new(8));
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Open,
-            );
-
-            let err = stream.try_next().await.unwrap_err();
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-        });
+        assert_rejected_timestamp_range(6, 8);
     }
 
+    /// Purpose: Discard an entire group when a later transaction violates the declared timestamp range.
+    /// Expected: No valid prefix escapes the failed group and subsequent reads remain failed.
     #[test]
     fn test_direct_stream_clears_partial_buffer_after_group_decode_error() {
         smol::block_on(async {
@@ -3042,15 +2999,7 @@ mod tests {
                 .ser(blocks[0].as_bytes_mut(), RedoBlockHeader::SIZE);
             patch_redo_block_checksum(blocks[0].as_bytes_mut());
 
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                blocks.len(),
-                &blocks,
-                TestSegmentSeal::Open,
-            );
+            let (_dir, mut stream) = temporary_stream(blocks.len(), &blocks, TestSegmentSeal::Open);
 
             let err = stream.try_next().await.unwrap_err();
             assert_eq!(
@@ -3061,43 +3010,21 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate a transaction timestamp above its group's declared range.
+    /// Expected: The out-of-range transaction causes an invalid-payload error.
     #[test]
     fn test_direct_stream_rejects_body_cts_above_header_range() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let log = simple_trx_log(TrxID::new(5));
-            let direct_buf = block_group_with_range(log, TrxID::new(1), TrxID::new(4));
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Open,
-            );
-
-            let err = stream.try_next().await.unwrap_err();
-            assert_eq!(
-                err.downcast_ref::<DataIntegrityError>().copied(),
-                Some(DataIntegrityError::InvalidPayload)
-            );
-        });
+        assert_rejected_timestamp_range(1, 4);
     }
 
+    /// Purpose: Allow group timestamp bounds that enclose the actual transaction timestamp.
+    /// Expected: The transaction is preserved and the stream ends cleanly.
     #[test]
     fn test_direct_stream_accepts_body_cts_within_loose_header_range() {
         smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
             let log = simple_trx_log(TrxID::new(5));
             let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Open,
-            );
+            let (_dir, mut stream) = temporary_stream(1, &[direct_buf], TestSegmentSeal::Open);
 
             let recovered = stream.try_next().await.unwrap().unwrap();
             assert_eq!(recovered.transactions[0].header.cts, TrxID::new(5));
@@ -3105,16 +3032,14 @@ mod tests {
         });
     }
 
+    /// Purpose: Accept group timestamp bounds consistent with the enclosing segment seal.
+    /// Expected: The sealed group is returned and replay ends at its durable boundary.
     #[test]
     fn test_direct_stream_accepts_matching_sealed_group_range() {
         smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
             let log = simple_trx_log(TrxID::new(5));
             let direct_buf = block_group_with_range(log, TrxID::new(4), TrxID::new(6));
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
+            let (_dir, mut stream) = temporary_stream(
                 1,
                 &[direct_buf],
                 TestSegmentSeal::Sealed {
@@ -3128,14 +3053,12 @@ mod tests {
         });
     }
 
+    /// Purpose: Recognize an empty sealed segment from its durable boundary.
+    /// Expected: The stream returns no group without requiring a zero-block terminator.
     #[test]
     fn test_direct_stream_skips_empty_sealed_file_without_zero_eof() {
         smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
+            let (_dir, mut stream) = temporary_stream(
                 1,
                 &[],
                 TestSegmentSeal::Sealed {
@@ -3148,69 +3071,31 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject an apparent zero tail inside a sealed segment's durable prefix.
+    /// Expected: Premature termination is reported as log-file corruption.
     #[test]
     fn test_direct_stream_rejects_zero_eof_before_sealed_durable_end() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[],
-                TestSegmentSeal::Sealed {
-                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
-                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
-                },
-            );
-
-            assert_stream_corrupted(&mut stream).await;
-        });
+        assert_sealed_corruption(&[], 1, 1);
     }
 
+    /// Purpose: Enforce the sealed durable boundary for groups requiring continuation blocks.
+    /// Expected: A group extending beyond that boundary is rejected as log-file corruption.
     #[test]
     fn test_direct_stream_rejects_group_crossing_sealed_durable_end() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let block = two_block_start_only();
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[block],
-                TestSegmentSeal::Sealed {
-                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
-                    redo_range: Some((TrxID::new(1), TrxID::new(1))),
-                },
-            );
-
-            assert_stream_corrupted(&mut stream).await;
-        });
+        assert_sealed_corruption(&[two_block_start_only()], 1, 1);
     }
 
+    /// Purpose: Validate a sealed segment's timestamp summary against its groups.
+    /// Expected: A mismatch between the seal and group range causes log-file corruption.
     #[test]
     fn test_direct_stream_rejects_mismatched_sealed_group_range() {
-        smol::block_on(async {
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let log = simple_trx_log(TrxID::new(5));
-            let direct_buf = block_group_with_range(log, TrxID::new(5), TrxID::new(5));
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                1,
-                &[direct_buf],
-                TestSegmentSeal::Sealed {
-                    durable_end_offset: REDO_DEFAULT_DATA_START_OFFSET + STORAGE_SECTOR_SIZE,
-                    redo_range: Some((TrxID::new(4), TrxID::new(6))),
-                },
-            );
-
-            assert_stream_corrupted(&mut stream).await;
-        });
+        let block =
+            block_group_with_range(simple_trx_log(TrxID::new(5)), TrxID::new(5), TrxID::new(5));
+        assert_sealed_corruption(&[block], 4, 6);
     }
 
+    /// Purpose: Account for a multiblock group followed by unused preallocated redo space.
+    /// Expected: Metrics count validated payload and consumed tail blocks without counting unread space.
     #[test]
     fn test_recovery_metrics_count_multiblock_payload_and_consumed_tail_only() {
         smol::block_on(async {
@@ -3271,6 +3156,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Read system and user transactions packaged in the same redo group.
+    /// Expected: Both transactions retain their headers and complete redo contents and contribute to group accounting.
     #[test]
     fn test_direct_stream_reads_multi_trx_log_in_one_group() {
         smol::block_on(async {
@@ -3320,19 +3207,48 @@ mod tests {
                 })
                 .unwrap();
 
-            let dir = tempfile::tempdir().unwrap();
-            let file_path = dir.path().join("test.log");
-            let mut stream = stream_for_test_file(
-                &file_path,
-                STORAGE_SECTOR_SIZE,
-                blocks.len(),
-                &blocks,
-                TestSegmentSeal::Open,
-            );
+            let (_dir, mut stream) = temporary_stream(blocks.len(), &blocks, TestSegmentSeal::Open);
             let group = stream.try_next().await.unwrap().unwrap();
             assert_eq!(group.transactions.len(), 2);
+            assert_eq!(group.transactions[0].header.cts, TrxID::new(1));
             assert_eq!(group.transactions[0].header.trx_kind, RedoTrxKind::System);
+            assert_eq!(group.transactions[1].header.cts, TrxID::new(2));
             assert_eq!(group.transactions[1].header.trx_kind, RedoTrxKind::User);
+            let DecodedTrxKind::Ddl(ddl, catalog_dml) = &group.transactions[0].kind else {
+                panic!("expected page creation: {:?}", group.transactions[0]);
+            };
+            let DDLRedo::CreateRowPage {
+                table_id,
+                page_id,
+                start_row_id,
+                end_row_id,
+            } = ddl.as_ref()
+            else {
+                panic!("expected page creation: {ddl:?}");
+            };
+            assert_eq!(
+                (*table_id, *page_id, *start_row_id, *end_row_id),
+                (
+                    TableID::new(6),
+                    test_page_id(5),
+                    RowID::new(0),
+                    RowID::new(574)
+                )
+            );
+            assert!(catalog_dml.is_empty());
+            let DecodedTrxKind::Dml(tables) = &group.transactions[1].kind else {
+                panic!("expected user DML: {:?}", group.transactions[1]);
+            };
+            assert_eq!(tables.len(), 1);
+            let DecodedTable::User(rows) = &tables[&TableID::new(6)] else {
+                panic!("expected user table");
+            };
+            assert_eq!(rows.len(), 1);
+            let row = &rows[&RowID::new(100)];
+            assert_eq!(row.row_id, RowID::new(100));
+            assert!(
+                matches!(row.kind, DecodedRowKind::Delete(Some(page)) if page == test_page_id(5))
+            );
             assert!(stream.try_next().await.unwrap().is_none());
             let (metrics, saturated) = stream.recovery_metrics();
             assert!(!saturated);
@@ -3342,6 +3258,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Replay adjacent sealed segments with different persisted block sizes.
+    /// Expected: Transactions remain ordered and consumed-byte metrics use each segment's block size.
     #[test]
     fn test_direct_stream_reads_segments_with_different_persisted_block_sizes() {
         smol::block_on(async {
@@ -3411,6 +3329,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Compare replay adapters when a later transaction corrupts an otherwise valid group.
+    /// Expected: Both adapters reject the entire group with the same error and remain terminal.
     #[test]
     fn both_adapters_reject_a_whole_group_and_remain_terminal() {
         smol::block_on(async {
@@ -3448,6 +3368,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover variable-length values spanning physical redo blocks.
+    /// Expected: Packed and owning adapters agree and the recovered value matches the original bytes.
     #[test]
     fn packed_adapter_keeps_values_crossing_physical_blocks() {
         smol::block_on(async {

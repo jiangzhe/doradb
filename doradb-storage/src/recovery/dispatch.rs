@@ -836,6 +836,8 @@ mod tests {
         group.operation(&row, cts).used_bytes()
     }
 
+    /// Purpose: Exercise restart with minimal replay capacity and either DML validation setting.
+    /// Expected: Bootstrap replays committed user and catalog operations successfully under both settings.
     #[test]
     fn test_restart_with_single_operation_replay_limits() {
         smol::block_on(async {
@@ -859,6 +861,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve per-page replay ordering while independent pages progress and retired pages reactivate.
+    /// Expected: Ordered mutations retain insertion history, and reinserting a deleted slot is rejected.
     #[test]
     fn test_page_order_concurrency_and_retained_history() {
         smol::block_on(async {
@@ -931,6 +935,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Exercise replay admission under batch and active-page pressure.
+    /// Expected: Partial batches are submitted, excess admission waits, and completion permits replay to drain.
     #[test]
     fn test_admission_bounds_flush_partial_batches_before_waiting() {
         smol::block_on(async {
@@ -979,6 +985,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve ready-page order when partial and full batches compete for a submission slot.
+    /// Expected: The older partial batch runs first and its collected completion releases the slot.
     #[test]
     fn test_fifo_partial_batches_and_completion_credits() {
         smol::block_on(async {
@@ -1022,6 +1030,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Scope replay barriers to their table with multiple jobs on a single worker.
+    /// Expected: Unrelated table barriers return immediately, while the affected barrier drains jobs and releases captures.
     #[test]
     fn test_multiple_outstanding_jobs_with_one_worker_and_table_barrier() {
         smol::block_on(async {
@@ -1058,6 +1068,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Allow a mixed-size payload batch to progress independently of a blocked page.
+    /// Expected: The independent batch applies its values correctly before the blocked page is released.
     #[test]
     fn test_mixed_payload_batch_progresses_while_another_page_is_blocked() {
         smol::block_on(async {
@@ -1124,6 +1136,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Settle a replay failure with both accepted and unsubmitted work.
+    /// Expected: Accepted jobs complete, pending mutations are discarded, and the original failure survives.
     #[test]
     fn test_failure_discards_pending_and_drains_accepted_jobs() {
         smol::block_on(async {
@@ -1150,6 +1164,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Collect replay completions while a source read remains pending.
+    /// Expected: Completion processing preserves the same input future until its result arrives.
     #[test]
     fn test_completion_while_waiting_keeps_same_input_future() {
         smol::block_on(async {
@@ -1177,6 +1193,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve page mutations when a later operation in the same replay batch fails.
+    /// Expected: Earlier inserted data remains visible and its page stays dirty after settlement.
     #[test]
     fn test_batch_failure_marks_prior_mutations_dirty() {
         smol::block_on(async {
@@ -1205,6 +1223,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Settle replay after the worker pool rejects submission due to engine poison.
+    /// Expected: The original fatal poison takes precedence while retaining the ordinary failure context.
     #[test]
     fn test_pool_rejection_preserves_fatal_during_settlement() {
         smol::block_on(async {
@@ -1228,6 +1248,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Distinguish worker completion from dispatcher collection of a replay batch.
+    /// Expected: Finished work retains its submission slot and page ownership until collection retires it.
     #[test]
     fn test_finished_batch_keeps_submission_slot_until_completion_collection() {
         smol::block_on(async {
@@ -1259,6 +1281,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Settle an ordinary recovery error while an accepted replay worker panics.
+    /// Expected: Settlement returns the fatal worker panic and clears active dispatcher bookkeeping.
     #[test]
     fn test_worker_panic_outranks_ordinary_failure() {
         smol::block_on(async {
@@ -1280,6 +1304,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Cancel bootstrap while an accepted replay job still owns storage resources.
+    /// Expected: Rollback waits for accepted replay and releases ownership so another bootstrap succeeds.
     #[test]
     fn test_cancelled_bootstrap_drains_replay_before_storage_teardown() {
         let temp = TempDir::new().unwrap();
@@ -1296,6 +1322,8 @@ mod tests {
         smol::block_on(verify_replay_after_cancellation(config));
     }
 
+    /// Purpose: Replay many underfilled pages under tight scheduling limits, then revisit them.
+    /// Expected: Active bookkeeping remains bounded and retained histories allow all later updates to complete.
     #[test]
     fn test_many_partial_pages_retire_and_reactivate_with_bounded_bookkeeping() {
         smol::block_on(async {
@@ -1349,6 +1377,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Admit new page work when submission of a queued batch frees pending capacity.
+    /// Expected: Admission resumes before the newly submitted batch finishes and all operations eventually drain.
     #[test]
     fn test_submission_rechecks_newly_available_pending_capacity_before_wait() {
         smol::block_on(async {
@@ -1405,6 +1435,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Split a partial replay batch when the next row would exceed its byte target.
+    /// Expected: The existing batch is submitted and the next row remains pending until both are replayed.
     #[test]
     fn byte_target_flushes_partial_batch_before_next_row() {
         smol::block_on(async {
@@ -1434,6 +1466,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Admit individual operations that meet or exceed the batch byte target.
+    /// Expected: Each operation is submitted immediately and completes without waiting for byte credits.
     #[test]
     fn exact_fit_and_oversized_operations_dispatch_without_byte_credit_waits() {
         smol::block_on(async {
@@ -1462,6 +1496,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reuse collected batch storage across pages after source groups have been released.
+    /// Expected: Recycling begins only after collection, preserves both pages' values, and releases storage at final drain.
     #[test]
     fn collected_storage_recycles_across_pages_without_borrowed_group_or_page_bytes() {
         smol::block_on(async {
