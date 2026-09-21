@@ -185,7 +185,7 @@ mod tests {
     }
 
     /// Purpose: Verify the persisted little-endian hint layout.
-    /// Expected: Slot 3 contains [4, 3, 2, 1] and reads back as 0x01020304.
+    /// Expected: A stored hint uses the specified byte order and reads back without loss.
     #[test]
     fn test_btree_hints_store_little_endian_heads() {
         let mut hints = BTreeHints::new_zeroed();
@@ -211,8 +211,8 @@ mod tests {
         assert_hint_bounds();
     }
 
-    /// Purpose: Compare AVX2 bounds with independent counts for 1,000 ChaCha8 cases seeded with 312.
-    /// Expected: Every stored and sampled key matches counts of heads below and at-or-below it, with seed/case diagnostics.
+    /// Purpose: Check AVX2 search bounds against independent counts over reproducible random inputs.
+    /// Expected: Stored and sampled keys produce the correct lower and upper positions.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     #[test]
     fn test_btree_search_hints_consistency() {

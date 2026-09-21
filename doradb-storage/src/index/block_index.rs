@@ -487,6 +487,8 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect initial and updated routing metadata for user and catalog block indexes.
+    /// Expected: Accessors expose the initial tree height and the current row-store pivot.
     #[test]
     fn test_block_index_root_accessors_and_update() {
         smol::block_on(async {
@@ -516,6 +518,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce the storage prerequisite when a lookup routes to the column store.
+    /// Expected: A column-route lookup without column storage rejects the violated contract.
     #[test]
     #[should_panic(expected = "block-index column route requires column storage")]
     fn test_find_row_panics_when_column_route_has_no_storage() {
@@ -536,6 +540,8 @@ mod tests {
         let _ = smol::block_on(blk_idx.find_row(&meta_guard, None, RowID::new(9), None));
     }
 
+    /// Purpose: Protect block-index error propagation when reloading a cached insert page fails.
+    /// Expected: The caller receives an index-access error retaining its I/O cause.
     #[test]
     fn test_get_insert_page_returns_error_on_free_list_io_failure() {
         smol::block_on(async {

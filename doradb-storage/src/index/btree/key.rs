@@ -525,6 +525,8 @@ mod tests {
     use std::f64::consts::PI;
     use std::slice::from_ref;
 
+    /// Purpose: Protect scalar key encodings at numeric extremes, byte boundaries, and nulls.
+    /// Expected: Encoded bytes match explicit fixtures and length and copy APIs agree.
     #[test]
     fn test_single_key_encoder_basic() {
         // Test all basic types with nullable and non-nullable variants
@@ -637,7 +639,6 @@ mod tests {
         for (ty, val, expected) in test_cases {
             let encoder = SingleKeyEncoder(ty);
             let key = encoder.encode_single(&val);
-            // assert!(!key.is_empty());
             assert_eq!(key.as_bytes(), expected);
 
             // Test encode_len
@@ -657,6 +658,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect scalar and composite B-tree key encodings, including segmented and null keys.
+    /// Expected: Encoded keys match the specified byte layout for every fixture.
     #[test]
     fn test_btree_key_encoder() {
         // Test single key encoders
@@ -754,7 +757,13 @@ mod tests {
         ]);
         let keys = vec![Val::from(42i32), Val::from(b"multi"), Val::from(PI)];
         let key = encoder.encode(&keys);
-        assert!(!key.is_empty());
+        assert_eq!(
+            key.as_bytes(),
+            &[
+                0x80, 0, 0, 42, b'm', b'u', b'l', b't', b'i', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5,
+                0xc0, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18,
+            ]
+        );
 
         // Test with NULL values in multi-key
         let encoder = BTreeKeyEncoder::new(vec![
@@ -763,9 +772,11 @@ mod tests {
         ]);
         let keys = vec![Val::Null, Val::from(b"null_test")];
         let key = encoder.encode(&keys);
-        assert!(!key.is_empty());
+        assert_eq!(key.as_bytes(), b"\x01\x02null_test");
     }
 
+    /// Purpose: Protect compatibility of the dedicated and general composite-key encoders.
+    /// Expected: Both APIs produce the same specified encoding for a mixed-type nullable key.
     #[test]
     fn test_multi_key_encoder_matches_btree_multi_encoder() {
         let val_types = vec![
@@ -778,9 +789,11 @@ mod tests {
         let btree_encoder = BTreeKeyEncoder::new(val_types.clone());
         let multi_encoder = MultiKeyEncoder::new(val_types);
 
-        assert_eq!(
-            multi_encoder.encode(&keys).as_bytes(),
-            btree_encoder.encode(&keys).as_bytes()
-        );
+        let expected = [
+            0, 0, 0, 42, b's', b'e', b'g', b'm', b'e', b'n', b't', b'e', b'd', b'-', b'p', b'r',
+            b'e', b'f', b'i', 0xff, b'x', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x01,
+        ];
+        assert_eq!(multi_encoder.encode(&keys).as_bytes(), expected);
+        assert_eq!(btree_encoder.encode(&keys).as_bytes(), expected);
     }
 }

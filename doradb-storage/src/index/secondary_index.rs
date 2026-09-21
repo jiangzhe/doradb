@@ -1306,6 +1306,8 @@ mod tests {
         table
     }
 
+    /// Purpose: Protect candidate streaming when no disk source is available.
+    /// Expected: The stream yields memory candidates and reaches the terminal state without polling disk.
     #[test]
     fn test_secondary_candidate_stream_without_disk_source_is_mem_only() {
         smol::block_on(async {
@@ -1326,6 +1328,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique and non-unique point access when the captured disk root is absent.
+    /// Expected: No disk view is opened, missing keys stay absent, and unique insertion can use memory.
     #[test]
     fn test_secondary_point_reads_skip_absent_disk_root() {
         smol::block_on(async {
@@ -1393,6 +1397,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique ownership and observed replacement across memory overlays and persisted roots.
+    /// Expected: Memory state takes precedence, stale claims fail, and scans preserve the unchanged disk version.
     #[test]
     fn test_unique_dual_tree_method_semantics() {
         smol::block_on(async {
@@ -1757,6 +1763,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect disk views opened at successive published secondary-index roots.
+    /// Expected: Each view retains its supplied root while later views expose newly published entries.
     #[test]
     fn test_disk_runtime_resolves_published_root_per_open() {
         smol::block_on(async {
@@ -1842,6 +1850,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect non-unique candidate merging and masking across memory and disk sources.
+    /// Expected: Scans deduplicate exact owners and memory masks take precedence without changing disk data.
     #[test]
     fn test_non_unique_dual_tree_merge_and_overlay_semantics() {
         smol::block_on(async {
@@ -2074,6 +2084,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect early stream drop for unique and non-unique composite indexes.
+    /// Expected: Later mutations and fresh scans complete with the expected merged candidates.
     #[test]
     fn test_secondary_index_batch_stream_early_drop_releases_sources() {
         smol::block_on(async {
@@ -2289,6 +2301,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect variant and slot metadata exposed by the secondary-index wrapper.
+    /// Expected: Unique and non-unique wrappers report their corresponding kind and index slot.
     #[test]
     fn test_dual_tree_secondary_index_wrapper() {
         smol::block_on(async {

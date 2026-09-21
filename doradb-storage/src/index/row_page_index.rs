@@ -2068,6 +2068,209 @@ mod tests {
         }
     }
 
+    async fn with_row_page_index(
+        pool_bytes: usize,
+        check: impl AsyncFnOnce(
+            &RowPageIndex,
+            &PoolGuard,
+            &QuiescentBox<FixedBufferPool>,
+            &PoolGuard,
+            &TableMetadata,
+        ),
+    ) {
+        let meta_pool = owned_index_pool(pool_bytes);
+        let mem_pool = owned_mem_pool(pool_bytes);
+        let meta_guard = (*meta_pool).create_base_guard();
+        let mem_guard = (*mem_pool).create_base_guard();
+        let metadata = make_test_metadata();
+        let index = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
+            .await
+            .expect("test row-page-index construction should succeed");
+        check(&index, &meta_guard, &mem_pool, &mem_guard, &metadata).await;
+    }
+
+    fn assert_insert_page_error(
+        err: RuntimeOrFatalError,
+        expected_resource: Option<ResourceError>,
+    ) {
+        let RuntimeOrFatalError::Runtime(err) = err else {
+            panic!("expected Runtime error, got {err:?}");
+        };
+        assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
+        if let Some(expected) = expected_resource {
+            assert_eq!(err.downcast_ref::<ResourceError>().copied(), Some(expected));
+        } else {
+            assert!(err.downcast_ref::<IoError>().is_some(), "{err:?}");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InsertPageMode {
+        Shared,
+        Exclusive,
+        Reserved,
+    }
+
+    async fn assert_insert_page_rollback(mode: InsertPageMode) {
+        with_row_page_index(
+            fixed_pool_bytes(1),
+            async |index, meta_guard, mem_pool, mem_guard, metadata| {
+                fill_root_leaf_full(index, meta_guard).await;
+                let page_id = test_page_id(0);
+                let result = match mode {
+                    InsertPageMode::Shared => index
+                        .get_insert_page(meta_guard, &**mem_pool, mem_guard, &metadata.col, 100)
+                        .await
+                        .map(|page| page.page_id()),
+                    InsertPageMode::Exclusive => index
+                        .get_insert_page_exclusive(
+                            meta_guard,
+                            &**mem_pool,
+                            mem_guard,
+                            &metadata.col,
+                            100,
+                        )
+                        .await
+                        .map(|page| page.page_id()),
+                    InsertPageMode::Reserved => index
+                        .allocate_row_page_at(
+                            meta_guard,
+                            &**mem_pool,
+                            mem_guard,
+                            &metadata.col,
+                            100,
+                            page_id,
+                        )
+                        .await
+                        .map(|page| page.page_id()),
+                };
+                let err = result.expect_err("metadata split should fail in one-page meta pool");
+                assert_insert_page_error(err, Some(ResourceError::BufferPoolFull));
+                assert_eq!(mem_pool.allocated(), 0, "mode={mode:?}");
+                if matches!(mode, InsertPageMode::Reserved) {
+                    let page = mem_pool
+                        .allocate_page_at::<RowPage>(mem_guard, page_id)
+                        .await
+                        .expect("fixed page id should be released on rollback");
+                    mem_pool.deallocate_page(page);
+                }
+            },
+        )
+        .await;
+    }
+
+    async fn assert_free_list_io_failure(exclusive: bool) {
+        with_row_page_index(
+            64 * 1024 * 1024,
+            async |index, meta_guard, mem_pool, mem_guard, metadata| {
+                let page = index
+                    .get_insert_page_exclusive(
+                        meta_guard,
+                        &**mem_pool,
+                        mem_guard,
+                        &metadata.col,
+                        100,
+                    )
+                    .await
+                    .unwrap();
+                let page_id = page.page_id();
+                index.cache_exclusive_insert_page(page);
+                let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
+                let result = if exclusive {
+                    index
+                        .get_insert_page_exclusive(
+                            meta_guard,
+                            &failing_pool,
+                            mem_guard,
+                            &metadata.col,
+                            100,
+                        )
+                        .await
+                        .map(|page| page.page_id())
+                } else {
+                    index
+                        .get_insert_page(meta_guard, &failing_pool, mem_guard, &metadata.col, 100)
+                        .await
+                        .map(|page| page.page_id())
+                };
+                let err = result.expect_err("expected cached insert-page reload failure");
+                assert_insert_page_error(err, None);
+                assert!(
+                    index.insert_free_list.lock().is_empty(),
+                    "exclusive={exclusive}"
+                );
+            },
+        )
+        .await;
+    }
+
+    async fn assert_free_list_reuse(exclusive: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(
+            EngineConfig::default()
+                .storage_root(temp_dir.path().to_path_buf())
+                .data_buffer(
+                    EvictableBufferPoolConfig::default()
+                        .max_mem_size(64usize * 1024 * 1024)
+                        .max_file_size(128usize * 1024 * 1024),
+                )
+                .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
+        )
+        .await
+        .unwrap();
+        let metadata = make_test_metadata();
+        let meta_guard = engine.inner().pools.meta.create_base_guard();
+        let index = RowPageIndex::new(
+            engine.inner().pools.meta.clone(),
+            &meta_guard,
+            RowID::new(0),
+        )
+        .await
+        .unwrap();
+        let mem_pool = &*engine.inner().pools.mem;
+        let mem_guard = mem_pool.create_base_guard();
+        let page = if exclusive {
+            index
+                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .await
+                .unwrap()
+        } else {
+            index
+                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .await
+                .unwrap()
+                .downgrade()
+                .lock_exclusive_async()
+                .await
+                .unwrap()
+        };
+        let page_id = page.page_id();
+        index.cache_exclusive_insert_page(page);
+        assert_eq!(
+            index.insert_free_list.lock().len(),
+            1,
+            "exclusive={exclusive}"
+        );
+        let reused_page_id = if exclusive {
+            index
+                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .await
+                .unwrap()
+                .page_id()
+        } else {
+            index
+                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .await
+                .unwrap()
+                .page_id()
+        };
+        assert_eq!(reused_page_id, page_id, "exclusive={exclusive}");
+        assert!(
+            index.insert_free_list.lock().is_empty(),
+            "exclusive={exclusive}"
+        );
+    }
+
     fn first_i32_unique_index() -> StorageIndexSpec {
         StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK)
     }
@@ -2085,6 +2288,8 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect row-page-index node capacity from overlapping the integrity footer.
+    /// Expected: Header, entry, and footer offsets reserve the required checksum space.
     #[test]
     fn test_row_page_index_node_reserves_checksum_footer() {
         assert_eq!(mem::size_of::<RowPageIndexNode>(), PAGE_SIZE);
@@ -2111,123 +2316,22 @@ mod tests {
         assert_eq!(NBR_ROW_PAGE_ENTRIES_IN_LEAF, NBR_ENTRIES_IN_BRANCH);
     }
 
+    /// Purpose: Protect cached row-page reuse through shared insert-page acquisition.
+    /// Expected: Acquisition returns the cached page and removes it from the free list.
     #[test]
     fn test_row_page_index_free_list_shared() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
-            )
-            .await
-            .unwrap();
-            {
-                let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.create_base_guard();
-                let blk_idx = RowPageIndex::new(
-                    engine.inner().pools.meta.clone(),
-                    &meta_guard,
-                    RowID::new(0),
-                )
-                .await
-                .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.create_base_guard();
-                let p1 = blk_idx
-                    .get_insert_page(
-                        &meta_guard,
-                        &*engine.inner().pools.mem,
-                        &mem_guard,
-                        &metadata.col,
-                        100,
-                    )
-                    .await
-                    .expect("test insert-page allocation should succeed");
-                let pid1 = p1.page_id();
-                let p1 = p1.downgrade().lock_exclusive_async().await.unwrap();
-                blk_idx.cache_exclusive_insert_page(p1);
-                assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
-                let p2 = blk_idx
-                    .get_insert_page(
-                        &meta_guard,
-                        &*engine.inner().pools.mem,
-                        &mem_guard,
-                        &metadata.col,
-                        100,
-                    )
-                    .await
-                    .expect("test insert-page allocation should succeed");
-                assert_eq!(pid1, p2.page_id());
-                assert!(blk_idx.insert_free_list.lock().is_empty());
-            }
-            drop(engine);
-        })
+        smol::block_on(assert_free_list_reuse(false));
     }
 
+    /// Purpose: Protect cached row-page reuse through exclusive insert-page acquisition.
+    /// Expected: Exclusive acquisition returns the cached page and consumes its free-list entry.
     #[test]
     fn test_row_page_index_free_list_exclusive() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("redo_row_page_idx")),
-            )
-            .await
-            .unwrap();
-            {
-                let metadata = make_test_metadata();
-                let meta_guard = engine.inner().pools.meta.create_base_guard();
-                let blk_idx = RowPageIndex::new(
-                    engine.inner().pools.meta.clone(),
-                    &meta_guard,
-                    RowID::new(0),
-                )
-                .await
-                .expect("test row-page-index construction should succeed");
-                let mem_guard = engine.inner().pools.mem.create_base_guard();
-                let p1 = blk_idx
-                    .get_insert_page_exclusive(
-                        &meta_guard,
-                        &*engine.inner().pools.mem,
-                        &mem_guard,
-                        &metadata.col,
-                        100,
-                    )
-                    .await
-                    .expect("test insert-page allocation should succeed");
-                let pid1 = p1.page_id();
-                blk_idx.cache_exclusive_insert_page(p1);
-                assert_eq!(blk_idx.insert_free_list.lock().len(), 1);
-                let p2 = blk_idx
-                    .get_insert_page_exclusive(
-                        &meta_guard,
-                        &*engine.inner().pools.mem,
-                        &mem_guard,
-                        &metadata.col,
-                        100,
-                    )
-                    .await
-                    .expect("test insert-page allocation should succeed");
-                assert_eq!(pid1, p2.page_id());
-                assert!(blk_idx.insert_free_list.lock().is_empty());
-            }
-            drop(engine);
-        })
+        smol::block_on(assert_free_list_reuse(true));
     }
 
+    /// Purpose: Protect shared and exclusive free-list paths against recycled page identifiers.
+    /// Expected: Stale generations are discarded without returning the replacement page.
     #[test]
     fn test_row_page_index_free_list_skips_recycled_page_versions() {
         smol::block_on(async {
@@ -2300,6 +2404,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect destruction of empty indexes at initial and advanced row-id origins.
+    /// Expected: The empty root is reclaimed regardless of its starting row ID.
     #[test]
     fn test_row_page_index_destroy_empty_reclaims_root() {
         smol::block_on(async {
@@ -2322,6 +2428,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect destruction of a populated row-page index and its owned row pages.
+    /// Expected: Both index and memory pools release every page owned by the destroyed index.
     #[test]
     fn test_row_page_index_destroy_reclaims_leaf_row_pages_and_root() {
         smol::block_on(async {
@@ -2359,6 +2467,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect destruction prerequisites for nonempty indexes and mismatched pivots.
+    /// Expected: Invalid destruction panics before any index or row page is deallocated.
     #[test]
     fn test_row_page_index_destroy_rejects_invalid_state_before_deallocation() {
         smol::block_on(async {
@@ -2408,193 +2518,43 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shared insert-page acquisition when a cached page cannot be reloaded.
+    /// Expected: The index-access error retains the underlying I/O failure.
     #[test]
     fn test_get_insert_page_returns_error_on_free_list_io_failure() {
-        smol::block_on(async {
-            let meta_pool = owned_index_pool(64 * 1024 * 1024);
-            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-
-            let page_guard = blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
-                .await
-                .expect("test insert-page allocation should succeed");
-            let page_id = page_guard.page_id();
-            blk_idx.cache_exclusive_insert_page(page_guard);
-
-            let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
-            let res = blk_idx
-                .get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata.col, 100)
-                .await;
-            let err = match res {
-                Ok(_) => panic!("expected free-list page reload failure"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
-            assert!(err.downcast_ref::<IoError>().is_some());
-        });
+        smol::block_on(assert_free_list_io_failure(false));
     }
 
+    /// Purpose: Protect exclusive insert-page acquisition when a cached page cannot be reloaded.
+    /// Expected: The error retains its I/O cause and consumes the failed free-list entry.
     #[test]
     fn test_get_insert_page_exclusive_propagates_free_list_io_failure() {
-        smol::block_on(async {
-            let meta_pool = owned_index_pool(64 * 1024 * 1024);
-            let mem_pool = owned_mem_pool(64 * 1024 * 1024);
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-
-            let page_guard = blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
-                .await
-                .expect("test insert-page allocation should succeed");
-            let failed_page_id = page_guard.page_id();
-            blk_idx.cache_exclusive_insert_page(page_guard);
-
-            let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), failed_page_id);
-            let res = blk_idx
-                .get_insert_page_exclusive(
-                    &meta_guard,
-                    &failing_pool,
-                    &mem_guard,
-                    &metadata.col,
-                    100,
-                )
-                .await;
-            let err = match res {
-                Ok(_) => panic!("expected exclusive free-list page reload failure"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
-            assert!(err.downcast_ref::<IoError>().is_some());
-            assert!(blk_idx.insert_free_list.lock().is_empty());
-        });
+        smol::block_on(assert_free_list_io_failure(true));
     }
 
+    /// Purpose: Protect shared insert-page allocation when index growth exhausts metadata capacity.
+    /// Expected: The capacity error is preserved and the unpublished row page is reclaimed.
     #[test]
     fn test_get_insert_page_reclaims_allocated_row_page_on_insert_error() {
-        smol::block_on(async {
-            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
-            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-            fill_root_leaf_full(&blk_idx, &meta_guard).await;
-
-            let err = match blk_idx
-                .get_insert_page(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
-                .await
-            {
-                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
-            assert_eq!(
-                err.downcast_ref::<ResourceError>().copied(),
-                Some(ResourceError::BufferPoolFull)
-            );
-            assert_eq!(mem_pool.allocated(), 0);
-        });
+        smol::block_on(assert_insert_page_rollback(InsertPageMode::Shared));
     }
 
+    /// Purpose: Protect exclusive insert-page allocation when index growth exhausts metadata capacity.
+    /// Expected: The capacity error is preserved and the exclusively allocated row page is reclaimed.
     #[test]
     fn test_get_insert_page_exclusive_reclaims_allocated_row_page_on_insert_error() {
-        smol::block_on(async {
-            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
-            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-            fill_root_leaf_full(&blk_idx, &meta_guard).await;
-
-            let err = match blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
-                .await
-            {
-                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
-            assert_eq!(
-                err.downcast_ref::<ResourceError>().copied(),
-                Some(ResourceError::BufferPoolFull)
-            );
-            assert_eq!(mem_pool.allocated(), 0);
-        });
+        smol::block_on(assert_insert_page_rollback(InsertPageMode::Exclusive));
     }
 
+    /// Purpose: Protect allocation rollback for a caller-selected row-page identifier.
+    /// Expected: Failed index growth releases the reservation so the same page ID can be allocated again.
     #[test]
     fn test_allocate_row_page_at_reclaims_reserved_page_id_on_insert_error() {
-        smol::block_on(async {
-            let meta_pool = owned_index_pool(fixed_pool_bytes(1));
-            let mem_pool = owned_mem_pool(fixed_pool_bytes(1));
-            let meta_guard = (*meta_pool).create_base_guard();
-            let mem_guard = (*mem_pool).create_base_guard();
-            let metadata = make_test_metadata();
-            let blk_idx = RowPageIndex::new(meta_pool.guard(), &meta_guard, RowID::new(0))
-                .await
-                .expect("test row-page-index construction should succeed");
-            fill_root_leaf_full(&blk_idx, &meta_guard).await;
-
-            let page_id = test_page_id(0);
-            let err = match blk_idx
-                .allocate_row_page_at(
-                    &meta_guard,
-                    &*mem_pool,
-                    &mem_guard,
-                    &metadata.col,
-                    100,
-                    page_id,
-                )
-                .await
-            {
-                Ok(_) => panic!("metadata split should fail in one-page meta pool"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(err) = err else {
-                panic!("expected Runtime error, got {err:?}");
-            };
-            assert_eq!(err.current_context(), &RuntimeError::IndexAccess);
-            assert_eq!(
-                err.downcast_ref::<ResourceError>().copied(),
-                Some(ResourceError::BufferPoolFull)
-            );
-            assert_eq!(mem_pool.allocated(), 0);
-
-            let page = mem_pool
-                .allocate_page_at::<RowPage>(&mem_guard, page_id)
-                .await
-                .expect("fixed page id should be released on rollback");
-            mem_pool.deallocate_page(page);
-        });
+        smol::block_on(assert_insert_page_rollback(InsertPageMode::Reserved));
     }
 
+    /// Purpose: Protect shared cursor traversal over allocated row pages.
+    /// Expected: The cursor yields leaf guards and visits the expected number of leaves.
     #[test]
     fn test_row_page_index_cursor_shared() {
         smol::block_on(async {
@@ -2652,6 +2612,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect cursor traversal after row-page entries overflow the root leaf.
+    /// Expected: Traversal follows both root children in order, preserves their ranges, and reaches exhaustion.
     #[test]
     fn test_row_page_index_cursor_two_level_tree() {
         smol::block_on(async {
@@ -2722,6 +2684,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect prefix pruning and subsequent append after an index becomes empty.
+    /// Expected: Invalid page order is rejected, pruned rows disappear, and appends resume at the retained boundary.
     #[test]
     fn test_prune_checkpoint_prefix_in_root_leaf_and_reset_empty_root() {
         smol::block_on(async {
@@ -2787,6 +2751,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect prefix pruning when a two-level index contracts to a leaf.
+    /// Expected: Obsolete nodes are reclaimed, the root collapses, and retained rows remain addressable.
     #[test]
     fn test_prune_checkpoint_prefix_reclaims_leaf_and_collapses_root() {
         smol::block_on(async {
@@ -2829,6 +2795,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect pruning across a complete branch and part of the next branch.
+    /// Expected: Pruning reclaims obsolete levels and preserves routing at the new prefix boundary.
     #[test]
     fn test_prune_checkpoint_prefix_across_multiple_branch_levels() {
         smol::block_on(async {
@@ -2932,6 +2900,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect row-page lookup across many appended ranges and the end boundary.
+    /// Expected: Each range resolves to its assigned page and the exclusive end remains absent.
     #[test]
     fn test_row_page_index_search() {
         smol::block_on(async {
@@ -2974,6 +2944,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect height growth when appended pages fill leaves and the root branch.
+    /// Expected: Leaf overflow grows a branch root and forced branch overflow adds another level.
     #[test]
     fn test_row_page_index_split() {
         smol::block_on(async {
@@ -3038,6 +3010,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect create-page redo when a newly allocated page is later reused from the free list.
+    /// Expected: Creation assigns a commit timestamp and reuse does not emit another create-page record.
     #[test]
     fn test_row_page_index_inline_redo_ctx_commits_create_row_page_once() {
         smol::block_on(async {
@@ -3122,6 +3096,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect published row-page state when create-page redo encounters a fatal failure.
+    /// Expected: The fatal cause is preserved and the published page remains allocated and initialized.
     #[test]
     fn test_row_page_index_redo_failure_keeps_published_page_initialized() {
         smol::block_on(async {
@@ -3199,6 +3175,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect create-page redo ordering across concurrent append tasks and leaf overflow.
+    /// Expected: Redo records describe every appended page in contiguous row-range order.
     #[test]
     fn test_row_page_index_create_row_page_redo_follows_append_order() {
         smol::block_on(async {
@@ -3280,6 +3258,10 @@ mod tests {
                 create_row_page_logs += 1;
             }
             assert_eq!(create_row_page_logs, NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64);
+            assert_eq!(
+                expected_start,
+                RowID::from(NBR_ROW_PAGE_ENTRIES_IN_LEAF + 64)
+            );
         })
     }
 }

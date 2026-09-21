@@ -300,6 +300,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect cursor resumption where an exact fence key precedes its strict successor.
+    /// Expected: Crossing the branch boundary visits the leaf containing the exact fence key.
     #[test]
     fn test_btree_cursor_resumes_with_raw_upper_fence_before_strict_successor() {
         smol::block_on(async {
@@ -364,6 +366,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect compactor resumption after exhausting a parent at an exact fence boundary.
+    /// Expected: The saved raw fence resumes at the first leaf of the following branch.
     #[test]
     fn test_btree_compactor_parent_done_buffers_raw_upper_fence() {
         smol::block_on(async {

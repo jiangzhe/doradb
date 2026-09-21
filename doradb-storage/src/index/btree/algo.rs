@@ -567,6 +567,24 @@ mod tests {
         node
     }
 
+    fn assert_packed_capacity_boundary<V: BTreeValue + Copy>(entries: &[PackedNodeEntry<'_, V>]) {
+        let first_overflow = (1..=entries.len())
+            .find(|&count| !scratch_node_fits::<V>(&[], None, entries, count))
+            .expect("wide-key fixture must overflow a scratch node");
+        assert!(first_overflow > 1);
+        assert!(
+            packed_node_fits::<V>(&[], None, entries, first_overflow - 1),
+            "last fitting scratch-node prefix: count={}",
+            first_overflow - 1
+        );
+        assert!(
+            !packed_node_fits::<V>(&[], None, entries, first_overflow),
+            "first overflowing scratch-node prefix: count={first_overflow}"
+        );
+    }
+
+    /// Purpose: Protect upper-fence selection when packing part or all of a sibling run.
+    /// Expected: A partial run ends at the next key, while a complete run has no next-key fence.
     #[test]
     fn test_packed_sibling_upper_fence_selects_next_lower_fence() {
         let entries = [
@@ -587,6 +605,8 @@ mod tests {
         assert_eq!(packed_sibling_upper_fence(&entries, 2), None);
     }
 
+    /// Purpose: Check packed capacity estimates for valued and key-only nodes with varied fences.
+    /// Expected: Estimates agree with scratch insertion, including both sides of the capacity boundary.
     #[test]
     fn test_packed_node_estimate_matches_scratch_node() {
         let u64_entries = [
@@ -632,8 +652,35 @@ mod tests {
             &nil_entries,
             nil_entries.len(),
         );
+
+        let keys = (0u64..64)
+            .map(|i| {
+                let mut key = vec![0u8; 2048];
+                key[..8].copy_from_slice(&i.to_be_bytes());
+                key
+            })
+            .collect::<Vec<_>>();
+        let valued = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| PackedNodeEntry {
+                key: key.as_slice(),
+                value: BTreeU64::from(i as u64),
+            })
+            .collect::<Vec<_>>();
+        assert_packed_capacity_boundary(&valued);
+        let key_only = keys
+            .iter()
+            .map(|key| PackedNodeEntry {
+                key: key.as_slice(),
+                value: BTreeNil,
+            })
+            .collect::<Vec<_>>();
+        assert_packed_capacity_boundary(&key_only);
     }
 
+    /// Purpose: Protect capacity estimation when fence prefixes cross the inline-storage boundary.
+    /// Expected: Both prefix layouts agree with the fit of a constructed scratch node.
     #[test]
     fn test_packed_node_estimate_tracks_prefix_shrink() {
         let lower_fence = b"shared-prefix-long-0001";
@@ -671,6 +718,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect fence fitting when shared prefixes make a conservative estimate too large.
+    /// Expected: Prefix-compressed fences that fit a real node are accepted.
     #[test]
     fn test_fences_fit_uses_prefix_aware_estimator() {
         let prefix = vec![b'p'; 16];
@@ -716,8 +765,10 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect fixed-entry packing with finite prefix-sharing fences.
+    /// Expected: The packed node retains its entries, finite upper fence, and shared prefix.
     #[test]
-    fn test_plan_sibling_node_uses_finite_fence_common_prefix() {
+    fn test_pack_fixed_entries_uses_finite_fence_common_prefix() {
         let entries = [
             PackedNodeEntry {
                 key: b"prefix-0001",
@@ -732,18 +783,6 @@ mod tests {
                 value: BTreeU64::from(3),
             },
         ];
-
-        let result = plan_sibling_node(
-            PackedNodePlanParams {
-                lower_fence: b"prefix-0001",
-                upper_fence: None,
-                min_slots: 1,
-            },
-            &entries,
-        );
-
-        assert_eq!(result.packed, entries.len());
-        assert_eq!(result.upper_fence, None);
 
         let mut finite_node = BTreeNodeBox::alloc(
             0,
@@ -768,10 +807,17 @@ mod tests {
 
         assert_eq!(result.upper_fence, Some(b"prefix-0004".as_slice()));
         assert_eq!(finite_node.common_prefix(), b"prefix-000");
+        assert_eq!(finite_node.count(), 2);
+        for (idx, entry) in entries[..2].iter().enumerate() {
+            assert_eq!(finite_node.key(idx).as_bytes(), entry.key);
+            assert_eq!(finite_node.value::<BTreeU64>(idx), entry.value);
+        }
     }
 
+    /// Purpose: Protect open-ended and explicitly bounded plans when the entire sibling run fits.
+    /// Expected: Each plan includes every entry and preserves the caller's requested extent.
     #[test]
-    fn test_plan_sibling_node_uses_supplied_run_upper_fence() {
+    fn test_plan_sibling_node_preserves_run_upper_fence() {
         let entries = [
             PackedNodeEntry {
                 key: b"prefix-0001",
@@ -781,21 +827,30 @@ mod tests {
                 key: b"prefix-0002",
                 value: BTreeU64::from(2),
             },
-        ];
-
-        let result = plan_sibling_node(
-            PackedNodePlanParams {
-                lower_fence: b"prefix-0001",
-                upper_fence: Some(b"prefix-0003"),
-                min_slots: 1,
+            PackedNodeEntry {
+                key: b"prefix-0003",
+                value: BTreeU64::from(3),
             },
-            &entries,
-        );
-
-        assert_eq!(result.packed, entries.len());
-        assert_eq!(result.upper_fence, Some(b"prefix-0003".as_slice()));
+        ];
+        for (case, count, upper_fence) in [
+            ("open-ended", 3, None),
+            ("supplied upper fence", 2, Some(b"prefix-0003".as_slice())),
+        ] {
+            let result = plan_sibling_node(
+                PackedNodePlanParams {
+                    lower_fence: b"prefix-0001",
+                    upper_fence,
+                    min_slots: 1,
+                },
+                &entries[..count],
+            );
+            assert_eq!(result.packed, count, "case={case}");
+            assert_eq!(result.upper_fence, upper_fence, "case={case}");
+        }
     }
 
+    /// Purpose: Reject a sibling plan whose required key and fences cannot fit in a node.
+    /// Expected: Planning reports the packing invariant violation instead of accepting overflow.
     #[test]
     #[should_panic(expected = "B-tree pack invariant violated")]
     fn test_plan_sibling_node_accounts_for_upper_fence_capacity() {
@@ -815,6 +870,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect merge planning across no-progress, partial, full, and empty-sibling cases.
+    /// Expected: The plan respects the space budget and identifies how much of the sibling fits.
     #[test]
     fn test_plan_memtree_sibling_merge_outcomes() {
         let left = leaf_node(&[b"aa01"]);
@@ -856,6 +913,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect rebuilding a node from ordered ranges spanning sibling nodes.
+    /// Expected: Packed keys, values, and effective space match a manual reconstruction.
     #[test]
     fn test_pack_node_ranges_matches_manual_rebuild() {
         let left = leaf_node(&[b"aa01", b"aa02"]);
