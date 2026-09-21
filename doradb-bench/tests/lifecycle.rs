@@ -204,6 +204,116 @@ mod tests {
         assert_eq!(counters.expected_outcomes.write_conflict, 0);
     }
 
+    #[track_caller]
+    fn assert_recovery_fixture(
+        name: &str,
+        index: Option<&str>,
+        insert: Option<&str>,
+        checkpoint: bool,
+        stats: bool,
+    ) {
+        use doradb_bench::measurement::InternalMetricKind;
+        let temp = TempDir::new().unwrap();
+        let rows = if insert.is_none() {
+            0
+        } else if checkpoint {
+            // Keep enough pages for both a checkpointed prefix and a hot suffix.
+            4096
+        } else {
+            // Exercise multiple transaction batches with a small semantic fixture.
+            128
+        };
+        let mut phases = String::new();
+        if let Some(index) = index {
+            phases.push_str(&format!(
+                "[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n"
+            ));
+        }
+        if let Some(insert) = insert {
+            phases.push_str(&format!("[[phase]]\nworkload = {{ type = '{insert}', num = {rows}, threads = 1, sessions = 1, batch_size = 100, value_size = '128 B' }}\n"));
+        }
+        if checkpoint {
+            phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', max_rows = 2048 }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
+        }
+        // Double quotes also select durable configuration in the shared invocation helper.
+        phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = \"recovery\", include_stats = {stats} }}\n"));
+        let (root, result) = execute_plan(&temp, name, &phases);
+        let run = &result.measured_runs[0];
+        let Some(WorkloadMetrics::Recovery {
+            report,
+            verification,
+        }) = &run.workload_metrics
+        else {
+            panic!("missing recovery metrics");
+        };
+        assert_eq!(
+            run.counters,
+            WorkloadCounters {
+                operations: 1,
+                ..WorkloadCounters::default()
+            }
+        );
+        assert_eq!(run.latency.sample_count, 1);
+        assert_eq!(run.latency.sum_nanos, run.elapsed_nanos);
+        assert_eq!(run.latency.unit, LatencyUnit::EngineRecovery);
+        assert_eq!(verification.table_count, u64::from(index.is_some()));
+        let inserted = result
+            .prepare_phases
+            .iter()
+            .map(|phase| phase.counters.inserted_rows)
+            .sum::<u64>();
+        assert_eq!(inserted, rows);
+        assert_eq!(verification.verified_rows, inserted);
+        assert_eq!(
+            verification.index_verified,
+            index.is_some_and(|index| index != "none")
+        );
+        assert_eq!(verification.fingerprint.len(), 64);
+        assert!(!report.saturated);
+        assert!(report.redo.consumed_bytes >= report.redo.validated_payload_bytes);
+        if insert.is_some() {
+            assert_eq!(report.work.user_row_ops_seen, inserted);
+            assert_eq!(
+                report.work.user_row_ops_seen,
+                report.work.user_row_ops_applied + report.work.user_row_ops_skipped
+            );
+            assert!(report.work.hot_inserts > 0);
+            assert!(report.redo.transactions_decoded > 0);
+            if checkpoint {
+                assert!(report.work.user_row_ops_skipped > 0);
+                assert!(report.work.hot_inserts < inserted);
+            } else {
+                assert_eq!(report.work.hot_inserts, inserted);
+                assert_eq!(report.work.user_row_ops_skipped, 0);
+            }
+            assert_eq!(
+                report.work.index_entries_inserted,
+                if verification.index_verified {
+                    inserted
+                } else {
+                    0
+                }
+            );
+        }
+        assert_eq!(run.internal_metrics.is_empty(), !stats);
+        assert!(
+            !run.internal_metrics
+                .iter()
+                .any(|metric| metric.kind == InternalMetricKind::CounterDelta)
+        );
+        if stats {
+            assert!(
+                run.internal_metrics
+                    .iter()
+                    .any(|metric| metric.kind == InternalMetricKind::CumulativeCounter)
+            );
+        }
+        let encoded = toml::to_string_pretty(&result).unwrap();
+        let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded, result);
+        assert!(root.exists());
+    }
+
     fn recovery_profiler_case(corrupt_reopen: bool) {
         let temp = TempDir::new().unwrap();
         let source = temp.path().join("pause.toml");
@@ -930,125 +1040,72 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(prefix_pages > 0 && suffix_pages > 0);
     }
 
-    /// Purpose: Validate recovered state across supported fixture shapes and storage
-    /// placements.
-    /// Expected: Reports preserve verified contents, index coverage, and recovery accounting
-    /// while retaining the root.
+    /// Purpose: Validate recovery of a database without user tables.
+    /// Expected: Recovery reports an empty fixture and retains the storage root.
     #[test]
-    fn recovery_verifies_empty_loaded_indexed_random_and_checkpoint_fixtures() {
-        use doradb_bench::measurement::InternalMetricKind;
-        let temp = TempDir::new().unwrap();
-        for (name, index, insert, checkpoint, stats) in [
-            ("empty", None, None, false, false),
-            ("empty-table", Some("none"), None, false, true),
-            ("empty-index", Some("unique"), None, false, false),
-            ("heap", Some("none"), Some("insert-seq"), false, true),
-            ("unique", Some("unique"), Some("insert-seq"), false, true),
-            (
-                "duplicates",
-                Some("non-unique"),
-                Some("insert-rand"),
-                false,
-                true,
-            ),
-            (
-                "random-unique",
-                Some("unique"),
-                Some("insert-rand"),
-                false,
-                false,
-            ),
-            ("checkpoint", Some("none"), Some("insert-seq"), true, true),
-        ] {
-            let mut phases = String::new();
-            if let Some(index) = index {
-                phases.push_str(&format!(
-                    "[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n"
-                ));
-            }
-            if let Some(insert) = insert {
-                phases.push_str(&format!("[[phase]]\nworkload = {{ type = '{insert}', num = 4096, threads = 1, sessions = 1, batch_size = 100, value_size = '128 B' }}\n"));
-            }
-            if checkpoint {
-                phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', max_rows = 2048 }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
-            }
-            // Double quotes also select durable configuration in the shared invocation helper.
-            phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = \"recovery\", include_stats = {stats} }}\n"));
-            let (root, result) = execute_plan(&temp, name, &phases);
-            let run = &result.measured_runs[0];
-            let Some(WorkloadMetrics::Recovery {
-                report,
-                verification,
-            }) = &run.workload_metrics
-            else {
-                panic!("missing recovery metrics");
-            };
-            assert_eq!(
-                run.counters,
-                WorkloadCounters {
-                    operations: 1,
-                    ..WorkloadCounters::default()
-                }
-            );
-            assert_eq!(run.latency.sample_count, 1);
-            assert_eq!(run.latency.sum_nanos, run.elapsed_nanos);
-            assert_eq!(run.latency.unit, LatencyUnit::EngineRecovery);
-            assert_eq!(verification.table_count, u64::from(index.is_some()));
-            let inserted = result
-                .prepare_phases
-                .iter()
-                .map(|phase| phase.counters.inserted_rows)
-                .sum::<u64>();
-            assert_eq!(verification.verified_rows, inserted);
-            assert_eq!(
-                verification.index_verified,
-                index.is_some_and(|index| index != "none")
-            );
-            assert_eq!(verification.fingerprint.len(), 64);
-            assert!(!report.saturated);
-            assert!(report.redo.consumed_bytes >= report.redo.validated_payload_bytes);
-            if insert.is_some() {
-                assert_eq!(report.work.user_row_ops_seen, inserted);
-                assert_eq!(
-                    report.work.user_row_ops_seen,
-                    report.work.user_row_ops_applied + report.work.user_row_ops_skipped
-                );
-                assert!(report.work.hot_inserts > 0);
-                assert!(report.redo.transactions_decoded > 0);
-                if checkpoint {
-                    assert!(report.work.user_row_ops_skipped > 0);
-                    assert!(report.work.hot_inserts < inserted);
-                } else {
-                    assert_eq!(report.work.hot_inserts, inserted);
-                    assert_eq!(report.work.user_row_ops_skipped, 0);
-                }
-                assert_eq!(
-                    report.work.index_entries_inserted,
-                    if verification.index_verified {
-                        inserted
-                    } else {
-                        0
-                    }
-                );
-            }
-            assert_eq!(run.internal_metrics.is_empty(), !stats);
-            assert!(
-                !run.internal_metrics
-                    .iter()
-                    .any(|metric| metric.kind == InternalMetricKind::CounterDelta)
-            );
-            if stats {
-                assert!(
-                    run.internal_metrics
-                        .iter()
-                        .any(|metric| metric.kind == InternalMetricKind::CumulativeCounter)
-                );
-            }
-            let encoded = toml::to_string_pretty(&result).unwrap();
-            let decoded: InvocationReport = toml::from_str(&encoded).unwrap();
-            assert_eq!(decoded, result);
-            assert!(root.exists());
-        }
+    fn recovery_verifies_empty_database() {
+        assert_recovery_fixture("empty", None, None, false, false);
+    }
+
+    /// Purpose: Preserve an empty heap table across recovery with statistics enabled.
+    /// Expected: Recovery verifies the table identity and empty contents and reports cumulative statistics.
+    #[test]
+    fn recovery_verifies_empty_heap_table() {
+        assert_recovery_fixture("empty-table", Some("none"), None, false, true);
+    }
+
+    /// Purpose: Preserve an empty unique index across recovery.
+    /// Expected: Recovery verifies the table and index contents without collecting optional statistics.
+    #[test]
+    fn recovery_verifies_empty_unique_index() {
+        assert_recovery_fixture("empty-index", Some("unique"), None, false, false);
+    }
+
+    /// Purpose: Recover a populated heap table from durable log records.
+    /// Expected: Every inserted row is replayed and the recovered contents match the original fixture.
+    #[test]
+    fn recovery_verifies_loaded_heap() {
+        assert_recovery_fixture("heap", Some("none"), Some("insert-seq"), false, true);
+    }
+
+    /// Purpose: Rebuild a unique index over sequentially inserted rows during recovery.
+    /// Expected: Recovery replays every row and reconstructs index entries matching the table contents.
+    #[test]
+    fn recovery_verifies_sequential_unique_index() {
+        assert_recovery_fixture("unique", Some("unique"), Some("insert-seq"), false, true);
+    }
+
+    /// Purpose: Recover a non-unique index populated with random keys and duplicates.
+    /// Expected: Replayed rows and rebuilt index entries preserve the fixture contents and multiplicity.
+    #[test]
+    fn recovery_verifies_random_non_unique_index() {
+        assert_recovery_fixture(
+            "duplicates",
+            Some("non-unique"),
+            Some("insert-rand"),
+            false,
+            true,
+        );
+    }
+
+    /// Purpose: Rebuild a unique index populated in random key order during recovery.
+    /// Expected: Recovery preserves every row and matching index contents without optional statistics.
+    #[test]
+    fn recovery_verifies_random_unique_index() {
+        assert_recovery_fixture(
+            "random-unique",
+            Some("unique"),
+            Some("insert-rand"),
+            false,
+            false,
+        );
+    }
+
+    /// Purpose: Recover a table containing a checkpointed prefix and a hot suffix.
+    /// Expected: Recovery skips checkpointed rows, replays the hot suffix, and preserves all contents.
+    #[test]
+    fn recovery_verifies_checkpointed_prefix_and_hot_suffix() {
+        assert_recovery_fixture("checkpoint", Some("none"), Some("insert-seq"), true, true);
     }
 
     /// Purpose: Require durable logging before admitting a recovery benchmark.
