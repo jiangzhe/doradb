@@ -47,6 +47,8 @@ mod tests {
     use crate::bitmap::bitmap_required_units;
     use crate::id::PageID;
 
+    /// Purpose: Track inserted row slots across bitmap word boundaries.
+    /// Expected: Only recorded slots are marked, repeated inserts are distinguished, and page identity is retained.
     #[test]
     fn test_replay_bitmap_tracks_sparse_slots() {
         let id = PageID::new(7);

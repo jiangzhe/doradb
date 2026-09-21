@@ -1475,6 +1475,11 @@ mod tests {
     const CORRUPTION_RECOVERY_LOG_BLOCK_SIZE: usize = 4096;
     const CORRUPTION_RECOVERY_LOG_FILE_MAX_SIZE: usize = 128 * 1024;
 
+    enum CatalogCheckpointOrder {
+        BeforeTable,
+        AfterTable,
+    }
+
     // Keep the runtime carrier assertion separate from the public table error contract.
     fn assert_table_runtime_data_integrity(
         err: RuntimeOrFatalError,
@@ -1554,6 +1559,17 @@ mod tests {
             work.catalog_row_ops_applied + work.catalog_row_ops_skipped
         );
         assert!(redo.consumed_bytes >= redo.validated_payload_bytes);
+    }
+
+    fn recovery_engine_config(main_dir: impl Into<PathBuf>, log_file_stem: &str) -> EngineConfig {
+        EngineConfig::default()
+            .storage_root(main_dir)
+            .data_buffer(
+                EvictableBufferPoolConfig::default()
+                    .max_mem_size(64usize * 1024 * 1024)
+                    .max_file_size(128usize * 1024 * 1024),
+            )
+            .trx(TrxSysConfig::default().log_file_stem(log_file_stem))
     }
 
     fn lightweight_recovery_engine_config(
@@ -2128,6 +2144,131 @@ mod tests {
         drop(table);
     }
 
+    async fn prepare_checkpointed_unique_row(engine: &Engine) -> (TableID, RowID) {
+        let mut session = engine.new_session().unwrap();
+        let table_id = session
+            .create_table(
+                StorageTableSpec::new(vec![
+                    StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                ]),
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
+                )],
+            )
+            .await
+            .unwrap()
+            .table_id();
+        session.checkpoint_catalog().await.unwrap();
+        let catalog_replay_start_ts = engine
+            .inner()
+            .core
+            .catalog()
+            .storage
+            .checkpoint_snapshot()
+            .catalog_replay_start_ts;
+        let mut trx = session.begin_trx().unwrap();
+        let row_id = trx
+            .table_insert_mvcc(table_id, vec![Val::from(7u32), Val::from("cold-row")])
+            .await
+            .unwrap();
+        trx.commit().await.unwrap();
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        let mut checkpoint_session = engine.new_session().unwrap();
+        assert_checkpoint_published(&mut checkpoint_session, table_id).await;
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+        let root = table.file().active_root_unchecked();
+        assert!(root.heap_redo_start_ts > catalog_replay_start_ts);
+        assert!(root.pivot_row_id > row_id);
+        (table_id, row_id)
+    }
+
+    async fn assert_recovered_unique_tiers(
+        engine: &Engine,
+        table_id: TableID,
+        key: &SelectKey,
+        cold_row_id: RowID,
+        hot_row_id: Option<RowID>,
+    ) {
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+        let session = engine.new_session().unwrap();
+        let pool_guards = session.pool_guards();
+        let layout = table.layout_snapshot();
+        let index = layout.secondary_index(key.index_slot).unwrap();
+        let root = table
+            .file()
+            .active_root_unchecked()
+            .secondary_index_root(key.index_slot);
+        let disk = index
+            .disk_runtime()
+            .open_unique_at(root, pool_guards.disk_guard())
+            .unwrap();
+        assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
+        assert_eq!(
+            index
+                .unique_mem()
+                .unwrap()
+                .bind(pool_guards.index_guard())
+                .lookup(&key.vals, MIN_SNAPSHOT_TS)
+                .await
+                .unwrap(),
+            hot_row_id.map(|row_id| (row_id, false)),
+            "memory index must contain only replayed hot rows"
+        );
+        assert_eq!(
+            index
+                .bind_unique_unchecked(&pool_guards, root)
+                .unwrap()
+                .lookup(&key.vals, MIN_SNAPSHOT_TS)
+                .await
+                .unwrap(),
+            Some((hot_row_id.unwrap_or(cold_row_id), false)),
+            "combined lookup must prefer the hot replacement"
+        );
+    }
+
+    async fn prepare_index_recovery(
+        log_file_stem: &str,
+        indexes: Vec<StorageIndexSpec>,
+        checkpoint_order: CatalogCheckpointOrder,
+    ) -> (TempDir, EngineConfig, Engine, TableID) {
+        let dir = TempDir::new().unwrap();
+        let config = lightweight_recovery_engine_config(dir.path(), log_file_stem);
+        let engine = Engine::bootstrap(config.clone()).await.unwrap();
+        if matches!(checkpoint_order, CatalogCheckpointOrder::BeforeTable) {
+            engine
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
+                .await
+                .unwrap();
+        }
+        let table_id = create_index_ddl_base_table(&engine, indexes).await;
+        if matches!(checkpoint_order, CatalogCheckpointOrder::AfterTable) {
+            engine
+                .new_session()
+                .unwrap()
+                .checkpoint_catalog()
+                .await
+                .unwrap();
+        }
+        (dir, config, engine, table_id)
+    }
+
+    async fn restart_and_assert_index_state(
+        engine: Engine,
+        config: EngineConfig,
+        table_id: TableID,
+        index_slot_count: u32,
+        index_one_active: bool,
+    ) {
+        drop(engine);
+        let recovered = Engine::bootstrap(config).await.unwrap();
+        assert_recovered_index_state(&recovered, table_id, index_slot_count, index_one_active)
+            .await;
+    }
+
     async fn assert_recovered_index_state(
         engine: &Engine,
         table_id: TableID,
@@ -2137,12 +2278,19 @@ mod tests {
         let table = engine.inner().core.catalog().get_table(table_id).unwrap();
         let metadata = table.metadata();
         assert_eq!(metadata.idx.index_slot_count_u32(), index_slot_count);
+        assert_eq!(metadata.idx.next_index_id(), u64::from(index_slot_count));
+        let mut expected_indexes = vec![IndexRef::new(IndexID::new(0), IndexSlot::new(0))];
+        if index_one_active {
+            expected_indexes.push(IndexRef::new(IndexID::new(1), IndexSlot::new(1)));
+        }
         assert_eq!(
             metadata
                 .idx
-                .index_spec(crate::catalog::IndexSlot::new(1))
-                .is_some(),
-            index_one_active
+                .active_indexes()
+                .map(|(_, index)| index.index)
+                .collect::<Vec<_>>(),
+            expected_indexes,
+            "runtime index identities"
         );
 
         let session = engine.new_session().unwrap();
@@ -2157,6 +2305,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(table_obj.index_slot_count, index_slot_count);
+        assert_eq!(table_obj.next_index_id, u64::from(index_slot_count));
         let indexes = engine
             .inner()
             .core
@@ -2166,11 +2315,11 @@ mod tests {
             .list_uncommitted_by_table_id(&session.pool_guards(), table_id)
             .await
             .unwrap();
+        let mut catalog_indexes: Vec<_> = indexes.iter().map(|index| index.index).collect();
+        catalog_indexes.sort_unstable_by_key(|index| index.id().get());
         assert_eq!(
-            indexes
-                .iter()
-                .any(|index| index.index == IndexRef::new(IndexID::new(1), IndexSlot::new(1))),
-            index_one_active
+            catalog_indexes, expected_indexes,
+            "catalog index identities"
         );
         drop(session);
         drop(table);
@@ -2258,6 +2407,8 @@ mod tests {
         assert!(report.contains(&format!("page_id={page_id}")), "{report}");
     }
 
+    /// Purpose: Filter heap redo at the published row pivot and replay timestamp boundary.
+    /// Expected: Rows below the pivot or older than the replay floor are skipped, while equality is eligible.
     #[test]
     fn test_heap_replay_requires_row_at_or_above_published_pivot() {
         let pivot_row_id = RowID::new(100);
@@ -2282,6 +2433,8 @@ mod tests {
         ));
     }
 
+    /// Purpose: Classify catalog-style keyed redo incorrectly addressed to a user table.
+    /// Expected: The invalid-payload report identifies the operation and row context without inventing a page identity.
     #[test]
     fn test_invalid_user_table_keyed_redo_reports_invalid_payload() {
         let table_id = TableID::new(42);
@@ -2327,6 +2480,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Determine the table replay floor independently of root publication time.
+    /// Expected: The earlier heap or deletion boundary controls replay even when the root timestamp precedes both.
     #[test]
     fn test_recovery_table_state_replay_start_uses_heap_and_deletion_floor() {
         let heap_first = TableReplayBounds {
@@ -2344,6 +2499,8 @@ mod tests {
         assert_eq!(deletion_first.replay_start_ts(), TrxID::new(13));
     }
 
+    /// Purpose: Validate reloaded roots for ordinary and pending table creation.
+    /// Expected: Initial roots are accepted, while pending creation requires a root published after its commit.
     #[test]
     fn test_create_table_root_ts_validation_accepts_initial_sts_root() {
         let root_before_create = TableReplayBounds {
@@ -2393,6 +2550,8 @@ mod tests {
         .unwrap();
     }
 
+    /// Purpose: Apply heap replay filtering before validating page identity and replay registration.
+    /// Expected: Obsolete redo is skipped, while eligible redo without required page state reports contextual errors.
     #[test]
     fn test_hot_replay_filters_before_requiring_registered_page() {
         smol::block_on(async {
@@ -2463,6 +2622,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Replay checkpointed cold rows without depending on hot-page history.
+    /// Expected: Covered inserts are skipped, matching cold deletes are idempotent, and conflicting delete timestamps fail.
     #[test]
     fn test_cold_replay_ignores_hot_page_identity() {
         smol::block_on(async {
@@ -2542,6 +2703,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Rebuild indexes from sparse replay histories with differing page allocation orders.
+    /// Expected: Only live rows enter indexes, replay histories are consumed, and active version maps retain their identity.
     #[test]
     fn test_replay_rebuild_consumes_sidecars_and_retains_version_maps() {
         smol::block_on(async {
@@ -2679,6 +2842,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reuse a dropped table's page identity during recovery.
+    /// Expected: Dropping removes old insertion history and the replacement table can replay into a fresh page.
     #[test]
     fn test_replay_drop_removes_sidecars_before_page_reuse() {
         smol::block_on(async {
@@ -2753,6 +2918,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Rebuild indexes after a transaction replaces a row across pages and updates another table.
+    /// Expected: Unique and non-unique lookups reflect final row images without retaining obsolete keys.
     #[test]
     fn test_cross_page_replacement_rebuilds_final_unique_and_non_unique_indexes() {
         smol::block_on(async {
@@ -2895,6 +3062,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Scope recovery DDL barriers while replay jobs on multiple tables are blocked.
+    /// Expected: New pages can be created independently, and dropping waits only for the affected table before page reuse.
     #[test]
     fn test_creation_and_drop_fence_only_the_affected_table() {
         smol::block_on(async {
@@ -3030,6 +3199,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Clean up replay histories when index reconstruction encounters invalid state.
+    /// Expected: Duplicate keys and orphaned table histories fail with contextual errors and leave no retained histories.
     #[test]
     fn test_failed_index_rebuild_consumes_remaining_sidecars() {
         smol::block_on(async {
@@ -3093,6 +3264,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Skip redo for unknown tables when catalog or global replay floors already cover it.
+    /// Expected: Obsolete row and DDL records succeed without table lookup and skipped operations remain accounted for.
     #[test]
     fn test_log_recovery_skips_checkpoint_covered_unknown_user_table_redo() {
         smol::block_on(async {
@@ -3157,6 +3330,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate user-table existence at the inclusive catalog replay boundary.
+    /// Expected: Eligible DML and page-creation redo for unknown tables fail with recovery-ordering context.
     #[test]
     fn test_log_recovery_fails_unknown_user_table_redo_at_catalog_boundary() {
         smol::block_on(async {
@@ -3213,6 +3388,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover a provisional index creation followed by a later durable index creation.
+    /// Expected: The provisional slot remains vacant and the later index retains its allocation across restarts and checkpointing.
     #[test]
     fn test_recovery_quarantines_provisional_create_before_later_durable_create() {
         smol::block_on(async {
@@ -3336,214 +3513,114 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover index creation backed by a published table root.
+    /// Expected: Catalog and runtime metadata expose the created index and retain its allocation history.
     #[test]
     fn test_recovery_replays_root_proven_create_index_redo() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "recover-create-index",
-            ))
-            .await
-            .unwrap();
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let cts = commit_create_index_catalog_ddl(&engine, table_id).await;
-            publish_index_metadata_root(&engine, table_id, created_index_metadata(), cts).await;
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "recover-create-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
-            drop(recovered);
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::AfterTable,
+            )
+            .await;
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
+                .await;
+            restart_and_assert_index_state(engine, config, table_id, 2, true).await;
         });
     }
 
+    /// Purpose: Recover index removal backed by a published table root.
+    /// Expected: The dropped index is absent while its allocated slot remains part of the metadata history.
     #[test]
     fn test_recovery_replays_root_proven_drop_index_redo() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "recover-drop-index",
-            ))
-            .await
-            .unwrap();
-            let table_id = create_index_ddl_base_table(
-                &engine,
                 vec![base_unique_index_spec(), added_index_spec()],
+                CatalogCheckpointOrder::AfterTable,
             )
             .await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
-            publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), cts).await;
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "recover-drop-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
-            drop(recovered);
+            let drop_cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), drop_cts)
+                .await;
+            restart_and_assert_index_state(engine, config, table_id, 2, false).await;
         });
     }
 
+    /// Purpose: Recover durable creation and subsequent removal of the same index.
+    /// Expected: The final index is absent and its allocated identity and slot remain consumed.
     #[test]
     fn test_recovery_replays_create_then_drop_index_allocation_history() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "recover-create-drop-index",
-            ))
-            .await
-            .unwrap();
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::AfterTable,
+            )
+            .await;
             let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
                 .await;
             let drop_cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), drop_cts)
                 .await;
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "recover-create-drop-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
-            drop(recovered);
+            restart_and_assert_index_state(engine, config, table_id, 2, false).await;
         });
     }
 
+    /// Purpose: Recover a table created after the catalog checkpoint with a later index-creation root.
+    /// Expected: Table bootstrap accepts the later root and recovers the created index.
     #[test]
     fn test_recovery_replays_new_table_with_later_create_index_root() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "recover-new-table-create-index",
-            ))
-            .await
-            .unwrap();
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            let index_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
-            publish_index_metadata_root(&engine, table_id, created_index_metadata(), index_cts)
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::BeforeTable,
+            )
+            .await;
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
                 .await;
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "recover-new-table-create-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
-            drop(recovered);
+            restart_and_assert_index_state(engine, config, table_id, 2, true).await;
         });
     }
 
+    /// Purpose: Recover a new table whose later roots include index creation and removal.
+    /// Expected: The table retains index allocation history while recovering only its surviving index.
     #[test]
     fn test_recovery_replays_new_table_with_later_create_drop_index_roots() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "recover-new-table-create-drop-index",
-            ))
-            .await
-            .unwrap();
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::BeforeTable,
+            )
+            .await;
             let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
                 .await;
             let drop_cts = commit_drop_index_catalog_ddl(&engine, table_id).await;
             publish_index_metadata_root(&engine, table_id, dropped_index_metadata(), drop_cts)
                 .await;
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "recover-new-table-create-drop-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, false).await;
-            drop(recovered);
+            restart_and_assert_index_state(engine, config, table_id, 2, false).await;
         });
     }
 
+    /// Purpose: Checkpoint catalog redo for an index creation lacking durable root proof.
+    /// Expected: The checkpoint advances past the provisional DDL without making the index visible after restart.
     #[test]
     fn test_catalog_checkpoint_skips_unproved_index_ddl_catalog_dml() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "checkpoint-skip-provisional-index",
-            ))
-            .await
-            .unwrap();
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let ddl_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::AfterTable,
+            )
+            .await;
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
             engine
                 .new_session()
                 .unwrap()
@@ -3551,42 +3628,25 @@ mod tests {
                 .await
                 .unwrap();
             let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert!(snapshot.catalog_replay_start_ts > ddl_cts);
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "checkpoint-skip-provisional-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 1, false).await;
-            drop(recovered);
+            assert!(snapshot.catalog_replay_start_ts > create_cts);
+            restart_and_assert_index_state(engine, config, table_id, 1, false).await;
         });
     }
 
+    /// Purpose: Checkpoint catalog redo for an index creation backed by a published root.
+    /// Expected: The checkpoint advances past the DDL and restart retains the durable index.
     #[test]
     fn test_catalog_checkpoint_includes_root_proven_index_ddl_catalog_dml() {
         smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir.clone(),
+            let (_dir, config, engine, table_id) = prepare_index_recovery(
                 "checkpoint-include-durable-index",
-            ))
-            .await
-            .unwrap();
-            let table_id =
-                create_index_ddl_base_table(&engine, vec![base_unique_index_spec()]).await;
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let ddl_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
-            publish_index_metadata_root(&engine, table_id, created_index_metadata(), ddl_cts).await;
+                vec![base_unique_index_spec()],
+                CatalogCheckpointOrder::AfterTable,
+            )
+            .await;
+            let create_cts = commit_create_index_catalog_ddl(&engine, table_id).await;
+            publish_index_metadata_root(&engine, table_id, created_index_metadata(), create_cts)
+                .await;
             engine
                 .new_session()
                 .unwrap()
@@ -3594,20 +3654,13 @@ mod tests {
                 .await
                 .unwrap();
             let snapshot = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert!(snapshot.catalog_replay_start_ts > ddl_cts);
-            drop(engine);
-
-            let recovered = Engine::bootstrap(lightweight_recovery_engine_config(
-                main_dir,
-                "checkpoint-include-durable-index",
-            ))
-            .await
-            .unwrap();
-            assert_recovered_index_state(&recovered, table_id, 2, true).await;
-            drop(recovered);
+            assert!(snapshot.catalog_replay_start_ts > create_cts);
+            restart_and_assert_index_state(engine, config, table_id, 2, true).await;
         });
     }
 
+    /// Purpose: Skip a corrupt sealed redo segment whose timestamp range is obsolete.
+    /// Expected: Bootstrap avoids decoding the segment and subsequent runtime timestamps exceed its recorded maximum.
     #[test]
     fn test_log_recover_skips_corrupt_obsolete_sealed_segment_and_seeds_cts() {
         smol::block_on(async {
@@ -3641,6 +3694,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate a sealed segment whose timestamp range reaches the replay floor.
+    /// Expected: Bootstrap scans the boundary segment and rejects its checksum corruption.
     #[test]
     fn test_log_recover_scans_boundary_sealed_segment_and_fails_corruption() {
         smol::block_on(async {
@@ -3654,6 +3709,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover from a group-start checksum failure in an unsealed redo tail.
+    /// Expected: Bootstrap succeeds and retains an open redo file without publishing a sealed alternate superblock.
     #[test]
     fn test_log_recover_discards_unsealed_group_start_checksum_tail() {
         smol::block_on(async {
@@ -3677,6 +3734,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Restart after reclaiming redo files older than the persisted retention marker.
+    /// Expected: Bootstrap accepts the retained suffix despite the missing obsolete prefix.
     #[test]
     fn test_log_recover_accepts_missing_prefix_below_first_retained_redo() {
         smol::block_on(async {
@@ -3698,6 +3757,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Restart with the first required retained redo segment missing.
+    /// Expected: Bootstrap reports a redo sequence gap with the owning log-access error.
     #[test]
     fn test_log_recover_rejects_missing_first_retained_redo_file() {
         smol::block_on(async {
@@ -3734,6 +3795,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Scan catalog checkpoint redo after reclaiming an obsolete prefix.
+    /// Expected: The scan accepts the retained suffix and reaches the durable upper boundary.
     #[test]
     fn test_catalog_checkpoint_scan_accepts_missing_prefix_below_first_retained_redo() {
         smol::block_on(async {
@@ -3774,23 +3837,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Report recovery work when bootstrapping an empty storage root.
+    /// Expected: Recovery records no replay work and its report remains unchanged after shutdown.
     #[test]
     fn test_log_recover_empty() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover1")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover1"))
+                .await
+                .unwrap();
 
             let report = *engine.recovery_report();
             assert_report_accounting(&report);
@@ -3802,23 +3858,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Recover a table definition with unique and ordered composite indexes.
+    /// Expected: Restart restores the table and its complete column and index metadata.
     #[test]
     fn test_log_recover_ddl() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover2")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover2"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_spec = StorageTableSpec::new(vec![
@@ -3853,18 +3902,9 @@ mod tests {
             drop(engine);
 
             // second recovery.
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover2")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover2"))
+                .await
+                .unwrap();
 
             assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
@@ -3875,6 +3915,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Recover committed inserts, updates, and deletes across multiple transactions.
+    /// Expected: Restart preserves surviving row values and deleted-key absence with consistent replay accounting.
     #[test]
     fn test_log_recover_dml() {
         smol::block_on(async {
@@ -3885,18 +3927,9 @@ mod tests {
 
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover3")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover3"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_spec = StorageTableSpec::new(vec![
@@ -3954,18 +3987,9 @@ mod tests {
             drop(engine);
 
             // second recovery.
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover3")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover3"))
+                .await
+                .unwrap();
 
             let report = engine.recovery_report();
             assert_report_accounting(report);
@@ -3983,7 +4007,7 @@ mod tests {
                 report.work.catalog_row_ops_applied
             );
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let session = engine.new_session().unwrap();
+            let mut session = engine.new_session().unwrap();
             let mut rows = 0usize;
             {
                 let layout = table.layout_snapshot();
@@ -4004,29 +4028,41 @@ mod tests {
             }
             assert_eq!(rows, DML_SIZE - (DML_SIZE / DEL_STEP + 1));
 
+            let mut trx = session.begin_trx().unwrap();
+            for id in 0..DML_SIZE {
+                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(id as u32)]);
+                let row = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1])
+                    .await
+                    .unwrap();
+                if id % DEL_STEP == 0 {
+                    assert_eq!(row, SelectMvcc::NotFound, "deleted key={id}");
+                } else {
+                    let expected = if id % UPD_STEP == 0 { &s2 } else { &s };
+                    assert_eq!(
+                        row,
+                        SelectMvcc::Found(vec![Val::from(id as u32), Val::from(expected.as_str())]),
+                        "surviving key={id}"
+                    );
+                }
+            }
+            trx.commit().await.unwrap();
+
             drop(session);
             drop(table);
             drop(engine);
         })
     }
 
+    /// Purpose: Bootstrap table metadata from a published catalog checkpoint.
+    /// Expected: The table is restored without applying covered catalog row redo and startup reports stay immutable.
     #[test]
     fn test_log_recover_bootstraps_catalog_from_checkpoint() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover4")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover4"))
+                .await
+                .unwrap();
 
             let initial_report = *engine.recovery_report();
             let mut session = engine.new_session().unwrap();
@@ -4057,18 +4093,9 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover4")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover4"))
+                .await
+                .unwrap();
 
             assert_report_accounting(engine.recovery_report());
             assert_eq!(engine.recovery_report().work.checkpoint_user_tables, 1);
@@ -4078,6 +4105,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Distinguish replayed silent watermarks from checkpointed durable replay floors.
+    /// Expected: Only checkpointed watermarks advance recovered table floors; uncheckpointed rows are merely replayed.
     #[test]
     fn test_recovery_uses_silent_watermark_only_after_catalog_checkpoint() {
         async fn prepare_silent_watermark(
@@ -4223,292 +4252,74 @@ mod tests {
         })
     }
 
+    /// Purpose: Read a checkpointed row through its persisted secondary index after restart.
+    /// Expected: Disk and combined lookups return the cold row while hot row pages and the memory index remain empty.
     #[test]
     fn test_log_recover_reads_checkpointed_secondary_from_disk_tree_without_mem_backfill() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover5")),
-            )
-            .await
-            .unwrap();
-
-            let mut session = engine.new_session().unwrap();
-            let table_id = session
-                .create_table(
-                    StorageTableSpec::new(vec![
-                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-                    ]),
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::UK,
-                    )],
-                )
-                .await
-                .unwrap()
-                .table_id();
-
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-            let catalog_replay_start_ts = engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .checkpoint_snapshot()
-                .catalog_replay_start_ts;
-
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let insert = trx
-                .table_insert_mvcc(
-                    table.table_id(),
-                    vec![Val::from(7u32), Val::from("cold-row")],
-                )
-                .await;
-            let cold_row_id = match insert {
-                Ok(row_id) => row_id,
-                other => panic!("expected cold insert success, got {other:?}"),
-            };
-            trx.commit().await.unwrap();
-
-            assert_freeze_created(
-                session
-                    .freeze_table(table.table_id(), usize::MAX)
-                    .await
-                    .unwrap(),
-            );
-            let mut checkpoint_session = engine.new_session().unwrap();
-            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
-            let root_after_checkpoint = table.file().active_root_unchecked();
-            assert!(root_after_checkpoint.heap_redo_start_ts > catalog_replay_start_ts);
-
-            drop(table);
-            drop(checkpoint_session);
-            drop(session);
+            let config = recovery_engine_config(temp_dir.path(), "recover5");
+            let engine = Engine::bootstrap(config.clone()).await.unwrap();
+            let (table_id, cold_row_id) = prepare_checkpointed_unique_row(&engine).await;
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover5")),
-            )
-            .await
-            .unwrap();
-
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let engine = Engine::bootstrap(config).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
-
+            assert_eq!(session.total_row_pages(table_id).await.unwrap(), 0);
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
-            let layout = table.layout_snapshot();
-            let index_slot = key.index_slot;
-            let index = layout.secondary_index(index_slot).unwrap();
-            let root = table
-                .file()
-                .active_root_unchecked()
-                .secondary_index_root(index_slot);
-            {
-                let pool_guards = session.pool_guards();
-                let disk = index
-                    .disk_runtime()
-                    .open_unique_at(root, pool_guards.disk_guard())
-                    .unwrap();
-                assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
-            }
-            {
-                let pool_guards = session.pool_guards();
-                assert_eq!(
-                    index
-                        .bind_unique_unchecked(&pool_guards, root)
-                        .unwrap()
-                        .lookup(&key.vals, MIN_SNAPSHOT_TS)
-                        .await
-                        .unwrap(),
-                    Some((cold_row_id, false))
-                );
-            }
+            assert_recovered_unique_tiers(&engine, table_id, &key, cold_row_id, None).await;
             let mut trx = session.begin_trx().unwrap();
-            let row = trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &key, &[0, 1]).await;
+            let row = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
                 vec![Val::from(7u32), Val::from("cold-row")]
             );
             trx.commit().await.unwrap();
-
-            drop(layout);
-            drop(table);
-            drop(session);
-            drop(engine);
-        })
+        });
     }
 
+    /// Purpose: Recover a hot replacement sharing a deleted cold row's unique key.
+    /// Expected: Combined lookup selects the hot replacement even though the persisted index still contains the cold identity.
     #[test]
     fn test_log_recover_rebuilds_hot_unique_memindex_over_checkpointed_cold_duplicate() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover11")),
-            )
-            .await
-            .unwrap();
-
-            let mut session = engine.new_session().unwrap();
-            let table_id = session
-                .create_table(
-                    StorageTableSpec::new(vec![
-                        StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                        StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-                    ]),
-                    vec![StorageIndexSpec::new(
-                        vec![StorageIndexKey::new(0)],
-                        StorageIndexFlags::UK,
-                    )],
-                )
-                .await
-                .unwrap()
-                .table_id();
-
-            engine
-                .new_session()
-                .unwrap()
-                .checkpoint_catalog()
-                .await
-                .unwrap();
-
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let insert = trx
-                .table_insert_mvcc(
-                    table.table_id(),
-                    vec![Val::from(7u32), Val::from("cold-row")],
-                )
-                .await;
-            let Ok(cold_row_id) = insert else {
-                panic!("cold insert should succeed");
-            };
-            trx.commit().await.unwrap();
-
-            assert_freeze_created(
-                session
-                    .freeze_table(table.table_id(), usize::MAX)
-                    .await
-                    .unwrap(),
-            );
-            let mut checkpoint_session = engine.new_session().unwrap();
-            assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
-            assert!(table.file().active_root_unchecked().pivot_row_id > cold_row_id);
-
+            let config = recovery_engine_config(temp_dir.path(), "recover11");
+            let engine = Engine::bootstrap(config.clone()).await.unwrap();
+            let (table_id, cold_row_id) = prepare_checkpointed_unique_row(&engine).await;
             let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(7u32)]);
+            let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            let delete = trx_delete_row_by_id(&mut trx, table.table_id(), &key).await;
+            let delete = trx_delete_row_by_id(&mut trx, table_id, &key).await;
             assert!(matches!(delete, Ok(UniqueMutationOutcome::Deleted)));
             trx.commit().await.unwrap();
-
             let mut trx = session.begin_trx().unwrap();
-            let insert = trx
-                .table_insert_mvcc(
-                    table.table_id(),
-                    vec![Val::from(7u32), Val::from("hot-row")],
-                )
-                .await;
-            let Ok(hot_row_id) = insert else {
-                panic!("hot insert should reclaim deleted cold key");
-            };
+            let hot_row_id = trx
+                .table_insert_mvcc(table_id, vec![Val::from(7u32), Val::from("hot-row")])
+                .await
+                .unwrap();
             assert_ne!(cold_row_id, hot_row_id);
             trx.commit().await.unwrap();
-
-            drop(table);
-            drop(checkpoint_session);
             drop(session);
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover11")),
-            )
-            .await
-            .unwrap();
-
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            let engine = Engine::bootstrap(config).await.unwrap();
             let mut session = engine.new_session().unwrap();
-            assert!(session.total_row_pages(table.table_id()).await.unwrap() > 0);
-
-            let layout = table.layout_snapshot();
-            let index_slot = key.index_slot;
-            let index = layout.secondary_index(index_slot).unwrap();
-            let root = table
-                .file()
-                .active_root_unchecked()
-                .secondary_index_root(index_slot);
-            {
-                let pool_guards = session.pool_guards();
-                let disk = index
-                    .disk_runtime()
-                    .open_unique_at(root, pool_guards.disk_guard())
-                    .unwrap();
-                assert_eq!(disk.lookup(&key.vals).await.unwrap(), Some(cold_row_id));
-            }
-            {
-                let pool_guards = session.pool_guards();
-                assert_eq!(
-                    index
-                        .bind_unique_unchecked(&pool_guards, root)
-                        .unwrap()
-                        .lookup(&key.vals, MIN_SNAPSHOT_TS)
-                        .await
-                        .unwrap(),
-                    Some((hot_row_id, false))
-                );
-            }
-
+            assert!(session.total_row_pages(table_id).await.unwrap() > 0);
+            assert_recovered_unique_tiers(&engine, table_id, &key, cold_row_id, Some(hot_row_id))
+                .await;
             let mut trx = session.begin_trx().unwrap();
-            let row = trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &key, &[0, 1]).await;
+            let row = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
                 vec![Val::from(7u32), Val::from("hot-row")]
             );
             trx.commit().await.unwrap();
-
-            drop(layout);
-            drop(table);
-            drop(session);
-            drop(engine);
-        })
+        });
     }
 
+    /// Purpose: Recover a cold deletion among rows sharing a non-unique index key.
+    /// Expected: Logical lookups hide only the deleted row while retaining the other equal-key rows.
     #[test]
     fn test_log_recover_non_unique_disk_tree_scan_suppresses_exact_cold_delete() {
         smol::block_on(async {
@@ -4657,6 +4468,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Recover full-table mutations that delete, update, and retain both cold and hot rows.
+    /// Expected: Scans and index lookups expose the committed final values and exclude deleted rows.
     #[test]
     fn test_log_recover_full_table_mutation_mixed_cold_hot_actions() {
         smol::block_on(async {
@@ -4795,23 +4608,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Combine a checkpointed cold row with later committed heap redo during restart.
+    /// Expected: Both persisted and replayed rows are readable with their original values.
     #[test]
     fn test_log_recover_replays_post_checkpoint_heap_redo_after_bootstrap() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover6")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover6"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -4882,18 +4688,9 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover6")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover6"))
+                .await
+                .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
@@ -4925,6 +4722,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Filter checkpoint-covered inserts even when their commit reaches the heap replay floor.
+    /// Expected: Cold rows retain persisted placement, hot rows are replayed, and checkpointed deletion remains effective.
     #[test]
     fn test_log_recover_skips_checkpointed_tail_insert_newer_than_heap_redo_start() {
         smol::block_on(async {
@@ -5074,23 +4873,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Distinguish checkpoint-covered cold deletions from newer deletion redo.
+    /// Expected: Only newer deletes rebuild committed markers, while both deleted rows remain invisible after restart.
     #[test]
     fn test_log_recover_skips_checkpointed_and_replays_newer_cold_deletes() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover10")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover10"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -5172,18 +4964,9 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover10")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover10"))
+                .await
+                .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let report = engine.recovery_report();
@@ -5238,23 +5021,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Recover tables with different persistence states under the same catalog checkpoint.
+    /// Expected: Checkpointed rows remain cold and replay-only rows regain hot pages with correct values.
     #[test]
     fn test_log_recover_handles_mixed_user_table_checkpoint_states() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover7")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover7"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let checkpointed_table_id = session
@@ -5387,18 +5163,9 @@ mod tests {
             drop(session);
             drop(engine);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover7")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover7"))
+                .await
+                .unwrap();
 
             let checkpointed_table = engine
                 .inner()
@@ -5466,23 +5233,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Defer validation of a corrupted persisted column block during recovery.
+    /// Expected: Bootstrap succeeds and the first row read reports the block's checksum failure with context.
     #[test]
     fn test_log_recover_defers_corrupted_persisted_lwc_block_until_read() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover8")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover8"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -5556,18 +5316,9 @@ mod tests {
 
             corrupt_page_checksum(table_file_path, block_id);
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover8")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover8"))
+                .await
+                .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let mut session = engine.new_session().unwrap();
@@ -5592,23 +5343,16 @@ mod tests {
         })
     }
 
+    /// Purpose: Defer validation of malformed persisted deletion metadata during recovery.
+    /// Expected: Bootstrap succeeds and loading deletion deltas reports invalid framing with blob context.
     #[test]
     fn test_log_recover_defers_invalid_delete_blob_framing_until_delta_load() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir.clone())
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover9")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir.clone(), "recover9"))
+                .await
+                .unwrap();
 
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -5715,18 +5459,9 @@ mod tests {
                 blob_ref.start_offset,
             );
 
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(TrxSysConfig::default().log_file_stem("recover9")),
-            )
-            .await
-            .unwrap();
+            let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover9"))
+                .await
+                .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let session = engine.new_session().unwrap();
@@ -5764,6 +5499,8 @@ mod tests {
         })
     }
 
+    /// Purpose: Handle decoded keyed user-table redo at the replay floor under either validation setting.
+    /// Expected: Older operations are skipped, eligible keyed operations are rejected, and decoding remains accounted for.
     #[test]
     fn keyed_user_redo_is_fully_decoded_before_floor_filtering_and_rejection() {
         smol::block_on(async {
@@ -5809,9 +5546,10 @@ mod tests {
                         if cts == 9 {
                             result.unwrap();
                         } else {
-                            assert!(
-                                format!("{:?}", result.unwrap_err())
-                                    .contains("key-based catalog redo")
+                            assert_replay_integrity(
+                                result.unwrap_err(),
+                                DataIntegrityError::InvalidPayload,
+                                "key-based catalog redo",
                             );
                         }
                     }

@@ -698,14 +698,16 @@ mod tests {
                     }
                     let op = group.operation(row, trx.header.cts);
                     let expected = &owning.payload.dml[id].rows[key];
+                    assert_eq!(op.cts, owning.header.cts);
                     assert_operation(&op, expected);
                     batch.append(&op, usize::MAX);
-                    expected_rows.push(snapshot_row(expected));
+                    expected_rows.push((owning.header.cts, snapshot_row(expected)));
                 }
             }
         }
         drop(group); // Batch bytes must remain valid independently of every group.
-        for (op, expected) in batch.operations().skip(1).zip(&expected_rows) {
+        for (op, (cts, expected)) in batch.operations().skip(1).zip(&expected_rows) {
+            assert_eq!(op.cts, *cts);
             assert_eq!(op.row_id, expected.row_id);
             match (op.kind, &expected.kind) {
                 (ReplayKind::Insert(values), RowSnapshotKind::Insert(_, expected)) => {
@@ -1008,6 +1010,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect redo variant decoding and inclusive transaction timestamp bounds.
+    /// Expected: Both decoders preserve valid records and reject timestamps outside the declared range.
     #[test]
     fn complete_redo_contract_matches_for_all_variants_and_timestamp_bounds() {
         let logs = contract_logs();
@@ -1038,6 +1042,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Compare decoder acceptance under truncated and deterministically mutated redo frames.
+    /// Expected: Truncations and trailing bytes fail validation, while mutations produce matching values or errors.
     #[test]
     fn compact_contract_truncations_and_seeded_mutations_preserve_parity() {
         let mut rng = StdRng::seed_from_u64(0x311dec0de);
@@ -1066,6 +1072,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect optional redo fields using independently framed deletes and noncanonical presence flags.
+    /// Expected: Nonzero flags retain present fields, while absent page identities remain absent.
     #[test]
     fn noncanonical_option_flags_and_independent_delete_wire_keep_their_meaning() {
         // Entire transaction assembled from documented field widths, without Ser.
@@ -1130,6 +1138,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Validate redo that is superseded by duplicate table entries or follows a valid transaction.
+    /// Expected: Corruption rejects the whole group even when the corrupt entry would be overwritten.
     #[test]
     fn overwritten_tables_and_later_transactions_are_still_validated() {
         let valid = raw_frame(vec![
@@ -1149,6 +1159,8 @@ mod tests {
         assert_eq!(compare_decoders(&group, 7, 7).unwrap().len(), 2);
     }
 
+    /// Purpose: Protect scalar and byte payload boundaries across decoding and batch ownership transfer.
+    /// Expected: Values retain exact contents through repeated borrows and after source groups are released.
     #[test]
     fn all_value_boundaries_survive_decode_pack_and_repeated_borrows() {
         differential(&[
@@ -1157,6 +1169,8 @@ mod tests {
         ]);
     }
 
+    /// Purpose: Exercise decoding and packing with deterministically generated mixed values.
+    /// Expected: Both representations preserve the original values, including exact floating-point bits.
     #[test]
     fn seeded_mixed_values_match_owning_decode_bit_for_bit() {
         let mut rng = StdRng::seed_from_u64(311);
@@ -1189,6 +1203,8 @@ mod tests {
         differential(&logs);
     }
 
+    /// Purpose: Protect duplicate map replacement and distinct row map and payload identities.
+    /// Expected: Decoded maps are ordered, later entries replace earlier ones, and payload identities survive.
     #[test]
     fn map_order_replacement_and_payload_identity_match_owning() {
         let user = USER_TABLE_ID_START;
@@ -1206,17 +1222,44 @@ mod tests {
             (user + 1, vec![raw_row(10, "replacement table")]),
         ]);
         let actual = compare_decoders(&wire, 7, 7).unwrap();
-        let expected = raw_frame(vec![
-            (CATALOG_TABLE_ID_START, vec![raw_row(4, "catalog")]),
-            (
-                user,
-                vec![raw_row(2, "sorted first"), raw_row(8, "last row wins")],
+        let row = |id, value: &str| RowSnapshot {
+            row_id: RowID::new(id),
+            kind: RowSnapshotKind::Insert(
+                PageID::new(10),
+                vec![ValueSnapshot::Bytes(value.as_bytes().to_vec())],
             ),
-            (user + 1, vec![raw_row(10, "replacement table")]),
-        ]);
-        assert_eq!(actual, compare_decoders(&expected, 7, 7).unwrap());
+        };
+        // Keep the expected keys and payload identities independent of raw_row
+        // and both decoders, so shared replacement bugs cannot define the oracle.
+        assert_eq!(
+            actual,
+            vec![TrxSnapshot {
+                cts: TrxID::new(7),
+                trx_kind: RedoTrxKind::System,
+                ddl: None,
+                tables: BTreeMap::from([
+                    (
+                        CATALOG_TABLE_ID_START,
+                        BTreeMap::from([(RowID::new(2), row(4, "catalog"))]),
+                    ),
+                    (
+                        user,
+                        BTreeMap::from([
+                            (RowID::new(1), row(2, "sorted first")),
+                            (RowID::new(4), row(8, "last row wins")),
+                        ]),
+                    ),
+                    (
+                        user + 1,
+                        BTreeMap::from([(RowID::new(5), row(10, "replacement table"))]),
+                    ),
+                ]),
+            }]
+        );
     }
 
+    /// Purpose: Protect decoder validation at framing, tag, count, and payload boundaries.
+    /// Expected: Malformed records are rejected, while sparse update ordinals remain unchanged for later validation.
     #[test]
     fn truncation_tags_lengths_frames_and_overwritten_corruption_fail_closed() {
         for value in boundary_values() {
@@ -1296,6 +1339,8 @@ mod tests {
         differential(&[TrxLog::new(log.header, log.payload)]);
     }
 
+    /// Purpose: Validate value tags and byte order against independently constructed wire records.
+    /// Expected: Decoded and packed values match explicit expectations, and truncated values are rejected.
     #[test]
     fn independent_known_wire_tags_and_exact_scalar_bits() {
         let cases = [

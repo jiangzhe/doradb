@@ -79,6 +79,8 @@ mod tests {
     use super::{RecoveryTimeline, TableReplayBounds};
     use crate::id::TrxID;
 
+    /// Purpose: Choose the replay start when heap and deletion boundaries differ.
+    /// Expected: Replay begins at the earlier boundary regardless of which source supplies it.
     #[test]
     fn table_replay_bounds_start_at_min_heap_or_deletion_cutoff() {
         let heap_first = TableReplayBounds {
@@ -96,19 +98,42 @@ mod tests {
         assert_eq!(deletion_first.replay_start_ts(), TrxID::new(4));
     }
 
+    /// Purpose: Combine catalog, table, and recovered transaction timestamps into the recovery timeline.
+    /// Expected: Each timestamp source can advance the watermark without regression, while replay floors retain earlier bounds.
     #[test]
     fn recovery_timeline_seeds_watermark_from_all_sources() {
         let mut timeline = RecoveryTimeline::new(TrxID::new(1));
+        assert_eq!(timeline.catalog_replay_start_ts, TrxID::new(1));
+        assert_eq!(timeline.replay_floor, TrxID::new(1));
+        assert_eq!(timeline.max_recovered_cts, TrxID::new(1));
         timeline.seed_catalog_checkpoint(TrxID::new(10));
-        timeline.seed_table_bounds(TableReplayBounds {
-            root_ts: TrxID::new(12),
-            heap_redo_start_ts: TrxID::new(4),
-            deletion_cutoff_ts: TrxID::new(8),
-        });
+        assert_eq!(timeline.catalog_replay_start_ts, TrxID::new(10));
+        assert_eq!(timeline.replay_floor, TrxID::new(10));
+        assert_eq!(timeline.max_recovered_cts, TrxID::new(10));
+        for (source, root, heap, deletion, floor, watermark) in [
+            ("root", 12, 4, 8, 4, 12),
+            ("heap", 11, 14, 8, 4, 14),
+            ("deletion", 11, 8, 16, 4, 16),
+            ("older table", 11, 8, 3, 3, 16),
+        ] {
+            timeline.seed_table_bounds(TableReplayBounds {
+                root_ts: TrxID::new(root),
+                heap_redo_start_ts: TrxID::new(heap),
+                deletion_cutoff_ts: TrxID::new(deletion),
+            });
+            assert_eq!(timeline.replay_floor, TrxID::new(floor), "{source}");
+            assert_eq!(
+                timeline.max_recovered_cts,
+                TrxID::new(watermark),
+                "{source}"
+            );
+        }
         timeline.seed_recovered_cts(TrxID::new(20));
+        assert_eq!(timeline.max_recovered_cts, TrxID::new(20));
+        timeline.seed_recovered_cts(TrxID::new(15));
 
         assert_eq!(timeline.catalog_replay_start_ts, TrxID::new(10));
-        assert_eq!(timeline.replay_floor, TrxID::new(4));
+        assert_eq!(timeline.replay_floor, TrxID::new(3));
         assert_eq!(timeline.max_recovered_cts, TrxID::new(20));
     }
 }
