@@ -290,9 +290,26 @@ mod tests {
         }
     }
 
-    fn poll_waiter(
+    struct WriterWakeProbe {
+        lock: Arc<RawRwLock>,
+        notified: AtomicBool,
+        woke_with_mutex_locked: AtomicBool,
+    }
+
+    impl Wake for WriterWakeProbe {
+        fn wake(self: Arc<Self>) {
+            // Event notification invokes this callback before returning. Record
+            // the mutex state here, before a later unlock can hide an early wake.
+            // Do not poll or panic inside the event listener's notification path.
+            self.woke_with_mutex_locked
+                .fetch_or(self.lock.mu.is_locked(), Ordering::SeqCst);
+            self.notified.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn poll_waiter<W: Wake + Send + Sync + 'static>(
         waiter: Pin<&mut impl Future<Output = ()>>,
-        notified: &Arc<WakeFlag>,
+        notified: &Arc<W>,
     ) -> Poll<()> {
         let waker = Waker::from(Arc::clone(notified));
         waiter.poll(&mut Context::from_waker(&waker))
@@ -430,34 +447,43 @@ mod tests {
         assert_eq!(total, 100);
     }
 
-    /// Purpose: Protect progress of multiple writers queued behind an exclusive owner.
-    /// Expected: Releasing the owner lets all queued writers complete and leaves the lock unlocked.
+    /// Purpose: Protect notification ordering and progress of writers queued behind an exclusive owner.
+    /// Expected: Each wake observes an available writer mutex, and all queued writers complete and release the lock.
     #[test]
     fn test_raw_rwlock_async_waiting_writers_progress_after_single_unlock() {
-        let rw = RawRwLock::new();
+        let rw = Arc::new(RawRwLock::new());
         rw.lock_exclusive();
         let mut waiters = [
             Box::pin(rw.lock_exclusive_async()),
             Box::pin(rw.lock_exclusive_async()),
         ];
-        let notified = [
-            Arc::new(WakeFlag(AtomicBool::new(false))),
-            Arc::new(WakeFlag(AtomicBool::new(false))),
-        ];
+        let notified = [(); 2].map(|()| {
+            Arc::new(WriterWakeProbe {
+                lock: Arc::clone(&rw),
+                notified: AtomicBool::new(false),
+                woke_with_mutex_locked: AtomicBool::new(false),
+            })
+        });
         for (index, waiter) in waiters.iter_mut().enumerate() {
             assert!(
                 poll_waiter(waiter.as_mut(), &notified[index]).is_pending(),
                 "writer {index} must wait for the initial owner"
             );
-            assert!(!notified[index].0.swap(false, Ordering::SeqCst));
+            assert!(!notified[index].notified.swap(false, Ordering::SeqCst));
         }
 
         // SAFETY: both waiters are pending, so the initial owner still holds the lock.
         unsafe { rw.unlock_exclusive() };
         let first = notified
             .iter()
-            .position(|flag| flag.0.swap(false, Ordering::SeqCst))
+            .position(|probe| probe.notified.swap(false, Ordering::SeqCst))
             .expect("initial release must wake a queued writer");
+        assert!(
+            !notified[first]
+                .woke_with_mutex_locked
+                .load(Ordering::SeqCst),
+            "initial release woke writer {first} before unlocking the raw mutex"
+        );
         assert!(
             poll_waiter(waiters[first].as_mut(), &notified[first]).is_ready(),
             "writer {first} must acquire after the initial release"
@@ -469,12 +495,18 @@ mod tests {
             poll_waiter(waiters[second].as_mut(), &notified[second]).is_pending(),
             "writer {second} must wait while writer {first} owns the lock"
         );
-        notified[second].0.store(false, Ordering::SeqCst);
+        notified[second].notified.store(false, Ordering::SeqCst);
         // SAFETY: the first ready waiter acquired the exclusive lock above.
         unsafe { rw.unlock_exclusive() };
         assert!(
-            notified[second].0.swap(false, Ordering::SeqCst),
+            notified[second].notified.swap(false, Ordering::SeqCst),
             "writer {first} must wake writer {second} on release"
+        );
+        assert!(
+            !notified[second]
+                .woke_with_mutex_locked
+                .load(Ordering::SeqCst),
+            "writer {first} woke writer {second} before unlocking the raw mutex"
         );
         assert!(
             poll_waiter(waiters[second].as_mut(), &notified[second]).is_ready(),
