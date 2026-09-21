@@ -474,10 +474,22 @@ mod tests {
 
         // SAFETY: both waiters are pending, so the initial owner still holds the lock.
         unsafe { rw.unlock_exclusive() };
-        let first = notified
+        let notified_writers: Vec<_> = notified
             .iter()
-            .position(|probe| probe.notified.swap(false, Ordering::SeqCst))
-            .expect("initial release must wake a queued writer");
+            .enumerate()
+            .filter_map(|(index, probe)| {
+                probe
+                    .notified
+                    .swap(false, Ordering::SeqCst)
+                    .then_some(index)
+            })
+            .collect();
+        assert_eq!(
+            notified_writers.len(),
+            1,
+            "initial release must wake a queued writer"
+        );
+        let first = notified_writers[0];
         assert!(
             !notified[first]
                 .woke_with_mutex_locked
