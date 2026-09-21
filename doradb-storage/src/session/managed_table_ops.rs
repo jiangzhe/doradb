@@ -591,6 +591,7 @@ impl SessionOperationPin {
 
 #[cfg(test)]
 mod tests {
+    use super::SessionOperationPin;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::table::{
         CreateTableTestFailure, install_create_before_first_effect_gate,
@@ -606,7 +607,9 @@ mod tests {
         TABLE_ID_TABLE_BINDINGS, TABLE_ID_TABLE_DESCRIPTORS, TableBindingObject,
         TableDescriptorObject, TableDescriptors, Tables,
     };
-    use crate::error::RuntimeOrFatalError;
+    use crate::error::{
+        DataIntegrityError, OperationOrFatalResult, RuntimeError, RuntimeOrFatalError,
+    };
     use crate::id::TrxID;
     use crate::id::{SessionID, TableID};
     use crate::lock::tests::TestLockOwner;
@@ -1075,6 +1078,42 @@ mod tests {
         assert_eq!(Tables::lookup_count(), 0, "{context}: parent-row reads");
     }
 
+    async fn assert_binding_acquisition_cancellation(
+        blocker_session_id: SessionID,
+        expected_entries: usize,
+        acquire: impl AsyncFnOnce(&mut SessionOperationPin) -> OperationOrFatalResult<()>,
+    ) {
+        let root = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+            .await
+            .unwrap();
+        let manager = engine.inner().core.lock_manager();
+        let blocker_owner = LockOwner::session_explicit(blocker_session_id);
+        let mut blocker = TestLockOwner::new(blocker_owner);
+        blocker
+            .acquire(
+                manager,
+                LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
+                LockMode::Exclusive,
+            )
+            .await
+            .unwrap();
+        let session = engine.new_session().unwrap();
+        let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
+        let resolver_owner = operation.operation_lock_owner();
+        let mut acquire = Box::pin(acquire(&mut operation));
+        assert!(futures::poll!(acquire.as_mut()).is_pending());
+        assert_eq!(lock_entry_count(&engine, resolver_owner), expected_entries);
+        drop(acquire);
+        assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
+        assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
+        operation.curr_scope.as_ref().unwrap().assert_cleared();
+        operation.authority.as_ref().unwrap().assert_idle();
+        drop(operation);
+        blocker.close(manager);
+        assert_eq!(lock_entry_count(&engine, blocker_owner), 0);
+    }
+
     async fn wait_for_index_ddl_first_effect<F>(entered: &flume::Receiver<()>, ddl: Pin<&mut F>)
     where
         F: Future,
@@ -1089,6 +1128,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Serve managed definition reads while descriptor rows are exclusively locked.
+    /// Expected: Readers use the cached generation and only replacement construction projects metadata.
     #[test]
     fn test_managed_definition_reads_ignore_descriptor_exclusion() {
         smol::block_on(async {
@@ -1158,6 +1199,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Bound current-table lookups during managed definition reads and index DDL.
+    /// Expected: Each foreground phase selects the table once and publishes the expected definition.
     #[test]
     fn test_managed_index_uses_one_current_lookup_per_phase() {
         use crate::catalog::IndexDdlKind;
@@ -1258,6 +1301,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Avoid redundant current-table and managed-definition work for unmanaged index DDL.
+    /// Expected: Preparation selects the table once without descriptor work and applies the index change.
     #[test]
     fn test_unmanaged_index_uses_one_current_lookup_per_phase() {
         use crate::catalog::IndexDdlKind;
@@ -1322,6 +1367,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject missing, foreign, stale, and wrongly attached managed definition generations.
+    /// Expected: Readers report integrity failures without rebuilding definitions from catalog rows.
     #[test]
     fn test_managed_cache_corruption_fails_all_definition_readers() {
         smol::block_on(async {
@@ -1425,6 +1472,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Tie managed definition generation lifetimes to current ownership and captured readers.
+    /// Expected: Captured data stays stable and obsolete definitions are released after readers or tables drop.
     #[test]
     fn test_managed_definition_generations_follow_readers_and_drop() {
         smol::block_on(async {
@@ -1490,10 +1539,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Exercise managed definition changes and recovery against a seeded operation model.
+    /// Expected: Catalog, cached definitions, and binding snapshots agree with the model after every step.
     #[test]
     fn test_managed_definition_seeded_recovery_model() {
         use rand::{RngExt, SeedableRng};
-        let mut rng = StdRng::seed_from_u64(298);
+        const SEED: u64 = 298;
+        let mut rng = StdRng::seed_from_u64(SEED);
         smol::block_on(async {
             for bindings in [0, 1, 3] {
                 let root = TempDir::new().unwrap();
@@ -1507,6 +1559,9 @@ mod tests {
                     .unwrap()
                     .table_id();
                 assert_definition_model(&mut session, table_id, &model).await;
+                let mut next_index_id = 0;
+                // The seed drives a sequential stream across binding cases; no scheduling
+                // outcome selects the next operation. Allocation is modeled independently.
                 for step in 0..24 {
                     match rng.random_range(0..6) {
                         0 => {
@@ -1549,6 +1604,7 @@ mod tests {
                                     .is_none()
                             );
                             model.indexes.clear();
+                            next_index_id = 0;
                             model.epoch = 0;
                             model.payload = vec![step, 0xff];
                             table_id = session
@@ -1568,11 +1624,14 @@ mod tests {
                                 result: Err("invalid"),
                                 bindings: vec![],
                             };
-                            assert!(
-                                session
-                                    .create_managed_index(table_id, b"", &mut invalid)
-                                    .await
-                                    .is_err()
+                            let error = session
+                                .create_managed_index(table_id, b"", &mut invalid)
+                                .await
+                                .unwrap_err();
+                            assert_eq!(
+                                error.into_user(),
+                                Some("invalid"),
+                                "seed={SEED}, bindings={bindings}, step={step}"
                             );
                             assert!(Arc::ptr_eq(
                                 &definition,
@@ -1589,6 +1648,12 @@ mod tests {
                                 .create_managed_index(table_id, &[step], &mut model)
                                 .await
                                 .unwrap();
+                            assert_eq!(
+                                id,
+                                IndexID::new(next_index_id),
+                                "seed={SEED}, bindings={bindings}, step={step}"
+                            );
+                            next_index_id += 1;
                             model.indexes.push(id);
                             model.epoch += 1;
                             model.payload = vec![step];
@@ -1600,6 +1665,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Roll back managed index create and drop failures during catalog staging.
+    /// Expected: Runtime failure leaves the original definition allocation and catalog contents intact.
     #[test]
     fn test_managed_index_staging_failure_preserves_exact_generation() {
         use crate::catalog::IndexDdlKind;
@@ -1658,6 +1725,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Distinguish index allocation changes from managed definition changes during revalidation.
+    /// Expected: Allocation drift invalidates create while an existing index remains eligible for drop.
     #[test]
     fn test_managed_allocator_only_change_stales_create_but_not_drop() {
         smol::block_on(async {
@@ -1720,6 +1789,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Exclude managed readers from intermediate create and drop publication states.
+    /// Expected: Binding resolution and preflight wait for publication and then see the complete new definition.
     #[test]
     fn test_managed_readers_wait_through_durable_publication_boundaries() {
         use crate::catalog::IndexDdlKind;
@@ -1808,6 +1879,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover managed index publication failures with and without a prior catalog checkpoint.
+    /// Expected: Recovery installs only root-proven changes while preserving consumed index allocation.
     #[test]
     fn test_managed_fatal_publication_recovers_root_qualified_definition() {
         use crate::catalog::IndexDdlKind;
@@ -1904,6 +1977,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate managed definition ownership during recovery hydration.
+    /// Expected: Missing, foreign, duplicate, and already-owned definitions fail while valid hydration succeeds.
     #[test]
     fn test_recovery_hydration_rejects_missing_foreign_and_duplicate_ownership() {
         smol::block_on(async {
@@ -1924,31 +1999,44 @@ mod tests {
                 .validate_live_table_descriptors(runtime.pool_guards())
                 .await
                 .unwrap();
+            let error = catalog
+                .hydrate_recovered_managed_definitions(descriptors.clone())
+                .unwrap_err();
+            assert_eq!(error.current_context(), &DataIntegrityError::InvalidPayload);
             assert!(
-                catalog
-                    .hydrate_recovered_managed_definitions(descriptors.clone())
-                    .is_err()
+                format!("{error:?}").contains("invalid or duplicate managed definition hydration")
             );
-            replace_managed_definition(catalog, table_id, None);
-            assert!(
-                catalog
-                    .hydrate_recovered_managed_definitions(vec![])
-                    .is_err()
-            );
+
             let mut foreign = descriptors.clone();
-            foreign[0].table_id = TableID::new(99_999);
-            assert!(
-                catalog
-                    .hydrate_recovered_managed_definitions(foreign)
-                    .is_err()
-            );
+            let mut extra = descriptors[0].clone();
+            extra.table_id = TableID::new(99_999);
+            foreign.push(extra);
             let mut duplicate = descriptors.clone();
             duplicate.push(descriptors[0].clone());
-            assert!(
-                catalog
-                    .hydrate_recovered_managed_definitions(duplicate)
-                    .is_err()
-            );
+            for (case, invalid, diagnostic) in [
+                ("missing", vec![], "recovered descriptor ownership mismatch"),
+                (
+                    "foreign",
+                    foreign,
+                    "recovered descriptors without live runtimes",
+                ),
+                ("duplicate", duplicate, "duplicate recovered descriptor"),
+            ] {
+                replace_managed_definition(catalog, table_id, None);
+                let error = catalog
+                    .hydrate_recovered_managed_definitions(invalid)
+                    .unwrap_err();
+                assert_eq!(
+                    error.current_context(),
+                    &DataIntegrityError::InvalidPayload,
+                    "case={case}"
+                );
+                assert!(
+                    format!("{error:?}").contains(diagnostic),
+                    "case={case}: {error:?}"
+                );
+            }
+            replace_managed_definition(catalog, table_id, None);
             catalog
                 .hydrate_recovered_managed_definitions(descriptors)
                 .unwrap();
@@ -1956,6 +2044,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect managed drop interpretation made stale by a concurrent index create.
+    /// Expected: Drop reports a schema change without repeating interpretation or replacing the winner's definition.
     #[test]
     fn test_managed_drop_interpretation_becomes_stale_without_retry() {
         let root = TempDir::new().unwrap();
@@ -1975,6 +2065,7 @@ mod tests {
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let mut stale_model = model.clone();
+        let calls_before = stale_model.calls;
         stale_model.callback_gate = Some((entered.clone(), release.clone()));
         let mut stale_session = engine.new_session().unwrap();
         let stale = thread::spawn(move || {
@@ -1999,7 +2090,11 @@ mod tests {
             result.unwrap_err().engine().unwrap().operation_error(),
             Some(OperationError::SchemaChanged)
         );
-        assert_eq!(calls, model.calls);
+        assert_eq!(
+            calls,
+            calls_before + 1,
+            "stale drop must interpret only once"
+        );
         assert!(Arc::ptr_eq(
             &definition,
             &engine
@@ -2012,6 +2107,8 @@ mod tests {
         smol::block_on(assert_definition_model(&mut writer, table_id, &model));
     }
 
+    /// Purpose: Exclude direct catalog readers and history purge during managed definition publication.
+    /// Expected: Both callers wait until publication releases the gate and the final definition matches the model.
     #[test]
     fn test_managed_publication_excludes_direct_current_read_and_purge() {
         use crate::catalog::IndexDdlKind;
@@ -2094,6 +2191,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect missing or stale durable descriptor rows when reopening managed tables.
+    /// Expected: Cached reads remain valid before shutdown, but corrupted durable state prevents engine admission.
     #[test]
     fn test_managed_recovery_rejects_row_corruption_before_session_admission() {
         smol::block_on(async {
@@ -2160,107 +2259,78 @@ mod tests {
         });
     }
 
+    /// Purpose: Isolate simultaneous binding probe pauses for distinct bindings.
+    /// Expected: Each registered pause is reached and released independently.
     #[test]
     fn test_binding_probe_pauses_are_keyed() {
-        let first_namespace_id = BindingNamespaceID::new(90_200);
-        let second_namespace_id = BindingNamespaceID::new(90_201);
-        let (first_entered, first_release) =
-            install_binding_probe_pause(first_namespace_id, &b"first"[..]);
-        let (second_entered, second_release) =
-            install_binding_probe_pause(second_namespace_id, &b"second"[..]);
-
-        thread::scope(|scope| {
-            let first = scope.spawn(|| {
-                pause_after_binding_probe(first_namespace_id, b"first");
+        for (case, first_namespace, first_key, second_namespace, second_key) in [
+            (
+                "different keys",
+                90_200,
+                b"first".as_slice(),
+                90_200,
+                b"second".as_slice(),
+            ),
+            (
+                "different namespaces",
+                90_200,
+                b"shared".as_slice(),
+                90_201,
+                b"shared".as_slice(),
+            ),
+        ] {
+            let first_namespace = BindingNamespaceID::new(first_namespace);
+            let second_namespace = BindingNamespaceID::new(second_namespace);
+            let (first_entered, first_release) =
+                install_binding_probe_pause(first_namespace, first_key);
+            let (second_entered, second_release) =
+                install_binding_probe_pause(second_namespace, second_key);
+            thread::scope(|scope| {
+                let first = scope.spawn(|| pause_after_binding_probe(first_namespace, first_key));
+                let second =
+                    scope.spawn(|| pause_after_binding_probe(second_namespace, second_key));
+                first_entered
+                    .recv()
+                    .unwrap_or_else(|error| panic!("{case}: first pause: {error}"));
+                second_entered
+                    .recv()
+                    .unwrap_or_else(|error| panic!("{case}: second pause: {error}"));
+                first_release.send(()).unwrap();
+                first.join().unwrap();
+                second_release.send(()).unwrap();
+                second.join().unwrap();
             });
-            let second = scope.spawn(|| {
-                pause_after_binding_probe(second_namespace_id, b"second");
-            });
-
-            first_entered.recv().unwrap();
-            second_entered.recv().unwrap();
-            first_release.send(()).unwrap();
-            second_release.send(()).unwrap();
-            first.join().unwrap();
-            second.join().unwrap();
-        });
+        }
     }
 
+    /// Purpose: Clean up a binding-only probe cancelled during lock acquisition.
+    /// Expected: Cancellation removes every resolver claim while retaining the conflicting owner's lock.
     #[test]
     fn test_binding_probe_acquisition_cancellation_releases_every_claim() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let manager = engine.inner().core.lock_manager();
-            let blocker_owner = LockOwner::session_explicit(SessionID::new(90_100));
-            let mut blocker = TestLockOwner::new(blocker_owner);
-            blocker
-                .acquire(
-                    manager,
-                    LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
-                    LockMode::Exclusive,
-                )
-                .await
-                .unwrap();
-            let session = engine.new_session().unwrap();
-            let resolver_owner = LockOwner::session_explicit(session.id());
-            let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
-            let mut acquire = Box::pin(operation.acquire_table_binding_probe());
-
-            assert!(matches!(
-                futures::poll!(acquire.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(lock_entry_count(&engine, resolver_owner), 2);
-            drop(acquire);
-            assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
-            assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
-
-            drop(operation);
-            blocker.close(manager);
-        });
+        smol::block_on(assert_binding_acquisition_cancellation(
+            SessionID::new(90_100),
+            2,
+            SessionOperationPin::acquire_table_binding_probe,
+        ));
     }
 
+    /// Purpose: Clean up final binding resolution cancelled after acquiring target metadata claims.
+    /// Expected: Cancellation releases both target and binding claims without disturbing the blocker.
     #[test]
     fn test_binding_final_acquisition_cancellation_releases_every_claim() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let manager = engine.inner().core.lock_manager();
-            let blocker_owner = LockOwner::session_explicit(SessionID::new(90_101));
-            let mut blocker = TestLockOwner::new(blocker_owner);
-            blocker
-                .acquire(
-                    manager,
-                    LockResource::TableData(TABLE_ID_TABLE_BINDINGS),
-                    LockMode::Exclusive,
-                )
-                .await
-                .unwrap();
-            let session = engine.new_session().unwrap();
-            let resolver_owner = LockOwner::session_explicit(session.id());
-            let mut operation = session.pin_operation(SessionOperationKind::Ddl).unwrap();
-            let mut acquire =
-                Box::pin(operation.acquire_table_binding_resolution(TableID::new(90_102)));
-
-            assert!(matches!(
-                futures::poll!(acquire.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(lock_entry_count(&engine, resolver_owner), 3);
-            drop(acquire);
-            assert_eq!(lock_entry_count(&engine, resolver_owner), 0);
-            assert_eq!(lock_entry_count(&engine, blocker_owner), 1);
-
-            drop(operation);
-            blocker.close(manager);
-        });
+        smol::block_on(assert_binding_acquisition_cancellation(
+            SessionID::new(90_101),
+            3,
+            async |operation| {
+                operation
+                    .acquire_table_binding_resolution(TableID::new(90_102))
+                    .await
+            },
+        ));
     }
 
+    /// Purpose: Classify binding enumeration for a table identity that was never allocated.
+    /// Expected: Enumeration returns a table-not-found operation error.
     #[test]
     fn test_list_table_bindings_reports_unallocated_table_as_not_found() {
         smol::block_on(async {
@@ -2279,6 +2349,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve opaque descriptors and bindings throughout the managed DDL lifecycle.
+    /// Expected: Managed changes advance definitions, unmanaged index calls fail, and drop clears owned metadata.
     #[test]
     fn test_managed_ddl_round_trips_descriptor_and_rejects_unmanaged_index_changes() {
         smol::block_on(async {
@@ -2473,6 +2545,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Recover managed and unmanaged table distinctions with boundary-sized binding keys.
+    /// Expected: Restart preserves bindings and enforces the corresponding index DDL restrictions.
     #[test]
     fn test_table_definition_kind_survives_restart() {
         smol::block_on(async {
@@ -2595,6 +2669,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve managed table state when index interpretation returns a user error.
+    /// Expected: User errors retain their payload and leave the definition and next index allocation unchanged.
     #[test]
     fn test_managed_index_user_failures_preserve_definition_and_allocation() {
         smol::block_on(async {
@@ -2656,6 +2732,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject interpreter errors and invalid descriptor or binding inputs before managed creation.
+    /// Expected: Failures preserve table allocation and oversized binding lookups report invalid metadata.
     #[test]
     fn test_managed_create_interpreter_and_size_fail_before_table_id_allocation() {
         smol::block_on(async {
@@ -2756,6 +2834,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce binding uniqueness within a namespace during managed table creation.
+    /// Expected: A collision preserves the existing table and binding, while another namespace accepts the key.
     #[test]
     fn test_managed_create_binding_collision_is_atomic_and_namespace_local() {
         smol::block_on(async {
@@ -2819,9 +2899,25 @@ mod tests {
                 .unwrap()
                 .table_id();
             assert_ne!(second_id, first_id);
+            for (namespace, table_id, payload) in [(7, first_id, [1]), (8, second_id, [3])] {
+                let resolved = session
+                    .resolve_table_binding(BindingNamespaceID::new(namespace), b"shared", true)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(resolved.table_id(), table_id, "namespace={namespace}");
+                assert_eq!(
+                    resolved.full_schema().unwrap().descriptor(),
+                    payload,
+                    "namespace={namespace}"
+                );
+            }
+            assert_eq!(session.list_table_ids().unwrap(), [first_id, second_id]);
         });
     }
 
+    /// Purpose: Roll back managed table metadata after failures at staged creation boundaries.
+    /// Expected: Failed creation leaves no visible table, descriptor, or binding ownership.
     #[test]
     fn test_managed_create_failure_rolls_back_binding_definition_bundle() {
         for failure in [
@@ -2849,7 +2945,20 @@ mod tests {
                     .create_managed_table(b"create", &mut interpreter)
                     .await;
                 set_create_table_failure(&engine, None);
-                assert!(result.is_err());
+                let error = result.unwrap_err().into_engine().unwrap();
+                assert_eq!(
+                    error.kind(),
+                    ErrorKind::Runtime,
+                    "failure={failure:?}: {error:?}"
+                );
+                assert_eq!(
+                    error.report().downcast_ref::<RuntimeError>().copied(),
+                    Some(RuntimeError::CatalogAccess)
+                );
+                assert!(
+                    !user_table_file_exists(&engine, table_id),
+                    "failure={failure:?}: table file leaked"
+                );
                 assert!(
                     session
                         .engine()
@@ -2890,6 +2999,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Resolve concurrent managed creates that contend for the same binding.
+    /// Expected: One table owns the binding and the losing create leaves no metadata, bindings, or table file.
     #[test]
     fn test_concurrent_managed_create_binding_collision_has_one_clean_winner() {
         smol::block_on(async {
@@ -2994,6 +3105,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Detect existing binding rows that reference missing or unmanaged tables.
+    /// Expected: Resolution classifies invalid binding targets as data integrity failures.
     #[test]
     fn test_binding_resolution_classifies_existing_invalid_targets_as_integrity() {
         smol::block_on(async {
@@ -3049,6 +3162,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Revalidate a binding moved to a replacement table between resolution passes.
+    /// Expected: Resolution returns the replacement identity and descriptor instead of the stale candidate.
     #[test]
     fn test_binding_resolution_revalidates_after_drop_and_recreate() {
         smol::block_on(async {
@@ -3111,6 +3226,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Handle binding removal between the probe and final resolution passes.
+    /// Expected: Resolution reports absence and releases all resolver lock claims.
     #[test]
     fn test_binding_resolution_returns_none_after_drop_between_passes() {
         smol::block_on(async {
@@ -3160,6 +3277,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Separate cached managed reads from validation of corrupted durable descriptor stamps.
+    /// Expected: Cached reads preserve the definition while durable validation and checkpointing reject corruption.
     #[test]
     fn test_cached_definition_is_independent_of_corrupt_descriptor_rows() {
         smol::block_on(async {
@@ -3241,6 +3360,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Revalidate concurrent managed index interpretations before publication.
+    /// Expected: One create wins, the other reports schema change without reinvocation, and an explicit retry succeeds.
     #[test]
     fn test_concurrent_managed_create_index_returns_stale_without_reinvocation() {
         smol::block_on(async {

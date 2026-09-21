@@ -1691,7 +1691,7 @@ impl Session {
             .attach("operation=count_table_row_pages")
             .disclose()?;
         #[cfg(test)]
-        tests::run_test_total_row_pages_after_runtime_resolution_hook().await;
+        tests::run_test_total_row_pages_after_runtime_resolution_hook(table.session).await;
         table
             .table()
             .total_row_pages(table.pool_guards())
@@ -3880,7 +3880,6 @@ pub(crate) mod tests {
         DataIntegrityError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
     };
     use crate::io::install_storage_backend_test_hook;
-    use crate::lock::tests::LockDebugEntryState;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
     use crate::stats::{
@@ -3888,8 +3887,8 @@ pub(crate) mod tests {
         TransactionSystemStats,
     };
     use crate::table::tests::{
-        FailingFirstWriteHook, assert_freeze_created, has_lock_entry,
-        lightweight_test_engine_config, lock_entry_count, maintenance_lock_owner,
+        FailingFirstWriteHook, assert_freeze_created, lightweight_test_engine_config,
+        lock_entry_count,
     };
     use crate::trx::retention::{
         RedoTruncationBlocker, tests::install_redo_cleanup_before_unlink_hook,
@@ -3901,6 +3900,7 @@ pub(crate) mod tests {
     use crate::value::{Val, ValKind};
     use futures::task::noop_waker;
     use std::cell::RefCell;
+    use std::fmt::Debug;
     use std::fs;
     use std::future::Future;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -3963,8 +3963,9 @@ pub(crate) mod tests {
         }
     }
 
-    type TotalRowPagesAfterRuntimeResolutionHook =
-        Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static>;
+    type TotalRowPagesAfterRuntimeResolutionHook = Box<
+        dyn FnOnce(&SessionOperationPin) -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static,
+    >;
 
     thread_local! {
         static TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK:
@@ -4316,13 +4317,13 @@ pub(crate) mod tests {
 
     fn set_test_total_row_pages_after_runtime_resolution_hook<F, Fut>(hook: F)
     where
-        F: FnOnce() -> Fut + 'static,
+        F: FnOnce(&SessionOperationPin) -> Fut + 'static,
         Fut: Future<Output = ()> + 'static,
     {
         TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK.with(|slot| {
             let old = slot
                 .borrow_mut()
-                .replace(Box::new(move || Box::pin(hook())));
+                .replace(Box::new(move |operation| Box::pin(hook(operation))));
             assert!(
                 old.is_none(),
                 "total-row-pages runtime-resolution hook already installed"
@@ -4330,11 +4331,13 @@ pub(crate) mod tests {
         });
     }
 
-    pub(super) async fn run_test_total_row_pages_after_runtime_resolution_hook() {
+    pub(super) async fn run_test_total_row_pages_after_runtime_resolution_hook(
+        operation: &SessionOperationPin,
+    ) {
         let hook = TEST_TOTAL_ROW_PAGES_AFTER_RUNTIME_RESOLUTION_HOOK
             .with(|slot| slot.borrow_mut().take());
         if let Some(hook) = hook {
-            hook().await;
+            hook(operation).await;
         }
     }
 
@@ -4465,6 +4468,220 @@ pub(crate) mod tests {
         trx.commit().await.unwrap();
     }
 
+    async fn with_rotated_redo_table(
+        log_file_stem: &str,
+        target_file_seq: u32,
+        check: impl AsyncFnOnce(&Engine, &Path, TableID),
+    ) {
+        let root = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(redo_truncation_engine_config(root.path(), log_file_stem))
+            .await
+            .unwrap();
+        let table_id =
+            create_rotated_redo_table(&engine, root.path(), log_file_stem, target_file_seq).await;
+        check(&engine, root.path(), table_id).await;
+    }
+
+    async fn assert_redo_publication_failure<T: Debug>(
+        engine: &Engine,
+        main_dir: &Path,
+        log_file_stem: &str,
+        session: &mut Session,
+        operation: &'static str,
+        maintenance: impl AsyncFnOnce(&mut Session) -> Result<T>,
+    ) {
+        let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
+        assert_eq!(before.meta.first_redo_log_seq, 0);
+        let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
+        assert_eq!(plan.first_retained_file_seq, 0);
+        assert!(!plan.candidates.is_empty(), "{log_file_stem}: {plan:?}");
+        let candidate_paths = plan
+            .candidates
+            .iter()
+            .map(|candidate| redo_file_path(main_dir, log_file_stem, candidate.file_seq))
+            .collect::<Vec<_>>();
+        for path in &candidate_paths {
+            assert!(
+                path.exists(),
+                "candidate must exist before failure: {}",
+                path.display()
+            );
+        }
+
+        let publish_hook = Arc::new(FailingFirstWriteHook::new(
+            engine.inner().table_fs.catalog_mtb_file_path(),
+        ));
+        let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
+        let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
+            &engine.inner().maintenance_test,
+            Arc::new(move |file_seq, path| {
+                panic!(
+                    "{operation}: cleanup ran after publication failure: file_seq={file_seq}, path={}",
+                    path.display()
+                );
+            }),
+        );
+
+        let error = maintenance(session).await.unwrap_err();
+        let report = format!("{error:?}");
+        let context = format!("operation={operation}, phase=wait_mandatory_completion");
+        assert!(report.contains(&context), "{log_file_stem}: {report}");
+        assert_fatal_admission_error(error, FatalError::CheckpointWrite);
+        assert!(
+            publish_hook.call_count() > 0,
+            "{log_file_stem}: failure hook was not reached"
+        );
+        let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
+        assert_eq!(
+            after.catalog_replay_start_ts,
+            before.catalog_replay_start_ts
+        );
+        assert_eq!(
+            after.meta.first_redo_log_seq,
+            before.meta.first_redo_log_seq
+        );
+        for path in &candidate_paths {
+            assert!(
+                path.exists(),
+                "candidate must survive publication failure: {}",
+                path.display()
+            );
+        }
+    }
+
+    async fn publish_obsolete_redo_marker(
+        engine: &Engine,
+        main_dir: &Path,
+        log_file_stem: &str,
+    ) -> PathBuf {
+        engine
+            .inner()
+            .core
+            .catalog()
+            .storage
+            .publish_first_redo_log_seq(1)
+            .await
+            .unwrap();
+        let obsolete_path = redo_file_path(main_dir, log_file_stem, 0);
+        assert!(obsolete_path.exists());
+        obsolete_path
+    }
+
+    async fn assert_redo_cleanup_releases_catalog_gate(
+        engine: &Engine,
+        main_dir: &Path,
+        log_file_stem: &str,
+        maintenance: impl AsyncFnOnce(&mut Session) -> Result<RedoTruncationOutcome>,
+    ) {
+        let obsolete_path = publish_obsolete_redo_marker(engine, main_dir, log_file_stem).await;
+        let hook_called = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_called);
+        let hook_catalog = engine.inner().core.catalog.clone();
+        let hook_guard = install_redo_cleanup_before_unlink_hook(
+            &engine.inner().maintenance_test,
+            Arc::new(move |file_seq, _path| {
+                if file_seq != 0 {
+                    return;
+                }
+                hook_flag.store(true, Ordering::SeqCst);
+                let catalog = &*hook_catalog;
+                let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
+                let waker = noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                assert!(
+                    metadata_fut.as_mut().poll(&mut cx).is_ready(),
+                    "catalog gate should be released before redo cleanup"
+                );
+                catalog.release_index_metadata_change();
+            }),
+        );
+
+        let mut session = engine.new_session().unwrap();
+        let outcome = maintenance(&mut session).await.unwrap();
+        assert!(hook_called.load(Ordering::SeqCst));
+        assert_eq!(outcome.previous_first_retained_file_seq, 1);
+        assert_eq!(outcome.new_first_retained_file_seq, 1);
+        assert_eq!(outcome.advanced_files, 0);
+        assert_eq!(outcome.removed_files, 1);
+        assert_eq!(outcome.already_missing_files, 0);
+        assert_eq!(outcome.failed_unlink_files, 0);
+        assert!(!obsolete_path.exists());
+        drop(hook_guard);
+    }
+
+    async fn assert_redo_poison_after_gate_wait<T: Debug>(
+        engine: &Engine,
+        main_dir: &Path,
+        log_file_stem: &str,
+        maintenance: impl AsyncFnOnce(&mut Session) -> Result<T>,
+    ) {
+        let obsolete_path = publish_obsolete_redo_marker(engine, main_dir, log_file_stem).await;
+        let redo_retention_scope =
+            RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let state = engine
+            .inner()
+            .session_registry
+            .session_state(session_id)
+            .unwrap();
+        let mut maintenance_fut = Box::pin(maintenance(&mut session));
+        assert!(futures::poll!(maintenance_fut.as_mut()).is_pending());
+        let entry = active_operation_entry_for_test(&engine.inner().session_registry, session_id);
+        assert_eq!(
+            entry.inspect().state,
+            SessionOperationState::Voluntary(None)
+        );
+        assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
+        // Prove preparation reached retention admission after taking the catalog gate.
+        let mut catalog_acquire = Box::pin(CatalogCheckpointScope::acquire(
+            engine.inner().catalog.clone(),
+        ));
+        assert!(futures::poll!(catalog_acquire.as_mut()).is_pending());
+        drop(catalog_acquire);
+
+        let _ = engine
+            .inner()
+            .poisoner
+            .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
+        drop(redo_retention_scope);
+        assert_fatal_admission_error(maintenance_fut.await.unwrap_err(), FatalError::RedoWrite);
+        assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+        assert!(matches!(
+            state.lifecycle.lock().slot,
+            SessionOperationSlot::Idle
+        ));
+        assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
+        let mut catalog_acquire = Box::pin(CatalogCheckpointScope::acquire(
+            engine.inner().catalog.clone(),
+        ));
+        let Poll::Ready(catalog_scope) = futures::poll!(catalog_acquire.as_mut()) else {
+            panic!("failed preparation must release catalog checkpoint authority")
+        };
+        let mut redo_acquire =
+            Box::pin(RedoRetentionScope::acquire(engine.inner().trx_sys.clone()));
+        let Poll::Ready(redo_scope) = futures::poll!(redo_acquire.as_mut()) else {
+            panic!("failed preparation must release redo retention authority")
+        };
+        drop(catalog_scope);
+        drop(redo_scope);
+        assert!(
+            obsolete_path.exists(),
+            "obsolete redo file should survive poison"
+        );
+        assert_eq!(
+            engine
+                .inner()
+                .core
+                .catalog()
+                .storage
+                .checkpoint_snapshot()
+                .meta
+                .first_redo_log_seq,
+            1
+        );
+    }
+
     async fn create_cache_test_table(session: &mut Session) -> TableID {
         session
             .create_table(
@@ -4512,6 +4729,45 @@ pub(crate) mod tests {
         drop(state);
         drop(seed);
         synthetic
+    }
+
+    fn new_active_transaction_state_for_test(
+        engine: &Engine,
+        session_id: SessionID,
+        trx_id: TrxID,
+    ) -> (Arc<SessionState>, Arc<SessionOperationEntry>) {
+        let state = Arc::new(new_session_state_for_test(engine, session_id));
+        let key = SessionOperationKey::new(session_id, OperationID::new(1));
+        let entry = SessionOperationEntry::new_public_transaction(
+            key,
+            Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
+        );
+        state.lifecycle.lock().slot =
+            SessionOperationSlot::Active(ActiveSessionOperation::Operation(Arc::clone(&entry)));
+        (state, entry)
+    }
+
+    async fn assert_maintenance_requires_idle<T: Debug>(
+        maintenance: impl AsyncFnOnce(&mut Session) -> Result<T>,
+    ) {
+        let root = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+            .await
+            .unwrap();
+        let mut session = engine.new_session().unwrap();
+        let trx = session.begin_trx().unwrap();
+        let entry = active_operation_entry_for_test(&engine.inner().session_registry, session.id());
+        let before = entry.inspect();
+
+        let error = maintenance(&mut session).await.unwrap_err();
+        assert_existing_transaction_error(&error, session.id(), trx.trx_id(), "voluntary");
+        assert_eq!(entry.inspect(), before);
+        assert!(Arc::ptr_eq(
+            &active_operation_entry_for_test(&engine.inner().session_registry, session.id()),
+            &entry,
+        ));
+        trx.rollback().await.unwrap();
+        assert!(!session.in_trx().unwrap());
     }
 
     #[inline]
@@ -4626,6 +4882,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect session admission while a public transaction is active.
+    /// Expected: Observers remain available and effectful calls report the owning transaction.
     #[test]
     fn test_active_transaction_allows_observers_and_rejects_effectful_operations() {
         smol::block_on(async {
@@ -4740,6 +4998,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep observer registration independent of the active operation slot.
+    /// Expected: Observer counts follow pin lifetimes without changing operation identity or allocation.
     #[test]
     fn test_observer_registration_counts_without_consuming_operation_slot() {
         smol::block_on(async {
@@ -4787,6 +5047,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Isolate observer accounting between sessions.
+    /// Expected: Releasing one session's observer leaves another session's count unchanged.
     #[test]
     fn test_observer_counts_are_session_local() {
         smol::block_on(async {
@@ -4820,6 +5082,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve an observed session through explicit close.
+    /// Expected: Close rejects new observers and registry removal waits for the final observer.
     #[test]
     fn test_close_retains_observed_session_until_final_observer_drop() {
         smol::block_on(async {
@@ -4860,6 +5124,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve observer ownership after session abandonment and transaction rollback.
+    /// Expected: The closed session remains registered until its final observer is released.
     #[test]
     fn test_abandonment_and_terminal_operation_retain_observed_session() {
         smol::block_on(async {
@@ -4900,6 +5166,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prioritize shutdown blockers when a session owns an operation and observers.
+    /// Expected: The operation is reported first, then observers, until both lifetimes end.
     #[test]
     fn test_shutdown_reports_operation_before_observers_on_same_session() {
         smol::block_on(async {
@@ -4927,6 +5195,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown notification around the final observer release.
+    /// Expected: Registered listeners wake and a scan after release finds no blocker.
     #[test]
     fn test_observer_shutdown_wait_is_woken_by_exact_release() {
         smol::block_on(async {
@@ -4965,6 +5235,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Retain shutdown admission while an upgraded session runtime is held.
+    /// Expected: Shutdown cannot complete until the admitted runtime is released.
     #[test]
     fn test_admitted_session_runtime_holds_admission_until_drop() {
         smol::block_on(async {
@@ -5002,16 +5274,22 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect normal observer admission racing with engine shutdown.
+    /// Expected: Either shutdown rejects the observer or the registered observer blocks shutdown.
     #[test]
     fn test_normal_observer_admission_race_registers_or_rejects() {
         run_observer_admission_shutdown_race(false);
     }
 
+    /// Purpose: Protect inspection admission racing with shutdown after engine poison.
+    /// Expected: Inspection either blocks shutdown as an observer or receives a shutdown rejection.
     #[test]
     fn test_poison_tolerant_inspection_race_registers_or_rejects() {
         run_observer_admission_shutdown_race(true);
     }
 
+    /// Purpose: Keep a user table's active insert page in its session cache entry.
+    /// Expected: Loading transfers the cached page and saving restores it without losing the table.
     #[test]
     fn test_session_table_cache_owns_active_user_insert_page() {
         smol::block_on(async {
@@ -5060,6 +5338,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share catalog insert pages across sessions.
+    /// Expected: Later catalog inserts reuse pages without populating session table caches.
     #[test]
     fn test_catalog_insert_pages_use_shared_free_list() {
         smol::block_on(async {
@@ -5111,6 +5391,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Separate pool keepalive roots by session while sharing the underlying pools.
+    /// Expected: Same-session clones share roots, while other sessions and engine guards do not.
     #[test]
     fn test_sessions_use_independent_pool_guard_arc_roots() {
         smol::block_on(async {
@@ -5159,6 +5441,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Identify abandoned transaction cleanup during shutdown inspection.
+    /// Expected: The cleanup claim retains the exact operation, transaction, and session runtime.
     #[test]
     fn test_shutdown_inspection_collects_exact_claimable_transaction() {
         smol::block_on(async {
@@ -5168,19 +5452,12 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
-            let entry = SessionOperationEntry::new_public_transaction(
-                key,
-                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-            );
+            let (state, entry) = new_active_transaction_state_for_test(&engine, session_id, trx_id);
             assert!(entry.abandon_transaction(trx_id));
             {
                 let mut lifecycle = state.lifecycle.lock();
                 lifecycle.disposition = SessionDisposition::Abandoned;
-                lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(
-                    Arc::clone(&entry),
-                ));
             }
 
             let blocker = state
@@ -5196,6 +5473,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve failed retained operations during shutdown inspection.
+    /// Expected: The operation remains a shutdown blocker without becoming claimable cleanup.
     #[test]
     fn test_shutdown_inspection_keeps_failed_retained_operation_active() {
         smol::block_on(async {
@@ -5205,19 +5484,11 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = Arc::new(new_session_state_for_test(&engine, session_id));
-            let key = SessionOperationKey::new(session_id, OperationID::new(1));
-            let entry = SessionOperationEntry::new_public_transaction(
-                key,
-                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-            );
+            let (state, entry) = new_active_transaction_state_for_test(&engine, session_id, trx_id);
             entry.fail_retained();
             {
                 let mut lifecycle = state.lifecycle.lock();
                 lifecycle.disposition = SessionDisposition::Abandoned;
-                lifecycle.slot = SessionOperationSlot::Active(ActiveSessionOperation::Operation(
-                    Arc::clone(&entry),
-                ));
             }
 
             let blocker = state
@@ -5232,6 +5503,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prevent lost shutdown notifications when transaction abandonment follows inspection.
+    /// Expected: The installed listener observes the transition to claimable cleanup.
     #[test]
     fn test_shutdown_wait_installs_listener_before_transition() {
         smol::block_on(async {
@@ -5241,14 +5514,8 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
-            let entry = SessionOperationEntry::new_public_transaction(
-                key,
-                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-            );
-            state.lifecycle.lock().slot =
-                SessionOperationSlot::Active(ActiveSessionOperation::Operation(Arc::clone(&entry)));
+            let (state, entry) = new_active_transaction_state_for_test(&engine, session_id, trx_id);
 
             let shutdown_wait = state
                 .shutdown_wait()
@@ -5263,6 +5530,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Notify every shutdown waiter of a session operation transition.
+    /// Expected: Transaction abandonment wakes all listeners installed on the session.
     #[test]
     fn test_session_change_wakes_all_installed_listeners() {
         smol::block_on(async {
@@ -5272,14 +5541,8 @@ pub(crate) mod tests {
                 .unwrap();
             let session_id = SessionID::new(1);
             let trx_id = MIN_ACTIVE_TRX_ID;
-            let state = Arc::new(new_session_state_for_test(&engine, session_id));
             let key = SessionOperationKey::new(session_id, OperationID::new(1));
-            let entry = SessionOperationEntry::new_public_transaction(
-                key,
-                Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-            );
-            state.lifecycle.lock().slot =
-                SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
+            let (state, entry) = new_active_transaction_state_for_test(&engine, session_id, trx_id);
 
             let first = state
                 .shutdown_wait()
@@ -5290,9 +5553,12 @@ pub(crate) mod tests {
             assert!(state.abandon_trx_handle(key, trx_id));
 
             futures::join!(first.listener, second.listener);
+            assert_eq!(entry.inspect().state, SessionOperationState::CleanupReady);
         });
     }
 
+    /// Purpose: Keep registry shutdown listener installation lazy across blocked sessions.
+    /// Expected: A scan returns a valid cleanup claim and arms only its selected blocker.
     #[test]
     fn test_registry_shutdown_wait_arms_only_first_blocker() {
         smol::block_on(async {
@@ -5306,18 +5572,13 @@ pub(crate) mod tests {
             for raw_id in 1..=2 {
                 let session_id = SessionID::new(raw_id);
                 let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
-                let state = Arc::new(new_session_state_for_test(&engine, session_id));
                 let key = SessionOperationKey::new(session_id, OperationID::new(1));
-                let entry = SessionOperationEntry::new_public_transaction(
-                    key,
-                    Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-                );
+                let (state, entry) =
+                    new_active_transaction_state_for_test(&engine, session_id, trx_id);
                 assert!(entry.abandon_transaction(trx_id));
                 {
                     let mut lifecycle = state.lifecycle.lock();
                     lifecycle.disposition = SessionDisposition::Abandoned;
-                    lifecycle.slot =
-                        SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
                 }
                 expected_cleanup.push((key, trx_id));
                 states.push(Arc::clone(&state));
@@ -5343,6 +5604,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Guard registry removal against a replacement with the same session identity.
+    /// Expected: Removing stale runtime state preserves the distinct replacement allocation.
     #[test]
     fn test_cold_removal_preserves_pointer_distinct_replacement() {
         smol::block_on(async {
@@ -5382,6 +5645,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Drain a registry of shutdown blockers through successive lazy scans.
+    /// Expected: Each pass arms one new blocker and completed sessions never block later passes.
     #[test]
     fn test_registry_shutdown_wait_lazily_drains_many_blockers() {
         smol::block_on(async {
@@ -5396,18 +5661,12 @@ pub(crate) mod tests {
             for raw_id in 1..=SESSION_COUNT {
                 let session_id = SessionID::new(raw_id);
                 let trx_id = TrxID::new(MIN_ACTIVE_TRX_ID.as_u64() + raw_id);
-                let state = Arc::new(new_session_state_for_test(&engine, session_id));
-                let key = SessionOperationKey::new(session_id, OperationID::new(1));
-                let entry = SessionOperationEntry::new_public_transaction(
-                    key,
-                    Box::new(trx_inner(trx_id, MIN_SNAPSHOT_TS, 0, session_id)),
-                );
+                let (state, entry) =
+                    new_active_transaction_state_for_test(&engine, session_id, trx_id);
                 assert!(entry.abandon_transaction(trx_id));
                 {
                     let mut lifecycle = state.lifecycle.lock();
                     lifecycle.disposition = SessionDisposition::Abandoned;
-                    lifecycle.slot =
-                        SessionOperationSlot::Active(ActiveSessionOperation::Operation(entry));
                 }
                 states.push(Arc::clone(&state));
                 registry.insert(state);
@@ -5454,6 +5713,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep a nonwaiting shutdown probe free of listener allocation.
+    /// Expected: The active operation is detected without creating a session change event.
     #[test]
     fn test_shutdown_probe_does_not_install_listener() {
         smol::block_on(async {
@@ -5482,6 +5743,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Share a session's operation sequence across transaction, DDL, and maintenance kinds.
+    /// Expected: Successive operations retain the session identity and advance one common sequence.
     #[test]
     fn test_session_operation_ids_are_local_monotonic_and_kind_independent() {
         smol::block_on(async {
@@ -5543,6 +5806,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Transfer an admitted operation into mandatory completion ownership.
+    /// Expected: Identity survives the transfer and completion selects terminal or failed retained state.
     #[test]
     fn test_operation_pin_consumes_into_mandatory_terminal_authority() {
         smol::block_on(async {
@@ -5581,6 +5846,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Distinguish operation identities reused by different sessions.
+    /// Expected: Equal local operation sequences still produce distinct operation keys and lock owners.
     #[test]
     fn test_equal_raw_operation_ids_are_isolated_by_session_family() {
         smol::block_on(async {
@@ -5609,6 +5876,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject a lock scope belonging to another operation in the same session family.
+    /// Expected: Lock access panics with diagnostics identifying the mismatched operation and owner.
     #[test]
     fn test_lock_parts_reject_wrong_same_family_operation_scope() {
         smol::block_on(async {
@@ -5642,6 +5911,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect operation reservation at sequence exhaustion.
+    /// Expected: Exhaustion panics without advancing the sequence or occupying the operation slot.
     #[test]
     fn test_operation_id_exhaustion_panics_before_reservation() {
         smol::block_on(async {
@@ -5673,6 +5944,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Isolate sequential private transactions inside one mandatory operation.
+    /// Expected: Private lifetimes preserve the outer entry and public cache while rejecting nested begin.
     #[test]
     fn test_mandatory_private_transaction_preserves_stable_entry_and_public_cache() {
         smol::block_on(async {
@@ -5805,6 +6078,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Avoid notification allocation for unobserved transaction and statement transitions.
+    /// Expected: Statement execution, rollback, and empty commit leave the change event unallocated.
     #[test]
     fn test_unobserved_transaction_and_statement_transitions_are_silent() {
         smol::block_on(async {
@@ -5832,6 +6107,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Diagnose admission conflicts with an active maintenance operation.
+    /// Expected: Rejections identify the owning operation and closing succeeds after its release.
     #[test]
     fn test_existing_operation_reports_exact_coordinator_identity() {
         smol::block_on(async {
@@ -5870,6 +6147,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Expose user table identities through session catalog inspection.
+    /// Expected: An empty catalog yields no identities and created tables appear in sorted order.
     #[test]
     fn test_session_list_table_ids_empty_and_sorted() {
         smol::block_on(async {
@@ -5891,26 +6170,17 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject catalog checkpoint admission during a session transaction.
+    /// Expected: The call reports an existing transaction and leaves it available for rollback.
     #[test]
     fn test_session_checkpoint_catalog_requires_idle_session() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let trx = session.begin_trx().unwrap();
-
-            let err = session.checkpoint_catalog().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::ExistingTransaction)
-            );
-
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_maintenance_requires_idle(
+            Session::checkpoint_catalog,
+        ));
     }
 
+    /// Purpose: Retain a resolved table runtime while counting its row pages.
+    /// Expected: Concurrent table drop waits until the count releases its runtime ownership.
     #[test]
     fn test_total_row_pages_session_table_blocks_drop_until_runtime_release() {
         smol::block_on(async {
@@ -5925,7 +6195,7 @@ pub(crate) mod tests {
             let mut count_session = engine.new_session().unwrap();
             let (entered_tx, entered_rx) = flume::bounded(1);
             let (release_tx, release_rx) = flume::bounded(1);
-            set_test_total_row_pages_after_runtime_resolution_hook(move || async move {
+            set_test_total_row_pages_after_runtime_resolution_hook(move |_| async move {
                 entered_tx.send_async(()).await.unwrap();
                 release_rx.recv_async().await.unwrap();
             });
@@ -5947,6 +6217,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve maintenance ownership when the session already holds an explicit table lock.
+    /// Expected: Maintenance retains its own claims and releases them without disturbing explicit locks.
     #[test]
     fn test_explicit_table_lock_retains_separate_maintenance_claim() {
         smol::block_on(async {
@@ -5967,61 +6239,88 @@ pub(crate) mod tests {
                 let explicit_owner = LockOwner::session_explicit(session_id);
                 session.lock_table(table_id, table_mode).await.unwrap();
 
+                let claims = [
+                    (
+                        LockResource::TableMetadata(table_id),
+                        LockMode::Shared,
+                        LockMode::Shared,
+                    ),
+                    (
+                        LockResource::TableData(table_id),
+                        explicit_data_mode,
+                        LockMode::IntentShared,
+                    ),
+                ];
                 let (entered_tx, entered_rx) = flume::bounded(1);
                 let (release_tx, release_rx) = flume::bounded(1);
-                set_test_total_row_pages_after_runtime_resolution_hook(move || async move {
-                    entered_tx.send_async(()).await.unwrap();
-                    release_rx.recv_async().await.unwrap();
+                set_test_total_row_pages_after_runtime_resolution_hook(move |operation| {
+                    let maintenance_owner = LockOwner::operation(operation.key());
+                    assert_ne!(maintenance_owner, explicit_owner);
+                    assert_eq!(maintenance_owner.family(), explicit_owner.family());
+                    let scope = operation.curr_scope.as_ref().unwrap();
+                    assert_eq!(scope.owner(), maintenance_owner);
+                    let family = operation.authority.as_ref().unwrap().family();
+                    // Physical manager entries aggregate a whole family, so inspect
+                    // both owner-side indexes to prove that maintenance has its own claims.
+                    for (resource, explicit_mode, maintenance_mode) in claims {
+                        assert!(
+                            family.scope_covers(explicit_owner, resource, explicit_mode),
+                            "explicit claim missing: resource={resource}, table_mode={table_mode:?}"
+                        );
+                        assert!(
+                            family.scope_covers(maintenance_owner, resource, maintenance_mode),
+                            "maintenance claim missing: resource={resource}, table_mode={table_mode:?}"
+                        );
+                        assert!(
+                            scope.covers(resource, maintenance_mode),
+                            "maintenance cleanup index missing: resource={resource}, table_mode={table_mode:?}"
+                        );
+                    }
+                    async move {
+                        entered_tx.send_async(maintenance_owner).await.unwrap();
+                        release_rx.recv_async().await.unwrap();
+                    }
                 });
 
                 let mut count = Box::pin(session.total_row_pages(table_id));
                 assert!(futures::poll!(count.as_mut()).is_pending());
-                entered_rx.recv_async().await.unwrap();
-
-                let metadata = LockResource::TableMetadata(table_id);
-                let data = LockResource::TableData(table_id);
-                let maintenance_owner = maintenance_lock_owner(
-                    &engine,
-                    session_id,
-                    metadata,
-                    LockMode::Shared,
-                    LockDebugEntryState::Granted,
-                )
-                .expect("maintenance owner should retain metadata S");
-                assert_eq!(maintenance_owner.family(), explicit_owner.family());
-                assert!(has_lock_entry(
-                    &engine,
-                    explicit_owner,
-                    metadata,
-                    LockMode::Shared,
-                    LockDebugEntryState::Granted,
-                ));
-                assert!(has_lock_entry(
-                    &engine,
-                    explicit_owner,
-                    data,
-                    explicit_data_mode,
-                    LockDebugEntryState::Granted,
-                ));
-                assert!(has_lock_entry(
-                    &engine,
-                    maintenance_owner,
-                    data,
-                    explicit_data_mode,
-                    LockDebugEntryState::Granted,
-                ));
+                let maintenance_owner = entered_rx.recv_async().await.unwrap();
+                assert_eq!(lock_entry_count(&engine, explicit_owner), 2);
 
                 release_tx.send_async(()).await.unwrap();
                 assert_eq!(count.await.unwrap(), 0);
-                assert_eq!(lock_entry_count(&engine, maintenance_owner), 2);
+                let state = engine
+                    .inner()
+                    .session_registry
+                    .session_state(session_id)
+                    .unwrap();
+                {
+                    let lifecycle = state.lifecycle.lock();
+                    assert!(matches!(lifecycle.slot, SessionOperationSlot::Idle));
+                    let family = lifecycle.lock_authority.as_ref().unwrap().family();
+                    for (resource, explicit_mode, maintenance_mode) in claims {
+                        assert!(
+                            family.scope_covers(explicit_owner, resource, explicit_mode),
+                            "explicit claim lost: resource={resource}, table_mode={table_mode:?}"
+                        );
+                        assert!(
+                            !family.scope_covers(maintenance_owner, resource, maintenance_mode),
+                            "maintenance claim leaked: resource={resource}, table_mode={table_mode:?}"
+                        );
+                    }
+                }
                 assert_eq!(lock_entry_count(&engine, explicit_owner), 2);
 
                 session.unlock_table(table_id).unwrap();
+                assert_eq!(lock_entry_count(&engine, explicit_owner), 0);
+                drop(state);
                 engine.shutdown();
             }
         });
     }
 
+    /// Purpose: Cancel a queued explicit table lock when the engine becomes poisoned.
+    /// Expected: The fatal cause survives and waiter claims are released without disturbing the blocker.
     #[test]
     fn test_queued_explicit_lock_poison_returns_fatal_and_rolls_back_prefix() {
         smol::block_on(async {
@@ -6060,6 +6359,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allow maintenance progress observation alongside an active session transaction.
+    /// Expected: Waits observe progress beyond the target without consuming or ending the transaction.
     #[test]
     fn test_session_maintenance_progress_waits_are_observers() {
         smol::block_on(async {
@@ -6106,6 +6407,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve poison diagnostics at maintenance progress wait boundaries.
+    /// Expected: Wait failures retain their fatal cause and identify the boundary and target.
     #[test]
     fn test_maintenance_progress_wait_poison_reports_boundary_context() {
         smol::block_on(async {
@@ -6121,9 +6424,9 @@ pub(crate) mod tests {
                 .poisoner
                 .poison(Report::new(FatalError::RedoWrite).attach("maintenance wait poison"));
 
-            for boundary in [
-                MaintenanceBoundary::GcHorizon,
-                MaintenanceBoundary::PurgeCompletion,
+            for (boundary, expected_name) in [
+                (MaintenanceBoundary::GcHorizon, "GC horizon"),
+                (MaintenanceBoundary::PurgeCompletion, "purge completion"),
             ] {
                 let error = wait_for_maintenance_boundary(&observer, target, boundary)
                     .await
@@ -6138,14 +6441,15 @@ pub(crate) mod tests {
                 assert!(error.downcast_ref::<LifecycleError>().is_none());
                 let report = format!("{error:?}");
                 let expected = format!(
-                    "maintenance progress wait observed engine poison: boundary={}, target_ts={target}",
-                    boundary.name()
+                    "maintenance progress wait observed engine poison: boundary={expected_name}, target_ts={target}"
                 );
                 assert!(report.contains(&expected), "{report}");
             }
         });
     }
 
+    /// Purpose: Persist catalog state through the session checkpoint API.
+    /// Expected: Checkpointing advances retention progress and the table remains available after restart.
     #[test]
     fn test_session_checkpoint_catalog_persists_catalog_state() {
         smol::block_on(async {
@@ -6188,49 +6492,24 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject redo truncation admission during a session transaction.
+    /// Expected: Truncation reports an existing transaction and leaves it available for rollback.
     #[test]
     fn test_session_truncate_redo_log_requires_idle_session() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let trx = session.begin_trx().unwrap();
-
-            let err = session.truncate_redo_log().await.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::ExistingTransaction)
-            );
-
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_maintenance_requires_idle(Session::truncate_redo_log));
     }
 
+    /// Purpose: Reject combined catalog and redo maintenance during a session transaction.
+    /// Expected: Combined maintenance reports an existing transaction that can still be rolled back.
     #[test]
     fn test_session_combined_catalog_redo_maintenance_requires_idle_session() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-            let trx = session.begin_trx().unwrap();
-
-            let err = session
-                .checkpoint_catalog_and_truncate_redo_log()
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<LifecycleError>().copied(),
-                Some(LifecycleError::ExistingTransaction)
-            );
-
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_maintenance_requires_idle(
+            Session::checkpoint_catalog_and_truncate_redo_log,
+        ));
     }
 
+    /// Purpose: Combine catalog checkpoint publication with redo retention advancement.
+    /// Expected: Published metadata matches truncation, obsolete files disappear, and restart recovers the table.
     #[test]
     fn test_session_combined_catalog_redo_maintenance_publishes_checkpoint_and_marker() {
         smol::block_on(async {
@@ -6300,6 +6579,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Advance redo retention when combined maintenance needs no new catalog checkpoint.
+    /// Expected: The retention marker advances while the catalog replay boundary remains unchanged.
     #[test]
     fn test_session_combined_catalog_redo_maintenance_marker_only_after_checkpoint() {
         smol::block_on(async {
@@ -6340,6 +6621,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Include pending silent checkpoint watermarks in combined redo retention planning.
+    /// Expected: Combined publication installs the new watermark and reports its floor as the blocker.
     #[test]
     fn test_session_combined_uses_projected_silent_watermark_for_truncation() {
         smol::block_on(async {
@@ -6356,7 +6639,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             session.checkpoint_catalog().await.unwrap();
 
-            let checkpoint = session.checkpoint_table(table_id).await.unwrap();
+            let checkpoint = session.checkpoint_table_with_wait(table_id).await.unwrap();
             assert!(
                 matches!(
                     checkpoint,
@@ -6450,320 +6733,109 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect redo files when combined catalog checkpoint publication fails.
+    /// Expected: Failure remains fatal and preserves the prior checkpoint, retention marker, and files.
     #[test]
     fn test_session_combined_checkpoint_publish_failure_does_not_unlink() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_combined_checkpoint_fail";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
-            let mut session = engine.new_session().unwrap();
-            session.checkpoint_catalog().await.unwrap();
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert_eq!(before.meta.first_redo_log_seq, 0);
-            let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
-            assert_eq!(plan.first_retained_file_seq, 0);
-            assert!(!plan.candidates.is_empty(), "{plan:?}");
-            let candidate_paths = plan
-                .candidates
-                .iter()
-                .map(|candidate| redo_file_path(&main_dir, log_file_stem, candidate.file_seq))
-                .collect::<Vec<_>>();
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "test setup candidate redo file should exist before checkpoint failure: {}",
-                    path.display()
-                );
-            }
-
-            let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
-            let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
-            let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
-                &engine.inner().maintenance_test,
-                Arc::new(|file_seq, path| {
-                    panic!(
-                        "redo cleanup must not run after combined checkpoint failure: file_seq={file_seq}, path={}",
-                        path.display()
-                    );
-                }),
-            );
-
-            let err = session
-                .checkpoint_catalog_and_truncate_redo_log()
-                .await
-                .unwrap_err();
-
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::CheckpointWrite)
-            );
-            let report = format!("{err:?}");
-            assert!(
-                report.contains(
-                    "operation=checkpoint_catalog_and_truncate_redo_log, phase=wait_mandatory_completion"
-                ),
-                "{report}"
-            );
-            assert!(publish_hook.call_count() > 0);
-            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert_eq!(
-                after.catalog_replay_start_ts,
-                before.catalog_replay_start_ts
-            );
-            assert_eq!(after.meta.first_redo_log_seq, 0);
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "candidate redo file should remain after checkpoint failure: {}",
-                    path.display()
-                );
-            }
-        });
+        let log_file_stem = "redo_combined_checkpoint_fail";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            2,
+            async |engine, main_dir, table_id| {
+                let mut session = engine.new_session().unwrap();
+                session.checkpoint_catalog().await.unwrap();
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                assert_redo_publication_failure(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    &mut session,
+                    "checkpoint_catalog_and_truncate_redo_log",
+                    Session::checkpoint_catalog_and_truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Protect redo files when combined maintenance fails to publish only the retention marker.
+    /// Expected: The fatal publication failure leaves catalog metadata and candidate files unchanged.
     #[test]
     fn test_session_combined_marker_only_publish_failure_does_not_unlink() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_combined_marker_fail";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
-            let mut session = engine.new_session().unwrap();
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-            commit_redo_durability_anchor(&mut session, table_id).await;
-            session.checkpoint_catalog().await.unwrap();
-
-            let before = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert_eq!(before.meta.first_redo_log_seq, 0);
-            let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
-            assert_eq!(plan.first_retained_file_seq, 0);
-            assert!(!plan.candidates.is_empty(), "{plan:?}");
-            let candidate_paths = plan
-                .candidates
-                .iter()
-                .map(|candidate| redo_file_path(&main_dir, log_file_stem, candidate.file_seq))
-                .collect::<Vec<_>>();
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "test setup candidate redo file should exist before marker failure: {}",
-                    path.display()
-                );
-            }
-
-            let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
-            let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
-            let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
-                &engine.inner().maintenance_test,
-                Arc::new(|file_seq, path| {
-                    panic!(
-                        "redo cleanup must not run after combined marker failure: file_seq={file_seq}, path={}",
-                        path.display()
-                    );
-                }),
-            );
-
-            let err = session
-                .checkpoint_catalog_and_truncate_redo_log()
-                .await
-                .unwrap_err();
-
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::CheckpointWrite)
-            );
-            assert!(publish_hook.call_count() > 0);
-            let after = engine.inner().core.catalog().storage.checkpoint_snapshot();
-            assert_eq!(
-                after.catalog_replay_start_ts,
-                before.catalog_replay_start_ts
-            );
-            assert_eq!(after.meta.first_redo_log_seq, 0);
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "candidate redo file should remain after marker failure: {}",
-                    path.display()
-                );
-            }
-        });
+        let log_file_stem = "redo_combined_marker_fail";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            2,
+            async |engine, main_dir, table_id| {
+                let mut session = engine.new_session().unwrap();
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                commit_redo_durability_anchor(&mut session, table_id).await;
+                session.checkpoint_catalog().await.unwrap();
+                assert_redo_publication_failure(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    &mut session,
+                    "checkpoint_catalog_and_truncate_redo_log",
+                    Session::checkpoint_catalog_and_truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Release catalog authority before combined maintenance unlinks obsolete redo files.
+    /// Expected: Cleanup permits metadata gate acquisition and removes files below the existing marker.
     #[test]
     fn test_session_combined_releases_catalog_gate_before_cleanup() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_combined_cleanup_gate";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
-            let mut setup_session = engine.new_session().unwrap();
-            setup_session.checkpoint_catalog().await.unwrap();
-            engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .publish_first_redo_log_seq(1)
-                .await
-                .unwrap();
-            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
-            assert!(obsolete_path.exists());
-
-            let hook_called = Arc::new(AtomicBool::new(false));
-            let hook_flag = Arc::clone(&hook_called);
-            let hook_catalog = engine.inner().core.catalog.clone();
-            let hook_guard = install_redo_cleanup_before_unlink_hook(
-                &engine.inner().maintenance_test,
-                Arc::new(move |file_seq, _path| {
-                    if file_seq != 0 {
-                        return;
-                    }
-                    hook_flag.store(true, Ordering::SeqCst);
-                    let catalog = &*hook_catalog;
-                    let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
-                    let waker = noop_waker();
-                    let mut cx = Context::from_waker(&waker);
-                    match metadata_fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(()) => {}
-                        Poll::Pending => {
-                            panic!("catalog gate should be released before redo cleanup")
-                        }
-                    }
-                    catalog.release_index_metadata_change();
-                }),
-            );
-
-            let mut session = engine.new_session().unwrap();
-            let outcome = session
-                .checkpoint_catalog_and_truncate_redo_log()
-                .await
-                .unwrap();
-
-            assert!(hook_called.load(Ordering::SeqCst));
-            assert_eq!(outcome.catalog_checkpoint, CatalogCheckpointOutcome::Noop);
-            assert_eq!(outcome.redo_truncation.previous_first_retained_file_seq, 1);
-            assert_eq!(outcome.redo_truncation.new_first_retained_file_seq, 1);
-            assert_eq!(outcome.redo_truncation.advanced_files, 0);
-            assert_eq!(outcome.redo_truncation.removed_files, 1);
-            assert_eq!(outcome.redo_truncation.failed_unlink_files, 0);
-            assert!(!obsolete_path.exists());
-            drop(hook_guard);
-        });
+        let log_file_stem = "redo_combined_cleanup_gate";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            1,
+            async |engine, main_dir, _table_id| {
+                let mut setup_session = engine.new_session().unwrap();
+                setup_session.checkpoint_catalog().await.unwrap();
+                assert_redo_cleanup_releases_catalog_gate(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    async |session| {
+                        let outcome = session.checkpoint_catalog_and_truncate_redo_log().await?;
+                        assert_eq!(outcome.catalog_checkpoint, CatalogCheckpointOutcome::Noop);
+                        Ok(outcome.redo_truncation)
+                    },
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Recheck engine health after combined maintenance waits for retention authority.
+    /// Expected: Poison aborts preparation, releases operation and gate ownership, and preserves redo files.
     #[test]
     fn test_session_combined_rechecks_poison_after_gate_wait() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_combined_poison_wait";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
-            let mut setup_session = engine.new_session().unwrap();
-            setup_session.checkpoint_catalog().await.unwrap();
-            engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .publish_first_redo_log_seq(1)
-                .await
-                .unwrap();
-            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
-            assert!(obsolete_path.exists());
-
-            let redo_retention_scope =
-                RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
-            let mut session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let state = engine
-                .inner()
-                .session_registry
-                .session_state(session_id)
-                .unwrap();
-            let mut maintenance_fut = Box::pin(session.checkpoint_catalog_and_truncate_redo_log());
-
-            assert!(matches!(
-                futures::poll!(maintenance_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-            let entry =
-                active_operation_entry_for_test(&engine.inner().session_registry, session_id);
-            assert_eq!(
-                entry.inspect().state,
-                SessionOperationState::Voluntary(None)
-            );
-            assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
-
-            let _ = engine
-                .inner()
-                .poisoner
-                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
-            drop(redo_retention_scope);
-
-            let err = maintenance_fut.await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RedoWrite)
-            );
-            assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
-            assert!(matches!(
-                state.lifecycle.lock().slot,
-                SessionOperationSlot::Idle
-            ));
-            assert_eq!(engine.inner().mandatory_runtime.blocker_counts(), (0, 0));
-            let mut catalog_acquire = Box::pin(CatalogCheckpointScope::acquire(
-                engine.inner().catalog.clone(),
-            ));
-            let Poll::Ready(catalog_scope) = futures::poll!(catalog_acquire.as_mut()) else {
-                panic!("failed preparation must release catalog checkpoint authority")
-            };
-            let mut redo_acquire =
-                Box::pin(RedoRetentionScope::acquire(engine.inner().trx_sys.clone()));
-            let Poll::Ready(redo_scope) = futures::poll!(redo_acquire.as_mut()) else {
-                panic!("failed preparation must release redo retention authority")
-            };
-            drop(catalog_scope);
-            drop(redo_scope);
-            assert!(
-                obsolete_path.exists(),
-                "obsolete redo file should not be removed after poison"
-            );
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .checkpoint_snapshot()
-                    .meta
-                    .first_redo_log_seq,
-                1
-            );
-        });
+        let log_file_stem = "redo_combined_poison_wait";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            1,
+            async |engine, main_dir, _table_id| {
+                let mut setup_session = engine.new_session().unwrap();
+                setup_session.checkpoint_catalog().await.unwrap();
+                assert_redo_poison_after_gate_wait(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    Session::checkpoint_catalog_and_truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Explain redo truncation when only the active unsealed file exists.
+    /// Expected: Truncation reports the unsealed blocker without advancing retention or removing files.
     #[test]
     fn test_session_truncate_redo_log_no_candidates_reports_unsealed_blocker() {
         smol::block_on(async {
@@ -6788,6 +6860,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Retain a dropped table's replay floor until catalog durability permits release.
+    /// Expected: The table disappears from current reads while its prior floor still blocks truncation.
     #[test]
     fn test_session_truncate_redo_log_reports_catalog_retained_dropped_floor() {
         smol::block_on(async {
@@ -6826,6 +6900,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Serialize redo truncation with an active catalog metadata change.
+    /// Expected: Truncation remains pending until the catalog gate is released and then reports its blocker.
     #[test]
     fn test_session_truncate_redo_log_waits_for_catalog_metadata_change() {
         smol::block_on(async {
@@ -6854,6 +6930,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover after redo prefix removal while enforcing the retained suffix boundary.
+    /// Expected: Truncation preserves recovery, but a missing first retained file causes a sequence-gap error.
     #[test]
     fn test_session_truncate_redo_log_removes_prefix_and_restart_keeps_retained_suffix_strict() {
         smol::block_on(async {
@@ -6934,139 +7012,55 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect redo files when standalone truncation cannot publish its retention marker.
+    /// Expected: The write failure remains fatal and leaves the marker and candidate files unchanged.
     #[test]
     fn test_session_truncate_redo_log_marker_publish_failure_does_not_unlink() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_truncate_marker_fail";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            let table_id = create_rotated_redo_table(&engine, &main_dir, log_file_stem, 2).await;
-            let mut session = engine.new_session().unwrap();
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-            commit_redo_durability_anchor(&mut session, table_id).await;
-            session.checkpoint_catalog().await.unwrap();
-
-            let plan = engine.inner().trx_sys.plan_redo_truncation().unwrap();
-            assert_eq!(plan.first_retained_file_seq, 0);
-            assert!(!plan.candidates.is_empty(), "{plan:?}");
-            let candidate_paths = plan
-                .candidates
-                .iter()
-                .map(|candidate| redo_file_path(&main_dir, log_file_stem, candidate.file_seq))
-                .collect::<Vec<_>>();
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "test setup candidate redo file should exist before marker failure: {}",
-                    path.display()
-                );
-            }
-
-            let catalog_path = engine.inner().table_fs.catalog_mtb_file_path();
-            let publish_hook = Arc::new(FailingFirstWriteHook::new(catalog_path));
-            let _publish_hook_guard = install_storage_backend_test_hook(publish_hook.clone());
-            let _cleanup_hook_guard = install_redo_cleanup_before_unlink_hook(
-                &engine.inner().maintenance_test,
-                Arc::new(|file_seq, path| {
-                    panic!(
-                        "redo cleanup must not run after marker publication failure: file_seq={file_seq}, path={}",
-                        path.display()
-                    );
-                }),
-            );
-
-            let err = session.truncate_redo_log().await.unwrap_err();
-
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::CheckpointWrite)
-            );
-            assert!(publish_hook.call_count() > 0);
-            assert_eq!(
-                engine
-                    .inner()
-                    .core
-                    .catalog()
-                    .storage
-                    .checkpoint_snapshot()
-                    .meta
-                    .first_redo_log_seq,
-                0
-            );
-            for path in &candidate_paths {
-                assert!(
-                    path.exists(),
-                    "candidate redo file should remain after marker failure: {}",
-                    path.display()
-                );
-            }
-        });
+        let log_file_stem = "redo_truncate_marker_fail";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            2,
+            async |engine, main_dir, table_id| {
+                let mut session = engine.new_session().unwrap();
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                commit_redo_durability_anchor(&mut session, table_id).await;
+                session.checkpoint_catalog().await.unwrap();
+                assert_redo_publication_failure(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    &mut session,
+                    "truncate_redo_log",
+                    Session::truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Release catalog authority before standalone redo cleanup begins.
+    /// Expected: Unlink permits metadata gate acquisition and removes obsolete files without marker advancement.
     #[test]
     fn test_session_truncate_redo_log_releases_catalog_gate_before_cleanup() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_truncate_cleanup_gate";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
-            engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .publish_first_redo_log_seq(1)
-                .await
-                .unwrap();
-            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
-            assert!(obsolete_path.exists());
-
-            let hook_called = Arc::new(AtomicBool::new(false));
-            let hook_flag = Arc::clone(&hook_called);
-            let hook_catalog = engine.inner().core.catalog.clone();
-            let hook_guard = install_redo_cleanup_before_unlink_hook(
-                &engine.inner().maintenance_test,
-                Arc::new(move |file_seq, _path| {
-                    if file_seq != 0 {
-                        return;
-                    }
-                    hook_flag.store(true, Ordering::SeqCst);
-                    let catalog = &*hook_catalog;
-                    let mut metadata_fut = Box::pin(catalog.acquire_index_metadata_change());
-                    let waker = noop_waker();
-                    let mut cx = Context::from_waker(&waker);
-                    match metadata_fut.as_mut().poll(&mut cx) {
-                        Poll::Ready(()) => {}
-                        Poll::Pending => {
-                            panic!("catalog gate should be released before redo cleanup")
-                        }
-                    }
-                    catalog.release_index_metadata_change();
-                }),
-            );
-
-            let mut session = engine.new_session().unwrap();
-            let outcome = session.truncate_redo_log().await.unwrap();
-
-            assert!(hook_called.load(Ordering::SeqCst));
-            assert_eq!(outcome.previous_first_retained_file_seq, 1);
-            assert_eq!(outcome.new_first_retained_file_seq, 1);
-            assert_eq!(outcome.advanced_files, 0);
-            assert_eq!(outcome.removed_files, 1);
-            assert_eq!(outcome.failed_unlink_files, 0);
-            assert!(!obsolete_path.exists());
-            drop(hook_guard);
-        });
+        let log_file_stem = "redo_truncate_cleanup_gate";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            1,
+            async |engine, main_dir, _table_id| {
+                assert_redo_cleanup_releases_catalog_gate(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    Session::truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Preserve mandatory redo cleanup after its caller drops the result future.
+    /// Expected: Accepted unlink work completes and releases the session operation despite caller cancellation.
     #[test]
     fn test_dropped_redo_truncation_observer_does_not_cancel_unlink() {
         smol::block_on(async {
@@ -7117,56 +7111,28 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recheck engine health after standalone truncation waits for retention authority.
+    /// Expected: Poison preserves redo files and releases preparation's operation and gate ownership.
     #[test]
     fn test_session_truncate_redo_log_rechecks_poison_after_gate_wait() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let main_dir = root.path().to_path_buf();
-            let log_file_stem = "redo_truncate_poison_wait";
-            let engine = Engine::bootstrap(redo_truncation_engine_config(&main_dir, log_file_stem))
-                .await
-                .unwrap();
-            create_rotated_redo_table(&engine, &main_dir, log_file_stem, 1).await;
-            engine
-                .inner()
-                .core
-                .catalog()
-                .storage
-                .publish_first_redo_log_seq(1)
-                .await
-                .unwrap();
-            let obsolete_path = redo_file_path(&main_dir, log_file_stem, 0);
-            assert!(obsolete_path.exists());
-
-            let redo_retention_scope =
-                RedoRetentionScope::acquire(engine.inner().trx_sys.clone()).await;
-            let mut session = engine.new_session().unwrap();
-            let mut truncate_fut = Box::pin(session.truncate_redo_log());
-
-            assert!(matches!(
-                futures::poll!(truncate_fut.as_mut()),
-                std::task::Poll::Pending
-            ));
-
-            let _ = engine
-                .inner()
-                .poisoner
-                .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
-            drop(redo_retention_scope);
-
-            let err = truncate_fut.await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                err.report().downcast_ref::<FatalError>().copied(),
-                Some(FatalError::RedoWrite)
-            );
-            assert!(
-                obsolete_path.exists(),
-                "obsolete redo file should not be removed after poison"
-            );
-        });
+        let log_file_stem = "redo_truncate_poison_wait";
+        smol::block_on(with_rotated_redo_table(
+            log_file_stem,
+            1,
+            async |engine, main_dir, _table_id| {
+                assert_redo_poison_after_gate_wait(
+                    engine,
+                    main_dir,
+                    log_file_stem,
+                    Session::truncate_redo_log,
+                )
+                .await;
+            },
+        ));
     }
 
+    /// Purpose: Retry redo cleanup below an already durable retention marker.
+    /// Expected: Missing files and unlink failures are reported accurately, and later cleanup can succeed.
     #[test]
     fn test_session_truncate_redo_log_retries_below_marker_cleanup() {
         smol::block_on(async {
@@ -7235,6 +7201,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allow catalog checkpoint requests from concurrent sessions.
+    /// Expected: Both overlapping checkpoint calls complete successfully.
     #[test]
     fn test_session_overlapping_checkpoint_catalog_calls_complete() {
         smol::block_on(async {
@@ -7254,6 +7222,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Expose cumulative session statistics across catalog work and mandatory task completion.
+    /// Expected: Cumulative counters do not decrease and drained mandatory work is fully accounted for.
     #[test]
     fn test_session_stats_snapshots_are_monotonic() {
         smol::block_on(async {
@@ -7312,6 +7282,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject session inspection after its registry entry is removed.
+    /// Expected: Catalog and statistics queries report session unavailability as a lifecycle failure.
     #[test]
     fn test_session_query_methods_require_registered_running_session() {
         smol::block_on(async {
@@ -7340,6 +7312,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject session inspection after engine shutdown completes.
+    /// Expected: Catalog and statistics queries consistently report the shutdown lifecycle cause.
     #[test]
     fn test_session_query_methods_fail_after_engine_shutdown() {
         smol::block_on(async {
@@ -7364,6 +7338,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve session diagnostics when storage poison prevents ordinary work.
+    /// Expected: Inspection remains available while normal observers and maintenance retain fatal rejection.
     #[test]
     fn test_session_diagnostics_remain_visible_after_storage_poison() {
         smol::block_on(async {
