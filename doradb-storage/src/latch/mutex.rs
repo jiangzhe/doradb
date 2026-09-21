@@ -207,8 +207,7 @@ impl<'a, T: fmt::Display + 'a> fmt::Display for MutexGuard<'a, T> {
 mod tests {
     use super::*;
     use std::cell::UnsafeCell;
-    use std::sync::Arc;
-    use std::thread::spawn;
+    use std::thread;
 
     struct Counter {
         data: UnsafeCell<usize>,
@@ -260,6 +259,19 @@ mod tests {
     // SAFETY: shared references are synchronized by `RawMutex`.
     unsafe impl Sync for Counter {}
 
+    fn run_counter_workers(worker: fn(&Counter)) -> usize {
+        let counter = Counter::new();
+        thread::scope(|scope| {
+            for _ in 0..10 {
+                scope.spawn(|| worker(&counter));
+            }
+        });
+        assert!(!counter.mu.is_locked(), "workers must release the mutex");
+        counter.val()
+    }
+
+    /// Purpose: Protect mutex guard ownership and access to the protected value.
+    /// Expected: Guard drop releases exclusive access and preserves mutations to the inner value.
     #[test]
     fn test_mutex_ops() {
         let mu = Mutex::new(42i32);
@@ -269,51 +281,35 @@ mod tests {
         assert!(mu.is_locked());
         assert!(mu.try_lock().is_none());
         drop(g);
+        assert!(!mu.is_locked());
         assert!(mu.try_lock().is_some());
         let v = mu.into_inner();
-        assert!(v == 43);
+        assert_eq!(v, 43);
     }
 
+    /// Purpose: Protect synchronous raw mutex updates across worker threads.
+    /// Expected: The final counter preserves every completed increment.
     #[test]
     fn test_raw_mutex_sync() {
-        let counter = Arc::new(Counter::new());
-        let mut threads = vec![];
-        for _ in 0..10 {
-            let counter = Arc::clone(&counter);
-            let handle = spawn(move || {
-                for _ in 0..10 {
-                    counter.inc();
-                }
-            });
-            threads.push(handle);
-        }
-
-        for th in threads {
-            th.join().unwrap();
-        }
-        println!("val={:?}", counter.val());
-        assert!(counter.val() == 100);
+        let total = run_counter_workers(|counter| {
+            for _ in 0..10 {
+                counter.inc();
+            }
+        });
+        assert_eq!(total, 100);
     }
 
+    /// Purpose: Protect asynchronous raw mutex updates across worker threads.
+    /// Expected: The final counter preserves every completed increment.
     #[test]
     fn test_raw_mutex_async() {
-        let counter = Arc::new(Counter::new());
-        let mut threads = vec![];
-        for _ in 0..10 {
-            let counter = Arc::clone(&counter);
-            let handle = spawn(move || {
-                smol::block_on(async {
-                    for _ in 0..10 {
-                        counter.inc_async().await;
-                    }
-                });
+        let total = run_counter_workers(|counter| {
+            smol::block_on(async {
+                for _ in 0..10 {
+                    counter.inc_async().await;
+                }
             });
-            threads.push(handle);
-        }
-        for th in threads {
-            th.join().unwrap();
-        }
-        println!("val={:?}", counter.val());
-        assert!(counter.val() == 100);
+        });
+        assert_eq!(total, 100);
     }
 }
