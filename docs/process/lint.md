@@ -43,6 +43,12 @@ checks also inspect the immediate items
 inside each file's top-level inline `#[cfg(test)] mod tests` module. File-level
 test-module placement and uniqueness checks remain limited to the file root.
 
+The audit script runs with pinned nightly Rust, but its Clippy gate explicitly
+uses `cargo +stable clippy --workspace --all-targets -- -D warnings`. This keeps
+the script runner's inherited `RUSTUP_TOOLCHAIN` from selecting nightly Clippy
+for workspace validation. Install stable Rust with the Clippy component and
+keep it updated to match CI; the auditor does not fall back to nightly.
+
 To audit against a different branch base, pass an explicit diff base:
 
 ```bash
