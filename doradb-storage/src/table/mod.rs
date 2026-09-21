@@ -3294,6 +3294,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Protect the disk-pool guard invariant for column block-index routes.
+    /// Expected: Publishing a column route without the required disk guard panics.
     #[test]
     #[should_panic(expected = "block-index column route requires disk pool guard")]
     fn test_block_index_column_route_panics_without_disk_pool_guard() {
@@ -3324,6 +3326,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect default statement validation of inserted row shape and nullability.
+    /// Expected: Malformed rows are rejected and nullable columns accept null values.
     #[test]
     fn test_statement_insert_dml_validation_default_on() {
         smol::block_on(async {
@@ -3367,6 +3371,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect default statement validation of unique mutations.
+    /// Expected: Invalid keys, update payloads, and nonunique index targets are rejected.
     #[test]
     fn test_statement_unique_dml_validation_default_on() {
         smol::block_on(async {
@@ -3450,6 +3456,9 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Protect the boundary between user and catalog table identities.
+    /// Expected: Identity classification agrees with the reserved catalog range at both domain
+    /// extremes.
     #[test]
     fn test_table_id_kind() {
         let last_user = TableID::new(TableID::CATALOG_START.as_u64() - 1);

@@ -1087,6 +1087,10 @@ pub(crate) mod tests {
         .into_plan(cutoff_ts, observed_version)
     }
 
+    /// Purpose: Protect prepared transition images while delete or deferred-lock undo is
+    /// rolled back.
+    /// Expected: Rollback restores the live row without changing the prepared bitmap or
+    /// borrowed column view.
     #[test]
     fn test_transition_cleanup_preserves_prepared_bitmap_and_borrowed_columns() {
         for deferred_lock in [false, true] {
@@ -1154,6 +1158,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect frozen-plan invalidation across metadata purge and transition.
+    /// Expected: Frozen purge changes the mutation version while transition purge preserves
+    /// the prepared row image.
     #[test]
     fn test_metadata_purge_preserves_transition_image_and_invalidates_frozen_plan() {
         for transition_first in [false, true] {
@@ -1200,6 +1207,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect transition readiness when ownership entries hide an unresolved row
+    /// image.
+    /// Expected: An unresolved insert or update beneath lock and delete entries prevents
+    /// preparation.
     #[test]
     fn test_transition_readiness_rejects_unresolved_image_beneath_lock_and_delete() {
         for image in [RowUndoKind::Insert, RowUndoKind::update(vec![])] {
@@ -1216,6 +1227,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect version validation when a frozen-row mutation finishes during
+    /// analysis.
+    /// Expected: Both physical and metadata mutations change the version so the optimistic
+    /// plan cannot be retained.
     #[test]
     fn test_frozen_mutation_finishing_during_analysis_discards_optimistic_plan() {
         for metadata_only in [false, true] {
@@ -1291,6 +1306,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect initial frozen-page readiness against unresolved images and earlier
+    /// ownership.
+    /// Expected: Blocked pages produce neither ready validation nor a transition plan.
     #[test]
     fn test_frozen_analyzer_blocks_unresolved_image_and_pre_fence_ownership() {
         let frozen_ts = TrxID::new(20);
@@ -1319,6 +1337,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect stable-image preparation with earlier lock or delete ownership.
+    /// Expected: The live base image is retained with an overlay sharing the owning
+    /// transaction status.
     #[test]
     fn test_stable_frozen_analyzer_represents_pre_fence_ownership() {
         let cutoff_ts = TrxID::new(50);
@@ -1340,6 +1361,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect stable-image analysis from unresolved insert and update contents.
+    /// Expected: Unresolved row images cannot produce transition plans.
     #[test]
     fn test_stable_frozen_analyzer_still_rejects_unresolved_image() {
         for kind in [RowUndoKind::Insert, RowUndoKind::update(vec![])] {
@@ -1354,6 +1377,9 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect prepared deletion overlays when their owner commits later.
+    /// Expected: The overlay retains the shared status and observes the eventual commit
+    /// timestamp.
     #[test]
     fn test_frozen_analyzer_retains_status_ref_across_commit_after_preparation() {
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));
@@ -1378,6 +1404,9 @@ pub(crate) mod tests {
         assert_eq!(marker_status.ts(), TrxID::new(25));
     }
 
+    /// Purpose: Protect overlay precedence across leading lock and delete undo entries.
+    /// Expected: The first unresolved owner supplies the marker while the prepared base
+    /// remains visible.
     #[test]
     fn test_frozen_analyzer_leading_lock_delete_chain_selects_first_marker() {
         let lock_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 30));

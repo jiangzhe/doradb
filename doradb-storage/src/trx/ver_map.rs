@@ -366,6 +366,8 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect row-slot lookup at ordinary and maximum row-ID boundaries.
+    /// Expected: Only rows within the allocated range acquire access, including empty maps.
     #[test]
     fn test_row_slot_lookup_checked_bounds() {
         for start in [100, u64::MAX - 3] {
@@ -383,6 +385,8 @@ mod tests {
         assert!(empty.try_write_row(RowID::new(100)).is_none());
     }
 
+    /// Purpose: Protect undo purge eligibility and synchronization across page states.
+    /// Expected: Purge requires a strictly newer horizon and pairs frozen mutation versions under locks.
     #[test]
     fn test_version_purge_strict_horizon_and_paired_mutations() {
         for state in [
@@ -426,6 +430,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect selective purge of main history and alternate index branches.
+    /// Expected: Eligible history detaches, retained statuses compact, and boundary branches survive.
     #[test]
     fn test_version_purge_main_suffix_status_compaction_and_index_branches() {
         let map = RowVersionMap::new(Arc::clone(&metadata().col), RowID::new(100), 4);
@@ -442,14 +448,14 @@ mod tests {
         });
         for target in [
             IndexBranchTarget::Hot {
-                cts: TrxID::new(9),
+                end_cts: TrxID::new(9),
                 entry: oldest.leak(),
             },
             IndexBranchTarget::ColdTerminal {
                 delete_cts: Some(TrxID::new(9)),
             },
             IndexBranchTarget::Hot {
-                cts: TrxID::new(10),
+                end_cts: TrxID::new(10),
                 entry: middle.leak(),
             },
             IndexBranchTarget::ColdTerminal {
@@ -490,6 +496,8 @@ mod tests {
         assert_eq!(oldest.row_id, RowID::new(100));
     }
 
+    /// Purpose: Protect row-version mutation against an unrelated map's state guard.
+    /// Expected: Access rejects the foreign guard with the ownership contract panic.
     #[test]
     #[should_panic(expected = "same map's state lock")]
     fn test_version_mutation_rejects_foreign_state_guard() {
@@ -498,6 +506,8 @@ mod tests {
         let _access = RowVersionWriteAccess::with_state_guard(&first, 0, second.read_state());
     }
 
+    /// Purpose: Protect row-page creation timestamp storage.
+    /// Expected: A new map starts unset and retains an explicitly assigned timestamp.
     #[test]
     fn test_row_version_map_create_cts() {
         let metadata = metadata();
@@ -507,6 +517,8 @@ mod tests {
         assert_eq!(map.create_cts(), TrxID::new(42));
     }
 
+    /// Purpose: Protect row-page state publication through the version map.
+    /// Expected: The map exposes its initial active state and subsequent state changes.
     #[test]
     fn test_row_version_map_state_transitions() {
         let metadata = metadata();
@@ -520,6 +532,8 @@ mod tests {
         assert_eq!(map.inspect_state(), RowPageState::Transition);
     }
 
+    /// Purpose: Protect column-layout sharing independently of index metadata changes.
+    /// Expected: The version map retains the shared column layout across index creation.
     #[test]
     fn test_row_version_map_stores_column_layout_arc_only() {
         let metadata = metadata();

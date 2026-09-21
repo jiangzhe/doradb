@@ -414,6 +414,8 @@ mod tests {
         assert_eq!(page.page().row(1).val(&metadata.col, 1), Val::from("name"));
     }
 
+    /// Purpose: Protect recovery acceptance of successful index insert outcomes.
+    /// Expected: Both successful insert variants are accepted.
     #[test]
     fn test_ensure_recovery_index_insert_accepts_ok_variants() {
         let index_slot = IndexSlot::new(1);
@@ -421,6 +423,9 @@ mod tests {
         assert!(ensure_recovery_index_insert(index_slot, IndexInsert::Ok(true)).is_ok());
     }
 
+    /// Purpose: Protect duplicate-key diagnostics during index recovery.
+    /// Expected: The error retains the conflicting index slot, row identity, and deletion
+    /// state.
     #[test]
     fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
         let err = ensure_recovery_index_insert(
@@ -436,6 +441,9 @@ mod tests {
         assert!(!duplicate.deleted);
     }
 
+    /// Purpose: Protect cold-delete replay boundaries and idempotency.
+    /// Expected: Covered deletes are skipped, matching timestamps replay safely, and
+    /// conflicting or hot-row deletes are rejected.
     #[test]
     fn test_recover_cold_delete_rejects_already_deleted_with_different_cts() {
         smol::block_on(async {
@@ -473,6 +481,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect sparse row-page replay with owned and borrowed payloads.
+    /// Expected: Replay preserves slot history and enforces bitmap, payload-capacity, and row-
+    /// state boundaries.
     #[test]
     fn test_recover_row_page_sparse_bitmap_boundaries_and_slot_history() {
         smol::block_on(async {
@@ -497,6 +508,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect recovery from malformed row payloads before physical mutation.
+    /// Expected: Invalid payloads retain typed diagnostics and leave the page unchanged; valid
+    /// replay installs the expected row.
     #[test]
     fn test_recover_row_dml_validation_rejects_malformed_payloads() {
         smol::block_on(async {
@@ -608,6 +622,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect restart after drop admission without a committed DROP record.
+    /// Expected: Recovery restores a live table with consistent metadata and no retained drop
+    /// state.
     #[test]
     fn test_drop_table_recovery_keeps_table_live_without_committed_drop() {
         smol::block_on(async {
@@ -672,6 +689,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect committed DROP recovery before catalog durability catches up.
+    /// Expected: The table remains absent while its retained drop floor guards cleanup until
+    /// catalog checkpoint completion.
     #[test]
     fn test_drop_table_recovery_replays_committed_drop_before_catalog_checkpoint() {
         smol::block_on(async {
@@ -774,6 +794,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect restart cleanup of provisional files without committed table creation.
+    /// Expected: Recovery exposes no table and removes the orphaned file.
     #[test]
     fn test_recovery_cleans_post_replay_create_table_provisional_file() {
         smol::block_on(async {
@@ -813,6 +835,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect packed replay value fidelity across supported page types.
+    /// Expected: Owned and packed inserts and updates preserve the fixture values, including
+    /// exact floating-point bits.
     #[test]
     fn packed_recovery_matches_owning_writes_for_every_page_value_type() {
         use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
@@ -876,69 +901,102 @@ mod tests {
                 .table_id();
             let table = table_for_internal_assertion(&engine, table_id);
             let guards = session.pool_guards();
-            let mut reference = table
+            let reference = table
                 .row_store
                 .get_insert_page_exclusive(&guards, 2)
                 .await
                 .unwrap();
             let mut reference_state = replay_state(&reference);
-            let first = reference.page().header.start_row_id;
-            table
-                .recover_row_insert_to_page(
-                    &table.metadata(),
-                    &mut reference,
-                    &mut reference_state,
-                    first,
-                    values.as_slice(),
-                    TrxID::new(10),
-                )
-                .unwrap();
-            table
-                .recover_row_update_to_page(
-                    &table.metadata(),
-                    &mut reference,
-                    &reference_state,
-                    first,
-                    updates.as_slice(),
-                    TrxID::new(11),
-                )
-                .unwrap();
-            let page_id = reference.page_id();
             let mut replay = replay_state(&reference);
+            let first = reference.page().header.start_row_id;
+            let page_id = reference.page_id();
             drop(reference);
-            let batch = pack_test_ops([
-                OwnedReplayOp {
-                    cts: TrxID::new(10),
+            let updated_values: Vec<_> = updates.iter().map(|col| col.val.clone()).collect();
+            for (phase, cts, kind, expected) in [
+                (
+                    "insert",
+                    TrxID::new(10),
+                    RowRedoKind::Insert(page_id, values.clone()),
+                    values,
+                ),
+                (
+                    "update",
+                    TrxID::new(11),
+                    RowRedoKind::Update(page_id, updates),
+                    updated_values,
+                ),
+            ] {
+                let mut reference = table
+                    .row_store
+                    .must_get_row_page_exclusive(&guards, page_id)
+                    .await
+                    .unwrap();
+                match &kind {
+                    RowRedoKind::Insert(_, values) => table
+                        .recover_row_insert_to_page(
+                            &table.metadata(),
+                            &mut reference,
+                            &mut reference_state,
+                            first,
+                            values.as_slice(),
+                            cts,
+                        )
+                        .unwrap(),
+                    RowRedoKind::Update(_, updates) => table
+                        .recover_row_update_to_page(
+                            &table.metadata(),
+                            &mut reference,
+                            &reference_state,
+                            first,
+                            updates.as_slice(),
+                            cts,
+                        )
+                        .unwrap(),
+                    _ => unreachable!(),
+                }
+                drop(reference);
+                let batch = pack_test_ops([OwnedReplayOp {
+                    cts,
                     row: RowRedo {
                         row_id: first + 1,
-                        kind: RowRedoKind::Insert(page_id, values),
+                        kind,
                     },
-                },
-                OwnedReplayOp {
-                    cts: TrxID::new(11),
-                    row: RowRedo {
-                        row_id: first + 1,
-                        kind: RowRedoKind::Update(page_id, updates),
-                    },
-                },
-            ]);
-            table
-                .recover_row_batch(&guards, &mut replay, &batch, false)
-                .await
-                .unwrap();
-            drop(batch);
-            let page = table
-                .row_store
-                .must_get_row_page_exclusive(&guards, page_id)
-                .await
-                .unwrap();
-            let expected = page.page().row(0).clone_vals(&table.metadata().col);
-            let actual = page.page().row(1).clone_vals(&table.metadata().col);
-            for (a, b) in actual.iter().zip(&expected) {
-                match (a, b) {
-                    (Val::F32(a), Val::F32(b)) => assert_eq!(a.0.to_bits(), b.0.to_bits()),
-                    (Val::F64(a), Val::F64(b)) => assert_eq!(a.0.to_bits(), b.0.to_bits()),
-                    (a, b) => assert_eq!(a, b),
+                }]);
+                let counts = table
+                    .recover_row_batch(&guards, &mut replay, &batch, false)
+                    .await
+                    .unwrap();
+                assert_eq!(counts.inserts, u64::from(phase == "insert"), "{phase}");
+                assert_eq!(counts.updates, u64::from(phase == "update"), "{phase}");
+                assert_eq!(counts.deletes, 0, "{phase}");
+                assert!(replay.is_inserted(1), "{phase}");
+                drop(batch);
+                let page = table
+                    .row_store
+                    .must_get_row_page_exclusive(&guards, page_id)
+                    .await
+                    .unwrap();
+                for (slot, representation) in [(0, "owned"), (1, "packed")] {
+                    assert!(!page.page().is_deleted(slot), "{phase}: {representation}");
+                    let actual = page.page().row(slot).clone_vals(&table.metadata().col);
+                    assert_eq!(actual.len(), expected.len(), "{phase}: {representation}");
+                    for (column, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                        match (actual, expected) {
+                            (Val::F32(a), Val::F32(b)) => assert_eq!(
+                                a.0.to_bits(),
+                                b.0.to_bits(),
+                                "{phase}: {representation}, column={column}"
+                            ),
+                            (Val::F64(a), Val::F64(b)) => assert_eq!(
+                                a.0.to_bits(),
+                                b.0.to_bits(),
+                                "{phase}: {representation}, column={column}"
+                            ),
+                            (a, b) => {
+                                assert_eq!(a, b, "{phase}: {representation}, column={column}")
+                            }
+                        }
+                    }
                 }
             }
         });

@@ -544,6 +544,8 @@ mod tests {
     use crate::value::ValKind;
     use std::num::NonZeroU64;
 
+    /// Purpose: Protect index DDL against a root slot that contradicts inactive metadata.
+    /// Expected: The inconsistent root is rejected as an invalid root invariant.
     #[test]
     fn validate_index_ddl_root_shape_rejects_inconsistent_inactive_slot() {
         let metadata = TableMetadata::try_new_with_index_slot_count(

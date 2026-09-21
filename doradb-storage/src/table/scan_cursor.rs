@@ -304,6 +304,8 @@ mod tests {
         from_fn(|| cursor.next_unit()).collect()
     }
 
+    /// Purpose: Protect scan cursor boundaries within a shared unit array.
+    /// Expected: Each valid range yields exactly its selected units in order.
     #[test]
     fn range_cursor_covers_empty_singleton_interior_and_full_ranges() {
         let units: Arc<[TableScanUnit]> = Arc::from([hot_unit(1), hot_unit(2), hot_unit(3)]);
@@ -322,6 +324,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect scan cursors against reversed and out-of-bounds ranges.
+    /// Expected: Invalid ranges fail during cursor construction.
     #[test]
     fn range_cursor_rejects_invalid_ranges() {
         let units: Arc<[TableScanUnit]> = Arc::from([hot_unit(1)]);
@@ -333,6 +337,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect unit ordering across worklist and shared-range scan adapters.
+    /// Expected: Both adapters yield the same ordered units.
     #[test]
     fn worklist_and_arc_range_adapters_preserve_identical_unit_order() {
         let hot_pages = (1..=3)
@@ -347,7 +353,8 @@ mod tests {
             cold_entries: Vec::new(),
             hot_pages,
         });
-        let expected = collect(worklist);
+        let expected = vec![hot_unit(1), hot_unit(2), hot_unit(3)];
+        assert_eq!(collect(worklist), expected);
         let units: Arc<[TableScanUnit]> = Arc::from(expected.clone());
         let unit_count = units.len();
         assert_eq!(

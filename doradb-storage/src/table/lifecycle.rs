@@ -751,6 +751,8 @@ mod tests {
 
     const TABLE_ID: TableID = TableID::new(42);
 
+    /// Purpose: Protect foreground admission after table teardown begins.
+    /// Expected: Dropping and dropped tables return their distinct terminal operation errors.
     #[test]
     fn test_lifecycle_foreground_errors_for_terminal_states() {
         smol::block_on(async {
@@ -766,6 +768,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect drop admission while checkpoint publication is active.
+    /// Expected: Drop waits for the existing publisher and blocks new publication, root
+    /// mutation, and metadata change.
     #[test]
     fn test_drop_gate_waits_for_active_publish_lease_before_completing() {
         smol::block_on(async {
@@ -804,6 +809,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the terminal drop invariant while a publisher remains active.
+    /// Expected: Marking the table dropped before its publish gate drains panics.
     #[test]
     #[should_panic(expected = "mark dropped requires closed publish gate")]
     fn test_mark_dropped_requires_drained_publish_gate() {
@@ -823,6 +830,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the prerequisite ownership for checkpoint publication.
+    /// Expected: Publication without a root-mutation lease panics.
     #[test]
     #[should_panic(expected = "checkpoint publish requires active root mutation lease")]
     fn test_checkpoint_publish_requires_root_mutation_lease() {
@@ -830,6 +839,8 @@ mod tests {
         let _lease = lifecycle.try_begin_checkpoint_publish();
     }
 
+    /// Purpose: Protect lifecycle exclusivity between metadata changes and drop.
+    /// Expected: Starting drop during an active metadata change panics.
     #[test]
     #[should_panic(expected = "begin drop requires no active metadata change")]
     fn test_begin_drop_rejects_active_metadata_change() {
@@ -841,6 +852,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect irreversible progression through table drop states.
+    /// Expected: Repeated drop admission fails and the dropping state can advance to dropped.
     #[test]
     fn test_dropping_transition_has_no_live_restore_path() {
         smol::block_on(async {
@@ -859,6 +872,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint admission during an active metadata change.
+    /// Expected: Checkpoint root mutation is blocked until the metadata change releases
+    /// ownership.
     #[test]
     fn test_metadata_change_blocks_checkpoint_root_mutation() {
         smol::block_on(async {
@@ -876,6 +892,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect exclusive checkpoint root-mutation ownership.
+    /// Expected: A second checkpoint is rejected and admission reopens after release.
     #[test]
     fn test_active_checkpoint_root_mutation_blocks_concurrent_checkpoint() {
         let lifecycle = TableLifecycle::new();
@@ -891,6 +909,9 @@ mod tests {
         lifecycle.release_checkpoint_root_mutation();
     }
 
+    /// Purpose: Protect metadata-change priority while a checkpoint owns root mutation.
+    /// Expected: Metadata change waits for the current owner and blocks new checkpoints until
+    /// it releases ownership.
     #[test]
     fn test_metadata_change_waits_for_active_checkpoint_root_mutation() {
         smol::block_on(async {
@@ -921,6 +942,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint admission after cancelling a pending metadata change.
+    /// Expected: Cancellation removes the metadata gate so checkpoints can acquire released
+    /// ownership.
     #[test]
     fn test_pending_metadata_change_cancellation_reopens_checkpoint_root_mutation() {
         smol::block_on(async {
@@ -940,6 +964,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table-level drop integration with checkpoint publication.
+    /// Expected: Drop remains pending until the publisher releases its lease and denies later
+    /// publishers.
     #[test]
     fn test_table_drop_gate_waits_for_checkpoint_publish_lease() {
         smol::block_on(async {
@@ -967,6 +994,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint rejection after table drop admission.
+    /// Expected: The operation reports table dropping without changing root metadata or
+    /// retaining a transaction.
     #[test]
     fn test_checkpoint_cancelled_when_table_dropping() {
         smol::block_on(async {
@@ -996,6 +1026,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect terminal lifecycle precedence over delayed checkpoint readiness.
+    /// Expected: A dropping table returns its terminal error without changing the root or
+    /// retaining a transaction.
     #[test]
     fn test_checkpoint_cancelled_when_table_dropping_before_delayed_readiness() {
         smol::block_on(async {
@@ -1031,6 +1064,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint rejection after the table reaches its dropped state.
+    /// Expected: The operation reports table not found without changing the root or retaining
+    /// a transaction.
     #[test]
     fn test_checkpoint_cancelled_when_table_lifecycle_dropped() {
         smol::block_on(async {

@@ -99,6 +99,8 @@ mod tests {
         assert_impl::<CheckedOutTableScanRoot<'_>>();
     };
 
+    /// Purpose: Protect scan-root projection from an active root.
+    /// Expected: The checked-out root preserves the captured pivot and column-index root.
     #[test]
     fn checked_out_root_exposes_exact_scan_projection() {
         let metadata = Arc::new(

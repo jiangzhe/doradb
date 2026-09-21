@@ -705,6 +705,10 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect reuse of prepared transition pages against stale identity and version
+    /// state.
+    /// Expected: Reuse requires matching page identity, row coverage, cutoff, and full
+    /// version.
     #[test]
     fn test_prepared_transition_page_matches_identity_cutoff_and_full_version() {
         let page = FrozenPage {
@@ -744,6 +748,9 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect cleanup of a reversible checkpoint attempt.
+    /// Expected: Dropping the admitted attempt releases exclusivity and restores the idle
+    /// state.
     #[test]
     fn test_reversible_checkpoint_attempt_restores_admitted_state() {
         let lifecycle = TableLifecycle::new();
@@ -758,6 +765,9 @@ mod tests {
         assert_eq!(workflow.state_name(), "Idle");
     }
 
+    /// Purpose: Protect terminal checkpoint closure while an attempt is outstanding.
+    /// Expected: Dropping the attempt preserves closure and later admission reports table
+    /// dropping.
     #[test]
     fn test_terminal_close_prevents_attempt_state_resurrection() {
         let lifecycle = TableLifecycle::new();
@@ -775,6 +785,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect checkpoint exclusivity during publication and transition.
+    /// Expected: Concurrent attempts are rejected until publication restores the idle state.
     #[test]
     fn test_publish_states_reject_concurrent_checkpoint() {
         fn assert_checkpoint_conflicts(

@@ -175,6 +175,9 @@ mod tests {
         (weight_prefix, offsets)
     }
 
+    /// Purpose: Protect scan partition planning for empty and hot-only worklists.
+    /// Expected: Partition boundaries and cumulative weights follow the configured shared
+    /// budget.
     #[test]
     fn empty_and_hot_initial_offsets_follow_shared_budget() {
         let empty = compile_table_scan_plan(hot_worklist(&[]), TableScanConfig::default());
@@ -192,6 +195,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect partition planning across cold and mixed scan worklists.
+    /// Expected: Cold and hot units consume one normalized budget with stable boundary
+    /// placement.
     #[test]
     fn cold_and_mixed_initial_offsets_use_one_normalized_budget() {
         for (count, expected) in [
@@ -211,6 +217,9 @@ mod tests {
         assert_eq!(exact_offsets, [0, 16, 48]);
     }
 
+    /// Purpose: Protect greedy scan repartitioning at empty and uneven-weight boundaries.
+    /// Expected: Repartitioning preserves complete unit coverage and the expected budget-based
+    /// boundaries.
     #[test]
     fn repartition_reuses_greedy_budget_packing() {
         assert_eq!(
@@ -239,6 +248,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect hot-unit weighting under custom scan partition limits.
+    /// Expected: Cumulative weights and partition boundaries reflect the configured cross-
+    /// normalization.
     #[test]
     fn custom_config_cross_normalizes_hot_weight() {
         let config = TableScanConfig::default()

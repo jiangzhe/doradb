@@ -510,6 +510,8 @@ mod tests {
     use crate::value::Val;
     use tempfile::TempDir;
 
+    /// Purpose: Protect rollback of a deletion on an already cold row.
+    /// Expected: Rollback restores the original index owner and makes the row visible again.
     #[test]
     fn test_column_delete_rollback() {
         smol::block_on(async {
@@ -566,6 +568,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deletion rollback when checkpoint moves its source into cold storage.
+    /// Expected: The deleting transaction sees absence until rollback restores the row.
     #[test]
     fn test_column_delete_rollback_after_checkpoint() {
         smol::block_on(async {
@@ -612,6 +616,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback after reclaiming a deleted index owner whose row is absent.
+    /// Expected: The original delete-marked owner is restored and the key remains reusable.
     #[test]
     fn test_unique_insert_rollback_restores_deleted_owner_even_when_row_missing() {
         smol::block_on(async {
@@ -705,6 +711,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback after reclaiming a stale key pointing to a live hot row.
+    /// Expected: The prior deleted owner and live row are preserved while the stale key can be
+    /// reused.
     #[test]
     fn test_unique_insert_rollback_restores_delete_marked_stale_hot_owner() {
         smol::block_on(async {
@@ -811,6 +820,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect visibility after rolling back a new row insertion.
+    /// Expected: A later transaction cannot find the rolled-back row.
     #[test]
     fn test_mvcc_rollback_insert_normal() {
         smol::block_on(async {
@@ -834,6 +845,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback of reinsertion through a deleted unique-index owner.
+    /// Expected: Rolling back the replacement preserves the previously committed deletion.
     #[test]
     fn test_mvcc_rollback_insert_link_unique_index() {
         smol::block_on(async {
@@ -865,6 +878,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transactional row restoration in a table with a secondary index.
+    /// Expected: Rolled-back inserts, updates, deletes, and replacements preserve the original
+    /// visible rows.
     #[test]
     fn test_secondary_index_rollback() {
         smol::block_on(async {

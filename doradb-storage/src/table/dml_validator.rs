@@ -311,6 +311,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect sparse-update validation at ordering, column, type, and nullability
+    /// boundaries.
+    /// Expected: Valid updates pass and malformed updates return the sparse-update error
+    /// classification.
     #[test]
     fn test_sparse_update_validates_order_bounds_and_types() {
         let metadata = TableMetadata::try_new(
@@ -361,6 +365,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect equivalent validation of owned and borrowed row inputs.
+    /// Expected: Both forms enforce the same shape and update rules with matching error
+    /// context and diagnostics.
     #[test]
     fn test_borrowed_validation_parity() {
         let metadata = TableMetadata::try_new(

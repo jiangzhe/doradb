@@ -3583,8 +3583,7 @@ mod tests {
     };
     use crate::TableIndex;
     use crate::buffer::BufferPool;
-    use crate::buffer::frame::FrameKind;
-    use crate::buffer::test_frame_kind;
+    use crate::buffer::test_evict_existing_page;
     use crate::catalog::tests::table4;
     use crate::catalog::{
         IndexID, IndexRef, IndexSlot, SecondaryIndexSlot, StorageColumnFlags, StorageColumnSpec,
@@ -3641,6 +3640,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColdReadCorruption {
+        Checksum,
+        RowCodec,
+        BlockId,
+        RowShape,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColdCallbackWaitPhase {
+        BeforeCallback,
+        AfterCallback,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColdMutationAfterDelete {
+        Delete,
+        Update,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReclaimKeyWith {
+        Insert,
+        Update,
+    }
 
     // A borrowing payload with no formatting, standard Error, Clone, or Send bounds.
     struct CallbackFailure<'a> {
@@ -3858,6 +3883,409 @@ mod tests {
         rows
     }
 
+    async fn assert_cold_read_corruption(case: ColdReadCorruption) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine =
+            evictable_test_engine(&temp_dir, 64 * 1024 * 1024, "cold-read-corruption").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let row_count = if matches!(case, ColdReadCorruption::Checksum) {
+            10
+        } else {
+            4
+        };
+        insert_rows(table_id, &mut session, 0, row_count, "name").await;
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        assert_checkpoint_published(&mut session, table_id).await;
+        let key = single_key(1i32);
+        let table = table_for_internal_assertion(&engine, table_id);
+        let mut reader = session.begin_trx().unwrap();
+        let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, reader.sts()).await;
+        assert_eq!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+                .await
+                .unwrap(),
+            SelectMvcc::Found(vec![Val::from(1i32), Val::from("name")]),
+            "uncorrupted fixture: {case:?}",
+        );
+        reader.commit().await.unwrap();
+        let guards = session.pool_guards();
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let entry = snapshot
+            .index(guards.disk_guard())
+            .locate_block(row_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = engine.inner().table_fs.user_table_file_path(table_id);
+        let (block_id, component, expected) = match case {
+            ColdReadCorruption::Checksum => {
+                corrupt_page_checksum(path, entry.block_id());
+                (
+                    entry.block_id(),
+                    "lwc_block",
+                    DataIntegrityError::ChecksumMismatch,
+                )
+            }
+            ColdReadCorruption::RowCodec => {
+                corrupt_leaf_row_codec(path, entry.leaf_block_id, 0);
+                (
+                    entry.leaf_block_id,
+                    "column_block_index",
+                    DataIntegrityError::InvalidPayload,
+                )
+            }
+            ColdReadCorruption::BlockId => {
+                corrupt_leaf_block_id(path, entry.leaf_block_id, 0);
+                (
+                    entry.leaf_block_id,
+                    "column_block_index",
+                    DataIntegrityError::InvalidPayload,
+                )
+            }
+            ColdReadCorruption::RowShape => {
+                corrupt_lwc_row_shape_fingerprint(path, entry.block_id());
+                (
+                    entry.block_id(),
+                    "lwc_block",
+                    DataIntegrityError::InvalidPayload,
+                )
+            }
+        };
+        table.disk_pool().invalidate_block(
+            guards.disk_guard(),
+            table.file().sparse_file().file_id(),
+            block_id,
+        );
+        let mut reader = session.begin_trx().unwrap();
+        let error = trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Runtime, "{case:?}: {error:?}");
+        assert_eq!(
+            error.report().downcast_ref::<RuntimeError>(),
+            Some(&RuntimeError::TableAccess),
+            "{case:?}: {error:?}"
+        );
+        assert_table_data_integrity(error, component, block_id, expected);
+        reader.rollback().await.unwrap();
+    }
+
+    fn assert_lazy_row_buffer_cleared(clear: impl FnOnce(&mut LazyRowBuffer)) {
+        let mut buffer = LazyRowBuffer::new(3);
+        buffer.cache_value(0, Val::from("stale"));
+        buffer.cache_value(2, Val::from(2i32));
+        let pointers = (
+            buffer.values.as_ptr(),
+            buffer.ready.as_ptr(),
+            buffer.ready_columns.as_ptr(),
+        );
+        let capacities = (
+            buffer.values.capacity(),
+            buffer.ready.capacity(),
+            buffer.ready_columns.capacity(),
+        );
+        clear(&mut buffer);
+        assert!(buffer.values.iter().all(|value| value == &Val::default()));
+        assert!(buffer.ready.iter().all(|ready| !ready));
+        assert!(buffer.ready_columns.is_empty());
+        assert_eq!(
+            (
+                buffer.values.as_ptr(),
+                buffer.ready.as_ptr(),
+                buffer.ready_columns.as_ptr()
+            ),
+            pointers
+        );
+        assert_eq!(
+            (
+                buffer.values.capacity(),
+                buffer.ready.capacity(),
+                buffer.ready_columns.capacity()
+            ),
+            capacities
+        );
+    }
+
+    async fn assert_cold_callback_wait(phase: ColdCallbackWaitPhase) {
+        let (_temp_dir, engine, table_id, mut setup, table, key, row_id) =
+            setup_single_cold_row("full-table-cold-wait").await;
+        let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 102));
+        if matches!(phase, ColdCallbackWaitPhase::BeforeCallback) {
+            table
+                .deletion_buffer()
+                .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+                .unwrap();
+        }
+        prepare_shared_trx_status(&owner);
+        let callbacks = AtomicUsize::new(0);
+        let mut session = engine.new_session().unwrap();
+        let mut writer = session.begin_trx().unwrap();
+        let mutate = async {
+            let result = writer
+                .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
+                    callbacks.fetch_add(1, Ordering::SeqCst);
+                    if matches!(phase, ColdCallbackWaitPhase::AfterCallback) {
+                        table
+                            .deletion_buffer()
+                            .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
+                            .unwrap();
+                    }
+                    Ok(RowMutation::Delete)
+                })
+                .await
+                .unwrap();
+            writer.commit().await.unwrap();
+            result
+        };
+        let release = async {
+            while !prepare_event_is_installed(&owner) {
+                yield_now().await;
+            }
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                usize::from(matches!(phase, ColdCallbackWaitPhase::AfterCallback)),
+                "callback ordering: {phase:?}"
+            );
+            table.deletion_buffer().remove(row_id);
+            rollback_preparing_shared_trx_status(&owner);
+        };
+        let (outcome, ()) = futures::join!(mutate, release);
+        assert_eq!(
+            outcome,
+            TableMutationOutcome {
+                delete_count: 1,
+                update_count: 0
+            },
+            "{phase:?}"
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1, "{phase:?}");
+        expect_select_not_found_committed(table_id, &mut setup, &key).await;
+    }
+
+    async fn update_and_check_string_key(
+        session: &mut Session,
+        table_id: TableID,
+        old: &str,
+        new: &str,
+    ) -> RowID {
+        let old_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(old)]);
+        let new_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(new)]);
+        let mut writer = session.begin_trx().unwrap();
+        let result = trx_update_row_by_id(
+            &mut writer,
+            table_id,
+            &old_key,
+            vec![UpdateCol {
+                idx: 0,
+                val: Val::from(new),
+            }],
+        )
+        .await
+        .unwrap();
+        let UniqueMutationOutcome::Updated(row_id) = result else {
+            panic!("string update must find its old key: {result:?}");
+        };
+        writer.commit().await.unwrap();
+        let mut reader = session.begin_trx().unwrap();
+        assert_eq!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &old_key, &[0])
+                .await
+                .unwrap(),
+            SelectMvcc::NotFound
+        );
+        assert_eq!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &new_key, &[0])
+                .await
+                .unwrap(),
+            SelectMvcc::Found(vec![Val::from(new)])
+        );
+        reader.commit().await.unwrap();
+        row_id
+    }
+
+    async fn assert_cold_mutation_conflicts_after_delete(mutation: ColdMutationAfterDelete) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        assert_checkpoint_published(&mut session, table_id).await;
+
+        let key = single_key(5i32);
+        let mut writer_session = engine.new_session().unwrap();
+        let mut writer = writer_session.begin_trx().unwrap();
+        let writer_sts = writer.sts();
+        let row_id = assert_row_in_lwc(
+            &table_for_internal_assertion(&engine, table_id),
+            &writer_session.pool_guards(),
+            &key,
+            writer_sts,
+        )
+        .await;
+
+        expect_delete_committed(table_id, &mut session, &key).await;
+        let delete_cts = delete_marker_ts(
+            table_for_internal_assertion(&engine, table_id)
+                .deletion_buffer()
+                .get(row_id)
+                .unwrap(),
+        );
+        assert!(delete_cts > writer_sts);
+
+        writer = expect_trx_select(table_id, writer, &key, |row| {
+            assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+        })
+        .await;
+
+        let result = match mutation {
+            ColdMutationAfterDelete::Delete => {
+                trx_delete_row_by_id(&mut writer, table_id, &key).await
+            }
+            ColdMutationAfterDelete::Update => {
+                trx_update_row_by_id(
+                    &mut writer,
+                    table_id,
+                    &key,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("updated"),
+                    }],
+                )
+                .await
+            }
+        };
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.report().downcast_ref::<OperationError>().copied(),
+            Some(OperationError::WriteConflict)
+        );
+        writer.rollback().await.unwrap();
+
+        expect_select_not_found_committed(table_id, &mut session, &key).await;
+    }
+
+    async fn assert_reclaimed_key_history(reclaim: ReclaimKeyWith) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "key-history").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        expect_insert_committed(
+            table_id,
+            &mut session,
+            vec![Val::from(1i32), Val::from("hello")],
+        )
+        .await;
+        let mut original_session = engine.new_session().unwrap();
+        let mut original = original_session.begin_trx().unwrap();
+        expect_update_committed(
+            table_id,
+            &mut session,
+            &single_key(1i32),
+            vec![
+                UpdateCol {
+                    idx: 0,
+                    val: Val::from(2i32),
+                },
+                UpdateCol {
+                    idx: 1,
+                    val: Val::from("world"),
+                },
+            ],
+        )
+        .await;
+        let mut moved_session = engine.new_session().unwrap();
+        let mut moved = moved_session.begin_trx().unwrap();
+        let replacement = match reclaim {
+            ReclaimKeyWith::Insert => {
+                expect_insert_committed(
+                    table_id,
+                    &mut session,
+                    vec![Val::from(1i32), Val::from("rust")],
+                )
+                .await;
+                "rust"
+            }
+            ReclaimKeyWith::Update => {
+                expect_insert_committed(
+                    table_id,
+                    &mut session,
+                    vec![Val::from(5i32), Val::from("rust")],
+                )
+                .await;
+                expect_update_committed(
+                    table_id,
+                    &mut session,
+                    &single_key(5i32),
+                    vec![
+                        UpdateCol {
+                            idx: 0,
+                            val: Val::from(1i32),
+                        },
+                        UpdateCol {
+                            idx: 1,
+                            val: Val::from("c++"),
+                        },
+                    ],
+                )
+                .await;
+                "c++"
+            }
+        };
+        for (snapshot, reader, first, second) in [
+            (
+                "original",
+                &mut original,
+                SelectMvcc::Found(vec![Val::from(1i32), Val::from("hello")]),
+                SelectMvcc::NotFound,
+            ),
+            (
+                "moved",
+                &mut moved,
+                SelectMvcc::NotFound,
+                SelectMvcc::Found(vec![Val::from(2i32), Val::from("world")]),
+            ),
+        ] {
+            for (key, expected) in [(1i32, first), (2i32, second), (5i32, SelectMvcc::NotFound)] {
+                assert_eq!(
+                    trx_select_row_mvcc_by_id(reader, table_id, &single_key(key), &[0, 1])
+                        .await
+                        .unwrap(),
+                    expected,
+                    "{reclaim:?}: {snapshot}, key={key}",
+                );
+            }
+        }
+        original.commit().await.unwrap();
+        moved.commit().await.unwrap();
+        let mut latest = session.begin_trx().unwrap();
+        for (key, expected) in [
+            (
+                1i32,
+                SelectMvcc::Found(vec![Val::from(1i32), Val::from(replacement)]),
+            ),
+            (
+                2i32,
+                SelectMvcc::Found(vec![Val::from(2i32), Val::from("world")]),
+            ),
+            (5i32, SelectMvcc::NotFound),
+        ] {
+            assert_eq!(
+                trx_select_row_mvcc_by_id(&mut latest, table_id, &single_key(key), &[0, 1])
+                    .await
+                    .unwrap(),
+                expected,
+                "{reclaim:?}: latest, key={key}",
+            );
+        }
+        latest.commit().await.unwrap();
+    }
+
+    /// Purpose: Protect deferred lazy-row materialization and buffer reuse after ownership
+    /// transfer.
+    /// Expected: Cached nulls remain valid, invalid reads do not allocate, and reused buffers
+    /// load fresh values.
     #[test]
     fn test_lazy_row_deferred_storage_transfer_and_null_reuse() {
         smol::block_on(async {
@@ -3922,47 +4350,22 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect lazy-row reset without allocation churn.
+    /// Expected: Reset clears values and readiness while retaining backing allocations.
     #[test]
     fn test_lazy_row_buffer_reset_reuses_all_storage() {
-        let mut buffer = LazyRowBuffer::new(3);
-        buffer.cache_value(0, Val::from("zero"));
-        buffer.cache_value(2, Val::from(2i32));
-        let values_ptr = buffer.values.as_ptr();
-        let values_capacity = buffer.values.capacity();
-        let ready_capacity = buffer.ready.capacity();
-        let ready_columns_ptr = buffer.ready_columns.as_ptr();
-        let ready_columns_capacity = buffer.ready_columns.capacity();
-
-        buffer.reset_ready();
-
-        assert!(buffer.values.iter().all(|value| value == &Val::default()));
-        assert!(buffer.ready.iter().all(|ready| !ready));
-        assert!(buffer.ready_columns.is_empty());
-        assert_eq!(buffer.values.as_ptr(), values_ptr);
-        assert_eq!(buffer.values.capacity(), values_capacity);
-        assert_eq!(buffer.ready.capacity(), ready_capacity);
-        assert_eq!(buffer.ready_columns.as_ptr(), ready_columns_ptr);
-        assert_eq!(buffer.ready_columns.capacity(), ready_columns_capacity);
+        assert_lazy_row_buffer_cleared(LazyRowBuffer::reset_ready);
     }
 
+    /// Purpose: Protect lazy-row preparation after a path leaves cached values behind.
+    /// Expected: Preparation clears stale values and readiness without replacing storage.
     #[test]
     fn test_lazy_row_buffer_prepare_clears_stale_values_without_reallocation() {
-        let mut buffer = LazyRowBuffer::new(3);
-        buffer.cache_value(0, Val::from("stale"));
-        buffer.cache_value(2, Val::from(2i32));
-        let values_ptr = buffer.values.as_ptr();
-        let ready_columns_ptr = buffer.ready_columns.as_ptr();
-
-        // Simulate an exit path that did not perform eager post-row cleanup.
-        buffer.prepare(3);
-
-        assert!(buffer.values.iter().all(|value| value == &Val::default()));
-        assert!(buffer.ready.iter().all(|ready| !ready));
-        assert!(buffer.ready_columns.is_empty());
-        assert_eq!(buffer.values.as_ptr(), values_ptr);
-        assert_eq!(buffer.ready_columns.as_ptr(), ready_columns_ptr);
+        assert_lazy_row_buffer_cleared(|buffer| buffer.prepare(3));
     }
 
+    /// Purpose: Protect key derivation from replacement and retained sparse layouts.
+    /// Expected: Each key set preserves its layout's exact index identity and indexed values.
     #[test]
     fn test_layout_key_derivation_preserves_sparse_and_retained_index_identities() {
         use crate::catalog::{ActiveIndexSpec, IndexID};
@@ -4018,6 +4421,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect foreground access against incompatible root and runtime layouts.
+    /// Expected: Matching layouts pass while allocation-identity and slot-shape mismatches
+    /// panic.
     #[test]
     fn test_foreground_root_layout_compatibility_uses_identity_and_slot_shape() {
         smol::block_on(async {
@@ -4066,6 +4472,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect committed point reads after inserting rows across multiple pages.
+    /// Expected: Every inserted key returns its original complete row.
     #[test]
     fn test_mvcc_insert_normal() {
         smol::block_on(async {
@@ -4103,6 +4511,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique insertion against committed and uncommitted duplicate keys.
+    /// Expected: Both duplicate attempts return the duplicate-key error.
     #[test]
     fn test_mvcc_insert_dup_key() {
         smol::block_on(async {
@@ -4157,6 +4567,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect updates with short and large variable-length values.
+    /// Expected: Successful updates commit and the large replacement is visible to both its
+    /// writer and a later reader.
     #[test]
     fn test_mvcc_update_normal() {
         smol::block_on(async {
@@ -4222,6 +4635,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect full-table upsert across missing and existing unique keys.
+    /// Expected: Upsert inserts once, updates the same row identity, and exposes the
+    /// replacement values after commit.
     #[test]
     fn test_mvcc_upsert_unique_insert_and_update() {
         smol::block_on(async {
@@ -4275,6 +4691,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect upsert that relocates a row while retaining its keys.
+    /// Expected: Indexes follow the new row while older snapshots retain the original complete
+    /// image.
     #[test]
     fn test_mvcc_upsert_unique_full_row_move_update_preserves_undo_and_indexes() {
         smol::block_on(async {
@@ -4442,6 +4861,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect concurrent upserts against existing-row and insert ownership.
+    /// Expected: A competing writer receives a write conflict for either branch.
     #[test]
     fn test_mvcc_upsert_unique_conflicts_on_existing_and_missing_key() {
         smol::block_on(async {
@@ -4538,6 +4959,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect row absence after a transactional hot-row deletion.
+    /// Expected: The deleting transaction and later readers cannot find the deleted key.
     #[test]
     fn test_mvcc_delete_normal() {
         smol::block_on(async {
@@ -4577,6 +5000,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect committed deletion of a checkpointed column-store row.
+    /// Expected: Deletion succeeds and later point reads report the row absent.
     #[test]
     fn test_column_delete_basic() {
         smol::block_on(async {
@@ -4612,6 +5037,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cached column-store reads through the readonly pool.
+    /// Expected: Repeated reads return the original values without additional pool allocation
+    /// after the first read.
     #[test]
     fn test_lwc_read_uses_readonly_buffer_pool() {
         smol::block_on(async {
@@ -4656,6 +5084,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect propagation of resolved column-index routing metadata.
+    /// Expected: Row lookup preserves the block, ordinal, fingerprint, and durable-deletion
+    /// state of the resolved route.
     #[test]
     fn test_find_row_returns_resolved_lwc_page_location() {
         smol::block_on(async {
@@ -4706,54 +5137,16 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect point-read diagnostics for a corrupted persisted column block.
+    /// Expected: The checksum error retains table-access classification and block context.
     #[test]
     fn test_lwc_select_surfaces_persisted_corruption() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 10, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(1i32);
-            let trx = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
-            trx.commit().await.unwrap();
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index.locate_block(row_id).await.unwrap().unwrap();
-            let block_id = entry.block_id();
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_page_checksum(table_file_path, block_id);
-
-            let mut trx = session.begin_trx().unwrap();
-            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
-            let err = match res {
-                Err(err) => err,
-                other => panic!("expected persisted LWC corruption, got {other:?}"),
-            };
-            assert_eq!(err.kind(), ErrorKind::Runtime);
-            assert_eq!(
-                err.report().downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::TableAccess)
-            );
-            assert_table_data_integrity(
-                err,
-                "lwc_block",
-                block_id,
-                DataIntegrityError::ChecksumMismatch,
-            );
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_cold_read_corruption(ColdReadCorruption::Checksum));
     }
 
+    /// Purpose: Protect streaming scan failure on a corrupted cold block.
+    /// Expected: The stream terminates after the error and preserves integrity details without
+    /// duplicating operation context.
     #[test]
     fn test_table_scan_mvcc_stream_preserves_cold_data_integrity_context() {
         smol::block_on(async {
@@ -4813,147 +5206,30 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold point reads against corrupt column-index row metadata.
+    /// Expected: The read reports invalid payload with the affected column-index block
+    /// context.
     #[test]
     fn test_lwc_select_surfaces_column_block_index_row_metadata_corruption() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 4, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(1i32);
-            let trx = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
-            trx.commit().await.unwrap();
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index.locate_block(row_id).await.unwrap().unwrap();
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_leaf_row_codec(table_file_path, entry.leaf_block_id, 0);
-            let _ = table.disk_pool().invalidate_block(
-                session.pool_guards().disk_guard(),
-                table.file().sparse_file().file_id(),
-                entry.leaf_block_id,
-            );
-
-            let mut trx = session.begin_trx().unwrap();
-            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
-            let err = match res {
-                Err(err) => err,
-                other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-            };
-            assert_table_data_integrity(
-                err,
-                "column_block_index",
-                entry.leaf_block_id,
-                DataIntegrityError::InvalidPayload,
-            );
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_cold_read_corruption(ColdReadCorruption::RowCodec));
     }
 
+    /// Purpose: Protect cold point reads against an invalid zero block route.
+    /// Expected: The read reports invalid payload at the owning column-index block.
     #[test]
     fn test_lwc_select_surfaces_column_block_index_zero_block_id_corruption() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 4, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(1i32);
-            let trx = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
-            trx.commit().await.unwrap();
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index.locate_block(row_id).await.unwrap().unwrap();
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_leaf_block_id(table_file_path, entry.leaf_block_id, 0);
-            let _ = table.disk_pool().invalidate_block(
-                session.pool_guards().disk_guard(),
-                table.file().sparse_file().file_id(),
-                entry.leaf_block_id,
-            );
-
-            let mut trx = session.begin_trx().unwrap();
-            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
-            let err = match res {
-                Err(err) => err,
-                other => panic!("expected persisted column-block-index corruption, got {other:?}"),
-            };
-            assert_table_data_integrity(
-                err,
-                "column_block_index",
-                entry.leaf_block_id,
-                DataIntegrityError::InvalidPayload,
-            );
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_cold_read_corruption(ColdReadCorruption::BlockId));
     }
 
+    /// Purpose: Protect cold point reads against inconsistent row-shape metadata.
+    /// Expected: The read reports an invalid column-block payload with block context.
     #[test]
     fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 4, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(1i32);
-            let trx = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id = assert_row_in_lwc(&table, &session.pool_guards(), &key, trx.sts()).await;
-            trx.commit().await.unwrap();
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index.locate_block(row_id).await.unwrap().unwrap();
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_lwc_row_shape_fingerprint(table_file_path, entry.block_id());
-            let _ = table.disk_pool().invalidate_block(
-                session.pool_guards().disk_guard(),
-                table.file().sparse_file().file_id(),
-                entry.block_id(),
-            );
-
-            let mut trx = session.begin_trx().unwrap();
-            let res = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
-            let err = match res {
-                Err(err) => err,
-                other => panic!("expected persisted LWC invalid-payload corruption, got {other:?}"),
-            };
-            assert_table_data_integrity(
-                err,
-                "lwc_block",
-                entry.block_id(),
-                DataIntegrityError::InvalidPayload,
-            );
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_cold_read_corruption(ColdReadCorruption::RowShape));
     }
 
+    /// Purpose: Protect cold-row deletion against an active competing owner.
+    /// Expected: A second transaction receives a write conflict while the first owns deletion.
     #[test]
     fn test_column_delete_write_conflict() {
         smol::block_on(async {
@@ -4997,6 +5273,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect snapshot visibility across a committed cold-row deletion.
+    /// Expected: An older reader retains the row while a later reader sees absence.
     #[test]
     fn test_column_delete_mvcc_visibility() {
         smol::block_on(async {
@@ -5041,57 +5319,20 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold deletion when a newer committed delete is invisible to the
+    /// writer's snapshot.
+    /// Expected: Snapshot reads retain the old row but another delete reports a write
+    /// conflict.
     #[test]
     fn test_lwc_delete_unique_conflicts_when_delete_committed_after_snapshot() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 10, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(5i32);
-            let mut writer_session = engine.new_session().unwrap();
-            let mut writer = writer_session.begin_trx().unwrap();
-            let writer_sts = writer.sts();
-            let row_id = assert_row_in_lwc(
-                &table_for_internal_assertion(&engine, table_id),
-                &writer_session.pool_guards(),
-                &key,
-                writer_sts,
-            )
-            .await;
-
-            expect_delete_committed(table_id, &mut session, &key).await;
-            let delete_cts = delete_marker_ts(
-                table_for_internal_assertion(&engine, table_id)
-                    .deletion_buffer()
-                    .get(row_id)
-                    .unwrap(),
-            );
-            assert!(delete_cts > writer_sts);
-
-            writer = expect_trx_select(table_id, writer, &key, |row| {
-                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
-            })
-            .await;
-
-            let err = trx_delete_row_by_id(&mut writer, table_id, &key)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::WriteConflict)
-            );
-            writer.rollback().await.unwrap();
-
-            expect_select_not_found_committed(table_id, &mut session, &key).await;
-        });
+        smol::block_on(assert_cold_mutation_conflicts_after_delete(
+            ColdMutationAfterDelete::Delete,
+        ));
     }
 
+    /// Purpose: Protect same-key updates that move a cold row into hot storage.
+    /// Expected: The writer owns the new row while older snapshots continue reading the
+    /// original cold image.
     #[test]
     fn test_lwc_update_unique_same_key_reinserts_hot_and_preserves_old_snapshot() {
         smol::block_on(async {
@@ -5182,65 +5423,18 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold updates when deletion committed after the writer's snapshot.
+    /// Expected: The old row remains snapshot-visible but mutation reports a write conflict.
     #[test]
     fn test_lwc_update_unique_conflicts_when_delete_committed_after_snapshot() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 10, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key = single_key(5i32);
-            let mut writer_session = engine.new_session().unwrap();
-            let mut writer = writer_session.begin_trx().unwrap();
-            let writer_sts = writer.sts();
-            let row_id = assert_row_in_lwc(
-                &table_for_internal_assertion(&engine, table_id),
-                &writer_session.pool_guards(),
-                &key,
-                writer_sts,
-            )
-            .await;
-
-            expect_delete_committed(table_id, &mut session, &key).await;
-            let delete_cts = delete_marker_ts(
-                table_for_internal_assertion(&engine, table_id)
-                    .deletion_buffer()
-                    .get(row_id)
-                    .unwrap(),
-            );
-            assert!(delete_cts > writer_sts);
-
-            writer = expect_trx_select(table_id, writer, &key, |row| {
-                assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
-            })
-            .await;
-
-            let res = trx_update_row_by_id(
-                &mut writer,
-                table_id,
-                &key,
-                vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from("updated"),
-                }],
-            )
-            .await;
-            let err = res.unwrap_err();
-            assert_eq!(
-                err.report().downcast_ref::<OperationError>().copied(),
-                Some(OperationError::WriteConflict)
-            );
-            writer.rollback().await.unwrap();
-
-            expect_select_not_found_committed(table_id, &mut session, &key).await;
-        });
+        smol::block_on(assert_cold_mutation_conflicts_after_delete(
+            ColdMutationAfterDelete::Update,
+        ));
     }
 
+    /// Purpose: Protect snapshot key visibility when a cold update changes its unique key.
+    /// Expected: Current readers see only the new key while older snapshots retain only the
+    /// original key and values.
     #[test]
     fn test_lwc_update_unique_key_change_preserves_old_and_new_key_visibility() {
         smol::block_on(async {
@@ -5321,6 +5515,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect failed cold-row relocation into an occupied unique key.
+    /// Expected: The duplicate-key error leaves no deletion marker and preserves both original
+    /// rows.
     #[test]
     fn test_lwc_update_unique_duplicate_rolls_back_cold_marker_and_hot_insert() {
         smol::block_on(async {
@@ -5380,6 +5577,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold deletion after redundant memory-index entries have been removed.
+    /// Expected: Commit and rollback preserve index-cache absence while deletion markers
+    /// enforce visibility.
     #[test]
     fn test_persisted_delete_without_mem_copies_does_not_install_overlays() {
         smol::block_on(async {
@@ -5479,6 +5679,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reuse of a committed deleted cold key by an update.
+    /// Expected: Current, pre-delete, and gap snapshots each retain their correct view of the
+    /// reused key.
     #[test]
     fn test_lwc_update_unique_claims_committed_deleted_cold_owner_with_visibility_bridge() {
         smol::block_on(async {
@@ -5540,6 +5743,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect key claims when the prior cold owner's deletion is newer than the
+    /// claimant snapshot.
+    /// Expected: The claim reports a duplicate key and preserves both source and prior
+    /// deletion state.
     #[test]
     fn test_lwc_update_unique_rejects_cold_owner_deleted_after_snapshot() {
         smol::block_on(async {
@@ -5630,6 +5837,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction rollback after claiming a deleted cold key needed by an
+    /// old reader.
+    /// Expected: Rollback restores the delete-marked owner and its historical visibility.
     #[test]
     fn test_lwc_update_unique_claim_rollback_restores_deleted_cold_owner() {
         smol::block_on(async {
@@ -5731,6 +5941,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback after claiming a cold key whose prior deletion is globally
+    /// purgeable.
+    /// Expected: Stale purge attempts cannot affect the replacement and rollback preserves the
+    /// prior row's logical absence.
     #[test]
     fn test_lwc_update_unique_claim_rollback_drops_purgeable_deleted_cold_owner() {
         smol::block_on(async {
@@ -5866,6 +6080,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect hot mutation admission while a row page is transitioning.
+    /// Expected: Insert, update, and delete attempts request retry instead of modifying the
+    /// transitioning page.
     #[test]
     fn test_row_page_transition_retries_update_delete() {
         smol::block_on(async {
@@ -5973,6 +6190,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reinsertion through a retained deleted unique-index owner.
+    /// Expected: Snapshots before deletion, in the deletion gap, and after reinsertion
+    /// retain their respective row visibility.
     #[test]
     fn test_mvcc_insert_link_unique_index() {
         smol::block_on(async {
@@ -5988,16 +6208,33 @@ mod tests {
 
                 // we must hold a transaction before the deletion,
                 // to prevent index GC.
-                let trx_to_prevent_gc = engine.new_session().unwrap().begin_trx().unwrap();
+                let mut original_session = engine.new_session().unwrap();
+                let mut original = original_session.begin_trx().unwrap();
                 // delete it
                 let key = single_key(1i32);
                 expect_delete_committed(table_id, &mut session, &key).await;
+
+                let mut deleted_session = engine.new_session().unwrap();
+                let mut deleted = deleted_session.begin_trx().unwrap();
 
                 // insert again, trigger insert+link
                 let insert = vec![Val::from(1i32), Val::from("world")];
                 expect_insert_committed(table_id, &mut session, insert).await;
 
-                trx_to_prevent_gc.rollback().await.unwrap();
+                assert_eq!(
+                    trx_select_row_mvcc_by_id(&mut original, table_id, &key, &[0, 1])
+                        .await
+                        .unwrap(),
+                    SelectMvcc::Found(vec![Val::from(1i32), Val::from("hello")]),
+                );
+                assert_eq!(
+                    trx_select_row_mvcc_by_id(&mut deleted, table_id, &key, &[0, 1])
+                        .await
+                        .unwrap(),
+                    SelectMvcc::NotFound,
+                );
+                original.commit().await.unwrap();
+                deleted.commit().await.unwrap();
 
                 // select 1 row
                 let key = single_key(1i32);
@@ -6010,159 +6247,24 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect snapshot history when insertion reuses a key vacated by update.
+    /// Expected: Readers before and after each change observe the corresponding row version.
     #[test]
     fn test_mvcc_insert_link_update() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            {
-                let mut session = engine.new_session().unwrap();
-                // insert 1 row: v1=1, v2=hello
-                let insert = vec![Val::from(1i32), Val::from("hello")];
-                expect_insert_committed(table_id, &mut session, insert).await;
-
-                // open one session and trnasaction to see this row
-                let mut sess1 = engine.new_session().unwrap();
-                let mut trx1 = sess1.begin_trx().unwrap();
-
-                // update it: v1=2, v2=world
-                let key = single_key(1i32);
-                let update = vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("world"),
-                    },
-                ];
-                expect_update_committed(table_id, &mut session, &key, update).await;
-
-                // open session and transaction to see row 2
-                let mut sess2 = engine.new_session().unwrap();
-                let mut trx2 = sess2.begin_trx().unwrap();
-
-                // insert again, trigger insert+link
-                let insert = vec![Val::from(1i32), Val::from("rust")];
-                expect_insert_committed(table_id, &mut session, insert).await;
-
-                // use transaction 1 to see version 1.
-                let key = single_key(1i32);
-                trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
-                })
-                .await;
-                _ = trx1.commit().await.unwrap();
-
-                // use transaction 2 to see version 2.
-                let key = single_key(2i32);
-                trx2 = expect_trx_select(table_id, trx2, &key, |vals| {
-                    assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
-                _ = trx2.commit().await.unwrap();
-
-                // use new transaction to see version 3.
-                let key = single_key(1i32);
-                _ = expect_select_committed(table_id, &mut session, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("rust"));
-                })
-                .await;
-            }
-        });
+        smol::block_on(assert_reclaimed_key_history(ReclaimKeyWith::Insert));
     }
 
+    /// Purpose: Protect snapshot history when update reclaims a previously vacated key.
+    /// Expected: Older readers retain their versions and a fresh reader sees the new key
+    /// owner.
     #[test]
     fn test_mvcc_update_link_insert() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            {
-                let mut session = engine.new_session().unwrap();
-                // insert 1 row: v1=1, v2=hello
-                let insert = vec![Val::from(1i32), Val::from("hello")];
-                expect_insert_committed(table_id, &mut session, insert).await;
-                println!("debug-only insert finish");
-
-                // open one session and trnasaction to see this row
-                let mut sess1 = engine.new_session().unwrap();
-                let mut trx1 = sess1.begin_trx().unwrap();
-
-                // update it: v1=2, v2=world
-                let key = single_key(1i32);
-                let update = vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("world"),
-                    },
-                ];
-                expect_update_committed(table_id, &mut session, &key, update).await;
-                println!("debug-only update finish");
-
-                // open session and transaction to see row 2
-                let mut sess2 = engine.new_session().unwrap();
-                let mut trx2 = sess2.begin_trx().unwrap();
-
-                // insert v1=5, v2=rust
-                let insert = vec![Val::from(5i32), Val::from("rust")];
-                expect_insert_committed(table_id, &mut session, insert).await;
-                println!("debug-only insert2 finish");
-
-                // update it: v1=1, v2=c++, trigger update+link
-                let key = single_key(5i32);
-                let update = vec![
-                    UpdateCol {
-                        idx: 0,
-                        val: Val::from(1i32),
-                    },
-                    UpdateCol {
-                        idx: 1,
-                        val: Val::from("c++"),
-                    },
-                ];
-                expect_update_committed(table_id, &mut session, &key, update).await;
-                println!("debug-only update2 finish");
-
-                // use transaction 1 to see version 1.
-                let key = single_key(1i32);
-                trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
-                })
-                .await;
-                _ = trx1.commit().await;
-
-                // use transaction 2 to see version 2.
-                let key = single_key(2i32);
-                trx2 = expect_trx_select(table_id, trx2, &key, |vals| {
-                    assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
-                })
-                .await;
-                _ = trx2.commit().await;
-
-                // use new transaction to see version 3.
-                let key = single_key(1i32);
-                _ = expect_select_committed(table_id, &mut session, &key, |vals| {
-                    assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("c++"));
-                })
-            }
-        });
+        smol::block_on(assert_reclaimed_key_history(ReclaimKeyWith::Update));
     }
 
+    /// Purpose: Protect in-place updates when only part of the index set changes.
+    /// Expected: Changed keys follow the update, untouched keys remain valid, and rollback
+    /// restores original lookups.
     #[test]
     fn test_mvcc_in_place_update_changes_only_affected_index_keys() {
         smol::block_on(async {
@@ -6281,6 +6383,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect row history across multiple updates in one transaction.
+    /// Expected: The writer sees its final key and values while an older reader retains the
+    /// original image.
     #[test]
     fn test_mvcc_multi_update() {
         smol::block_on(async {
@@ -6344,6 +6449,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect repeated growth of a nonindexed variable-length column.
+    /// Expected: Every committed update preserves the exact replacement payload under the original key.
     #[test]
     fn test_string_non_index_updates() {
         smol::block_on(async {
@@ -6370,11 +6477,17 @@ mod tests {
                         }],
                     )
                     .await;
+                    expect_select_committed(table_id, &mut session, &key, |row| {
+                        assert_eq!(row, vec![Val::from(1i32), Val::from(&value[..i])]);
+                    })
+                    .await;
                 }
             }
         });
     }
 
+    /// Purpose: Protect repeated growth of a variable-length unique key.
+    /// Expected: Each replacement key returns its exact value and the prior key is absent.
     #[test]
     fn test_string_index_updates() {
         use crate::catalog::tests::table3;
@@ -6397,22 +6510,15 @@ mod tests {
                     assert!(res.is_ok());
                     trx.commit().await.unwrap();
                 }
-                // perform updates.
                 for i in 0..COUNT {
-                    let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(&s[..i])]);
-                    let update = vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(&s[..i + 1]),
-                    }];
-                    let mut trx = session.begin_trx().unwrap();
-                    let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
-                    assert!(matches!(res, Ok(UniqueMutationOutcome::Updated(_))));
-                    trx.commit().await.unwrap();
+                    update_and_check_string_key(&mut session, table_id, &s[..i], &s[..i + 1]).await;
                 }
             }
         });
     }
 
+    /// Purpose: Protect growing indexed values on a densely populated row page.
+    /// Expected: Growth moves a physical row while preserving replacement keys and every untouched row.
     #[test]
     fn test_mvcc_out_of_place_update() {
         use crate::catalog::tests::table3;
@@ -6429,31 +6535,40 @@ mod tests {
                 let table_id = table3(&engine).await;
                 let mut session = engine.new_session().unwrap();
                 let s: String = repeat_n('0', SIZE).collect();
-                // insert 60 rows
+                let mut original_ids = Vec::new();
+                // Fill the source page before growing indexed values.
                 for i in 0usize..COUNT {
                     let insert = vec![Val::from(&s[..BASE + i])];
                     let mut trx = session.begin_trx().unwrap();
-                    let res = trx.table_insert_mvcc(table_id, insert).await;
-                    assert!(res.is_ok());
+                    original_ids.push(trx.table_insert_mvcc(table_id, insert).await.unwrap());
                     trx.commit().await.unwrap();
                 }
-                // perform updates to trigger out-of-place update.
-                // try to update k=s[..BASE+DELTA] to s[..BASE+COUNT+DELTA]
-                for i in 0..DELTA {
-                    let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(&s[..BASE + i])]);
-                    let update = vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(&s[..BASE + COUNT + i]),
-                    }];
-                    let mut trx = session.begin_trx().unwrap();
-                    let res = trx_update_row_by_id(&mut trx, table_id, &key, update).await;
-                    assert!(matches!(res, Ok(UniqueMutationOutcome::Updated(_))));
-                    trx.commit().await.unwrap();
+                let mut moved = false;
+                for (i, original_id) in original_ids.iter().take(DELTA).enumerate() {
+                    let new_id = update_and_check_string_key(
+                        &mut session,
+                        table_id,
+                        &s[..BASE + i],
+                        &s[..BASE + COUNT + i],
+                    )
+                    .await;
+                    moved |= new_id != *original_id;
                 }
+                assert!(moved, "fixture must exercise a physical row move");
+                let mut reader = session.begin_trx().unwrap();
+                let mut actual = scan_table_rows(&mut reader, table_id, &[0]).await;
+                actual.sort_by_key(|row| row[0].as_str().unwrap().len());
+                let expected: Vec<_> = (BASE + DELTA..BASE + COUNT + DELTA)
+                    .map(|len| vec![Val::from(&s[..len])])
+                    .collect();
+                assert_eq!(actual, expected);
+                reader.commit().await.unwrap();
             }
         });
     }
 
+    /// Purpose: Protect streaming scan visibility around another transaction's inserts.
+    /// Expected: Scans return exactly the committed rows before and after another writer commits.
     #[test]
     fn test_table_scan_mvcc_stream_visibility() {
         smol::block_on(async {
@@ -6480,7 +6595,7 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let rows = scan_table_i32s(&mut trx, table_id).await;
-                assert_eq!(rows.len(), SIZE as usize);
+                assert_eq!(rows, (0..SIZE).collect::<Vec<_>>());
                 trx.commit().await.unwrap();
             }
             // insert 100 rows but not commit.
@@ -6497,7 +6612,7 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let rows = scan_table_i32s(&mut trx, table_id).await;
-                assert_eq!(rows.len(), SIZE as usize);
+                assert_eq!(rows, (0..SIZE).collect::<Vec<_>>());
                 trx.commit().await.unwrap();
             }
             // commit the pending transaction.
@@ -6506,12 +6621,15 @@ mod tests {
             {
                 let mut trx = session2.begin_trx().unwrap();
                 let rows = scan_table_i32s(&mut trx, table_id).await;
-                assert_eq!(rows.len(), (SIZE * 2) as usize);
+                assert_eq!(rows, (0..SIZE * 2).collect::<Vec<_>>());
                 trx.commit().await.unwrap();
             }
         });
     }
 
+    /// Purpose: Protect scan boundaries against rows inserted during traversal.
+    /// Expected: The earliest observed insertion into a future page limits that page's scan
+    /// boundary.
     #[test]
     fn test_scan_boundary_tracker_uses_first_future_insert_boundary() {
         let pages = vec![
@@ -6537,6 +6655,8 @@ mod tests {
         assert_eq!(tracker.start_page(1, RowID::new(240)), RowID::new(220));
     }
 
+    /// Purpose: Protect in-memory visibility precedence when compiling cold delete masks.
+    /// Expected: Overrides can restore or hide rows after durable deletes are applied.
     #[test]
     fn test_cold_delete_mask_applies_cdb_overrides_after_persisted_deletes() {
         let mask = ColdDeleteMask::compile(
@@ -6574,6 +6694,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect current cold-row admission across deletion-owner states.
+    /// Expected: Visible rows are readable, consumed or committed deletions are absent, and
+    /// foreign owners conflict or require settlement.
     #[test]
     fn test_read_latest_cold_row_checks_delete_ownership() {
         let deletion_buffer = ColumnDeletionBuffer::new();
@@ -6640,6 +6763,10 @@ mod tests {
         rollback_preparing_shared_trx_status(&preparing);
     }
 
+    /// Purpose: Protect snapshot visibility when in-memory cold markers override durable
+    /// deletion.
+    /// Expected: Owned, foreign, and committed markers determine visibility for both
+    /// transactional and ownerless views.
     #[test]
     fn test_cold_row_visibility_prefers_cdb_marker_to_durable_delete() {
         let deletion_buffer = ColumnDeletionBuffer::new();
@@ -6690,6 +6817,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect unique point operations against a stale owner of a durably deleted
+    /// row.
+    /// Expected: Reads and mutations treat the row as absent and its key can be reclaimed
+    /// without a new marker.
     #[test]
     fn test_unique_single_row_paths_reject_durable_deleted_candidate() {
         smol::block_on(async {
@@ -6749,6 +6880,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nonunique lookup against a stale candidate for a durably deleted cold
+    /// row.
+    /// Expected: The candidate is filtered from the returned rows.
     #[test]
     fn test_non_unique_lookup_rejects_durable_deleted_candidate() {
         smol::block_on(async {
@@ -6804,6 +6938,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the uncontended hot point-update path.
+    /// Expected: A successful update avoids entering prepare-wait handling.
     #[test]
     fn test_hot_point_update_fast_path_skips_prepare_wait_helper() {
         smol::block_on(async {
@@ -6839,6 +6975,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a cold point update blocked on a preparing owner when the engine is
+    /// poisoned.
+    /// Expected: The wait returns the original unrelated fatal error.
     #[test]
     fn test_cold_point_update_returns_fatal_on_unrelated_poison() {
         smol::block_on(async {
@@ -6885,6 +7024,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a hot point update blocked on a preparing owner when the engine is
+    /// poisoned.
+    /// Expected: The blocked update preserves the unrelated fatal error and its context.
     #[test]
     fn test_hot_point_update_returns_fatal_on_unrelated_poison() {
         smol::block_on(async {
@@ -6945,6 +7087,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold update resumption after a preparing owner rolls back.
+    /// Expected: The update succeeds after settlement and its committed replacement is
+    /// readable.
     #[test]
     fn test_cold_point_update_waits_for_preparing_owner_rollback() {
         smol::block_on(async {
@@ -6994,6 +7139,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cold deletion after another preparing delete commits.
+    /// Expected: The waiting delete settles as a no-op.
     #[test]
     fn test_cold_point_delete_waits_for_preparing_owner_commit() {
         smol::block_on(async {
@@ -7030,102 +7177,28 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a staged cold mutation that waits after its callback has run.
+    /// Expected: Resumption applies the action without invoking the callback again.
     #[test]
     fn test_full_table_cold_staged_wait_does_not_repeat_callback() {
-        smol::block_on(async {
-            let (_temp_dir, engine, table_id, _setup_session, table, _key, row_id) =
-                setup_single_cold_row("full_table_cold_prepare_staged").await;
-
-            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 102));
-            prepare_shared_trx_status(&owner);
-            let callbacks = AtomicUsize::new(0);
-            let mut writer_session = engine.new_session().unwrap();
-            let mut writer = writer_session.begin_trx().unwrap();
-            let mutate = async {
-                let result = writer
-                    .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
-                        callbacks.fetch_add(1, Ordering::SeqCst);
-                        table
-                            .deletion_buffer()
-                            .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
-                            .unwrap();
-                        Ok(RowMutation::Delete)
-                    })
-                    .await;
-                if result.is_ok() {
-                    writer.commit().await.unwrap();
-                } else {
-                    writer.rollback().await.unwrap();
-                }
-                result
-            };
-            let release = async {
-                while !prepare_event_is_installed(&owner) {
-                    yield_now().await;
-                }
-                table.deletion_buffer().remove(row_id);
-                rollback_preparing_shared_trx_status(&owner);
-            };
-            let (result, ()) = futures::join!(mutate, release);
-            assert_eq!(
-                result.unwrap(),
-                TableMutationOutcome {
-                    delete_count: 1,
-                    update_count: 0,
-                }
-            );
-            assert_eq!(callbacks.load(Ordering::SeqCst), 1);
-        });
+        smol::block_on(assert_cold_callback_wait(
+            ColdCallbackWaitPhase::AfterCallback,
+        ));
     }
 
+    /// Purpose: Protect full-table cold mutation waiting before callback admission.
+    /// Expected: Settlement permits one callback and one successful deletion.
     #[test]
     fn test_full_table_cold_wait_before_callback_reloads_row_once() {
-        smol::block_on(async {
-            let (_temp_dir, engine, table_id, _setup_session, table, _key, row_id) =
-                setup_single_cold_row("full_table_cold_prepare_before_callback").await;
-            let owner = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 103));
-            table
-                .deletion_buffer()
-                .put_ref(row_id, Arc::clone(&owner), MAX_SNAPSHOT_TS)
-                .unwrap();
-            prepare_shared_trx_status(&owner);
-
-            let callbacks = AtomicUsize::new(0);
-            let mut writer_session = engine.new_session().unwrap();
-            let mut writer = writer_session.begin_trx().unwrap();
-            let mutate = async {
-                let result = writer
-                    .table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
-                        callbacks.fetch_add(1, Ordering::SeqCst);
-                        Ok(RowMutation::Delete)
-                    })
-                    .await;
-                if result.is_ok() {
-                    writer.commit().await.unwrap();
-                } else {
-                    writer.rollback().await.unwrap();
-                }
-                result
-            };
-            let release = async {
-                while !prepare_event_is_installed(&owner) {
-                    yield_now().await;
-                }
-                table.deletion_buffer().remove(row_id);
-                rollback_preparing_shared_trx_status(&owner);
-            };
-            let (result, ()) = futures::join!(mutate, release);
-            assert_eq!(
-                result.unwrap(),
-                TableMutationOutcome {
-                    delete_count: 1,
-                    update_count: 0,
-                }
-            );
-            assert_eq!(callbacks.load(Ordering::SeqCst), 1);
-        });
+        smol::block_on(assert_cold_callback_wait(
+            ColdCallbackWaitPhase::BeforeCallback,
+        ));
     }
 
+    /// Purpose: Protect selective hot-row callback updates and rollback of a later failed
+    /// statement.
+    /// Expected: Selected rows update correctly and statement failure restores the prior
+    /// transaction view.
     #[test]
     fn test_table_mutate_mvcc_hot_callback_and_statement_rollback() {
         smol::block_on(async {
@@ -7204,6 +7277,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect point mutations using a key vacated earlier in the same transaction.
+    /// Expected: The old key produces no mutation and the new key retains its row contents.
     #[test]
     fn test_hot_point_mutation_rejects_stale_key_from_same_transaction() {
         smol::block_on(async {
@@ -7260,6 +7335,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect full-table mutation on an empty table.
+    /// Expected: No callback runs and the operation reports no changes.
     #[test]
     fn test_table_mutate_mvcc_empty_table_returns_default_outcome() {
         smol::block_on(async {
@@ -7280,6 +7357,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect physical redo selection for unique deletions in both storage tiers.
+    /// Expected: Hot and cold deletions emit their corresponding physical redo kinds.
     #[test]
     fn test_delete_unique_mvcc_emits_physical_hot_and_cold_redo() {
         smol::block_on(async {
@@ -7325,6 +7404,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect full-table mixed actions and redo across cold and hot storage.
+    /// Expected: Mutation counts, redo kinds, scans, and point reads reflect the chosen
+    /// actions.
     #[test]
     fn test_table_mutate_mvcc_mixed_cold_hot_actions_and_outcome() {
         smol::block_on(async {
@@ -7392,6 +7474,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect statement rollback after a callback fails during mixed-storage
+    /// mutation.
+    /// Expected: The original user error is preserved and all statement effects are undone
+    /// without losing earlier work.
     #[test]
     fn test_table_mutate_mvcc_mixed_actions_callback_error_rolls_back() {
         for (indexed, deferred) in [(false, false), (true, false), (true, true)] {
@@ -7491,6 +7577,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect transaction rollback after successful mixed-storage updates and
+    /// deletions.
+    /// Expected: Rollback restores every original row and its point lookup.
     #[test]
     fn test_table_mutate_mvcc_transaction_rollback_restores_mixed_actions() {
         smol::block_on(async {
@@ -7548,6 +7637,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect secondary-index maintenance when a cold deletion callback omits
+    /// indexed columns.
+    /// Expected: Committed deletions remove the affected secondary results while preserving
+    /// survivors.
     #[test]
     fn test_table_mutate_mvcc_cold_delete_decodes_unread_index_columns() {
         smol::block_on(async {
@@ -7596,6 +7689,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect hot deletion and rollback when callbacks omit indexed columns.
+    /// Expected: All relevant keys are masked during deletion and restored by rollback.
     #[test]
     fn test_table_mutate_mvcc_hot_delete_captures_unread_index_columns() {
         smol::block_on(async {
@@ -7668,6 +7763,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect hot point deletion across primary and secondary lookups.
+    /// Expected: Rollback restores all keys and commit removes the row from both lookup paths.
     #[test]
     fn test_hot_point_delete_masks_all_index_keys_and_rolls_back() {
         smol::block_on(async {
@@ -7762,6 +7859,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique-key enforcement in full-table callback order.
+    /// Expected: An earlier delete permits key reuse while the opposite order conflicts and
+    /// rolls back.
     #[test]
     fn test_table_mutate_mvcc_enforces_uniqueness_in_action_order() {
         smol::block_on(async {
@@ -7828,6 +7928,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect current-value callbacks in a transaction with an older snapshot.
+    /// Expected: The hot callback observes the newer committed value.
     #[test]
     fn test_table_mutate_mvcc_hot_callback_reads_latest_committed_value() {
         smol::block_on(async {
@@ -7869,6 +7971,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect current-state callbacks after cold rows are updated or deleted.
+    /// Expected: The callback visits only the remaining current row and sees its committed
+    /// replacement.
     #[test]
     fn test_table_mutate_mvcc_cold_callback_reads_latest_committed_state() {
         smol::block_on(async {
@@ -7918,6 +8023,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect full-table traversal from its own cold-to-hot and hot replacements.
+    /// Expected: Each original row is updated once and replacement rows are not revisited.
     #[test]
     fn test_table_mutate_mvcc_mixed_storage_excludes_replacements() {
         smol::block_on(async {
@@ -7958,6 +8065,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect statement atomicity when full-table updates create a duplicate key.
+    /// Expected: All original rows and indexes are restored and attempted replacement keys
+    /// remain absent.
     #[test]
     fn test_table_mutate_mvcc_duplicate_rolls_back_all_rows_and_indexes() {
         smol::block_on(async {
@@ -8005,6 +8115,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect physical rollback bookkeeping after a failed cold replacement.
+    /// Expected: The replacement page stays dirty while logical rows and indexes return to
+    /// their original state.
     #[test]
     fn test_table_mutate_mvcc_cold_duplicate_marks_replacement_page_dirty() {
         smol::block_on(async {
@@ -8080,6 +8193,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect freeze exclusion while full-table mutation holds an exclusive table
+    /// lock.
+    /// Expected: Freeze waits for transaction settlement and then releases its maintenance
+    /// lock.
     #[test]
     fn test_table_mutate_mvcc_x_blocks_freeze_until_transaction_end() {
         smol::block_on(async {
@@ -8122,6 +8239,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback admission when table-lock conversion conflicts.
+    /// Expected: The lock error occurs before any mutation callback runs.
     #[test]
     fn test_table_mutate_mvcc_ix_conversion_failure_has_no_callbacks() {
         smol::block_on(async {
@@ -8186,6 +8305,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect scan worklist capture across mixed storage.
+    /// Expected: The worklist preserves the captured root, pivot, cold descriptors, and hot-
+    /// page sequence.
     #[test]
     fn test_table_scan_mvcc_worklist_captures_root_and_physical_work() {
         smol::block_on(async {
@@ -8241,6 +8363,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect warm cold-scan access costs and deletion-buffer traversal.
+    /// Expected: The scan uses cached index and column pages with one bounded marker pass and
+    /// no per-row marker lookups.
     #[test]
     fn test_warm_cold_scan_reads_each_index_and_lwc_page_once() {
         smol::block_on(async {
@@ -8278,6 +8403,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect empty scan stream exhaustion and transaction reuse.
+    /// Expected: Repeated reads remain exhausted and the transaction accepts another operation
+    /// after stream release.
     #[test]
     fn test_table_scan_mvcc_stream_empty_exhaustion_releases_checkout() {
         smol::block_on(async {
@@ -8302,6 +8430,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect complete table scanning across the storage pivot.
+    /// Expected: Scans include every cold row and subsequently inserted hot row.
     #[test]
     fn test_table_scan_mvcc_includes_cold_and_hot_rows() {
         smol::block_on(async {
@@ -8332,6 +8462,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect lazy filtering independently of the output projection.
+    /// Expected: Callbacks see stable values from both tiers while output contains only
+    /// included projected rows.
     #[test]
     fn test_table_scan_mvcc_stream_filters_cold_and_hot_rows_lazily() {
         smol::block_on(async {
@@ -8379,6 +8512,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect scan projection validation and its explicit opt-out.
+    /// Expected: Invalid projections fail before callbacks while trusted empty projection
+    /// yields an empty row.
     #[test]
     fn test_table_scan_mvcc_stream_validates_projection_unless_disabled() {
         smol::block_on(async {
@@ -8427,6 +8563,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect streamed snapshot reconstruction across repeated hot updates.
+    /// Expected: Both callback reads and projected output retain the reader's original row
+    /// image.
     #[test]
     fn test_table_scan_mvcc_stream_reconstructs_repeated_hot_updates() {
         smol::block_on(async {
@@ -8474,6 +8613,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect lazy buffer reuse while reconstructing different historical rows.
+    /// Expected: Each streamed row contains its own snapshot values without leaking the
+    /// previous row's cache.
     #[test]
     fn test_table_scan_mvcc_stream_clears_reused_lazy_row_buffer() {
         smol::block_on(async {
@@ -8533,6 +8675,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect stream page-guard lifetime while concurrent row updates remain
+    /// possible.
+    /// Expected: Exclusive page access waits until exhaustion while the stream preserves
+    /// snapshot values.
     #[test]
     fn test_table_scan_mvcc_stream_retains_hot_guard_and_allows_updates() {
         smol::block_on(async {
@@ -8607,6 +8753,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a captured hot scan worklist when checkpoint publishes cold routes.
+    /// Expected: The stream still returns every originally captured row exactly once.
     #[test]
     fn test_table_scan_mvcc_stream_uses_captured_hot_pages_after_checkpoint() {
         smol::block_on(async {
@@ -8648,6 +8796,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect stream cleanup and error identity after callback or projection
+    /// failure.
+    /// Expected: The error remains intact, callback state is released, and subsequent reads
+    /// stay exhausted.
     #[test]
     fn test_table_scan_callback_errors_release_state_and_are_terminal() {
         smol::block_on(async {
@@ -8749,6 +8901,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect stream termination after an explicit stop or invalid row access.
+    /// Expected: Further reads remain exhausted and releasing the stream permits transaction
+    /// reuse.
     #[test]
     fn test_table_scan_mvcc_stream_stop_and_error_are_terminal() {
         smol::block_on(async {
@@ -8806,6 +8961,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect scan construction from redundant lifecycle checks after catalog
+    /// resolution.
+    /// Expected: A scan can be constructed from the locked catalog state despite a separately
+    /// advanced runtime lifecycle.
     #[test]
     fn test_table_scan_mvcc_uses_locked_catalog_state_without_lifecycle_revalidation() {
         smol::block_on(async {
@@ -8830,6 +8989,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect streamed snapshot visibility of committed cold deletion markers.
+    /// Expected: Older scans retain the deleted row while newer scans omit it.
     #[test]
     fn test_table_scan_mvcc_cold_delete_buffer_visibility() {
         smol::block_on(async {
@@ -8863,6 +9024,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table scans across a committed cold-to-hot update.
+    /// Expected: Older scans retain the original image and newer scans return the replacement
+    /// once.
     #[test]
     fn test_table_scan_mvcc_cold_update_visibility() {
         smol::block_on(async {
@@ -8912,6 +9076,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect scan visibility of a transaction's uncommitted cold deletion.
+    /// Expected: The writer omits its deleted row while another transaction still sees it.
     #[test]
     fn test_table_scan_mvcc_uncommitted_cold_delete_visibility() {
         smol::block_on(async {
@@ -8941,6 +9107,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table scans after cold deletions become durable.
+    /// Expected: The persisted deletion delta excludes the deleted row from scan results.
     #[test]
     fn test_table_scan_mvcc_skips_persisted_delete_delta() {
         smol::block_on(async {
@@ -8981,6 +9149,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect early stream termination during cold traversal.
+    /// Expected: Stopping in the cold phase prevents callbacks and output for remaining cold
+    /// and hot rows.
     #[test]
     fn test_table_scan_mvcc_stream_stops_before_hot_phase() {
         smol::block_on(async {
@@ -9018,6 +9189,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the canonical frozen prefix across repeated freeze and subsequent
+    /// writes.
+    /// Expected: New inserts use an active page, repeated freeze preserves the prefix, and
+    /// moved rows reuse active capacity.
     #[test]
     fn test_table_freeze() {
         smol::block_on(async {
@@ -9099,6 +9274,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect ownership transfer for an uncommitted lock during hot-to-cold
+    /// publication.
+    /// Expected: The cold marker shares the writer status before route publication and
+    /// statement rollback removes it.
     #[test]
     fn test_transition_captures_uncommitted_lock_into_deletion_buffer() {
         smol::block_on(async {
@@ -9224,6 +9403,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect session reuse of a valid cached insert-page generation.
+    /// Expected: Later insertion uses the same page and retains the same versioned cache
+    /// entry.
     #[test]
     fn test_session_cached_insert_page_reuses_live_versioned_page() {
         smol::block_on(async {
@@ -9275,6 +9457,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cached insert-page handoff on explicit session close.
+    /// Expected: Closing the session returns its page for reuse by another session.
     #[test]
     fn test_session_close_returns_cached_insert_page() {
         smol::block_on(assert_session_end_returns_cached_insert_page(
@@ -9282,6 +9466,8 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect cached insert-page handoff when an idle session is dropped.
+    /// Expected: Dropping the session returns its page for reuse by another session.
     #[test]
     fn test_idle_session_drop_returns_cached_insert_page() {
         smol::block_on(assert_session_end_returns_cached_insert_page(
@@ -9289,6 +9475,9 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect insertion through a session cache whose page was reclaimed after
+    /// checkpoint.
+    /// Expected: Insertion succeeds on a fresh generation and replaces the stale cache entry.
     #[test]
     fn test_stale_session_cached_insert_page_falls_back_after_checkpoint_gc() {
         smol::block_on(async {
@@ -9347,6 +9536,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect row-range validation after a reclaimed page slot is reused.
+    /// Expected: The old row identity is rejected while the new row validates on the reused
+    /// page.
     #[test]
     fn test_validated_row_page_shared_result_rejects_stale_reused_page_range() {
         smol::block_on(async {
@@ -9448,6 +9640,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect insertion when reloading an evicted cached page fails.
+    /// Expected: The injected page-read error reaches the caller and the reload hook confirms
+    /// the failing path.
     #[test]
     fn test_mvcc_insert_surfaces_cached_insert_page_reload_error() {
         smol::block_on(async {
@@ -9467,43 +9662,7 @@ mod tests {
             let cached_page = session.load_active_insert_page(table_id).unwrap();
             session.save_active_insert_page(table_id, cached_page);
 
-            let mut writer = engine.new_session().unwrap();
-            for i in 2..258 {
-                expect_insert_committed(
-                    table_id,
-                    &mut writer,
-                    vec![Val::from(i), Val::from(&large[..])],
-                )
-                .await;
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    break;
-                }
-            }
-            // Timer audit: buffer-eviction/I/O test coordination.
-            let mut evicted = false;
-            for _ in 0..20 {
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    evicted = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(50)).await;
-            }
-            assert!(
-                evicted,
-                "cached insert page should be evicted before repro insert"
-            );
+            test_evict_existing_page(engine.inner().pools.mem.clone(), cached_page.page_id).await;
 
             let mem_pool_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
@@ -9536,142 +9695,9 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_mvcc_rollback_poisons_runtime_on_row_page_reload_error() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = evictable_test_engine(&temp_dir, 9u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-
-            let large = "r".repeat(48 * 1024);
-            let mut trx = session.begin_trx().unwrap();
-            let _row_id = match trx
-                .table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
-                .await
-            {
-                Ok(row_id) => row_id,
-                res => panic!("res={res:?}"),
-            };
-
-            let cached_page = session.load_active_insert_page(table_id).unwrap();
-
-            let mut writer = engine.new_session().unwrap();
-            for i in 2..258 {
-                expect_insert_committed(
-                    table_id,
-                    &mut writer,
-                    vec![Val::from(i), Val::from(&large[..])],
-                )
-                .await;
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    break;
-                }
-            }
-            // Timer audit: buffer-eviction/I/O test coordination.
-            let mut evicted = false;
-            for _ in 0..20 {
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    evicted = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(50)).await;
-            }
-            assert!(evicted, "rollback row page should be evicted before repro");
-
-            let mem_pool_file =
-                StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
-            let read_hook = Arc::new(FailingPageReadHook::for_page(
-                mem_pool_file,
-                cached_page.page_id,
-                libc::EIO,
-            ));
-            let _hook = install_storage_backend_test_hook(read_hook);
-            let expected_io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
-
-            let rollback_error = trx
-                .rollback()
-                .await
-                .expect_err("row-page reload failure must fail terminal rollback");
-            assert_eq!(rollback_error.kind(), ErrorKind::Fatal);
-            assert_eq!(
-                rollback_error
-                    .report()
-                    .downcast_ref::<FatalError>()
-                    .copied(),
-                Some(FatalError::RollbackAccess)
-            );
-            assert_eq!(
-                rollback_error
-                    .report()
-                    .downcast_ref::<RuntimeError>()
-                    .copied(),
-                Some(RuntimeError::BufferPageAccess)
-            );
-            assert_eq!(
-                rollback_error
-                    .report()
-                    .downcast_ref::<IoError>()
-                    .copied()
-                    .map(IoError::kind),
-                Some(expected_io_kind)
-            );
-            assert_eq!(
-                rollback_error
-                    .report()
-                    .frames()
-                    .filter(|frame| frame.is::<ErrorKind>())
-                    .count(),
-                1
-            );
-
-            let poison_error = engine
-                .inner()
-                .poisoner
-                .poison_error()
-                .expect("terminal rollback failure must poison the runtime");
-            assert_eq!(poison_error.current_context(), &FatalError::RollbackAccess);
-            assert_eq!(
-                poison_error.downcast_ref::<RuntimeError>().copied(),
-                Some(RuntimeError::BufferPageAccess)
-            );
-            assert_eq!(
-                poison_error
-                    .downcast_ref::<IoError>()
-                    .copied()
-                    .map(IoError::kind),
-                Some(expected_io_kind)
-            );
-            assert!(poison_error.downcast_ref::<ErrorKind>().is_none());
-            assert_eq!(fatal_rollback_retention_count(&engine.inner().trx_sys), 1);
-            assert!(
-                engine
-                    .inner()
-                    .poisoner
-                    .ensure_healthy()
-                    .as_ref()
-                    .is_err_and(|err| *err.current_context() == FatalError::RollbackAccess)
-            );
-            assert!(
-                session.in_trx().unwrap(),
-                "failed-retained operation must remain attached to the session"
-            );
-            remove_session_for_test(&engine.inner().session_registry, session.id());
-        });
-    }
-
+    /// Purpose: Protect transaction rollback when an evicted undo page cannot be read.
+    /// Expected: The fatal report retains its cause and the engine retains both poison and
+    /// failed transaction ownership.
     #[test]
     fn test_transaction_rollback_poisons_runtime_on_row_page_reload_error() {
         smol::block_on(async {
@@ -9680,49 +9706,13 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             let large = "r".repeat(48 * 1024);
-            let mut writer = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
                 .await
                 .unwrap();
 
             let cached_page = session.load_active_insert_page(table_id).unwrap();
-            for i in 2..258 {
-                expect_insert_committed(
-                    table_id,
-                    &mut writer,
-                    vec![Val::from(i), Val::from(&large[..])],
-                )
-                .await;
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    break;
-                }
-            }
-            // Timer audit: buffer-eviction/I/O test coordination.
-            let mut evicted = false;
-            for _ in 0..20 {
-                if test_frame_kind(
-                    &table_for_internal_assertion(&engine, table_id)
-                        .row_store
-                        .mem_pool,
-                    cached_page.page_id,
-                ) == FrameKind::Evicted
-                {
-                    evicted = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(50)).await;
-            }
-            assert!(
-                evicted,
-                "transaction rollback page should be evicted before repro"
-            );
+            test_evict_existing_page(engine.inner().pools.mem.clone(), cached_page.page_id).await;
 
             let mem_pool_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
@@ -9796,10 +9786,22 @@ mod tests {
                 "failed-retained operation must keep the session unavailable"
             );
 
+            assert_eq!(
+                engine
+                    .inner()
+                    .poisoner
+                    .ensure_healthy()
+                    .unwrap_err()
+                    .current_context(),
+                &FatalError::RollbackAccess,
+            );
             remove_session_for_test(&engine.inner().session_registry, session.id());
         });
     }
 
+    /// Purpose: Protect user index operation under buffer-pool eviction pressure.
+    /// Expected: Eviction completes without write errors; point reads and a full scan
+    /// preserve the inserted keys and payloads.
     #[test]
     fn test_user_secondary_indexes_evict_and_continue_serving_lookups() {
         smol::block_on(async {
@@ -9910,12 +9912,13 @@ mod tests {
             }
 
             let mut trx = session.begin_trx().unwrap();
-            let visible_rows = scan_table_i32s(&mut trx, table_id).await.len();
+            assert_eq!(scan_table_pairs(&mut trx, table_id).await, inserted);
             trx.commit().await.unwrap();
-            assert_eq!(visible_rows, inserted.len());
         });
     }
 
+    /// Purpose: Protect cold secondary-index scans whose projection omits the index column.
+    /// Expected: Both eager and streaming scans return the requested projection correctly.
     #[test]
     fn test_secondary_index_scan_mvcc_reads_lwc_projection_without_index_column() {
         smol::block_on(async {
@@ -9983,6 +9986,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the scope and reversibility of stream validation opt-out.
+    /// Expected: Reenabling validation restores rejection and a new transaction starts with
+    /// validation enabled.
     #[test]
     fn test_transaction_stream_validation_opt_out_can_be_reenabled_and_is_transaction_local() {
         smol::block_on(async {
@@ -10075,6 +10081,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect secondary lookup and range scans across row mutation and stream
+    /// lifetimes.
+    /// Expected: Results reflect updates and deletes, invalid stream inputs fail, and
+    /// exhausted or dropped streams permit reuse.
     #[test]
     fn test_secondary_index_common() {
         smol::block_on(async {
@@ -10328,6 +10338,9 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect secondary scans of a row deleted by an active transaction.
+    /// Expected: The writer sees absence while another reader sees the row through both scan
+    /// interfaces.
     #[test]
     fn test_secondary_index_scan_mvcc_uncommitted_delete_candidate_visibility() {
         smol::block_on(async {
@@ -10380,6 +10393,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect secondary scans across a deletion committed after a reader's snapshot.
+    /// Expected: Both scan interfaces retain the row for the old reader and omit it for a
+    /// fresh reader.
     #[test]
     fn test_secondary_index_scan_mvcc_delete_committed_after_snapshot() {
         smol::block_on(async {
