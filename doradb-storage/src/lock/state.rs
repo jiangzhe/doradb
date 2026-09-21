@@ -1039,6 +1039,23 @@ mod tests {
             .count()
     }
 
+    fn reference_data_mode_covers(held: LockMode, requested: LockMode) -> bool {
+        // Independent table from the data-lock coverage contract in docs/lock-system.md.
+        let coverage = [
+            [true, false, false, false],
+            [true, true, false, false],
+            [true, false, true, false],
+            [true, true, true, true],
+        ];
+        let index = |mode| match mode {
+            LockMode::IntentShared => 0,
+            LockMode::IntentExclusive => 1,
+            LockMode::Shared => 2,
+            LockMode::Exclusive => 3,
+        };
+        coverage[index(held)][index(requested)]
+    }
+
     fn family_snapshot(
         family: &FamilyLockState,
     ) -> Vec<(
@@ -1051,14 +1068,19 @@ mod tests {
     )> {
         let mut snapshot = Vec::new();
         for (&resource, state) in &family.resources {
+            assert!(matches!(resource, LockResource::TableData(_)));
             let mut expected_mask = ModeMask::default();
             let mut expected_covering = None;
             state.for_each(|scope, claim| {
                 expected_mask.insert(claim.mode);
                 expected_covering = match expected_covering {
                     None => Some(claim.mode),
-                    Some(current) if current.covers(resource, claim.mode) => Some(current),
-                    Some(current) if claim.mode.covers(resource, current) => Some(claim.mode),
+                    Some(current) if reference_data_mode_covers(current, claim.mode) => {
+                        Some(current)
+                    }
+                    Some(current) if reference_data_mode_covers(claim.mode, current) => {
+                        Some(claim.mode)
+                    }
                     Some(current) => panic!(
                         "debug snapshot found incomparable occupied modes: \
                          resource={resource}, left={current}, right={}",
@@ -1188,9 +1210,10 @@ mod tests {
             LockMode::Exclusive,
         ];
         let mut model = BTreeMap::<(usize, LockResource), (ClaimNo, LockMode)>::new();
-        let mut last_claim_no = 0;
+        let initial_seed = seed;
+        let mut next_claim_no = 1;
 
-        for _step in 0..512 {
+        for step in 0..512 {
             seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
@@ -1231,16 +1254,20 @@ mod tests {
                         model.iter().all(|(&(index, held_resource), &(_no, held))| {
                             held_resource != resource
                                 || index == scope_index
-                                || held.covers(resource, requested)
+                                || reference_data_mode_covers(held, requested)
                         });
-                    let expected_success = match exact {
-                        Some((_claim_no, held)) if held.covers(resource, requested) => true,
-                        Some((_claim_no, held)) => {
-                            family_covers && requested.covers(resource, held)
+                    let expected = match exact {
+                        Some((claim_no, held)) if reference_data_mode_covers(held, requested) => {
+                            Ok((claim_no, held))
                         }
-                        None => family_covers,
+                        Some((_claim_no, held)) if !reference_data_mode_covers(requested, held) => {
+                            Err(OperationError::LockConversionNotSupported)
+                        }
+                        _ if !family_covers => Err(OperationError::LockFamilyConflict),
+                        Some((claim_no, _held)) => Ok((claim_no, requested)),
+                        None => Ok((ClaimNo::new(next_claim_no), requested)),
                     };
-                    let next_claim_no = family.next_claim_no;
+                    next_claim_no += u64::from(exact.is_none());
                     let result = family
                         .acquire(
                             &mut scopes[scope_index],
@@ -1251,27 +1278,41 @@ mod tests {
                         )
                         .now_or_never()
                         .expect("reference-model acquisition unexpectedly waited");
-                    if expected_success {
-                        result.unwrap();
-                        let actual = scopes[scope_index].claims[&resource];
-                        if let Some((claim_no, _held)) = exact {
-                            assert_eq!(actual.claim_no, claim_no);
-                        } else {
-                            assert_eq!(actual.claim_no.as_u64(), next_claim_no);
-                            assert!(actual.claim_no.as_u64() > last_claim_no);
-                            last_claim_no = actual.claim_no.as_u64();
+                    match expected {
+                        Ok((claim_no, mode)) => {
+                            let grant = if exact.is_some() {
+                                LockGrant::Existing
+                            } else {
+                                LockGrant::Fresh
+                            };
+                            assert_eq!(
+                                result.unwrap(),
+                                grant,
+                                "seed={initial_seed:#x}, step={step}, scope={scope_index}, resource={resource}"
+                            );
+                            assert_eq!(
+                                scopes[scope_index].claims[&resource],
+                                ScopeClaim { claim_no, mode },
+                                "seed={initial_seed:#x}, step={step}, scope={scope_index}, resource={resource}"
+                            );
+                            model.insert((scope_index, resource), (claim_no, mode));
                         }
-                        model.insert((scope_index, resource), (actual.claim_no, actual.mode));
-                    } else {
-                        assert!(result.is_err());
-                        assert_eq!(
-                            scopes[scope_index].claims.get(&resource).copied(),
-                            exact.map(|(claim_no, mode)| ScopeClaim { claim_no, mode })
-                        );
+                        Err(error) => {
+                            assert_eq!(
+                                *operation_report(result.unwrap_err()).current_context(),
+                                error,
+                                "seed={initial_seed:#x}, step={step}, scope={scope_index}, resource={resource}"
+                            );
+                            assert_eq!(
+                                scopes[scope_index].claims.get(&resource).copied(),
+                                exact.map(|(claim_no, mode)| ScopeClaim { claim_no, mode }),
+                                "seed={initial_seed:#x}, step={step}"
+                            );
+                        }
                     }
                     assert_eq!(
-                        family.next_claim_no,
-                        next_claim_no + u64::from(exact.is_none())
+                        family.next_claim_no, next_claim_no,
+                        "seed={initial_seed:#x}, step={step}"
                     );
                 }
             }
@@ -1303,19 +1344,22 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut expected_claims = expected_claims;
             expected_claims.sort_unstable_by_key(|entry| (entry.0, entry.1));
-            assert_eq!(actual_claims, expected_claims);
+            assert_eq!(
+                actual_claims, expected_claims,
+                "seed={initial_seed:#x}, step={step}"
+            );
             assert_manager_agreement(&family, &manager);
         }
 
-        for scope in &mut scopes {
+        for scope in scopes.iter_mut().rev() {
             family.close_scope(scope, &manager);
         }
         family.assert_empty();
         assert_manager_agreement(&family, &manager);
     }
 
-    /// Purpose: Construct a session lock authority before any claims exist.
-    /// Expected: Family and session owner match, the next claim is one, and claims/resources/statistics are empty.
+    /// Purpose: Establish the initial state of a session lock authority.
+    /// Expected: The authority has the correct owner and an unused claim sequence with no lock activity.
     #[test]
     fn new_authority_starts_with_one_empty_session_root() {
         let session_id = SessionID::new(9);
@@ -1332,7 +1376,7 @@ mod tests {
     }
 
     /// Purpose: Close a public transaction whose shared claim is covered by a session exclusive claim.
-    /// Expected: One covered publication is counted and the session exclusive claim survives transaction close.
+    /// Expected: Closing the child preserves the session's covering claim and records local publication.
     #[test]
     fn fixed_scope_slots_preserve_session_claim_when_transaction_closes() {
         smol::block_on(async {
@@ -1379,7 +1423,7 @@ mod tests {
     }
 
     /// Purpose: Close a private transaction covered by an operation-owned exclusive claim.
-    /// Expected: The operation retains Exclusive, one mode-preserving release is counted, and manager state agrees.
+    /// Expected: The operation's covering claim survives child close without changing its physical mode.
     #[test]
     fn operation_claim_preserves_mode_when_private_transaction_closes() {
         smol::block_on(async {
@@ -1424,7 +1468,7 @@ mod tests {
     }
 
     /// Purpose: Close a transaction holding a resource distinct from the session parent resource.
-    /// Expected: Only the child physical claim is removed; the parent stays Exclusive and manager state agrees.
+    /// Expected: Closing the child removes only its resource while preserving the parent's physical grant.
     #[test]
     fn child_only_physical_claim_is_removed_while_parent_remains_on_other_resource() {
         smol::block_on(async {
@@ -1467,8 +1511,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Repeat a covered claim, release it, and reacquire the resource.
-    /// Expected: The repeat returns Existing with one physical owner; reacquisition has a new claim number.
+    /// Purpose: Distinguish exact covered reuse from acquisition after release.
+    /// Expected: Covered requests reuse the claim locally while reacquisition receives a fresh identity.
     #[test]
     fn repeated_covered_acquire_is_local_and_reacquire_burns_identity() {
         smol::block_on(async {
@@ -1522,7 +1566,7 @@ mod tests {
     }
 
     /// Purpose: Measure exact-cover, family-cover, and close work for a session and public transaction.
-    /// Expected: Explicit counters distinguish local hits/publications from one physical acquire/removal and zero final resources.
+    /// Expected: Statistics distinguish local claim work from physical ownership and record complete cleanup.
     #[test]
     fn logical_lock_stats_split_owner_local_and_physical_work() {
         smol::block_on(async {
@@ -1596,8 +1640,8 @@ mod tests {
         assert_eq!(from_ref(authority.as_ref()), ptr);
     }
 
-    /// Purpose: Request Shared in a transaction whose family holds noncovering IntentExclusive.
-    /// Expected: The request returns LockFamilyConflict and the manager retains one granted family entry.
+    /// Purpose: Reject a transaction request not covered by its session's intent lock.
+    /// Expected: A family conflict preserves the existing physical grant without accepting a child claim.
     #[test]
     fn same_family_noncovering_request_is_rejected_locally() {
         smol::block_on(async {
@@ -1617,6 +1661,8 @@ mod tests {
                 .await
                 .unwrap();
             let mut trx = LockScopeState::new(LockOwner::transaction(session_id, TrxID::new(31)));
+            let before = family_snapshot(family);
+            let manager_before = debug_snapshot(&manager);
             let err = family
                 .acquire(
                     &mut trx,
@@ -1632,12 +1678,15 @@ mod tests {
                 OperationError::LockFamilyConflict
             );
             assert_eq!(owner_count(&manager, trx.owner()), 1);
+            trx.assert_cleared();
+            assert_eq!(family_snapshot(family), before);
+            assert_eq!(debug_snapshot(&manager), manager_before);
             family.close_scope(session_scope, &manager);
         });
     }
 
     /// Purpose: Publish session, operation, and transaction claims under one covering exclusive family.
-    /// Expected: Three logical claims share one manager acquire; ordered close clears all indexes with exact release counters.
+    /// Expected: Exact scopes share a physical grant while publication and ordered cleanup keep indexes and counters consistent.
     #[test]
     fn three_scope_identities_update_stats_and_manager_mirrors() {
         smol::block_on(async {
@@ -1700,8 +1749,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Convert IntentShared to IntentExclusive, then attempt an unsupported Shared conversion.
-    /// Expected: The claim number stays fixed; rejection is LockConversionNotSupported and IntentExclusive remains held.
+    /// Purpose: Protect claim identity through a comparable upgrade and an incomparable conversion attempt.
+    /// Expected: Upgrade preserves identity and unsupported conversion leaves the accepted mode unchanged.
     #[test]
     fn conversion_retains_claim_identity_and_rejection_preserves_mode() {
         smol::block_on(async {
@@ -1761,8 +1810,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Poll a blocked claim to Waiting and cancel its acquisition future.
-    /// Expected: Claim one is observed waiting; cancellation advances the next number to two and leaves no accepted claims.
+    /// Purpose: Cancel a blocked acquisition after reserving its claim identity.
+    /// Expected: Cancellation consumes the reserved identity without publishing accepted claims.
     #[test]
     fn cancelled_wait_burns_claim_number_without_accepted_indexes() {
         smol::block_on(async {
@@ -1805,8 +1854,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Release and reacquire a resource, then attempt release using the stale token.
-    /// Expected: The stale release panics while the current token and one physical family entry remain intact.
+    /// Purpose: Reject a stale release token after reacquiring its resource.
+    /// Expected: Rejection preserves the current claim identity and physical grant.
     #[test]
     fn stale_claim_token_panics_before_touching_reacquired_claim() {
         smol::block_on(async {
@@ -1881,8 +1930,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Drop a fresh-claims guard after an Existing claim and a Fresh claim.
-    /// Expected: Rollback retains the preexisting Exclusive claim, removes only the fresh claim, and leaves one physical entry.
+    /// Purpose: Roll back a guarded group containing preexisting and fresh claims.
+    /// Expected: Guard cleanup releases only fresh claims and preserves preexisting protection.
     #[test]
     fn fresh_group_rollback_preserves_preexisting_exact_claims() {
         smol::block_on(async {
@@ -1927,8 +1976,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Inject poison at listener registration, completion selection, and pre-provisional observation.
-    /// Expected: Each hook yields Fatal StorageIo with its attachment and clears pending, scope, family, and manager state.
+    /// Purpose: Abort pending acquisition when poison arrives at each wait-to-accept boundary.
+    /// Expected: The fatal report retains its cause and cancellation clears pending and accepted lock state.
     #[test]
     fn pending_claim_poison_cancels_every_wait_to_accept_race() {
         for phase in [
@@ -1941,7 +1990,7 @@ mod tests {
     }
 
     /// Purpose: Inject poison after the final health check of a previously pending claim.
-    /// Expected: Acquisition returns Fresh despite recorded poison; the claim stays held until explicit close clears the manager.
+    /// Expected: Poison after acceptance does not revoke the claim, which remains held until explicit close.
     #[test]
     fn poison_after_final_health_check_does_not_revoke_accepted_claim() {
         smol::block_on(async {
@@ -1974,7 +2023,7 @@ mod tests {
     }
 
     /// Purpose: Poison a blocked group acquisition after accepting a fresh prefix beside an older claim.
-    /// Expected: Fatal StorageIo is preserved; rollback removes fresh/pending claims and keeps the older claim until close.
+    /// Expected: Poison retains its fatal cause while rollback preserves only the preexisting claim.
     #[test]
     fn fresh_group_poison_rolls_back_only_its_fresh_prefix() {
         smol::block_on(async {
@@ -2024,7 +2073,7 @@ mod tests {
     }
 
     /// Purpose: Acquire an immediate physical claim followed by a family-covered transaction claim.
-    /// Expected: Both grants are Fresh without increasing poison observations, and closing both empties the manager.
+    /// Expected: Nonwaiting acquisitions avoid poison observation and their claims are fully releasable.
     #[test]
     fn immediate_and_family_covered_acquires_skip_poison_observation() {
         smol::block_on(async {
@@ -2060,8 +2109,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Run 512 deterministic lifecycle steps for session/public-transaction owners with seed 0x258d0a274c6f91e3.
-    /// Expected: Claim acceptance and identity checks hold; scope indexes, family snapshots, and manager aggregates agree through teardown.
+    /// Purpose: Compare session and public-transaction lifecycles with an independent claim model.
+    /// Expected: Acceptance, modes, identities, and aggregate ownership match the model through teardown.
     #[test]
     fn public_transaction_lifecycle_model_matches_indexes_and_manager() {
         let session_id = SessionID::new(90);
@@ -2072,8 +2121,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Run 512 deterministic lifecycle steps for operation/private-transaction owners with seed 0xa6e153d488b02f79.
-    /// Expected: Claim acceptance and identity checks hold; scope indexes, family snapshots, and manager aggregates agree through teardown.
+    /// Purpose: Compare operation and private-transaction lifecycles with an independent claim model.
+    /// Expected: Acceptance, modes, identities, and aggregate ownership match the model through teardown.
     #[test]
     fn private_transaction_lifecycle_model_matches_indexes_and_manager() {
         let session_id = SessionID::new(91);
@@ -2084,8 +2133,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Attempt to release a strong outer claim while its covered child still exists.
-    /// Expected: Release panics before changing family or manager snapshots, and both original modes remain covered.
+    /// Purpose: Reject releasing a strong outer claim while its covered child still exists.
+    /// Expected: Invalid release preserves both claims and their logical and physical ownership.
     #[test]
     fn closing_strong_outer_claim_before_covered_child_panics_before_mutation() {
         smol::block_on(async {
