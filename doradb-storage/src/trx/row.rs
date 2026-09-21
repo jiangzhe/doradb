@@ -315,15 +315,13 @@ impl<'a> RowReadAccess<'a> {
                         debug_assert!(!ver.deleted);
                         match &ib.target {
                             IndexBranchTarget::Hot {
-                                cts,
+                                end_cts,
                                 entry: hot_entry,
                             } => {
-                                if ctx.sts() > *cts {
-                                    return ver.get_visible_vals_for_index_candidate(
-                                        metadata,
-                                        self.row(),
-                                        candidate,
-                                    );
+                                if ctx.sts() > *end_cts {
+                                    // The predecessor had already deleted or vacated
+                                    // this key before the reader's snapshot.
+                                    return ReadRow::NotFound;
                                 }
                                 entry = hot_entry.snapshot_view();
                             }
@@ -465,7 +463,7 @@ impl<'a> RowReadAccess<'a> {
                 // Old row does not match key.
                 // Traverse version chain to find matched version.
                 let mut entry = undo_head.next.main.entry.clone();
-                let mut cts = ts;
+                let mut end_cts = ts;
                 let mut deleted = row.is_deleted();
                 let mut vals = row.clone_vals(metadata.col.as_ref());
                 // Traverse version chain until oldest version.
@@ -491,7 +489,7 @@ impl<'a> RowReadAccess<'a> {
                     }
                     // Here we check if current version matches input key
                     if !deleted && metadata.idx.match_key(index_slot, key_vals, &vals) {
-                        return Ok(FindOldVersion::Found(vals, cts, entry));
+                        return Ok(FindOldVersion::Found(vals, end_cts, entry));
                     }
                     // We only need to go through main branch, because Index
                     // branch won't have different key than those in main
@@ -501,7 +499,7 @@ impl<'a> RowReadAccess<'a> {
                             return Ok(FindOldVersion::None);
                         }
                         Some(next) => {
-                            cts = next.main.status.ts();
+                            end_cts = next.main.status.ts();
                             entry = next.main.entry.clone();
                         }
                     }
@@ -1210,7 +1208,7 @@ impl<'a> RowWriteAccess<'a> {
     pub(crate) fn link_for_unique_index(
         &mut self,
         key: ResolvedIndexKey,
-        cts: TrxID,
+        end_cts: TrxID,
         entry: RowUndoRef,
         undo_vals: Vec<UpdateCol>,
     ) {
@@ -1221,7 +1219,7 @@ impl<'a> RowWriteAccess<'a> {
         let undo_head = self.guard.as_mut().expect("undo head");
         undo_head.next.indexes.push(IndexBranch::new(
             key,
-            IndexBranchTarget::Hot { cts, entry },
+            IndexBranchTarget::Hot { end_cts, entry },
             undo_vals,
         ));
     }
@@ -1461,7 +1459,8 @@ pub(crate) enum LockRowForWrite<'a> {
 
 /// Result of searching a row's old versions for a unique-key owner.
 pub(crate) enum FindOldVersion {
-    /// Matching old version found with values, timestamp, and undo entry.
+    /// Matching old version with values, its key-ownership end timestamp,
+    /// and the undo entry for that departure.
     Found(Vec<Val>, TrxID, RowUndoRef),
     /// No matching old version exists.
     None,
@@ -1557,6 +1556,8 @@ pub(crate) mod tests {
         RowReadAccess::from_guard(page, row_idx, row_ver.read_latch(row_idx))
     }
 
+    /// Purpose: Protect latest-row reads independently of snapshot history.
+    /// Expected: Committed page values remain readable even after the reader snapshot.
     #[test]
     fn test_read_latest_uses_committed_page_image_newer_than_snapshot() {
         let metadata = sparse_metadata();
@@ -1575,6 +1576,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Protect latest-row admission against competing owners.
+    /// Expected: Own changes are readable and another active owner causes a write conflict.
     #[test]
     fn test_read_latest_allows_own_head_and_rejects_foreign_active_head() {
         let metadata = sparse_metadata();
@@ -1595,6 +1598,8 @@ pub(crate) mod tests {
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::WriteConflict);
     }
 
+    /// Purpose: Protect conflict precedence on a deleted row.
+    /// Expected: Active foreign ownership conflicts; committed deletion reports absence.
     #[test]
     fn test_read_latest_checks_foreign_owner_before_deleted_image() {
         let metadata = sparse_metadata();
@@ -1611,6 +1616,8 @@ pub(crate) mod tests {
         assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::NotFound);
     }
 
+    /// Purpose: Protect scan visibility across each active undo kind.
+    /// Expected: Owners see their current state while foreign and ownerless readers reconstruct history.
     #[test]
     fn test_scan_read_view_resolves_active_main_branch_kinds() {
         #[derive(Clone, Copy)]
@@ -1700,6 +1707,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect ordered replay of repeated sparse before-images.
+    /// Expected: Foreign and ownerless snapshots reconstruct the oldest applicable column value.
     #[test]
     fn test_ownerless_scan_replays_repeated_sparse_updates_like_foreign_reader() {
         let metadata = sparse_metadata();
@@ -1760,6 +1769,8 @@ pub(crate) mod tests {
         assert_eq!(reconstruct(&ownerless), reconstruct(&foreign));
     }
 
+    /// Purpose: Protect exact index-candidate admission against missing metadata.
+    /// Expected: Invalid resolved identities fail as contracts instead of ordinary lookup misses.
     #[test]
     fn test_index_candidate_requires_resolved_metadata() {
         let metadata = sparse_metadata();
@@ -1799,6 +1810,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Protect historical catalog reads through an index branch.
+    /// Expected: The reconstructed previous owner supplies the expected row values.
     #[test]
     fn test_index_candidate_mvcc_follows_catalog_branch_to_previous_owner() {
         let metadata = sparse_metadata();
@@ -1849,6 +1862,106 @@ pub(crate) mod tests {
         assert_eq!(vals, vec![Val::from(10i32), Val::from(15i32)]);
     }
 
+    /// Purpose: Protect unique-key history at insertion, departure, and replacement boundaries.
+    /// Expected: Hot branches expose the prior owner only before its departure is visible.
+    #[test]
+    fn test_hot_index_branch_respects_departure_visibility_boundary() {
+        for deleted in [false, true] {
+            let metadata = sparse_metadata();
+            let page = row_page(&metadata);
+            let row_ver =
+                RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+            let original = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                None,
+                RowID::new(101),
+                RowUndoKind::Insert,
+            );
+            let mut departure = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                None,
+                RowID::new(101),
+                if deleted {
+                    RowUndoKind::delete()
+                } else {
+                    RowUndoKind::update(vec![UndoCol {
+                        idx: 0,
+                        val: Val::from(10i32),
+                        var_offset: None,
+                    }])
+                },
+            );
+            departure.next = Some(NextRowUndo::new(MainBranch {
+                entry: original.leak(),
+                status: UndoStatus::Committed(TrxID::new(5)),
+            }));
+            let replacement = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                TableID::new(1),
+                None,
+                RowID::new(100),
+                RowUndoKind::Insert,
+            );
+            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
+            commit_shared_trx_status(&status, TrxID::new(20));
+            let mut head = RowUndoHead::new(status, replacement.leak());
+            let index = IndexRef::new(IndexID::new(0), IndexSlot::new(0));
+            head.next.indexes.push(IndexBranch::new(
+                ResolvedIndexKey::new(index, vec![Val::from(10i32)]),
+                IndexBranchTarget::Hot {
+                    end_cts: TrxID::new(10),
+                    entry: departure.leak(),
+                },
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from(15i32),
+                }],
+            ));
+            *row_ver.write_latch(0) = Some(Box::new(head));
+            let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::I32, false)]);
+            let candidate = BoundIndexCandidate::new(
+                index,
+                true,
+                &encoder,
+                IndexLookupCandidate {
+                    encoded_key: encoder.encode(&[Val::from(10i32)]),
+                    row_id: RowID::new(100),
+                },
+            );
+            let access = test_row_read_access(&page, &row_ver, 0);
+            for (sts, value) in [
+                (5, None),
+                (6, Some(15)),
+                (10, Some(15)),
+                (11, None),
+                (20, None),
+                (21, Some(20)),
+            ] {
+                let actual = match access.read_row_mvcc_index_candidate(
+                    &test_trx_context(TrxID::new(sts)),
+                    &metadata,
+                    &[0, 1],
+                    &candidate,
+                ) {
+                    ReadRow::Ok(values) => Some(values),
+                    ReadRow::NotFound => None,
+                    ReadRow::InvalidIndex => {
+                        panic!("valid candidate rejected: deleted={deleted}, sts={sts}")
+                    }
+                };
+                assert_eq!(
+                    actual,
+                    value.map(|value| vec![Val::from(10i32), Val::from(value)]),
+                    "deleted={deleted}, sts={sts}"
+                );
+            }
+        }
+    }
+
+    /// Purpose: Protect index branch identity across generation reuse.
+    /// Expected: Only the exact index generation matches the candidate.
     #[test]
     fn test_index_candidate_branch_matching_preserves_user_generation() {
         let index_slot = IndexSlot::new(0);
@@ -1882,6 +1995,8 @@ pub(crate) mod tests {
         assert!(!candidate.matches_branch(&stale));
     }
 
+    /// Purpose: Protect borrowed backward history during concurrent forward-hint changes.
+    /// Expected: Source ownership gates mutation and every acknowledged change preserves the historical image.
     #[test]
     fn test_forward_hint_mutation_preserves_borrowed_snapshot_branch() {
         for update_source in [false, true] {
@@ -2096,6 +2211,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Protect frozen mutation version updates around row access.
+    /// Expected: Frozen access advances the version on entry and exit while active access leaves it unchanged.
     #[test]
     fn test_row_write_access_pairs_frozen_mutation_version() {
         let metadata = sparse_metadata();
@@ -2116,6 +2233,8 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), 2);
     }
 
+    /// Purpose: Protect page dirty tracking at row mutation boundaries.
+    /// Expected: Mutable image access and deletion mark the page dirty; latch acquisition alone does not.
     #[test]
     fn test_row_write_access_marks_dirty_for_page_image_mutations() {
         let metadata = sparse_metadata();
@@ -2148,6 +2267,8 @@ pub(crate) mod tests {
         assert!(dirty.load(Ordering::Acquire));
     }
 
+    /// Purpose: Protect frozen mutation cleanup during panic unwinding.
+    /// Expected: Dropping the access closes the mutation version even when its body panics.
     #[test]
     fn test_row_write_access_closes_frozen_version_during_unwind() {
         let metadata = sparse_metadata();
@@ -2165,6 +2286,8 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), 2);
     }
 
+    /// Purpose: Protect change detection with overlapping frozen writers.
+    /// Expected: Each writer entry and exit advances the version, including while both writers are active.
     #[test]
     fn test_overlapping_frozen_writers_do_not_use_version_parity_as_quiescence() {
         let metadata = sparse_metadata();
@@ -2185,6 +2308,8 @@ pub(crate) mod tests {
         assert_ne!(row_ver.frozen_mutation_version(), 0);
     }
 
+    /// Purpose: Protect active pages from frozen-version bookkeeping.
+    /// Expected: Writes, rollback, and undo purge leave the frozen mutation version unchanged.
     #[test]
     fn test_active_page_mutations_do_not_change_frozen_version() {
         let metadata = sparse_metadata();
@@ -2262,6 +2387,8 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), 0);
     }
 
+    /// Purpose: Protect checkpoint invalidation across frozen mutation paths.
+    /// Expected: Deletion, rollback, and purge each publish paired version changes.
     #[test]
     fn test_frozen_delete_rollbacks_and_purge_publish_paired_versions() {
         let metadata = sparse_metadata();
@@ -2364,6 +2491,8 @@ pub(crate) mod tests {
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
     }
 
+    /// Purpose: Protect optional latest-row lookup through an inactive index.
+    /// Expected: The missing index reports an invalid-index result.
     #[test]
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
         let metadata = sparse_metadata();
@@ -2377,6 +2506,8 @@ pub(crate) mod tests {
         assert!(matches!(res, ReadRow::InvalidIndex));
     }
 
+    /// Purpose: Protect historical key matching through an inactive index.
+    /// Expected: Missing index metadata cannot match a row version.
     #[test]
     fn test_any_version_matches_key_inactive_index_returns_false() {
         let metadata = sparse_metadata();
@@ -2388,6 +2519,8 @@ pub(crate) mod tests {
         assert!(!access.any_version_matches_key(&metadata, key.index_slot, &key.vals));
     }
 
+    /// Purpose: Protect key matching without an undo chain.
+    /// Expected: The current page image matches the active index key.
     #[test]
     fn test_any_version_matches_key_latest_page_row_returns_true() {
         let metadata = sparse_metadata();
@@ -2399,6 +2532,8 @@ pub(crate) mod tests {
         assert!(access.any_version_matches_key(&metadata, key.index_slot, &key.vals));
     }
 
+    /// Purpose: Protect unique-key history lookup through an inactive index.
+    /// Expected: Missing index metadata yields no prior owner.
     #[test]
     fn test_find_old_version_for_unique_key_inactive_index_returns_none() {
         let metadata = sparse_metadata();

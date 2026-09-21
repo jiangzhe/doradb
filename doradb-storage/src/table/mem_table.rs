@@ -1903,33 +1903,38 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect insertion across multiple row pages in an evictable pool.
+    /// Expected: Inserts span multiple pages and every committed row retains its key and payload.
     #[test]
     fn test_evict_pool_insert_full() {
         smol::block_on(async {
             const SIZE: i32 = 800;
 
-            // in-mem ~1000 pages, on-disk 2000 pages.
             let temp_dir = TempDir::new().unwrap();
             let engine =
                 evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
             let table_id = create_table2_for_test(&engine).await;
             {
                 let mut session = engine.new_session().unwrap();
-                // insert 1000 rows
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
-                    // make string 1KB long, so a page can only hold about 60 rows.
-                    // if page is full, 17 pages are required.
-                    // if page is half full, 35 pages are required.
                     let s: String = (0..1000).map(|_| 'a').collect();
                     let insert = vec![Val::from(i), Val::from(&s[..])];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
-                let _ = trx.commit().await.unwrap();
+                trx.commit().await.unwrap();
+                assert!(session.total_row_pages(table_id).await.unwrap() > 1);
+                let mut reader = session.begin_trx().unwrap();
+                let expected: Vec<_> = (0..SIZE).map(|id| (id, "a".repeat(1000))).collect();
+                assert_eq!(scan_table_pairs(&mut reader, table_id).await, expected);
+                reader.commit().await.unwrap();
             }
         });
     }
 
+    /// Purpose: Protect memory-table key reuse after an update moves the row.
+    /// Expected: Current selection follows the move while predecessor links preserve the
+    /// original snapshot image.
     #[test]
     fn test_mem_table_moved_key_reuse_preserves_links_and_snapshot() {
         smol::block_on(async {
@@ -2104,6 +2109,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect memory-table mutation when a selected row is concurrently replaced.
+    /// Expected: Update, delete, and upsert target the committed replacement owner.
     #[test]
     fn test_mem_table_current_replacement_selection() {
         smol::block_on(async {
@@ -2198,6 +2205,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect memory-table upsert across missing and existing unique keys.
+    /// Expected: The first upsert inserts and the next updates the same row to the new values.
     #[test]
     fn test_mem_table_upsert_unique_insert_and_update() {
         smol::block_on(async {
@@ -2247,6 +2256,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect competing memory-table upserts for an uncommitted key.
+    /// Expected: The second writer receives a write conflict while the original writer can
+    /// commit.
     #[test]
     fn test_mem_table_upsert_unique_missing_key_write_conflict() {
         smol::block_on(async {
@@ -2287,6 +2299,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional memory-table maintenance of shared secondary keys.
+    /// Expected: Deleting one primary row removes only its own unique and nonunique entries.
     #[test]
     fn test_mem_table_non_unique_no_trx_insert_and_delete() {
         smol::block_on(async {
@@ -2345,6 +2359,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect logical change callbacks for nontransactional upsert.
+    /// Expected: Insert and update report their actual changes while an identical upsert
+    /// invokes no callback.
     #[test]
     fn test_mem_table_primary_key_no_trx_upsert_reports_logical_change() {
         smol::block_on(async {
@@ -2412,6 +2429,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect primary-key-only nontransactional lookup validation.
+    /// Expected: A nonprimary lookup is rejected as an invalid payload with explanatory
+    /// context.
     #[test]
     fn test_mem_table_primary_key_no_trx_rejects_non_primary_key() {
         smol::block_on(async {
@@ -2447,6 +2467,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the explicit trusted-input opt-out for nontransactional deletion.
+    /// Expected: Default validation rejects a nonprimary key while opt-out deletion removes
+    /// all row index entries.
     #[test]
     fn test_mem_table_delete_primary_key_no_trx_opt_out_skips_primary_key_validation() {
         smol::block_on(async {
@@ -2492,6 +2515,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect default row validation for nontransactional insertion.
+    /// Expected: Malformed rows return a typed payload error and valid trusted input can be
+    /// inserted.
     #[test]
     fn test_mem_table_insert_no_trx_validates_full_row_by_default() {
         smol::block_on(async {
@@ -2525,6 +2551,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional updates of nonindexed row values.
+    /// Expected: Valid updates become visible and invalid update input returns a typed payload
+    /// error.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_updates_non_indexed_columns() {
         smol::block_on(async {
@@ -2588,6 +2617,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional updates of a nonunique indexed column.
+    /// Expected: The old entry disappears and the new key resolves to the updated row.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_refreshes_non_unique_index() {
         smol::block_on(async {
@@ -2642,6 +2673,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional updates in a primary-index-only layout.
+    /// Expected: The original primary key resolves to the updated non-key contents.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_single_primary_key_updates_without_refresh() {
         smol::block_on(async {
@@ -2684,6 +2717,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect trusted nonprimary lookups during nontransactional update.
+    /// Expected: Opt-out updates succeed and refresh changed unique keys while default
+    /// validation rejects the lookup.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_opt_out_skips_primary_key_validation() {
         smol::block_on(async {
@@ -2777,6 +2813,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional index refresh against duplicate unique keys.
+    /// Expected: A conflicting refresh reports the recovery duplicate-key integrity error.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_rejects_duplicate_unique_index_refresh() {
         smol::block_on(async {
@@ -2824,6 +2862,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nontransactional row growth beyond the source page's free space.
+    /// Expected: The row moves, its old secondary entry disappears, and all lookups use the
+    /// new row identity.
     #[test]
     fn test_mem_table_update_primary_key_no_trx_relocates_on_no_free_space() {
         smol::block_on(async {
@@ -2911,6 +2952,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transactional memory-table deletion across unique and nonunique
+    /// indexes.
+    /// Expected: The committed delete hides the row and masks its index entries.
     #[test]
     fn test_mem_table_delete_unique_mvcc_marks_non_unique_index() {
         smol::block_on(async {
@@ -2978,6 +3022,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect memory-table key changes and subsequent unique-key conflicts.
+    /// Expected: Old entries are masked, new entries expose updated values, and a conflicting
+    /// update preserves the row.
     #[test]
     fn test_mem_table_update_key_change_updates_unique_and_non_unique_indexes() {
         smol::block_on(async {
@@ -3086,6 +3133,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect index ownership when memory-table updates relocate rows.
+    /// Expected: Both unchanged and changed keys point to the destination while source entries
+    /// are masked.
     #[test]
     fn test_mem_table_moved_updates_refresh_unique_and_non_unique_indexes() {
         smol::block_on(async {
@@ -3230,6 +3280,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the memory-only storage invariant for catalog tables.
+    /// Expected: Attempting to use a column-store route panics with the invariant diagnostic.
     #[test]
     #[should_panic(expected = "catalog table unexpectedly resolved a persisted LWC row")]
     fn test_mem_table_catalog_lwc_invariant_panics() {
@@ -3240,6 +3292,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect memory-table mutations against transition and row-range invariant
+    /// violations.
+    /// Expected: Update and delete panic with the relevant diagnostic and discard the affected
+    /// transaction.
     #[test]
     fn test_mem_table_invalid_row_page_update_and_delete_panic() {
         enum InvalidRowPage {
@@ -3338,6 +3394,10 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect undo routing across active, frozen, transitioning, and stale page
+    /// generations.
+    /// Expected: Eligible pages apply rollback, transitioning pages remain unchanged, and
+    /// stale generations report absence.
     #[test]
     fn test_hot_row_undo_attempt_classifies_page_state_and_generation() {
         smol::block_on(async {
@@ -3506,6 +3566,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect uncommitted memory scans beginning at the current pivot.
+    /// Expected: The scan visits every inserted row across the hot row pages.
     #[test]
     fn test_mem_scan_uncommitted_from_current_pivot() {
         smol::block_on(async {
@@ -3548,6 +3610,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect memory-scan start boundaries as the pivot advances.
+    /// Expected: Page-aligned scans succeed, interior starts fail, and scanning beyond
+    /// retained pages yields no hot pages.
     #[test]
     fn test_scan_from_requires_row_page_boundary() {
         smol::block_on(async {
@@ -3617,6 +3682,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect fixed-memory layout identity and resource ownership across table
+    /// kinds.
+    /// Expected: Metadata and runtime indexes stay aligned and destruction reclaims all
+    /// allocated pages.
     #[test]
     fn test_fixed_memory_layout_identity_and_resource_cleanup() {
         use crate::catalog::{CATALOG_TABLE_ID_START, CatalogTable};
@@ -3708,6 +3777,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect memory-layout construction against mismatched index runtime kinds.
+    /// Expected: Swapped unique and nonunique runtimes fail construction.
     #[test]
     fn test_memory_layout_rejects_mismatched_runtime_kinds() {
         smol::block_on(async {
@@ -3728,6 +3799,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect catalog construction against invalid index identity metadata.
+    /// Expected: Invalid identity panics before allocating secondary-index pages.
     #[test]
     fn test_catalog_identity_is_rejected_before_index_allocation() {
         use crate::catalog::{CATALOG_TABLE_ID_START, CatalogTable};
@@ -3757,6 +3830,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect catalog construction cleanup after partial index allocation.
+    /// Expected: Pool exhaustion preserves the typed resource error and releases row-store and
+    /// index pages.
     #[test]
     fn test_catalog_construction_reclaims_row_store_on_index_build_failure() {
         use crate::buffer::frame::BufferFrame;
@@ -3795,6 +3871,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect secondary-index construction cleanup after a partial build.
+    /// Expected: Pool exhaustion releases every index allocated by the failed build.
     #[test]
     fn test_build_in_memory_secondary_indexes_reclaims_staged_indexes_on_error() {
         smol::block_on(async {

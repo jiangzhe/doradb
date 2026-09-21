@@ -839,11 +839,19 @@ impl IndexBranch {
 /// Target of a runtime unique-index branch.
 pub(crate) enum IndexBranchTarget {
     /// Branch to another hot row's undo chain.
-    ///
-    /// `cts` is the delete/update timestamp at which the old hot owner stopped
-    /// being visible. Readers at or before that timestamp continue through
-    /// `entry` to find the older same-key version.
-    Hot { cts: TrxID, entry: RowUndoRef },
+    Hot {
+        /// Timestamp of the delete or key-changing update that ended the
+        /// previous owner's visibility under this branch's key.
+        ///
+        /// For a committed operation this is its commit timestamp. Readers
+        /// with `sts > end_cts` must not see that owner; readers at or before
+        /// it follow `entry` to resolve the older same-key version.
+        /// A same-transaction replacement may carry the active transaction ID,
+        /// which sorts after snapshot timestamps and permits history traversal.
+        end_cts: TrxID,
+        /// Undo entry for the operation that ended the previous key ownership.
+        entry: RowUndoRef,
+    },
     /// Branch to a persisted cold row reconstructed from `undo_vals`.
     ///
     /// Cold rows are immutable and have no row-page undo chain. `delete_cts`
@@ -860,7 +868,7 @@ impl IndexBranchTarget {
     #[inline]
     pub(crate) fn purge_cts(&self) -> Option<TrxID> {
         match self {
-            IndexBranchTarget::Hot { cts, .. } => Some(*cts),
+            IndexBranchTarget::Hot { end_cts, .. } => Some(*end_cts),
             IndexBranchTarget::ColdTerminal { delete_cts } => *delete_cts,
         }
     }
@@ -922,6 +930,8 @@ mod tests {
     use crate::id::RowID;
     use std::mem::size_of;
 
+    /// Purpose: Protect lazy forward hints across index generations and restoration.
+    /// Expected: Updates reuse bounded storage, preserve exact identities, and release empty hints.
     #[test]
     fn test_delete_successors_are_lazy_exact_and_bounded() {
         let mut delete = ForwardLinks::default();

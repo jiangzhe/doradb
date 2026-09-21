@@ -884,6 +884,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect retained selection evidence while following current-row successors.
+    /// Expected: Decisions do not consume position or authority, and advancement preserves
+    /// invalidated lookup evidence.
     #[test]
     fn test_unique_current_decide_preserves_position_and_advance_preserves_evidence() {
         smol::block_on(async {
@@ -989,6 +992,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique mutation against a stable row-route range mismatch.
+    /// Expected: The invariant panics before callback execution and transaction cleanup leaves
+    /// the row readable.
     #[test]
     fn test_unique_current_row_page_range_mismatch_panics_before_callback() {
         smol::block_on(async {
@@ -1064,6 +1070,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect selection of a rolled-back forward target that later becomes cold.
+    /// Expected: Invalidated evidence forces retry and the callback observes the authoritative
+    /// missing key.
     #[test]
     fn test_unique_current_rollback_exposes_forward_target_that_becomes_cold() {
         smol::block_on(async {
@@ -1191,6 +1200,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect current-row selection when replacement races with candidate
+    /// inspection.
+    /// Expected: The callback sees the replacement once while older snapshots retain the
+    /// original row without scan duplication.
     #[test]
     fn test_unique_current_replacement_before_inspection() {
         smol::block_on(async {
@@ -1270,6 +1283,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect selection across active and preparing replacement owners.
+    /// Expected: Active ownership conflicts; preparing ownership settles before one callback
+    /// sees the resulting row.
     #[test]
     fn test_unique_current_replacement_preparing_and_active() {
         smol::block_on(async {
@@ -1344,6 +1360,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect successor traversal when a replacement moves, rekeys, or disappears.
+    /// Expected: Selection reaches the final owner or validated absence while preserving
+    /// reader-dependent checkpoint delays.
     #[test]
     fn test_unique_current_successor_changes_follow_complete_hot_chain() {
         smol::block_on(async {
@@ -1445,6 +1464,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect surviving successor links after a partially applied statement fails.
+    /// Expected: Selection never follows a rolled-back destination and observes any later
+    /// successful claim exactly once.
     #[test]
     fn test_unique_current_rollback_restores_surviving_source_links() {
         smol::block_on(async {
@@ -1569,6 +1591,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect restoration of multiple predecessor links after a later unique-index
+    /// conflict.
+    /// Expected: Failed transfers restore every source slot and preserve earlier committed row
+    /// changes.
     #[test]
     fn test_unique_current_statement_rollback_restores_multiple_update_sources() {
         smol::block_on(async {
@@ -1677,6 +1703,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect undo ownership when forward-link restoration is cancelled while
+    /// blocked.
+    /// Expected: Cancellation retains unfinished records and a later rollback restores the
+    /// original row and identity.
     #[test]
     fn test_unique_current_cancelled_forward_restore_retains_destination_undo() {
         smol::block_on(async {
@@ -1756,6 +1786,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect selection that captured an uncommitted destination before its writer
+    /// rolls back.
+    /// Expected: Selection retries using retained evidence and finds the restored committed
+    /// owner.
     #[test]
     fn test_unique_current_captured_uncommitted_destination_survives_writer_rollback() {
         smol::block_on(async {
@@ -1834,6 +1868,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect independent successor links for different unique indexes.
+    /// Expected: Each selected index follows its own replacement and invokes the callback
+    /// once.
     #[test]
     fn test_unique_current_successors_are_per_index() {
         smol::block_on(async {
@@ -1886,6 +1923,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reused-key forwarding after a row move from hot or frozen storage.
+    /// Expected: The earlier update supplies the successor and backward branches preserve old
+    /// snapshot contents.
     #[test]
     fn test_unique_moved_key_reuse_follows_earlier_update() {
         smol::block_on(async {
@@ -1953,6 +1993,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect moved-row history when the destination key is absent, deleted, or
+    /// updated.
+    /// Expected: Backward branches identify the actual prior owner and preserve snapshot and
+    /// settlement results.
     #[test]
     fn test_unique_moved_key_history_uses_actual_previous_owner() {
         smol::block_on(async {
@@ -2040,6 +2084,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect successor restoration after a moved-key update fails on another index.
+    /// Expected: Statement rollback removes the failed transfer and permits a valid retry
+    /// without corrupting snapshots.
     #[test]
     fn test_unique_moved_key_failure_restores_update_successor() {
         smol::block_on(async {
@@ -2121,6 +2168,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect forwarding from leading or buried key-departure updates.
+    /// Expected: Selection reaches inserted or updated replacement owners without losing old
+    /// snapshot visibility.
     #[test]
     fn test_unique_current_update_departures_forward_to_insert_and_update() {
         smol::block_on(async {
@@ -2193,6 +2243,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect successor traversal when a key returns to an earlier row identity.
+    /// Expected: Traversal follows the current ownership chain to its final owner or validated
+    /// absence.
     #[test]
     fn test_unique_current_forward_chain_revisits_row_id() {
         smol::block_on(async {
@@ -2269,6 +2322,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect current selection from stale timestamp shortcuts on a live wrong-key
+    /// row.
+    /// Expected: Selection validates the original lookup and finds the newer key owner.
     #[test]
     fn test_unique_current_live_wrong_key_cannot_use_head_timestamp() {
         smol::block_on(async {
@@ -2318,6 +2374,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect hot-row admission at deletion, ownership, and snapshot boundaries.
+    /// Expected: Admission distinguishes foreign ownership, visible deletion, and successor
+    /// traversal with the expected lookup work.
     #[test]
     fn test_unique_current_hot_admission_classifies_deletion_and_successor() {
         smol::block_on(async {
@@ -2442,6 +2501,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect current-selection fast paths for success and older committed deletion.
+    /// Expected: Both paths avoid unnecessary successor storage and post-row validation.
     #[test]
     fn test_unique_current_timestamp_shortcut_and_success_cost() {
         smol::block_on(async {
@@ -2494,6 +2555,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback action validity for occupied and missing keys in both storage
+    /// tiers.
+    /// Expected: Each action enforces its entry-state contract even when payload validation is
+    /// disabled.
     #[test]
     fn test_unique_callback_entry_state_matrix_and_trusted_contracts() {
         smol::block_on(async {
@@ -2556,6 +2621,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback payload and index argument validation.
+    /// Expected: Valid resolved indexes work, invalid inputs fail, and invalid index targets
+    /// never invoke the callback.
     #[test]
     fn test_unique_callback_payload_validation_and_index_arguments() {
         smol::block_on(async {
@@ -2635,6 +2703,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callbacks that branch on the current row and consume local payloads.
+    /// Expected: Existing rows expose current values and missing rows can insert using a
+    /// single-use captured payload.
     #[test]
     fn test_unique_callback_current_read_and_branch_local_payload() {
         smol::block_on(async {
@@ -2707,6 +2778,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect ownership settlement for skipped, empty, and invalid callback actions.
+    /// Expected: Newly acquired ownership is released while earlier transactional writes
+    /// remain protected until rollback.
     #[test]
     fn test_unique_callback_cancellation_releases_only_new_ownership() {
         smol::block_on(async {
@@ -2754,6 +2828,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback key changes across in-place and relocated rows.
+    /// Expected: Index lookups and snapshots remain consistent through commit, rollback, and
+    /// later statement conflicts.
     #[test]
     fn test_unique_callback_moves_keys_and_rolls_back_index_conflicts() {
         smol::block_on(async {
@@ -2853,6 +2930,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction state and application error identity after callback
+    /// failure.
+    /// Expected: Errors retain their payloads and earlier successful statements remain visible
+    /// and committable.
     #[test]
     fn test_unique_callback_errors_preserve_earlier_statements() {
         smol::block_on(async {
@@ -2902,6 +2983,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback visibility under owned and committed cold deletion markers.
+    /// Expected: Consumed images appear missing without losing ownership, and newer committed
+    /// markers reject callbacks.
     #[test]
     fn test_unique_callback_cold_marker_authority_and_consumed_images() {
         smol::block_on(async {
@@ -2913,23 +2997,39 @@ mod tests {
                 .deletion_buffer()
                 .put_ref(ids[0], Arc::clone(&status), trx.sts())
                 .unwrap();
-            for action in [
-                UniqueMutation::Skip,
-                UniqueMutation::Update(vec![]),
-                UniqueMutation::Delete,
-                UniqueMutation::Insert(values(1)),
+            for (case, action, succeeds) in [
+                ("skip", UniqueMutation::Skip, true),
+                ("missing update", UniqueMutation::Update(vec![]), false),
+                ("missing delete", UniqueMutation::Delete, false),
+                (
+                    "mismatched insert key",
+                    UniqueMutation::Insert(values(1)),
+                    false,
+                ),
             ] {
+                let mut calls = 0;
                 let result = trx
                     .table_unique_mutate_mvcc(
                         index,
                         &[Val::from(0i32)],
                         |row| -> CallbackResult<_> {
-                            assert!(row.is_none(), "a consumed cold image is missing");
+                            calls += 1;
+                            assert!(row.is_none(), "a consumed cold image is missing: {case}");
                             Ok(action)
                         },
                     )
                     .await;
-                assert!(matches!(result, Ok(UniqueMutationOutcome::Noop) | Err(_)));
+                assert_eq!(calls, 1, "{case}");
+                if succeeds {
+                    assert_eq!(result.unwrap(), UniqueMutationOutcome::Noop, "{case}");
+                } else {
+                    let error = result.unwrap_err().into_engine().unwrap();
+                    assert_eq!(
+                        error.operation_error(),
+                        Some(OperationError::InvalidDmlInput),
+                        "{case}: {error:?}"
+                    );
+                }
                 assert!(
                     matches!(table.deletion_buffer().get(ids[0]), Some(crate::table::DeleteMarker::Ref(owner)) if Arc::ptr_eq(&owner, &status))
                 );
@@ -2964,6 +3064,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback admission while a cold-row owner prepares.
+    /// Expected: Settlement precedes exactly one callback reflecting commit or rollback
+    /// visibility.
     #[test]
     fn test_unique_callback_cold_preparing_retry_invokes_once() {
         smol::block_on(async {
@@ -3007,6 +3110,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect single-use insert callbacks when another writer wins the missing-key
+    /// race.
+    /// Expected: The insertion reports a conflict without replaying the callback.
     #[test]
     fn test_unique_callback_insert_race_is_not_retried() {
         smol::block_on(async {
@@ -3057,6 +3163,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cooperative selection yields during forwarding and retry.
+    /// Expected: Yield releases page guards and permits resumption, fatal propagation, or
+    /// cancellation cleanup without premature callbacks.
     #[test]
     fn test_unique_current_yield_allows_poison_and_cancellation() {
         smol::block_on(async {
@@ -3186,6 +3295,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction cleanup when a preparing-owner wait is cancelled.
+    /// Expected: The callback stays uninvoked and earlier statements are rolled back before
+    /// session reuse.
     #[test]
     fn test_unique_callback_drop_waiting_future_cleans_transaction() {
         smol::block_on(async {
@@ -3222,6 +3334,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect empty callback updates of frozen and cold rows.
+    /// Expected: An empty update retains physical identity while a later nonempty update moves
+    /// the row into hot storage.
     #[test]
     fn test_unique_callback_empty_update_preserves_row_before_nonempty_move() {
         smol::block_on(async {
@@ -3255,6 +3370,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect lazy row materialization in mutation callbacks.
+    /// Expected: Actions without row reads avoid dense-cache initialization while a value read
+    /// initializes it once.
     #[test]
     fn test_unique_callback_zero_read_actions_avoid_dense_cache() {
         smol::block_on(async {
@@ -3294,6 +3412,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback admission against active and preparing hot deletions.
+    /// Expected: Active ownership conflicts and preparing ownership settles before one
+    /// callback observes final visibility.
     #[test]
     fn test_unique_callback_active_hot_delete_and_preparing_settlement() {
         smol::block_on(async {
@@ -3348,6 +3469,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect selective decoding for callback deletion of a cold row.
+    /// Expected: Deletion decodes indexed columns while leaving unindexed values undecoded.
     #[test]
     fn test_unique_callback_cold_delete_only_decodes_index_columns() {
         smol::block_on(async {
@@ -3369,6 +3492,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique lookup short-circuiting after a cold row gains a memory owner.
+    /// Expected: A memory-index hit avoids an additional disk-tree lookup.
     #[test]
     fn test_unique_callback_mem_hit_short_circuits_disk() {
         smol::block_on(async {

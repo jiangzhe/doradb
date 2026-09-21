@@ -692,7 +692,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                     branch(
                         SelectKey::new(index_slot, vals),
                         IndexBranchTarget::Hot {
-                            cts: undo_head.ts(),
+                            end_cts: undo_head.ts(),
                             entry: old_entry.clone(),
                         },
                         // This deep-clones the same changed-column delta once per

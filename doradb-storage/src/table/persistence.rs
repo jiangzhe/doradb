@@ -2682,6 +2682,12 @@ mod tests {
     use std::thread;
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, Debug)]
+    enum OwnershipRefreshPhase {
+        FullPlan,
+        LockedPage,
+    }
+
     pub(crate) mod test_hooks {
         use crate::engine::Engine;
         use crate::error::{FatalError, FatalResult, RuntimeError, RuntimeResult};
@@ -3328,6 +3334,176 @@ mod tests {
         (table_id, test_mutable_table_file(engine, &table, &guards))
     }
 
+    async fn assert_checkpoint_delete_metadata_corruption(
+        corrupt: impl FnOnce(String, BlockID, usize),
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 0, 10, "name").await;
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        assert_checkpoint_published(&mut session, table_id).await;
+
+        let key1 = single_key(6i32);
+        let reader = session.begin_trx().unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let row_id1 = assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
+        reader.commit().await.unwrap();
+
+        expect_delete_committed(table_id, &mut session, &key1).await;
+        let marker1 = table.deletion_buffer().get(row_id1).unwrap();
+        let marker1_ts = delete_marker_ts(marker1);
+        session.wait_for_gc_horizon_after(marker1_ts).await.unwrap();
+        assert_checkpoint_published(&mut session, table_id).await;
+
+        let pool_guards = session.pool_guards();
+        let snapshot = column_block_index_snapshot(&engine, table_id);
+        let index = snapshot.index(pool_guards.disk_guard());
+        let entry = index
+            .locate_block(row_id1)
+            .await
+            .unwrap()
+            .expect("persisted entry should exist");
+
+        let key2 = single_key(7i32);
+        let mut reader_session = engine.new_session().unwrap();
+        let reader = reader_session.begin_trx().unwrap();
+        let row_id2 =
+            assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
+        reader.commit().await.unwrap();
+        let entry2 = index
+            .locate_block(row_id2)
+            .await
+            .unwrap()
+            .expect("second persisted entry should exist");
+        assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
+        drop(reader_session);
+
+        expect_delete_committed(table_id, &mut session, &key2).await;
+        let marker2 = table.deletion_buffer().get(row_id2).unwrap();
+        let marker2_ts = delete_marker_ts(marker2);
+        session.wait_for_gc_horizon_after(marker2_ts).await.unwrap();
+        wait_for_checkpoint_root_ready(&mut session, table_id).await;
+
+        let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
+        corrupt(table_file_path, entry.leaf_block_id, 0);
+        let _ = table.disk_pool().invalidate_block(
+            session.pool_guards().disk_guard(),
+            table.file().sparse_file().file_id(),
+            entry.leaf_block_id,
+        );
+
+        let root_before = table.file().active_root_unchecked().clone();
+        let err = session.checkpoint_table(table_id).await.unwrap_err();
+        assert_table_data_integrity(
+            err,
+            "column_block_index",
+            entry.leaf_block_id,
+            DataIntegrityError::InvalidPayload,
+        );
+        assert_root_metadata_unchanged(&root_before, &table);
+        assert!(!session.in_trx().unwrap());
+    }
+
+    async fn assert_checkpoint_ownership_refresh(phase: OwnershipRefreshPhase) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "stable-ownership-refresh").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut session, 1, 20, "blocked").await;
+        let batch =
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        let target_ts = session.last_cts();
+        session.wait_for_gc_horizon_after(target_ts).await.unwrap();
+        wait_for_checkpoint_root_ready(&mut session, table_id).await;
+
+        let table = table_for_internal_assertion(&engine, table_id);
+        let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
+        let first_page_id = page_ids[0];
+        let first_page = table
+            .row_store
+            .must_get_row_page_shared(&session.pool_guards(), first_page_id)
+            .await
+            .unwrap();
+        let row_id = first_page.page().row_id(0);
+        let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
+        let undo_owner = Arc::new(parking_lot::Mutex::new(None));
+        let hook_undo_owner = Arc::clone(&undo_owner);
+        let hook_first_page = Arc::clone(&first_page);
+        let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
+        let ownership_status = Arc::new(shared_trx_status(
+            MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
+        ));
+        let hook_ownership_status = Arc::clone(&ownership_status);
+        let install_ownership = move || {
+            let page_guard = hook_first_page.lock().take().unwrap();
+            let page = page_guard.page();
+            let map = page_guard.unwrap_vmap();
+            let undo = OwnedRowUndo::new(
+                NON_FOREGROUND_STMT_NO,
+                table_id,
+                None,
+                page.row_id(0),
+                RowUndoKind::Lock,
+            );
+            map.begin_frozen_mutation();
+            *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
+                hook_ownership_status,
+                undo.leak(),
+            )));
+            map.finish_frozen_mutation();
+            hook_undo_owner.lock().replace(undo);
+            drop(page_guard);
+        };
+        match phase {
+            OwnershipRefreshPhase::FullPlan => {
+                set_test_frozen_pages_ready_hook(&engine, install_ownership)
+            }
+            OwnershipRefreshPhase::LockedPage => {
+                set_test_stable_page_plans_refreshed_hook(&engine, install_ownership)
+            }
+        }
+        let locked_rebuild_observed = Arc::new(AtomicBool::new(false));
+        if matches!(phase, OwnershipRefreshPhase::LockedPage) {
+            let hook_locked_rebuild_observed = Arc::clone(&locked_rebuild_observed);
+            let hook_table = Arc::downgrade(&table);
+            set_test_locked_page_plan_rebuild_hook(&engine, move |page_id| {
+                assert_eq!(page_id, first_page_id);
+                assert_eq!(
+                    hook_table
+                        .upgrade()
+                        .unwrap()
+                        .checkpoint_workflow
+                        .state_name(),
+                    "Transition"
+                );
+                hook_locked_rebuild_observed.store(true, AtomicOrdering::Relaxed);
+            });
+        }
+        let publish_admitted = Arc::new(AtomicBool::new(false));
+        let hook_publish_admitted = Arc::clone(&publish_admitted);
+        set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
+            hook_publish_admitted.store(true, AtomicOrdering::Relaxed);
+        });
+
+        let outcome = session.checkpoint_table(table_id).await.unwrap();
+        assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
+        assert!(publish_admitted.load(AtomicOrdering::Relaxed));
+        if matches!(phase, OwnershipRefreshPhase::LockedPage) {
+            assert!(locked_rebuild_observed.load(AtomicOrdering::Relaxed));
+        }
+        assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
+        let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
+            panic!("{phase:?} must install the ownership marker");
+        };
+        assert!(Arc::ptr_eq(&marker_status, &ownership_status));
+        undo_owner.lock().take();
+    }
+
+    /// Purpose: Protect maintenance wait error classification during engine shutdown.
+    /// Expected: Shutdown remains a recoverable checkpoint error with its lifecycle cause
+    /// retained.
     #[test]
     fn test_maintenance_wait_stacks_shutdown_under_checkpoint_runtime() {
         smol::block_on(async {
@@ -3359,6 +3535,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect maintenance waits after the engine has already been poisoned.
+    /// Expected: The existing fatal reason propagates without conversion to a recoverable
+    /// error.
     #[test]
     fn test_maintenance_wait_preserves_existing_fatal_reason() {
         smol::block_on(async {
@@ -3383,6 +3562,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect normalization of overlapping unique-index checkpoint changes.
+    /// Expected: The latest put wins per key and suppresses conflicting deletes while output
+    /// stays ordered.
     #[test]
     fn test_unique_sidecar_normalize_keeps_latest_put_and_suppresses_delete() {
         let mut puts = vec![
@@ -3439,6 +3621,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect normalization of duplicate nonunique-index checkpoint changes.
+    /// Expected: Exact-key deletes override inserts and normalized entries are sorted and
+    /// deduplicated.
     #[test]
     fn test_non_unique_sidecar_normalize_delete_wins_exact_key() {
         let mut sidecar = SecondaryIndexSidecar::NonUnique {
@@ -3459,6 +3644,9 @@ mod tests {
         assert_eq!(deletes, vec![b"b".to_vec(), b"c".to_vec()]);
     }
 
+    /// Purpose: Protect durable checkpointing of committed cold deletion markers.
+    /// Expected: The deletion cutoff advances and the affected block records the delete
+    /// without changing row coverage.
     #[test]
     fn test_checkpoint_persists_committed_cold_delete_markers() {
         smol::block_on(async {
@@ -3513,6 +3701,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unique-index publication alongside cold row checkpointing.
+    /// Expected: The published disk root resolves every checkpointed key to its cold row.
     #[test]
     fn test_checkpoint_publishes_unique_secondary_disk_tree_root() {
         smol::block_on(async {
@@ -3559,6 +3749,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction-owned capture of active table root metadata.
+    /// Expected: The snapshot preserves root fields and reports visibility relative to its
+    /// read timestamp.
     #[test]
     fn test_trx_read_proof_root_snapshot_captures_active_root() {
         smol::block_on(async {
@@ -3602,6 +3795,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect column-block building when even the first row page cannot fit.
+    /// Expected: The operation returns a builder error with the offending page context.
     #[test]
     fn test_build_and_write_lwc_blocks_rejects_oversized_first_page() {
         smol::block_on(async {
@@ -3681,6 +3876,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect final column-block shape when trailing rows are deleted.
+    /// Expected: The indexed row span reaches the final pivot and its fingerprint matches the
+    /// encoded block.
     #[test]
     fn checkpoint_lwc_pipeline_finalizes_trailing_deleted_span_before_encoding() {
         smol::block_on(async {
@@ -3808,6 +4006,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint pipeline ordering across encoded tasks.
+    /// Expected: Output follows logical row order and consumes every accepted completion.
     #[test]
     fn checkpoint_lwc_pipeline_preserves_logical_write_order() {
         smol::block_on(async {
@@ -3851,6 +4051,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect ordered checkpoint output despite out-of-order write completion.
+    /// Expected: Entries retain logical order and all accepted write completions are consumed.
     #[test]
     fn checkpoint_lwc_pipeline_drains_out_of_order_writes_into_ordered_entries() {
         smol::block_on(async {
@@ -3884,6 +4086,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect pipeline draining after an earlier backend write fails.
+    /// Expected: The typed IO cause is retained and later accepted writes are drained.
     #[test]
     fn checkpoint_lwc_pipeline_write_failure_drains_later_accepted_write() {
         smol::block_on(async {
@@ -3925,6 +4129,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect pipeline draining after an encoder returns an internal error.
+    /// Expected: The checkpoint error preserves the builder cause and drains later accepted
+    /// encoding work.
     #[test]
     fn checkpoint_lwc_pipeline_drains_after_inner_encode_error() {
         smol::block_on(async {
@@ -3965,6 +4172,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect error precedence when draining reveals a fatal encoder failure.
+    /// Expected: Fatal failure wins while earlier producer and encoder diagnostics remain
+    /// attached and completions are consumed.
     #[test]
     fn checkpoint_lwc_pipeline_fatal_drain_outranks_producer_error() {
         smol::block_on(async {
@@ -4010,6 +4220,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect prepared checkpoint images and index sidecars across column-block
+    /// splits.
+    /// Expected: All nonunique entries publish across distinct blocks without rescanning after
+    /// live bitmap rollback.
     #[test]
     fn test_checkpoint_publishes_non_unique_secondary_disk_tree_entries_across_lwc_splits() {
         smol::block_on(async {
@@ -4093,6 +4307,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect prepared deletion bitmaps for tables without secondary indexes.
+    /// Expected: Checkpoint publishes surviving cold rows and omits deleted rows without
+    /// requiring index sidecars.
     #[test]
     fn test_checkpoint_prepared_bitmap_without_secondary_indexes() {
         smol::block_on(async {
@@ -4187,6 +4404,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect disk-index maintenance during deletion-only checkpointing.
+    /// Expected: Unique and nonunique disk indexes remove deleted owners and retain surviving
+    /// rows.
     #[test]
     fn test_deletion_checkpoint_updates_secondary_disk_tree_roots() {
         smol::block_on(async {
@@ -4255,6 +4475,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint overlap between deletion and reinsertion of the same unique
+    /// key.
+    /// Expected: The resulting disk tree retains the replacement row as the key owner.
     #[test]
     fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         smol::block_on(async {
@@ -4311,6 +4534,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect root publication when secondary-index sidecar construction fails.
+    /// Expected: The deletion cutoff and column and secondary index roots remain unchanged.
     #[test]
     fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         struct ResetSidecarHook(MaintenanceTestController);
@@ -4376,6 +4601,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpointing a frozen prefix containing no surviving rows.
+    /// Expected: The pivot and deletion cutoff advance without creating a column index or
+    /// resurrecting deleted rows.
     #[test]
     fn test_checkpoint_all_deleted_row_page_advances_without_column_index() {
         smol::block_on(async {
@@ -4407,6 +4635,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deletion-range selection for markers captured during transition.
+    /// Expected: The first checkpoint retains a newer deletion in memory and a later eligible
+    /// checkpoint persists it.
     #[test]
     fn test_checkpoint_transition_delete_marker_waits_for_next_cutoff_range() {
         smol::block_on(async {
@@ -4494,6 +4725,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deletion checkpoint invariants when an eligible marker has no column
+    /// index.
+    /// Expected: Checkpoint reports an invalid root and leaves durable cutoff and column-root
+    /// metadata unchanged.
     #[test]
     fn test_checkpoint_fails_when_eligible_delete_marker_has_no_column_index() {
         smol::block_on(async {
@@ -4541,6 +4776,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deletion checkpointing against an eligible marker outside indexed row
+    /// coverage.
+    /// Expected: Checkpoint rejects the invalid root state without advancing the deletion
+    /// cutoff.
     #[test]
     fn test_checkpoint_fails_when_eligible_delete_marker_cannot_be_located() {
         smol::block_on(async {
@@ -4589,6 +4828,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint progress past already-covered deletion markers.
+    /// Expected: An old unlocatable marker is ignored and effective replay watermarks can
+    /// advance.
     #[test]
     fn test_checkpoint_ignores_missing_old_delete_marker_below_previous_cutoff() {
         smol::block_on(async {
@@ -4654,6 +4896,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the exclusive upper boundary of deletion checkpoint selection.
+    /// Expected: Deletes outside the eligible cutoff remain absent from durable delete deltas.
     #[test]
     fn test_checkpoint_skips_cold_delete_markers_at_or_after_cutoff() {
         smol::block_on(async {
@@ -4712,150 +4956,29 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deletion checkpointing against malformed persisted delete metadata.
+    /// Expected: Checkpoint returns the column-index payload error with the affected block
+    /// context.
     #[test]
     fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 10, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key1 = single_key(6i32);
-            let reader = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id1 =
-                assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
-            reader.commit().await.unwrap();
-
-            expect_delete_committed(table_id, &mut session, &key1).await;
-            let marker1 = table.deletion_buffer().get(row_id1).unwrap();
-            let marker1_ts = delete_marker_ts(marker1);
-            session.wait_for_gc_horizon_after(marker1_ts).await.unwrap();
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index
-                .locate_block(row_id1)
-                .await
-                .unwrap()
-                .expect("persisted entry should exist");
-
-            let key2 = single_key(7i32);
-            let mut reader_session = engine.new_session().unwrap();
-            let reader = reader_session.begin_trx().unwrap();
-            let row_id2 =
-                assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
-            reader.commit().await.unwrap();
-            let entry2 = index
-                .locate_block(row_id2)
-                .await
-                .unwrap()
-                .expect("second persisted entry should exist");
-            assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
-            drop(reader_session);
-
-            expect_delete_committed(table_id, &mut session, &key2).await;
-            let marker2 = table.deletion_buffer().get(row_id2).unwrap();
-            let marker2_ts = delete_marker_ts(marker2);
-            session.wait_for_gc_horizon_after(marker2_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&mut session, table_id).await;
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_leaf_delete_codec(table_file_path, entry.leaf_block_id, 0);
-            let _ = table.disk_pool().invalidate_block(
-                session.pool_guards().disk_guard(),
-                table.file().sparse_file().file_id(),
-                entry.leaf_block_id,
-            );
-
-            let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_table_data_integrity(
-                err,
-                "column_block_index",
-                entry.leaf_block_id,
-                DataIntegrityError::InvalidPayload,
-            );
-        });
+        smol::block_on(assert_checkpoint_delete_metadata_corruption(
+            corrupt_leaf_delete_codec,
+        ));
     }
 
+    /// Purpose: Protect deletion checkpointing against a truncated persisted delete-section
+    /// header.
+    /// Expected: Checkpoint reports invalid payload at the owning column-index block.
     #[test]
     fn test_checkpoint_fails_on_short_v2_delete_section_header() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 10, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let key1 = single_key(6i32);
-            let reader = session.begin_trx().unwrap();
-            let table = table_for_internal_assertion(&engine, table_id);
-            let row_id1 =
-                assert_row_in_lwc(&table, &session.pool_guards(), &key1, reader.sts()).await;
-            reader.commit().await.unwrap();
-
-            expect_delete_committed(table_id, &mut session, &key1).await;
-            let marker1 = table.deletion_buffer().get(row_id1).unwrap();
-            let marker1_ts = delete_marker_ts(marker1);
-            session.wait_for_gc_horizon_after(marker1_ts).await.unwrap();
-            assert_checkpoint_published(&mut session, table_id).await;
-
-            let pool_guards = session.pool_guards();
-            let snapshot = column_block_index_snapshot(&engine, table_id);
-            let index = snapshot.index(pool_guards.disk_guard());
-            let entry = index
-                .locate_block(row_id1)
-                .await
-                .unwrap()
-                .expect("persisted entry should exist");
-
-            let key2 = single_key(7i32);
-            let mut reader_session = engine.new_session().unwrap();
-            let reader = reader_session.begin_trx().unwrap();
-            let row_id2 =
-                assert_row_in_lwc(&table, &reader_session.pool_guards(), &key2, reader.sts()).await;
-            reader.commit().await.unwrap();
-            let entry2 = index
-                .locate_block(row_id2)
-                .await
-                .unwrap()
-                .expect("second persisted entry should exist");
-            assert_eq!(entry2.leaf_block_id, entry.leaf_block_id);
-            drop(reader_session);
-
-            expect_delete_committed(table_id, &mut session, &key2).await;
-            let marker2 = table.deletion_buffer().get(row_id2).unwrap();
-            let marker2_ts = delete_marker_ts(marker2);
-            session.wait_for_gc_horizon_after(marker2_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&mut session, table_id).await;
-
-            let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_leaf_short_delete_section_header(table_file_path, entry.leaf_block_id, 0);
-            let _ = table.disk_pool().invalidate_block(
-                session.pool_guards().disk_guard(),
-                table.file().sparse_file().file_id(),
-                entry.leaf_block_id,
-            );
-
-            let err = session.checkpoint_table(table_id).await.unwrap_err();
-            assert_table_data_integrity(
-                err,
-                "column_block_index",
-                entry.leaf_block_id,
-                DataIntegrityError::InvalidPayload,
-            );
-        });
+        smol::block_on(assert_checkpoint_delete_metadata_corruption(
+            corrupt_leaf_short_delete_section_header,
+        ));
     }
 
+    /// Purpose: Protect normal publication of a frozen table prefix.
+    /// Expected: Checkpoint advances the pivot and deletion cutoff, installs a column root,
+    /// and leaves the engine healthy.
     #[test]
     fn test_checkpoint_basic_flow() {
         smol::block_on(async {
@@ -4889,6 +5012,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect heap replay boundaries after checkpointing only a page prefix.
+    /// Expected: The first unfrozen successor page supplies the heap redo start timestamp.
     #[test]
     fn test_partial_freeze_uses_successor_page_heap_redo_start() {
         smol::block_on(async {
@@ -4917,6 +5042,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect heap replay boundaries when a new page appears after freezing the
+    /// current pages.
+    /// Expected: Checkpoint uses the later successor's creation timestamp.
     #[test]
     fn test_freeze_all_resolves_later_successor_heap_redo_start() {
         smol::block_on(async {
@@ -4947,6 +5075,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect heap replay boundaries when no hot successor remains.
+    /// Expected: Checkpoint uses its own timestamp as the heap redo start.
     #[test]
     fn test_freeze_all_without_successor_uses_checkpoint_ts() {
         smol::block_on(async {
@@ -4969,6 +5099,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect silent checkpoint replay boundaries after an empty freeze.
+    /// Expected: The silent watermark retains the first later page's creation timestamp.
     #[test]
     fn test_empty_freeze_resolves_first_later_page_heap_redo_start() {
         smol::block_on(async {
@@ -5005,6 +5137,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cleanup of a prepared freeze attempt before installation.
+    /// Expected: The attempt excludes concurrent freeze and checkpoint work, then restores
+    /// idle state when dropped.
     #[test]
     fn test_prepared_freeze_attempt_drop_restores_idle() {
         smol::block_on(async {
@@ -5035,6 +5170,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect canonical frozen-batch ownership across repeated requests.
+    /// Expected: Repeated freeze returns the original batch and preserves its frozen workflow
+    /// state.
     #[test]
     fn test_repeated_freeze_returns_original_table_owned_batch() {
         smol::block_on(async {
@@ -5062,6 +5200,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect engine-owned freeze work after the observer future is dropped.
+    /// Expected: Loading completes into the canonical frozen batch and competing maintenance
+    /// remains excluded meanwhile.
     #[test]
     fn test_dropped_freeze_observer_does_not_cancel_loading() {
         smol::block_on(async {
@@ -5131,6 +5272,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the volatile nature of freeze workflow state across restart.
+    /// Expected: New and recovered tables begin idle, and recovered row pages are active.
     #[test]
     fn test_new_and_recovered_table_workflow_is_idle_and_volatile() {
         smol::block_on(async {
@@ -5170,6 +5313,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect freeze admission against an already frozen or transitioning selected
+    /// page.
+    /// Expected: The invariant failure becomes a mandatory-task fatal error and poisons the
+    /// engine.
     #[test]
     fn test_freeze_panics_on_non_active_selected_page() {
         smol::block_on(async {
@@ -5216,6 +5363,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect engine-owned checkpoint completion after observer cancellation.
+    /// Expected: Both idle and frozen sources finish with an idle workflow and no retained
+    /// frozen batch.
     #[test]
     fn test_dropped_checkpoint_observer_completes_source_publication() {
         smol::block_on(async {
@@ -5265,6 +5415,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect per-page freeze locking while writers reach different pages.
+    /// Expected: The locked page blocks its writer and a later-page update delays checkpoint
+    /// until its horizon is safe.
     #[test]
     fn test_page_by_page_freeze_isolates_writers_and_validates_later_page() {
         smol::block_on(async {
@@ -5399,6 +5552,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint failure after irreversible transition begins but root
+    /// writing fails.
+    /// Expected: The engine is poisoned, root metadata stays unchanged, and the workflow
+    /// cannot restore its frozen source.
     #[test]
     fn test_checkpoint_publish_write_failure_poisons_storage() {
         smol::block_on(async {
@@ -5429,6 +5586,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint failure after the new root has been published.
+    /// Expected: The engine is poisoned and the advanced root remains under irreversible
+    /// transition state.
     #[test]
     fn test_checkpoint_post_publication_failure_poisons_storage() {
         smol::block_on(async {
@@ -5458,6 +5618,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint redo failure after route publication.
+    /// Expected: The engine retains fatal poison and irreversible workflow state without
+    /// leaving a session transaction.
     #[test]
     fn test_checkpoint_commit_failure_after_route_is_fail_closed() {
         smol::block_on(async {
@@ -5489,6 +5652,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect active-root readiness once older snapshots are gone.
+    /// Expected: A root whose effective timestamp is below the GC horizon no longer delays
+    /// checkpoint.
     #[test]
     fn test_active_root_readiness_ready_when_effective_ts_crossed_gc_horizon() {
         smol::block_on(async {
@@ -5512,6 +5678,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect diagnostics for an active-root checkpoint delay.
+    /// Expected: The delay identifies the protected root and reader horizon and clears after
+    /// that reader finishes.
     #[test]
     fn test_checkpoint_readiness_delayed_reports_effective_ts_and_horizon() {
         smol::block_on(async {
@@ -5560,6 +5729,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect root visibility for readers admitted between checkpoint start and
+    /// publication.
+    /// Expected: Readiness uses the effective publication boundary and waits until those
+    /// readers release their snapshots.
     #[test]
     fn test_checkpoint_readiness_uses_root_effective_ts_not_checkpoint_start_ts() {
         smol::block_on(async {
@@ -5635,6 +5808,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint session admission ahead of readiness checks.
+    /// Expected: An existing transaction is reported with session context and remains attached
+    /// to the caller.
     #[test]
     fn test_checkpoint_requires_idle_session_before_delayed_outcome() {
         smol::block_on(async {
@@ -5672,6 +5848,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reversible checkpoint state while an older root remains visible.
+    /// Expected: A delayed attempt preserves root metadata and its frozen batch until safe
+    /// publication can proceed.
     #[test]
     fn test_checkpoint_delayed_preserves_root_and_frozen_pages_until_ready() {
         smol::block_on(async {
@@ -5738,6 +5917,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect successive checkpoints while a reader retains the previous root.
+    /// Expected: The second attempt preserves the root until the reader horizon advances, then
+    /// publishes later progress.
     #[test]
     fn test_second_checkpoint_waits_for_previous_root_horizon() {
         smol::block_on(async {
@@ -5790,6 +5972,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the retry wait against progress racing with listener registration.
+    /// Expected: The readiness recheck observes intervening horizon progress and completes the
+    /// wait.
     #[test]
     fn test_checkpoint_retry_notification_between_registration_and_recheck_is_not_lost() {
         smol::block_on(async {
@@ -5837,6 +6022,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table teardown while a detached active-root retry waiter exists.
+    /// Expected: Table drop and runtime cleanup complete without retaining the waiting
+    /// observer's table ownership.
     #[test]
     fn test_detached_active_root_waiter_does_not_block_drop_or_runtime_gc() {
         smol::block_on(async {
@@ -5875,6 +6063,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect column-index block reclamation across successive root generations.
+    /// Expected: Protected roots remain allocated and obsolete blocks become free or reusable
+    /// after their horizon passes.
     #[test]
     fn test_checkpoint_reachability_reclaims_obsolete_column_index_root() {
         smol::block_on(async {
@@ -5936,6 +6127,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table checkpoint exclusivity across sessions.
+    /// Expected: The competing attempt reports in-progress cancellation while the original
+    /// publishes and both sessions settle.
     #[test]
     fn test_concurrent_checkpoint_table_returns_in_progress_cancellation() {
         smol::block_on(async {
@@ -5987,6 +6181,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table drop ordering against an admitted reversible checkpoint.
+    /// Expected: Drop waits while the table remains live and completes after checkpoint
+    /// publication.
     #[test]
     fn test_drop_waits_for_reversible_checkpoint() {
         smol::block_on(async {
@@ -6049,6 +6246,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect final transition admission after table drop wins the lifecycle race.
+    /// Expected: Admission fails, pages remain frozen, and attempt cleanup preserves the
+    /// closed workflow.
     #[test]
     fn test_drop_wins_validated_transition_admission_without_page_transition() {
         smol::block_on(async {
@@ -6099,6 +6299,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect table teardown while freeze owns maintenance admission.
+    /// Expected: Drop remains pending until freeze finishes, then removes the table from the
+    /// catalog.
     #[test]
     fn test_drop_waits_for_active_freeze() {
         smol::block_on(async {
@@ -6144,6 +6347,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect teardown of a table with a delayed frozen checkpoint batch.
+    /// Expected: Drop closes the workflow, wakes retry waiters, and permits runtime and file
+    /// cleanup.
     #[test]
     fn test_drop_discards_delayed_frozen_batch_before_runtime_destroy() {
         smol::block_on(async {
@@ -6226,6 +6432,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect teardown while a detached frozen-page retry observer exists.
+    /// Expected: After the writer settles, table drop and runtime cleanup proceed without
+    /// observer-held ownership.
     #[test]
     fn test_detached_frozen_page_waiter_does_not_block_drop_or_runtime_gc() {
         smol::block_on(async {
@@ -6290,6 +6499,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect fatal checkpoint error conversion.
+    /// Expected: An existing fatal classification and its diagnostic survive conversion
+    /// unchanged.
     #[test]
     fn test_checkpoint_carrier_preserves_fatal_reason() {
         let err = RuntimeOrFatalError::Fatal(
@@ -6302,6 +6514,9 @@ mod tests {
         assert!(format!("{report:?}").contains("fatal checkpoint source"));
     }
 
+    /// Purpose: Protect promotion of a recoverable checkpoint failure at a fatal boundary.
+    /// Expected: The fallback fatal classification retains the original runtime and internal
+    /// causes.
     #[test]
     fn test_checkpoint_runtime_carrier_uses_fallback_reason() {
         let err = RuntimeOrFatalError::Runtime(
@@ -6324,6 +6539,9 @@ mod tests {
         assert!(format!("{report:?}").contains("typed checkpoint invariant"));
     }
 
+    /// Purpose: Protect drop ordering after checkpoint enters irreversible publication.
+    /// Expected: Checkpoint commits before DROP and the table remains live until publication
+    /// settles.
     #[test]
     fn test_drop_waits_for_checkpoint_that_won_publish_admission() {
         smol::block_on(async {
@@ -6387,6 +6605,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect foreground access during incremental frozen-page transition.
+    /// Expected: Reads and active-suffix inserts proceed while blocked prefix writers resume
+    /// after route publication.
     #[test]
     fn test_transition_allows_reads_and_suffix_inserts_and_wakes_writers() {
         smol::block_on(async {
@@ -6570,8 +6791,14 @@ mod tests {
                 prefix_delete_start_tx.send(()).unwrap();
                 suffix_delete_start_tx.send(()).unwrap();
                 suffix_delete_done_rx.recv().unwrap();
-                assert!(hook_prefix_update_done_rx.try_recv().is_err());
-                assert!(hook_prefix_delete_done_rx.try_recv().is_err());
+                assert_eq!(
+                    hook_prefix_update_done_rx.try_recv(),
+                    Err(flume::TryRecvError::Empty)
+                );
+                assert_eq!(
+                    hook_prefix_delete_done_rx.try_recv(),
+                    Err(flume::TryRecvError::Empty)
+                );
             });
             let suffix_page_id =
                 hot_page_id_for_key(&table, &mut frozen_foreground, &single_key(1000)).await;
@@ -6618,8 +6845,14 @@ mod tests {
                 )
                 .await;
 
-                assert!(prefix_update_done_rx.try_recv().is_err());
-                assert!(prefix_delete_done_rx.try_recv().is_err());
+                assert_eq!(
+                    prefix_update_done_rx.try_recv(),
+                    Err(flume::TryRecvError::Empty)
+                );
+                assert_eq!(
+                    prefix_delete_done_rx.try_recv(),
+                    Err(flume::TryRecvError::Empty)
+                );
 
                 release_tx.send_async(()).await.unwrap();
                 checkpoint.await.unwrap()
@@ -6658,6 +6891,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect final checkpoint rebuild locking across independently changing pages.
+    /// Expected: A changed page rebuilds under its own lock while another frozen page can
+    /// still change.
     #[test]
     fn test_final_page_lock_rebuild_is_page_local() {
         smol::block_on(async {
@@ -6731,6 +6967,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint progress while each frozen page changes during preparation.
+    /// Expected: Every affected page rebuilds and checkpoint publishes without requiring
+    /// global quiescence.
     #[test]
     fn test_continuous_frozen_deletes_rebuild_each_page_without_global_quiet_window() {
         smol::block_on(async {
@@ -6783,76 +7022,19 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect full plan refresh when earlier ownership becomes visible on a stable
+    /// frozen image.
+    /// Expected: Publication retains the exact shared ownership marker and returns the
+    /// workflow to idle.
     #[test]
     fn test_full_plan_refresh_represents_frozen_observed_pre_fence_ownership() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "stable-full-refresh").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 1, 20, "blocked").await;
-            let batch =
-                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            let target_ts = session.last_cts();
-            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&mut session, table_id).await;
-
-            let table = table_for_internal_assertion(&engine, table_id);
-            let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
-            let first_page_id = page_ids[0];
-            let first_page = table
-                .row_store
-                .must_get_row_page_shared(&session.pool_guards(), first_page_id)
-                .await
-                .unwrap();
-            let row_id = first_page.page().row_id(0);
-            let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
-            let undo_owner = Arc::new(parking_lot::Mutex::new(None));
-            let hook_undo_owner = Arc::clone(&undo_owner);
-            let hook_first_page = Arc::clone(&first_page);
-            let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
-            let ownership_status = Arc::new(shared_trx_status(
-                MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
-            ));
-            let hook_ownership_status = Arc::clone(&ownership_status);
-            set_test_frozen_pages_ready_hook(&engine, move || {
-                let page_guard = hook_first_page.lock().take().unwrap();
-                let page = page_guard.page();
-                let map = page_guard.unwrap_vmap();
-                let undo = OwnedRowUndo::new(
-                    NON_FOREGROUND_STMT_NO,
-                    table_id,
-                    None,
-                    page.row_id(0),
-                    RowUndoKind::Lock,
-                );
-                map.begin_frozen_mutation();
-                *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
-                    hook_ownership_status,
-                    undo.leak(),
-                )));
-                map.finish_frozen_mutation();
-                hook_undo_owner.lock().replace(undo);
-                drop(page_guard);
-            });
-            let publish_admitted = Arc::new(AtomicBool::new(false));
-            let hook_publish_admitted = Arc::clone(&publish_admitted);
-            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
-                hook_publish_admitted.store(true, AtomicOrdering::Relaxed);
-            });
-
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
-            assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(publish_admitted.load(AtomicOrdering::Relaxed));
-            assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
-            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
-                panic!("stable-plan refresh must install the ownership marker");
-            };
-            assert!(Arc::ptr_eq(&marker_status, &ownership_status));
-            undo_owner.lock().take();
-        });
+        smol::block_on(assert_checkpoint_ownership_refresh(
+            OwnershipRefreshPhase::FullPlan,
+        ));
     }
 
+    /// Purpose: Protect checkpoint plan validity after frozen undo metadata is purged.
+    /// Expected: The stale plan is rebuilt under the page lock before successful publication.
     #[test]
     fn test_metadata_purge_after_preparation_forces_locked_checkpoint_rebuild() {
         smol::block_on(async {
@@ -6916,92 +7098,19 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect ownership capture during the first page's final locked rebuild.
+    /// Expected: The rebuild runs after transition admission and publishes the exact shared
+    /// ownership marker.
     #[test]
     fn test_first_page_locked_rebuild_represents_frozen_observed_pre_fence_ownership() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "stable-locked-refresh").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 1, 20, "blocked").await;
-            let batch =
-                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            let target_ts = session.last_cts();
-            session.wait_for_gc_horizon_after(target_ts).await.unwrap();
-            wait_for_checkpoint_root_ready(&mut session, table_id).await;
-
-            let table = table_for_internal_assertion(&engine, table_id);
-            let page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
-            let first_page_id = page_ids[0];
-            let first_page = table
-                .row_store
-                .must_get_row_page_shared(&session.pool_guards(), first_page_id)
-                .await
-                .unwrap();
-            let row_id = first_page.page().row_id(0);
-            let first_page = Arc::new(parking_lot::Mutex::new(Some(first_page)));
-            let undo_owner = Arc::new(parking_lot::Mutex::new(None));
-            let hook_undo_owner = Arc::clone(&undo_owner);
-            let hook_first_page = Arc::clone(&first_page);
-            let pre_fence_sts = batch.frozen_ts().saturating_sub(2);
-            let ownership_status = Arc::new(shared_trx_status(
-                MIN_ACTIVE_TRX_ID + pre_fence_sts.as_u64(),
-            ));
-            let hook_ownership_status = Arc::clone(&ownership_status);
-            set_test_stable_page_plans_refreshed_hook(&engine, move || {
-                let page_guard = hook_first_page.lock().take().unwrap();
-                let page = page_guard.page();
-                let map = page_guard.unwrap_vmap();
-                let undo = OwnedRowUndo::new(
-                    NON_FOREGROUND_STMT_NO,
-                    table_id,
-                    None,
-                    page.row_id(0),
-                    RowUndoKind::Lock,
-                );
-                map.begin_frozen_mutation();
-                *map.write_latch(0) = Some(Box::new(RowUndoHead::new(
-                    hook_ownership_status,
-                    undo.leak(),
-                )));
-                map.finish_frozen_mutation();
-                hook_undo_owner.lock().replace(undo);
-                drop(page_guard);
-            });
-            let locked_rebuild_observed = Arc::new(AtomicBool::new(false));
-            let hook_locked_rebuild_observed = Arc::clone(&locked_rebuild_observed);
-            let hook_table = Arc::downgrade(&table);
-            set_test_locked_page_plan_rebuild_hook(&engine, move |page_id| {
-                assert_eq!(page_id, first_page_id);
-                assert_eq!(
-                    hook_table
-                        .upgrade()
-                        .unwrap()
-                        .checkpoint_workflow
-                        .state_name(),
-                    "Transition"
-                );
-                hook_locked_rebuild_observed.store(true, AtomicOrdering::Relaxed);
-            });
-            let publish_admitted = Arc::new(AtomicBool::new(false));
-            let hook_publish_admitted = Arc::clone(&publish_admitted);
-            set_test_checkpoint_after_publish_admission_hook(&engine, move || async move {
-                hook_publish_admitted.store(true, AtomicOrdering::Relaxed);
-            });
-
-            let outcome = session.checkpoint_table(table_id).await.unwrap();
-            assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
-            assert!(publish_admitted.load(AtomicOrdering::Relaxed));
-            assert!(locked_rebuild_observed.load(AtomicOrdering::Relaxed));
-            assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
-            let Some(DeleteMarker::Ref(marker_status)) = table.deletion_buffer().get(row_id) else {
-                panic!("locked rebuild must install the ownership marker");
-            };
-            assert!(Arc::ptr_eq(&marker_status, &ownership_status));
-            undo_owner.lock().take();
-        });
+        smol::block_on(assert_checkpoint_ownership_refresh(
+            OwnershipRefreshPhase::LockedPage,
+        ));
     }
 
+    /// Purpose: Protect foreground writers waiting for a transition whose checkpoint fails.
+    /// Expected: Update and delete waiters wake with checkpoint poison while the workflow
+    /// remains irreversible.
     #[test]
     fn test_transition_writers_wake_through_checkpoint_poison() {
         smol::block_on(async {
@@ -7103,6 +7212,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect partial statement rollback after its source enters transition.
+    /// Expected: Rollback removes only the failed transfer, retains earlier deletion
+    /// ownership, and later transaction rollback clears it.
     #[test]
     fn test_transition_statement_rollback_preserves_earlier_delete_and_forward_source() {
         smol::block_on(async {
@@ -7214,6 +7326,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transition undo against invalid marker state and same-owner
+    /// predecessor loss.
+    /// Expected: Invalid rollback leaves row state intact and valid lock rollback preserves
+    /// the earlier delete until final cleanup.
     #[test]
     fn test_transition_rollback_validates_marker_and_keeps_main_predecessor() {
         smol::block_on(async {
@@ -7396,6 +7512,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect row-undo cleanup before a transitioning page publishes its cold route.
+    /// Expected: Rollback unlinks undo and clears deletion ownership without a route wait,
+    /// preserving visibility before and after publication.
     #[test]
     fn test_transaction_row_rollback_unlinks_before_transition_route_publication() {
         smol::block_on(async {
@@ -7535,6 +7654,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect terminal rollback of a moved update during source transition.
+    /// Expected: Rollback removes the replacement and restores the original row before cold
+    /// publication completes.
     #[test]
     fn test_move_update_terminal_rollback_unwinds_replacement_before_transition_publication() {
         smol::block_on(async {
@@ -7677,6 +7799,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect mandatory transition cleanup after its rollback observer is cancelled.
+    /// Expected: Cleanup reaches terminal state, releases locks and markers, and restores row
+    /// visibility.
     #[test]
     fn test_terminal_rollback_waiter_cancellation_does_not_cancel_transition_cleanup() {
         smol::block_on(async {
@@ -7749,6 +7874,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect failed-precommit cleanup ordering while a transitioning row is
+    /// blocked.
+    /// Expected: Observers receive completion only after undo, markers, locks, snapshot
+    /// registration, and session ownership are settled.
     #[test]
     fn test_failed_precommit_rollback_unlinks_transition_before_releasing_observers() {
         smol::block_on(async {
@@ -7843,6 +7972,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback safety after irreversible checkpoint failure.
+    /// Expected: Safe cleanup can complete, while marker or reload faults retain undo
+    /// ownership and the original poison.
     #[test]
     fn test_transition_rollback_after_checkpoint_poison_requires_only_safe_cleanup() {
         smol::block_on(async {
@@ -7958,6 +8090,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect undo ownership when its exact page generation is missing.
+    /// Expected: Rollback reports an internal error and retains the undo entry and marker on
+    /// either side of the pivot.
     #[test]
     fn test_missing_generation_row_rollback_retains_entry_after_route_publication() {
         smol::block_on(async {
@@ -8022,6 +8157,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect unresolved rollback ownership in an already poisoned engine.
+    /// Expected: A missing page generation retains its undo entry, exact deletion owner,
+    /// and the original checkpoint poison.
     #[test]
     fn test_missing_generation_row_rollback_preserves_checkpoint_poison_and_entry() {
         smol::block_on(async {
@@ -8071,12 +8209,24 @@ mod tests {
                 panic!("poisoned rollback must retain its unresolved cold marker");
             };
             assert!(Arc::ptr_eq(&actual, &status));
+            assert_eq!(
+                *engine
+                    .inner()
+                    .poisoner
+                    .poison_error()
+                    .unwrap()
+                    .current_context(),
+                FatalError::CheckpointWrite,
+            );
             drop(session);
             drop(table);
             engine.shutdown();
         });
     }
 
+    /// Purpose: Protect direct row-rollback paths from unnecessary poison observation.
+    /// Expected: Valid hot and cold-origin undo is consumed while invalid routed undo remains
+    /// retained without poison-listener work.
     #[test]
     fn test_row_rollback_fast_paths_do_not_observe_poison() {
         smol::block_on(async {
@@ -8177,6 +8327,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transition-route waits against publication and poison races around
+    /// registration.
+    /// Expected: Route progress is not lost and fatal poison wins when both become observable.
     #[test]
     fn test_transition_route_registration_boundaries_preserve_precedence() {
         smol::block_on(async {
@@ -8197,6 +8350,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect an existing reader's snapshot while checkpoint and an uncommitted
+    /// insert overlap.
+    /// Expected: The reader cannot see the newer uncommitted row after checkpoint publication.
     #[test]
     fn test_checkpoint_snapshot_consistency() {
         smol::block_on(async {
@@ -8239,6 +8395,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect old-root lifetime across checkpoint publication and reader completion.
+    /// Expected: The old root remains retained until GC passes the protecting reader's
+    /// horizon.
     #[test]
     fn test_checkpoint_old_root_released_after_active_reader_purged() {
         smol::block_on(async {
@@ -8291,6 +8450,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reopening a checkpointed table file.
+    /// Expected: The recovered root preserves the persisted pivot and replay cutoffs.
     #[test]
     fn test_checkpoint_persistence_recovery() {
         smol::block_on(async {
@@ -8342,6 +8503,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect an accepted silent checkpoint after its observer is dropped.
+    /// Expected: Publication completes without poison, records its watermark, and restores
+    /// idle workflow state.
     #[test]
     fn test_dropped_publication_observer_does_not_cancel_accepted_checkpoint() {
         smol::block_on(async {
@@ -8387,6 +8551,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect silent checkpoint failure during catalog watermark mutation.
+    /// Expected: The engine retains catalog-write poison without publishing a watermark or
+    /// changing the table root.
     #[test]
     fn test_silent_watermark_mutation_failure_poisons_catalog_write() {
         smol::block_on(async {
@@ -8421,6 +8588,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect silent watermark failure after the checkpoint observer is cancelled.
+    /// Expected: Engine-owned work preserves catalog-write poison and leaves the watermark
+    /// absent and root unchanged.
     #[test]
     fn test_dropped_observer_preserves_silent_watermark_mutation_failure() {
         smol::block_on(async {
@@ -8473,6 +8643,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect silent replay-watermark publication and later catalog durability.
+    /// Expected: The table root stays unchanged while catalog checkpoint makes the advanced
+    /// replay floors durable.
     #[test]
     fn test_checkpoint_heartbeat() {
         smol::block_on(async {
@@ -8583,6 +8756,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect DROP ordering against silent watermark publication.
+    /// Expected: Competing maintenance is excluded and DROP commits only after the silent
+    /// checkpoint settles.
     #[test]
     fn test_drop_waits_for_silent_watermark_checkpoint_commit() {
         smol::block_on(async {
@@ -8603,6 +8779,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect DROP ordering against deletion-only root publication.
+    /// Expected: Competing maintenance is excluded and DROP commits only after the root
+    /// checkpoint settles.
     #[test]
     fn test_drop_waits_for_deletion_only_root_checkpoint_commit() {
         smol::block_on(async {
@@ -8636,6 +8815,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect metadata-change admission around frozen and active workflow states.
+    /// Expected: A frozen batch permits metadata change, while active metadata ownership
+    /// cancels freeze and checkpoint admission.
     #[test]
     fn test_frozen_batch_allows_metadata_change_and_metadata_blocks_maintenance() {
         smol::block_on(async {
@@ -8688,6 +8870,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reclamation of hot row pages retired by checkpoint.
+    /// Expected: Purge completion reduces allocated row-page storage.
     #[test]
     fn test_checkpoint_gc_verification() {
         smol::block_on(async {
@@ -8713,6 +8897,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint-retired pages under both purge execution modes.
+    /// Expected: Pages remain allocated while a reader pins the horizon and are reclaimed
+    /// after it releases ownership.
     #[test]
     fn test_checkpoint_retirement_waits_for_reader_in_single_and_dispatcher_modes() {
         smol::block_on(async {
@@ -8721,6 +8908,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect frozen checkpoint readiness with an unresolved earlier insertion.
+    /// Expected: The batch and root remain unchanged until writer rollback allows publication.
     #[test]
     fn test_checkpoint_batch_delays_for_pre_fence_uncommitted_insert() {
         smol::block_on(async {
@@ -8795,6 +8984,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect retry readiness with multiple unresolved row images on one frozen
+    /// page.
+    /// Expected: Cancellation preserves the batch and readiness waits for every blocker
+    /// without reacting to unrelated progress.
     #[test]
     fn test_frozen_page_wait_requires_all_image_blockers() {
         smol::block_on(async {
@@ -8894,6 +9087,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect stable-image reuse while a committed update remains beyond the
+    /// checkpoint cutoff.
+    /// Expected: Same-cutoff retries avoid rescanning and horizon progress permits a refreshed
+    /// publication.
     #[test]
     fn test_checkpoint_batch_retries_stale_committed_update_cutoff() {
         smol::block_on(async {
@@ -9003,6 +9200,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect incremental readiness after a later frozen page blocks checkpoint.
+    /// Expected: Retry reuses the stable prefix and resumes analysis from the blocked page
+    /// after ownership settles.
     #[test]
     fn test_blocked_page_retry_reuses_stable_prefix() {
         smol::block_on(async {
@@ -9145,6 +9345,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect frozen image analysis when a delete hides a newer committed update.
+    /// Expected: Checkpoint waits for the hidden update's cutoff before publishing the deleted
+    /// state safely.
     #[test]
     fn test_checkpoint_batch_detects_future_update_behind_delete() {
         smol::block_on(async {
@@ -9228,6 +9431,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint state after an injected irreversible construction failure.
+    /// Expected: The engine is poisoned, durable root fields stay unchanged, and transition
+    /// state cannot restore the batch.
     #[test]
     fn test_checkpoint_error_rollback() {
         smol::block_on(async {
@@ -9252,7 +9458,7 @@ mod tests {
                 let _guard = ForceLwcBuildErrorGuard::new(&engine);
                 session.checkpoint_table(table_id).await
             };
-            assert!(res.is_err());
+            assert_checkpoint_write_poisoned(&res.unwrap_err(), &engine);
             let poison = engine
                 .inner()
                 .poisoner
@@ -9283,6 +9489,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect checkpoint admission during index metadata mutation.
+    /// Expected: The attempt returns normal metadata-changing cancellation.
     #[test]
     fn test_checkpoint_cancelled_while_table_metadata_change_active() {
         smol::block_on(async {
@@ -9310,6 +9518,9 @@ mod tests {
         })
     }
 
+    /// Purpose: Protect disk-index reclamation after logical DROP INDEX and reader cleanup.
+    /// Expected: Checkpoint frees detached index blocks while retained metadata stays valid
+    /// and restart preserves reclamation.
     #[test]
     fn test_checkpoint_reachability_reclaims_dropped_secondary_disk_tree_root() {
         smol::block_on(async {

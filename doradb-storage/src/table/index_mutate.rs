@@ -618,6 +618,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, Debug)]
+    enum ActiveHotMutation {
+        Delete,
+        ChangeKey,
+    }
+
     thread_local! {
         static DEFERRED_APPLICATION_PAUSE: RefCell<Option<flume::Receiver<()>>> = const { RefCell::new(None) };
         static DEFERRED_APPLICATION_PAUSED: Cell<bool> = const { Cell::new(false) };
@@ -915,6 +921,90 @@ mod tests {
         reader.commit().await.unwrap();
     }
 
+    async fn assert_active_hot_mutation_blocks_callback(mutation: ActiveHotMutation) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "index_mutate_active_hot_owner").await;
+        let table_id = create_table2_for_test(&engine).await;
+        let mut setup_session = engine.new_session().unwrap();
+        insert_rows(table_id, &mut setup_session, 1, 1, "original").await;
+
+        let mut owner_session = engine.new_session().unwrap();
+        let mut owner = owner_session.begin_trx().unwrap();
+        match mutation {
+            ActiveHotMutation::Delete => {
+                assert_eq!(
+                    trx_delete_row_by_id(&mut owner, table_id, &single_key(1i32))
+                        .await
+                        .unwrap(),
+                    UniqueMutationOutcome::Deleted
+                );
+            }
+            ActiveHotMutation::ChangeKey => {
+                assert!(matches!(
+                    trx_update_row_by_id(
+                        &mut owner,
+                        table_id,
+                        &single_key(1i32),
+                        vec![UpdateCol {
+                            idx: 0,
+                            val: Val::from(2i32),
+                        }],
+                    )
+                    .await
+                    .unwrap(),
+                    UniqueMutationOutcome::Updated(_)
+                ));
+            }
+        }
+
+        let key = [Val::from(1i32)];
+        let mut callbacks = 0usize;
+        let mut competitor_session = engine.new_session().unwrap();
+        let mut competitor = competitor_session.begin_trx().unwrap();
+        let result = competitor
+            .table_index_mutate_mvcc(
+                crate::TableIndex(table_id, crate::IndexID::new(0)),
+                &key[..]..=&key[..],
+                |_| -> CallbackResult<_> {
+                    callbacks += 1;
+                    Ok(RowMutation::Skip)
+                },
+            )
+            .await;
+        assert_eq!(
+            result
+                .unwrap_err()
+                .engine()
+                .unwrap()
+                .report()
+                .downcast_ref::<OperationError>()
+                .copied(),
+            Some(OperationError::WriteConflict)
+        );
+        assert_eq!(callbacks, 0);
+        competitor.rollback().await.unwrap();
+        owner.rollback().await.unwrap();
+        let mut reader = setup_session.begin_trx().unwrap();
+        assert_eq!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &single_key(1i32), &[0, 1])
+                .await
+                .unwrap(),
+            SelectMvcc::Found(vec![Val::from(1i32), Val::from("original")]),
+            "{mutation:?}: owner rollback must restore the row",
+        );
+        assert_eq!(
+            trx_select_row_mvcc_by_id(&mut reader, table_id, &single_key(2i32), &[0, 1])
+                .await
+                .unwrap(),
+            SelectMvcc::NotFound,
+            "{mutation:?}: owner rollback must not leave a new key",
+        );
+        reader.commit().await.unwrap();
+    }
+
+    /// Purpose: Protect index-driven mixed actions across cold and hot rows.
+    /// Expected: Each candidate is visited once and committed rows reflect skips, updates, and
+    /// deletions.
     #[test]
     fn test_table_index_mutate_mvcc_mixed_cold_hot_actions() {
         smol::block_on(async {
@@ -988,6 +1078,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect index mutation against stale candidates for durably deleted cold rows.
+    /// Expected: Deleted rows invoke no callback and acquire no deletion marker.
     #[test]
     fn test_table_index_mutate_mvcc_skips_persisted_cold_delete() {
         smol::block_on(async {
@@ -1055,6 +1147,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect index traversal when updates change the driving unique key.
+    /// Expected: Each original row is visited once and all deferred key changes become
+    /// visible.
     #[test]
     fn test_table_index_mutate_mvcc_unique_driver_key_changes_apply_after_traversal() {
         smol::block_on(async {
@@ -1104,6 +1199,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deferred unique-key updates of frozen variable-length rows.
+    /// Expected: The moved row is found under its new key and disappears under the old key.
     #[test]
     fn test_table_index_mutate_mvcc_unique_driver_change_moves_frozen_row() {
         smol::block_on(async {
@@ -1166,6 +1263,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect statement rollback when deferred unique-key changes collide.
+    /// Expected: The duplicate-key error restores original rows after visiting the candidate
+    /// set.
     #[test]
     fn test_table_index_mutate_mvcc_unique_driver_duplicate_settles_pending_locks() {
         smol::block_on(async {
@@ -1214,6 +1314,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deferred driving-key changes across both storage tiers.
+    /// Expected: Each cold and hot candidate is updated once and retains its non-key contents.
     #[test]
     fn test_table_index_mutate_mvcc_unique_driver_changes_mixed_cold_hot() {
         smol::block_on(async {
@@ -1265,6 +1367,10 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect deferred updates whose locked hot source becomes cold before
+    /// application.
+    /// Expected: Commit and rollback preserve old-reader visibility, undo ownership,
+    /// reclamation, and recovered results.
     #[test]
     fn test_table_index_mutate_mvcc_deferred_hot_lock_resumes_after_cold_publication() {
         smol::block_on(async {
@@ -1279,6 +1385,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect rollback of a transitioned source when its deferred update collides.
+    /// Expected: The duplicate error restores the source and clears undo and deletion
+    /// ownership through recovery.
     #[test]
     fn test_deferred_transition_duplicate_rolls_back_finalized_delete() {
         smol::block_on(async {
@@ -1367,6 +1476,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cancellation of a deferred mutation after cold publication.
+    /// Expected: Session cleanup restores the original row using retained undo ownership.
     #[test]
     fn test_table_index_mutate_mvcc_transition_cancellation_retains_deferred_undo_ownership() {
         smol::block_on(async {
@@ -1406,6 +1517,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect row ownership while a deferred index update is paused.
+    /// Expected: Competing writes conflict until the deferred update completes.
     #[test]
     fn test_table_index_mutate_mvcc_deferred_update_retains_write_conflict() {
         smol::block_on(async {
@@ -1459,6 +1572,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nonunique index traversal from entries produced by its own updates.
+    /// Expected: Each original row is mutated once despite forward key movement.
     #[test]
     fn test_table_index_mutate_mvcc_non_unique_forward_moves_skip_self_entries() {
         smol::block_on(async {
@@ -1523,6 +1638,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect ownership release for skipped and empty-update index mutations.
+    /// Expected: Another transaction can update both hot and cold rows while the first
+    /// transaction remains open.
     #[test]
     fn test_table_index_mutate_mvcc_noop_releases_hot_and_cold_ownership() {
         smol::block_on(async {
@@ -1589,6 +1707,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect statement-local visitation after an earlier insert in the same
+    /// transaction.
+    /// Expected: Each later index mutation visits the inserted row once.
     #[test]
     fn test_table_index_mutate_mvcc_visits_row_inserted_by_prior_direct_operation() {
         smol::block_on(async {
@@ -1637,111 +1758,28 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect callback admission against a foreign active hot-row deletion.
+    /// Expected: The operation reports a write conflict without invoking the callback.
     #[test]
     fn test_table_index_mutate_mvcc_conflicts_with_active_hot_delete_before_callback() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "index_mutate_active_hot_delete").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut setup_session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut setup_session, 1, 1, "original").await;
-
-            let mut owner_session = engine.new_session().unwrap();
-            let mut owner = owner_session.begin_trx().unwrap();
-            assert_eq!(
-                trx_delete_row_by_id(&mut owner, table_id, &single_key(1i32))
-                    .await
-                    .unwrap(),
-                UniqueMutationOutcome::Deleted
-            );
-
-            let key = [Val::from(1i32)];
-            let mut callbacks = 0usize;
-            let mut competitor_session = engine.new_session().unwrap();
-            let mut competitor = competitor_session.begin_trx().unwrap();
-            let result = competitor
-                .table_index_mutate_mvcc(
-                    crate::TableIndex(table_id, crate::IndexID::new(0)),
-                    &key[..]..=&key[..],
-                    |_| -> CallbackResult<_> {
-                        callbacks += 1;
-                        Ok(RowMutation::Skip)
-                    },
-                )
-                .await;
-            assert_eq!(
-                result
-                    .unwrap_err()
-                    .engine()
-                    .unwrap()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::WriteConflict)
-            );
-            assert_eq!(callbacks, 0);
-            competitor.rollback().await.unwrap();
-            owner.rollback().await.unwrap();
-        });
+        smol::block_on(assert_active_hot_mutation_blocks_callback(
+            ActiveHotMutation::Delete,
+        ));
     }
 
+    /// Purpose: Protect callback admission through a key changed by another active
+    /// transaction.
+    /// Expected: The old-key candidate reports a write conflict without invoking the callback.
     #[test]
     fn test_table_index_mutate_mvcc_conflicts_with_active_hot_key_change_before_callback() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                lightweight_test_engine(&temp_dir, "index_mutate_active_hot_key_change").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut setup_session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut setup_session, 1, 1, "original").await;
-
-            let mut owner_session = engine.new_session().unwrap();
-            let mut owner = owner_session.begin_trx().unwrap();
-            assert!(matches!(
-                trx_update_row_by_id(
-                    &mut owner,
-                    table_id,
-                    &single_key(1i32),
-                    vec![UpdateCol {
-                        idx: 0,
-                        val: Val::from(2i32),
-                    }],
-                )
-                .await
-                .unwrap(),
-                UniqueMutationOutcome::Updated(_)
-            ));
-
-            let old_key = [Val::from(1i32)];
-            let mut callbacks = 0usize;
-            let mut competitor_session = engine.new_session().unwrap();
-            let mut competitor = competitor_session.begin_trx().unwrap();
-            let result = competitor
-                .table_index_mutate_mvcc(
-                    crate::TableIndex(table_id, crate::IndexID::new(0)),
-                    &old_key[..]..=&old_key[..],
-                    |_| -> CallbackResult<_> {
-                        callbacks += 1;
-                        Ok(RowMutation::Skip)
-                    },
-                )
-                .await;
-            assert_eq!(
-                result
-                    .unwrap_err()
-                    .engine()
-                    .unwrap()
-                    .report()
-                    .downcast_ref::<OperationError>()
-                    .copied(),
-                Some(OperationError::WriteConflict)
-            );
-            assert_eq!(callbacks, 0);
-            competitor.rollback().await.unwrap();
-            owner.rollback().await.unwrap();
-        });
+        smol::block_on(assert_active_hot_mutation_blocks_callback(
+            ActiveHotMutation::ChangeKey,
+        ));
     }
 
+    /// Purpose: Protect index mutation settlement of a preparing hot-row delete.
+    /// Expected: The operation waits for commit, then skips the deleted row without invoking
+    /// the callback.
     #[test]
     fn test_table_index_mutate_mvcc_waits_for_preparing_hot_delete_before_skipping() {
         smol::block_on(async {

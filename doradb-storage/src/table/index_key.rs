@@ -259,6 +259,9 @@ mod tests {
         assert!(indexed.into_keys().next().is_none());
     }
 
+    /// Purpose: Protect key derivation for layouts without indexes.
+    /// Expected: User and memory layouts produce empty write-key sets from full and indexed
+    /// row values.
     #[test]
     fn test_empty_user_and_memory_key_sets() {
         let metadata = Arc::new(
@@ -277,6 +280,10 @@ mod tests {
         assert_empty_keys(&memory);
     }
 
+    /// Purpose: Protect owned index-key derivation from sparse memory layouts and deleted
+    /// rows.
+    /// Expected: Derived keys retain index identity, column order, and values after page
+    /// access ends.
     #[test]
     fn test_memory_key_derivation_owns_live_and_deleted_physical_values() {
         smol::block_on(async {

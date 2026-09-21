@@ -592,6 +592,10 @@ mod tests {
         )
     }
 
+    /// Purpose: Protect generic layouts against inconsistent runtime entries and identity
+    /// maps.
+    /// Expected: Invalid slot counts, activity, identities, and mappings fail invariant
+    /// checks.
     #[test]
     fn generic_layout_rejects_inconsistent_entries_and_identity_maps() {
         let metadata = sparse_binding_metadata();
@@ -665,6 +669,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect sparse index bindings and column-layout allocation identity.
+    /// Expected: Active entries pair with their metadata and only the original column
+    /// allocation is accepted.
     #[test]
     fn generic_layout_binds_paired_entries_and_column_allocation() {
         let metadata = sparse_binding_metadata();
@@ -708,6 +715,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect construction of user and memory layouts without indexes.
+    /// Expected: Both layouts retain their generation and expose empty index slots and read
+    /// sets.
     #[test]
     fn runtime_layout_accepts_matching_empty_index_shape() {
         let metadata = metadata_without_indexes();
@@ -729,6 +739,8 @@ mod tests {
         assert!(layout.indexed_column_read_set().is_empty());
     }
 
+    /// Purpose: Protect runtime layout construction against inconsistent index metadata.
+    /// Expected: Mismatched references, activity, slots, and uniqueness are rejected.
     #[test]
     fn runtime_layout_rejects_structural_mismatches() {
         smol::block_on(async {
@@ -834,6 +846,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect exact index-generation validation after slot replacement.
+    /// Expected: Only the replacement reference validates, and retained-reference validation
+    /// avoids identity-map lookup.
     #[test]
     fn runtime_layout_validates_exact_generation_without_id_map_lookup() {
         smol::block_on(async {
@@ -871,6 +886,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect direct access through retained index references.
+    /// Expected: Exact active references resolve without lookup; replaced, inactive, and
+    /// absent references are rejected.
     #[test]
     fn retained_index_access_requires_exact_active_generation() {
         smol::block_on(async {
@@ -936,6 +954,9 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect retired index ownership while an old layout remains pinned.
+    /// Expected: The new layout hides the index while the old owner prevents cleanup and slot
+    /// reuse.
     #[test]
     fn test_runtime_layout_install_retains_removed_index_while_layout_is_pinned() {
         smol::block_on(async {

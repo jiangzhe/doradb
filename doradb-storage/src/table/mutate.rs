@@ -843,7 +843,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
             .attach_with(|| format!("operation=link_for_unique_index, index={index_ref}"))?
         {
             FindOldVersion::None => Ok(LinkForUniqueIndex::NotNeeded),
-            FindOldVersion::Found(old_row, cts, old_entry) => {
+            FindOldVersion::Found(old_row, end_cts, old_entry) => {
                 let source = old_access
                     .undo_head()
                     .and_then(|head| HotForwardSource::new(rt.ctx(), head, &old_entry));
@@ -856,7 +856,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
                 let undo_vals = new_access.row().calc_delta(metadata.col.as_ref(), &old_row);
                 new_access.link_for_unique_index(
                     self.retained_key(index_ref, key_vals.to_vec()),
-                    cts,
+                    end_cts,
                     old_entry,
                     undo_vals,
                 );

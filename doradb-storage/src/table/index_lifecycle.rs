@@ -815,6 +815,9 @@ mod tests {
         root
     }
 
+    /// Purpose: Protect reuse of recovered index slots at the DROP replay boundary.
+    /// Expected: A retired slot becomes reusable only after checkpoint progress strictly
+    /// covers its drop.
     #[test]
     fn checkpoint_strictly_gates_recovered_retirement_reuse() {
         let retired = IndexRef::new(IndexID::new(4), IndexSlot::new(0));
@@ -840,6 +843,9 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect slot allocation around provisional index reservations.
+    /// Expected: Allocation skips reserved slots until checkpoint release and preserves the
+    /// consumed identity watermark.
     #[test]
     fn lowest_reusable_slot_skips_provisional_and_preserves_effective_watermark() {
         let retired0 = IndexRef::new(IndexID::new(4), IndexSlot::new(0));
@@ -908,6 +914,9 @@ mod tests {
         assert_eq!(view.effective_next_index_id(), 8);
     }
 
+    /// Purpose: Protect index identity exhaustion after a maximum-identity reservation is
+    /// released.
+    /// Expected: The allocator retains exhaustion and rejects another index creation.
     #[test]
     fn provisional_max_id_keeps_exact_widened_exhaustion_after_release() {
         let root = root(1, vec![SecondaryIndexSlot::Vacant]);

@@ -592,6 +592,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect lazy snapshot lookup and the strict deletion purge boundary.
+    /// Expected: Only committed markers consult the cutoff and become purgeable strictly
+    /// before it.
     #[test]
     fn test_delete_marker_is_globally_purgeable_with_is_lazy() {
         let buffer = ColumnDeletionBuffer::new();
@@ -639,6 +642,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// Purpose: Protect snapshot classification for compact and referenced committed
+    /// deletions.
+    /// Expected: Visible deletions report already deleted and newer deletions report a write
+    /// conflict.
     #[test]
     fn test_put_ref_respects_snapshot_for_committed_markers() {
         let buffer = ColumnDeletionBuffer::new();
@@ -668,6 +675,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect cold visibility overrides for own, foreign, and committed deletions.
+    /// Expected: Overrides reflect snapshot visibility and are ordered by row identity.
     #[test]
     fn test_collect_cold_visibility_overrides_classifies_and_sorts_once() {
         let buffer = ColumnDeletionBuffer::new();
@@ -728,6 +737,10 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect current cold-row ownership classification across marker
+    /// representations.
+    /// Expected: Claims preserve consumed state and deletion timestamps, reject conflicts, and
+    /// leave durable-only deletions unclaimed.
     #[test]
     fn test_current_claim_preserves_committed_cts_and_consumed_state() {
         for compact in [false, true] {
@@ -782,6 +795,9 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect shared settlement listeners for cold-row claims.
+    /// Expected: Preparing claims wake after commit and subsequent claims observe the
+    /// committed deletion.
     #[test]
     fn test_foreground_claim_waits_for_shared_preparing_owner() {
         let buffer = ColumnDeletionBuffer::new();
@@ -822,6 +838,9 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect in-memory deletion authority over durable delete bits.
+    /// Expected: Newer markers determine conflicts and durable-only deletions install no
+    /// marker.
     #[test]
     fn test_foreground_claim_prefers_cdb_marker_to_durable_delete() {
         let buffer = ColumnDeletionBuffer::new();
@@ -848,6 +867,9 @@ mod tests {
         ));
     }
 
+    /// Purpose: Protect event-free rejection of nonwaiting deletion claims.
+    /// Expected: Active conflicts and no-wait preparing conflicts leave prepare events
+    /// uninstalled.
     #[test]
     fn test_no_wait_claim_does_not_inject_prepare_event() {
         let buffer = ColumnDeletionBuffer::new();
@@ -879,6 +901,9 @@ mod tests {
         rollback_preparing_shared_trx_status(&owner);
     }
 
+    /// Purpose: Protect deletion rollback racing with prepare-listener registration.
+    /// Expected: Both participants finish, the claimant wakes, and marker and event ownership
+    /// are cleared.
     #[test]
     fn test_rollback_marker_removal_does_not_deadlock_listener_registration() {
         let buffer = Arc::new(ColumnDeletionBuffer::new());
