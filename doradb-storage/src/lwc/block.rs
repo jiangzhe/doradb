@@ -459,6 +459,8 @@ impl PreparedLwcBlock {
         col_layout: &TableColumnLayout,
         col_idx: usize,
     ) -> DataIntegrityResult<PreparedLwcColumn> {
+        #[cfg(test)]
+        tests::record_prepare();
         let range = self.column_ranges.get(col_idx).cloned().ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!("LWC column index {col_idx} is out of range"))
@@ -509,14 +511,6 @@ impl PreparedLwcBlock {
             values,
             data,
         })
-    }
-
-    #[cfg(test)]
-    fn prepared_column_count(&self) -> usize {
-        self.columns
-            .iter()
-            .filter(|column| column.is_some())
-            .count()
     }
 }
 
@@ -690,12 +684,8 @@ mod tests {
         StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, TableMetadata,
     };
-    // Test helper inspects the intentional `PersistedLwcBlock::load` public
-    // convergence over read/completion and DataIntegrity domains.
-    use crate::error::{DataIntegrityError, DiscloseError, Error};
-    use crate::file::block_integrity::{
-        BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum, write_block_header,
-    };
+    use crate::error::DataIntegrityError;
+    use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
     use crate::index::ColumnBlockEntryShape;
@@ -704,10 +694,10 @@ mod tests {
     use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer, LwcPrimitiveSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
-    use error_stack::ResultExt;
 
     thread_local! {
         static DECODE_COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+        static PREPARE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// Returns counts for the four-column point-mutation fixture.
@@ -724,6 +714,24 @@ mod tests {
         }
     }
 
+    /// Records actual column preparation, including repeated attempts on the same column.
+    pub(super) fn record_prepare() {
+        PREPARE_COUNT.set(PREPARE_COUNT.get() + 1);
+    }
+
+    fn prepared_column_count(prepared: &PreparedLwcBlock) -> usize {
+        prepared
+            .columns
+            .iter()
+            .filter(|column| column.is_some())
+            .count()
+    }
+
+    fn persisted_payload_mut(buf: &mut DirectBuf) -> &mut LwcBlock {
+        let end = BLOCK_INTEGRITY_HEADER_SIZE + LWC_BLOCK_PAYLOAD_SIZE;
+        LwcBlock::from_bytes_mut(&mut buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..end])
+    }
+
     fn row_shape_fingerprint_for(row_ids: &[RowID]) -> u128 {
         let start_row_id = row_ids.first().unwrap().as_u64();
         let end_row_id = row_ids.last().unwrap().as_u64().saturating_add(1);
@@ -736,26 +744,16 @@ mod tests {
         .row_shape_fingerprint()
     }
 
-    fn assert_lwc_data_integrity(err: Error, block_id: BlockID, expected: DataIntegrityError) {
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(expected)
-        );
+    fn assert_lwc_data_integrity(
+        err: Report<DataIntegrityError>,
+        block_id: BlockID,
+        expected: DataIntegrityError,
+    ) {
+        assert_eq!(err.current_context(), &expected, "{err:?}");
         let report = format!("{err:?}");
         assert!(report.contains("table_file"), "{report}");
         assert!(report.contains("lwc_block"), "{report}");
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
-    }
-
-    fn build_persisted_lwc_block() -> DirectBuf {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
-        page.header = LwcBlockHeader::new(11, 1, 1, 0);
-        page.body[..2].copy_from_slice(&(2u16).to_le_bytes());
-        write_block_checksum(buf.data_mut());
-        buf
     }
 
     fn build_valid_persisted_lwc_block() -> (TableMetadata, DirectBuf) {
@@ -769,18 +767,19 @@ mod tests {
         .expect("valid table metadata");
         let mut page = RowPage::new_test_page();
         page.init(RowID::new(100), 8, metadata.col.as_ref());
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &[Val::U8(10), Val::I16(20)]),
-            InsertRow::Ok(_)
-        ));
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &[Val::U8(11), Val::Null]),
-            InsertRow::Ok(_)
-        ));
-        assert!(matches!(
-            page.insert(metadata.col.as_ref(), &[Val::U8(12), Val::I16(22)]),
-            InsertRow::Ok(_)
-        ));
+        for (offset, row) in [
+            [Val::U8(10), Val::I16(20)],
+            [Val::U8(11), Val::Null],
+            [Val::U8(12), Val::I16(22)],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                page.insert(metadata.col.as_ref(), row),
+                InsertRow::Ok(row_id) if row_id == RowID::new(100 + offset as u64)
+            ));
+        }
         let buf = {
             let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let view = page.vector_view(metadata.col.as_ref());
@@ -791,36 +790,64 @@ mod tests {
         (metadata, buf)
     }
 
+    /// Purpose: Reject raw block lengths outside the fixed layout and preserve the source error.
+    /// Expected: Invalid payload reports retain the underlying layout mismatch at both size boundaries.
     #[test]
-    fn test_lwc_persisted_layout_adaptation_preserves_source() {
-        let persisted = match LwcBlock::try_from_bytes(&[0u8; 1]) {
-            Ok(_) => panic!("short persisted LWC payload must fail"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            persisted.current_context(),
-            &DataIntegrityError::InvalidPayload
-        );
-        assert_eq!(
-            persisted.downcast_ref::<LayoutError>().copied(),
-            Some(LayoutError::Mismatch)
-        );
+    fn test_lwc_block_invalid_lengths_preserve_layout_error() {
+        for (case, len) in [
+            ("empty", 0),
+            ("tiny", 1),
+            ("one byte short", LWC_BLOCK_PAYLOAD_SIZE - 1),
+            ("one byte long", LWC_BLOCK_PAYLOAD_SIZE + 1),
+        ] {
+            let bytes = vec![0; len];
+            let err = match LwcBlock::try_from_bytes(&bytes) {
+                Ok(_) => panic!("{case}: invalid block length was accepted"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "{case}: {err:?}"
+            );
+            assert_eq!(
+                err.downcast_ref::<LayoutError>().copied(),
+                Some(LayoutError::Mismatch),
+                "{case}: {err:?}"
+            );
+        }
     }
 
+    /// Purpose: Protect every byte of the persisted LWC header layout.
+    /// Expected: Multibyte fields use the specified byte order and reserved bytes remain zero.
     #[test]
-    fn test_lwc_block() {
-        let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
-        let page = LwcBlock::from_bytes_mut(buf.data_mut());
-        page.header = LwcBlockHeader::new(100, 50, 2, 7);
-        assert!(page.header.row_shape_fingerprint() == 100);
-        assert!(page.header.row_count() == 50);
-        assert!(page.header.col_count() == 2);
-        let mut header_vec = vec![0u8; page.header.ser_len()];
-        let ser_idx = page.header.ser(&mut header_vec[..], 0);
-        assert!(ser_idx == header_vec.len());
-        assert_eq!(&header_vec, layout::bytes_of(&page.header));
+    fn test_lwc_block_header_persisted_layout() {
+        let header = LwcBlockHeader::new(
+            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201,
+            0x1211,
+            0x1413,
+            0x1615,
+        );
+        assert_eq!(
+            header.row_shape_fingerprint(),
+            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201
+        );
+        assert_eq!(header.row_count(), 0x1211);
+        assert_eq!(header.col_count(), 0x1413);
+        let mut bytes = vec![0; header.ser_len()];
+        assert_eq!(header.ser(&mut bytes[..], 0), bytes.len());
+        assert_eq!(
+            bytes,
+            [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        assert_eq!(&bytes, layout::bytes_of(&header));
     }
 
+    /// Purpose: Decode a nullable column with interleaved null and non-null rows.
+    /// Expected: The null bitmap and underlying values retain their row positions.
     #[test]
     fn test_lwc_block_nullable_column() {
         let metadata = TableMetadata::try_new(
@@ -866,6 +893,8 @@ mod tests {
         assert_eq!(output, values);
     }
 
+    /// Purpose: Reject block columns absent from the supplied table metadata.
+    /// Expected: Column access reports an invalid payload.
     #[test]
     fn test_lwc_block_column_metadata_mismatch() {
         let metadata = TableMetadata::try_new(
@@ -891,16 +920,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_lwc_block_try_from_bytes_invalid_len() {
-        let bytes = [0u8; LWC_BLOCK_PAYLOAD_SIZE - 1];
-        let err = LwcBlock::try_from_bytes(&bytes);
-        assert!(
-            err.as_ref()
-                .is_err_and(|err| *err.current_context() == DataIntegrityError::InvalidPayload)
-        );
-    }
-
+    /// Purpose: Read an LWC block initialized through its mutable byte view.
+    /// Expected: The immutable view preserves header metadata, offsets, and body bytes.
     #[test]
     fn test_lwc_block_from_bytes_mut_roundtrip() {
         let mut buf = DirectBuf::zeroed(LWC_BLOCK_PAYLOAD_SIZE);
@@ -918,9 +939,13 @@ mod tests {
         assert_eq!(page.body[2], 0xAB);
     }
 
+    /// Purpose: Detect corruption in a checksummed persisted LWC block.
+    /// Expected: Decoding reports a checksum mismatch with the owning block context.
     #[test]
     fn test_lwc_block_rejects_persisted_checksum_corruption() {
-        let mut buf = build_persisted_lwc_block();
+        let (_, mut buf) = build_valid_persisted_lwc_block();
+        LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(7))
+            .unwrap();
         let last_idx = buf.data().len() - 1;
         buf.data_mut()[last_idx] ^= 0xFF;
 
@@ -932,13 +957,11 @@ mod tests {
             Ok(_) => panic!("expected LWC checksum corruption"),
             Err(err) => err,
         };
-        assert_lwc_data_integrity(
-            err.disclose(),
-            test_block_id(7),
-            DataIntegrityError::ChecksumMismatch,
-        );
+        assert_lwc_data_integrity(err, test_block_id(7), DataIntegrityError::ChecksumMismatch);
     }
 
+    /// Purpose: Decode full and projected persisted rows and validate access boundaries.
+    /// Expected: Decoding preserves schema or projection order and nulls, while invalid positions are rejected.
     #[test]
     fn test_lwc_block_decode_row_values() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
@@ -970,6 +993,12 @@ mod tests {
             .unwrap();
         assert_eq!(vals, vec![Val::Null, Val::U8(11)]);
         assert_eq!(
+            page.decode_full_row_values(metadata.col.as_ref(), 0)
+                .unwrap(),
+            vec![Val::U8(10), Val::I16(20)],
+            "complete row in schema order"
+        );
+        assert_eq!(
             page.row_shape_fingerprint(),
             row_shape_fingerprint_for(&[RowID::new(100), RowID::new(101), RowID::new(102)])
         );
@@ -981,45 +1010,53 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
-    #[test]
-    fn test_lwc_block_decode_full_row_values() {
-        let (metadata, buf) = build_valid_persisted_lwc_block();
-        let page =
-            LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
-                .unwrap();
-        assert_eq!(
-            page.decode_full_row_values(metadata.col.as_ref(), 0)
-                .unwrap(),
-            vec![Val::U8(10), Val::I16(20)]
-        );
-    }
-
+    /// Purpose: Prepare persisted columns lazily across repeated row accesses.
+    /// Expected: Only touched columns are prepared and reused without changing decoded values.
     #[test]
     fn test_prepared_lwc_block_lazily_reuses_touched_columns() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
         let page =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(8))
                 .unwrap();
+        let preparations_before = PREPARE_COUNT.get();
         let mut prepared = PreparedLwcBlock::new(page, metadata.col.as_ref()).unwrap();
-        assert_eq!(prepared.prepared_column_count(), 0);
+        assert_eq!(prepared_column_count(&prepared), 0);
+        assert_eq!(PREPARE_COUNT.get(), preparations_before);
+        for (case, row, column) in [("row past end", 3, 0), ("column past end", 0, 2)] {
+            let err = prepared
+                .decode_value(page, metadata.col.as_ref(), row, column)
+                .unwrap_err();
+            assert_eq!(
+                err.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "{case}: {err:?}"
+            );
+        }
+        assert_eq!(prepared_column_count(&prepared), 0);
+        assert_eq!(PREPARE_COUNT.get(), preparations_before);
 
-        for row_idx in 0..page.row_count() {
+        for (row_idx, expected) in [Val::U8(10), Val::U8(11), Val::U8(12)]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 prepared
                     .decode_value(page, metadata.col.as_ref(), row_idx, 0)
                     .unwrap(),
-                page.decode_value(metadata.col.as_ref(), row_idx, 0)
-                    .unwrap()
+                expected,
+                "row={row_idx}"
             );
         }
-        assert_eq!(prepared.prepared_column_count(), 1);
+        assert_eq!(prepared_column_count(&prepared), 1);
+        assert_eq!(PREPARE_COUNT.get() - preparations_before, 1);
         assert_eq!(
             prepared
                 .decode_value(page, metadata.col.as_ref(), 1, 0)
                 .unwrap(),
             Val::U8(11)
         );
-        assert_eq!(prepared.prepared_column_count(), 1);
+        assert_eq!(prepared_column_count(&prepared), 1);
+        assert_eq!(PREPARE_COUNT.get() - preparations_before, 1);
 
         assert_eq!(
             prepared
@@ -1027,9 +1064,23 @@ mod tests {
                 .unwrap(),
             Val::Null
         );
-        assert_eq!(prepared.prepared_column_count(), 2);
+        assert_eq!(prepared_column_count(&prepared), 2);
+        assert_eq!(PREPARE_COUNT.get() - preparations_before, 2);
+        for (row_idx, expected) in [(0, Val::I16(20)), (2, Val::I16(22))] {
+            assert_eq!(
+                prepared
+                    .decode_value(page, metadata.col.as_ref(), row_idx, 1)
+                    .unwrap(),
+                expected,
+                "row={row_idx}"
+            );
+        }
+        assert_eq!(prepared_column_count(&prepared), 2);
+        assert_eq!(PREPARE_COUNT.get() - preparations_before, 2);
     }
 
+    /// Purpose: Decode persisted rows after index creation and removal.
+    /// Expected: Index-only metadata changes preserve column values and nulls.
     #[test]
     fn test_lwc_block_decode_stable_across_index_only_metadata_changes() {
         let (metadata, buf) = build_valid_persisted_lwc_block();
@@ -1062,14 +1113,15 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject invalid column offsets even when the persisted checksum is valid.
+    /// Expected: Decoding reports an invalid payload with the owning block context.
     #[test]
     fn test_lwc_block_rejects_invalid_offsets_as_persisted_corruption() {
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
-        let invalid_end = (page.body.len() as u16).saturating_add(1);
-        page.header = LwcBlockHeader::new(0, 1, 1, 0);
+        let (_, mut buf) = build_valid_persisted_lwc_block();
+        LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(9))
+            .unwrap();
+        let page = persisted_payload_mut(&mut buf);
+        let invalid_end = (page.body.len() as u16) + 1;
         page.body[..2].copy_from_slice(&invalid_end.to_le_bytes());
         write_block_checksum(buf.data_mut());
 
@@ -1081,20 +1133,16 @@ mod tests {
             Ok(_) => panic!("expected invalid persisted offsets"),
             Err(err) => err,
         };
-        assert_lwc_data_integrity(
-            err.disclose(),
-            test_block_id(9),
-            DataIntegrityError::InvalidPayload,
-        );
+        assert_lwc_data_integrity(err, test_block_id(9), DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Classify malformed persisted column encoding at value access.
+    /// Expected: Decoding reports an invalid payload and accepts caller-owned block context.
     #[test]
     fn test_lwc_block_maps_persisted_value_decode_error_to_corruption() {
         let (metadata, mut buf) = build_valid_persisted_lwc_block();
-        let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
         {
-            let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
+            let page = persisted_payload_mut(&mut buf);
             let (start_idx, end_idx) = page.col_offsets().unwrap().get(0).unwrap();
             let column = &mut page.body[start_idx..end_idx];
             let data_len = column.len().saturating_sub(11);
@@ -1116,22 +1164,14 @@ mod tests {
                 .unwrap();
         let err = page.decode_value(metadata.col.as_ref(), 0, 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let err = page
-            .decode_value(metadata.col.as_ref(), 0, 0)
-            .attach_with(|| {
-                format!(
-                    "file={}, block=lwc_block, block_id={}",
-                    FileKind::TableFile,
-                    test_block_id(10)
-                )
-            })
-            .unwrap_err();
+        assert!(!format!("{err:?}").contains("block_id="), "{err:?}");
+        let err = err.attach(format!(
+            "file={}, block=lwc_block, block_id={}",
+            FileKind::TableFile,
+            test_block_id(10)
+        ));
         let report = format!("{err:?}");
         assert_eq!(report.matches("block_id=10").count(), 1, "{report}");
-        assert_lwc_data_integrity(
-            err.disclose(),
-            test_block_id(10),
-            DataIntegrityError::InvalidPayload,
-        );
+        assert_lwc_data_integrity(err, test_block_id(10), DataIntegrityError::InvalidPayload);
     }
 }
