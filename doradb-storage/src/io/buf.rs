@@ -181,24 +181,34 @@ mod tests {
     use super::*;
     use crate::io::STORAGE_SECTOR_SIZE;
 
-    #[test]
-    fn test_direct_buf_aligned_capacity_boundaries() {
-        assert_eq!(DirectBuf::aligned_capacity(0), STORAGE_SECTOR_SIZE);
-        assert_eq!(DirectBuf::aligned_capacity(1), STORAGE_SECTOR_SIZE);
-        assert_eq!(
-            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE - 1),
-            STORAGE_SECTOR_SIZE
-        );
-        assert_eq!(
-            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE),
-            STORAGE_SECTOR_SIZE
-        );
-        assert_eq!(
-            DirectBuf::aligned_capacity(STORAGE_SECTOR_SIZE + 1),
-            STORAGE_SECTOR_SIZE * 2
-        );
+    #[track_caller]
+    fn assert_buffer_layout(buf: &DirectBuf, len: usize, capacity: usize) {
+        assert_eq!(buf.len(), len);
+        assert_eq!(buf.data().len(), len);
+        assert_eq!(buf.capacity(), capacity);
+        assert_eq!(buf.as_bytes().len(), capacity);
+        assert_eq!(buf.remaining_capacity(), capacity - len);
+        assert_eq!(buf.as_bytes().as_ptr() as usize % STORAGE_SECTOR_SIZE, 0);
+        assert_eq!(capacity % STORAGE_SECTOR_SIZE, 0);
     }
 
+    /// Purpose: Round direct-buffer capacity at empty and sector-boundary lengths.
+    /// Expected: Capacity is the smallest covering sector multiple, with a nonempty allocation.
+    #[test]
+    fn test_direct_buf_aligned_capacity_boundaries() {
+        for (len, capacity) in [
+            (0, STORAGE_SECTOR_SIZE),
+            (1, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE - 1, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE + 1, STORAGE_SECTOR_SIZE * 2),
+        ] {
+            assert_eq!(DirectBuf::aligned_capacity(len), capacity, "len={len}");
+        }
+    }
+
+    /// Purpose: Accept the maximum supported logical length on a wide pointer target.
+    /// Expected: Sector rounding preserves the required capacity without truncation.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn test_direct_buf_aligned_capacity_accepts_u32_max_len() {
@@ -208,6 +218,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject direct-buffer lengths beyond the supported representation.
+    /// Expected: Construction panics with a length-limit diagnostic before allocation.
     #[cfg(target_pointer_width = "64")]
     #[test]
     #[should_panic(expected = "exceeds maximum")]
@@ -215,6 +227,8 @@ mod tests {
         let _buf = DirectBuf::zeroed((u32::MAX as usize) + 1);
     }
 
+    /// Purpose: Reject capacities beyond the allocation-layout limit on a narrow pointer target.
+    /// Expected: Capacity calculation panics with an allocation-size diagnostic.
     #[cfg(target_pointer_width = "32")]
     #[test]
     #[should_panic(expected = "not a valid allocation size")]
@@ -222,6 +236,8 @@ mod tests {
         let _cap = DirectBuf::aligned_capacity((isize::MAX as usize) + 1);
     }
 
+    /// Purpose: Detect sector rounding overflow on a narrow pointer target.
+    /// Expected: Capacity calculation panics instead of wrapping to a smaller allocation.
     #[cfg(target_pointer_width = "32")]
     #[test]
     #[should_panic(expected = "capacity overflow")]
@@ -229,46 +245,42 @@ mod tests {
         let _cap = DirectBuf::aligned_capacity(usize::MAX);
     }
 
+    /// Purpose: Align direct-buffer allocations for empty and nonempty logical data.
+    /// Expected: Allocation pointers and capacity satisfy sector alignment while preserving length.
     #[test]
     fn test_direct_buf_allocation_alignment() {
-        let buf = DirectBuf::zeroed(1024);
-        assert_eq!(buf.len(), 1024);
-        assert!(buf.capacity() >= 1024);
-        assert!(buf.capacity().is_multiple_of(STORAGE_SECTOR_SIZE));
-        assert_eq!(buf.as_bytes().as_ptr() as usize % STORAGE_SECTOR_SIZE, 0);
-
-        let buf = DirectBuf::zeroed(0);
-        assert_eq!(buf.len(), 0);
-        assert_eq!(buf.as_bytes().as_ptr() as usize % STORAGE_SECTOR_SIZE, 0);
+        for len in [1024, 0] {
+            let buf = DirectBuf::zeroed(len);
+            assert_buffer_layout(&buf, len, STORAGE_SECTOR_SIZE);
+        }
     }
 
+    /// Purpose: Initialize direct buffers whose logical lengths require sector padding.
+    /// Expected: The allocation is zeroed and capacity accounts for both data and padding.
     #[test]
     fn test_direct_buf_zeroed() {
-        let buf = DirectBuf::zeroed(512);
-        assert_eq!(buf.len(), 512);
-        assert!(buf.capacity() >= 512);
-        assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
-        assert_eq!(buf.remaining_capacity(), buf.capacity() - buf.len());
-        assert!(buf.data().iter().all(|&b| b == 0));
-
-        let buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE + 1);
-        assert_eq!(buf.len(), STORAGE_SECTOR_SIZE + 1);
-        assert!(buf.capacity() > STORAGE_SECTOR_SIZE);
-        assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
-        assert_eq!(buf.remaining_capacity(), buf.capacity() - buf.len());
+        for (len, capacity) in [
+            (512, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE + 1, STORAGE_SECTOR_SIZE * 2),
+        ] {
+            let buf = DirectBuf::zeroed(len);
+            assert_buffer_layout(&buf, len, capacity);
+            assert!(buf.as_bytes().iter().all(|&b| b == 0), "len={len}");
+        }
     }
 
+    /// Purpose: Allocate direct buffers for exact sector multiples.
+    /// Expected: Logical length fills the allocation without unused capacity.
     #[test]
     fn test_direct_buf_page() {
-        let buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
-        assert_eq!(buf.len(), STORAGE_SECTOR_SIZE);
-        assert_eq!(buf.capacity(), STORAGE_SECTOR_SIZE);
-        assert_eq!(buf.remaining_capacity(), 0);
-
-        let buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE * 4);
-        assert_eq!(buf.len(), STORAGE_SECTOR_SIZE * 4);
+        for len in [STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE * 4] {
+            let buf = DirectBuf::zeroed(len);
+            assert_buffer_layout(&buf, len, len);
+        }
     }
 
+    /// Purpose: Preserve appended data and clear a direct buffer for reuse.
+    /// Expected: Growth retains existing bytes and reset clears the allocation and logical length.
     #[test]
     fn test_direct_buf_data_operations() {
         let mut buf = DirectBuf::zeroed(0);
@@ -282,13 +294,17 @@ mod tests {
         let old_len = buf.len();
         buf.truncate(old_len + more_data.len());
         buf.data_mut()[old_len..].copy_from_slice(&more_data);
-        assert_eq!(&buf.data()[data.len()..], &more_data);
+        assert_eq!(buf.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
 
+        let len = buf.len();
+        buf.as_bytes_mut()[len..].fill(0xff);
         buf.reset();
         assert_eq!(buf.len(), 0);
-        assert!(buf.data().iter().all(|&b| b == 0));
+        assert!(buf.as_bytes().iter().all(|&b| b == 0));
     }
 
+    /// Purpose: Bound direct-buffer logical length when truncation requests exceed capacity.
+    /// Expected: The logical length stops at the allocated capacity.
     #[test]
     fn test_direct_buf_truncate_clamps_to_capacity() {
         let mut buf = DirectBuf::zeroed(32);
@@ -298,17 +314,26 @@ mod tests {
         assert_eq!(buf.len(), capacity);
     }
 
+    /// Purpose: Exercise repeated allocation and release across direct-buffer size boundaries.
+    /// Expected: Each allocation retains sector-aligned storage and releases without panicking.
     #[test]
     fn test_direct_buf_repeated_alloc_drop_preserves_layout() {
-        for len in [0, 1, 32, STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE + 1] {
+        for (len, capacity) in [
+            (0, STORAGE_SECTOR_SIZE),
+            (1, STORAGE_SECTOR_SIZE),
+            (32, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE, STORAGE_SECTOR_SIZE),
+            (STORAGE_SECTOR_SIZE + 1, STORAGE_SECTOR_SIZE * 2),
+        ] {
             for _ in 0..64 {
                 let buf = DirectBuf::zeroed(len);
-                assert_eq!(buf.as_bytes().as_ptr() as usize % STORAGE_SECTOR_SIZE, 0);
-                assert_eq!(buf.capacity() % STORAGE_SECTOR_SIZE, 0);
+                assert_buffer_layout(&buf, len, capacity);
             }
         }
     }
 
+    /// Purpose: Construct a direct buffer from an existing byte slice.
+    /// Expected: The logical data and length match the source slice.
     #[test]
     fn test_direct_buf_from_slice() {
         let data = [10, 20, 30, 40];

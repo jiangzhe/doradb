@@ -643,6 +643,8 @@ mod tests {
     use super::*;
     use std::io::ErrorKind as StdIoErrorKind;
 
+    /// Purpose: Preserve submit failures through cloning and conversion into an I/O report.
+    /// Expected: Clones share source diagnostics and the report retains the error classification and context.
     #[test]
     fn test_backend_error_submit_preserves_shared_source_and_converts_at_boundary() {
         let failure = BackendError::submit(
@@ -664,13 +666,17 @@ mod tests {
         assert!(Arc::ptr_eq(&failure.source, &cloned.source));
 
         let report = failure.into_report();
-        assert!(report.downcast_ref::<BackendError>().is_some());
+        let attached = report.downcast_ref::<BackendError>().unwrap();
+        assert_eq!(attached, &cloned);
+        assert!(Arc::ptr_eq(&attached.source, &cloned.source));
         assert_eq!(
             report.current_context().kind(),
             StdIoErrorKind::PermissionDenied
         );
     }
 
+    /// Purpose: Include backend-specific guidance in submit failure diagnostics.
+    /// Expected: The optional note accompanies the operation, source error, and queue state.
     #[test]
     fn test_backend_error_submit_formats_optional_note() {
         let failure = BackendError::submit_with_note(
@@ -688,6 +694,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Preserve kernel error details in backend wait diagnostics.
+    /// Expected: The diagnostic identifies the backend, wait operation, errno, and syscall attempts.
     #[test]
     fn test_backend_error_wait_formats_common_diagnostics() {
         let failure =
@@ -701,6 +709,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Describe submit retry expiry when no kernel errno is available.
+    /// Expected: The failure retains the queue state, retry reason, and timeout accounting.
     #[test]
     fn test_submit_retry_expiry_uses_operation_specific_detail() {
         let failure = SubmitRetry::new(SubmitRetryReason::NoProgress, 4).progress_error(
