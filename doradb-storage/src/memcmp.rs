@@ -68,8 +68,10 @@ impl BytesExtendable for Vec<u8> {
 ///
 /// 1. Unsigned integer: Use Bigendian encoding.
 /// 2. Signed integer: Use Bigendian encoding, then flip most significant bit.
-/// 3. Float-point number: Use Bigendian encoding, if positive, flip most significant bit,
-///    Otherwise, flip all bits.
+/// 3. Floating-point number: Encode both zeros as positive zero and all NaNs as
+///    all-one bytes, matching `OrderedFloat` equality and sorting NaNs last.
+///    For other values, use big-endian encoding, flipping the most significant
+///    bit for positive values and all bits for negative values.
 /// 4. variable length bytes/string: keep as is.
 /// 5. component type.
 ///    a) Fixed-size types: Use same encoding described above.
@@ -252,7 +254,21 @@ impl_nmcf_for!(i32);
 impl_nmcf_for!(i64);
 
 macro_rules! impl_mcf_for_f {
-    ($t1:ty, $zero:expr, $mask:expr) => {
+    ($t1:ty, $bits:ty, $encode:ident, $mask:expr) => {
+        #[inline]
+        fn $encode(value: $t1) -> [u8; size_of::<$t1>()] {
+            let bits = if value.is_nan() {
+                <$bits>::MAX
+            } else if value == 0.0 {
+                $mask
+            } else if value > 0.0 {
+                value.to_bits() ^ $mask
+            } else {
+                !value.to_bits()
+            };
+            bits.to_be_bytes()
+        }
+
         impl MemCmpFormat for $t1 {
             #[inline]
             fn est_mcf_len() -> Option<usize> {
@@ -266,33 +282,21 @@ macro_rules! impl_mcf_for_f {
 
             #[inline]
             fn extend_mcf_to<T: BytesExtendable>(&self, buf: &mut T) {
-                let u = if *self >= $zero {
-                    // flip msb
-                    self.to_bits() ^ $mask
-                } else {
-                    // flip all bits
-                    !(self.to_bits())
-                };
-                buf.extend_from_byte_slice(&u.to_be_bytes());
+                buf.extend_from_byte_slice(&$encode(*self));
             }
 
             #[inline]
             fn copy_mcf_to(&self, buf: &mut [u8], start_idx: usize) -> usize {
-                let u = if *self >= $zero {
-                    self.to_bits() ^ $mask
-                } else {
-                    !(self.to_bits())
-                };
                 let end_idx = start_idx + self.enc_mcf_len();
-                buf[start_idx..end_idx].copy_from_slice(&u.to_be_bytes());
+                buf[start_idx..end_idx].copy_from_slice(&$encode(*self));
                 end_idx
             }
         }
     };
 }
 
-impl_mcf_for_f!(f32, 0.0f32, 0x8000_0000);
-impl_mcf_for_f!(f64, 0.0f64, 0x8000_0000_0000_0000);
+impl_mcf_for_f!(f32, u32, encode_f32_mcf, 0x8000_0000);
+impl_mcf_for_f!(f64, u64, encode_f64_mcf, 0x8000_0000_0000_0000);
 impl_nmcf_for!(f32);
 impl_nmcf_for!(f64);
 
@@ -1046,6 +1050,7 @@ fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
 
 #[cfg(test)]
 mod tests {
+    use ordered_float::OrderedFloat;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
     use rand_distr::{Distribution, StandardUniform};
@@ -1100,6 +1105,13 @@ mod tests {
         assert_eq!(copied[0], 0xa5);
         assert_eq!(copied[copied.len() - 1], 0xa5);
         encoded
+    }
+
+    fn assert_float_fixture<T: MemCmpFormat + NullableMemCmpFormat>(value: T, expected: &[u8]) {
+        assert_eq!(encode_mcf(&value), expected);
+        let mut nullable = vec![NON_NULL_FLAG];
+        nullable.extend_from_slice(expected);
+        assert_eq!(encode_nmcf(&value), nullable);
     }
 
     fn assert_encoding_order<T: fmt::Debug>(
@@ -1215,51 +1227,88 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect floating-point encodings against native ordering and a known negative encoding.
-    /// Expected: Both encoding paths preserve ordering, lengths, and the specified sign transformation.
+    /// Purpose: Protect float key ordering across reproducible arbitrary IEEE bit patterns.
+    /// Expected: Plain and nullable encodings agree with value ordering and equality for both widths.
     #[test]
     fn test_mcf_float() {
-        let plain = encode_mcf(&-1.0f64);
-        assert_eq!(plain, [0x40, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        let nullable = encode_nmcf(&-1.0f64);
-        assert_eq!(nullable[0], NON_NULL_FLAG);
-        assert_eq!(nullable[1..], plain);
-
         let mut rng = StdRng::seed_from_u64(0x4d43_4601);
-        assert_encoding_order(gen_input::<f32>(&mut rng), f32::total_cmp, encode_mcf);
-        assert_encoding_order(gen_input::<f32>(&mut rng), f32::total_cmp, encode_nmcf);
-        assert_encoding_order(gen_input::<f64>(&mut rng), f64::total_cmp, encode_mcf);
-        assert_encoding_order(gen_input::<f64>(&mut rng), f64::total_cmp, encode_nmcf);
+        let values: Vec<_> = gen_input::<u32>(&mut rng)
+            .into_iter()
+            .map(f32::from_bits)
+            .collect();
+        let compare = |left: &f32, right: &f32| OrderedFloat(*left).cmp(&OrderedFloat(*right));
+        assert_encoding_order(values.clone(), compare, encode_mcf);
+        assert_encoding_order(values, compare, encode_nmcf);
+        let values: Vec<_> = gen_input::<u64>(&mut rng)
+            .into_iter()
+            .map(f64::from_bits)
+            .collect();
+        let compare = |left: &f64, right: &f64| OrderedFloat(*left).cmp(&OrderedFloat(*right));
+        assert_encoding_order(values.clone(), compare, encode_mcf);
+        assert_encoding_order(values, compare, encode_nmcf);
     }
 
-    /// Purpose: Protect floating-point encoding at finite-range boundaries.
-    /// Expected: Encoded order preserves finite extrema, positive zero, and infinities.
+    /// Purpose: Protect canonical float key bytes at signed-zero, NaN, and numeric boundaries.
+    /// Expected: Equivalent values share bytes, NaNs sort last, and numeric boundaries have exact encodings.
     #[test]
     fn test_mcf_float_boundaries() {
-        // Negative zero and NaN need a separate production encoding decision;
-        // this test does not endorse their current key ordering.
-        let values = vec![
-            f32::NEG_INFINITY,
-            f32::MIN,
-            -1.0,
-            0.0,
-            1.0,
-            f32::MAX,
-            f32::INFINITY,
+        let cases32: [(u32, u32); 16] = [
+            (0xff80_0000, 0x007f_ffff), // Negative infinity.
+            (0xff7f_ffff, 0x0080_0000), // Negative finite extreme.
+            (0xbf80_0000, 0x407f_ffff), // Negative one.
+            (0x8080_0000, 0x7f7f_ffff), // Negative minimum normal.
+            (0x8000_0001, 0x7fff_fffe), // Negative minimum subnormal.
+            (0x8000_0000, 0x8000_0000), // Negative zero.
+            (0x0000_0000, 0x8000_0000), // Positive zero.
+            (0x0000_0001, 0x8000_0001), // Positive minimum subnormal.
+            (0x0080_0000, 0x8080_0000), // Positive minimum normal.
+            (0x3f80_0000, 0xbf80_0000), // Positive one.
+            (0x7f7f_ffff, 0xff7f_ffff), // Positive finite extreme.
+            (0x7f80_0000, 0xff80_0000), // Positive infinity.
+            (0x7f80_0001, 0xffff_ffff), // Positive signaling NaN.
+            (0x7fc0_1234, 0xffff_ffff), // Positive quiet NaN with payload.
+            (0xff80_0001, 0xffff_ffff), // Negative signaling NaN.
+            (0xffc0_5678, 0xffff_ffff), // Negative quiet NaN with payload.
         ];
-        assert_encoding_order(values.clone(), f32::total_cmp, encode_mcf);
-        assert_encoding_order(values, f32::total_cmp, encode_nmcf);
-        let values = vec![
-            f64::NEG_INFINITY,
-            f64::MIN,
-            -1.0,
-            0.0,
-            1.0,
-            f64::MAX,
-            f64::INFINITY,
+        for (bits, expected) in cases32 {
+            assert_float_fixture(f32::from_bits(bits), &expected.to_be_bytes());
+        }
+        let values = cases32
+            .into_iter()
+            .map(|(bits, _)| f32::from_bits(bits))
+            .collect::<Vec<_>>();
+        let compare = |left: &f32, right: &f32| OrderedFloat(*left).cmp(&OrderedFloat(*right));
+        assert_encoding_order(values.clone(), compare, encode_mcf);
+        assert_encoding_order(values, compare, encode_nmcf);
+
+        let cases64: [(u64, u64); 16] = [
+            (0xfff0_0000_0000_0000, 0x000f_ffff_ffff_ffff),
+            (0xffef_ffff_ffff_ffff, 0x0010_0000_0000_0000),
+            (0xbff0_0000_0000_0000, 0x400f_ffff_ffff_ffff),
+            (0x8010_0000_0000_0000, 0x7fef_ffff_ffff_ffff),
+            (0x8000_0000_0000_0001, 0x7fff_ffff_ffff_fffe),
+            (0x8000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0x0000_0000_0000_0000, 0x8000_0000_0000_0000),
+            (0x0000_0000_0000_0001, 0x8000_0000_0000_0001),
+            (0x0010_0000_0000_0000, 0x8010_0000_0000_0000),
+            (0x3ff0_0000_0000_0000, 0xbff0_0000_0000_0000),
+            (0x7fef_ffff_ffff_ffff, 0xffef_ffff_ffff_ffff),
+            (0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000),
+            (0x7ff0_0000_0000_0001, 0xffff_ffff_ffff_ffff),
+            (0x7ff8_0000_0000_1234, 0xffff_ffff_ffff_ffff),
+            (0xfff0_0000_0000_0001, 0xffff_ffff_ffff_ffff),
+            (0xfff8_0000_0000_5678, 0xffff_ffff_ffff_ffff),
         ];
-        assert_encoding_order(values.clone(), f64::total_cmp, encode_mcf);
-        assert_encoding_order(values, f64::total_cmp, encode_nmcf);
+        for (bits, expected) in cases64 {
+            assert_float_fixture(f64::from_bits(bits), &expected.to_be_bytes());
+        }
+        let values = cases64
+            .into_iter()
+            .map(|(bits, _)| f64::from_bits(bits))
+            .collect::<Vec<_>>();
+        let compare = |left: &f64, right: &f64| OrderedFloat(*left).cmp(&OrderedFloat(*right));
+        assert_encoding_order(values.clone(), compare, encode_mcf);
+        assert_encoding_order(values, compare, encode_nmcf);
     }
 
     /// Purpose: Protect key construction, extension, and comparison across storage forms.

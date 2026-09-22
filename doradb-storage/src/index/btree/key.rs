@@ -521,9 +521,100 @@ fn encode_key_pair<P: Borrow<Val>, S: Borrow<Val>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memcmp::NULL_FLAG;
+    use crate::memcmp::{NON_NULL_FLAG, NULL_FLAG};
     use std::f64::consts::PI;
     use std::slice::from_ref;
+
+    /// Purpose: Protect float equality through scalar and composite index-key encoding.
+    /// Expected: Signed zeros and NaN variants share canonical bytes in both nullability formats and key positions.
+    #[test]
+    fn test_float_key_equivalence() {
+        let cases = [
+            (
+                "f32 zero",
+                ValKind::F32,
+                [Val::from(-0.0f32), Val::from(0.0f32)],
+                vec![0x80, 0, 0, 0],
+            ),
+            (
+                "f64 zero",
+                ValKind::F64,
+                [Val::from(-0.0f64), Val::from(0.0f64)],
+                vec![0x80, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                "f32 NaN",
+                ValKind::F32,
+                [
+                    Val::from(f32::from_bits(0xffc0_1234)),
+                    Val::from(f32::from_bits(0x7f80_0001)),
+                ],
+                vec![0xff; 4],
+            ),
+            (
+                "f64 NaN",
+                ValKind::F64,
+                [
+                    Val::from(f64::from_bits(0xfff8_0000_0000_1234)),
+                    Val::from(f64::from_bits(0x7ff0_0000_0000_0001)),
+                ],
+                vec![0xff; 8],
+            ),
+        ];
+        for (name, kind, values, bytes) in cases {
+            assert_eq!(values[0], values[1], "{name}: value equality");
+            for nullable in [false, true] {
+                let ty = ValType::new(kind, nullable);
+                let mut expected = if nullable {
+                    vec![NON_NULL_FLAG]
+                } else {
+                    vec![]
+                };
+                expected.extend_from_slice(&bytes);
+                let scalar = BTreeKeyEncoder::new(vec![ty]);
+                for value in &values {
+                    let mut appended = vec![];
+                    value.encode_memcmp(ty, &mut appended);
+                    assert_eq!(
+                        appended, expected,
+                        "{name}, nullable={nullable}: value encoding"
+                    );
+                    assert_eq!(
+                        scalar.encode(from_ref(value)).as_bytes(),
+                        expected,
+                        "{name}, nullable={nullable}: scalar key"
+                    );
+                }
+                for float_first in [false, true] {
+                    let tag_ty = ValType::new(ValKind::U8, false);
+                    let types = if float_first {
+                        vec![ty, tag_ty]
+                    } else {
+                        vec![tag_ty, ty]
+                    };
+                    let composite = BTreeKeyEncoder::new(types);
+                    let mut expected = expected.clone();
+                    if float_first {
+                        expected.push(7);
+                    } else {
+                        expected.insert(0, 7);
+                    }
+                    for value in &values {
+                        let key = if float_first {
+                            vec![value.clone(), Val::from(7u8)]
+                        } else {
+                            vec![Val::from(7u8), value.clone()]
+                        };
+                        assert_eq!(
+                            composite.encode(&key).as_bytes(),
+                            expected,
+                            "{name}, nullable={nullable}, float_first={float_first}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// Purpose: Protect scalar key encodings at numeric extremes, byte boundaries, and nulls.
     /// Expected: Encoded bytes match explicit fixtures and length and copy APIs agree.
