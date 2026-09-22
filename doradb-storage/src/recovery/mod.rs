@@ -1423,8 +1423,8 @@ mod tests {
     use crate::engine::Engine;
     use crate::error::RuntimeOrFatalError;
     use crate::error::{
-        CompletionErrorBridge, DataIntegrityError, ErrorKind, InternalError, RuntimeError,
-        RuntimeOrFatalResult,
+        CompletionErrorBridge, DataIntegrityError, ErrorKind, InternalError, OperationError,
+        RuntimeError, RuntimeOrFatalResult,
     };
     use crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE;
     use crate::file::cow_file::tests::{corrupt_page_checksum, rewrite_page_with_checksum};
@@ -2226,6 +2226,52 @@ mod tests {
             Some((hot_row_id.unwrap_or(cold_row_id), false)),
             "combined lookup must prefer the hot replacement"
         );
+    }
+
+    async fn assert_float_unique_rows(
+        engine: &Engine,
+        table_id: TableID,
+        rows: &[(Val, SelectKey, RowID)],
+        stage: &str,
+    ) {
+        let mut session = engine.new_session().unwrap();
+        for (stored, key, _) in rows {
+            let probe = &key.vals[0];
+            let mut trx = session.begin_trx().unwrap();
+            let row = trx_select_row_mvcc_by_id(&mut trx, table_id, key, &[0, 1])
+                .await
+                .unwrap()
+                .unwrap_found();
+            assert_eq!(
+                row,
+                vec![stored.clone(), Val::from(7u32)],
+                "{stage}, key={key:?}"
+            );
+            // Val equality canonicalizes zeros and NaNs, so inspect the stored bits too.
+            assert_eq!(
+                row[0].as_f32().map(f32::to_bits),
+                stored.as_f32().map(f32::to_bits),
+                "{stage}: f32 row bits"
+            );
+            assert_eq!(
+                row[0].as_f64().map(f64::to_bits),
+                stored.as_f64().map(f64::to_bits),
+                "{stage}: f64 row bits"
+            );
+            trx.commit().await.unwrap();
+
+            let mut trx = session.begin_trx().unwrap();
+            let err = trx
+                .table_insert_mvcc(table_id, vec![probe.clone(), Val::from(7u32)])
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.operation_error(),
+                Some(OperationError::DuplicateKey),
+                "{stage}, key={key:?}"
+            );
+            trx.rollback().await.unwrap();
+        }
     }
 
     async fn prepare_index_recovery(
@@ -4275,6 +4321,91 @@ mod tests {
                 vec![Val::from(7u32), Val::from("cold-row")]
             );
             trx.commit().await.unwrap();
+        });
+    }
+
+    /// Purpose: Protect float unique-key equality across hot rows, checkpointing, and restart.
+    /// Expected: Equivalent zeros and NaNs find the same row and reject duplicates in scalar and composite indexes while stored bits survive.
+    #[test]
+    fn test_float_unique_keys_survive_checkpoint_and_reopen() {
+        smol::block_on(async {
+            let cases = [
+                (
+                    ValKind::F32,
+                    [
+                        (Val::from(-0.0f32), Val::from(0.0f32)),
+                        (
+                            Val::from(f32::from_bits(0xffc0_1234)),
+                            Val::from(f32::from_bits(0x7f80_0001)),
+                        ),
+                    ],
+                ),
+                (
+                    ValKind::F64,
+                    [
+                        (Val::from(-0.0f64), Val::from(0.0f64)),
+                        (
+                            Val::from(f64::from_bits(0xfff8_0000_0000_1234)),
+                            Val::from(f64::from_bits(0x7ff0_0000_0000_0001)),
+                        ),
+                    ],
+                ),
+            ];
+            for (kind, pairs) in cases {
+                for composite in [false, true] {
+                    let dir = TempDir::new().unwrap();
+                    let config = lightweight_recovery_engine_config(dir.path(), "float_keys");
+                    let engine = Engine::bootstrap(config.clone()).await.unwrap();
+                    let mut session = engine.new_session().unwrap();
+                    let mut keys = vec![StorageIndexKey::new(0)];
+                    if composite {
+                        keys.push(StorageIndexKey::new(1));
+                    }
+                    let table_id = session
+                        .create_table(
+                            StorageTableSpec::new(vec![
+                                StorageColumnSpec::new(kind, StorageColumnFlags::empty()),
+                                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
+                            ]),
+                            vec![StorageIndexSpec::new(keys, StorageIndexFlags::UK)],
+                        )
+                        .await
+                        .unwrap()
+                        .table_id();
+                    session.checkpoint_catalog().await.unwrap();
+                    let mut trx = session.begin_trx().unwrap();
+                    let mut rows = vec![];
+                    for (stored, probe) in &pairs {
+                        let row_id = trx
+                            .table_insert_mvcc(table_id, vec![stored.clone(), Val::from(7u32)])
+                            .await
+                            .unwrap();
+                        let mut vals = vec![probe.clone()];
+                        if composite {
+                            vals.push(Val::from(7u32));
+                        }
+                        let key = SelectKey::new(IndexSlot::new(0), vals);
+                        rows.push((stored.clone(), key, row_id));
+                    }
+                    trx.commit().await.unwrap();
+                    assert_float_unique_rows(&engine, table_id, &rows, "hot").await;
+                    assert_freeze_created(
+                        session.freeze_table(table_id, usize::MAX).await.unwrap(),
+                    );
+                    assert_checkpoint_published(&mut session, table_id).await;
+                    assert_float_unique_rows(&engine, table_id, &rows, "checkpointed").await;
+                    drop(session);
+                    drop(engine);
+
+                    let engine = Engine::bootstrap(config).await.unwrap();
+                    // Failed inserts can allocate hot pages; check the persisted index
+                    // and absence of matching hot entries directly.
+                    for (_, key, row_id) in &rows {
+                        assert_recovered_unique_tiers(&engine, table_id, key, *row_id, None).await;
+                    }
+                    assert_float_unique_rows(&engine, table_id, &rows, "reopened").await;
+                }
+            }
         });
     }
 
