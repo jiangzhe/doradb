@@ -99,31 +99,26 @@ valid intermediate states while asserting only one of them.
 A passing stress run increases confidence but does not replace reasoning about
 the predicates and lost-wakeup behavior.
 
-## Local Coverage Focus
+## Production Line Coverage
 
-Use the local coverage focus script when you need fast coverage feedback for
-changed files or directories.
-
-### Prerequisites
-
-Requires nightly Rust, `cargo-nextest`, `cargo-llvm-cov`, and LLVM tools for the
-active Rust toolchain.
-
-### Usage
-
-Run focused coverage for a file or directory path inside this repository:
+`tools/coverage.rs` measures production-line coverage for the default `iouring`
+workspace, excluding test-only code. Requires `nightly-2026-05-22` for the script,
+stable Rust with matching `llvm-tools`, `cargo-nextest`, and `cargo-llvm-cov`.
 
 ```bash
-tools/coverage_focus.rs --path doradb-storage/src/table/tests.rs
+# Collect workspace coverage.
+tools/coverage.rs run
+# Reuse the result for a focused report and optional Markdown output.
+tools/coverage.rs report --path doradb-storage/src/io --write target/coverage/io.md
 ```
 
-Repeat `--path` to report multiple files or directories from one coverage run.
+Repeat `--path` for multiple targets; it limits reporting, not test execution.
+Rerun `run` after source or configuration changes. See `--help` for other options.
 
-The script prints focused line-coverage summaries and uncovered-line hotspots
-for the requested paths.
+Artifacts are stored in `target/coverage/`: `lcov.info` is the authoritative
+report, `coverage.json` records provenance, and `raw.lcov` is diagnostic only.
+`N/A` means no production executable lines. CI uses
+[coverage.yml](../../.github/workflows/coverage.yml).
 
-Treat 80% focused coverage as the default review bar. For definition-heavy
-files, explain lower whole-file results and cite covered consumer or runtime
-paths.
-
-Intermediate coverage artifacts stay under `target/coverage-focus/`.
+Treat 80% focused coverage as the default review bar. For definition-heavy files,
+explain lower results and cite covered consumer or runtime paths.

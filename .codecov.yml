@@ -8,5 +8,10 @@ coverage:
       default:
         target: auto
         threshold: 80%
-  ignore:
-    - "doradb-storage/examples/"
+ignore:
+  - "doradb-storage/examples/**"
+  - "doradb-storage/tests/**"
+  - "doradb-storage/benches/**"
+  - "doradb-bench/examples/**"
+  - "doradb-bench/tests/**"
+  - "doradb-bench/benches/**"

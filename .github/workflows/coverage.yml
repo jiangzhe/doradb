@@ -1,4 +1,4 @@
-name: build
+name: coverage
 
 on:
   push:
@@ -10,14 +10,14 @@ jobs:
   changes:
     runs-on: ubuntu-22.04
     outputs:
-      run_build: ${{ steps.delta.outputs.run_build }}
+      run_coverage: ${{ steps.delta.outputs.run_coverage }}
       diff_range: ${{ steps.delta.outputs.diff_range }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Detect build changes in current update
+    - name: Detect coverage changes in current update
       id: delta
       shell: bash
       run: |
@@ -58,9 +58,9 @@ jobs:
         echo "changed files in ${range}:"
         printf '%s\n' "$files"
 
-        run_build="false"
+        run_coverage="false"
         if [[ "$diff_failed" == "true" || -z "$files" ]]; then
-          run_build="true"
+          run_coverage="true"
         else
           while IFS= read -r file; do
             [[ -z "$file" ]] && continue
@@ -73,81 +73,111 @@ jobs:
                   "$file" == rust-toolchain.toml ||
                   "$file" == .cargo/* ||
                   "$file" == .config/nextest.toml ||
+                  "$file" == tools/coverage.rs ||
+                  "$file" == tools/coverage/* ||
+                  "$file" == tools/coverage_focus.rs ||
+                  "$file" == .codecov.yml ||
                   "$file" == .github/actions/* ||
-                  ( "$file" == .github/workflows/* &&
-                    "$file" != .github/workflows/coverage.yml ) ]]; then
-              run_build="true"
+                  "$file" == .github/workflows/coverage.yml ]]; then
+              run_coverage="true"
               break
             fi
           done <<< "$files"
         fi
 
-        echo "run_build=${run_build}" >> "$GITHUB_OUTPUT"
-        echo "run_build=${run_build}"
+        echo "run_coverage=${run_coverage}" >> "$GITHUB_OUTPUT"
+        echo "run_coverage=${run_coverage}"
 
-  test-audit:
+  coverage:
     needs: changes
-    if: needs.changes.outputs.run_build == 'true'
-    uses: ./.github/workflows/test-audit.yml
-
-  clippy:
-    needs: changes
-    if: needs.changes.outputs.run_build == 'true'
+    if: needs.changes.outputs.run_coverage == 'true'
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-    - name: Setup Rust
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - name: Setup stable Rust and LLVM
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
-    - name: Clippy (default backend)
-      run: cargo clippy --workspace --all-targets -- -D warnings
-    - name: Clippy (libaio backend)
-      run: cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings
-
-  libaio:
-    needs: changes
-    if: needs.changes.outputs.run_build == 'true'
-    runs-on: ubuntu-22.04
-    steps:
-    - name: Install libaio
-      run: sudo apt-get install -y libaio1 libaio-dev
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    - name: Setup Rust
-      uses: actions-rust-lang/setup-rust-toolchain@v1
-      with:
-        toolchain: stable
+        components: llvm-tools
+        rustflags: ""
+    - name: Install coverage script interpreter
+      run: rustup toolchain install nightly-2026-05-22 --profile minimal
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
-    - name: Validate alternate libaio backend
-      env:
-        RUST_BACKTRACE: "full"
-      run: cargo nextest run -p doradb-storage --no-default-features --features libaio --profile ci
-    - name: Upload libaio nextest JUnit report
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Validate coverage tool modules
+      run: cargo +nightly-2026-05-22 -Zscript test --manifest-path tools/coverage.rs
+    - name: Collect production line coverage
+      run: tools/coverage.rs run
+    - name: Upload coverage nextest JUnit report
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
-        name: nextest-junit-libaio
+        name: nextest-junit-coverage
         if-no-files-found: warn
         overwrite: true
         path: target/nextest/ci/junit.xml
+    - name: Upload canonical production LCOV
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-lcov
+        if-no-files-found: error
+        overwrite: true
+        path: target/coverage/lcov.info
+    - name: Upload coverage provenance and diagnostics
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-diagnostics
+        if-no-files-found: warn
+        overwrite: true
+        path: |
+          target/coverage/coverage.json
+          target/coverage/raw*.lcov
+          target/coverage/*.log
 
-  verify:
-    needs: [changes, test-audit, clippy, libaio]
+  codecov:
+    needs: [changes, coverage]
+    if: needs.changes.outputs.run_coverage == 'true' && needs.coverage.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - name: Download LCOV report
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-lcov
+        path: coverage-artifact
+    - name: Upload to codecov.io
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      uses: codecov/codecov-action@v5
+      with:
+        files: coverage-artifact/lcov.info
+        disable_search: true
+        disable_file_fixes: true
+        fail_ci_if_error: true
+        override_commit: ${{ github.event.pull_request.head.sha || github.sha }}
+        token: ${{secrets.CODECOV_TOKEN}}
+
+  verify-coverage:
+    needs: [changes, coverage, codecov]
     if: ${{ always() }}
     runs-on: ubuntu-22.04
     permissions: {}
     steps:
-    - name: Verify CI results
+    - name: Verify coverage results
       env:
         CHANGES_RESULT: ${{ needs.changes.result }}
-        TEST_AUDIT_RESULT: ${{ needs.test-audit.result }}
         DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
-        RUN_BUILD: ${{ needs.changes.outputs.run_build }}
-        CLIPPY_RESULT: ${{ needs.clippy.result }}
-        LIBAIO_RESULT: ${{ needs.libaio.result }}
+        RUN_COVERAGE: ${{ needs.changes.outputs.run_coverage }}
+        COVERAGE_RESULT: ${{ needs.coverage.result }}
+        CODECOV_RESULT: ${{ needs.codecov.result }}
       run: |
         set -euo pipefail
 
@@ -156,14 +186,14 @@ jobs:
           exit 1
         fi
 
-        if [[ "$RUN_BUILD" == "false" ]]; then
-          echo "No build changes detected in update range: ${DIFF_RANGE}"
-          echo "Compile/test jobs were intentionally skipped."
+        if [[ "$RUN_COVERAGE" == "false" ]]; then
+          echo "No coverage changes detected in update range: ${DIFF_RANGE}"
+          echo "Coverage jobs were intentionally skipped."
           exit 0
         fi
 
-        if [[ "$RUN_BUILD" != "true" ]]; then
-          echo "Change detection returned an invalid run_build value: ${RUN_BUILD}"
+        if [[ "$RUN_COVERAGE" != "true" ]]; then
+          echo "Change detection returned an invalid run_coverage value: ${RUN_COVERAGE}"
           exit 1
         fi
 
@@ -177,12 +207,11 @@ jobs:
           fi
         }
 
-        verify_result "test-audit" "$TEST_AUDIT_RESULT"
-        verify_result "clippy" "$CLIPPY_RESULT"
-        verify_result "libaio" "$LIBAIO_RESULT"
+        verify_result "coverage" "$COVERAGE_RESULT"
+        verify_result "codecov" "$CODECOV_RESULT"
 
         if [[ "$failed" == "true" ]]; then
           exit 1
         fi
 
-        echo "All required CI jobs succeeded."
+        echo "All required coverage jobs succeeded."
