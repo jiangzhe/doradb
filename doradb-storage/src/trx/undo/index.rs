@@ -175,6 +175,8 @@ mod tests {
         user_key_from_index_ref(index, vec![])
     }
 
+    /// Purpose: Merge empty and populated index undo logs without losing insertion order.
+    /// Expected: The destination retains the combined sequence and the source becomes empty.
     #[test]
     fn test_index_undo_logs_merge() {
         let mut log1 = IndexUndoLogs::empty();
@@ -219,20 +221,44 @@ mod tests {
         log1.merge(&mut log2);
         assert_eq!(log1.len(), original_len);
         assert!(log2.is_empty());
+        assert_eq!(
+            log1.0
+                .iter()
+                .map(|entry| (entry.table_id, entry.row_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (TableID::new(1), RowID::new(1)),
+                (TableID::new(2), RowID::new(2)),
+                (TableID::new(3), RowID::new(3)),
+            ]
+        );
 
         // Verify order is preserved
         let first = &log1.0[0];
         match &first.kind {
-            IndexUndoKind::InsertUnique(..) => (),
+            IndexUndoKind::InsertUnique(key, false) => {
+                assert_eq!(key.index, IndexRef::new(IndexID::new(1), IndexSlot::new(1)));
+            }
             _ => panic!("First entry should be InsertUnique"),
         }
         let second = &log1.0[1];
         match &second.kind {
-            IndexUndoKind::DeferDelete(..) => (),
+            IndexUndoKind::DeferDelete(key, true) => {
+                assert_eq!(key.index, IndexRef::new(IndexID::new(2), IndexSlot::new(2)));
+            }
             _ => panic!("Second entry should be DeferDelete"),
+        }
+        match &log1.0[2].kind {
+            IndexUndoKind::UpdateUnique(key, old_row_id, false) => {
+                assert_eq!(key.index, IndexRef::new(IndexID::new(3), IndexSlot::new(3)));
+                assert_eq!(*old_row_id, RowID::new(4));
+            }
+            _ => panic!("Third entry should be UpdateUnique"),
         }
     }
 
+    /// Purpose: Preserve resolved catalog and user index references through undo-to-purge conversion.
+    /// Expected: Retained undo entries and resulting purge keys retain their index identities and slots.
     #[test]
     fn test_index_undo_and_purge_preserve_resolved_references() {
         let mut logs = IndexUndoLogs::empty();
@@ -248,7 +274,7 @@ mod tests {
             table_id: TableID::new(9),
             row_id: RowID::new(11),
             kind: IndexUndoKind::DeferDelete(
-                create_test_key(IndexRef::new(IndexID::new(5), IndexSlot::new(5))),
+                create_test_key(IndexRef::new(IndexID::new(35), IndexSlot::new(5))),
                 false,
             ),
         });
@@ -257,13 +283,21 @@ mod tests {
         let IndexUndoKind::DeferDelete(key, false) = &user.kind else {
             panic!("user retained entry must preserve deferred-delete payload");
         };
-        assert_eq!(key.index.id().get(), 5);
+        assert_eq!(key.index.id().get(), 35);
         assert_eq!(key.index.slot().get(), 5);
 
         let purge = logs.commit_for_gc();
+        assert!(logs.is_empty());
+        assert_eq!(purge.len(), 2);
         assert_eq!(purge[0].key.index.id().get(), 3);
         assert_eq!(purge[0].key.index.slot().get(), 3);
-        assert_eq!(purge[1].key.index.id().get(), 5);
+        assert_eq!(purge[0].table_id, CATALOG_TABLE_ID_START);
+        assert_eq!(purge[0].row_id, RowID::new(7));
+        assert!(purge[0].unique);
+        assert_eq!(purge[1].key.index.id().get(), 35);
         assert_eq!(purge[1].key.index.slot().get(), 5);
+        assert_eq!(purge[1].table_id, TableID::new(9));
+        assert_eq!(purge[1].row_id, RowID::new(11));
+        assert!(!purge[1].unique);
     }
 }

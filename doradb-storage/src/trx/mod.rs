@@ -3681,10 +3681,9 @@ fn is_catalog_metadata_ddl(ddl: Option<&DDLRedo>) -> bool {
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::EvictableBufferPool;
-    use crate::buffer::frame::FrameKind;
     use crate::buffer::guard::PageSharedGuard;
     use crate::buffer::page::PAGE_SIZE;
-    use crate::buffer::test_frame_kind;
+    use crate::buffer::test_evict_existing_page;
     use crate::catalog::storage::tables::TABLE_ID_TABLES;
     use crate::catalog::tests as catalog_tests;
     use crate::catalog::{
@@ -3738,7 +3737,7 @@ pub(crate) mod tests {
     use std::ptr::from_ref;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
-    use std::thread::{scope, sleep, spawn};
+    use std::thread::{JoinHandle, scope, sleep, spawn};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -3822,6 +3821,13 @@ pub(crate) mod tests {
     }
 
     type TerminalRollbackRelease = Arc<(Mutex<bool>, Condvar)>;
+
+    #[derive(Clone, Copy)]
+    enum TerminalCase {
+        OrderedCommit,
+        ReadOnlyCommit,
+        Rollback,
+    }
 
     /// Installs a thread-local pause after the optimistic prepare load.
     #[inline]
@@ -4518,7 +4524,7 @@ pub(crate) mod tests {
             "query_test_transaction_durability",
             TrxInner::require_durability,
         )
-        .unwrap_or(false)
+        .expect("test transaction must be active")
     }
 
     #[inline]
@@ -4528,7 +4534,7 @@ pub(crate) mod tests {
             "query_test_transaction_ordered_commit",
             TrxInner::require_ordered_commit,
         )
-        .unwrap_or(false)
+        .expect("test transaction must be active")
     }
 
     #[inline]
@@ -4553,6 +4559,160 @@ pub(crate) mod tests {
         discard_transaction_after_fatal_rollback(trx);
         engine.inner().trx_sys.record_rollback_for_purge(gc_no, sts);
         remove_session_for_test(&engine.inner().session_registry, session_id);
+    }
+
+    fn prepared_user_undo(
+        prepared: &PreparedTrx,
+        expected_sts: TrxID,
+        expected_gc_no: usize,
+    ) -> (&RowUndoLogs, &IndexUndoLogs) {
+        let PreparedTrxPayload::User {
+            status,
+            sts,
+            gc_no,
+            row_undo,
+            index_undo,
+        } = prepared.payload.as_ref().unwrap()
+        else {
+            panic!("prepared user transaction must retain its user payload");
+        };
+        assert!(Arc::ptr_eq(
+            status,
+            prepared.trx_inner.as_ref().unwrap().ctx.status(),
+        ));
+        assert_eq!(*sts, expected_sts);
+        assert_eq!(*gc_no, expected_gc_no);
+        (row_undo, index_undo)
+    }
+
+    async fn assert_terminal_lock_release(log_file_stem: &str, table_id: u64, case: TerminalCase) {
+        let (_temp_dir, engine) = test_engine(log_file_stem).await;
+        let (mut session, mut trx) = begin_production_test_transaction(&engine);
+        let mode = if matches!(case, TerminalCase::ReadOnlyCommit) {
+            LockMode::IntentShared
+        } else {
+            LockMode::IntentExclusive
+        };
+        acquire_transaction_lock_immediate(
+            &mut trx,
+            LockResource::TableData(TableID::new(table_id)),
+            mode,
+        )
+        .unwrap();
+        assert_eq!(lock_entry_count(&engine, lock_owner(&trx).unwrap()), 1);
+        let status = if matches!(case, TerminalCase::OrderedCommit) {
+            add_pseudo_redo_log_entry(&mut trx).await;
+            Some(transaction_status_for_test(&trx))
+        } else {
+            None
+        };
+        let (hook, observed_rx) = install_terminal_boundary_observer(
+            engine.inner().core.lock_manager().clone(),
+            Arc::clone(&engine.inner().session_registry),
+            trx.operation_key,
+            trx.trx_id(),
+            status,
+            None,
+        );
+        let (outcome, status_ts) = match case {
+            TerminalCase::OrderedCommit => {
+                let cts = trx.commit().await.unwrap();
+                assert!(cts > TrxID::new(0));
+                (TerminalAttachmentOutcome::Commit, Some(cts))
+            }
+            TerminalCase::ReadOnlyCommit => {
+                assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
+                (TerminalAttachmentOutcome::Rollback, None)
+            }
+            TerminalCase::Rollback => {
+                trx.rollback().await.unwrap();
+                (TerminalAttachmentOutcome::Rollback, None)
+            }
+        };
+        let observed = recv_terminal_boundary(&observed_rx);
+        assert_eq!(observed.outcome, outcome);
+        assert_eq!(observed.status_ts, status_ts);
+        assert_eq!(observed.transaction_lock_entries, 0);
+        assert!(observed.session_active);
+        assert!(!session.in_trx().unwrap());
+        drop(hook);
+        session.begin_trx().unwrap().rollback().await.unwrap();
+    }
+
+    fn start_prepare_waiter<T: Send + 'static>(
+        status: Arc<SharedTrxStatus>,
+        observe: impl FnOnce(&SharedTrxStatus) -> T + Send + 'static,
+    ) -> (JoinHandle<()>, mpsc::Receiver<T>) {
+        assert!(status.preparing());
+        let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
+            panic!("preparing transaction should expose a listener");
+        };
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = spawn(move || {
+            ready_tx.send(()).expect("waiter should report ready");
+            listener.wait_primary_for_test();
+            done_tx
+                .send(observe(&status))
+                .expect("waiter should report completion");
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter should start");
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "prepare waiter must remain blocked before terminal completion"
+        );
+        (waiter, done_rx)
+    }
+
+    async fn inserted_transaction_fixture(
+        log_file_stem: &str,
+        value: i32,
+        label: &str,
+    ) -> (TempDir, Engine, TableID, Session, Transaction) {
+        let (temp_dir, engine) = test_engine(log_file_stem).await;
+        let table_id = catalog_tests::table2(&engine).await;
+        let (session, mut trx) = begin_production_test_transaction(&engine);
+        trx.table_insert_mvcc(table_id, vec![Val::from(value), Val::from(label)])
+            .await
+            .unwrap();
+        assert!(lock_entry_count(&engine, lock_owner(&trx).unwrap()) > 0);
+        (temp_dir, engine, table_id, session, trx)
+    }
+
+    async fn assert_cancelled_terminal_waiter<T>(
+        engine: &Engine,
+        session: &Session,
+        entry: &SessionOperationEntry,
+        owner: LockOwner,
+        terminal: impl Future<Output = T>,
+        boundary: (
+            &mpsc::Receiver<&'static str>,
+            &TerminalRollbackRelease,
+            &'static str,
+        ),
+    ) {
+        let (started_rx, release, operation) = boundary;
+        let mut terminal = Box::pin(terminal);
+        assert!(futures::poll!(terminal.as_mut()).is_pending());
+        assert_eq!(
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("terminal rollback worker should start"),
+            operation
+        );
+        assert_eq!(entry.inspect().state, SessionOperationState::Completing);
+        assert!(session.in_trx().unwrap());
+        drop(terminal);
+        release_terminal_rollback_hook(release);
+        wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
+        assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
+        assert!(!session.in_trx().unwrap());
+        assert_eq!(lock_entry_count(engine, owner), 0);
     }
 
     fn lock_entry_count(engine: &Engine, owner: LockOwner) -> usize {
@@ -4867,6 +5027,8 @@ pub(crate) mod tests {
         engine.shutdown();
     }
 
+    /// Purpose: Distinguish transaction-owned MVCC visibility from ownerless snapshots and equal timestamps.
+    /// Expected: Only the exact status object grants ownership, while every view preserves its snapshot timestamp.
     #[test]
     fn mvcc_visibility_preserves_optional_pointer_exact_ownership() {
         let own_status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 10));
@@ -4892,6 +5054,8 @@ pub(crate) mod tests {
         assert!(!ownerless.owns_status(same_timestamp.as_ref()));
     }
 
+    /// Purpose: Publish terminal transaction status to existing and late listeners.
+    /// Expected: Commit and rollback wake registered listeners and leave a permanently terminal status.
     #[test]
     fn test_shared_status_terminal_resolution_is_sticky_and_wakeable() {
         smol::block_on(async {
@@ -4913,6 +5077,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reset a reusable transaction core without retaining its prior status identity.
+    /// Expected: Reset clears retained state and creates a fresh status that initialization reuses exclusively.
     #[test]
     fn test_transaction_core_reset_installs_fresh_ready_status_before_init() {
         let session_id = SessionID::new(71);
@@ -4958,6 +5124,8 @@ pub(crate) mod tests {
         inner.reset();
     }
 
+    /// Purpose: Reuse a session's transaction allocation across terminal completion.
+    /// Expected: The core allocation is reused while each transaction receives a distinct nonterminal status.
     #[test]
     fn test_session_reuses_transaction_core_with_fresh_status_identity() {
         smol::block_on(async {
@@ -5006,6 +5174,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Remember transaction abandonment while its core is checked out.
+    /// Expected: Returning the core publishes cleanup readiness with the original transaction identity.
     #[test]
     fn test_checked_out_entry_remembers_abandonment_until_return() {
         let session_id = SessionID::new(100);
@@ -5036,6 +5206,8 @@ pub(crate) mod tests {
         assert!(snapshot.cleanup_requested);
     }
 
+    /// Purpose: Return a cancelled statement with or without a prior abandonment request.
+    /// Expected: The entry immediately owns cleanup and never becomes available for ordinary reuse.
     #[test]
     fn test_cancelled_statement_return_publishes_cleanup_ready_directly() {
         for preexisting_cleanup in [false, true] {
@@ -5062,6 +5234,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Keep private transaction lifecycle subordinate to a voluntary foreground operation.
+    /// Expected: Checkout and cleanup retain the outer operation until foreground release publishes terminal state.
     #[test]
     fn test_private_transaction_state_is_nested_under_foreground_operation() {
         let session_id = SessionID::new(101);
@@ -5124,6 +5298,8 @@ pub(crate) mod tests {
         assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
     }
 
+    /// Purpose: Keep private transaction lifecycle subordinate to a mandatory operation.
+    /// Expected: Checkout and terminal completion preserve mandatory ownership until the outer operation finishes.
     #[test]
     fn test_private_transaction_state_is_nested_under_mandatory_operation() {
         let session_id = SessionID::new(102);
@@ -5183,6 +5359,8 @@ pub(crate) mod tests {
         assert_eq!(entry.inspect().state, SessionOperationState::Terminal);
     }
 
+    /// Purpose: Reject stale handles after an operation installs a replacement private transaction.
+    /// Expected: The old identity cannot abandon or claim cleanup for the replacement transaction.
     #[test]
     fn test_stale_transaction_identity_cannot_claim_reused_operation_entry() {
         let session_id = SessionID::new(200);
@@ -5232,6 +5410,8 @@ pub(crate) mod tests {
         assert!(snapshot.cleanup_requested);
     }
 
+    /// Purpose: Transfer private transaction ownership when foreground execution ends.
+    /// Expected: Available work becomes cleanup-ready, terminal work keeps its owner, and checked-out work defers cleanup until return.
     #[test]
     fn test_foreground_release_promotes_private_transaction_state() {
         let session_id = SessionID::new(102);
@@ -5315,6 +5495,8 @@ pub(crate) mod tests {
         assert_eq!(snapshot.state, SessionOperationState::CleanupReady);
     }
 
+    /// Purpose: Retain failed transaction entries in the active operation registry.
+    /// Expected: Fatal retention continues to count as an active operation until explicit test cleanup.
     #[test]
     fn test_failed_entry_remains_an_active_operation_blocker() {
         smol::block_on(async {
@@ -5339,6 +5521,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Validate transaction identity independently of an otherwise matching operation key.
+    /// Expected: Checkout rejects the forged handle with lifecycle context identifying the actual transaction.
     #[test]
     fn test_same_operation_key_rejects_wrong_transaction_identity() {
         smol::block_on(async {
@@ -5371,6 +5555,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Wake session shutdown observers when an abandoned checkout returns.
+    /// Expected: The observer remains blocked before return and wakes when terminal cleanup becomes eligible.
     #[test]
     fn test_checked_out_abandoned_return_notifies_session_waiter() {
         smol::block_on(async {
@@ -5434,6 +5620,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Prepare a read-only transaction without durability or ordering work.
+    /// Expected: The user payload preserves snapshot ownership with empty undo and no redo.
     #[test]
     fn test_transaction_readonly_prepare_keeps_empty_effect_payload() {
         smol::block_on(async {
@@ -5446,19 +5634,8 @@ pub(crate) mod tests {
             assert!(prepared.redo_bin.is_none());
             assert!(!prepared.require_durability());
             assert!(!prepared.require_ordered_commit());
-            let payload = prepared.payload.as_ref().unwrap();
-            let PreparedTrxPayload::User {
-                sts,
-                gc_no,
-                row_undo,
-                index_undo,
-                ..
-            } = payload
-            else {
-                panic!("readonly transaction must carry user payload")
-            };
-            assert_eq!(*sts, expected_sts);
-            assert_eq!(*gc_no, expected_gc_no);
+            let (row_undo, index_undo) =
+                prepared_user_undo(&prepared, expected_sts, expected_gc_no);
             assert!(row_undo.is_empty());
             assert!(index_undo.is_empty());
 
@@ -5466,13 +5643,15 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Transfer effectful transaction state into its prepared payload.
+    /// Expected: Preparation retains snapshot ownership and both undo kinds while requiring durable ordered commit.
     #[test]
     fn test_transaction_prepare_moves_effect_payload() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("redo_trx_effect_prepare").await;
             let (_session, mut trx) = begin_production_test_transaction(&engine);
             add_pseudo_redo_log_entry(&mut trx).await;
-            with_transaction_inner_mut(&mut trx, "test_prepare_payload", |inner| {
+            let undo_ptr = with_transaction_inner_mut(&mut trx, "test_prepare_payload", |inner| {
                 inner.effects_mut().row_undo_mut().push(OwnedRowUndo::new(
                     NON_FOREGROUND_STMT_NO,
                     TableID::new(11),
@@ -5491,6 +5670,7 @@ pub(crate) mod tests {
                         true,
                     ),
                 });
+                from_ref(&*inner.effects.row_undo[0])
             })
             .unwrap();
             let expected_sts = trx.sts();
@@ -5500,26 +5680,21 @@ pub(crate) mod tests {
             assert!(prepared.redo_bin.is_some());
             assert!(prepared.require_durability());
             assert!(prepared.require_ordered_commit());
-            let payload = prepared.payload.as_ref().unwrap();
-            let PreparedTrxPayload::User {
-                sts,
-                gc_no,
-                row_undo,
-                index_undo,
-                ..
-            } = payload
-            else {
-                panic!("prepared transaction must carry user payload")
-            };
-            assert_eq!(*sts, expected_sts);
-            assert_eq!(*gc_no, expected_gc_no);
+            let (row_undo, index_undo) =
+                prepared_user_undo(&prepared, expected_sts, expected_gc_no);
             assert_eq!(row_undo.len(), 1);
             assert_eq!(index_undo.len(), 1);
+            assert_eq!(from_ref(&*row_undo[0]), undo_ptr);
+            assert_eq!(row_undo[0].table_id, TableID::new(11));
+            assert_eq!(row_undo[0].row_id, RowID::new(22));
+            assert!(matches!(row_undo[0].kind, RowUndoKind::Delete(_)));
 
             discard_production_prepared_for_test(prepared);
         });
     }
 
+    /// Purpose: Retain reversible index effects until precommit succeeds.
+    /// Expected: Precommit owns the undo and successful commit converts deferred deletion into the corresponding purge entry.
     #[test]
     fn test_precommit_retains_index_undo_until_successful_commit() {
         smol::block_on(async {
@@ -5559,6 +5734,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Notify prepare waiters after successful precommit publication.
+    /// Expected: Waiters observe the committed timestamp and later registration sees preparation complete.
     #[test]
     fn test_prepare_listener_wakes_after_precommit_commit() {
         smol::block_on(async {
@@ -5573,28 +5750,7 @@ pub(crate) mod tests {
                 .unwrap();
 
             let prepared = prepare_transaction(trx).unwrap();
-            assert!(status.preparing());
-            let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
-                panic!("preparing transaction should expose a listener");
-            };
-            let waiter_status = Arc::clone(&status);
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let (done_tx, done_rx) = mpsc::channel();
-            let waiter = spawn(move || {
-                ready_tx.send(()).expect("waiter should report ready");
-                listener.wait_primary_for_test();
-                done_tx
-                    .send(waiter_status.ts())
-                    .expect("waiter should report observed status");
-            });
-
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("waiter should start");
-            assert!(
-                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-                "prepare waiter should block before commit completion"
-            );
+            let (waiter, done_rx) = start_prepare_waiter(Arc::clone(&status), SharedTrxStatus::ts);
 
             let cts = TrxID::new(91_248);
             let mut precommit = prepared.fill_cts(cts);
@@ -5609,6 +5765,7 @@ pub(crate) mod tests {
             );
             waiter.join().expect("waiter thread should finish");
             assert_eq!(status.ts(), cts);
+            finish_production_committed_for_test(&engine, committed);
             assert!(!status.preparing());
             assert!(matches!(
                 status.prepare_listener(),
@@ -5617,6 +5774,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allocate the shared prepare event lazily when contention appears.
+    /// Expected: Waiters share one event and completion wakes them all before clearing the event slot.
     #[test]
     fn test_prepare_listener_is_injected_only_by_waiters() {
         let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_000);
@@ -5649,6 +5808,8 @@ pub(crate) mod tests {
         assert!(status.prepare_ev.lock().is_none());
     }
 
+    /// Purpose: Complete uncontended preparation without allocating a notification event.
+    /// Expected: The event slot remains empty and late listener registration reports completed preparation.
     #[test]
     fn test_prepare_without_waiters_keeps_event_slot_empty() {
         let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_001);
@@ -5662,6 +5823,8 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Complete preparation between an optimistic status read and listener registration.
+    /// Expected: Registration reports the completion race without installing an event or losing a wakeup.
     #[test]
     fn test_prepare_completion_wins_first_listener_registration() {
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 90_002));
@@ -5702,6 +5865,8 @@ pub(crate) mod tests {
         assert!(status.prepare_ev.lock().is_none());
     }
 
+    /// Purpose: Recheck poison when prepare completion wins listener registration.
+    /// Expected: The foreground wait preserves the fatal classification and original poison diagnostics.
     #[test]
     fn test_prepare_completion_won_registration_rechecks_poison() {
         smol::block_on(async {
@@ -5731,6 +5896,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cancel an individual prepare waiter before transaction completion.
+    /// Expected: The shared event remains owned by preparation until completion clears it.
     #[test]
     fn test_cancelled_prepare_listener_leaves_event_for_completion() {
         let status = shared_trx_status(MIN_ACTIVE_TRX_ID + 90_003);
@@ -5747,6 +5914,8 @@ pub(crate) mod tests {
         assert!(status.prepare_ev.lock().is_none());
     }
 
+    /// Purpose: Notify prepare waiters when failed precommit is rolled back.
+    /// Expected: Rollback clears preparation and wakes waiters so late registration cannot block.
     #[test]
     fn test_prepare_listener_wakes_after_failed_precommit_rollback() {
         smol::block_on(async {
@@ -5761,31 +5930,12 @@ pub(crate) mod tests {
                 .unwrap();
 
             let prepared = prepare_transaction(trx).unwrap();
-            assert!(status.preparing());
-            let PrepareListenerResult::Registered(listener) = status.prepare_listener() else {
-                panic!("preparing transaction should expose a listener");
-            };
-            let waiter_status = Arc::clone(&status);
-            let (ready_tx, ready_rx) = mpsc::channel();
-            let (done_tx, done_rx) = mpsc::channel();
-            let waiter = spawn(move || {
-                ready_tx.send(()).expect("waiter should report ready");
-                listener.wait_primary_for_test();
-                done_tx
-                    .send(matches!(
-                        waiter_status.prepare_listener(),
-                        PrepareListenerResult::NotPreparing
-                    ))
-                    .expect("waiter should report completion state");
+            let (waiter, done_rx) = start_prepare_waiter(Arc::clone(&status), |status| {
+                matches!(
+                    status.prepare_listener(),
+                    PrepareListenerResult::NotPreparing
+                )
             });
-
-            ready_rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("waiter should start");
-            assert!(
-                done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-                "prepare waiter should block before rollback completion"
-            );
 
             let mut precommit = prepared.fill_cts(TrxID::new(91_249));
             assert_eq!(
@@ -5809,6 +5959,8 @@ pub(crate) mod tests {
 
     // Focused owned-runner coverage verifies raw statement effects merge into
     // transaction-owned undo and redo.
+    /// Purpose: Transfer successful statement effects to transaction ownership.
+    /// Expected: Row undo, index undo, and redo survive settlement and require durable ordered commit.
     #[test]
     fn test_statement_success_merges_statement_effects_into_transaction_effects() {
         smol::block_on(async {
@@ -5857,6 +6009,8 @@ pub(crate) mod tests {
     }
 
     // An unpolled direct operation must not check out the transaction core.
+    /// Purpose: Drop a direct statement future before its first poll.
+    /// Expected: No checkout or cleanup request occurs and the transaction remains usable.
     #[test]
     fn test_unpolled_statement_future_leaves_transaction_reusable() {
         smol::block_on(async {
@@ -5877,6 +6031,8 @@ pub(crate) mod tests {
 
     // Dropping a checked-out direct operation terminally transfers transaction
     // cleanup ownership.
+    /// Purpose: Cancel a direct statement after it has checked out the transaction core.
+    /// Expected: The transaction rejects further statements and terminal cleanup returns the session to idle.
     #[test]
     fn test_dropped_polled_statement_future_terminally_cancels_transaction() {
         smol::block_on(async {
@@ -5912,6 +6068,8 @@ pub(crate) mod tests {
 
     // Focused owned-runner cancellation folds raw effects and transaction
     // locks into terminal cleanup.
+    /// Purpose: Cancel a statement holding redo and accepted transaction locks.
+    /// Expected: Commit is rejected and terminal cleanup releases the retained locks.
     #[test]
     fn test_dropped_effectful_statement_discards_redo_and_terminally_releases_locks() {
         smol::block_on(async {
@@ -5957,6 +6115,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cancel statement rollback while its index undo is still pending.
+    /// Expected: Transaction cleanup owns the remaining index and row work and removes the failed insert.
     #[test]
     fn test_cancelled_index_rollback_folds_index_and_row_residuals() {
         smol::block_on(
@@ -5968,6 +6128,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Cancel statement rollback after index reversal while row undo is pending.
+    /// Expected: Transaction cleanup consumes the remaining row undo and removes the failed insert.
     #[test]
     fn test_cancelled_row_rollback_folds_remaining_row_residual() {
         smol::block_on(
@@ -5979,6 +6141,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Cancel a statement whose metadata claim remains queued.
+    /// Expected: The pending claim disappears immediately and terminal cleanup completes without reusing the transaction.
     #[test]
     fn test_dropped_statement_removes_queued_lock_before_cleanup() {
         smol::block_on(assert_dropped_statement_waiter_cancelled(
@@ -5988,6 +6152,8 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Cancel a statement after lock promotion but before observing its grant.
+    /// Expected: The provisional claim disappears immediately and terminal cleanup completes without reusing the transaction.
     #[test]
     fn test_dropped_statement_releases_promoted_unobserved_lock_before_cleanup() {
         smol::block_on(assert_dropped_statement_waiter_cancelled(
@@ -5997,6 +6163,8 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Purpose: Require metadata DDL when transaction redo contains catalog row changes.
+    /// Expected: Catalog-only DML triggers the redo invariant panic.
     #[test]
     #[should_panic(expected = "catalog table DML must be logged")]
     fn test_redo_invariants_debug_assert_catalog_dml_without_metadata_ddl() {
@@ -6011,6 +6179,8 @@ pub(crate) mod tests {
         effects.debug_assert_redo_invariants();
     }
 
+    /// Purpose: Install the first DDL record into empty transaction effects.
+    /// Expected: The transaction retains the exact DDL operation and target.
     #[test]
     fn test_transaction_effects_install_first_ddl_redo() {
         let mut effects = TrxEffects::empty();
@@ -6022,6 +6192,8 @@ pub(crate) mod tests {
         effects.clear_for_rollback();
     }
 
+    /// Purpose: Prevent a transaction from installing more than one DDL record.
+    /// Expected: A second installation panics instead of replacing the first operation.
     #[test]
     #[should_panic(expected = "transaction DDL redo installed more than once")]
     fn test_transaction_effects_reject_duplicate_ddl_redo() {
@@ -6032,6 +6204,8 @@ pub(crate) mod tests {
 
     // Focused raw redo injection distinguishes successful effect merge from
     // operation-error rollback.
+    /// Purpose: Isolate failed statement redo from earlier successful transaction work.
+    /// Expected: The initiating operation error is preserved and only the failed statement's redo is discarded.
     #[test]
     fn test_statement_error_rolls_back_only_statement_effects() {
         smol::block_on(async {
@@ -6082,6 +6256,8 @@ pub(crate) mod tests {
 
     // Focused raw statement lock acquisition proves operation completion
     // retains transaction-lifetime claims.
+    /// Purpose: Retain transaction-scoped locks across successful and failed statements.
+    /// Expected: Repeated requests reuse claims and all accepted locks survive until terminal rollback.
     #[test]
     fn test_statement_completion_retains_transaction_locks_until_terminal_cleanup() {
         smol::block_on(async {
@@ -6163,6 +6339,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse covered transaction lock requests without hiding invalid conversions.
+    /// Expected: Coverage avoids duplicate entries, conversion errors retain their domain, and rollback releases the claims.
     #[test]
     fn test_transaction_lock_cache_skips_covered_requests_and_preserves_errors() {
         smol::block_on(async {
@@ -6210,6 +6388,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reuse explicit transaction table locks across repeated weaker and equal requests.
+    /// Expected: The entry returns to available state with cached claims that terminal rollback releases.
     #[test]
     fn test_lock_table_caches_explicit_locks_and_restores_entry_state() {
         smol::block_on(async {
@@ -6269,6 +6449,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cancel table locking after metadata admission while the data request waits.
+    /// Expected: New claims are removed and the checked-out transaction returns to available state.
     #[test]
     fn test_pending_lock_table_checkout_restores_active_on_drop() {
         smol::block_on(async {
@@ -6331,6 +6513,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cancel table locking when its metadata claim predates the pending data request.
+    /// Expected: The existing metadata claim survives while the new data request is cancelled.
     #[test]
     fn test_lock_table_cancel_preserves_cached_metadata_only() {
         smol::block_on(async {
@@ -6404,6 +6588,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Release transaction locks through each ordinary terminal path.
+    /// Expected: Read-only commit, rollback, and durable ordered commit leave no transaction lock entries.
     #[test]
     fn test_transaction_locks_release_on_readonly_commit_rollback_and_ordered_commit() {
         smol::block_on(async {
@@ -6446,6 +6632,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Bind released-lock authority to the completing transaction's identity.
+    /// Expected: Matching proof consumption succeeds and mismatches panic with both identities.
     #[test]
     fn test_released_transaction_lock_proof_validates_identity() {
         let proof_trx_id = TrxID::new(91_501);
@@ -6471,80 +6659,30 @@ pub(crate) mod tests {
         assert!(diagnostic.contains(&format!("attachment_trx_id={attachment_trx_id}")));
     }
 
+    /// Purpose: Order durable commit publication and lock release before session reuse.
+    /// Expected: At the terminal attachment boundary the committed status is visible, locks are gone, and the session still owns the operation.
     #[test]
     fn test_ordered_commit_releases_locks_before_session_finish() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_ordered_commit_release_boundary").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let trx_id = trx.trx_id();
-            acquire_transaction_lock_immediate(
-                &mut trx,
-                LockResource::TableData(TableID::new(91_510)),
-                LockMode::IntentExclusive,
-            )
-            .unwrap();
-            add_pseudo_redo_log_entry(&mut trx).await;
-            let status = with_transaction_inner(&trx, "observe_ordered_commit_status", |inner| {
-                Arc::clone(inner.ctx().status())
-            })
-            .unwrap();
-            let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.inner().core.lock_manager().clone(),
-                Arc::clone(&engine.inner().session_registry),
-                trx.operation_key,
-                trx_id,
-                Some(status),
-                None,
-            );
-
-            let cts = trx.commit().await.unwrap();
-            let observed = recv_terminal_boundary(&observed_rx);
-            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Commit);
-            assert_eq!(observed.transaction_lock_entries, 0);
-            assert!(observed.session_active);
-            assert_eq!(observed.status_ts, Some(cts));
-            assert!(!session.in_trx().unwrap());
-
-            drop(hook);
-            session.begin_trx().unwrap().rollback().await.unwrap();
-        });
+        smol::block_on(assert_terminal_lock_release(
+            "trx_ordered_commit_release_boundary",
+            91510,
+            TerminalCase::OrderedCommit,
+        ));
     }
 
+    /// Purpose: Release read-only transaction locks before completing session ownership.
+    /// Expected: The unordered terminal path has no lock entries while the session operation is still active.
     #[test]
     fn test_unordered_commit_releases_locks_before_session_finish() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_unordered_commit_release_boundary").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let trx_id = trx.trx_id();
-            acquire_transaction_lock_immediate(
-                &mut trx,
-                LockResource::TableData(TableID::new(91_511)),
-                LockMode::IntentShared,
-            )
-            .unwrap();
-            let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.inner().core.lock_manager().clone(),
-                Arc::clone(&engine.inner().session_registry),
-                trx.operation_key,
-                trx_id,
-                None,
-                None,
-            );
-
-            assert_eq!(trx.commit().await.unwrap(), TrxID::new(0));
-            let observed = recv_terminal_boundary(&observed_rx);
-            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
-            assert_eq!(observed.transaction_lock_entries, 0);
-            assert!(observed.session_active);
-            assert!(!session.in_trx().unwrap());
-
-            drop(hook);
-            session.begin_trx().unwrap().rollback().await.unwrap();
-        });
+        smol::block_on(assert_terminal_lock_release(
+            "trx_unordered_commit_release_boundary",
+            91511,
+            TerminalCase::ReadOnlyCommit,
+        ));
     }
 
+    /// Purpose: Finalize a synthetic committed transaction through the terminal attachment.
+    /// Expected: The operation leaves the active registry and its reusable core returns to the session cache.
     #[test]
     fn test_synthetic_transaction_commit_finalization_returns_session_authority() {
         smol::block_on(async {
@@ -6588,40 +6726,19 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Release rollback's transaction claims before ending session ownership.
+    /// Expected: The terminal boundary has no transaction locks while the session remains active, then session reuse succeeds.
     #[test]
     fn test_rollback_releases_locks_before_session_finish() {
-        smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_rollback_release_boundary").await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            let trx_id = trx.trx_id();
-            acquire_transaction_lock_immediate(
-                &mut trx,
-                LockResource::TableData(TableID::new(91_512)),
-                LockMode::IntentExclusive,
-            )
-            .unwrap();
-            let (hook, observed_rx) = install_terminal_boundary_observer(
-                engine.inner().core.lock_manager().clone(),
-                Arc::clone(&engine.inner().session_registry),
-                trx.operation_key,
-                trx_id,
-                None,
-                None,
-            );
-
-            trx.rollback().await.unwrap();
-            let observed = recv_terminal_boundary(&observed_rx);
-            assert_eq!(observed.outcome, TerminalAttachmentOutcome::Rollback);
-            assert_eq!(observed.transaction_lock_entries, 0);
-            assert!(observed.session_active);
-            assert!(!session.in_trx().unwrap());
-
-            drop(hook);
-            session.begin_trx().unwrap().rollback().await.unwrap();
-        });
+        smol::block_on(assert_terminal_lock_release(
+            "trx_rollback_release_boundary",
+            91512,
+            TerminalCase::Rollback,
+        ));
     }
 
+    /// Purpose: Prevent replacement transactions while terminal attachment cleanup still owns the session.
+    /// Expected: Read-only observation remains available, but new transaction admission fails even after lock release.
     #[test]
     fn test_session_admission_waits_for_terminal_lifecycle_finish() {
         smol::block_on(async {
@@ -6683,6 +6800,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve explicit session locks through an abandoned transaction's terminal boundary.
+    /// Expected: Transaction-only locks disappear before explicit session locks and registry ownership are released.
     #[test]
     fn test_abandoned_session_releases_transaction_locks_before_explicit_locks() {
         smol::block_on(async {
@@ -6703,6 +6822,15 @@ pub(crate) mod tests {
                 LockMode::IntentShared,
             )
             .unwrap();
+            // A distinct resource makes transaction release observable even
+            // though accepted transaction and session claims share a family.
+            acquire_transaction_lock_immediate(
+                &mut trx,
+                LockResource::TableData(TableID::new(91_514)),
+                LockMode::IntentExclusive,
+            )
+            .unwrap();
+            assert_eq!(lock_entry_count(&engine, session_owner), 3);
             let (hook, observed_rx) = install_terminal_boundary_observer(
                 engine.inner().core.lock_manager().clone(),
                 Arc::clone(&engine.inner().session_registry),
@@ -6727,6 +6855,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Release transaction claims when failed precommit is reversed.
+    /// Expected: Locks disappear before terminal session completion and the session becomes idle.
     #[test]
     fn test_transaction_locks_release_on_precommit_abort() {
         smol::block_on(async {
@@ -6768,6 +6898,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve storage-fatal failures from worker-owned index and row rollback.
+    /// Expected: The returned error keeps its storage cause, residual undo is retained, and earlier engine poison remains unchanged.
     #[test]
     fn test_terminal_rollback_preserves_storage_fatal() {
         use crate::trx::undo::tests::{
@@ -6820,71 +6952,63 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Cancel the caller's waiter after terminal rollback is accepted by its worker.
+    /// Expected: Worker-owned rollback still finishes the entry, releases locks, and returns the session to idle.
     #[test]
     fn test_dropped_terminal_rollback_waiter_completes_worker_cleanup() {
         let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_cancel").await;
-            let table_id = catalog_tests::table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let (_temp_dir, engine, table_id, mut session, trx) = inserted_transaction_fixture(
+                "trx_terminal_rollback_cancel",
+                91270,
+                "terminal-rollback",
+            )
+            .await;
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let owner = lock_owner(&trx).unwrap();
-            trx.table_insert_mvcc(
-                table_id,
-                vec![Val::from(91_270i32), Val::from("terminal-rollback")],
-            )
-            .await
-            .unwrap();
-            assert!(lock_entry_count(&engine, owner) > 0);
-
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
-            let mut rollback = Box::pin(trx.rollback());
-            assert!(matches!(
-                futures::poll!(rollback.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("terminal rollback worker should start"),
-                "rollback active transaction"
+            assert_cancelled_terminal_waiter(
+                &engine,
+                &session,
+                &entry,
+                owner,
+                trx.rollback(),
+                (&started_rx, &release, "rollback active transaction"),
+            )
+            .await;
+            let mut verify = session.begin_trx().unwrap();
+            assert!(
+                verify
+                    .table_lookup_unique_mvcc(
+                        crate::TableIndex(table_id, IndexID::new(0)),
+                        &[Val::from(91_270i32)],
+                        &[0, 1],
+                    )
+                    .await
+                    .unwrap()
+                    .not_found()
             );
-            assert_eq!(entry.inspect().state, SessionOperationState::Completing);
-            assert!(session.in_trx().unwrap());
-
-            drop(rollback);
-            release_terminal_rollback_hook(&release);
-            wait_until(
-                || {
-                    !session.in_trx().unwrap()
-                        && entry.inspect().state == SessionOperationState::Terminal
-                        && lock_entry_count(&engine, owner) == 0
-                },
-                "terminal rollback cleanup did not finish after waiter drop",
-            );
+            verify.rollback().await.unwrap();
             engine.shutdown();
         });
     }
 
+    /// Purpose: Keep accepted rollback work visible to shutdown after its waiter is dropped.
+    /// Expected: Shutdown remains blocked until worker cleanup completes and publishes terminal state.
     #[test]
     fn test_terminal_rollback_blocks_shutdown_after_waiter_drop() {
         let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_shutdown").await;
-            let table_id = catalog_tests::table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let (_temp_dir, engine, _table_id, session, trx) = inserted_transaction_fixture(
+                "trx_terminal_rollback_shutdown",
+                91271,
+                "terminal-shutdown",
+            )
+            .await;
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
-            trx.table_insert_mvcc(
-                table_id,
-                vec![Val::from(91_271i32), Val::from("terminal-shutdown")],
-            )
-            .await
-            .unwrap();
 
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
@@ -6921,23 +7045,21 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject duplicate cleanup while a worker already owns terminal rollback.
+    /// Expected: The duplicate claim fails and the original worker completes the transaction once.
     #[test]
     fn test_duplicate_abandoned_cleanup_cannot_claim_terminal_rollback() {
         let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_terminal_rollback_duplicate").await;
-            let table_id = catalog_tests::table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let (_temp_dir, engine, _table_id, session, trx) = inserted_transaction_fixture(
+                "trx_terminal_rollback_duplicate",
+                91272,
+                "terminal-duplicate",
+            )
+            .await;
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let operation_key = trx.operation_key;
-            trx.table_insert_mvcc(
-                table_id,
-                vec![Val::from(91_272i32), Val::from("terminal-duplicate")],
-            )
-            .await
-            .unwrap();
 
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback active transaction");
@@ -6976,61 +7098,42 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Cancel a poisoned commit after its pre-handoff rollback has been accepted.
+    /// Expected: The rollback worker still releases locks and completes session and transaction cleanup.
     #[test]
     fn test_dropped_commit_waiter_after_pre_handoff_rollback_still_cleans_up() {
         let _hook_lock = terminal_rollback_hook_test_lock().lock().unwrap();
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("trx_commit_pre_handoff_cancel").await;
-            let table_id = catalog_tests::table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
+            let (_temp_dir, engine, _table_id, session, trx) = inserted_transaction_fixture(
+                "trx_commit_pre_handoff_cancel",
+                91273,
+                "pre-handoff-rollback",
+            )
+            .await;
             let entry = transaction_entry(&trx);
             let trx_id = trx.trx_id();
             let owner = lock_owner(&trx).unwrap();
-            trx.table_insert_mvcc(
-                table_id,
-                vec![Val::from(91_273i32), Val::from("pre-handoff-rollback")],
-            )
-            .await
-            .unwrap();
-            assert!(lock_entry_count(&engine, owner) > 0);
-
             let (_hook, started_rx, release) =
                 install_blocking_terminal_rollback_hook(trx_id, "rollback poisoned commit");
-            let _ = engine
+            engine
                 .inner()
                 .poisoner
                 .poison(Report::new(FatalError::RedoWrite).attach("test redo write failure"));
-            let mut commit = Box::pin(trx.commit());
-            assert!(matches!(
-                futures::poll!(commit.as_mut()),
-                std::task::Poll::Pending
-            ));
-            assert_eq!(
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("poisoned commit rollback worker should start"),
-                "rollback poisoned commit"
-            );
-            assert!(matches!(
-                entry.inspect().state,
-                SessionOperationState::Completing
-            ));
-
-            drop(commit);
-            release_terminal_rollback_hook(&release);
-            wait_until(
-                || {
-                    !session.in_trx().unwrap()
-                        && entry.inspect().state == SessionOperationState::Terminal
-                        && lock_entry_count(&engine, owner) == 0
-                },
-                "poisoned commit rollback cleanup did not finish after waiter drop",
-            );
+            assert_cancelled_terminal_waiter(
+                &engine,
+                &session,
+                &entry,
+                owner,
+                trx.commit(),
+                (&started_rx, &release, "rollback poisoned commit"),
+            )
+            .await;
             engine.shutdown();
         });
     }
 
+    /// Purpose: Stop reverse precommit cleanup when reloading the newest transaction's undo fails.
+    /// Expected: All failed and unprocessed payloads are retained, sessions become idle, and the initiating poison stays authoritative.
     #[test]
     fn test_failed_precommit_cleanup_stops_reverse_after_rollback_failure() {
         smol::block_on(async {
@@ -7040,7 +7143,6 @@ pub(crate) mod tests {
             )
             .await;
             let table_id = catalog_tests::table2(&engine).await;
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
             let large = "r".repeat(48 * 1024);
 
             fn precommit_with_cold_row_undo(
@@ -7086,34 +7188,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .fill_cts(TrxID::new(91_263));
 
-            let mut writer = engine.new_session().unwrap();
-            for i in 0..258 {
-                let mut trx = writer.begin_trx().unwrap();
-                trx.table_insert_mvcc(
-                    table_id,
-                    vec![Val::from(92_000i32 + i), Val::from(&large[..])],
-                )
-                .await
-                .unwrap();
-                trx.commit().await.unwrap();
-                if test_frame_kind(&table.row_store.mem_pool, cached_page.page_id)
-                    == FrameKind::Evicted
-                {
-                    break;
-                }
-            }
-            // Timer audit: buffer-eviction/I/O test coordination.
-            let mut evicted = false;
-            for _ in 0..20 {
-                if test_frame_kind(&table.row_store.mem_pool, cached_page.page_id)
-                    == FrameKind::Evicted
-                {
-                    evicted = true;
-                    break;
-                }
-                Timer::after(Duration::from_millis(50)).await;
-            }
-            assert!(evicted, "failed-precommit rollback page should be evicted");
+            test_evict_existing_page(engine.inner().pools.mem.clone(), cached_page.page_id).await;
 
             let mem_pool_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
@@ -7179,6 +7254,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject terminal operations and session replacement after fatal transaction discard.
+    /// Expected: Prepare, commit, and rollback report lifecycle rejection while the failed core remains unrecycled.
     #[test]
     fn test_commit_and_rollback_after_fatal_discard_return_error() {
         smol::block_on(async {
@@ -7262,6 +7339,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject transaction checkout after the engine is poisoned.
+    /// Expected: Admission returns the original fatal cause without reclassifying it as a lifecycle error.
     #[test]
     fn test_transaction_checkout_preserves_fatal_poison() {
         smol::block_on(async {
@@ -7290,6 +7369,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Distinguish index-only ordering work from redo durability requirements.
+    /// Expected: Index undo requires ordered commit without redo, while redo requires both durability and ordering before and after prepare.
     #[test]
     fn test_transaction_effect_predicates_split_durability_from_ordering() {
         smol::block_on(async {
@@ -7331,6 +7412,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Retain a replaced table root while an earlier transaction can still observe it.
+    /// Expected: The old root survives the active reader and is reclaimed after the publication fence passes the purge horizon.
     #[test]
     fn test_published_table_root_retention_waits_for_fence_horizon() {
         smol::block_on(async {

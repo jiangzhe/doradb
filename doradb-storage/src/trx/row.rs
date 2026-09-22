@@ -1520,6 +1520,13 @@ pub(crate) mod tests {
         page
     }
 
+    fn row_fixture() -> (TableMetadata, RowPage, RowVersionMap) {
+        let metadata = sparse_metadata();
+        let page = row_page(&metadata);
+        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        (metadata, page, row_ver)
+    }
+
     fn row_page_with_two_rows(metadata: &TableMetadata) -> RowPage {
         let page = row_page(metadata);
         assert!(
@@ -1537,7 +1544,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn install_test_undo_head(row_ver: &RowVersionMap, status: Arc<SharedTrxStatus>) {
+    fn install_test_undo_head(
+        row_ver: &RowVersionMap,
+        status: Arc<SharedTrxStatus>,
+    ) -> OwnedRowUndo {
         let undo = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             TableID::new(1),
@@ -1546,6 +1556,8 @@ pub(crate) mod tests {
             RowUndoKind::Lock,
         );
         *row_ver.write_latch(0) = Some(Box::new(RowUndoHead::new(status, undo.leak())));
+        // The map holds non-owning links; each caller must retain this allocation.
+        undo
     }
 
     fn test_row_read_access<'a>(
@@ -1560,12 +1572,10 @@ pub(crate) mod tests {
     /// Expected: Committed page values remain readable even after the reader snapshot.
     #[test]
     fn test_read_latest_uses_committed_page_image_newer_than_snapshot() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
         commit_shared_trx_status(&status, TrxID::new(10));
-        install_test_undo_head(&row_ver, status);
+        let _undo = install_test_undo_head(&row_ver, status);
         let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
@@ -1580,17 +1590,15 @@ pub(crate) mod tests {
     /// Expected: Own changes are readable and another active owner causes a write conflict.
     #[test]
     fn test_read_latest_allows_own_head_and_rejects_foreign_active_head() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (_metadata, page, row_ver) = row_fixture();
         let trx_ctx = test_trx_context(TrxID::new(1));
-        install_test_undo_head(&row_ver, Arc::clone(trx_ctx.status()));
+        let _own_undo = install_test_undo_head(&row_ver, Arc::clone(trx_ctx.status()));
         {
             let access = test_row_read_access(&page, &row_ver, 0);
             assert_eq!(access.read_latest(&trx_ctx), ReadLatestRow::Readable);
         }
 
-        install_test_undo_head(
+        let _foreign_undo = install_test_undo_head(
             &row_ver,
             Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 100)),
         );
@@ -1607,7 +1615,7 @@ pub(crate) mod tests {
         assert!(page.set_deleted(0, true));
         let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
         let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 99));
-        install_test_undo_head(&row_ver, Arc::clone(&status));
+        let _undo = install_test_undo_head(&row_ver, Arc::clone(&status));
         let access = test_row_read_access(&page, &row_ver, 0);
         let trx_ctx = test_trx_context(TrxID::new(1));
 
@@ -1711,9 +1719,7 @@ pub(crate) mod tests {
     /// Expected: Foreign and ownerless snapshots reconstruct the oldest applicable column value.
     #[test]
     fn test_ownerless_scan_replays_repeated_sparse_updates_like_foreign_reader() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (_metadata, page, row_ver) = row_fixture();
         let older = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             TableID::new(1),
@@ -1773,9 +1779,7 @@ pub(crate) mod tests {
     /// Expected: Invalid resolved identities fail as contracts instead of ordinary lookup misses.
     #[test]
     fn test_index_candidate_requires_resolved_metadata() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::I32, false)]);
         let key = [Val::from(10i32)];
         // Slot 1 is inactive. A caller cannot admit this candidate against metadata.
@@ -1814,9 +1818,7 @@ pub(crate) mod tests {
     /// Expected: The reconstructed previous owner supplies the expected row values.
     #[test]
     fn test_index_candidate_mvcc_follows_catalog_branch_to_previous_owner() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let newest = OwnedRowUndo::new(
             NON_FOREGROUND_STMT_NO,
             CATALOG_TABLE_ID_START,
@@ -2215,9 +2217,7 @@ pub(crate) mod tests {
     /// Expected: Frozen access advances the version on entry and exit while active access leaves it unchanged.
     #[test]
     fn test_row_write_access_pairs_frozen_mutation_version() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (_metadata, page, row_ver) = row_fixture();
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
 
@@ -2271,9 +2271,7 @@ pub(crate) mod tests {
     /// Expected: Dropping the access closes the mutation version even when its body panics.
     #[test]
     fn test_row_write_access_closes_frozen_version_during_unwind() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (_metadata, page, row_ver) = row_fixture();
         *row_ver.write_state() = RowPageState::Frozen;
         let dirty = AtomicBool::new(false);
 
@@ -2495,9 +2493,7 @@ pub(crate) mod tests {
     /// Expected: The missing index reports an invalid-index result.
     #[test]
     fn test_read_row_latest_inactive_index_returns_invalid_index() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
@@ -2510,9 +2506,7 @@ pub(crate) mod tests {
     /// Expected: Missing index metadata cannot match a row version.
     #[test]
     fn test_any_version_matches_key_inactive_index_returns_false() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
 
@@ -2520,25 +2514,22 @@ pub(crate) mod tests {
     }
 
     /// Purpose: Protect key matching without an undo chain.
-    /// Expected: The current page image matches the active index key.
+    /// Expected: The current page image matches only its own active index key.
     #[test]
     fn test_any_version_matches_key_latest_page_row_returns_true() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(10i32)]);
 
         assert!(access.any_version_matches_key(&metadata, key.index_slot, &key.vals));
+        assert!(!access.any_version_matches_key(&metadata, key.index_slot, &[Val::from(99i32)]));
     }
 
     /// Purpose: Protect unique-key history lookup through an inactive index.
     /// Expected: Missing index metadata yields no prior owner.
     #[test]
     fn test_find_old_version_for_unique_key_inactive_index_returns_none() {
-        let metadata = sparse_metadata();
-        let page = row_page(&metadata);
-        let row_ver = RowVersionMap::new(Arc::clone(&metadata.col), page.header.start_row_id, 4);
+        let (metadata, page, row_ver) = row_fixture();
         let access = test_row_read_access(&page, &row_ver, 0);
         let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
         let trx_ctx = test_trx_context(TrxID::new(1));

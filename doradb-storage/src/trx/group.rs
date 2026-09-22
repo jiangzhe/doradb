@@ -316,6 +316,33 @@ mod tests {
         }
     }
 
+    fn single_log_group(cts: TrxID) -> CommitGroup {
+        log_group(
+            cts,
+            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(cts)).unwrap(),
+        )
+    }
+
+    fn assert_logged_group_join(
+        initial_cts: TrxID,
+        candidate: PrecommitTrx,
+        expected_redo_end: TrxID,
+    ) {
+        let candidate_cts = candidate.cts;
+        let mut group = single_log_group(initial_cts);
+        assert!(matches!(group.try_join(candidate, false), Left(None)));
+        assert_eq!(
+            group.trx_list.iter().map(|trx| trx.cts).collect::<Vec<_>>(),
+            vec![initial_cts, candidate_cts]
+        );
+        assert_eq!(group.max_cts, candidate_cts);
+        assert_eq!(
+            group.log.as_ref().unwrap().group.redo_cts_range(),
+            (initial_cts, expected_redo_end)
+        );
+        assert!(group.trx_list.iter().all(|trx| trx.redo_bin.is_none()));
+    }
+
     fn no_log_group(cts: TrxID) -> CommitGroup {
         CommitGroup {
             trx_list: vec![precommit_no_log(cts)],
@@ -329,33 +356,24 @@ mod tests {
         trx.redo_bin.take();
     }
 
+    /// Purpose: Join a logged commit group without requesting a synchronous waiter.
+    /// Expected: The group accepts the transaction and advances its commit boundary without a listener.
     #[test]
     fn test_commit_group_join_without_sync_listener() {
-        let log_block_group =
-            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(1))).unwrap();
-        let mut group = log_group(TrxID::new(1), log_block_group);
-
-        assert!(matches!(
-            group.try_join(precommit(TrxID::new(2)), false),
-            Left(None)
-        ));
-        assert_eq!(group.trx_list.len(), 2);
-        assert_eq!(group.max_cts, TrxID::new(2));
-        for trx in &mut group.trx_list {
-            clear_redo(trx);
-        }
+        assert_logged_group_join(TrxID::new(1), precommit(TrxID::new(2)), TrxID::new(2));
     }
 
+    /// Purpose: Enforce the capacity boundary when appending redo to a commit group.
+    /// Expected: A rejected transaction retains its redo and leaves the existing group unchanged.
     #[test]
     fn test_commit_group_try_join_respects_capacity() {
-        let log_block_group =
-            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(100))).unwrap();
-        let mut group = log_group(TrxID::new(1), log_block_group);
+        let mut group = single_log_group(TrxID::new(1));
 
         let candidate1 = precommit_large(TrxID::new(2));
         assert!(matches!(group.try_join(candidate1, false), Left(None)));
         let trx_count = group.trx_list.len();
         let max_cts = group.max_cts;
+        let redo_range = group.log.as_ref().unwrap().group.redo_cts_range();
         let mut rejected = match group.try_join(precommit_large(TrxID::new(3)), false) {
             Left(_) => panic!("oversized redo trx must be rejected"),
             Right(rejected) => rejected,
@@ -364,12 +382,18 @@ mod tests {
         assert!(rejected.redo_bin.is_some());
         assert_eq!(group.trx_list.len(), trx_count);
         assert_eq!(group.max_cts, max_cts);
+        assert_eq!(
+            group.log.as_ref().unwrap().group.redo_cts_range(),
+            redo_range
+        );
         clear_redo(&mut rejected);
         for trx in &mut group.trx_list {
             clear_redo(trx);
         }
     }
 
+    /// Purpose: Preserve the no-log commit group's admission and synchronization rules.
+    /// Expected: Only no-log transactions join, and synchronization requires no redo writes or buffers.
     #[test]
     fn test_commit_group_no_log_join_rules() {
         let mut no_log_group = no_log_group(TrxID::new(1));
@@ -396,25 +420,19 @@ mod tests {
         assert_eq!(sync_group.outstanding_requests, 0);
     }
 
+    /// Purpose: Allow a no-log transaction to join a logged commit group.
+    /// Expected: The transaction joins successfully and advances the group's commit boundary.
     #[test]
     fn test_commit_group_log_group_accepts_no_log_transaction() {
-        let log_block_group =
-            LogBlockGroup::new(TEST_LOG_BLOCK_SIZE, redo_bin(TrxID::new(10))).unwrap();
-        let mut group = log_group(TrxID::new(10), log_block_group);
-
-        assert!(group.log.is_some());
-        assert!(matches!(
-            group.try_join(precommit_no_log(TrxID::new(11)), false),
-            Left(None)
-        ));
-        assert_eq!(group.trx_list.len(), 2);
-        assert_eq!(group.max_cts, TrxID::new(11));
-
-        for trx in &mut group.trx_list {
-            clear_redo(trx);
-        }
+        assert_logged_group_join(
+            TrxID::new(10),
+            precommit_no_log(TrxID::new(11)),
+            TrxID::new(10),
+        );
     }
 
+    /// Purpose: Isolate oversized redo in a multi-block commit group.
+    /// Expected: Further redo is rejected while no-log joins and aligned multi-block writes remain valid.
     #[test]
     fn test_commit_group_oversized_transaction_becomes_multi_block_group() {
         let oversized = redo_bin_oversized(TrxID::new(20));

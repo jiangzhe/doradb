@@ -1029,6 +1029,8 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// Purpose: Scope redo cleanup hook exclusivity to the owning engine.
+    /// Expected: Independent engines accept hooks while duplicate installation on one engine panics.
     #[test]
     fn redo_cleanup_before_unlink_hook_installation_is_exclusive() {
         let first_test = MaintenanceTestController::default();
@@ -1043,6 +1045,8 @@ pub(crate) mod tests {
         .expect_err("one engine must reject a duplicate redo cleanup hook");
     }
 
+    /// Purpose: Reclaim sealed empty redo at the start of a retained prefix.
+    /// Expected: The empty segment is eligible and the following unsealed segment blocks further truncation.
     #[test]
     fn sealed_empty_prefix_is_candidate() {
         let plan = plan_with_fallback(10, vec![], vec![], vec![sealed_empty(0), unsealed(1)]);
@@ -1060,6 +1064,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Reclaim sealed redo strictly below the earliest replay floor.
+    /// Expected: The eligible segment retains its original transaction range in the truncation plan.
     #[test]
     fn sealed_non_empty_below_global_floor_is_candidate() {
         let plan = plan_with_fallback(
@@ -1081,6 +1087,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Preserve redo at the exact live-table replay boundary.
+    /// Expected: The segment is retained and the limiting table floor is reported.
     #[test]
     fn sealed_non_empty_at_global_floor_reports_floor_blocker() {
         let plan = plan_with_fallback(
@@ -1101,6 +1109,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Explain every tied live and dropped-table floor blocking redo truncation.
+    /// Expected: The earliest floor is selected and all owners tied at that boundary are reported.
     #[test]
     fn sealed_non_empty_above_global_floor_reports_all_tied_floor_blockers() {
         let plan = plan_with_fallback(
@@ -1111,6 +1121,7 @@ pub(crate) mod tests {
         );
 
         assert_eq!(plan.global_floor, TrxID::new(7));
+        assert!(plan.candidates.is_empty());
         assert_eq!(
             plan.blockers,
             vec![
@@ -1134,6 +1145,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Preserve a redo segment needed for catalog replay.
+    /// Expected: No truncation candidate is produced and the catalog replay floor is reported.
     #[test]
     fn catalog_floor_blocks_catalog_unsafe_segment() {
         let plan = plan_with_fallback(10, vec![], vec![], vec![sealed_non_empty(0, 8, 12)]);
@@ -1147,6 +1160,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Use cached catalog safety when its retention marker and replay boundary match.
+    /// Expected: Catalog safety removes the catalog blocker while preserving the live-table blocker.
     #[test]
     fn valid_cached_catalog_progress_is_used() {
         let segments = vec![sealed_non_empty(0, 8, 12)];
@@ -1174,6 +1189,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
+        assert!(plan.candidates.is_empty());
         assert_eq!(
             plan.blockers,
             vec![RedoTruncationBlocker::LiveTableFloor {
@@ -1184,6 +1200,8 @@ pub(crate) mod tests {
         );
     }
 
+    /// Purpose: Reject cached catalog safety from a different retention marker or replay boundary.
+    /// Expected: Either mismatch discards the cached safe-segment evidence.
     #[test]
     fn stale_cached_catalog_progress_is_ignored() {
         let segments = vec![sealed_non_empty(0, 8, 12)];
@@ -1218,9 +1236,11 @@ pub(crate) mod tests {
         assert!(old_boundary_safe.is_empty());
     }
 
+    /// Purpose: Prevent truncation from starting at an unsealed redo segment.
+    /// Expected: The plan reports the unsealed blocker without producing a candidate.
     #[test]
     fn unsealed_segment_blocks_prefix_growth() {
-        let plan = plan_with_fallback(10, vec![], vec![], vec![unsealed(0)]);
+        let plan = plan_with_fallback(10, vec![], vec![], vec![unsealed(0), sealed_empty(1)]);
 
         assert!(plan.candidates.is_empty());
         assert_eq!(

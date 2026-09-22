@@ -244,6 +244,8 @@ mod tests {
         vec![Val::from(id), Val::from(name)]
     }
 
+    /// Purpose: Preserve input order and read-your-writes visibility in direct batch insertion.
+    /// Expected: Returned row identifiers follow input order and every inserted row is visible.
     #[test]
     fn test_direct_batch_insert_preserves_order_and_visibility() {
         smol::block_on(async {
@@ -260,7 +262,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(row_ids.windows(2).all(|pair| pair[0] < pair[1]));
+            assert_eq!(row_ids, vec![RowID::new(0), RowID::new(1), RowID::new(2)]);
             for (id, name) in [(1, "one"), (2, "two"), (3, "three")] {
                 let selected = trx
                     .table_lookup_unique_mvcc(
@@ -276,6 +278,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate an entire direct batch before acquiring write locks or inserting its prefix.
+    /// Expected: A malformed later row reports its position and leaves the valid prefix absent.
     #[test]
     fn test_direct_batch_validates_every_row_before_insert() {
         smol::block_on(async {
@@ -315,6 +319,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect atomicity when a direct batch encounters a duplicate key.
+    /// Expected: The inserted prefix is rolled back before the error returns and the transaction remains usable.
     #[test]
     fn test_direct_batch_duplicate_rolls_back_prefix_before_return() {
         smol::block_on(async {
@@ -349,6 +355,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reuse a transaction across no-op, empty batch, insertion, and stream operations.
+    /// Expected: Empty batches consume statement admission without allocating rows, and stream drop returns checkout.
     #[test]
     fn test_direct_noop_empty_batch_and_stream_reuse_transaction() {
         smol::block_on(async {
@@ -395,6 +403,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Keep resolved index operations on the direct generation-validation path.
+    /// Expected: Reads and mutations avoid index-map and retirement-registry lookups while preserving results.
     #[test]
     fn resolved_table_index_uses_direct_generation_validation() {
         smol::block_on(async {
@@ -669,6 +679,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve typed error context when constructing a stream for a missing table.
+    /// Expected: The error identifies the operation and table once and leaves the transaction reusable.
     #[test]
     fn test_table_scan_mvcc_stream_missing_table_preserves_typed_context() {
         smol::block_on(async {
@@ -707,6 +719,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Support infallible callback inference inside an engine-result operation.
+    /// Expected: Mutation and scan callbacks compose with engine errors and preserve the selected row.
     #[test]
     fn test_callback_infallible_inference_in_engine_result() {
         smol::block_on(async {

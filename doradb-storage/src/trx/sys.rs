@@ -2100,6 +2100,8 @@ pub(crate) mod tests {
         (entry, status)
     }
 
+    /// Purpose: Release the active redo file even when joining the log worker panics.
+    /// Expected: Shutdown closes the file before resuming the original panic and remains repeatable.
     #[test]
     fn redo_shutdown_releases_active_file_before_resuming_join_panic() {
         let observer = observe_spawn_named(|event| {
@@ -2142,6 +2144,8 @@ pub(crate) mod tests {
         drop(observer);
     }
 
+    /// Purpose: Merge catalog redo-retention evidence monotonically.
+    /// Expected: Older progress is ignored and matching-boundary updates retain the ordered segment union.
     #[test]
     fn test_catalog_redo_retention_progress_records_monotonic_merge() {
         smol::block_on(async {
@@ -2198,6 +2202,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Complete empty transactions on both the initiating thread and a worker thread.
+    /// Expected: Both commits succeed and engine teardown completes after session release.
     #[test]
     fn test_transaction_system() {
         smol::block_on(async {
@@ -2218,13 +2224,13 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             {
                 let trx = session.begin_trx().unwrap();
-                let _ = smol::block_on(trx.commit());
+                trx.commit().await.unwrap();
             }
             {
                 let mut session = engine.new_session().unwrap();
                 spawn(move || {
                     let trx = session.begin_trx().unwrap();
-                    let _ = smol::block_on(trx.commit());
+                    smol::block_on(trx.commit()).unwrap();
                 })
                 .join()
                 .unwrap();
@@ -2235,6 +2241,8 @@ pub(crate) mod tests {
         })
     }
 
+    /// Purpose: Arbitrate concurrent engine-poison publications.
+    /// Expected: Callers retain their own fatal reports while health checks expose one stored winner.
     #[test]
     fn test_poison_engine_concurrent_callers_share_first_error() {
         smol::block_on(async {
@@ -2301,6 +2309,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Wake registered poison listeners while preserving the first fatal cause.
+    /// Expected: Initial waiters complete and later poison publications do not replace the stored failure.
     #[test]
     fn test_poison_engine_listener_wakes_first_waiters() {
         smol::block_on(async {
@@ -2366,6 +2376,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Recover committed rows across redo file rotation.
+    /// Expected: Consecutive redo segments are created and reopening restores every committed row exactly.
     #[test]
     fn test_log_rotate() {
         const COUNT: i32 = 128;
@@ -2431,6 +2443,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Handle redo capacity exhaustion during system-transaction commit.
+    /// Expected: Commit returns the typed capacity error without panicking or poisoning the engine.
     #[test]
     fn test_commit_sys_new_log_allocation_failure_rejects_without_panic() {
         smol::block_on(async {
@@ -2455,6 +2469,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Allocate checkpoint timestamps without adding active transaction snapshots.
+    /// Expected: A valid timestamp is returned while the active snapshot registry remains empty.
     #[test]
     fn test_checkpoint_timestamp_is_not_registered_as_active() {
         smol::block_on(async {
@@ -2477,6 +2493,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep empty system transactions independent of user garbage-collection assignment.
+    /// Expected: Beginning system transactions leaves the user worker sequence unchanged.
     #[test]
     fn test_sys_trx_without_retirement_does_not_perturb_user_gc_sequence() {
         smol::block_on(async {
@@ -2494,6 +2512,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Require recovery-visible redo for system row-page retirement.
+    /// Expected: Committing retirement without redo panics at the owning invariant.
     #[test]
     #[should_panic(expected = "system row-page retirement requires recovery-visible redo")]
     fn test_commit_sys_asserts_gc_pages_without_redo() {
@@ -2514,6 +2534,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Clean up user precommit state when redo allocation exhausts file capacity.
+    /// Expected: The typed commit error preserves its resource cause and terminal cleanup releases the session.
     #[test]
     fn test_user_commit_new_log_allocation_failure_cleans_failed_precommit() {
         smol::block_on(async {
