@@ -1593,14 +1593,17 @@ mod tests {
     use crate::lock::tests::{LockDebugEntryState, debug_snapshot};
     use crate::lock::{FamilyLockAuthority, LockMode, LockOwner, LockResource, LockScopeState};
     use crate::row::ops::ScanRowDecision;
+    use crate::session::Session;
     use crate::session::tests::assert_checkpoint_published;
     use crate::table::tests::assert_freeze_created;
     use crate::table::{RowPageDescriptor, TableScanRootView, TableScanWorklist};
     use crate::trx::tests::{active_sts_contains, active_sts_count, test_engine};
     use crate::trx::{MAX_SNAPSHOT_TS, MvccVisibility};
     use crate::value::Val;
+    use std::future::Future;
     use std::iter::empty;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::pin;
     use std::sync::Barrier;
     use std::thread::scope;
     use tempfile::TempDir;
@@ -1802,6 +1805,42 @@ mod tests {
         )
     }
 
+    async fn snapshot_fixture(
+        log_file_stem: &str,
+    ) -> (TempDir, Engine, TableID, Session, ReadSnapshot) {
+        let (temp_dir, engine) = test_engine(log_file_stem).await;
+        let table_id = table2(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let snapshot = session
+            .begin_read_snapshot()
+            .unwrap()
+            .acquire_tables([table_id])
+            .await
+            .unwrap();
+        (temp_dir, engine, table_id, session, snapshot)
+    }
+
+    fn assert_snapshot_unavailable(snapshot: &ReadSnapshot) {
+        let error = match snapshot.checkout() {
+            Ok(_) => panic!("closed snapshot must reject checkout"),
+            Err(error) => error,
+        };
+        assert_lifecycle_or_fatal_lifecycle(error, LifecycleError::ReadSnapshotUnavailable);
+    }
+
+    async fn assert_notified_close_releases_runtime(
+        engine: &Engine,
+        close: impl Future<Output = Result<()>>,
+        checkout: ReadSnapshotCheckout,
+    ) {
+        let mut close = pin!(close);
+        assert!(futures::poll!(close.as_mut()).is_pending());
+        drop(checkout);
+        // The notified future deliberately remains unpolled during shutdown.
+        engine.try_shutdown().unwrap();
+        close.await.unwrap();
+    }
+
     async fn insert_test_rows(engine: &Engine, table_id: TableID, count: i32) {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
@@ -1837,6 +1876,8 @@ mod tests {
         Ok(rows)
     }
 
+    /// Purpose: Execute snapshot partitions on independent tasks while preserving scan order.
+    /// Expected: Invalid partition access is rejected and concatenated partition rows match the sequential scan.
     #[test]
     fn partition_streams_are_spawnable_ordered_and_repeatable() {
         smol::block_on(async {
@@ -1902,13 +1943,17 @@ mod tests {
             }
             drop(sequential_stream);
             trx.rollback().await.unwrap();
-            assert_eq!(concatenated, sequential);
+            let expected = (0..12).map(|key| vec![Val::from(key)]).collect::<Vec<_>>();
+            assert_eq!(concatenated, expected);
+            assert_eq!(sequential, expected);
 
             session.close().await.unwrap();
             engine.shutdown();
         });
     }
 
+    /// Purpose: Scan a snapshot spanning checkpointed cold rows and newly committed hot rows.
+    /// Expected: Both unit kinds are present and their partitions return the complete ordered row set.
     #[test]
     fn partition_stream_scans_mixed_cold_and_hot_units() {
         smol::block_on(async {
@@ -1986,6 +2031,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Retain snapshot execution ownership across repeated opens and facade drops.
+    /// Expected: Streams reproduce the partition and the active snapshot survives until the last stream completes.
     #[test]
     fn opened_streams_outlive_facades_and_repeat_the_same_partition() {
         smol::block_on(async {
@@ -2013,8 +2060,10 @@ mod tests {
             let first = plan.open(0).unwrap();
             let second = plan.open(0).unwrap();
             let (first, second) = futures::join!(drain_partition(first), drain_partition(second));
-            let expected = first.unwrap();
-            assert_eq!(expected, second.unwrap());
+            assert_eq!(plan.partition_count(), 1);
+            let expected = (0..4).map(|key| vec![Val::from(key)]).collect::<Vec<_>>();
+            assert_eq!(first.unwrap(), expected);
+            assert_eq!(second.unwrap(), expected);
             assert!(active_sts_contains(&engine.inner().trx_sys, sts));
 
             let third = plan.open(0).unwrap();
@@ -2028,6 +2077,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Propagate a partition execution failure at peer unit boundaries.
+    /// Expected: New work is rejected, the origin retains its error, and peers finish the current unit before aborting.
     #[test]
     fn first_execution_error_aborts_peers_only_at_unit_boundary() {
         smol::block_on(async {
@@ -2098,6 +2149,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Validate snapshot scan projections and restrict planning to acquired tables.
+    /// Expected: Invalid requests fail and a valid empty plan retains the snapshot's identity and projection.
     #[test]
     fn table_scan_plan_preparation_validates_projection_and_identity() {
         smol::block_on(async {
@@ -2159,6 +2212,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Apply engine scan configuration to a real snapshot worklist.
+    /// Expected: Hot-page weights and initial partition boundaries reflect the configured policy.
     #[test]
     fn custom_engine_scan_config_drives_real_snapshot_initial_partitions() {
         smol::block_on(async {
@@ -2234,11 +2289,14 @@ mod tests {
         });
     }
 
+    /// Purpose: Prepare equivalent plans concurrently from the same snapshot.
+    /// Expected: Physical planning results agree while each plan owns independent generation and admission state.
     #[test]
     fn repeated_and_concurrent_preparation_is_deterministic_with_independent_gates() {
         smol::block_on(async {
             let (_temp_dir, engine) = test_engine("table_scan_plan_repeatable_prepare").await;
             let table_id = table2(&engine).await;
+            insert_large_test_rows(&engine, table_id, 4).await;
             let mut session = engine.new_session().unwrap();
             let snapshot = session
                 .begin_read_snapshot()
@@ -2273,6 +2331,40 @@ mod tests {
             assert_eq!(first.generation, 0);
             assert_eq!(second.generation, 0);
             assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+            assert_eq!(first.shared.units.len(), 4);
+            assert_eq!(first.partition_offsets.as_ref(), [0, 4]);
+            let repartitioned = first
+                .repartition(NonZeroUsize::new(2).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(repartitioned.partition_offsets.as_ref(), [0, 2, 4]);
+            assert_eq!(repartitioned.generation, 1);
+            let first_error = match first.open(0) {
+                Ok(_) => panic!("repartitioned plan's prior generation must be stale"),
+                Err(error) => error,
+            };
+            assert_operation(first_error, OperationError::StaleTableScanPlan);
+            let stream = second.open(0).unwrap();
+            assert_operation(
+                second
+                    .repartition(NonZeroUsize::new(2).unwrap())
+                    .unwrap_err(),
+                OperationError::TableScanAlreadyOpened,
+            );
+            assert!(
+                repartitioned
+                    .repartition(NonZeroUsize::new(3).unwrap())
+                    .unwrap()
+                    .is_some()
+            );
+            let rows = drain_partition(stream).await.unwrap();
+            assert_eq!(
+                rows,
+                (0..4)
+                    .map(|key| vec![Val::from(key), Val::from(vec![b'x'; 40 * 1024])])
+                    .collect::<Vec<_>>()
+            );
+            drop(repartitioned);
 
             drop(first);
             drop(second);
@@ -2283,18 +2375,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Enforce generation and open-admission boundaries within a scan-plan family.
+    /// Expected: Repartition invalidates old generations, successful open seals the family, and generation overflow panics.
     #[test]
     fn table_scan_repartition_supersedes_generations_and_open_seals_family() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_generation").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_generation").await;
 
             let original = synthetic_hot_plan(&snapshot, table_id);
             let clone = original.clone();
@@ -2379,18 +2466,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Serialize concurrent repartition and execution admission on one plan family.
+    /// Expected: Exactly one operation wins and the loser receives the corresponding stale or already-opened error.
     #[test]
     fn table_scan_repartition_and_open_have_one_gate_winner() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_gate_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_gate_race").await;
             let plan = synthetic_hot_plan(&snapshot, table_id);
             let repartition_plan = plan.clone();
             let open_plan = plan.clone();
@@ -2424,18 +2506,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Separate inert plan metadata from snapshot resource ownership after explicit close.
+    /// Expected: Close releases snapshot registration despite retained plans, while ordinary drop waits for the final plan.
     #[test]
     fn table_scan_plan_liveness_is_resource_free_after_explicit_close() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_resource_free").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_resource_free").await;
             let sts = snapshot.sts();
             let plan = snapshot
                 .prepare_table_scan(
@@ -2483,18 +2560,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Cancel scan planning after worklist capture but before publication.
+    /// Expected: The counted checkout is returned and the snapshot remains reusable and closable.
     #[test]
     fn cancelled_table_scan_planning_returns_counted_checkout() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_cancel").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_cancel").await;
             let hook = engine
                 .inner()
                 .table_scan_plan_test
@@ -2518,18 +2590,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Close a snapshot while a captured scan plan awaits publication.
+    /// Expected: Publication is rejected and close releases the active snapshot after planning returns its checkout.
     #[test]
     fn explicit_snapshot_close_wins_against_final_plan_publication() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_explicit_close_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_explicit_close_race").await;
             let sts = snapshot.sts();
             let hook = engine
                 .inner()
@@ -2562,18 +2629,13 @@ mod tests {
         });
     }
 
+    /// Purpose: End a session while snapshot scan planning is paused before publication.
+    /// Expected: Explicit close and session abandonment both prevent plan publication and permit cleanup.
     #[test]
     fn session_close_and_abandonment_win_against_plan_publication() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_session_close_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, mut session, snapshot) =
+                snapshot_fixture("table_scan_plan_session_close_race").await;
             let hook = engine
                 .inner()
                 .table_scan_plan_test
@@ -2601,15 +2663,8 @@ mod tests {
         });
 
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_abandon_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, session, snapshot) =
+                snapshot_fixture("table_scan_plan_abandon_race").await;
             let hook = engine
                 .inner()
                 .table_scan_plan_test
@@ -2632,18 +2687,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Recheck engine poison and shutdown before publishing a captured scan plan.
+    /// Expected: Poison preserves its fatal cause and shutdown rejects publication until checkout cleanup completes.
     #[test]
     fn poison_and_shutdown_win_against_final_plan_publication() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_poison_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, session, snapshot) =
+                snapshot_fixture("table_scan_plan_poison_race").await;
             let hook = engine
                 .inner()
                 .table_scan_plan_test
@@ -2667,15 +2717,8 @@ mod tests {
         });
 
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("table_scan_plan_shutdown_race").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, table_id, session, snapshot) =
+                snapshot_fixture("table_scan_plan_shutdown_race").await;
             let hook = engine
                 .inner()
                 .table_scan_plan_test
@@ -2699,6 +2742,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Track private snapshot registrations independently through their lifetimes.
+    /// Expected: Registration advances timestamps and dropping each owner updates the oldest active snapshot.
     #[test]
     fn private_snapshot_registers_and_releases_active_sts() {
         smol::block_on(async {
@@ -2729,6 +2774,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve cleanup ownership when an unfinished snapshot terminal claim is dropped.
+    /// Expected: The payload returns to a completable state before the invariant panic and can release its registration.
     #[test]
     fn dropped_terminal_claim_restores_payload_before_asserting() {
         smol::block_on(async {
@@ -2782,6 +2829,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Acquire and reuse a shared snapshot over a deduplicated frozen table set.
+    /// Expected: Checkouts retain bound table identity and close releases metadata locks and registration for every facade.
     #[test]
     fn shared_snapshot_acquires_checks_out_reuses_and_closes() {
         smol::block_on(async {
@@ -2851,6 +2900,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject snapshot construction without any requested tables.
+    /// Expected: The typed input error releases the builder's active snapshot registration.
     #[test]
     fn empty_snapshot_input_drops_registered_sts() {
         smol::block_on(async {
@@ -2870,6 +2921,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Clean up snapshot builders abandoned before polling or failed during table acquisition.
+    /// Expected: Registrations and accepted metadata claims are released, including after a partially acquired prefix.
     #[test]
     fn builder_drop_unpolled_future_and_prefix_failure_cleanup() {
         smol::block_on(async {
@@ -2920,18 +2973,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve a group-wide close request after its waiting future is cancelled.
+    /// Expected: All facades reject new checkout and the final accepted checkout releases snapshot registration.
     #[test]
     fn cancelled_explicit_close_stays_group_wide_and_finishes_on_checkout_return() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_cancelled_close").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, mut session, snapshot) =
+                snapshot_fixture("shared_snapshot_cancelled_close").await;
             let dormant = snapshot.clone();
             let sts = snapshot.sts();
             let checkout = snapshot.checkout().unwrap();
@@ -2942,7 +2990,7 @@ mod tests {
                 std::task::Poll::Pending
             ));
             drop(close);
-            assert!(dormant.checkout().is_err());
+            assert_snapshot_unavailable(&dormant);
             assert!(active_sts_contains(&engine.inner().trx_sys, sts));
 
             drop(checkout);
@@ -2953,18 +3001,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Clean up a ready snapshot when its final facade is dropped.
+    /// Expected: Snapshot registration is released and the session admits a new transaction.
     #[test]
     fn final_facade_drop_requests_ready_snapshot_cleanup() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_final_facade").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, mut session, snapshot) =
+                snapshot_fixture("shared_snapshot_final_facade").await;
             let sts = snapshot.sts();
             drop(snapshot);
             assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
@@ -2976,6 +3019,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Abandon snapshot construction blocked on a metadata lock.
+    /// Expected: The build returns a lifecycle error and releases its registration and pending claim before blocker release.
     #[test]
     fn abandonment_aborts_blocked_metadata_wait_and_cancels_pending_claim() {
         smol::block_on(async {
@@ -3052,18 +3097,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Close a session while an accepted snapshot checkout remains in use.
+    /// Expected: Close blocks and rejects new checkout until the existing checkout returns and registration is released.
     #[test]
     fn session_close_waits_for_accepted_snapshot_checkout() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_session_close").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, mut session, snapshot) =
+                snapshot_fixture("shared_snapshot_session_close").await;
             let sts = snapshot.sts();
             let checkout = snapshot.checkout().unwrap();
 
@@ -3072,7 +3112,7 @@ mod tests {
                 futures::poll!(close.as_mut()),
                 std::task::Poll::Pending
             ));
-            assert!(snapshot.checkout().is_err());
+            assert_snapshot_unavailable(&snapshot);
             assert!(active_sts_contains(&engine.inner().trx_sys, sts));
 
             drop(checkout);
@@ -3083,99 +3123,57 @@ mod tests {
         });
     }
 
+    /// Purpose: Release snapshot-close runtime ownership when its accepted checkout returns.
+    /// Expected: Engine shutdown succeeds even while the notified close future remains unpolled.
     #[test]
     fn notified_snapshot_close_future_retains_no_hidden_shutdown_runtime() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_close_runtime_release").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, session, snapshot) =
+                snapshot_fixture("shared_snapshot_close_runtime_release").await;
             let checkout = snapshot.checkout().unwrap();
-
-            let mut close = Box::pin(snapshot.close());
-            assert!(matches!(
-                futures::poll!(close.as_mut()),
-                std::task::Poll::Pending
-            ));
-            drop(checkout);
-
-            // Keep the notified close future deliberately unpolled. Shutdown
-            // must still remove the idle session and release engine components.
-            engine.try_shutdown().unwrap();
-            close.await.unwrap();
+            assert_notified_close_releases_runtime(&engine, snapshot.close(), checkout).await;
             drop(session);
         });
     }
 
+    /// Purpose: Release session-close runtime ownership when its accepted snapshot checkout returns.
+    /// Expected: Engine shutdown succeeds before the notified session-close future is polled again.
     #[test]
     fn notified_session_close_future_retains_no_hidden_shutdown_runtime() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("session_close_runtime_release").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, mut session, snapshot) =
+                snapshot_fixture("session_close_runtime_release").await;
             let checkout = snapshot.checkout().unwrap();
-
-            let mut close = Box::pin(session.close());
-            assert!(matches!(
-                futures::poll!(close.as_mut()),
-                std::task::Poll::Pending
-            ));
-            drop(checkout);
-
-            // Snapshot terminal cleanup removed the close-requested session.
-            // The unpolled close future must retain only its independent listener.
-            engine.try_shutdown().unwrap();
-            close.await.unwrap();
+            assert_notified_close_releases_runtime(&engine, session.close(), checkout).await;
             drop(snapshot);
         });
     }
 
+    /// Purpose: Clean up a checked-in snapshot when its owning session is abandoned.
+    /// Expected: Registration is released and surviving snapshot facades reject checkout.
     #[test]
     fn session_abandonment_cleans_checked_in_snapshot() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_abandonment").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, session, snapshot) =
+                snapshot_fixture("shared_snapshot_abandonment").await;
             let sts = snapshot.sts();
             assert!(active_sts_contains(&engine.inner().trx_sys, sts));
 
             drop(session);
             assert!(!active_sts_contains(&engine.inner().trx_sys, sts));
-            assert!(snapshot.checkout().is_err());
+            assert_snapshot_unavailable(&snapshot);
             drop(snapshot);
             engine.shutdown();
         });
     }
 
+    /// Purpose: Reconcile a ready snapshot during a nonblocking shutdown attempt.
+    /// Expected: The first attempt reports its sampled lifecycle blocker after cleanup, and the next attempt succeeds.
     #[test]
     fn try_shutdown_cleans_ready_snapshot_then_reports_sampled_blocker() {
         smol::block_on(async {
-            let (_temp_dir, engine) = test_engine("shared_snapshot_try_shutdown").await;
-            let table_id = table2(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let snapshot = session
-                .begin_read_snapshot()
-                .unwrap()
-                .acquire_tables([table_id])
-                .await
-                .unwrap();
+            let (_temp_dir, engine, _table_id, session, snapshot) =
+                snapshot_fixture("shared_snapshot_try_shutdown").await;
             let sts = snapshot.sts();
 
             let first = engine.try_shutdown().unwrap_err();

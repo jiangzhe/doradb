@@ -1588,11 +1588,9 @@ mod tests {
     use crate::error::{FatalError, RuntimeError};
     use crate::id::{PageID, RowID, TableID};
     use crate::index::RowLocation;
-    use crate::latch::LatchFallbackMode;
-    use crate::row::RowPage;
     use crate::row::ops::SelectKey;
     use crate::session::tests::wait_for_purge_handoff;
-    use crate::table::tests::{bound_unique_index, trx_delete_row_by_id};
+    use crate::table::tests::trx_delete_row_by_id;
     use crate::table::{DeleteMarker, TableRedoReplayFloor};
     use crate::trx::tests::shared_trx_status;
     use crate::trx::undo::{OwnedRowUndo, RowUndoKind, RowUndoLogs};
@@ -1606,6 +1604,12 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy, Debug)]
+    enum MissingUndoPage {
+        Absent,
+        StaleGeneration,
+    }
 
     async fn no_index_table(engine: &Engine) -> TableID {
         engine
@@ -1883,11 +1887,18 @@ mod tests {
     }
 
     async fn collect_purge_cycle(event_rx: &Receiver<PurgeTestEvent>) -> Vec<PurgeTestEvent> {
+        collect_purge_events_until(event_rx, PurgeTestEvent::CycleCompleted).await
+    }
+
+    async fn collect_purge_events_until(
+        event_rx: &Receiver<PurgeTestEvent>,
+        boundary: PurgeTestEvent,
+    ) -> Vec<PurgeTestEvent> {
         let mut events = Vec::new();
         loop {
             let event = event_rx.recv_async().await.unwrap();
             events.push(event);
-            if event == PurgeTestEvent::CycleCompleted {
+            if event == boundary {
                 return events;
             }
         }
@@ -1967,6 +1978,161 @@ mod tests {
                 ),
             })),
         }
+    }
+
+    async fn assert_missing_page_delete_marker(
+        log_file_stem: &str,
+        value: i32,
+        page_case: MissingUndoPage,
+        committed: bool,
+    ) {
+        let (_temp_dir, engine) = purge_test_engine(log_file_stem, DEFAULT_GC_BUCKETS, 1).await;
+        let table_id = table1(&engine).await;
+        let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let row_id = trx
+            .table_insert_mvcc(table_id, vec![Val::from(value)])
+            .await
+            .unwrap();
+        let insert_cts = trx.commit().await.unwrap();
+        session
+            .wait_for_purge_completion_after(insert_cts)
+            .await
+            .unwrap();
+        let guards = full_pool_guards(&engine);
+        let page_id = match page_case {
+            MissingUndoPage::Absent => None,
+            MissingUndoPage::StaleGeneration => {
+                let current = row_page_identity(&table, &guards, row_id).await;
+                let stale = VersionedPageID {
+                    page_id: current.page_id,
+                    generation: current.generation.checked_add(1).unwrap(),
+                };
+                assert!(
+                    table
+                        .row_store
+                        .get_row_version_map(&guards, current)
+                        .await
+                        .is_some()
+                );
+                assert!(
+                    table
+                        .row_store
+                        .get_row_version_map(&guards, stale)
+                        .await
+                        .is_none()
+                );
+                Some(stale)
+            }
+        };
+        let marker_ts = if committed {
+            TrxID::new(100)
+        } else {
+            MIN_ACTIVE_TRX_ID + 1
+        };
+        let status = Arc::new(shared_trx_status(marker_ts));
+        table
+            .deletion_buffer()
+            .put_ref(row_id, Arc::clone(&status), MAX_SNAPSHOT_TS)
+            .unwrap();
+        assert!(matches!(table.deletion_buffer().get(row_id),
+            Some(DeleteMarker::Ref(actual)) if Arc::ptr_eq(&actual, &status)));
+        let mut row_undo = RowUndoLogs::empty();
+        row_undo.push(OwnedRowUndo::new(
+            NON_FOREGROUND_STMT_NO,
+            table_id,
+            page_id,
+            row_id,
+            RowUndoKind::delete(),
+        ));
+        // A later deletion can replace the marker belonging to this old undo.
+        // Its timestamp must come from the marker, not the purged transaction.
+        let trx = CommittedTrx {
+            cts: TrxID::new(90),
+            payload: Some(CommittedTrxPayload::User {
+                sts: TrxID::new(1),
+                gc_no: 0,
+                row_undo,
+                index_gc: vec![],
+            }),
+        };
+        engine
+            .inner()
+            .trx_sys
+            .purge_trx_list(
+                engine.inner().core.catalog(),
+                &guards,
+                vec![trx],
+                MAX_SNAPSHOT_TS,
+            )
+            .await
+            .unwrap();
+        match (committed, table.deletion_buffer().get(row_id)) {
+            (true, Some(DeleteMarker::Committed(ts))) => {
+                assert_eq!(ts, TrxID::new(100), "{page_case:?}")
+            }
+            (false, Some(DeleteMarker::Ref(actual))) => {
+                assert!(Arc::ptr_eq(&actual, &status), "{page_case:?}")
+            }
+            (_, Some(DeleteMarker::Committed(ts))) => panic!(
+                "unexpected compact marker: page={page_case:?}, committed={committed}, ts={ts}"
+            ),
+            (_, Some(DeleteMarker::Ref(_))) => {
+                panic!("marker was not promoted: page={page_case:?}")
+            }
+            (_, None) => panic!("marker disappeared: page={page_case:?}, committed={committed}"),
+        }
+    }
+
+    async fn assert_trx_purge_accounting(workers: usize) {
+        const PURGE_SIZE: usize = 100;
+        let (_temp_dir, engine) =
+            purge_test_engine("redo_purge", DEFAULT_GC_BUCKETS, workers).await;
+        let table_id = table1(&engine).await;
+        let mut session = engine.new_session().unwrap();
+        let initial_target = engine.inner().trx_sys.purge_handoff_cts();
+        session
+            .wait_for_purge_completion_after(initial_target)
+            .await
+            .unwrap();
+        let initial = engine.inner().trx_sys.trx_sys_stats();
+        let mut target = initial_target;
+        for i in 0..PURGE_SIZE {
+            let mut trx = session.begin_trx().unwrap();
+            trx.table_insert_mvcc(table_id, vec![Val::from(i as i32)])
+                .await
+                .unwrap();
+            target = trx.commit().await.unwrap();
+        }
+        for i in 0..PURGE_SIZE {
+            let mut trx = session.begin_trx().unwrap();
+            let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
+            trx_delete_row_by_id(&mut trx, table_id, &key)
+                .await
+                .unwrap();
+            target = trx.commit().await.unwrap();
+        }
+        session
+            .wait_for_purge_completion_after(target)
+            .await
+            .unwrap();
+        let stats = engine.inner().trx_sys.trx_sys_stats();
+        assert_eq!(
+            stats.purge_trx_count,
+            initial.purge_trx_count + PURGE_SIZE * 2,
+            "workers={workers}"
+        );
+        assert_eq!(
+            stats.purge_row_count,
+            initial.purge_row_count + PURGE_SIZE * 2,
+            "workers={workers}"
+        );
+        assert_eq!(
+            stats.purge_index_count,
+            initial.purge_index_count + PURGE_SIZE,
+            "workers={workers}"
+        );
     }
 
     /// Purpose: Keep dropped-file cleanup ordered during initialization and insertion.
@@ -2714,9 +2880,15 @@ mod tests {
             let (_temp_dir, engine) = purge_test_engine("redo_gc_routing", 2, 1).await;
             let mut sessions = Vec::new();
             let mut transactions = Vec::new();
-            for _ in 0..5 {
+            for index in 0..5 {
                 let mut session = engine.new_session().unwrap();
-                transactions.push(session.begin_trx().unwrap());
+                let mut trx = session.begin_trx().unwrap();
+                assert_eq!(
+                    trx.checkout().unwrap().inner().gc_no(),
+                    index % 2,
+                    "transaction={index}"
+                );
+                transactions.push(trx);
                 sessions.push(session);
             }
 
@@ -2900,406 +3072,48 @@ mod tests {
     /// Expected: The shared delete marker becomes the matching committed timestamp.
     #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_without_page_id() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(1)
-                            .log_file_stem("redo_purge_promote"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1001i32)])
-                .await
-                .unwrap();
-            trx.commit().await.unwrap();
-            drop(session);
-            let pool_guards = full_pool_guards(&engine);
-            let key = vec![Val::from(1001i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
-                .lookup(&key, MAX_SNAPSHOT_TS)
-                .await
-                .unwrap()
-            else {
-                panic!("row should exist");
-            };
-            let status = Arc::new(shared_trx_status(TrxID::new(100)));
-            table
-                .deletion_buffer()
-                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
-                .unwrap();
-
-            let mut row_undo = RowUndoLogs::empty();
-            row_undo.push(OwnedRowUndo::new(
-                NON_FOREGROUND_STMT_NO,
-                table.table_id(),
-                None,
-                row_id,
-                RowUndoKind::delete(),
-            ));
-            let trx = CommittedTrx {
-                cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload::User {
-                    sts: TrxID::new(1),
-                    gc_no: 0,
-                    row_undo,
-                    index_gc: vec![],
-                }),
-            };
-            {
-                let pool_guards = full_pool_guards(&engine);
-                engine
-                    .inner()
-                    .trx_sys
-                    .purge_trx_list(
-                        engine.inner().core.catalog(),
-                        &pool_guards,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            match table.deletion_buffer().get(row_id) {
-                Some(DeleteMarker::Committed(ts)) => assert_eq!(ts, status.ts()),
-                Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
-                None => panic!("delete marker should exist"),
-            }
-        });
+        smol::block_on(assert_missing_page_delete_marker(
+            "redo_purge_promote",
+            1001,
+            MissingUndoPage::Absent,
+            true,
+        ));
     }
 
     /// Purpose: Purge a delete with no row-page identity while its marker is uncommitted.
     /// Expected: The original shared delete marker remains unpromoted.
     #[test]
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_without_page_id() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(1)
-                            .log_file_stem("redo_purge_no_promote"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1002i32)])
-                .await
-                .unwrap();
-            trx.commit().await.unwrap();
-            drop(session);
-            let pool_guards = full_pool_guards(&engine);
-            let key = vec![Val::from(1002i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
-                .lookup(&key, MAX_SNAPSHOT_TS)
-                .await
-                .unwrap()
-            else {
-                panic!("row should exist");
-            };
-            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
-            table
-                .deletion_buffer()
-                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
-                .unwrap();
-
-            let mut row_undo = RowUndoLogs::empty();
-            row_undo.push(OwnedRowUndo::new(
-                NON_FOREGROUND_STMT_NO,
-                table.table_id(),
-                None,
-                row_id,
-                RowUndoKind::delete(),
-            ));
-            let trx = CommittedTrx {
-                cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload::User {
-                    sts: TrxID::new(1),
-                    gc_no: 0,
-                    row_undo,
-                    index_gc: vec![],
-                }),
-            };
-            {
-                let pool_guards = full_pool_guards(&engine);
-                engine
-                    .inner()
-                    .trx_sys
-                    .purge_trx_list(
-                        engine.inner().core.catalog(),
-                        &pool_guards,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            match table.deletion_buffer().get(row_id) {
-                Some(DeleteMarker::Ref(actual)) => {
-                    assert!(Arc::ptr_eq(&actual, &status));
-                }
-                Some(DeleteMarker::Committed(_)) => {
-                    panic!("uncommitted delete marker should remain as ref")
-                }
-                None => panic!("delete marker should exist"),
-            }
-        });
+        smol::block_on(assert_missing_page_delete_marker(
+            "redo_purge_no_promote",
+            1002,
+            MissingUndoPage::Absent,
+            false,
+        ));
     }
 
     /// Purpose: Purge a committed delete whose row-page generation is stale.
     /// Expected: The shared delete marker becomes the matching committed timestamp.
     #[test]
     fn test_purge_promote_delete_marker_if_committed_for_delete_with_missing_page_id() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(1)
-                            .log_file_stem("redo_purge_promote_missing_page"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1003i32)])
-                .await
-                .unwrap();
-            trx.commit().await.unwrap();
-            drop(session);
-            let pool_guards = full_pool_guards(&engine);
-            let key = vec![Val::from(1003i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
-                .lookup(&key, MAX_SNAPSHOT_TS)
-                .await
-                .unwrap()
-            else {
-                panic!("row should exist");
-            };
-            let page_id = match table
-                .find_row(&pool_guards, row_id)
-                .await
-                .expect("test row lookup should succeed")
-            {
-                RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
-            };
-            let page_guard = table
-                .row_store
-                .mem_pool()
-                .get_page::<RowPage>(
-                    &table.row_store.mem_pool().create_base_guard(),
-                    page_id,
-                    LatchFallbackMode::Shared,
-                )
-                .await
-                .expect("buffer-pool read failed in test");
-            let stale_page_id = VersionedPageID {
-                page_id,
-                generation: page_guard.bf().generation().saturating_add(1),
-            };
-            drop(page_guard);
-            let status = Arc::new(shared_trx_status(TrxID::new(100)));
-            table
-                .deletion_buffer()
-                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
-                .unwrap();
-
-            let mut row_undo = RowUndoLogs::empty();
-            row_undo.push(OwnedRowUndo::new(
-                NON_FOREGROUND_STMT_NO,
-                table.table_id(),
-                Some(stale_page_id),
-                row_id,
-                RowUndoKind::delete(),
-            ));
-            let trx = CommittedTrx {
-                cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload::User {
-                    sts: TrxID::new(1),
-                    gc_no: 0,
-                    row_undo,
-                    index_gc: vec![],
-                }),
-            };
-            {
-                let pool_guards = full_pool_guards(&engine);
-                engine
-                    .inner()
-                    .trx_sys
-                    .purge_trx_list(
-                        engine.inner().core.catalog(),
-                        &pool_guards,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            match table.deletion_buffer().get(row_id) {
-                Some(DeleteMarker::Committed(ts)) => assert_eq!(ts, status.ts()),
-                Some(DeleteMarker::Ref(_)) => panic!("delete marker should be promoted"),
-                None => panic!("delete marker should exist"),
-            }
-        });
+        smol::block_on(assert_missing_page_delete_marker(
+            "redo_purge_promote_missing_page",
+            1003,
+            MissingUndoPage::StaleGeneration,
+            true,
+        ));
     }
 
     /// Purpose: Purge a delete with a stale page generation and uncommitted marker.
     /// Expected: The original shared delete marker remains unpromoted.
     #[test]
     fn test_purge_skip_promote_delete_marker_if_uncommitted_for_delete_with_missing_page_id() {
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(1)
-                            .log_file_stem("redo_purge_no_promote_missing_page"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let table = engine.inner().core.catalog().get_table(table_id).unwrap();
-            let mut session = engine.new_session().unwrap();
-            let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1004i32)])
-                .await
-                .unwrap();
-            trx.commit().await.unwrap();
-            drop(session);
-            let pool_guards = full_pool_guards(&engine);
-            let key = vec![Val::from(1004i32)];
-            let Some((row_id, _)) = bound_unique_index(&table, &pool_guards, IndexSlot::new(0))
-                .lookup(&key, MAX_SNAPSHOT_TS)
-                .await
-                .unwrap()
-            else {
-                panic!("row should exist");
-            };
-            let page_id = match table
-                .find_row(&pool_guards, row_id)
-                .await
-                .expect("test row lookup should succeed")
-            {
-                RowLocation::RowPage(page_id) => page_id,
-                RowLocation::LwcBlock(..) | RowLocation::NotFound => unreachable!(),
-            };
-            let page_guard = table
-                .row_store
-                .mem_pool()
-                .get_page::<RowPage>(
-                    &table.row_store.mem_pool().create_base_guard(),
-                    page_id,
-                    LatchFallbackMode::Shared,
-                )
-                .await
-                .expect("buffer-pool read failed in test");
-            let stale_page_id = VersionedPageID {
-                page_id,
-                generation: page_guard.bf().generation().saturating_add(1),
-            };
-            drop(page_guard);
-            let status = Arc::new(shared_trx_status(MIN_ACTIVE_TRX_ID + 1));
-            table
-                .deletion_buffer()
-                .put_ref(row_id, status.clone(), MAX_SNAPSHOT_TS)
-                .unwrap();
-
-            let mut row_undo = RowUndoLogs::empty();
-            row_undo.push(OwnedRowUndo::new(
-                NON_FOREGROUND_STMT_NO,
-                table.table_id(),
-                Some(stale_page_id),
-                row_id,
-                RowUndoKind::delete(),
-            ));
-            let trx = CommittedTrx {
-                cts: TrxID::new(100),
-                payload: Some(CommittedTrxPayload::User {
-                    sts: TrxID::new(1),
-                    gc_no: 0,
-                    row_undo,
-                    index_gc: vec![],
-                }),
-            };
-            {
-                let pool_guards = full_pool_guards(&engine);
-                engine
-                    .inner()
-                    .trx_sys
-                    .purge_trx_list(
-                        engine.inner().core.catalog(),
-                        &pool_guards,
-                        vec![trx],
-                        MAX_SNAPSHOT_TS,
-                    )
-                    .await
-                    .unwrap();
-            }
-
-            match table.deletion_buffer().get(row_id) {
-                Some(DeleteMarker::Ref(actual)) => {
-                    assert!(Arc::ptr_eq(&actual, &status));
-                }
-                Some(DeleteMarker::Committed(_)) => {
-                    panic!("uncommitted delete marker should remain as ref")
-                }
-                None => panic!("delete marker should exist"),
-            }
-        });
+        smol::block_on(assert_missing_page_delete_marker(
+            "redo_purge_no_promote_missing_page",
+            1004,
+            MissingUndoPage::StaleGeneration,
+            false,
+        ));
     }
 
     /// Purpose: Observe purge when the completed horizon has not advanced.
@@ -3437,17 +3251,17 @@ mod tests {
             engine.inner().trx_sys.set_purge_test_observer(event_tx);
 
             later.commit().await.unwrap();
+            let events = collect_purge_cycle(&event_rx).await;
             assert_eq!(
-                recv_purge_plan(&event_rx).await,
-                PurgeTestEvent::Planned {
-                    transaction_gc: false,
-                    advance_completed_horizon: false,
-                }
-            );
-            assert!(
-                event_rx
-                    .try_iter()
-                    .all(|event| !matches!(event, PurgeTestEvent::BucketStarted { .. }))
+                events,
+                vec![
+                    PurgeTestEvent::PreScan,
+                    PurgeTestEvent::Planned {
+                        transaction_gc: false,
+                        advance_completed_horizon: false,
+                    },
+                    PurgeTestEvent::CycleCompleted,
+                ]
             );
 
             oldest.rollback().await.unwrap();
@@ -3560,15 +3374,14 @@ mod tests {
             engine.inner().trx_sys.allocate_snapshot_fence();
             engine.inner().trx_sys.request_purge_observation();
             blocked_rx.recv_async().await.unwrap();
-            recv_purge_event(&event_rx, |event| {
-                *event == (PurgeTestEvent::BucketCompleted { gc_no: 0 })
-            })
-            .await;
+            let mut blocked_events =
+                collect_purge_events_until(&event_rx, PurgeTestEvent::BucketCompleted { gc_no: 0 })
+                    .await;
             assert_eq!(
                 engine.inner().trx_sys.global_visible_sts(),
                 initial_completed
             );
-            let blocked_events = event_rx.try_iter().collect::<Vec<_>>();
+            blocked_events.extend(event_rx.try_iter());
             assert!(blocked_events.iter().all(|event| !matches!(
                 event,
                 PurgeTestEvent::RetirementStarted
@@ -3618,9 +3431,10 @@ mod tests {
 
                 engine.inner().trx_sys.allocate_snapshot_fence();
                 engine.inner().trx_sys.request_purge_observation();
-                recv_purge_event(&event_rx, |event| {
-                    *event == (PurgeTestEvent::BucketFailed { gc_no: fail_gc_no })
-                })
+                let mut events = collect_purge_events_until(
+                    &event_rx,
+                    PurgeTestEvent::BucketFailed { gc_no: fail_gc_no },
+                )
                 .await;
                 wait_for_purge_poison(&engine.inner().trx_sys).await;
                 assert!(
@@ -3637,7 +3451,7 @@ mod tests {
                 );
                 engine.shutdown();
 
-                let events = event_rx.try_iter().collect::<Vec<_>>();
+                events.extend(event_rx.try_iter());
                 assert!(events.iter().all(|event| !matches!(
                     event,
                     PurgeTestEvent::RetirementStarted
@@ -3864,150 +3678,14 @@ mod tests {
     /// Expected: Completion accounts for all transaction, row, and index undo work.
     #[test]
     fn test_trx_purge_one_worker() {
-        use crate::catalog::tests::table1;
-
-        const PURGE_SIZE: usize = 100;
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(1)
-                            .log_file_stem("redo_purge"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
-            session
-                .wait_for_purge_completion_after(initial_target)
-                .await
-                .unwrap();
-            let init_stats = engine.inner().trx_sys.trx_sys_stats();
-            let mut purge_target = initial_target;
-            // insert
-            for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
-                let res = trx
-                    .table_insert_mvcc(table_id, vec![Val::from(i as i32)])
-                    .await;
-                assert!(res.is_ok());
-                purge_target = trx.commit().await.unwrap();
-            }
-            // delete
-            for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
-                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-                assert!(res.is_ok());
-                purge_target = trx.commit().await.unwrap();
-            }
-
-            session
-                .wait_for_purge_completion_after(purge_target)
-                .await
-                .unwrap();
-            let stats = engine.inner().trx_sys.trx_sys_stats();
-            assert_eq!(
-                stats.purge_trx_count,
-                init_stats.purge_trx_count + PURGE_SIZE * 2
-            );
-            assert_eq!(
-                stats.purge_row_count,
-                init_stats.purge_row_count + PURGE_SIZE * 2
-            );
-            assert_eq!(
-                stats.purge_index_count,
-                init_stats.purge_index_count + PURGE_SIZE
-            );
-            drop(session);
-        });
+        smol::block_on(assert_trx_purge_accounting(1));
     }
 
     /// Purpose: Reclaim committed insert and delete history with multiple purge workers.
     /// Expected: Completion accounts for all transaction, row, and index undo work.
     #[test]
     fn test_trx_purge_multi_threads() {
-        use crate::catalog::tests::table1;
-
-        smol::block_on(async {
-            const PURGE_SIZE: usize = 100;
-            let temp_dir = TempDir::new().unwrap();
-            let main_dir = temp_dir.path().to_path_buf();
-            let engine = Engine::bootstrap(
-                EngineConfig::default()
-                    .storage_root(main_dir)
-                    .data_buffer(
-                        EvictableBufferPoolConfig::default()
-                            .max_mem_size(64usize * 1024 * 1024)
-                            .max_file_size(128usize * 1024 * 1024),
-                    )
-                    .trx(
-                        TrxSysConfig::default()
-                            .purge_threads(2)
-                            .log_file_stem("redo_purge"),
-                    ),
-            )
-            .await
-            .unwrap();
-
-            let table_id = table1(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let initial_target = engine.inner().trx_sys.purge_handoff_cts();
-            session
-                .wait_for_purge_completion_after(initial_target)
-                .await
-                .unwrap();
-            let init_stats = engine.inner().trx_sys.trx_sys_stats();
-            let mut purge_target = initial_target;
-            // insert
-            for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
-                let res = trx
-                    .table_insert_mvcc(table_id, vec![Val::from(i as i32)])
-                    .await;
-                assert!(res.is_ok());
-                purge_target = trx.commit().await.unwrap();
-            }
-            // delete
-            for i in 0..PURGE_SIZE {
-                let mut trx = session.begin_trx().unwrap();
-                let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as i32)]);
-                let res = trx_delete_row_by_id(&mut trx, table_id, &key).await;
-                assert!(res.is_ok());
-                purge_target = trx.commit().await.unwrap();
-            }
-
-            session
-                .wait_for_purge_completion_after(purge_target)
-                .await
-                .unwrap();
-            let stats = engine.inner().trx_sys.trx_sys_stats();
-            assert_eq!(
-                stats.purge_trx_count,
-                init_stats.purge_trx_count + PURGE_SIZE * 2
-            );
-            assert_eq!(
-                stats.purge_row_count,
-                init_stats.purge_row_count + PURGE_SIZE * 2
-            );
-            assert_eq!(
-                stats.purge_index_count,
-                init_stats.purge_index_count + PURGE_SIZE
-            );
-            drop(session);
-        });
+        smol::block_on(assert_trx_purge_accounting(2));
     }
 
     /// Purpose: Purge evicted row undo with only the dispatcher worker.

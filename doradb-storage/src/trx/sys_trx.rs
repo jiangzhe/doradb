@@ -212,6 +212,8 @@ pub(crate) fn retirement_gc_no(table_id: TableID, gc_buckets: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// Purpose: Preserve retired row pages when preparing a system transaction.
+    /// Expected: Preparation stores the retirement batch in the system payload variant.
     #[test]
     fn test_sys_gc_prepare_uses_system_payload_variant() {
         let mut sys_trx = SysTrx {
@@ -235,16 +237,25 @@ mod tests {
         prepared.payload.take();
     }
 
+    /// Purpose: Route table retirement consistently across garbage-collection workers.
+    /// Expected: Table identifiers map to their assigned worker and wrap at the worker-count boundary.
     #[test]
     fn test_retirement_gc_no_is_table_affine() {
-        let table_id = TableID::new(91);
-        assert_eq!(
-            retirement_gc_no(table_id, 32),
-            retirement_gc_no(table_id, 32)
-        );
-        assert_eq!(
-            retirement_gc_no(table_id, 32),
-            retirement_gc_no(TableID::new(table_id.as_u64() + 32,), 32)
-        );
+        for (table_id, workers, expected) in [
+            (0, 32, 0),
+            (31, 32, 31),
+            (32, 32, 0),
+            (91, 32, 27),
+            (123, 32, 27),
+            (91, 1, 0),
+            (91, 3, 1),
+            (u64::MAX, 32, 31),
+        ] {
+            assert_eq!(
+                retirement_gc_no(TableID::new(table_id), workers),
+                expected,
+                "table_id={table_id}, workers={workers}",
+            );
+        }
     }
 }

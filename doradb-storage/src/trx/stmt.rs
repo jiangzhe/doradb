@@ -1516,6 +1516,7 @@ pub(crate) mod tests {
     use crate::trx::{MIN_ACTIVE_TRX_ID, PrivateTransaction, Transaction};
     use error_stack::Report;
     use futures::FutureExt;
+    use std::any::Any;
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr::from_ref;
@@ -1865,6 +1866,15 @@ pub(crate) mod tests {
         assert!(effects.redo.is_empty());
     }
 
+    fn assert_catalog_invariant_panic(panic: Box<dyn Any + Send>, expected: &str) {
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("catalog invariant panic should contain a string diagnostic");
+        assert!(message.contains(expected), "unexpected panic: {message}");
+    }
+
     fn assert_catalog_runtime_stack(err: &Report<RuntimeError>, operation: &str) {
         assert_eq!(*err.current_context(), RuntimeError::CatalogAccess);
         assert_eq!(
@@ -1917,6 +1927,8 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    /// Purpose: Preserve exact index identity through in-memory user-table mutation and rollback.
+    /// Expected: Recorded undo targets the original index and rollback restores the prior key without residual keys.
     #[test]
     fn test_memory_user_layout_preserves_exact_identity_through_mutation_and_rollback() {
         use crate::buffer::PoolRole;
@@ -2087,6 +2099,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Initialize statement effects without pending work.
+    /// Expected: Undo, deferred index updates, and redo buffers are empty.
     #[test]
     fn test_stmt_effects_empty() {
         let effects = empty_stmt_effects();
@@ -2095,6 +2109,8 @@ pub(crate) mod tests {
 
     // Owned-runner coverage: exact statement-number allocation is inspected
     // through raw statement effects across success and failure.
+    /// Purpose: Allocate statement numbers across successful and failed public statements.
+    /// Expected: Each statement consumes the next number and a new transaction restarts the sequence.
     #[test]
     fn test_public_statements_consume_monotonic_statement_numbers() {
         smol::block_on(async {
@@ -2140,6 +2156,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Transfer cancelled statement undo into transaction cleanup ownership.
+    /// Expected: Existing undo precedes the retained statement undo while cancelled redo is discarded.
     #[test]
     fn test_cancelled_stmt_effects_fold_undo_and_discard_redo() {
         let mut trx_effects = TrxEffects::empty();
@@ -2194,6 +2212,8 @@ pub(crate) mod tests {
         trx_effects.clear_for_rollback();
     }
 
+    /// Purpose: Preserve the current undo entry when index or row rollback is cancelled.
+    /// Expected: Dropping a paused rollback future leaves its pending entry owned by statement effects.
     #[test]
     fn test_cancelled_undo_rollback_retains_current_entries() {
         smol::block_on(async {
@@ -2245,6 +2265,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Apply catalog callback decisions while preserving statement isolation and original redo keys.
+    /// Expected: No-ops and callback errors preserve prior effects, and key-changing mutations retain the original redo key.
     #[test]
     fn test_catalog_callback_actions_redo_and_runtime_rollback() {
         smol::block_on(async {
@@ -2391,6 +2413,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Preserve catalog statement atomicity across replacement allocation and batch failures.
+    /// Expected: Failed statements restore their prefix without disturbing earlier work, and successful replacements remain visible.
     #[test]
     fn test_catalog_replacement_allocation_failure_and_batch_atomicity() {
         use crate::buffer::BufferPool;
@@ -2545,6 +2569,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce catalog callback action and payload invariants for vacant and occupied keys.
+    /// Expected: Invalid decisions are rejected after exactly one callback invocation.
     #[test]
     fn test_catalog_callback_always_validates_actions_and_payloads() {
         smol::block_on(async {
@@ -2595,9 +2621,9 @@ pub(crate) mod tests {
                 ))
                 .catch_unwind()
                 .await;
-                assert!(
-                    panic.is_err(),
-                    "invalid catalog decision must violate its invariant"
+                assert_catalog_invariant_panic(
+                    panic.expect_err("invalid catalog decision must violate its invariant"),
+                    "catalog mutation invariant violated",
                 );
                 assert_eq!(calls.get(), 1);
                 trx.rollback().await;
@@ -2605,35 +2631,40 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Enforce the error domains permitted at native catalog mutation boundaries.
+    /// Expected: Impossible operation or lifecycle failures panic while supported insert races retain their operation errors.
     #[test]
     fn test_catalog_native_impossible_domains_violate_invariant() {
         let table_id = TableID::new(42);
 
         let operation: OperationResult<()> = Err(Report::new(OperationError::InvalidDmlInput));
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 assert_catalog_operation_invariant(table_id, operation)
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation invariant violated",
         );
 
         let lock: OperationOrFatalResult<()> =
             Err(Report::new(OperationError::LockFamilyConflict).into());
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = narrow_catalog_operation_or_fatal(table_id, lock);
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation invariant violated",
         );
 
         let insert: QuadResult<()> = Err(Report::new(OperationError::DuplicateKey).into());
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = narrow_catalog_quad_result(table_id, insert, || {
                     "operation=test_catalog_insert".to_owned()
                 });
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation invariant violated",
         );
 
         for expected in [OperationError::DuplicateKey, OperationError::WriteConflict] {
@@ -2650,37 +2681,42 @@ pub(crate) mod tests {
 
         let unexpected_insert: QuadResult<()> =
             Err(Report::new(OperationError::InvalidDmlInput).into());
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = preserve_expected_catalog_insert_error(table_id, unexpected_insert, || {
                     "operation=test_unexpected_catalog_insert".to_owned()
                 });
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation invariant violated",
         );
 
         let delete_operation: QuadResult<()> =
             Err(Report::new(OperationError::WriteConflict).into());
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = narrow_catalog_quad_result(table_id, delete_operation, || {
                     "operation=test_catalog_delete".to_owned()
                 });
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation invariant violated",
         );
 
         let delete_lifecycle: QuadResult<()> = Err(Report::new(LifecycleError::Shutdown).into());
-        assert!(
+        assert_catalog_invariant_panic(
             catch_unwind(AssertUnwindSafe(|| {
                 let _ = narrow_catalog_quad_result(table_id, delete_lifecycle, || {
                     "operation=test_catalog_delete".to_owned()
                 });
             }))
-            .is_err()
+            .expect_err("impossible catalog error must violate its invariant"),
+            "catalog mutation lifecycle invariant violated",
         );
     }
 
+    /// Purpose: Add catalog context without losing an underlying runtime failure.
+    /// Expected: Insert and delete narrowing retain the resource cause and boundary diagnostics.
     #[test]
     fn test_catalog_native_runtime_errors_preserve_stack() {
         let table_id = TableID::new(42);
@@ -2712,6 +2748,8 @@ pub(crate) mod tests {
         assert_catalog_runtime_stack(&err, "operation=test_catalog_delete");
     }
 
+    /// Purpose: Preserve fatal errors through catalog lock and mutation narrowing.
+    /// Expected: The original fatal classification and source survive with the consuming operation's context.
     #[test]
     fn test_catalog_native_fatal_errors_preserve_first_source() {
         let table_id = TableID::new(42);
@@ -2737,6 +2775,8 @@ pub(crate) mod tests {
         assert!(format!("{err:?}").contains("operation=test_catalog_delete"));
     }
 
+    /// Purpose: Roll back only the current private statement after a catalog runtime failure.
+    /// Expected: The failed statement's inserted prefix disappears while earlier transaction work remains visible.
     #[test]
     fn test_private_statement_runtime_error_rolls_back_current_catalog_prefix() {
         smol::block_on(async {
@@ -2808,6 +2848,8 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject catalog primary-key mutation through a non-primary selector.
+    /// Expected: The operation panics with the catalog mutation invariant diagnostic.
     #[test]
     fn test_catalog_delete_primary_key_mvcc_rejects_non_primary_key() {
         smol::block_on(async {
@@ -2832,20 +2874,14 @@ pub(crate) mod tests {
             .catch_unwind()
             .await
             .expect_err("non-primary catalog delete must violate the catalog invariant");
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            assert!(
-                message.contains("catalog mutation invariant violated"),
-                "unexpected panic: {message}"
-            );
+            assert_catalog_invariant_panic(panic, "catalog mutation invariant violated");
             trx.rollback().await;
             engine.shutdown();
         });
     }
 
+    /// Purpose: Preserve storage-fatal rollback failures over an initiating statement error.
+    /// Expected: Index and row failures retain residual undo and their fatal source without replacing prior engine poison.
     #[test]
     fn test_statement_rollback_preserves_storage_fatal() {
         use crate::trx::undo::tests::{
@@ -2908,6 +2944,8 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Stop statement rollback when index reversal fails before row reversal.
+    /// Expected: Fatal cleanup retains row undo, releases locks, poisons the engine, and prevents transaction commit.
     #[test]
     fn test_statement_index_rollback_failure_poisons_and_discards_transaction() {
         use crate::trx::undo::tests::{RollbackTarget, stage_rollback_test_effects};

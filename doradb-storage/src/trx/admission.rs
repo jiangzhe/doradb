@@ -483,6 +483,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Reject resolved index tokens after their bound layout is replaced.
+    /// Expected: Stale generation validation fails before index execution.
     #[test]
     fn stale_resolved_token_rejects_replacement_generation_before_execution() {
         smol::block_on(async {
@@ -540,6 +542,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the metadata lifetime of a transaction's first table read.
+    /// Expected: Binding holds a shared metadata claim until terminal rollback.
     #[test]
     fn first_read_installs_binding_under_transaction_metadata_lock() {
         smol::block_on(async {
@@ -579,6 +583,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Preserve metadata admission across retries for a missing table.
+    /// Expected: Retries reuse the retained claim without binding, and rollback releases it.
     #[test]
     fn missing_table_retry_reuses_retained_transaction_metadata_claim() {
         smol::block_on(async {
@@ -630,6 +636,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect first-touch admission when the requested index is missing.
+    /// Expected: Lookup fails without binding while retaining the metadata claim until rollback.
     #[test]
     fn missing_index_installs_no_binding_but_retains_transaction_metadata_claim() {
         smol::block_on(async {
@@ -662,6 +670,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Cancel stream construction after metadata admission has succeeded.
+    /// Expected: Checkout returns for reuse while the accepted claim survives until rollback.
     #[test]
     fn cancelled_stream_constructor_returns_checkout_and_retains_claim_until_rollback() {
         smol::block_on(async {
@@ -719,6 +729,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject first writes from transactions predating either kind of new index.
+    /// Expected: Retries retain only the metadata claim, blocking DDL until rollback releases it.
     #[test]
     fn stale_write_first_rejects_binding_but_retains_transaction_metadata_lock() {
         smol::block_on(async {
@@ -803,6 +815,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Restrict an old reader to indexes shared by its snapshot and current metadata.
+    /// Expected: Surviving indexes remain readable, while new indexes and stale writes are rejected.
     #[test]
     fn read_intersection_rejects_both_new_index_kinds_and_later_write() {
         smol::block_on(async {
@@ -919,6 +933,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Serialize index creation with an existing transaction binding.
+    /// Expected: Metadata and root publication wait for the binding's metadata claim to be released.
     #[test]
     fn bound_transaction_makes_create_index_metadata_lock_wait() {
         smol::block_on(async {
@@ -974,6 +990,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Serialize index removal with an existing transaction binding.
+    /// Expected: The live index remains unchanged until commit releases the binding's metadata claim.
     #[test]
     fn bound_transaction_makes_drop_index_metadata_lock_wait() {
         smol::block_on(async {
@@ -1067,6 +1085,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Serialize table removal with an existing transaction binding.
+    /// Expected: The runtime remains live until rollback releases its binding and metadata claim.
     #[test]
     fn bound_transaction_makes_drop_table_metadata_lock_wait() {
         smol::block_on(async {
@@ -1116,6 +1136,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject first access to a removed index despite snapshot-visible predecessor metadata.
+    /// Expected: Schema validation installs no binding or data lock and retains metadata until rollback.
     #[test]
     fn untouched_old_transaction_cannot_bind_removed_index() {
         smol::block_on(async {
@@ -1204,6 +1226,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject first access to a dropped table despite snapshot-visible predecessor metadata.
+    /// Expected: Schema validation installs no binding or data lock and retains metadata until rollback.
     #[test]
     fn untouched_old_transaction_cannot_bind_dropped_table() {
         smol::block_on(async {
