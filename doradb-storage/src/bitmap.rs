@@ -679,10 +679,13 @@ pub(crate) const fn bitmap_required_units(count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
-    use std::sync::Arc;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
+    /// Purpose: Protect initialization of whole-word bitmaps.
+    /// Expected: Requested storage is allocated with every bit clear.
     #[test]
     fn test_bitmap_new() {
         let bm = new_bitmap(64);
@@ -695,6 +698,8 @@ mod tests {
         assert_eq!(bm[1], 0);
     }
 
+    /// Purpose: Protect bit reads at word boundaries.
+    /// Expected: Reads reflect the state of each selected boundary bit.
     #[test]
     fn test_bitmap_get_bit() {
         let mut bm = new_bitmap(128);
@@ -714,6 +719,8 @@ mod tests {
         assert!(bm.bitmap_get(127));
     }
 
+    /// Purpose: Protect word reads after boundary-bit updates.
+    /// Expected: Each word exposes the expected bit positions.
     #[test]
     fn test_bitmap_get_unit() {
         let mut bm = new_bitmap(128);
@@ -729,6 +736,8 @@ mod tests {
         assert_eq!(bm.bitmap_unit(1), 1 | (1 << 63));
     }
 
+    /// Purpose: Protect the immutable bitmap word view.
+    /// Expected: The view spans all initialized backing words.
     #[test]
     fn test_bitmap_units() {
         let bm = new_bitmap(128);
@@ -738,6 +747,8 @@ mod tests {
         assert_eq!(units[1], 0);
     }
 
+    /// Purpose: Protect mutation through the bitmap word view.
+    /// Expected: Writes through the view update the backing bitmap.
     #[test]
     fn test_bitmap_units_mut() {
         let mut bm = new_bitmap(128);
@@ -749,6 +760,8 @@ mod tests {
         assert_eq!(bm[1], 0xFFFF);
     }
 
+    /// Purpose: Protect setting bits across word boundaries.
+    /// Expected: Only newly set bits report a change and unrelated bits remain clear.
     #[test]
     fn test_bitmap_set_bit() {
         let mut bm = new_bitmap(128);
@@ -764,6 +777,8 @@ mod tests {
         assert_eq!(bm[1], 1 | (1 << 63));
     }
 
+    /// Purpose: Protect clearing bits across word boundaries.
+    /// Expected: Only previously set bits report a change and the words become clear.
     #[test]
     fn test_bitmap_unset_bit() {
         let mut bm = new_bitmap(128);
@@ -784,6 +799,8 @@ mod tests {
         assert_eq!(bm[1], 0);
     }
 
+    /// Purpose: Protect allocation past a full bitmap word.
+    /// Expected: The first free bit is set and a full bitmap reports exhaustion.
     #[test]
     fn test_bitmap_set_first() {
         let mut bm = new_bitmap(128);
@@ -805,6 +822,8 @@ mod tests {
         assert_eq!(bm.bitmap_set_first(0, 2), None);
     }
 
+    /// Purpose: Protect the bitmap indexing boundary.
+    /// Expected: Reading past allocated storage panics.
     #[test]
     #[should_panic(expected = "index out of bounds")]
     fn test_bitmap_out_of_bounds() {
@@ -812,32 +831,29 @@ mod tests {
         bm.bitmap_get(64); // Should panic
     }
 
+    /// Purpose: Protect uniform bitmap runs at empty, word, and partial-word boundaries.
+    /// Expected: One run covers the logical length and padding bits are never exposed.
     #[test]
-    fn test_bitmap_range_iter_empty() {
-        let bm = new_bitmap(0);
-        let mut iter = bm.bitmap_range_iter(0);
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn test_bitmap_range_iter_all_true() {
-        let mut bm = new_bitmap(64);
-        for i in 0..64 {
-            bm.bitmap_set(i);
+    fn test_bitmap_range_iter_uniform() {
+        for (name, set) in [("all_false", false), ("all_true", true)] {
+            for (boundary, len) in [
+                ("empty", 0usize),
+                ("single", 1),
+                ("partial", 63),
+                ("word", 64),
+                ("word_tail", 65),
+                ("two_words", 128),
+            ] {
+                let bitmap = vec![if set { u64::MAX } else { 0 }; len.div_ceil(64)];
+                let actual = bitmap.bitmap_range_iter(len).collect::<Vec<_>>();
+                let expected = if len == 0 { vec![] } else { vec![(set, len)] };
+                assert_eq!(actual, expected, "{name}, {boundary}");
+            }
         }
-        let mut iter = bm.bitmap_range_iter(64);
-        assert_eq!(iter.next(), Some((true, 64)));
-        assert_eq!(iter.next(), None);
     }
 
-    #[test]
-    fn test_bitmap_range_iter_all_false() {
-        let bm = new_bitmap(64);
-        let mut iter = bm.bitmap_range_iter(64);
-        assert_eq!(iter.next(), Some((false, 64)));
-        assert_eq!(iter.next(), None);
-    }
-
+    /// Purpose: Protect alternating range iteration across word boundaries.
+    /// Expected: Every bit produces its own run and iteration ends at the logical length.
     #[test]
     fn test_bitmap_range_iter_alternating() {
         let mut bm = new_bitmap(128);
@@ -846,11 +862,15 @@ mod tests {
             bm.bitmap_set(i);
         }
         let mut iter = bm.bitmap_range_iter(128);
-        assert_eq!(iter.next(), Some((true, 1)));
-        assert_eq!(iter.next(), Some((false, 1)));
-        // Should repeat this pattern 64 times (128 bits total)
+        for pair in 0..64 {
+            assert_eq!(iter.next(), Some((true, 1)), "set run in pair {pair}");
+            assert_eq!(iter.next(), Some((false, 1)), "clear run in pair {pair}");
+        }
+        assert_eq!(iter.next(), None);
     }
 
+    /// Purpose: Protect run merging across mixed bitmap words.
+    /// Expected: Adjacent equal bits merge across word boundaries without losing transitions.
     #[test]
     fn test_bitmap_range_iter_mixed() {
         let mut bm = new_bitmap(192); // 3 words
@@ -872,8 +892,11 @@ mod tests {
             assert_eq!(iter.next(), Some((true, 1)));
         }
         assert_eq!(iter.next(), Some((false, 65))); // last bit of second word and full third word.
+        assert_eq!(iter.next(), None);
     }
 
+    /// Purpose: Protect range iteration with a partial final word.
+    /// Expected: Runs stop at the logical length without exposing padding bits.
     #[test]
     fn test_bitmap_range_iter_partial() {
         let mut bm = new_bitmap(100); // Not multiple of 64
@@ -887,6 +910,8 @@ mod tests {
         assert_eq!(iter.next(), None);
     }
 
+    /// Purpose: Protect set-bit enumeration across empty, dense, sparse, and partial bitmaps.
+    /// Expected: Only logical set-bit positions are returned in increasing order.
     #[test]
     fn test_bitmap_true_index_iter() {
         // Test empty bitmap
@@ -944,6 +969,8 @@ mod tests {
         assert_eq!(iter.collect::<Vec<_>>(), vec![0, 99]);
     }
 
+    /// Purpose: Protect filtering clear and set runs by polarity.
+    /// Expected: Only matching ranges are returned with their logical boundaries.
     #[test]
     fn test_bitmap_range_filter() {
         let bm = new_bitmap(32);
@@ -961,47 +988,75 @@ mod tests {
         assert_eq!(filter_false.next(), None);
     }
 
+    /// Purpose: Protect concurrent allocation and release of distinct bitmap slots.
+    /// Expected: Each worker owns its requested slot until successfully releasing it.
     #[test]
     fn test_alloc_map_concurrent() {
         let bitmap = Arc::new(AllocMap::new(128));
+        let allocated = Arc::new(Barrier::new(65));
+        let release = Arc::new(Barrier::new(65));
         let mut handles = vec![];
-
         for i in 0..64 {
             let bitmap = Arc::clone(&bitmap);
+            let allocated = Arc::clone(&allocated);
+            let release = Arc::clone(&release);
             handles.push(thread::spawn(move || {
-                assert!(bitmap.allocate_at(i * 2));
-                assert!(bitmap.is_allocated(i * 2));
-                assert!(bitmap.deallocate(i * 2));
+                let acquired = bitmap.allocate_at(i * 2);
+                let observed = bitmap.is_allocated(i * 2);
+                allocated.wait();
+                release.wait();
+                (acquired, observed, bitmap.deallocate(i * 2))
             }));
         }
-
-        for handle in handles {
-            handle.join().unwrap();
+        allocated.wait();
+        let held_count = bitmap.allocated();
+        let held_slots: Vec<_> = (0..128).map(|idx| bitmap.is_allocated(idx)).collect();
+        release.wait();
+        for (worker, handle) in handles.into_iter().enumerate() {
+            assert_eq!(
+                handle.join().unwrap(),
+                (true, true, true),
+                "worker={worker}"
+            );
         }
+        assert_eq!(held_count, 64);
+        assert_eq!(
+            held_slots,
+            (0..128).map(|idx| idx % 2 == 0).collect::<Vec<_>>()
+        );
+        assert_eq!(bitmap.allocated(), 0);
+        assert!((0..128).all(|idx| !bitmap.is_allocated(idx)));
     }
 
+    /// Purpose: Protect allocation reuse and rejection of unavailable slots.
+    /// Expected: Released slots become reusable while occupied and out-of-range requests fail.
     #[test]
     fn test_alloc_map_ops() {
         let alloc_map = AllocMap::new(1024);
-        for _ in 0..1000 {
-            assert!(alloc_map.try_allocate().is_some());
+        for expected in 0..1000 {
+            assert_eq!(alloc_map.try_allocate(), Some(expected));
         }
         assert!(!alloc_map.deallocate(1000));
         assert!(alloc_map.deallocate(500));
-        for _ in 0..25 {
-            assert!(alloc_map.try_allocate().is_some());
+        assert_eq!(alloc_map.try_allocate(), Some(500));
+        for expected in 1000..1024 {
+            assert_eq!(alloc_map.try_allocate(), Some(expected));
         }
+        assert_eq!(alloc_map.allocated(), 1024);
+        assert_eq!(alloc_map.try_allocate(), None);
         assert!(alloc_map.deallocate(500));
-        assert!(alloc_map.try_allocate().is_some());
-
+        assert_eq!(alloc_map.try_allocate(), Some(500));
         assert!(!alloc_map.allocate_at(2000));
         assert!(!alloc_map.allocate_at(100));
+        assert_eq!(alloc_map.allocated(), 1024);
     }
 
+    /// Purpose: Protect serialization of a sparsely allocated map.
+    /// Expected: Round trips preserve capacity, allocation count, bitmap state, and scan position.
     #[test]
     fn test_alloc_map_serde() {
         let alloc_map = AllocMap::new(1024);
-        let mut rng = rand::rng();
+        let mut rng = StdRng::seed_from_u64(0xa110_c001);
         for _ in 0..20 {
             let idx = rng.next_u64() as usize % 1024;
             let _ = alloc_map.allocate_at(idx);
@@ -1023,6 +1078,8 @@ mod tests {
         assert!(*g1 == *g2);
     }
 
+    /// Purpose: Protect expansion of a partially allocated map.
+    /// Expected: Existing allocation state survives, added slots are free, and source capacity is unchanged.
     #[test]
     fn test_alloc_map_expansion_preserves_state_and_source() {
         let source = AllocMap::new(128);
@@ -1038,13 +1095,16 @@ mod tests {
         assert_eq!(source.allocated(), 96);
         assert_eq!(expanded.allocated(), 96);
         for idx in 0..128 {
-            assert_eq!(expanded.is_allocated(idx), source.is_allocated(idx));
+            assert_eq!(source.is_allocated(idx), idx < 96, "source slot {idx}");
+            assert_eq!(expanded.is_allocated(idx), idx < 96, "expanded slot {idx}");
         }
         for idx in 128..256 {
             assert!(!expanded.is_allocated(idx));
         }
     }
 
+    /// Purpose: Protect expansion beyond a partially used final word.
+    /// Expected: Former padding becomes allocatable without changing the source allocation count.
     #[test]
     fn test_alloc_map_expansion_clears_partial_word_tail() {
         let source = AllocMap::new(65);
@@ -1055,11 +1115,18 @@ mod tests {
 
         let expanded = source.expanded(130);
         assert_eq!(expanded.allocated(), 65);
-        assert_eq!(expanded.try_allocate(), Some(65));
+        for expected in 65..130 {
+            assert_eq!(expanded.try_allocate(), Some(expected));
+        }
+        assert_eq!(expanded.allocated(), 130);
+        assert_eq!(expanded.try_allocate(), None);
+        assert_eq!(source.try_allocate(), None);
         assert_eq!(source.len(), 65);
         assert_eq!(source.allocated(), 65);
     }
 
+    /// Purpose: Protect concatenation at aligned and unaligned bitmap boundaries.
+    /// Expected: Appended logical bits retain their positions across destination word boundaries.
     #[test]
     fn test_bitmap_extend() {
         let mut bm1 = vec![1u64];

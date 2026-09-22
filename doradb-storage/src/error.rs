@@ -2188,6 +2188,29 @@ mod tests {
     use std::cell::Cell;
     use std::io::Error as StdIoError;
 
+    fn assert_runtime_disclosure<C>(
+        error: Error,
+        expected_context: RuntimeError,
+        expected_cause: C,
+        diagnostics: &[&str],
+    ) where
+        C: fmt::Debug + PartialEq + Send + Sync + 'static,
+    {
+        assert_eq!(error.kind(), ErrorKind::Runtime);
+        assert_eq!(
+            error.report().downcast_ref::<RuntimeError>(),
+            Some(&expected_context)
+        );
+        assert_eq!(error.report().downcast_ref::<C>(), Some(&expected_cause));
+        let output = format!("{error:?}");
+        for diagnostic in diagnostics {
+            assert!(
+                output.contains(diagnostic),
+                "missing {diagnostic:?} in {output}"
+            );
+        }
+    }
+
     #[derive(Debug)]
     struct UnknownAttachment;
 
@@ -2197,6 +2220,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect callback error accessors and standard error integration.
+    /// Expected: Engine and user payloads remain distinguishable through borrowing, consumption, display, and source access.
     #[test]
     fn callback_error_preserves_both_domains_and_standard_error_traits() {
         let engine_error = Report::new(OperationError::InvalidMetadata).disclose();
@@ -2230,6 +2255,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect public access to operation error classifications.
+    /// Expected: Every listed operation variant is recoverable while other domains report no operation error.
     #[test]
     fn test_public_operation_error_returns_every_variant() {
         let cases = [
@@ -2260,6 +2287,8 @@ mod tests {
         assert_eq!(config.operation_error(), None);
     }
 
+    /// Purpose: Protect caller diagnostics attached to a typed I/O report.
+    /// Expected: The report retains the I/O kind and descriptive operation detail.
     #[test]
     fn test_io_report_with_caller_attachment_preserves_detail() {
         let source = StdIoError::new(IoErrorKind::PermissionDenied, "open denied");
@@ -2275,6 +2304,8 @@ mod tests {
         assert!(output.contains("open denied"));
     }
 
+    /// Purpose: Protect disclosure of a native I/O report.
+    /// Expected: Public classification, native I/O kind, and attached message survive conversion.
     #[test]
     fn test_io_report_converts_to_top_level_io() {
         let source = StdIoError::new(IoErrorKind::WouldBlock, "not ready");
@@ -2293,6 +2324,8 @@ mod tests {
         assert!(format!("{err:?}").contains("not ready"));
     }
 
+    /// Purpose: Protect an owned operating-system source during public disclosure.
+    /// Expected: The public I/O report retains the original raw operating-system error.
     #[test]
     fn test_std_io_error_disclosure_preserves_owned_source() {
         let source = StdIoError::from_raw_os_error(libc::EIO);
@@ -2309,6 +2342,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect disclosure of worker-startup runtime failures.
+    /// Expected: Public conversion preserves runtime classification, the I/O cause, and caller context.
     #[test]
     fn test_runtime_report_converts_losslessly_to_public_runtime() {
         let source = StdIoError::other("spawn unavailable");
@@ -2319,21 +2354,16 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::BackgroundSpawn)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::BackgroundSpawn,
+            IoError::from(IoErrorKind::Other),
+            &["spawn unavailable", "thread_name=Runtime-Conversion-Test"],
         );
-        assert_eq!(
-            err.report()
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::Other)
-        );
-        assert!(format!("{err:?}").contains("thread_name=Runtime-Conversion-Test"));
     }
 
+    /// Purpose: Protect operation errors carried alongside runtime errors.
+    /// Expected: Disclosure retains the operation variant and attachments from both boundaries.
     #[test]
     fn test_operation_or_runtime_operation_arm_stays_operation() {
         let carrier = OperationOrRuntimeError::from(
@@ -2353,6 +2383,8 @@ mod tests {
         assert!(output.contains("table_id=42"));
     }
 
+    /// Purpose: Protect runtime errors carried alongside operation errors.
+    /// Expected: Disclosure preserves the internal cause and diagnostics beneath the runtime boundary.
     #[test]
     fn test_operation_or_runtime_runtime_arm_preserves_native_source() {
         let carrier = OperationOrRuntimeError::from(
@@ -2364,20 +2396,16 @@ mod tests {
 
         let err = carrier.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::TableAccess)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::TableAccess,
+            InternalError::SecondaryIndexOutOfBounds,
+            &["index_no=4, index_count=2", "operation=insert_index"],
         );
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::SecondaryIndexOutOfBounds)
-        );
-        let output = format!("{err:?}");
-        assert!(output.contains("index_no=4, index_count=2"));
-        assert!(output.contains("operation=insert_index"));
     }
 
+    /// Purpose: Protect result-level attachment on an operation-or-runtime error.
+    /// Expected: Attaching context leaves the operation arm and native reason intact.
     #[test]
     fn test_operation_or_runtime_result_attachment_preserves_operation_arm() {
         let result: OperationOrRuntimeResult<()> = Err(OperationOrRuntimeError::from(Report::new(
@@ -2398,6 +2426,8 @@ mod tests {
         assert!(format!("{report:?}").contains("operation=insert_unique_index"));
     }
 
+    /// Purpose: Protect operation errors carried alongside fatal errors.
+    /// Expected: Disclosure retains operation classification and caller attachments.
     #[test]
     fn test_operation_or_fatal_operation_arm_stays_operation() {
         let carrier = OperationOrFatalError::from(
@@ -2417,6 +2447,8 @@ mod tests {
         assert!(output.contains("operation=table_insert_mvcc"));
     }
 
+    /// Purpose: Protect result-level attachment on an operation-or-fatal error.
+    /// Expected: The fatal reason and public classification survive the added context.
     #[test]
     fn test_operation_or_fatal_result_attachment_preserves_fatal_arm() {
         let result: OperationOrFatalResult<()> = Err(OperationOrFatalError::from(Report::new(
@@ -2441,6 +2473,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect result-level attachment on a runtime-or-fatal error.
+    /// Expected: The fatal arm retains its reason and added diagnostic.
     #[test]
     fn test_runtime_or_fatal_result_attachment_preserves_fatal_arm() {
         let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Fatal(Report::new(
@@ -2461,6 +2495,8 @@ mod tests {
         assert!(format!("{report:?}").contains("operation=publish_checkpoint"));
     }
 
+    /// Purpose: Protect runtime context replacement on a runtime carrier arm.
+    /// Expected: The new context preserves the lower-domain cause and attachments.
     #[test]
     fn test_runtime_or_fatal_result_changes_only_runtime_context() {
         let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Runtime(
@@ -2487,6 +2523,8 @@ mod tests {
         assert!(output.contains("operation=checkpoint_table"));
     }
 
+    /// Purpose: Protect fatal bypass during runtime context replacement.
+    /// Expected: The fatal reason and its I/O source remain unchanged.
     #[test]
     fn test_runtime_or_fatal_result_context_change_preserves_fatal_arm() {
         let result: RuntimeOrFatalResult<()> = Err(RuntimeOrFatalError::Fatal(
@@ -2510,6 +2548,8 @@ mod tests {
         assert!(format!("{report:?}").contains("checkpoint write failed"));
     }
 
+    /// Purpose: Protect error precedence when operation and cleanup failures coexist.
+    /// Expected: Fatal failures outrank runtime failures while equal-domain failures retain the primary reason and secondary diagnostics.
     #[test]
     fn test_runtime_or_fatal_cleanup_precedence_preserves_typed_sources() {
         let source_fatal = RuntimeOrFatalError::Fatal(
@@ -2568,6 +2608,8 @@ mod tests {
         assert!(format!("{report:?}").contains("later runtime cleanup"));
     }
 
+    /// Purpose: Protect lazy attachment evaluation on a successful multi-domain result.
+    /// Expected: The successful value is unchanged and the attachment closure is not evaluated.
     #[test]
     fn test_multi_domain_result_attachment_is_lazy_on_success() {
         let called = Cell::new(false);
@@ -2584,6 +2626,8 @@ mod tests {
         assert!(!called.get());
     }
 
+    /// Purpose: Protect public disclosure of the runtime carrier arm.
+    /// Expected: Runtime classification, the internal cause, and source diagnostics are preserved.
     #[test]
     fn test_runtime_or_fatal_runtime_arm_converts_losslessly() {
         let carrier = RuntimeOrFatalError::Runtime(
@@ -2594,18 +2638,16 @@ mod tests {
 
         let err = carrier.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::CheckpointExecution)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::CheckpointExecution,
+            InternalError::SecondaryIndexOutOfBounds,
+            &["index_no=4, index_count=2"],
         );
-        assert_eq!(
-            err.report().downcast_ref::<InternalError>().copied(),
-            Some(InternalError::SecondaryIndexOutOfBounds)
-        );
-        assert!(format!("{err:?}").contains("index_no=4, index_count=2"));
     }
 
+    /// Purpose: Protect public disclosure of the fatal carrier arm.
+    /// Expected: Fatal classification, the I/O cause, and source diagnostics are preserved.
     #[test]
     fn test_runtime_or_fatal_fatal_arm_converts_losslessly() {
         let carrier = RuntimeOrFatalError::Fatal(
@@ -2631,6 +2673,8 @@ mod tests {
         assert!(format!("{err:?}").contains("checkpoint write failed"));
     }
 
+    /// Purpose: Protect disclosure and attachment through lifecycle-or-fatal results.
+    /// Expected: Each arm keeps its native classification and fatal errors gain no lifecycle frame.
     #[test]
     fn lifecycle_or_fatal_preserves_domain_and_attachments() {
         let lifecycle: LifecycleOrFatalResult<()> =
@@ -2660,6 +2704,8 @@ mod tests {
         assert!(format!("{error:?}").contains("phase=health_check"));
     }
 
+    /// Purpose: Protect disclosure of every native quad error arm.
+    /// Expected: Public classification and attachments survive without exposing a carrier frame.
     #[test]
     fn quad_native_arms_disclose_without_carrier_context() {
         let cases = [
@@ -2689,6 +2735,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect promotion of pairwise error carriers into the quad carrier.
+    /// Expected: Native arms and attached diagnostics survive promotion without an extra carrier frame.
     #[test]
     fn quad_flattens_pairwise_carriers_without_losing_reports() {
         let operation = QuadError::from(OperationOrRuntimeError::Operation(
@@ -2720,6 +2768,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect disclosure of buffer-pool initialization failures.
+    /// Expected: The runtime boundary retains the resource cause and pool identity.
     #[test]
     fn test_buffer_pool_init_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(ResourceError::BufferPoolSizeTooSmall)
@@ -2729,18 +2779,19 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::BufferPoolInit)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::BufferPoolInit,
+            ResourceError::BufferPoolSizeTooSmall,
+            &[
+                "configured pool cannot hold the minimum resident pages",
+                "buffer_pool_type=fixed, buffer_pool_role=meta",
+            ],
         );
-        assert_eq!(
-            err.report().downcast_ref::<ResourceError>().copied(),
-            Some(ResourceError::BufferPoolSizeTooSmall)
-        );
-        assert!(format!("{err:?}").contains("buffer_pool_type=fixed, buffer_pool_role=meta"));
     }
 
+    /// Purpose: Protect disclosure of buffer-page allocation failures.
+    /// Expected: The runtime boundary retains the resource cause and allocation operation.
     #[test]
     fn test_buffer_page_allocation_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(ResourceError::BufferPoolFull)
@@ -2750,18 +2801,19 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::BufferPageAllocation)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::BufferPageAllocation,
+            ResourceError::BufferPoolFull,
+            &[
+                "capacity=1, allocated=1",
+                "buffer_pool_type=fixed, buffer_pool_role=meta, operation=allocate_page",
+            ],
         );
-        assert_eq!(
-            err.report().downcast_ref::<ResourceError>().copied(),
-            Some(ResourceError::BufferPoolFull)
-        );
-        assert!(format!("{err:?}").contains("operation=allocate_page"));
     }
 
+    /// Purpose: Protect disclosure of buffer-page access failures.
+    /// Expected: The runtime boundary retains the I/O cause and page-access context.
     #[test]
     fn test_buffer_page_access_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(IoError::from(IoErrorKind::Other))
@@ -2773,21 +2825,19 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::BufferPageAccess)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::BufferPageAccess,
+            IoError::from(IoErrorKind::Other),
+            &[
+                "injected page read failure",
+                "buffer_pool_type=evictable, buffer_pool_role=mem, operation=get_page, page_id=7",
+            ],
         );
-        assert_eq!(
-            err.report()
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::Other)
-        );
-        assert!(format!("{err:?}").contains("operation=get_page, page_id=7"));
     }
 
+    /// Purpose: Protect disclosure of invalid file-root metadata.
+    /// Expected: The runtime boundary retains the data-integrity cause and root-access operation.
     #[test]
     fn test_file_root_access_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(DataIntegrityError::InvalidRootInvariant)
@@ -2799,18 +2849,19 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::FileRootAccess)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::FileRootAccess,
+            DataIntegrityError::InvalidRootInvariant,
+            &[
+                "block_id=3",
+                "operation=load_file_root, file_kind=table_file, file_id=42, phase=validate_root",
+            ],
         );
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(DataIntegrityError::InvalidRootInvariant)
-        );
-        assert!(format!("{err:?}").contains("operation=load_file_root"));
     }
 
+    /// Purpose: Protect disclosure of redo-log discovery failures.
+    /// Expected: The runtime boundary retains the invalid-name cause and log-family context.
     #[test]
     fn test_redo_log_discovery_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(DataIntegrityError::InvalidRedoLogFileName)
@@ -2820,18 +2871,19 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::RedoLogAccess)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::RedoLogAccess,
+            DataIntegrityError::InvalidRedoLogFileName,
+            &[
+                "path=redo.log.invalid",
+                "phase=enumerate_redo_log_family, file_prefix=redo.log",
+            ],
         );
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(DataIntegrityError::InvalidRedoLogFileName)
-        );
-        assert!(format!("{err:?}").contains("file_prefix=redo.log"));
     }
 
+    /// Purpose: Protect disclosure of recovery I/O failures.
+    /// Expected: The recovery runtime context retains the I/O cause and source operation.
     #[test]
     fn test_recovery_io_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(IoError::from(IoErrorKind::PermissionDenied))
@@ -2840,21 +2892,16 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::Recovery)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::Recovery,
+            IoError::from(IoErrorKind::PermissionDenied),
+            &["operation=open_recovery_file"],
         );
-        assert_eq!(
-            err.report()
-                .downcast_ref::<IoError>()
-                .copied()
-                .map(IoError::kind),
-            Some(IoErrorKind::PermissionDenied)
-        );
-        assert!(format!("{err:?}").contains("operation=open_recovery_file"));
     }
 
+    /// Purpose: Protect disclosure of recovery integrity failures.
+    /// Expected: The recovery runtime context retains the corruption cause and replay phase.
     #[test]
     fn test_recovery_integrity_report_converts_losslessly_to_public_runtime() {
         let report = Report::new(DataIntegrityError::LogFileCorrupted)
@@ -2863,18 +2910,16 @@ mod tests {
 
         let err = report.disclose();
 
-        assert_eq!(err.kind(), ErrorKind::Runtime);
-        assert_eq!(
-            err.report().downcast_ref::<RuntimeError>().copied(),
-            Some(RuntimeError::Recovery)
+        assert_runtime_disclosure(
+            err,
+            RuntimeError::Recovery,
+            DataIntegrityError::LogFileCorrupted,
+            &["phase=replay_redo"],
         );
-        assert_eq!(
-            err.report().downcast_ref::<DataIntegrityError>().copied(),
-            Some(DataIntegrityError::LogFileCorrupted)
-        );
-        assert!(format!("{err:?}").contains("phase=replay_redo"));
     }
 
+    /// Purpose: Protect user-facing display of configuration errors.
+    /// Expected: Display includes the public domain, native reason, and configuration detail.
     #[test]
     fn test_storage_error_display_includes_config_detail() {
         let err = Report::new(ConfigError::InvalidIoDepth)
@@ -2887,6 +2932,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect user-facing display of I/O errors.
+    /// Expected: Display includes the public domain, I/O kind, operation, and source message.
     #[test]
     fn test_storage_error_display_includes_io_detail() {
         let source = StdIoError::new(IoErrorKind::PermissionDenied, "open denied");
@@ -2901,6 +2948,8 @@ mod tests {
         assert!(output.contains("open denied"), "{output}");
     }
 
+    /// Purpose: Protect stacking and disclosure of typed index-access failures.
+    /// Expected: The internal cause survives both boundaries with runtime classification and caller context.
     #[test]
     fn test_typed_index_access_context_preserves_lower_error() {
         let lower: InternalResult<()> = Err(Report::new(InternalError::SecondaryIndexOutOfBounds)
@@ -2929,6 +2978,8 @@ mod tests {
         assert!(format!("{err}").contains("secondary index claim"));
     }
 
+    /// Purpose: Protect diagnostic rendering of captured completion errors.
+    /// Expected: Bridge debug output matches the captured report.
     #[test]
     fn test_completion_bridge_debug_delegates_to_canonical_report() {
         let report = Report::new(IoError::from(IoErrorKind::BrokenPipe))
@@ -2939,6 +2990,8 @@ mod tests {
         assert_eq!(format!("{bridge:?}"), expected);
     }
 
+    /// Purpose: Protect replay of backend completion reports for multiple observers.
+    /// Expected: Replays retain backend diagnostics and share attachment storage without exposing the bridge publicly.
     #[test]
     fn test_completion_bridge_preserves_backend_report_and_public_classification() {
         let backend_report = BackendError::wait(
@@ -3005,6 +3058,8 @@ mod tests {
         assert!(!format!("{err}").contains("completion error bridge"));
     }
 
+    /// Purpose: Protect capture and replay of supported native completion roots.
+    /// Expected: Materialized reports retain the captured native causes.
     #[test]
     fn test_completion_bridge_captures_permitted_roots() {
         let resource = CompletionErrorBridge::capture(
@@ -3083,6 +3138,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect completion capture from constrained error carriers.
+    /// Expected: Capture and replay preserve native arms and source diagnostics.
     #[test]
     fn test_completion_bridge_captures_multi_domain_carriers() {
         use std::mem::discriminant;
@@ -3121,6 +3178,8 @@ mod tests {
         assert!(format!("{fatal:?}").contains("fatal carrier"));
     }
 
+    /// Purpose: Protect replay into the quad carrier for existing common domains.
+    /// Expected: Replay retains the native arm and boundary diagnostics without carrier or bridge frames.
     #[test]
     fn completion_bridge_into_quad_preserves_common_outer_domains() {
         let operation = CompletionErrorBridge::capture(
@@ -3193,6 +3252,8 @@ mod tests {
         assert!(fatal.downcast_ref::<CompletionErrorBridge>().is_none());
     }
 
+    /// Purpose: Protect quad replay of physical resource, I/O, and integrity failures.
+    /// Expected: The chosen runtime boundary retains each physical cause and owner diagnostic.
     #[test]
     fn completion_bridge_into_quad_stacks_physical_roots_under_runtime() {
         let resource = CompletionErrorBridge::capture(
@@ -3256,6 +3317,8 @@ mod tests {
         assert!(integrity.downcast_ref::<CompletionErrorBridge>().is_none());
     }
 
+    /// Purpose: Protect runtime completion conversion followed by result attachment.
+    /// Expected: The owner runtime context retains the internal cause and both source and boundary diagnostics.
     #[test]
     fn test_completion_bridge_runtime_conversion_composes_static_attachment() {
         let bridge = CompletionErrorBridge::capture(
@@ -3286,6 +3349,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect fatal completion conversion followed by result attachment.
+    /// Expected: Fatal classification bypasses runtime replacement while retaining I/O and boundary diagnostics.
     #[test]
     fn test_completion_bridge_fatal_conversion_composes_static_attachment() {
         let bridge = CompletionErrorBridge::capture(
@@ -3317,6 +3382,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect ordering of nested contexts during completion replay.
+    /// Expected: Reconstruction preserves the original context stack beneath the new owner boundary.
     #[test]
     fn test_completion_bridge_replays_real_context_order() {
         let report = Report::new(ConfigError::InvalidIoDepth)
@@ -3340,6 +3407,8 @@ mod tests {
         assert_eq!(contexts, ["runtime", "fatal", "io", "config"]);
     }
 
+    /// Purpose: Protect replay and disclosure of a layered fatal completion.
+    /// Expected: Native fatal, runtime, and I/O contexts survive with only one public classification frame.
     #[test]
     fn test_completion_bridge_preserves_fatal_runtime_io_stack() {
         let io_kind = StdIoError::from_raw_os_error(libc::EIO).kind();
@@ -3393,6 +3462,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect completion capture from a report containing a public classification frame.
+    /// Expected: Capture rejects the unregistered context instead of silently replaying it.
     #[test]
     #[should_panic(expected = "unregistered completion context")]
     fn test_completion_bridge_rejects_public_frame_below_fatal() {
@@ -3403,6 +3474,8 @@ mod tests {
         let _ = CompletionErrorBridge::capture(report);
     }
 
+    /// Purpose: Protect shared ownership and reconstruction of a fatal report.
+    /// Expected: Clones share identity and replay preserves one fatal frame with its I/O cause and diagnostics.
     #[test]
     fn test_shared_fatal_error_reconstructs_exact_fatal_chain() {
         let shared = SharedFatalError::capture(
@@ -3452,6 +3525,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect the linear-report requirement of completion capture.
+    /// Expected: A branched source report triggers the designated contract panic.
     #[test]
     #[should_panic(expected = "completion report must be linear")]
     fn test_completion_bridge_rejects_branched_report() {
@@ -3460,6 +3535,8 @@ mod tests {
         let _ = CompletionErrorBridge::capture(report.change_context(FatalError::Poisoned));
     }
 
+    /// Purpose: Protect completion capture from unsupported printable attachments.
+    /// Expected: An unregistered attachment triggers the designated contract panic.
     #[test]
     #[should_panic(expected = "unregistered printable completion attachment")]
     fn test_completion_bridge_rejects_unknown_attachment() {
@@ -3467,6 +3544,8 @@ mod tests {
         let _ = CompletionErrorBridge::capture(report);
     }
 
+    /// Purpose: Protect callback error ownership across engine and user conversion paths.
+    /// Expected: Domain identity, complete engine diagnostics, and owned user payloads survive conversion.
     #[test]
     fn test_callback_engine_conversions_preserve_reports_and_distinguish_user_error() {
         for user in [false, true] {

@@ -83,11 +83,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    fn counted_free_list(
+        initial: usize,
+        maximum: usize,
+        start: usize,
+    ) -> (FreeList<usize>, Arc<AtomicUsize>) {
+        let next = Arc::new(AtomicUsize::new(start));
+        let factory_next = Arc::clone(&next);
+        let list = FreeList::new(initial, maximum, move || {
+            factory_next.fetch_add(1, Ordering::SeqCst)
+        });
+        (list, next)
+    }
+
+    /// Purpose: Protect initial free-list population and factory fallback.
+    /// Expected: Preallocated elements are reused before the factory creates another element.
     #[test]
     fn test_free_list_basic() {
-        let next = Arc::new(AtomicUsize::new(0));
-        let factory_next = Arc::clone(&next);
-        let list = FreeList::new(2, 10, move || factory_next.fetch_add(1, Ordering::SeqCst));
+        let (list, next) = counted_free_list(2, 10, 0);
 
         assert_eq!(next.load(Ordering::SeqCst), 2);
         assert_eq!(list.pop(), 1);
@@ -96,38 +109,30 @@ mod tests {
         assert_eq!(next.load(Ordering::SeqCst), 3);
     }
 
+    /// Purpose: Protect reuse and the retention limit for individually returned elements.
+    /// Expected: Only elements within capacity are retained in stack order.
     #[test]
     fn test_free_list_push_retains_up_to_max_size() {
-        let next = Arc::new(AtomicUsize::new(100));
-        let factory_next = Arc::clone(&next);
-        let list = FreeList::new(0, 2, move || factory_next.fetch_add(1, Ordering::SeqCst));
-
-        list.push(1);
-        list.push(2);
-        list.push(3);
-
-        assert_eq!(list.pop(), 2);
-        assert_eq!(list.pop(), 1);
-        assert_eq!(list.pop(), 100);
+        for (name, maximum, start, returned) in [
+            ("within_capacity", 10, 42, vec![1, 2]),
+            ("overflow", 2, 100, vec![1, 2, 3]),
+        ] {
+            let (list, next) = counted_free_list(0, maximum, start);
+            for item in returned {
+                list.push(item);
+            }
+            assert_eq!(list.pop(), 2, "{name}");
+            assert_eq!(list.pop(), 1, "{name}");
+            assert_eq!(list.pop(), start, "{name}");
+            assert_eq!(next.load(Ordering::SeqCst), start + 1, "{name}");
+        }
     }
 
-    #[test]
-    fn test_free_list_push_recycles_elements() {
-        let list = FreeList::new(0, 10, || 42i32);
-
-        list.push(1);
-        list.push(2);
-
-        assert_eq!(list.pop(), 2);
-        assert_eq!(list.pop(), 1);
-        assert_eq!(list.pop(), 42);
-    }
-
+    /// Purpose: Protect batch allocation when retained elements are insufficient.
+    /// Expected: Retained elements are reused before the factory fills only the shortfall.
     #[test]
     fn test_free_list_pop_batch_reuses_and_creates_missing_elements() {
-        let next = Arc::new(AtomicUsize::new(100));
-        let factory_next = Arc::clone(&next);
-        let list = FreeList::new(0, 10, move || factory_next.fetch_add(1, Ordering::SeqCst));
+        let (list, next) = counted_free_list(0, 10, 100);
 
         list.push(1);
         list.push(2);
@@ -138,21 +143,23 @@ mod tests {
         assert_eq!(next.load(Ordering::SeqCst), 102);
     }
 
+    /// Purpose: Protect empty batch requests.
+    /// Expected: The result is empty, retained elements remain available, and the factory is not called.
     #[test]
     fn test_free_list_pop_batch_zero_count() {
-        let next = Arc::new(AtomicUsize::new(100));
-        let factory_next = Arc::clone(&next);
-        let list = FreeList::new(0, 10, move || factory_next.fetch_add(1, Ordering::SeqCst));
+        let (list, next) = counted_free_list(0, 10, 100);
 
+        list.push(7);
         assert!(list.pop_batch(0).is_empty());
+        assert_eq!(list.pop(), 7, "empty batch must retain cached elements");
         assert_eq!(next.load(Ordering::SeqCst), 100);
     }
 
+    /// Purpose: Protect batch returns when the free list is partially occupied.
+    /// Expected: Only available capacity is filled and excess elements are discarded.
     #[test]
     fn test_free_list_push_batch_retains_up_to_max_size() {
-        let next = Arc::new(AtomicUsize::new(100));
-        let factory_next = Arc::clone(&next);
-        let list = FreeList::new(0, 2, move || factory_next.fetch_add(1, Ordering::SeqCst));
+        let (list, _next) = counted_free_list(0, 2, 100);
 
         list.push(1);
         list.push_batch(vec![2, 3, 4]);
@@ -160,6 +167,8 @@ mod tests {
         assert_eq!(list.pop_batch(3), vec![2, 1, 100]);
     }
 
+    /// Purpose: Protect concurrent returns within free-list capacity.
+    /// Expected: Every returned element is retained exactly once.
     #[test]
     fn test_free_list_concurrent() {
         let free_list = Arc::new(FreeList::<i32>::new(0, 10, || 42i32));

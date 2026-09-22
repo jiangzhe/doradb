@@ -633,12 +633,16 @@ mod tests {
         assert_eq!(deser, id);
     }
 
+    /// Purpose: Protect checked row identifier addition at overflow.
+    /// Expected: Representable sums succeed and overflowing sums are rejected.
     #[test]
     fn test_row_id_checked_add() {
         assert_eq!(RowID::new(40).checked_add(2), Some(RowID::new(42)));
         assert_eq!(RowID::MAX.checked_add(1), None);
     }
 
+    /// Purpose: Protect checked row identifier differences.
+    /// Expected: Nonnegative differences succeed and negative differences are rejected.
     #[test]
     fn test_row_id_checked_sub() {
         assert_eq!(RowID::new(42).checked_sub(RowID::new(40)), Some(2));
@@ -646,12 +650,16 @@ mod tests {
         assert_eq!(RowID::new(40).checked_sub(RowID::new(42)), None);
     }
 
+    /// Purpose: Protect saturating row identifier addition.
+    /// Expected: Representable sums remain exact and overflow clamps to the maximum.
     #[test]
     fn test_row_id_saturating_add() {
         assert_eq!(RowID::new(40).saturating_add(2), RowID::new(42));
         assert_eq!(RowID::MAX.saturating_add(1), RowID::MAX);
     }
 
+    /// Purpose: Protect table identifier parsing across radices and numeric boundaries.
+    /// Expected: Valid inputs parse exactly while invalid digits and overflow retain their error kinds.
     #[test]
     fn test_table_id_from_str_radix() {
         assert_eq!(TableID::from_str_radix("42", 10), Ok(TableID::new(42)));
@@ -669,6 +677,8 @@ mod tests {
         assert_eq!(overflow.kind(), &IntErrorKind::PosOverflow);
     }
 
+    /// Purpose: Protect table identifier hexadecimal formatting.
+    /// Expected: Lowercase output honors alternate-prefix and padding options.
     #[test]
     fn test_table_id_lower_hex() {
         let table_id = TableID::new(0xabcd);
@@ -677,6 +687,8 @@ mod tests {
         assert_eq!(format!("{table_id:08x}"), "0000abcd");
     }
 
+    /// Purpose: Protect claim-number representation and zero validity.
+    /// Expected: The wrapper retains its scalar layout and preserves supplied values.
     #[test]
     fn test_claim_no_layout_and_zero_value() {
         assert_eq!(mem::size_of::<ClaimNo>(), mem::size_of::<u64>());
@@ -684,31 +696,43 @@ mod tests {
         assert_eq!(ClaimNo::new(42).as_u64(), 42);
     }
 
+    /// Purpose: Protect the row identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_row_id_serde_roundtrip() {
         assert_id_serde_roundtrip(RowID::new(0x0123_4567_89ab_cdef), 0x0123_4567_89ab_cdef);
     }
 
+    /// Purpose: Protect the table identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_table_id_serde_roundtrip() {
         assert_id_serde_roundtrip(TableID::new(0x1234_5678_9abc_def0), 0x1234_5678_9abc_def0);
     }
 
+    /// Purpose: Protect the transaction identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_trx_id_serde_roundtrip() {
         assert_id_serde_roundtrip(TrxID::new(0x2345_6789_abcd_ef01), 0x2345_6789_abcd_ef01);
     }
 
+    /// Purpose: Protect the page identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_page_id_serde_roundtrip() {
         assert_id_serde_roundtrip(PageID::new(0x3456_789a_bcde_f012), 0x3456_789a_bcde_f012);
     }
 
+    /// Purpose: Protect the file identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_file_id_serde_roundtrip() {
         assert_id_serde_roundtrip(FileID::new(0x4567_89ab_cdef_0123), 0x4567_89ab_cdef_0123);
     }
 
+    /// Purpose: Protect the block identifier wire representation at a nonzero offset.
+    /// Expected: Little-endian bytes round trip without modifying surrounding bytes.
     #[test]
     fn test_block_id_serde_roundtrip() {
         assert_id_serde_roundtrip(BlockID::new(0x5678_9abc_def0_1234), 0x5678_9abc_def0_1234);

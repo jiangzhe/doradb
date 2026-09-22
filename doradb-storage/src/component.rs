@@ -1154,6 +1154,24 @@ mod tests {
         fn shutdown(_component: &Self::Owned) {}
     }
 
+    fn shutdown_probe_registry(
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        panics: [Option<&'static str>; 3],
+    ) -> ComponentRegistry {
+        let probe = |panic_message, drop_event| ShutdownProbe {
+            events: Arc::clone(events),
+            panic_message,
+            drop_event,
+        };
+        let mut registry = ComponentRegistry::new();
+        registry.register::<ShutdownA>(probe(panics[0], "drop-a"));
+        registry.register::<ShutdownB>(probe(panics[1], "drop-b"));
+        registry.register::<ShutdownC>(probe(panics[2], "drop-c"));
+        registry
+    }
+
+    /// Purpose: Protect typed component lookup after registration.
+    /// Expected: Optional and dependency access return the registered component value.
     #[test]
     fn test_component_registry_returns_typed_access_clone() {
         let mut registry = ComponentRegistry::new();
@@ -1162,6 +1180,8 @@ mod tests {
         assert_eq!(registry.dependency::<ValueComponent>(), 7);
     }
 
+    /// Purpose: Protect transfer of successfully built components into a registry.
+    /// Expected: The finished registry retains typed access to the built component.
     #[test]
     fn test_registry_builder_finishes_normal_component_build() {
         smol::block_on(async {
@@ -1173,6 +1193,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cleanup of a component registered before its build fails.
+    /// Expected: The original runtime error survives and shutdown precedes owner destruction.
     #[test]
     fn test_registry_builder_cleans_up_after_component_build_failure() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1192,25 +1214,12 @@ mod tests {
         assert_eq!(events.lock().as_slice(), &["shutdown", "drop"]);
     }
 
+    /// Purpose: Protect registry shutdown ordering and repeated shutdown.
+    /// Expected: Hooks and owners unwind registration order without repeating completed hooks.
     #[test]
     fn test_component_registry_shutdown_uses_reverse_registration_order_and_is_idempotent() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = ComponentRegistry::new();
-        registry.register::<ShutdownA>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: None,
-            drop_event: "drop-a",
-        });
-        registry.register::<ShutdownB>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: None,
-            drop_event: "drop-b",
-        });
-        registry.register::<ShutdownC>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: None,
-            drop_event: "drop-c",
-        });
+        let registry = shutdown_probe_registry(&events, [None, None, None]);
 
         let outcome = registry.shutdown_all();
         assert!(!outcome.is_degraded());
@@ -1227,25 +1236,13 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect registry shutdown when several component hooks panic.
+    /// Expected: All hooks run and only the first panic payload is resumed.
     #[test]
     fn test_component_registry_contains_all_hook_panics_and_resumes_first_payload() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut registry = ComponentRegistry::new();
-        registry.register::<ShutdownA>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: None,
-            drop_event: "drop-a",
-        });
-        registry.register::<ShutdownB>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: Some("second panic"),
-            drop_event: "drop-b",
-        });
-        registry.register::<ShutdownC>(ShutdownProbe {
-            events: Arc::clone(&events),
-            panic_message: Some("first panic"),
-            drop_event: "drop-c",
-        });
+        let registry =
+            shutdown_probe_registry(&events, [None, Some("second panic"), Some("first panic")]);
 
         let outcome = registry.shutdown_all();
         assert!(outcome.is_degraded());
@@ -1266,6 +1263,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect panic aggregation from a secondary payload with a panicking destructor.
+    /// Expected: Resuming the first panic does not destroy the discarded secondary payload.
     #[test]
     fn test_first_panic_forgets_secondary_payload_without_running_destructor() {
         struct PanicOnDrop;
@@ -1286,6 +1285,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect an existing unwind from a deferred shutdown panic.
+    /// Expected: The original outer panic remains the propagated payload.
     #[test]
     fn test_component_shutdown_payload_is_suppressed_during_existing_unwind() {
         struct ApplyOutcomeOnDrop(Option<ComponentShutdownOutcome>);
@@ -1319,6 +1320,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect owner teardown from retained registry access.
+    /// Expected: Access values are destroyed before their component owner.
     #[test]
     fn test_component_registry_drop_clears_access_before_owner_drop() {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1332,6 +1335,8 @@ mod tests {
         assert_eq!(events.lock().as_slice(), &["access", "owner"]);
     }
 
+    /// Purpose: Protect selective retention after a component shutdown panic.
+    /// Expected: Independent owners are reclaimed while the suspect owner and its guarded dependency remain valid.
     #[test]
     fn test_degraded_registry_drop_leaks_only_suspect_guard_closure() {
         let dependency_dropped = Arc::new(AtomicUsize::new(0));
@@ -1365,6 +1370,8 @@ mod tests {
         drop(external_guard);
     }
 
+    /// Purpose: Protect builder cleanup when shelf guards coexist with a shutdown panic.
+    /// Expected: Shelf-held dependencies are reclaimed while the suspect owner is retained and its panic propagates.
     #[test]
     fn test_builder_clears_shelf_guards_before_degraded_registry_drop() {
         let dependency_dropped = Arc::new(AtomicUsize::new(0));
@@ -1404,6 +1411,8 @@ mod tests {
         assert_eq!(suspect_dropped.load(AtomicOrdering::Relaxed), 0);
     }
 
+    /// Purpose: Protect consumption of a supplied dependency from the shelf.
+    /// Expected: Taking the provision returns its value and removes the shelf entry.
     #[test]
     fn test_shelf_take_removes_edge_entry() {
         let mut shelf = Shelf::new();

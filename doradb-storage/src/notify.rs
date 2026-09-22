@@ -160,6 +160,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// Purpose: Protect notification when an event owner is dropped.
+    /// Expected: A previously registered listener is released.
     #[test]
     fn test_event_notify_on_drop() {
         let ev = EventNotifyOnDrop::default();
@@ -169,6 +171,8 @@ mod tests {
         listener.wait();
     }
 
+    /// Purpose: Protect epoch waiting when notification precedes registration.
+    /// Expected: A waiter observing an older epoch completes without another notification.
     #[test]
     fn test_change_notifier_wait_since_async_returns_after_prior_notify() {
         smol::block_on(async {
@@ -182,6 +186,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect epoch waiting when notification follows registration.
+    /// Expected: The waiter remains pending until notification and then completes.
     #[test]
     fn test_change_notifier_wait_since_async_wakes_after_future_notify() {
         smol::block_on(async {
@@ -193,8 +199,12 @@ mod tests {
             let waiter = {
                 let notifier = Arc::clone(&notifier);
                 thread::spawn(move || {
-                    ready_tx.send(()).expect("waiter should report ready");
-                    smol::block_on(notifier.wait_since_async(observed_epoch));
+                    smol::block_on(async {
+                        let mut wait = Box::pin(notifier.wait_since_async(observed_epoch));
+                        assert!(futures::poll!(wait.as_mut()).is_pending());
+                        ready_tx.send(()).expect("waiter should report registered");
+                        wait.await;
+                    });
                     done_tx.send(()).expect("waiter should report completion");
                 })
             };
@@ -215,6 +225,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect epoch advancement for successive notifications.
+    /// Expected: Each notification advances the epoch exactly once.
     #[test]
     fn test_change_notifier_epoch_advances_monotonically() {
         let notifier = ChangeNotifier::new();
@@ -227,6 +239,8 @@ mod tests {
         assert_eq!(notifier.epoch(), initial + 2);
     }
 
+    /// Purpose: Protect monotonic progress and change notification.
+    /// Expected: Only a strictly greater value updates progress and wakes registered listeners.
     #[test]
     fn test_monotonic_u64_advances_and_notifies() {
         smol::block_on(async {
@@ -245,6 +259,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect progress observation when advancement precedes listener creation.
+    /// Expected: The stored value exposes prior progress without relying on a new notification.
     #[test]
     fn test_monotonic_u64_value_records_prior_advance() {
         let progress = MonotonicU64::new(10);

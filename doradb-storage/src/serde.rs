@@ -1175,6 +1175,8 @@ fn checked_deser_end(input_len: usize, idx: usize, len: usize) -> DataIntegrityR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::type_name;
+    use std::fmt::Debug;
 
     #[derive(Debug, PartialEq, Eq)]
     struct TestStruct {
@@ -1345,6 +1347,21 @@ mod tests {
         }
     }
 
+    fn assert_invalid_collection_count<T: Deser + Debug>(count: u64, payload_len: usize) {
+        // Encode the header independently of the production serializer.
+        let mut input = count.to_le_bytes().to_vec();
+        input.resize(input.len() + payload_len, 0);
+        let error = T::deser(&input[..], 0).unwrap_err();
+        assert_eq!(
+            *error.current_context(),
+            DataIntegrityError::InvalidPayload,
+            "type={}, count={count}, payload_len={payload_len}, error={error:?}",
+            type_name::<T>(),
+        );
+    }
+
+    /// Purpose: Protect serialization of structured vector elements.
+    /// Expected: Decoding restores every field and consumes the complete encoding.
     #[test]
     fn test_vec_serde() {
         let vec = [TestStruct {
@@ -1368,26 +1385,22 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect vector decoding from an impossible declared element count.
+    /// Expected: The malformed payload returns a data-integrity error.
     #[test]
     fn test_vec_deser_rejects_count_larger_than_remaining_input() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, u64::MAX);
-
-        let err = Vec::<TestStruct>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<Vec<TestStruct>>(u64::MAX, 0);
     }
 
+    /// Purpose: Protect vector decoding with insufficient bytes for the declared elements.
+    /// Expected: Minimum element sizes constrain the accepted count.
     #[test]
     fn test_vec_deser_rejects_count_larger_than_min_byte_capacity() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + mem::size_of::<u64>() * 2 - 1];
-        out[..].ser_u64(0, 2);
-
-        let err = Vec::<u64>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<Vec<u64>>(2, 15);
     }
 
+    /// Purpose: Protect vector decoding from excessive allocation requests.
+    /// Expected: An impossible declared count is rejected before allocating or reading elements.
     #[test]
     fn test_vec_deser_rejects_huge_count_before_allocation() {
         let input = FakeLenInput {
@@ -1400,26 +1413,22 @@ mod tests {
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
     }
 
+    /// Purpose: Protect vector decoding when element size cannot be bounded.
+    /// Expected: A nonempty payload for an element type without a minimum-size hint is rejected.
     #[test]
     fn test_vec_deser_rejects_nonempty_type_without_min_hint() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + 1];
-        out[..].ser_u64(0, 1);
-
-        let err = Vec::<NoHint>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<Vec<NoHint>>(1, 1);
     }
 
+    /// Purpose: Protect vector decoding of zero-sized elements.
+    /// Expected: A nonempty unit-element count is rejected as an invalid payload.
     #[test]
     fn test_vec_unit_deser_rejects_nonempty_count() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, 1);
-
-        let err = Vec::<()>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<Vec<()>>(1, 0);
     }
 
+    /// Purpose: Protect serialization of maps with structured values.
+    /// Expected: Decoding restores keys and values and consumes the complete encoding.
     #[test]
     fn test_btree_map_serde() {
         let map = BTreeMap::from([(
@@ -1438,26 +1447,22 @@ mod tests {
         assert_eq!(val, map);
     }
 
+    /// Purpose: Protect map decoding from an impossible declared entry count.
+    /// Expected: The malformed payload returns a data-integrity error.
     #[test]
     fn test_btree_map_deser_rejects_count_larger_than_remaining_input() {
-        let mut out = vec![0u8; mem::size_of::<u64>()];
-        out[..].ser_u64(0, u64::MAX);
-
-        let err = BTreeMap::<u64, TestStruct>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<BTreeMap<u64, TestStruct>>(u64::MAX, 0);
     }
 
+    /// Purpose: Protect map decoding with an incomplete key-value entry.
+    /// Expected: The combined minimum key and value sizes constrain the accepted count.
     #[test]
     fn test_btree_map_deser_rejects_count_larger_than_min_byte_capacity() {
-        let mut out = vec![0u8; mem::size_of::<u64>() + (mem::size_of::<u64>() * 2) - 1];
-        out[..].ser_u64(0, 1);
-
-        let err = BTreeMap::<u64, u64>::deser(&out[..], 0).unwrap_err();
-
-        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+        assert_invalid_collection_count::<BTreeMap<u64, u64>>(1, 15);
     }
 
+    /// Purpose: Protect serialization of index key order and attributes.
+    /// Expected: The complete index specification survives a round trip.
     #[test]
     fn test_index_spec_serde() {
         let cols = vec![
@@ -1481,6 +1486,8 @@ mod tests {
         assert_eq!(parsed, spec);
     }
 
+    /// Purpose: Protect the persisted secondary-index slot format and invalid-input boundaries.
+    /// Expected: Valid states use the specified bytes while malformed tags, truncation, and invalid roots fail.
     #[test]
     fn test_secondary_index_slot_serde_is_exact_and_fallible() {
         for (slot, expected) in [
@@ -1520,6 +1527,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect fixed-size byte-array serialization.
+    /// Expected: Array contents round trip with the expected encoded length.
     #[test]
     fn test_array_serde() {
         let array = [0u8, 1, 2, 3, 4];
@@ -1533,6 +1542,8 @@ mod tests {
         assert_eq!(res, array);
     }
 
+    /// Purpose: Protect unsigned frame-of-reference compression across encoded widths.
+    /// Expected: Supported spans round trip while an uneconomical span declines compression.
     #[test]
     fn test_for_bitpacking_serde() {
         for input in [
@@ -1566,6 +1577,8 @@ mod tests {
         assert!(bp.is_none());
     }
 
+    /// Purpose: Protect frame-of-reference compression across signed zero.
+    /// Expected: Negative and positive values round trip without changing their order or magnitude.
     #[test]
     fn test_for_bitpacking_serde_signed_ints() {
         let input = vec![-10i16, -3, 0, 1, 5, 8];
@@ -1587,6 +1600,8 @@ mod tests {
         assert_eq!(decompressed.0, input);
     }
 
+    /// Purpose: Protect serialization of signed scalar collections.
+    /// Expected: Negative, zero, and positive values survive complete round trips.
     #[test]
     fn test_scalar_signed_ser_de() {
         let values = vec![-1024i16, -1, 0, 1, 2048];

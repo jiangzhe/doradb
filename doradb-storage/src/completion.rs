@@ -147,6 +147,8 @@ mod tests {
     use error_stack::Report;
     use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 
+    /// Purpose: Protect repeated observation of a successful completion.
+    /// Expected: The result is absent before completion and remains available afterward.
     #[test]
     fn test_completion_completed_result_is_stable() {
         let completion = Completion::<usize>::new();
@@ -156,6 +158,8 @@ mod tests {
         assert_eq!(completion.completed_result().unwrap().unwrap(), 7);
     }
 
+    /// Purpose: Protect waiting after a completion has already been published.
+    /// Expected: The waiter receives the stored successful value.
     #[test]
     fn test_completion_waiter_can_observe_precompleted_state() {
         smol::block_on(async {
@@ -165,6 +169,29 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect completion delivery to already pending asynchronous observers.
+    /// Expected: Publishing a result releases every registered waiter with the same value.
+    #[test]
+    fn test_completion_wakes_registered_waiters() {
+        smol::block_on(async {
+            let completion = Completion::<usize>::new();
+            let mut first = Box::pin(completion.wait_result());
+            let mut second = Box::pin(completion.wait_result());
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            completion.complete(Ok(19));
+            for (name, mut waiter) in [("first", first), ("second", second)] {
+                let result = futures::poll!(waiter.as_mut());
+                assert!(
+                    matches!(result, std::task::Poll::Ready(Ok(19))),
+                    "{name} waiter did not observe completion: {result:?}"
+                );
+            }
+        });
+    }
+
+    /// Purpose: Protect deferred error reconstruction during completion fanout.
+    /// Expected: Observers share the captured bridge and reconstruction preserves the original diagnostics.
     #[test]
     fn test_completion_error_fanout_clones_bridge_without_reconstructing() {
         let completion = Completion::<usize>::new();
@@ -177,6 +204,9 @@ mod tests {
 
         let first = completion.completed_result().unwrap().unwrap_err();
         let second = completion.completed_result().unwrap().unwrap_err();
+        let awaited = smol::block_on(completion.wait_result()).unwrap_err();
+        assert_eq!(awaited.test_identity(), identity);
+        assert_eq!(awaited.test_reconstructions(), 0);
         assert_eq!(first.test_identity(), identity);
         assert_eq!(second.test_identity(), identity);
         assert_eq!(first.test_reconstructions(), 0);
@@ -191,6 +221,8 @@ mod tests {
         assert!(output.contains("test send completion"));
     }
 
+    /// Purpose: Protect backend diagnostics transported through completion errors.
+    /// Expected: Runtime materialization retains the backend source and caller attachments.
     #[test]
     fn test_completion_error_propagates_backend_attachments() {
         let completion = Completion::<usize>::new();
@@ -218,6 +250,8 @@ mod tests {
         assert!(output.contains("complete test backend write"), "{output}");
     }
 
+    /// Purpose: Protect short-read diagnostics through completion transport.
+    /// Expected: Materialization preserves the I/O classification and byte-count context.
     #[test]
     fn test_completion_report_unexpected_eof_reports_io() {
         let report = CompletionErrorBridge::capture(
@@ -237,6 +271,8 @@ mod tests {
         assert!(output.contains("test completion short read"));
     }
 
+    /// Purpose: Protect attached operating-system error detail through completion transport.
+    /// Expected: Materialization preserves the I/O kind and caller-visible message.
     #[test]
     fn test_completion_report_io_attaches_error_detail() {
         let err = StdIoError::new(IoErrorKind::PermissionDenied, "completion io denied");

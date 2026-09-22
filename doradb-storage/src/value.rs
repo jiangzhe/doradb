@@ -1375,6 +1375,8 @@ mod tests {
     use crate::error::ErrorKind;
     use std::f64::consts::PI as PI_F64;
 
+    /// Purpose: Protect public disclosure of an invalid value-kind tag.
+    /// Expected: The error retains its data-integrity classification and native invalid-payload cause.
     #[test]
     fn test_val_kind_try_from_preserves_data_integrity_source() {
         let err = ValKind::try_from(257u32).expect_err("invalid value-kind tag must fail");
@@ -1386,21 +1388,16 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect the compact variable-value header layouts.
+    /// Expected: Memory and page representations retain their specified header sizes.
     #[test]
     fn test_var_len() {
         assert!(mem::size_of::<MemVar>() == MEM_VAR_HEADER);
         assert!(mem::size_of::<PageVar>() == PAGE_VAR_HEADER);
     }
 
-    #[test]
-    fn test_page_var() {
-        let var1 = PageVar::inline(b"hello");
-        assert!(var1.is_inlined());
-        assert!(var1.len() == 5);
-        // SAFETY: inline `PageVar` values ignore the page pointer argument.
-        assert!(unsafe { var1.as_bytes_unchecked(std::ptr::null()) } == b"hello");
-    }
-
+    /// Purpose: Protect memory-value access across inline and outlined storage.
+    /// Expected: Bytes, text, length, and outlined-storage requirements match the input.
     #[test]
     fn test_mem_var() {
         let var1 = MemVar::from(&b"hello"[..]);
@@ -1418,6 +1415,8 @@ mod tests {
         assert!(MemVar::outline_len(b"a long value stored outline") == 27);
     }
 
+    /// Purpose: Protect the persisted representation of all value variants.
+    /// Expected: Type tags and payload bytes match the specified format and decode to the original values.
     #[test]
     fn test_val_serde() {
         // serialize and deserialize null
@@ -1537,6 +1536,8 @@ mod tests {
         assert!(val == Val::from(&b"hello"[..]));
     }
 
+    /// Purpose: Protect value-type metadata serialization including nonzero offsets.
+    /// Expected: Kind and nullability survive encoding with correct field placement and consumption.
     #[test]
     fn test_valtype_serde() {
         // 测试用例1：非空的固定长度类型
@@ -1622,6 +1623,8 @@ mod tests {
         assert!(deserialized.nullable);
     }
 
+    /// Purpose: Protect type and byte-length distinctions in value hashing.
+    /// Expected: The sampled distinct scalar types and trailing-byte payloads yield different hashes.
     #[test]
     fn test_val_hash() {
         use std::hash::DefaultHasher;
@@ -1666,6 +1669,8 @@ mod tests {
         assert!(hash5 != hash6);
     }
 
+    /// Purpose: Protect inline page-value metadata and access.
+    /// Expected: Inline bytes retain their length and require no external offset.
     #[test]
     fn test_page_var_inline() {
         let data = b"hello";
@@ -1677,6 +1682,8 @@ mod tests {
         assert_eq!(var.offset(), None);
     }
 
+    /// Purpose: Protect page-relative access to an outlined value.
+    /// Expected: The recorded offset and length locate the original bytes in the backing page.
     #[test]
     fn test_page_var_outline() {
         let data = b"a long string that needs outline storage";
@@ -1696,44 +1703,48 @@ mod tests {
         assert_eq!(unsafe { var.as_bytes_unchecked(page_data.as_ptr()) }, data);
     }
 
+    /// Purpose: Protect page-value metadata at the inline storage boundary.
+    /// Expected: Length, storage mode, and external space requirements agree with each named payload.
     #[test]
-    fn test_page_var_len() {
-        let short_data = b"short";
-        let long_data = b"a long string that exceeds inline limit";
-
-        let short_var = PageVar::inline(short_data);
-        let long_var =
-            PageVar::outline(long_data.len() as u16, 0, &long_data[..PAGE_VAR_LEN_PREFIX]);
-
-        assert_eq!(short_var.len(), short_data.len());
-        assert_eq!(long_var.len(), long_data.len());
+    fn test_page_var_storage_boundaries() {
+        for (name, data, inline) in [
+            ("empty", b"".as_slice(), true),
+            ("short", b"short".as_slice(), true),
+            ("inline_limit", b"inline".as_slice(), true),
+            ("first_outline", b"outline".as_slice(), false),
+            (
+                "long",
+                b"a long string that exceeds inline limit".as_slice(),
+                false,
+            ),
+            (
+                "outline_space",
+                b"a long string that needs outline storage".as_slice(),
+                false,
+            ),
+            (
+                "outline_mode",
+                b"this will be stored outline".as_slice(),
+                false,
+            ),
+        ] {
+            let value = if inline {
+                PageVar::inline(data)
+            } else {
+                PageVar::outline(data.len() as u16, 0, &data[..PAGE_VAR_LEN_PREFIX])
+            };
+            assert_eq!(value.len(), data.len(), "{name}");
+            assert_eq!(value.is_inlined(), inline, "{name}");
+            assert_eq!(
+                PageVar::outline_len(data),
+                if inline { 0 } else { data.len() },
+                "{name}"
+            );
+        }
     }
 
-    #[test]
-    fn test_page_var_is_inlined() {
-        let inline_data = b"inline";
-        let outline_data = b"this will be stored outline";
-
-        let inline_var = PageVar::inline(inline_data);
-        let outline_var = PageVar::outline(
-            outline_data.len() as u16,
-            0,
-            &outline_data[..PAGE_VAR_LEN_PREFIX],
-        );
-
-        assert!(inline_var.is_inlined());
-        assert!(!outline_var.is_inlined());
-    }
-
-    #[test]
-    fn test_page_var_outline_len() {
-        let inline_data = b"short";
-        let outline_data = b"a long string that needs outline storage";
-
-        assert_eq!(PageVar::outline_len(inline_data), 0);
-        assert_eq!(PageVar::outline_len(outline_data), outline_data.len());
-    }
-
+    /// Purpose: Protect shrinking a page value across the inline storage boundary.
+    /// Expected: Updates preserve the new bytes and switch storage form when the payload fits inline.
     #[test]
     fn test_page_var_update_in_place() {
         let mut page_data = vec![0u8; 100];
@@ -1762,7 +1773,7 @@ mod tests {
             unsafe { var.as_bytes_unchecked(page_data.as_ptr()) },
             updated_data
         );
-        // Update with shorter data (should not switch to inline)
+        // Shrinking below the inline limit should switch storage form.
         // SAFETY: `page_data` backs the outlined payload referenced by `var`.
         unsafe { var.update_in_place(page_data.as_mut_ptr(), short_data) };
         assert!(var.is_inlined());
@@ -1775,6 +1786,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect cloning an outlined owned value.
+    /// Expected: The clone owns independent bytes that remain valid after the original is dropped.
     #[test]
     fn test_val_clone() {
         let v1 = Val::from("000000000000000");
@@ -1782,8 +1795,16 @@ mod tests {
         println!("v1={:?}", v1.as_bytes());
         println!("v2={:?}", v2.as_bytes());
         assert!(v1 == v2);
+        assert_ne!(
+            v1.as_bytes().unwrap().as_ptr(),
+            v2.as_bytes().unwrap().as_ptr()
+        );
+        drop(v1);
+        assert_eq!(v2.as_bytes().unwrap(), b"000000000000000");
     }
 
+    /// Purpose: Protect diagnostic formatting across value variants.
+    /// Expected: Output identifies scalar types and distinguishes text from non-UTF-8 byte payloads.
     #[test]
     fn test_val_debug_fmt() {
         assert!(format!("{:?}", Val::Null) == "Null");
@@ -1804,6 +1825,8 @@ mod tests {
         assert!(format!("{:?}", non_utf8) == "bytes([255])");
     }
 
+    /// Purpose: Protect borrowed scalar views at numeric boundaries.
+    /// Expected: Views preserve variants, integer values, and exact floating-point bits.
     #[test]
     fn test_value_views_preserve_variants_and_scalar_bits() {
         let cases = [
@@ -1870,6 +1893,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect borrowed byte views across storage boundaries.
+    /// Expected: Views borrow the original bytes without copying and preserve byte-specific diagnostics.
     #[test]
     fn test_value_views_borrow_inline_and_outlined_bytes() {
         for len in [0, 6, 7, 14, 15, 128] {
