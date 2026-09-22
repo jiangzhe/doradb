@@ -186,6 +186,8 @@ mod tests {
         ObserveWorkerFinish::new(worker.to_owned(), observer)
     }
 
+    /// Purpose: Protect successful execution of a named worker.
+    /// Expected: Joining the worker observes completion of its task.
     #[test]
     fn test_spawn_named_runs_and_joins_worker() {
         let ran = Arc::new(AtomicBool::new(false));
@@ -201,6 +203,8 @@ mod tests {
         assert!(ran.load(Ordering::Acquire));
     }
 
+    /// Purpose: Protect diagnostics and task ownership when worker creation fails.
+    /// Expected: The runtime report retains its I/O cause and thread name without running the task.
     #[test]
     fn test_spawn_named_failure_preserves_runtime_io_and_thread_name() {
         let _failure = fail_spawn_named("Thread-Test-Failure");

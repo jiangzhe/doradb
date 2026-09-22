@@ -544,27 +544,71 @@ fn recovery_sub_duration(value: Duration, decrement: Duration, saturated: &mut b
 mod tests {
     use super::*;
 
+    /// Purpose: Protect recovery diagnostics at arithmetic boundaries.
+    /// Expected: Overflow and underflow clamp safely and mark the report as saturated.
     #[test]
     fn recovery_diagnostic_arithmetic_saturates_without_panicking() {
-        let mut saturated = false;
-        let mut count = u64::MAX;
-        recovery_add_count(&mut count, 1, &mut saturated);
-        assert_eq!(count, u64::MAX);
-        assert!(saturated);
-        saturated = false;
-        let mut duration = Duration::MAX;
-        recovery_add_duration(&mut duration, Duration::from_nanos(1), &mut saturated);
-        assert_eq!(duration, Duration::MAX);
-        assert!(saturated);
-        saturated = false;
-        assert_eq!(recovery_sub_count(0, 1, &mut saturated), 0);
-        assert!(saturated);
-        saturated = false;
-        assert_eq!(
-            recovery_sub_duration(Duration::ZERO, Duration::from_nanos(1), &mut saturated),
-            Duration::ZERO
-        );
-        assert!(saturated);
+        for (initial, increment, expected, overflow) in
+            [(2, 3, 5, false), (u64::MAX, 1, u64::MAX, true)]
+        {
+            let mut value = initial;
+            let mut saturated = false;
+            recovery_add_count(&mut value, increment, &mut saturated);
+            assert_eq!(
+                (value, saturated),
+                (expected, overflow),
+                "count add: {initial} + {increment}"
+            );
+        }
+        for (initial, decrement, expected, underflow) in [(3, 1, 2, false), (0, 1, 0, true)] {
+            let mut saturated = false;
+            let value = recovery_sub_count(initial, decrement, &mut saturated);
+            assert_eq!(
+                (value, saturated),
+                (expected, underflow),
+                "count subtract: {initial} - {decrement}"
+            );
+        }
+        for (initial, increment, expected, overflow) in [
+            (
+                Duration::from_nanos(2),
+                Duration::from_nanos(3),
+                Duration::from_nanos(5),
+                false,
+            ),
+            (Duration::MAX, Duration::from_nanos(1), Duration::MAX, true),
+        ] {
+            let mut value = initial;
+            let mut saturated = false;
+            recovery_add_duration(&mut value, increment, &mut saturated);
+            assert_eq!(
+                (value, saturated),
+                (expected, overflow),
+                "duration add: {initial:?} + {increment:?}"
+            );
+        }
+        for (initial, decrement, expected, underflow) in [
+            (
+                Duration::from_nanos(3),
+                Duration::from_nanos(1),
+                Duration::from_nanos(2),
+                false,
+            ),
+            (
+                Duration::ZERO,
+                Duration::from_nanos(1),
+                Duration::ZERO,
+                true,
+            ),
+        ] {
+            let mut saturated = false;
+            let value = recovery_sub_duration(initial, decrement, &mut saturated);
+            assert_eq!(
+                (value, saturated),
+                (expected, underflow),
+                "duration subtract: {initial:?} - {decrement:?}"
+            );
+        }
         let mut report = RecoveryReport::default();
         report.phases.redo_replay_elapsed = Duration::from_nanos(1);
         report.finish_transaction(Duration::ZERO);

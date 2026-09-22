@@ -868,6 +868,7 @@ mod tests {
         session_registry_len,
     };
     use crate::thread::{SpawnTestEvent, fail_spawn_named_with_observer, observe_spawn_named};
+    use crate::trx::Transaction;
     use crate::trx::tests::{add_pseudo_redo_log_entry, pending_statement};
     use std::fs;
     use std::io::Error as StdIoError;
@@ -985,6 +986,78 @@ mod tests {
             .trx(TrxSysConfig::default())
     }
 
+    async fn bootstrap_test_engine(root: &Path) -> Engine {
+        Engine::bootstrap(test_engine_config_for(root))
+            .await
+            .unwrap()
+    }
+
+    async fn assert_swap_file_change(
+        path: &str,
+        configure: impl FnOnce(EngineConfig) -> EngineConfig,
+    ) {
+        let root = TempDir::new().unwrap();
+        drop(bootstrap_test_engine(root.path()).await);
+        let engine = Engine::bootstrap(configure(test_engine_config_for(root.path())))
+            .await
+            .unwrap();
+        assert!(
+            root.path().join(path).is_file(),
+            "replacement swap file was not created: {path}"
+        );
+        drop(engine);
+    }
+
+    fn assert_workers_reclaimed(
+        events: impl IntoIterator<Item = SpawnTestEvent>,
+        scenario: &str,
+    ) -> Vec<String> {
+        let mut started = Vec::new();
+        let mut finished = Vec::new();
+        for event in events {
+            match event {
+                SpawnTestEvent::Started(name) => started.push(name),
+                SpawnTestEvent::Finished(name) => finished.push(name),
+            }
+        }
+        started.sort_unstable();
+        finished.sort_unstable();
+        assert_eq!(started, finished, "unreclaimed workers: {scenario}");
+        started
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TransactionTerminal {
+        Commit,
+        ReadonlyCommit,
+        Rollback,
+    }
+
+    async fn assert_session_reuse(terminal: TransactionTerminal) {
+        let root = TempDir::new().unwrap();
+        let engine = bootstrap_test_engine(root.path()).await;
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        match terminal {
+            TransactionTerminal::Commit => {
+                add_pseudo_redo_log_entry(&mut trx).await;
+                let cts = trx.commit().await.unwrap();
+                assert!(cts > TrxID::new(0), "{terminal:?}");
+                assert_eq!(session.last_cts(), cts, "{terminal:?}");
+            }
+            TransactionTerminal::ReadonlyCommit => {
+                assert_eq!(trx.commit().await.unwrap(), TrxID::new(0), "{terminal:?}");
+                assert_eq!(session.last_cts(), TrxID::new(0), "{terminal:?}");
+            }
+            TransactionTerminal::Rollback => {
+                trx.rollback().await.unwrap();
+                assert_eq!(session.last_cts(), TrxID::new(0), "{terminal:?}");
+            }
+        }
+        assert!(!session.in_trx().unwrap(), "{terminal:?}");
+        session.begin_trx().unwrap().rollback().await.unwrap();
+    }
+
     fn wait_until_shutdown_begins(engine: &Engine) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while engine.inner().lifecycle.inspect_state() == EngineLifecycleState::Running {
@@ -1012,6 +1085,18 @@ mod tests {
             .count()
     }
 
+    async fn locked_test_transaction(engine: &Engine) -> (Session, Transaction, LockOwner) {
+        let table_id = table1(engine).await;
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let owner = LockOwner::transaction(session.id(), trx.trx_id());
+        trx.lock_table(table_id, TableLockMode::Shared)
+            .await
+            .unwrap();
+        assert!(lock_entry_count(engine, owner) > 0);
+        (session, trx, owner)
+    }
+
     #[inline]
     fn assert_runtime_unavailable_after_shutdown(err: Error) {
         assert_eq!(err.kind(), ErrorKind::Lifecycle);
@@ -1021,6 +1106,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect admission after lifecycle closure.
+    /// Expected: The lifecycle error identifies shutdown and the current engine state.
     #[test]
     fn test_engine_lifecycle_rejected_admission_reports_state() {
         let lifecycle = EngineLifecycle::new();
@@ -1034,13 +1121,13 @@ mod tests {
         assert!(output.contains("state=ShuttingDown"), "{output}");
     }
 
+    /// Purpose: Protect fatal-error precedence during poisoned engine admission.
+    /// Expected: New sessions fail with the original fatal reason without a lifecycle replacement.
     #[test]
     fn test_poisoned_engine_new_session_admission_remains_fatal() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let _ = engine
                 .inner()
                 .poisoner
@@ -1059,6 +1146,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect startup rollback when any engine worker cannot be spawned.
+    /// Expected: The runtime failure names its boundary and all previously started workers are reclaimed in dependency order.
     #[test]
     fn test_engine_worker_spawn_failures_are_runtime_and_failure_atomic() {
         for (worker, phase) in [
@@ -1106,20 +1195,7 @@ mod tests {
             );
 
             let events: Vec<_> = event_rx.try_iter().collect();
-            let mut started = Vec::new();
-            let mut finished = Vec::new();
-            for event in events.iter().cloned() {
-                match event {
-                    SpawnTestEvent::Started(name) => started.push(name),
-                    SpawnTestEvent::Finished(name) => finished.push(name),
-                }
-            }
-            started.sort_unstable();
-            finished.sort_unstable();
-            assert_eq!(
-                started, finished,
-                "startup returned before reclaiming all workers for failure at {worker}"
-            );
+            let started = assert_workers_reclaimed(events.iter().cloned(), worker);
             assert!(!started.iter().any(|name| name == worker));
             if worker.starts_with("Mandatory-Runtime-") {
                 assert!(
@@ -1156,6 +1232,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect startup rollback after the initial redo write fails.
+    /// Expected: The fatal write error is retained and every started worker finishes before bootstrap returns.
     #[test]
     fn test_initial_redo_header_failure_reclaims_started_workers_before_startup_returns() {
         let root = TempDir::new().unwrap();
@@ -1190,20 +1268,7 @@ mod tests {
             "report={output}"
         );
 
-        let mut started = Vec::new();
-        let mut finished = Vec::new();
-        for event in event_rx.try_iter() {
-            match event {
-                SpawnTestEvent::Started(name) => started.push(name),
-                SpawnTestEvent::Finished(name) => finished.push(name),
-            }
-        }
-        started.sort_unstable();
-        finished.sort_unstable();
-        assert_eq!(
-            started, finished,
-            "startup returned before reclaiming workers after initial redo-header failure"
-        );
+        let started = assert_workers_reclaimed(event_rx.try_iter(), "initial redo header failure");
         for expected in [
             "IO-Thread",
             "Log-Thread",
@@ -1218,6 +1283,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect rollback of a partially started purge executor group.
+    /// Expected: The started executor is reclaimed and dependent workers never start after the spawn failure.
     #[test]
     fn test_partial_purge_executor_spawn_failure_reclaims_started_executor() {
         let root = TempDir::new().unwrap();
@@ -1242,20 +1309,7 @@ mod tests {
         assert!(output.contains("phase=start_transaction_purge_workers"));
         assert_eq!(output.matches("thread_name=Purge-Executor-2").count(), 1);
 
-        let mut started = Vec::new();
-        let mut finished = Vec::new();
-        for event in event_rx.try_iter() {
-            match event {
-                SpawnTestEvent::Started(name) => started.push(name),
-                SpawnTestEvent::Finished(name) => finished.push(name),
-            }
-        }
-        started.sort_unstable();
-        finished.sort_unstable();
-        assert_eq!(
-            started, finished,
-            "partial purge startup returned before reclaiming its first executor"
-        );
+        let started = assert_workers_reclaimed(event_rx.try_iter(), "partial purge startup");
         assert!(
             started.iter().any(|name| name == "Purge-Executor-1"),
             "first purge executor did not start: {started:?}"
@@ -1274,6 +1328,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect the primary startup failure when cleanup joins a panicking worker.
+    /// Expected: The spawn report remains authoritative with additional cleanup-panic diagnostics.
     #[test]
     fn test_startup_rollback_join_panic_preserves_primary_runtime_report() {
         let root = TempDir::new().unwrap();
@@ -1303,6 +1359,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect configuration ownership of catalog checkpoint read-ahead.
+    /// Expected: Checkpoint scans use the transaction setting independently of recovery and log-write depths.
     #[test]
     fn test_catalog_checkpoint_scan_io_depth_comes_from_trx_config() {
         smol::block_on(async {
@@ -1328,13 +1386,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect engine session identifier allocation.
+    /// Expected: Successive sessions receive consecutive identifiers from the designated starting point.
     #[test]
     fn test_session_ids_are_monotonic_across_engine_sessions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let session1 = engine.new_session().unwrap();
             let session2 = engine.new_session().unwrap();
             let session3 = engine.new_session().unwrap();
@@ -1345,13 +1403,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect lock-manager identity across engine and session runtime access.
+    /// Expected: A conflicting acquisition waits until the same shared manager releases its blocker.
     #[test]
     fn test_engine_lock_manager_is_shared_across_runtime_handles() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let session = engine.new_session().unwrap();
             let runtime = session.engine();
             let resource = LockResource::TableMetadata(TableID::new(10));
@@ -1379,6 +1437,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shared storage statistics ownership across pools and table files.
+    /// Expected: All storage consumers reference the same backend statistics handle.
     #[test]
     fn test_engine_shared_storage_runtime_reuses_one_backend_stats_handle() {
         smol::block_on(async {
@@ -1408,6 +1468,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect configuration ownership of the shared storage backend.
+    /// Expected: The filesystem depth is applied and pool statistics agree with the shared backend.
     #[test]
     fn test_engine_shared_storage_io_depth_comes_from_file_system_config() {
         smol::block_on(async {
@@ -1440,59 +1502,33 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect reopening durable storage after changing the data swap path.
+    /// Expected: Bootstrap succeeds with the replacement ephemeral swap location.
     #[test]
     fn test_storage_layout_marker_allows_data_swap_change() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            drop(engine);
-
-            let engine = Engine::bootstrap(
-                test_engine_config_for(root.path()).data_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(64usize * 1024 * 1024)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .swap_file("alt-data.swp"),
-                ),
-            )
-            .await
-            .unwrap();
-            drop(engine);
-        });
+        smol::block_on(assert_swap_file_change("alt-data.swp", |config| {
+            let buffer = config.data_buffer.clone().swap_file("alt-data.swp");
+            config.data_buffer(buffer)
+        }));
     }
 
+    /// Purpose: Protect reopening durable storage after changing the index swap path.
+    /// Expected: Bootstrap succeeds with the replacement ephemeral swap location.
     #[test]
     fn test_storage_layout_marker_allows_index_swap_change() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            drop(engine);
-
-            let engine = Engine::bootstrap(
-                test_engine_config_for(root.path()).index_buffer(
-                    EvictableBufferPoolConfig::default()
-                        .max_mem_size(TEST_POOL_BYTES)
-                        .max_file_size(128usize * 1024 * 1024)
-                        .swap_file("alt-index.swp"),
-                ),
-            )
-            .await
-            .unwrap();
-            drop(engine);
-        });
+        smol::block_on(assert_swap_file_change("alt-index.swp", |config| {
+            let buffer = config.index_buffer.clone().swap_file("alt-index.swp");
+            config.index_buffer(buffer)
+        }));
     }
 
+    /// Purpose: Protect default swap-file creation during engine bootstrap.
+    /// Expected: Both data and index swap files exist after successful startup.
     #[test]
     fn test_engine_startup_creates_default_swap_files() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             drop(engine);
 
             assert!(root.path().join("data.swp").exists());
@@ -1500,62 +1536,41 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_storage_layout_marker_rejects_data_dir_change() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            drop(engine);
-
-            let err = match Engine::bootstrap(
-                test_engine_config_for(root.path())
-                    .file(FileSystemConfig::default().data_dir("data")),
-            )
-            .await
-            {
-                Ok(_) => panic!("expected storage layout mismatch"),
-                Err(err) => err,
-            };
-            assert!(err.is_kind(ErrorKind::Config));
-            assert_eq!(
-                err.report().downcast_ref::<ConfigError>().copied(),
-                Some(ConfigError::StorageLayoutMismatch)
-            );
-        });
-    }
-
+    /// Purpose: Protect filesystem state when persisted layout validation fails.
+    /// Expected: Bootstrap rejects the mismatch without creating the requested replacement directory.
     #[test]
     fn test_storage_layout_mismatch_does_not_create_new_directories() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
+            drop(bootstrap_test_engine(root.path()).await);
+            for directory in ["data", "other-data"] {
+                let target = root.path().join(directory);
+                assert!(!target.exists(), "{directory}");
+                let error = match Engine::bootstrap(
+                    test_engine_config_for(root.path())
+                        .file(FileSystemConfig::default().data_dir(directory)),
+                )
                 .await
-                .unwrap();
-            drop(engine);
-
-            let new_data_dir = root.path().join("other-data");
-            assert!(!new_data_dir.exists());
-
-            let err = match Engine::bootstrap(
-                test_engine_config_for(root.path())
-                    .file(FileSystemConfig::default().data_dir("other-data")),
-            )
-            .await
-            {
-                Ok(_) => panic!("expected storage layout mismatch"),
-                Err(err) => err,
-            };
-            assert!(err.is_kind(ErrorKind::Config));
-            assert_eq!(
-                err.report().downcast_ref::<ConfigError>().copied(),
-                Some(ConfigError::StorageLayoutMismatch)
-            );
-            assert!(!new_data_dir.exists());
+                {
+                    Ok(_) => panic!("layout change to {directory} must fail"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.kind(), ErrorKind::Config, "{directory}");
+                assert_eq!(
+                    error.report().downcast_ref::<ConfigError>(),
+                    Some(&ConfigError::StorageLayoutMismatch),
+                    "{directory}"
+                );
+                assert!(
+                    !target.exists(),
+                    "rejected directory was created: {directory}"
+                );
+            }
         });
     }
 
+    /// Purpose: Protect relocation of an intact storage-root directory.
+    /// Expected: The engine reopens successfully using the relocated relative layout.
     #[test]
     fn test_storage_layout_marker_allows_storage_root_relocation() {
         smol::block_on(async {
@@ -1563,28 +1578,24 @@ mod tests {
             let root_a = parent.path().join("root-a");
             let root_b = parent.path().join("root-b");
 
-            let engine = Engine::bootstrap(test_engine_config_for(&root_a))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(&root_a).await;
             drop(engine);
 
             fs::rename(&root_a, &root_b).unwrap();
 
-            let engine = Engine::bootstrap(test_engine_config_for(&root_b))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(&root_b).await;
             drop(engine);
         });
     }
 
+    /// Purpose: Protect exclusive engine ownership through canonical root aliases.
+    /// Expected: Concurrent bootstrap is rejected without side effects and shutdown permits a replacement engine.
     #[test]
     fn test_active_engine_excludes_aliases_and_shutdown_releases_root() {
         smol::block_on(async {
             let parent = TempDir::new().unwrap();
             let root = parent.path().join("storage");
-            let engine = Engine::bootstrap(test_engine_config_for(&root))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(&root).await;
             let alias = parent.path().join("storage-alias");
             symlink(&root, &alias).unwrap();
             let alternate_data = root.join("alternate-data");
@@ -1611,14 +1622,14 @@ mod tests {
             assert!(!alternate_data.exists());
 
             engine.shutdown();
-            let replacement = Engine::bootstrap(test_engine_config_for(&root))
-                .await
-                .unwrap();
+            let replacement = bootstrap_test_engine(&root).await;
             drop(replacement);
             drop(engine);
         });
     }
 
+    /// Purpose: Protect marker publication when buffer configuration prevents startup.
+    /// Expected: Failed bootstrap leaves no marker and a later valid configuration can establish its own layout.
     #[test]
     fn test_failed_startup_does_not_persist_storage_layout_marker() {
         smol::block_on(async {
@@ -1670,6 +1681,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect preflight validation of an undersized readonly buffer.
+    /// Expected: Bootstrap identifies the invalid configuration before publishing a layout marker.
     #[test]
     fn test_readonly_buffer_pool_preflight_reports_config_error() {
         smol::block_on(async {
@@ -1695,6 +1708,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect marker publication when a swap path overlaps durable storage.
+    /// Expected: Bootstrap reports the path conflict without publishing a marker.
     #[test]
     fn test_invalid_swap_path_startup_does_not_persist_storage_layout_marker() {
         smol::block_on(async {
@@ -1723,6 +1738,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown ordering while a pool job awaits storage completion.
+    /// Expected: Successful and failed jobs resume and release resources before their supporting workers stop.
     #[test]
     fn test_thread_pool_drains_pending_storage_before_eviction_and_io_shutdown() {
         for fail in [false, true] {
@@ -1749,9 +1766,7 @@ mod tests {
                         }
                     }
                 });
-                let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                    .await
-                    .unwrap();
+                let engine = bootstrap_test_engine(root.path()).await;
                 let table_id = table1(&engine).await;
                 let disk_pool = engine.inner().pools.disk.clone();
                 let disk_guard = disk_pool.create_base_guard();
@@ -1842,13 +1857,13 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect repeated explicit engine shutdown.
+    /// Expected: Shutdown can be repeated and subsequent session admission reports lifecycle closure.
     #[test]
     fn test_engine_shutdown_is_idempotent_and_rejects_new_work() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
 
             engine.shutdown();
             engine.shutdown();
@@ -1861,6 +1876,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown completion after a purge worker panics on exit.
+    /// Expected: Remaining workers finish in dependency order, the panic propagates once, and root ownership is released.
     #[test]
     fn test_engine_shutdown_contains_purge_finish_panic_and_releases_root() {
         let root = TempDir::new().unwrap();
@@ -1876,8 +1893,7 @@ mod tests {
                 panic::panic_any("injected purge dispatcher finish panic");
             }
         });
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
 
         let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
         assert_eq!(
@@ -1924,13 +1940,14 @@ mod tests {
 
         // Root-lease shutdown is an active hook, so a replacement engine can
         // start while the degraded terminal owner remains allocated.
-        let replacement =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let replacement = smol::block_on(bootstrap_test_engine(root.path()));
         replacement.shutdown();
         drop(replacement);
         drop(engine);
     }
 
+    /// Purpose: Protect owner destruction during an existing panic.
+    /// Expected: The outer panic survives a shutdown panic and the storage root becomes reusable.
     #[test]
     fn test_engine_owner_drop_suppresses_shutdown_panic_during_outer_unwind() {
         let root = TempDir::new().unwrap();
@@ -1943,8 +1960,7 @@ mod tests {
                 panic::panic_any("injected owner-drop purge finish panic");
             }
         });
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
 
         let payload = panic::catch_unwind(AssertUnwindSafe(move || {
             let _engine = engine;
@@ -1958,11 +1974,12 @@ mod tests {
         assert!(injected.load(Ordering::Acquire));
         drop(observer);
 
-        let replacement =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let replacement = smol::block_on(bootstrap_test_engine(root.path()));
         replacement.shutdown();
     }
 
+    /// Purpose: Protect terminal shutdown after eviction or I/O worker exit panics.
+    /// Expected: Shutdown reaches its terminal state, continues required teardown, and releases root ownership.
     #[test]
     fn test_engine_contains_evictor_and_io_finish_panics_after_stop_signals() {
         for target in ["Shared-Pool-Evictor", "IO-Thread"] {
@@ -1975,8 +1992,7 @@ mod tests {
                     panic::panic_any(format!("injected {target} finish panic"));
                 }
             });
-            let engine =
-                smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+            let engine = smol::block_on(bootstrap_test_engine(root.path()));
 
             let payload = panic::catch_unwind(AssertUnwindSafe(|| engine.shutdown())).unwrap_err();
             assert_eq!(
@@ -2001,21 +2017,20 @@ mod tests {
             drop(events);
             drop(observer);
 
-            let replacement =
-                smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+            let replacement = smol::block_on(bootstrap_test_engine(root.path()));
             replacement.shutdown();
             drop(replacement);
             drop(engine);
         }
     }
 
+    /// Purpose: Protect shutdown with an unpinned idle session handle.
+    /// Expected: The session registry drains and retained handles reject new work after shutdown.
     #[test]
     fn test_engine_shutdown_ignores_live_idle_session_handle() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
 
@@ -2048,13 +2063,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nonblocking shutdown with a pinned idle session.
+    /// Expected: The busy report identifies the observer and the registry drains after the pin is released.
     #[test]
     fn test_engine_shutdown_busy_keeps_pinned_idle_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let session_handle = engine.new_session().unwrap();
             let session = session_handle.pin_observer().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2082,13 +2097,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect nonblocking shutdown with an active transaction.
+    /// Expected: The busy report identifies the operation and terminal rollback permits shutdown.
     #[test]
     fn test_engine_shutdown_busy_until_active_transaction_finishes() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
 
@@ -2114,13 +2129,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction admission after shutdown has begun.
+    /// Expected: New transaction work is rejected while terminal rollback remains available.
     #[test]
     fn test_engine_shutdown_rejects_non_terminal_transaction_work() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
@@ -2153,11 +2168,12 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect blocking shutdown with a retained session observer.
+    /// Expected: Shutdown remains blocked until the observer pin is released and the registry drains.
     #[test]
     fn test_engine_shutdown_waits_for_pinned_idle_session() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let session_handle = engine.new_session().unwrap();
         let session = session_handle.pin_observer().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2186,35 +2202,42 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect maintenance waiting during engine shutdown.
+    /// Expected: A pending progress wait wakes with the shutdown lifecycle error.
     #[test]
     fn test_engine_shutdown_wakes_maintenance_progress_wait() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let session = engine.new_session().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
 
         thread::scope(|scope| {
             let waiter = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                let err = smol::block_on(session.wait_for_gc_horizon_after(TrxID::new(u64::MAX)))
-                    .unwrap_err();
+                let err = smol::block_on(async {
+                    let mut wait =
+                        Box::pin(session.wait_for_gc_horizon_after(TrxID::new(u64::MAX)));
+                    assert!(futures::poll!(wait.as_mut()).is_pending());
+                    started_tx.send(()).unwrap();
+                    wait.await
+                })
+                .unwrap_err();
                 assert_eq!(
                     err.report().downcast_ref::<LifecycleError>().copied(),
                     Some(LifecycleError::Shutdown)
                 );
             });
-            started_rx.recv().unwrap();
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             engine.shutdown();
             waiter.join().unwrap();
         });
     }
 
+    /// Purpose: Protect blocking shutdown with a live transaction.
+    /// Expected: Shutdown completes only after the transaction reaches a terminal state.
     #[test]
     fn test_engine_shutdown_waits_for_active_transaction_to_finish() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
         let (done_tx, done_rx) = mpsc::channel();
@@ -2241,11 +2264,12 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown when an abandoned transaction is still checked out.
+    /// Expected: Shutdown waits for checkout return and completion of abandonment cleanup.
     #[test]
     fn test_engine_shutdown_waits_for_checked_out_abandoned_transaction_to_return() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let checkout = trx.checkout().unwrap();
@@ -2275,11 +2299,12 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown while a pending statement owns transaction state.
+    /// Expected: Cancelling the statement returns its checkout and permits shutdown to complete.
     #[test]
     fn test_engine_shutdown_waits_for_cancelled_statement_return() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         let mut exec = Box::pin(pending_statement(&mut trx));
@@ -2312,13 +2337,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect session closure around an active transaction.
+    /// Expected: Closure rejects the active transaction, then becomes successful and idempotent after rollback.
     #[test]
     fn test_session_close_rejects_active_transaction_then_retries_after_rollback() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
 
@@ -2339,13 +2364,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction-state queries on a closed session.
+    /// Expected: The query reports session unavailability after successful closure.
     #[test]
     fn test_session_in_trx_returns_error_after_session_close() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
 
             assert!(!session.in_trx().unwrap());
@@ -2361,13 +2386,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction-state queries after engine shutdown.
+    /// Expected: A retained session reports engine shutdown instead of stale transaction state.
     #[test]
     fn test_session_in_trx_returns_error_after_engine_shutdown() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let session = engine.new_session().unwrap();
 
             assert!(!session.in_trx().unwrap());
@@ -2378,13 +2403,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect registry lifetime when a session handle is dropped before rollback.
+    /// Expected: The active transaction retains its session until terminal rollback removes it.
     #[test]
     fn test_dropped_active_session_is_removed_after_transaction_terminal() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2397,23 +2422,14 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cleanup of an abandoned transaction with held locks.
+    /// Expected: Cleanup releases the locks and returns the session to a reusable idle state.
     #[test]
     fn test_dropped_transaction_handle_cleanup_releases_locks_and_reuses_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let table_id = table1(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let mut trx = session.begin_trx().unwrap();
-            let owner = LockOwner::transaction(session_id, trx.trx_id());
-
-            trx.lock_table(table_id, TableLockMode::Shared)
-                .await
-                .unwrap();
-            assert!(lock_entry_count(&engine, owner) > 0);
+            let engine = bootstrap_test_engine(root.path()).await;
+            let (mut session, trx, owner) = locked_test_transaction(&engine).await;
 
             drop(trx);
             wait_until(
@@ -2428,24 +2444,15 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect abandonment cleanup while transaction state is checked out.
+    /// Expected: Locks and exclusivity persist until checkout return, then cleanup permits session reuse.
     #[test]
     fn test_checked_out_abandoned_cleanup_runs_after_checkout_return() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let table_id = table1(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            let session_id = session.id();
-            let mut trx = session.begin_trx().unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
+            let (mut session, mut trx, owner) = locked_test_transaction(&engine).await;
             let trx_id = trx.trx_id();
-            let owner = LockOwner::transaction(session_id, trx.trx_id());
-
-            trx.lock_table(table_id, TableLockMode::Shared)
-                .await
-                .unwrap();
-            assert!(lock_entry_count(&engine, owner) > 0);
 
             let checkout = trx.checkout().unwrap();
             drop(trx);
@@ -2472,13 +2479,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a live transaction after its session handle is dropped.
+    /// Expected: The transaction can commit durably and remove the retained registry entry.
     #[test]
     fn test_dropped_session_live_transaction_can_commit() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
             add_pseudo_redo_log_entry(&mut trx).await;
@@ -2493,13 +2500,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect cleanup when both session and transaction handles are abandoned.
+    /// Expected: Asynchronous cleanup removes the retained session entry.
     #[test]
     fn test_dropping_session_then_transaction_removes_abandoned_session() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
             assert_eq!(session_registry_len(&engine.inner().session_registry), 1);
@@ -2516,13 +2523,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect shutdown against an outstanding operation admission.
+    /// Expected: Shutdown remains blocked until the admission token is released.
     #[test]
     fn test_admitted_operation_token_releases_before_shutdown_completes() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let admission = engine.inner().acquire_admission().unwrap();
             let (started_tx, started_rx) = mpsc::channel();
             let (done_tx, done_rx) = mpsc::channel();
@@ -2537,6 +2544,7 @@ mod tests {
                 started_rx
                     .recv_timeout(Duration::from_secs(5))
                     .expect("shutdown thread should start");
+                wait_until_shutdown_begins(&engine);
                 assert!(
                     done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
                     "shutdown must wait while an admitted operation is active"
@@ -2551,13 +2559,13 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect transaction exclusivity within one session.
+    /// Expected: A second transaction is rejected while the first remains active.
     #[test]
     fn test_same_session_rejects_overlapping_transactions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2576,51 +2584,27 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect session reuse after a transaction with redo commits.
+    /// Expected: Commit returns a durable timestamp and releases the session for another transaction.
     #[test]
     fn test_same_session_reuse_after_commit() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-
-            let mut trx = session.begin_trx().unwrap();
-            add_pseudo_redo_log_entry(&mut trx).await;
-            let cts = trx.commit().await.unwrap();
-            assert!(cts > TrxID::new(0));
-            assert!(!session.in_trx().unwrap());
-
-            let trx = session.begin_trx().unwrap();
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_session_reuse(TransactionTerminal::Commit));
     }
 
+    /// Purpose: Protect session reuse after explicit rollback.
+    /// Expected: Rollback clears active transaction state and permits a replacement transaction.
     #[test]
     fn test_same_session_reuse_after_rollback() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-
-            let trx = session.begin_trx().unwrap();
-            trx.rollback().await.unwrap();
-            assert!(!session.in_trx().unwrap());
-
-            let trx = session.begin_trx().unwrap();
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_session_reuse(TransactionTerminal::Rollback));
     }
 
+    /// Purpose: Protect a replacement transaction from stale completion callbacks.
+    /// Expected: The stale callback changes neither the active transaction state nor the last commit timestamp.
     #[test]
     fn test_stale_transaction_commit_does_not_update_session_state() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session = engine.new_session().unwrap();
 
             let trx = session.begin_trx().unwrap();
@@ -2644,32 +2628,20 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect session reuse after a read-only transaction commits.
+    /// Expected: Commit needs no durable timestamp and releases the session for another transaction.
     #[test]
     fn test_same_session_reuse_after_readonly_commit() {
-        smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-            let mut session = engine.new_session().unwrap();
-
-            let trx = session.begin_trx().unwrap();
-            let cts = trx.commit().await.unwrap();
-            assert_eq!(cts, TrxID::new(0));
-            assert!(!session.in_trx().unwrap());
-
-            let trx = session.begin_trx().unwrap();
-            trx.rollback().await.unwrap();
-        });
+        smol::block_on(assert_session_reuse(TransactionTerminal::ReadonlyCommit));
     }
 
+    /// Purpose: Protect transaction independence between sessions.
+    /// Expected: Each session can retain its own active transaction concurrently.
     #[test]
     fn test_distinct_sessions_can_hold_overlapping_transactions() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
+            let engine = bootstrap_test_engine(root.path()).await;
             let mut session1 = engine.new_session().unwrap();
             let mut session2 = engine.new_session().unwrap();
 
@@ -2684,23 +2656,35 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect automatic shutdown through engine owner destruction.
+    /// Expected: Dropping a running engine reclaims its workers and releases root ownership.
     #[test]
     fn test_drop_engine_without_explicit_shutdown_succeeds() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(test_engine_config_for(root.path()))
-                .await
-                .unwrap();
-
+            let (events_tx, events_rx) = mpsc::channel();
+            let observer = observe_spawn_named(move |event| {
+                events_tx.send(event).unwrap();
+            });
+            let engine = bootstrap_test_engine(root.path()).await;
             drop(engine);
+            let started = assert_workers_reclaimed(events_rx.try_iter(), "implicit owner shutdown");
+            assert!(
+                !started.is_empty(),
+                "worker observation must cover the running engine"
+            );
+            drop(observer);
+            let replacement = bootstrap_test_engine(root.path()).await;
+            replacement.shutdown();
         });
     }
 
+    /// Purpose: Protect automatic engine teardown with a live transaction.
+    /// Expected: Owner destruction waits for terminal transaction cleanup before returning.
     #[test]
     fn test_drop_engine_waits_for_active_transaction_to_finish() {
         let root = TempDir::new().unwrap();
-        let engine =
-            smol::block_on(Engine::bootstrap(test_engine_config_for(root.path()))).unwrap();
+        let engine = smol::block_on(bootstrap_test_engine(root.path()));
         let mut session = engine.new_session().unwrap();
         let trx = session.begin_trx().unwrap();
         let shutdown_started = engine.inner().lifecycle.shutdown_listener();
@@ -2726,6 +2710,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect destruction of a bootstrapped transaction system whose workers were not started.
+    /// Expected: Dropping the startup token and system completes without requiring worker startup.
     #[test]
     fn test_unstarted_transaction_system_shutdown_is_safe() {
         smol::block_on(async {

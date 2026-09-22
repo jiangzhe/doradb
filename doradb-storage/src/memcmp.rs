@@ -1046,9 +1046,10 @@ fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
 
 #[cfg(test)]
 mod tests {
-    use rand::RngExt;
-    use rand::rngs::ThreadRng;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::{Distribution, StandardUniform};
+    use std::any::type_name;
 
     use super::*;
 
@@ -1071,266 +1072,114 @@ mod tests {
         unsafe { &key.0.u.h.prefix }
     }
 
-    fn run_test_mcf<T>()
+    fn encode_mcf<T: MemCmpFormat + ?Sized>(value: &T) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        value.extend_mcf_to(&mut encoded);
+        assert_eq!(encoded.len(), value.enc_mcf_len());
+        if let Some(length) = T::est_mcf_len() {
+            assert_eq!(encoded.len(), length);
+        }
+        let mut copied = vec![0xa5; encoded.len() + 2];
+        assert_eq!(value.copy_mcf_to(&mut copied, 1), encoded.len() + 1);
+        assert_eq!(&copied[1..copied.len() - 1], encoded);
+        assert_eq!(copied[0], 0xa5);
+        assert_eq!(copied[copied.len() - 1], 0xa5);
+        encoded
+    }
+
+    fn encode_nmcf<T: NullableMemCmpFormat>(value: &T) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        value.extend_nmcf_to(&mut encoded);
+        assert_eq!(encoded.len(), value.enc_nmcf_len());
+        if let Some(length) = T::est_nmcf_len() {
+            assert_eq!(encoded.len(), length);
+        }
+        let mut copied = vec![0xa5; encoded.len() + 2];
+        assert_eq!(value.copy_nmcf_to(&mut copied, 1), encoded.len() + 1);
+        assert_eq!(&copied[1..copied.len() - 1], encoded);
+        assert_eq!(copied[0], 0xa5);
+        assert_eq!(copied[copied.len() - 1], 0xa5);
+        encoded
+    }
+
+    fn assert_encoding_order<T: fmt::Debug>(
+        input: Vec<T>,
+        compare: impl Fn(&T, &T) -> Ordering,
+        encode: impl Fn(&T) -> Vec<u8>,
+    ) {
+        let mut pairs: Vec<_> = input
+            .into_iter()
+            .map(|value| {
+                let bytes = encode(&value);
+                (value, bytes)
+            })
+            .collect();
+        pairs.sort_by(|left, right| compare(&left.0, &right.0));
+        for pair in pairs.windows(2) {
+            // Compare native values directly: re-encoding sorted values alone
+            // would accept an encoder that maps distinct values to equal bytes.
+            assert_eq!(
+                pair[0].1.cmp(&pair[1].1),
+                compare(&pair[0].0, &pair[1].0),
+                "type={}, left={:?}, right={:?}",
+                type_name::<T>(),
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    fn gen_input<T>(rng: &mut StdRng) -> Vec<T>
     where
-        T: MemCmpFormat + NullableMemCmpFormat + Ord,
         StandardUniform: Distribution<T>,
     {
-        let mut r = rand::rng();
-        let mut input1 = gen_input::<T>(&mut r);
+        (0..1024).map(|_| rng.sample(StandardUniform)).collect()
+    }
 
-        check_mcf_length(&input1[0]);
-
-        let mut input2 = encode_mcf_input(&input1);
-
-        sort_and_check_mcf(&mut input1, &mut input2);
-
-        let mut input3 = gen_input::<T>(&mut r);
-
-        check_nmcf_length(&input3[0]);
-
-        let mut input4 = encode_nmcf_input(&input3);
-
-        sort_and_check_nmcf(&mut input3, &mut input4);
+    fn run_test_mcf<T>()
+    where
+        T: MemCmpFormat + NullableMemCmpFormat + Ord + fmt::Debug,
+        StandardUniform: Distribution<T>,
+    {
+        let mut rng = StdRng::seed_from_u64(0x4d43_4601);
+        assert_encoding_order(gen_input::<T>(&mut rng), T::cmp, encode_mcf);
+        assert_encoding_order(gen_input::<T>(&mut rng), T::cmp, encode_nmcf);
     }
 
     fn run_test_mcf2<T, U>()
     where
-        T: MemCmpFormat + NullableMemCmpFormat + Ord,
-        U: MemCmpFormat + NullableMemCmpFormat + Ord,
+        T: MemCmpFormat + NullableMemCmpFormat + Ord + fmt::Debug,
+        U: MemCmpFormat + NullableMemCmpFormat + Ord + fmt::Debug,
         StandardUniform: Distribution<T> + Distribution<U>,
     {
-        let mut r = rand::rng();
-
-        // mcf
-        let mut input1 = Vec::<(T, U)>::with_capacity(1024);
-        for _ in 0..1024 {
-            input1.push(r.sample(StandardUniform));
-        }
-        let mut input2 = Vec::with_capacity(1024);
-        for (t, u) in &input1 {
-            let mut buf = Vec::with_capacity(T::enc_mcf_len(t) + U::enc_mcf_len(u));
-            t.extend_mcf_to(&mut buf);
-            u.extend_mcf_to(&mut buf);
-            input2.push(buf);
-        }
-        input1.sort();
-        input2.sort();
-
-        for ((t, u), a) in input1.iter().zip(input2) {
-            let mut buf = Vec::with_capacity(T::enc_mcf_len(t) + U::enc_mcf_len(u));
-            t.extend_mcf_to(&mut buf);
-            u.extend_mcf_to(&mut buf);
-            assert_eq!(buf, a);
-        }
-
-        // nmcf
-        let mut input3 = Vec::<(T, U)>::with_capacity(1024);
-        for _ in 0..1024 {
-            input3.push(r.sample(StandardUniform));
-        }
-        let mut input4 = Vec::with_capacity(1024);
-        for (t, v) in &input3 {
-            let mut buf = Vec::with_capacity(T::enc_nmcf_len(t) + U::enc_nmcf_len(v));
-            T::extend_nmcf_to(t, &mut buf);
-            U::extend_nmcf_to(v, &mut buf);
-            input4.push(buf);
-        }
-        input3.sort();
-        input4.sort();
-
-        for ((t, v), a) in input3.iter().zip(input4) {
-            let mut buf = Vec::with_capacity(T::enc_nmcf_len(t) + U::enc_nmcf_len(v));
-            T::extend_nmcf_to(t, &mut buf);
-            U::extend_nmcf_to(v, &mut buf);
-            assert_eq!(buf, a);
-        }
+        let mut rng = StdRng::seed_from_u64(0x4d43_4601);
+        assert_encoding_order(
+            gen_input::<(T, U)>(&mut rng),
+            <(T, U)>::cmp,
+            |(first, second)| {
+                let mut bytes = encode_mcf(first);
+                bytes.extend(encode_mcf(second));
+                bytes
+            },
+        );
+        assert_encoding_order(
+            gen_input::<(T, U)>(&mut rng),
+            <(T, U)>::cmp,
+            |(first, second)| {
+                let mut bytes = encode_nmcf(first);
+                bytes.extend(encode_nmcf(second));
+                bytes
+            },
+        );
     }
 
-    fn run_test_mcf_varlen<F>(f: F)
-    where
-        F: Fn(&mut ThreadRng) -> Vec<u8>,
-        F: Copy,
-    {
-        let mut r = rand::rng();
-
-        let mut input1 = gen_varlen_input(&mut r, f);
-
-        check_mcf_length(&SegmentedBytes(&input1[0]));
-
-        let mut input2 = encode_varlen_mcf_input(&input1);
-
-        sort_and_check_varlen_mcf(&mut input1, &mut input2);
-
-        let input3 = gen_varlen_input(&mut r, f);
-
-        let mut input3: Vec<_> = input3.iter().map(|v| SegmentedBytes(v)).collect();
-
-        check_nmcf_length(&input3[0]);
-
-        let mut input4 = encode_varlen_nmcf_input(&input3);
-
-        sort_and_check_varlen_nmcf(&mut input3, &mut input4);
+    fn gen_rand_bytes(rng: &mut StdRng) -> Vec<u8> {
+        let len: u8 = rng.sample(StandardUniform);
+        (0..len).map(|_| rng.sample(StandardUniform)).collect()
     }
 
-    fn check_mcf_length<T>(value: &T)
-    where
-        T: MemCmpFormat + ?Sized,
-    {
-        if let Some(el) = T::est_mcf_len() {
-            assert_eq!(el, T::enc_mcf_len(value));
-        }
-        let mut buf = vec![];
-        value.extend_mcf_to(&mut buf);
-        assert_eq!(buf.len(), T::enc_mcf_len(value));
-    }
-
-    fn check_nmcf_length<T>(value: &T)
-    where
-        T: NullableMemCmpFormat,
-    {
-        if let Some(el) = <SegmentedBytes as NullableMemCmpFormat>::est_nmcf_len() {
-            assert_eq!(el, value.enc_nmcf_len());
-        }
-        let mut buf = vec![];
-        value.extend_nmcf_to(&mut buf);
-        assert_eq!(buf.len(), value.enc_nmcf_len());
-    }
-
-    fn gen_input<T>(r: &mut ThreadRng) -> Vec<T>
-    where
-        StandardUniform: Distribution<T>,
-    {
-        let mut input = Vec::with_capacity(1024);
-        for _ in 0..1024 {
-            input.push(r.sample(StandardUniform));
-        }
-        input
-    }
-
-    fn gen_varlen_input<U, F>(r: &mut ThreadRng, f: F) -> Vec<U>
-    where
-        F: Fn(&mut ThreadRng) -> U,
-    {
-        let mut input = Vec::with_capacity(1024);
-        for _ in 0..1024 {
-            input.push(f(r));
-        }
-        input
-    }
-
-    fn encode_mcf_input<T>(input: &[T]) -> Vec<Vec<u8>>
-    where
-        T: MemCmpFormat + Ord,
-    {
-        let mut input2 = Vec::with_capacity(1024);
-        for i in input {
-            let mut buf = Vec::with_capacity(T::enc_mcf_len(i));
-            i.extend_mcf_to(&mut buf);
-            // identical with write_mcf
-            let mut buf2 = vec![0u8; T::enc_mcf_len(i)];
-            i.copy_mcf_to(&mut buf2, 0);
-            assert_eq!(buf, buf2);
-            input2.push(buf);
-        }
-        input2
-    }
-
-    fn encode_varlen_mcf_input(input: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        let mut input2 = Vec::with_capacity(1024);
-        for i in input {
-            let mut buf = Vec::with_capacity(SegmentedBytes(i).enc_mcf_len());
-            SegmentedBytes(i).extend_mcf_to(&mut buf);
-            input2.push(buf);
-        }
-        input2
-    }
-
-    fn encode_nmcf_input<T>(input: &[T]) -> Vec<Vec<u8>>
-    where
-        T: NullableMemCmpFormat + Ord,
-    {
-        let mut input2 = Vec::with_capacity(1024);
-        for i in input {
-            let mut buf = Vec::with_capacity(T::enc_nmcf_len(i));
-            T::extend_nmcf_to(i, &mut buf);
-            input2.push(buf);
-        }
-        input2
-    }
-
-    fn encode_varlen_nmcf_input<T>(input: &[T]) -> Vec<Vec<u8>>
-    where
-        T: NullableMemCmpFormat + Ord,
-    {
-        let mut input2 = Vec::with_capacity(1024);
-        for i in input {
-            let mut buf = Vec::with_capacity(i.enc_nmcf_len());
-            i.extend_nmcf_to(&mut buf);
-            input2.push(buf);
-        }
-        input2
-    }
-
-    fn sort_and_check_mcf<T>(in1: &mut [T], in2: &mut [Vec<u8>])
-    where
-        T: MemCmpFormat + Ord,
-    {
-        in1.sort();
-        in2.sort();
-
-        for (e, a) in in1.iter().zip(in2.iter()) {
-            let mut buf = Vec::with_capacity(T::enc_mcf_len(e));
-            e.extend_mcf_to(&mut buf);
-            assert_eq!(&buf, a);
-        }
-    }
-
-    fn sort_and_check_varlen_mcf(in1: &mut [Vec<u8>], in2: &mut [Vec<u8>]) {
-        in1.sort();
-        in2.sort();
-
-        for (e, a) in in1.iter().zip(in2.iter()) {
-            let mut buf = Vec::with_capacity(SegmentedBytes(e).enc_mcf_len());
-            SegmentedBytes(e).extend_mcf_to(&mut buf);
-            assert_eq!(&buf, a);
-        }
-    }
-
-    fn sort_and_check_nmcf<T>(in1: &mut [T], in2: &mut [Vec<u8>])
-    where
-        T: NullableMemCmpFormat + Ord,
-    {
-        in1.sort();
-        in2.sort();
-
-        for (e, a) in in1.iter().zip(in2.iter()) {
-            let mut buf = Vec::with_capacity(NullableMemCmpFormat::enc_nmcf_len(e));
-            NullableMemCmpFormat::extend_nmcf_to(e, &mut buf);
-            assert_eq!(&buf, a);
-        }
-    }
-
-    fn sort_and_check_varlen_nmcf(in1: &mut [SegmentedBytes], in2: &mut [Vec<u8>]) {
-        in1.sort();
-        in2.sort();
-
-        for (e, a) in in1.iter().zip(in2.iter()) {
-            let mut buf = Vec::with_capacity(e.enc_nmcf_len());
-            e.extend_nmcf_to(&mut buf);
-            assert_eq!(&buf, a);
-        }
-    }
-
-    fn gen_rand_bytes(r: &mut ThreadRng) -> Vec<u8> {
-        let len: u8 = r.sample(StandardUniform);
-        let mut s = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            s.push(r.sample(StandardUniform));
-        }
-        s
-    }
-
+    /// Purpose: Protect order-preserving integer and composite-key encodings.
+    /// Expected: Sorting encoded bytes agrees with native ordering for plain and nullable formats.
     #[test]
     fn test_mcf_sized() {
         // int
@@ -1351,38 +1200,70 @@ mod tests {
         run_test_mcf2::<u64, u64>();
     }
 
+    /// Purpose: Protect order-preserving variable-length byte encodings.
+    /// Expected: Sorting segmented encodings agrees with native byte ordering in both nullability formats.
     #[test]
     fn test_mcf_varlen() {
-        run_test_mcf_varlen(gen_rand_bytes);
+        let mut rng = StdRng::seed_from_u64(0x4d43_4601);
+        let input = (0..1024).map(|_| gen_rand_bytes(&mut rng)).collect();
+        assert_encoding_order(input, Vec::<u8>::cmp, |value| {
+            encode_mcf(&SegmentedBytes(value))
+        });
+        let input = (0..1024).map(|_| gen_rand_bytes(&mut rng)).collect();
+        assert_encoding_order(input, Vec::<u8>::cmp, |value| {
+            encode_nmcf(&SegmentedBytes(value))
+        });
     }
 
+    /// Purpose: Protect floating-point encodings against native ordering and a known negative encoding.
+    /// Expected: Both encoding paths preserve ordering, lengths, and the specified sign transformation.
     #[test]
     fn test_mcf_float() {
-        let f0 = -1.0f64;
-        let mut buf0 = vec![];
-        f0.extend_mcf_to(&mut buf0);
-        assert_eq!(buf0.len(), 8);
-        assert!(buf0[0] & 0x80 == 0);
+        let plain = encode_mcf(&-1.0f64);
+        assert_eq!(plain, [0x40, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        let nullable = encode_nmcf(&-1.0f64);
+        assert_eq!(nullable[0], NON_NULL_FLAG);
+        assert_eq!(nullable[1..], plain);
 
-        let f1 = -1.0f64;
-        let mut buf1 = vec![];
-        NullableMemCmpFormat::extend_nmcf_to(&f1, &mut buf1);
-        assert_eq!(buf1.len(), 9);
-        assert_eq!(buf1[0], NON_NULL_FLAG);
-        assert!(buf1[1] & 0x80 == 0);
-
-        let mut r = rand::rng();
-        let input1 = gen_input::<f32>(&mut r);
-        check_mcf_length(&input1[0]);
-        let input2 = gen_input::<f32>(&mut r);
-        check_nmcf_length(&input2[0]);
-
-        let input1 = gen_input::<f64>(&mut r);
-        check_mcf_length(&input1[0]);
-        let input2 = gen_input::<f64>(&mut r);
-        check_nmcf_length(&input2[0]);
+        let mut rng = StdRng::seed_from_u64(0x4d43_4601);
+        assert_encoding_order(gen_input::<f32>(&mut rng), f32::total_cmp, encode_mcf);
+        assert_encoding_order(gen_input::<f32>(&mut rng), f32::total_cmp, encode_nmcf);
+        assert_encoding_order(gen_input::<f64>(&mut rng), f64::total_cmp, encode_mcf);
+        assert_encoding_order(gen_input::<f64>(&mut rng), f64::total_cmp, encode_nmcf);
     }
 
+    /// Purpose: Protect floating-point encoding at finite-range boundaries.
+    /// Expected: Encoded order preserves finite extrema, positive zero, and infinities.
+    #[test]
+    fn test_mcf_float_boundaries() {
+        // Negative zero and NaN need a separate production encoding decision;
+        // this test does not endorse their current key ordering.
+        let values = vec![
+            f32::NEG_INFINITY,
+            f32::MIN,
+            -1.0,
+            0.0,
+            1.0,
+            f32::MAX,
+            f32::INFINITY,
+        ];
+        assert_encoding_order(values.clone(), f32::total_cmp, encode_mcf);
+        assert_encoding_order(values, f32::total_cmp, encode_nmcf);
+        let values = vec![
+            f64::NEG_INFINITY,
+            f64::MIN,
+            -1.0,
+            0.0,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        assert_encoding_order(values.clone(), f64::total_cmp, encode_mcf);
+        assert_encoding_order(values, f64::total_cmp, encode_nmcf);
+    }
+
+    /// Purpose: Protect key construction, extension, and comparison across storage forms.
+    /// Expected: Keys preserve their bytes and comparison semantics through inline and heap operations.
     #[test]
     fn test_mem_cmp_key() {
         // inline key
@@ -1391,9 +1272,13 @@ mod tests {
         assert!(k1.0.len <= MEM_CMP_KEY_INLINE);
 
         // heap key
-        let k2 = MemCmpKey::from(&[1u8; 30]);
-        assert_eq!(k2.as_bytes(), &[1u8; 30]);
-        assert!(k2.0.len > MEM_CMP_KEY_INLINE);
+        for len in [25, 30] {
+            let input = vec![1u8; len];
+            let key = MemCmpKey::from(input.as_slice());
+            assert_eq!(key.as_bytes(), input, "heap constructor length={len}");
+            assert!(key.0.len > MEM_CMP_KEY_INLINE);
+            drop(key);
+        }
 
         // empty key
         let k3 = MemCmpKey::empty();
@@ -1466,6 +1351,8 @@ mod tests {
         assert!(k17.as_bytes().iter().all(|b| *b == 0x01));
     }
 
+    /// Purpose: Protect byte appends at the inline key capacity boundary.
+    /// Expected: Heap promotion preserves content and prefix while initializing spare capacity.
     #[test]
     fn test_mem_cmp_key_push_inline_to_heap_transition() {
         let mut key = MemCmpKey::empty();
@@ -1499,6 +1386,8 @@ mod tests {
         assert_eq!(heap_capacity(&key), MEM_CMP_KEY_INLINE * 2);
     }
 
+    /// Purpose: Protect bulk extension that promotes a short inline key.
+    /// Expected: Slice and repeated-byte extensions preserve content and initialize the heap prefix.
     #[test]
     fn test_mem_cmp_key_extend_short_inline_to_heap_initializes_prefix() {
         let mut key = MemCmpKey::from(&[0x11, 0x22][..]);
@@ -1526,6 +1415,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect heap key initialization and guarded in-place mutation.
+    /// Expected: New bytes are initialized and the cached prefix reflects completed mutations.
     #[test]
     fn test_mem_cmp_key_arbitrary_heap_is_initialized_and_updates_prefix() {
         let mut key = MemCmpKey::arbitrary(MEM_CMP_KEY_INLINE + 1);
@@ -1545,6 +1436,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect reallocation when extending an existing heap key.
+    /// Expected: Growth preserves appended content and initializes spare capacity for subsequent writes.
     #[test]
     fn test_mem_cmp_key_heap_growth_initializes_spare_capacity() {
         let base = vec![0x11; MEM_CMP_KEY_INLINE + 1];
@@ -1578,13 +1471,8 @@ mod tests {
         assert_eq!(repeated.as_bytes(), expected);
     }
 
-    #[test]
-    fn test_mem_cmp_key_drop() {
-        // This test will panic if double free occurs
-        let k = MemCmpKey::from(&[1u8; 25]);
-        drop(k); // Explicit drop to test
-    }
-
+    /// Purpose: Protect the nullable encoding of a null key.
+    /// Expected: Both encoding paths emit only the null marker with the expected length.
     #[test]
     fn test_mem_cmp_null() {
         assert!(Null::est_nmcf_len() == Some(1));
@@ -1598,6 +1486,8 @@ mod tests {
         assert!(buf[0] == NULL_FLAG);
     }
 
+    /// Purpose: Protect unsegmented byte encoding.
+    /// Expected: Input bytes are copied unchanged and no fixed encoded length is advertised.
     #[test]
     fn test_mem_cmp_normal_bytes() {
         assert!(NormalBytes::est_mcf_len().is_none());
@@ -1607,6 +1497,8 @@ mod tests {
         assert!(&buf[..] == b"hello");
     }
 
+    /// Purpose: Protect empty and exact-segment byte encoding boundaries.
+    /// Expected: Both encoding paths preserve padding, segment lengths, and nullable markers.
     #[test]
     fn test_mem_cmp_segmented_bytes() {
         let mut buf = vec![];

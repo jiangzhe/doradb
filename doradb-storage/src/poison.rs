@@ -295,6 +295,8 @@ mod tests {
     use std::thread::{sleep, spawn, yield_now};
     use std::time::Duration;
 
+    /// Purpose: Protect poison publication while reason storage is blocked.
+    /// Expected: The poison flag remains clear until the fatal reason can be stored and observed.
     #[test]
     fn test_poison_stores_reason_before_publishing_flag() {
         let poisoner = Arc::new(EnginePoisoner::new());
@@ -348,6 +350,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect first-error retention after later poison attempts.
+    /// Expected: Every first-error observer shares the original report and its lower-domain diagnostics.
     #[test]
     fn test_poison_and_get_first_preserves_original_report() {
         let poisoner = EnginePoisoner::new();
@@ -373,6 +377,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect competing poison publications under both return policies.
+    /// Expected: Stored poison remains the first error while each API honors its local or shared return policy.
     #[test]
     fn test_poison_concurrent_callers_share_first_error() {
         for return_first in [false, true] {
@@ -425,6 +431,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect poison notification and first-reason retention.
+    /// Expected: Initial listeners wake and later poison attempts do not replace the stored fatal report.
     #[test]
     fn test_poison_listener_wakes_first_waiters() {
         smol::block_on(async {
@@ -487,6 +495,8 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect the lightweight poison recheck path.
+    /// Expected: Health is inspected without installing a poison listener.
     #[test]
     fn test_recheck_only_token_checks_health_without_registering_listener() {
         smol::block_on(async {
@@ -507,6 +517,29 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect a registered wait when poison arrives without primary progress.
+    /// Expected: Poison releases the pending wait with its original fatal reason and diagnostics.
+    #[test]
+    fn test_registered_token_wakes_on_poison() {
+        smol::block_on(async {
+            let poisoner = EnginePoisoner::new();
+            let primary = Event::new();
+            let token = PoisonAwareListener::registered(primary.listen());
+            let mut wait = Box::pin(poisoner.wait_or_poison(token));
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            let _ =
+                poisoner.poison(Report::new(FatalError::RedoWrite).attach("pending wait poison"));
+            let error = wait
+                .now_or_never()
+                .expect("poison must release the registered wait")
+                .unwrap_err();
+            assert_eq!(*error.current_context(), FatalError::RedoWrite);
+            assert!(format!("{error:?}").contains("pending wait poison"));
+        });
+    }
+
+    /// Purpose: Protect the poison protocol around a ready primary listener.
+    /// Expected: The wait registers poison observation and checks health before and after selection.
     #[test]
     fn test_registered_token_races_primary_with_poison_protocol() {
         smol::block_on(async {

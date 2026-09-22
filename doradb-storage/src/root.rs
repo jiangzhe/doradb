@@ -1521,6 +1521,35 @@ mod tests {
         EngineConfig::default().index_buffer.swap_file(swap_file)
     }
 
+    fn fail_marker_publication(
+        paths: &ResolvedStoragePaths,
+        failed_stage: MarkerPublicationTestStage,
+    ) -> Report<IoError> {
+        persist_marker_with_test_hook(paths, move |stage| {
+            if stage == failed_stage {
+                let source = StdIoError::other("injected marker publication failure");
+                let kind = source.kind();
+                Err(Report::new(source)
+                    .change_context(IoError::from(kind))
+                    .attach(format!("injected marker test hook: stage={stage}")))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err()
+    }
+
+    fn assert_invalid_marker(contents: &str, expected: ConfigError) {
+        let root = TempDir::new().unwrap();
+        let paths = prepared_paths(root.path());
+        write(paths.marker_path(), contents).unwrap();
+        let error = paths.validate_marker_if_present().unwrap_err();
+        assert_eq!(*error.current_context(), expected, "marker={contents:?}");
+        assert_eq!(read(paths.marker_path()).unwrap(), contents.as_bytes());
+    }
+
+    /// Purpose: Protect storage path resolution with default configuration.
+    /// Expected: Durable directories lie under the root and default file names are retained.
     #[test]
     fn test_resolve_storage_paths_default_layout() {
         let root = TempDir::new().unwrap();
@@ -1535,6 +1564,8 @@ mod tests {
         assert!(paths.index_swap_file.ends_with("index.swp"));
     }
 
+    /// Purpose: Protect preparation through a storage-root symlink.
+    /// Expected: Resolved paths use the canonical root while durable layout remains relative.
     #[test]
     fn test_prepare_storage_root_canonicalizes_alias_and_preserves_layout() {
         let parent = TempDir::new().unwrap();
@@ -1550,6 +1581,8 @@ mod tests {
         assert_eq!(paths.durable_layout.log_dir, ".");
     }
 
+    /// Purpose: Protect root preparation when a regular file blocks directory creation.
+    /// Expected: The I/O report retains the operating-system cause, operation, and conflicting path.
     #[test]
     fn test_prepare_storage_root_create_failure_retains_io_source() {
         let root = TempDir::new().unwrap();
@@ -1568,6 +1601,8 @@ mod tests {
         assert!(output.contains(storage_root.to_str().unwrap()), "{output}");
     }
 
+    /// Purpose: Protect reserved control-file names and their descendants from configured storage paths.
+    /// Expected: Reserved collisions fail configuration validation while the root directory remains allowed.
     #[test]
     fn test_reserved_storage_control_namespace_is_rejected() {
         for err in [
@@ -1607,6 +1642,8 @@ mod tests {
             .unwrap();
     }
 
+    /// Purpose: Protect lease diagnostics during same-process contention.
+    /// Expected: Contention preserves the owner record and releasing the lease permits reacquisition.
     #[test]
     fn test_storage_root_lease_writes_diagnostics_and_contends_without_mutation() {
         let root = TempDir::new().unwrap();
@@ -1639,6 +1676,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect lock ownership when lease diagnostic publication fails.
+    /// Expected: The failure retains its cause and a subsequent acquisition succeeds.
     #[test]
     fn test_storage_root_lease_record_failure_releases_lock() {
         let root = TempDir::new().unwrap();
@@ -1661,6 +1700,8 @@ mod tests {
         drop(acquired_lease(&paths));
     }
 
+    /// Purpose: Protect contention handling with an oversized owner record.
+    /// Expected: Contention remains authoritative while the invalid diagnostic record is discarded.
     #[test]
     fn test_storage_root_contention_bounds_invalid_diagnostics() {
         let root = TempDir::new().unwrap();
@@ -1689,6 +1730,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Provide a child-process lease owner for cross-process contention tests.
+    /// Expected: Readiness follows acquisition and the child holds its lease until released or terminated.
     #[test]
     fn storage_root_lease_subprocess_helper() {
         let Some(root) = var_os(STORAGE_LEASE_HELPER_ENV) else {
@@ -1702,6 +1745,8 @@ mod tests {
         stdin().read_exact(&mut release).unwrap();
     }
 
+    /// Purpose: Protect exclusive root ownership across processes and canonical aliases.
+    /// Expected: Aliases contend with the child and reacquisition succeeds after normal release or forced exit.
     #[test]
     fn test_storage_root_lease_cross_process_release_and_process_exit() {
         let parent = TempDir::new().unwrap();
@@ -1730,6 +1775,8 @@ mod tests {
         drop(acquired_lease(&alias_paths));
     }
 
+    /// Purpose: Provide controlled process exits during marker publication.
+    /// Expected: The child exits at the requested publication stage for parent-side recovery checks.
     #[test]
     fn storage_marker_subprocess_helper() {
         let (Some(root), Some(target_stage)) = (
@@ -1752,6 +1799,8 @@ mod tests {
         panic!("marker helper did not observe target stage {target_stage}");
     }
 
+    /// Purpose: Protect recovery from process exit at marker publication boundaries.
+    /// Expected: Installed markers remain valid and stale temporary files can be removed safely.
     #[test]
     fn test_marker_process_exit_states_are_recoverable() {
         for (stage, final_installed) in [
@@ -1788,6 +1837,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect diagnostic names for publication stages and failure hooks.
+    /// Expected: Each stage retains its specified external spelling.
     #[test]
     fn test_marker_publication_stage_diagnostics_are_stable() {
         let publication_cases = [
@@ -1818,6 +1869,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect lease acquisition from a symlinked lock file.
+    /// Expected: Acquisition fails without modifying the symlink target.
     #[test]
     fn test_storage_root_lock_rejects_symlink() {
         let root = TempDir::new().unwrap();
@@ -1833,8 +1886,11 @@ mod tests {
         let output = format!("{err:?}");
         assert!(output.contains("open_storage_root_lock"), "{output}");
         assert!(output.contains(STORAGE_LOCK_FILE_NAME), "{output}");
+        assert_eq!(read(&target).unwrap(), b"not authoritative");
     }
 
+    /// Purpose: Protect configured storage names and root containment.
+    /// Expected: Invalid suffixes, escaped paths, and invalid durable file names produce specific configuration errors.
     #[test]
     fn test_validate_swap_file_suffix_and_escape() {
         validate_swap_file_path_candidate("data.swp").unwrap();
@@ -1900,6 +1956,8 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect persisted layout compatibility on reopen.
+    /// Expected: A matching marker is accepted and a changed durable directory is rejected.
     #[test]
     fn test_marker_rejects_durable_layout_change() {
         let root = TempDir::new().unwrap();
@@ -1922,6 +1980,8 @@ mod tests {
         assert_eq!(err.current_context(), &ConfigError::StorageLayoutMismatch);
     }
 
+    /// Purpose: Protect the typed durable-layout serialization boundary.
+    /// Expected: The I/O result contains a complete parseable representation of the layout.
     #[test]
     fn test_serialize_durable_layout_is_io_typed() {
         let root = TempDir::new().unwrap();
@@ -1935,6 +1995,8 @@ mod tests {
         assert_eq!(actual, paths.durable_layout);
     }
 
+    /// Purpose: Protect data-directory creation when its path is occupied by a file.
+    /// Expected: The typed I/O failure identifies the operation and blocked path.
     #[test]
     fn test_ensure_directories_is_io_typed() {
         let root = TempDir::new().unwrap();
@@ -1955,6 +2017,8 @@ mod tests {
         assert!(report.contains(data_dir.to_str().unwrap()), "{report}");
     }
 
+    /// Purpose: Protect failures creating log and swap parent directories.
+    /// Expected: Each report retains its operating-system source and owning operation.
     #[test]
     fn test_subordinate_directory_failures_retain_io_context() {
         let cases = [
@@ -1993,6 +2057,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect marker publication against overwriting an existing final file.
+    /// Expected: Publication reports the collision, preserves existing bytes, and removes temporary files.
     #[test]
     fn test_persist_marker_reports_existing_marker_as_io() {
         let root = TempDir::new().unwrap();
@@ -2021,6 +2087,8 @@ mod tests {
         assert!(marker_temp_paths(&paths).is_empty());
     }
 
+    /// Purpose: Protect cleanup when marker publication fails before installation.
+    /// Expected: No final marker or temporary file remains and diagnostics report noninstallation.
     #[test]
     fn test_marker_publication_cleans_preinstall_failure() {
         for failed_stage in [
@@ -2030,18 +2098,7 @@ mod tests {
         ] {
             let root = TempDir::new().unwrap();
             let paths = prepared_paths(root.path());
-            let err = persist_marker_with_test_hook(&paths, move |stage| {
-                if stage == failed_stage {
-                    let err = StdIoError::other("injected pre-install failure");
-                    let kind = err.kind();
-                    Err(Report::new(err)
-                        .change_context(IoError::from(kind))
-                        .attach("injected marker test hook"))
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
+            let err = fail_marker_publication(&paths, failed_stage);
             let output = format!("{err:?}");
             assert!(output.contains("not_installed"), "{output}");
             assert!(!paths.marker_path().exists());
@@ -2049,6 +2106,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect marker integrity when publication fails after installation.
+    /// Expected: The complete final marker remains valid while temporary files are removed.
     #[test]
     fn test_marker_publication_keeps_complete_final_after_install_failure() {
         for failed_stage in [
@@ -2057,18 +2116,7 @@ mod tests {
         ] {
             let root = TempDir::new().unwrap();
             let paths = prepared_paths(root.path());
-            let err = persist_marker_with_test_hook(&paths, move |stage| {
-                if stage == failed_stage {
-                    let err = StdIoError::other("injected post-install failure");
-                    let kind = err.kind();
-                    Err(Report::new(err)
-                        .change_context(IoError::from(kind))
-                        .attach("injected marker test hook"))
-                } else {
-                    Ok(())
-                }
-            })
-            .unwrap_err();
+            let err = fail_marker_publication(&paths, failed_stage);
             let output = format!("{err:?}");
             assert!(output.contains("installed_durability_unknown"), "{output}");
             assert!(paths.validate_marker_if_present().unwrap());
@@ -2076,6 +2124,8 @@ mod tests {
         }
     }
 
+    /// Purpose: Protect the namespace boundary of stale marker cleanup.
+    /// Expected: Only matching temporary files are removed and matching directories are rejected intact.
     #[test]
     fn test_stale_marker_temp_cleanup_is_exact_and_rejects_directories() {
         let root = TempDir::new().unwrap();
@@ -2103,6 +2153,8 @@ mod tests {
         assert!(stale_dir.is_dir());
     }
 
+    /// Purpose: Protect configuration diagnostics when the marker cannot be read.
+    /// Expected: The report retains the I/O kind, operating-system source, and marker path.
     #[test]
     fn test_marker_read_failure_retains_io_beneath_config() {
         let root = TempDir::new().unwrap();
@@ -2125,34 +2177,19 @@ mod tests {
         );
     }
 
+    /// Purpose: Protect marker validation from malformed serialized metadata.
+    /// Expected: Invalid syntax returns the invalid-marker configuration error.
     #[test]
     fn test_marker_rejects_malformed_toml() {
-        let root = TempDir::new().unwrap();
-        let paths = EngineConfig::default()
-            .storage_root(root.path())
-            .resolve_storage_paths()
-            .unwrap();
-        write(paths.marker_path(), "version = [").unwrap();
-
-        let err = paths.validate_marker_if_present().unwrap_err();
-        assert_eq!(
-            err.current_context(),
-            &ConfigError::InvalidStorageLayoutMarker
-        );
+        assert_invalid_marker("version = [", ConfigError::InvalidStorageLayoutMarker);
     }
 
+    /// Purpose: Protect rejection of obsolete partitioned storage layouts.
+    /// Expected: The old marker version returns a storage-layout mismatch.
     #[test]
     fn test_marker_rejects_v1_layout_with_log_partitions() {
-        let root = TempDir::new().unwrap();
-        let paths = EngineConfig::default()
-            .storage_root(root.path())
-            .resolve_storage_paths()
-            .unwrap();
-        paths.ensure_directories().unwrap();
-        // Keep the removed v1 field in this fixture to prove old partitioned
-        // storage-layout markers are rejected by the version bump.
-        write(
-            paths.marker_path(),
+        // Retain the removed partition field as evidence of the obsolete format.
+        assert_invalid_marker(
             r#"version = 1
 data_dir = "."
 catalog_file_name = "catalog.mtb"
@@ -2160,13 +2197,12 @@ log_dir = "."
 log_file_stem = "redo.log"
 log_partitions = 1
 "#,
-        )
-        .unwrap();
-
-        let err = paths.validate_marker_if_present().unwrap_err();
-        assert_eq!(err.current_context(), &ConfigError::StorageLayoutMismatch);
+            ConfigError::StorageLayoutMismatch,
+        );
     }
 
+    /// Purpose: Protect separation of data and index swap files.
+    /// Expected: A shared swap path fails configuration validation.
     #[test]
     fn test_swap_files_reject_overlap() {
         let err = EngineConfig::default()
@@ -2177,6 +2213,8 @@ log_partitions = 1
         assert_config_report(err, ConfigError::PathsMustNotOverlap, &["shared.swp"]);
     }
 
+    /// Purpose: Protect the durable data directory from swap-file collisions.
+    /// Expected: Swap paths equal to or beneath the data directory fail with specific diagnostics.
     #[test]
     fn test_swap_files_reject_data_dir_aliases() {
         let err = EngineConfig::default()
@@ -2202,6 +2240,8 @@ log_partitions = 1
         );
     }
 
+    /// Purpose: Protect the redo directory from swap-file collisions.
+    /// Expected: Swap paths equal to or beneath the log directory fail with specific diagnostics.
     #[test]
     fn test_swap_files_reject_log_dir_aliases() {
         let err = EngineConfig::default()
@@ -2227,6 +2267,8 @@ log_partitions = 1
         );
     }
 
+    /// Purpose: Protect durable file namespaces from nested swap-file paths.
+    /// Expected: Swap paths beneath catalog, marker, or redo file names are rejected.
     #[test]
     fn test_swap_files_reject_reserved_file_descendants() {
         let err = EngineConfig::default()

@@ -153,6 +153,8 @@ mod tests {
     use super::*;
     use zerocopy::byteorder::little_endian::U32 as LeU32;
 
+    /// Purpose: Protect conversion between a scalar and its borrowed byte view.
+    /// Expected: The specified byte order and scalar value are preserved.
     #[test]
     fn test_bytes_of_and_ref_from_bytes_roundtrip() {
         let value = LeU32::new(0x0102_0304);
@@ -162,6 +164,8 @@ mod tests {
         assert_eq!(ref_from_bytes::<LeU32>(bytes).get(), 0x0102_0304);
     }
 
+    /// Purpose: Protect scalar mutation through a typed byte view.
+    /// Expected: The backing bytes reflect the new value in the specified byte order.
     #[test]
     fn test_mut_from_bytes_updates_bytes() {
         let mut bytes = [0u8; mem::size_of::<LeU32>()];
@@ -171,14 +175,24 @@ mod tests {
         assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11]);
     }
 
+    /// Purpose: Protect mutable scalar views from incompatible byte lengths.
+    /// Expected: Any nonexact scalar length returns a layout mismatch.
     #[test]
     fn test_try_mut_from_bytes_rejects_wrong_len() {
-        let mut bytes = [0u8; 3];
-        let err = try_mut_from_bytes::<LeU32>(&mut bytes).unwrap_err();
-
-        assert_eq!(*err.current_context(), LayoutError::Mismatch);
+        for len in [0, 3, 5] {
+            let mut bytes = vec![0xa5; len];
+            let error = try_mut_from_bytes::<LeU32>(&mut bytes).unwrap_err();
+            assert_eq!(*error.current_context(), LayoutError::Mismatch, "len={len}");
+            assert_eq!(
+                bytes,
+                vec![0xa5; len],
+                "failed view changed bytes: len={len}"
+            );
+        }
     }
 
+    /// Purpose: Protect typed slice views over complete encoded elements.
+    /// Expected: Element count, order, and values match the input bytes.
     #[test]
     fn test_slice_from_bytes_roundtrip() {
         let bytes = [1u8, 0, 0, 0, 2, 0, 0, 0];
@@ -189,6 +203,8 @@ mod tests {
         assert_eq!(values[1].get(), 2);
     }
 
+    /// Purpose: Protect mutation through a typed slice view.
+    /// Expected: Each element update reaches the corresponding backing bytes.
     #[test]
     fn test_slice_from_bytes_mut_updates_bytes() {
         let mut bytes = [0u8; 2 * mem::size_of::<LeU32>()];
@@ -200,25 +216,41 @@ mod tests {
         assert_eq!(bytes, [7, 0, 0, 0, 9, 0, 0, 0]);
     }
 
+    /// Purpose: Protect immutable scalar views from incompatible byte lengths.
+    /// Expected: Any nonexact scalar length returns a layout mismatch.
     #[test]
     fn test_try_ref_from_bytes_rejects_wrong_len() {
-        let err = try_ref_from_bytes::<LeU32>(&[0u8; 3]).unwrap_err();
-
-        assert_eq!(*err.current_context(), LayoutError::Mismatch);
+        for len in [0, 3, 5] {
+            let bytes = vec![0xa5; len];
+            let error = try_ref_from_bytes::<LeU32>(&bytes).unwrap_err();
+            assert_eq!(*error.current_context(), LayoutError::Mismatch, "len={len}");
+        }
     }
 
+    /// Purpose: Protect immutable slice views from trailing partial elements.
+    /// Expected: A nonintegral element count returns a layout mismatch.
     #[test]
     fn test_try_slice_from_bytes_rejects_partial_element() {
-        let err = try_slice_from_bytes::<LeU32>(&[0u8; 5]).unwrap_err();
-
-        assert_eq!(*err.current_context(), LayoutError::Mismatch);
+        for len in [1, 3, 5, 7] {
+            let bytes = vec![0xa5; len];
+            let error = try_slice_from_bytes::<LeU32>(&bytes).unwrap_err();
+            assert_eq!(*error.current_context(), LayoutError::Mismatch, "len={len}");
+        }
     }
 
+    /// Purpose: Protect mutable slice views from trailing partial elements.
+    /// Expected: A nonintegral element count returns a layout mismatch.
     #[test]
     fn test_try_slice_from_bytes_mut_rejects_partial_element() {
-        let mut bytes = [0u8; 5];
-        let err = try_slice_from_bytes_mut::<LeU32>(&mut bytes).unwrap_err();
-
-        assert_eq!(*err.current_context(), LayoutError::Mismatch);
+        for len in [1, 3, 5, 7] {
+            let mut bytes = vec![0xa5; len];
+            let error = try_slice_from_bytes_mut::<LeU32>(&mut bytes).unwrap_err();
+            assert_eq!(*error.current_context(), LayoutError::Mismatch, "len={len}");
+            assert_eq!(
+                bytes,
+                vec![0xa5; len],
+                "failed view changed bytes: len={len}"
+            );
+        }
     }
 }

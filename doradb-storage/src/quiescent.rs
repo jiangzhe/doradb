@@ -386,6 +386,40 @@ mod tests {
         }
     }
 
+    fn assert_drop_waits_for_clones<G: Send + 'static>(
+        owner: QuiescentBox<DropSpy>,
+        guard: G,
+        clone: G,
+        dropped: Arc<AtomicBool>,
+    ) {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let clone_handle = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            drop(clone);
+        });
+        let owner_handle = thread::spawn(move || {
+            with_before_drop_hook(
+                owner.owner_identity(),
+                move || started_tx.send(()).unwrap(),
+                || drop(owner),
+            );
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        clone_handle.join().unwrap();
+        owner_handle.join().unwrap();
+    }
+
     /// Purpose: Access a quiescent owner's value through a shared guard.
     /// Expected: Owner and guard expose the same value at a stable address.
     #[test]
@@ -505,65 +539,21 @@ mod tests {
             dropped: Arc::clone(&dropped),
         });
         let guard = owner.guard();
-        let guard_clone = guard.clone();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let clone_handle = thread::spawn(move || {
-            release_rx.recv().unwrap();
-            drop(guard_clone);
-        });
-        let owner_handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(owner);
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(guard);
-        assert!(!dropped.load(Ordering::Acquire));
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-
-        release_tx.send(()).unwrap();
-
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(dropped.load(Ordering::Acquire));
-        clone_handle.join().unwrap();
-        owner_handle.join().unwrap();
+        let clone = guard.clone();
+        assert_drop_waits_for_clones(owner, guard, clone, dropped);
     }
 
     /// Purpose: Retain an owner through cloned sync guard wrappers.
     /// Expected: Teardown completes only after the last wrapper releases its shared keepalive.
     #[test]
     fn test_quiescent_box_drop_waits_for_last_sync_guard_wrapper() {
-        let owner = QuiescentBox::new(());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owner = QuiescentBox::new(DropSpy {
+            dropped: Arc::clone(&dropped),
+        });
         let guard = owner.guard().into_sync();
-        let guard_clone = guard.clone();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-
-        let clone_handle = thread::spawn(move || {
-            release_rx.recv().unwrap();
-            drop(guard_clone);
-        });
-        let owner_handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            drop(owner);
-            done_tx.send(()).unwrap();
-        });
-
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-
-        drop(guard);
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
-
-        release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        clone_handle.join().unwrap();
-        owner_handle.join().unwrap();
+        let clone = guard.clone();
+        assert_drop_waits_for_clones(owner, guard, clone, dropped);
     }
 
     /// Purpose: Clone sync wrappers without acquiring additional direct guards.
