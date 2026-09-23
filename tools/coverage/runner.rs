@@ -3,12 +3,16 @@ use super::source::{Configuration, Root};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+const SNAPSHOT_ROOTS: [&str; 4] = ["doradb-storage", "doradb-bench", "tools/coverage", ".cargo"];
+const SNAPSHOT_SKIPPED_DIRECTORIES: [&str; 2] = ["target", ".git"];
 
 #[derive(Deserialize)]
 struct Metadata {
@@ -334,10 +338,72 @@ fn cargo_configs(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Resolve a run destination without creating it or hiding snapshotted inputs.
+pub(super) fn output_directory(root: &Path, requested: &Path) -> Result<PathBuf> {
+    let output = resolve_directory(&root.join(requested))?;
+    for directory in SNAPSHOT_ROOTS {
+        let scanned = resolve_directory(&root.join(directory))?;
+        if let Ok(relative) = output.strip_prefix(&scanned)
+            && !relative.components().any(
+                |part| matches!(part, Component::Normal(name) if skip_snapshot_directory(name)),
+            )
+        {
+            return Err(format!(
+                "--output-dir {} is inside snapshotted tree `{directory}`; use target/coverage or another location outside the scanned trees",
+                output.display()
+            ));
+        }
+    }
+    Ok(output)
+}
+
+fn resolve_directory(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        // Resolve existing ancestors before applying '..'; a symlink can
+                        // change which directory that component leaves. Missing suffixes
+                        // stay lexical until an existing ancestor is reached again.
+                        resolved = resolved.canonicalize().map_err(|e| {
+                            format!("cannot resolve directory {}: {e}", resolved.display())
+                        })?;
+                        if !resolved.is_dir() {
+                            return Err(format!("not a directory: {}", resolved.display()));
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot resolve directory {}: {error}",
+                            resolved.display()
+                        ));
+                    }
+                }
+            }
+            part => resolved.push(part.as_os_str()),
+        }
+    }
+    Ok(resolved)
+}
+
+fn skip_snapshot_directory(name: &OsStr) -> bool {
+    SNAPSHOT_SKIPPED_DIRECTORIES
+        .iter()
+        .any(|skipped| name == *skipped)
+}
+
 /// Capture contents, not mtimes; include absent optional inputs so additions invalidate reuse.
 pub(super) fn snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
     let mut inputs = BTreeMap::new();
-    for directory in ["doradb-storage", "doradb-bench", "tools/coverage", ".cargo"] {
+    for directory in SNAPSHOT_ROOTS {
         collect(root, &root.join(directory), &mut inputs)?;
     }
     for name in [
@@ -375,10 +441,7 @@ fn collect(root: &Path, directory: &Path, inputs: &mut BTreeMap<String, String>)
             ));
         }
         if path.is_dir() {
-            if path
-                .file_name()
-                .is_some_and(|n| n != "target" && n != ".git")
-            {
+            if !path.file_name().is_some_and(skip_snapshot_directory) {
                 collect(root, &path, inputs)?;
             }
         } else if path.extension().is_some_and(|e| e == "rs" || e == "toml")
@@ -569,6 +632,170 @@ pub(super) fn atomic_write(output: &Path, name: &str, data: &[u8]) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Purpose: Keep coverage output out of scanned trees without modifying rejected destinations.
+    /// Expected: Scanned roots and descendants fail; ignored subtrees and unrelated locations remain usable.
+    #[test]
+    fn output_locations_follow_snapshot_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        // A target component above the repository must not exempt scanned inputs.
+        let root = dir.path().join("target/repository");
+        fs::create_dir_all(&root).unwrap();
+        for tree in ["doradb-storage", "doradb-bench", "tools/coverage", ".cargo"] {
+            for suffix in ["", "out", "target/../out", "target-extra/report"] {
+                let path = Path::new(tree).join(suffix);
+                for requested in [&path, &root.join(&path)] {
+                    let error = output_directory(&root, requested).unwrap_err();
+                    assert!(
+                        error.contains(&format!("snapshotted tree `{tree}`")),
+                        "{error}"
+                    );
+                    assert!(error.contains("target/coverage"), "{error}");
+                }
+            }
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        for path in [
+            "target/coverage",
+            "reports",
+            "doradb-storage-extra/out",
+            "tools/coverage-extra/out",
+            "doradb-storage/nested/target/out",
+            "doradb-bench/target/out",
+            "tools/coverage/target/out",
+            ".cargo/target/out",
+            "doradb-storage/.git/out",
+        ] {
+            assert_eq!(
+                output_directory(&root, Path::new(path)).unwrap(),
+                root.join(path)
+            );
+        }
+        let outside = dir.path().join("outside");
+        assert_eq!(output_directory(&root, &outside).unwrap(), outside);
+        assert_eq!(
+            output_directory(&root, Path::new("../../outside")).unwrap(),
+            outside
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        let existing = root.join("doradb-storage/out");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("coverage.json"), "previous manifest").unwrap();
+        fs::write(existing.join("lcov.info"), "previous report").unwrap();
+        assert!(output_directory(&root, &existing).is_err());
+        assert_eq!(
+            fs::read_to_string(existing.join("coverage.json")).unwrap(),
+            "previous manifest"
+        );
+        assert_eq!(
+            fs::read_to_string(existing.join("lcov.info")).unwrap(),
+            "previous report"
+        );
+        assert!(!existing.join(".coverage.lock").exists());
+    }
+
+    /// Purpose: Resolve physical output ownership through aliases and missing path suffixes.
+    /// Expected: Symlinks and parent components cannot bypass scanned trees or falsely reject ignored destinations.
+    #[cfg(unix)]
+    #[test]
+    fn output_aliases_preserve_physical_ownership() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join("doradb-storage/src")).unwrap();
+        fs::create_dir_all(root.join("doradb-storage/target")).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(root.join("doradb-storage"), root.join("storage-alias")).unwrap();
+        symlink(root.join("doradb-storage"), root.join("target")).unwrap();
+        symlink(
+            root.join("doradb-storage/target"),
+            root.join("target-alias"),
+        )
+        .unwrap();
+        symlink(&outside, root.join("outside-alias")).unwrap();
+        for path in [
+            "storage-alias/out",
+            "storage-alias/src/../out",
+            "missing/../storage-alias/out",
+            "target/out",
+        ] {
+            let error = output_directory(&root, Path::new(path)).unwrap_err();
+            assert!(
+                error.contains("snapshotted tree `doradb-storage`"),
+                "{path}: {error}"
+            );
+        }
+        assert_eq!(
+            output_directory(&root, Path::new("target-alias/out")).unwrap(),
+            root.join("doradb-storage/target/out")
+        );
+        assert_eq!(
+            output_directory(&root, Path::new("outside-alias/out")).unwrap(),
+            outside.join("out")
+        );
+        // Resolve the symlink before '..', which leaves its physical parent.
+        assert_eq!(
+            output_directory(&root, Path::new("outside-alias/../out")).unwrap(),
+            dir.path().join("out")
+        );
+
+        // Snapshot traversal also follows an aliased root itself.
+        let cargo_config = dir.path().join("cargo-config");
+        fs::create_dir(&cargo_config).unwrap();
+        symlink(&cargo_config, root.join(".cargo")).unwrap();
+        let error = output_directory(&root, &cargo_config.join("out")).unwrap_err();
+        assert!(error.contains("snapshotted tree `.cargo`"), "{error}");
+        assert!(!cargo_config.join("out").exists());
+        assert!(!root.join("missing").exists());
+    }
+
+    /// Purpose: Keep generated coverage files out of fingerprints while retaining real source-change detection.
+    /// Expected: Accepted ignored outputs leave snapshots stable and an adjacent production edit invalidates them.
+    #[test]
+    fn accepted_outputs_do_not_change_source_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for path in [
+            "doradb-storage/src/lib.rs",
+            "doradb-bench/src/main.rs",
+            "tools/coverage/source.rs",
+            ".cargo/config.toml",
+        ] {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "original\n").unwrap();
+        }
+        let before = snapshot(root).unwrap();
+        assert_eq!(
+            before.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                ".cargo/config.toml",
+                "doradb-bench/src/main.rs",
+                "doradb-storage/src/lib.rs",
+                "tools/coverage/source.rs",
+            ]
+        );
+        let expected = fingerprints(&before);
+        for tree in ["doradb-storage", "doradb-bench", "tools/coverage", ".cargo"] {
+            for skipped in ["target", ".git"] {
+                let output =
+                    output_directory(root, &Path::new(tree).join(skipped).join("coverage"))
+                        .unwrap();
+                let generated = output.join(".coverage-work/llvm/build");
+                fs::create_dir_all(&generated).unwrap();
+                fs::write(generated.join("generated.rs"), "fn generated() {}\n").unwrap();
+                fs::write(generated.join("generated.toml"), "generated = true\n").unwrap();
+            }
+        }
+        check_inputs(root, &expected).unwrap();
+        fs::write(root.join("doradb-storage/src/lib.rs"), "changed\n").unwrap();
+        let error = check_inputs(root, &expected).unwrap_err();
+        assert!(error.contains("doradb-storage/src/lib.rs"), "{error}");
+    }
 
     /// Purpose: Prevent concurrent writers and stale success after a failed replacement run.
     /// Expected: A second writer is rejected and invalidation removes completion and upload artifacts.

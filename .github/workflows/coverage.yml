@@ -17,26 +17,28 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Detect coverage changes in current update
+    - name: Detect coverage changes in PR or push
       id: delta
       shell: bash
       run: |
         set -euo pipefail
 
         event="${{ github.event_name }}"
-        action="${{ github.event.action || '' }}"
         before="${{ github.event.before || '' }}"
         after="${{ github.event.after || '' }}"
         base_sha="${{ github.event.pull_request.base.sha || '' }}"
-        head_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+        head_sha="${{ github.event.pull_request.head.sha || '' }}"
         before_valid="false"
         if [[ -n "$before" && ! "$before" =~ ^0+$ ]]; then
           before_valid="true"
         fi
 
-        if [[ "$event" == "pull_request" && "$action" == "synchronize" && "$before_valid" == "true" && -n "$after" ]]; then
-          range="${before}...${after}"
-        elif [[ "$event" == "pull_request" && -n "$base_sha" && -n "$head_sha" ]]; then
+        if [[ "$event" == "pull_request" ]]; then
+          if [[ -z "$base_sha" || -z "$head_sha" ]]; then
+            echo "coverage: missing pull request base or head revision" >&2
+            exit 1
+          fi
+          # Each new head needs coverage while the PR contains relevant changes.
           range="${base_sha}...${head_sha}"
         elif [[ "$event" == "push" && "$before_valid" == "true" && -n "$after" ]]; then
           range="${before}...${after}"
@@ -112,7 +114,8 @@ jobs:
     - name: Validate coverage tool modules
       run: cargo +nightly-2026-05-22 -Zscript test --manifest-path tools/coverage.rs
     - name: Collect production line coverage
-      run: tools/coverage.rs run
+      # Remove the setup action's profile override to use Cargo defaults.
+      run: env -u CARGO_PROFILE_DEV_DEBUG tools/coverage.rs run
     - name: Upload coverage nextest JUnit report
       if: ${{ always() }}
       uses: actions/upload-artifact@v4

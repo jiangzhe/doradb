@@ -24,7 +24,9 @@ report  Validate and render completed artifacts without running Cargo or tests.
 
 Prerequisites: nightly-2026-05-22 script interpreter, stable Rust and matching
 llvm-tools, cargo-llvm-cov, cargo-nextest. Run from the repository root.
-Canonical artifacts: lcov.info and coverage.json. raw.lcov is diagnostic only.";
+Canonical artifacts: lcov.info and coverage.json. raw.lcov is diagnostic only.
+Output directories must be outside snapshotted source/config trees or inside
+an excluded subtree such as target/.";
 
 #[derive(Debug)]
 struct Args {
@@ -98,7 +100,11 @@ pub(super) fn main(values: impl Iterator<Item = String>) -> Result<()> {
         .map_err(|e| e.to_string())?
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    let output = root.join(&args.directory);
+    let output = if args.run {
+        runner::output_directory(&root, &args.directory)?
+    } else {
+        root.join(&args.directory)
+    };
     let _lock = runner::OutputLock::acquire(&output, args.run)?;
     let output = output.canonicalize().map_err(|e| e.to_string())?;
     let (manifest, report) = if args.run {
