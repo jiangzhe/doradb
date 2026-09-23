@@ -1,0 +1,220 @@
+name: coverage
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  changes:
+    runs-on: ubuntu-22.04
+    outputs:
+      run_coverage: ${{ steps.delta.outputs.run_coverage }}
+      diff_range: ${{ steps.delta.outputs.diff_range }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Detect coverage changes in PR or push
+      id: delta
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        event="${{ github.event_name }}"
+        before="${{ github.event.before || '' }}"
+        after="${{ github.event.after || '' }}"
+        base_sha="${{ github.event.pull_request.base.sha || '' }}"
+        head_sha="${{ github.event.pull_request.head.sha || '' }}"
+        before_valid="false"
+        if [[ -n "$before" && ! "$before" =~ ^0+$ ]]; then
+          before_valid="true"
+        fi
+
+        if [[ "$event" == "pull_request" ]]; then
+          if [[ -z "$base_sha" || -z "$head_sha" ]]; then
+            echo "coverage: missing pull request base or head revision" >&2
+            exit 1
+          fi
+          # Each new head needs coverage while the PR contains relevant changes.
+          range="${base_sha}...${head_sha}"
+        elif [[ "$event" == "push" && "$before_valid" == "true" && -n "$after" ]]; then
+          range="${before}...${after}"
+        elif [[ "$event" == "push" && -n "$after" ]]; then
+          range="${after}^...${after}"
+        else
+          range="HEAD~1...HEAD"
+        fi
+
+        echo "diff_range=${range}" >> "$GITHUB_OUTPUT"
+
+        diff_failed="false"
+        if files="$(git diff --name-only "$range")"; then
+          :
+        else
+          diff_failed="true"
+          files=""
+        fi
+        echo "changed files in ${range}:"
+        printf '%s\n' "$files"
+
+        run_coverage="false"
+        if [[ "$diff_failed" == "true" || -z "$files" ]]; then
+          run_coverage="true"
+        else
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if [[ "$file" == doradb-bench/* ||
+                  "$file" == doradb-storage/* ||
+                  "$file" == Cargo.toml ||
+                  "$file" == Cargo.lock ||
+                  "$file" == build.rs ||
+                  "$file" == rust-toolchain ||
+                  "$file" == rust-toolchain.toml ||
+                  "$file" == .cargo/* ||
+                  "$file" == .config/nextest.toml ||
+                  "$file" == tools/coverage.rs ||
+                  "$file" == tools/coverage/* ||
+                  "$file" == tools/coverage_focus.rs ||
+                  "$file" == .codecov.yml ||
+                  "$file" == .github/actions/* ||
+                  "$file" == .github/workflows/coverage.yml ]]; then
+              run_coverage="true"
+              break
+            fi
+          done <<< "$files"
+        fi
+
+        echo "run_coverage=${run_coverage}" >> "$GITHUB_OUTPUT"
+        echo "run_coverage=${run_coverage}"
+
+  coverage:
+    needs: changes
+    if: needs.changes.outputs.run_coverage == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - name: Setup stable Rust and LLVM
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: stable
+        components: llvm-tools
+        rustflags: ""
+    - name: Install coverage script interpreter
+      run: rustup toolchain install nightly-2026-05-22 --profile minimal
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Validate coverage tool modules
+      run: cargo +nightly-2026-05-22 -Zscript test --manifest-path tools/coverage.rs
+    - name: Collect production line coverage
+      # Remove the setup action's profile override to use Cargo defaults.
+      run: env -u CARGO_PROFILE_DEV_DEBUG tools/coverage.rs run
+    - name: Upload coverage nextest JUnit report
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: nextest-junit-coverage
+        if-no-files-found: warn
+        overwrite: true
+        path: target/nextest/ci/junit.xml
+    - name: Upload canonical production LCOV
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-lcov
+        if-no-files-found: error
+        overwrite: true
+        path: target/coverage/lcov.info
+    - name: Upload coverage provenance and diagnostics
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-diagnostics
+        if-no-files-found: warn
+        overwrite: true
+        path: |
+          target/coverage/coverage.json
+          target/coverage/raw*.lcov
+          target/coverage/*.log
+
+  codecov:
+    needs: [changes, coverage]
+    if: needs.changes.outputs.run_coverage == 'true' && needs.coverage.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    - name: Download LCOV report
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-lcov
+        path: coverage-artifact
+    - name: Upload to codecov.io
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      uses: codecov/codecov-action@v5
+      with:
+        files: coverage-artifact/lcov.info
+        disable_search: true
+        disable_file_fixes: true
+        fail_ci_if_error: true
+        override_commit: ${{ github.event.pull_request.head.sha || github.sha }}
+        token: ${{secrets.CODECOV_TOKEN}}
+
+  verify-coverage:
+    needs: [changes, coverage, codecov]
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+    - name: Verify coverage results
+      env:
+        CHANGES_RESULT: ${{ needs.changes.result }}
+        DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
+        RUN_COVERAGE: ${{ needs.changes.outputs.run_coverage }}
+        COVERAGE_RESULT: ${{ needs.coverage.result }}
+        CODECOV_RESULT: ${{ needs.codecov.result }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$CHANGES_RESULT" != "success" ]]; then
+          echo "Change detection did not succeed: result=${CHANGES_RESULT}"
+          exit 1
+        fi
+
+        if [[ "$RUN_COVERAGE" == "false" ]]; then
+          echo "No coverage changes detected in update range: ${DIFF_RANGE}"
+          echo "Coverage jobs were intentionally skipped."
+          exit 0
+        fi
+
+        if [[ "$RUN_COVERAGE" != "true" ]]; then
+          echo "Change detection returned an invalid run_coverage value: ${RUN_COVERAGE}"
+          exit 1
+        fi
+
+        failed="false"
+        verify_result() {
+          local job="$1"
+          local result="$2"
+          if [[ "$result" != "success" ]]; then
+            echo "Required CI job did not succeed: job=${job}, result=${result}"
+            failed="true"
+          fi
+        }
+
+        verify_result "coverage" "$COVERAGE_RESULT"
+        verify_result "codecov" "$CODECOV_RESULT"
+
+        if [[ "$failed" == "true" ]]; then
+          exit 1
+        fi
+
+        echo "All required coverage jobs succeeded."
