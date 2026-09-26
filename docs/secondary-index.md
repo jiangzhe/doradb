@@ -196,3 +196,12 @@ conditions are satisfied.
 | Recovery | Reconstruction of cold and hot state after restart | [Recovery](./recovery.md) |
 | Reclamation | Reader-safe cleanup of entries, history, and storage | [Garbage Collection](./garbage-collect.md) |
 | Public API | Index definitions, keyed reads, mutations, and DDL | [Public API](./public-api.md) |
+
+## Parallel hot-index construction
+
+[RFC 0032](rfcs/0032-in-memory-parallel-hot-index-build.md) defines a shared
+pipeline for stable hot-row extraction, sorted runs, validation, and tree
+construction under bounded memory and concurrency. The first phase provides
+extraction and local duplicate evidence; global validation and production
+CREATE/recovery integration remain later phases. Existing index construction
+and publication behavior are unchanged.

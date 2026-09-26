@@ -23,6 +23,8 @@ mod memcmp;
 mod notify;
 mod obs;
 mod poison;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 mod ptr;
 mod quiescent;
 mod recovery;
@@ -55,8 +57,8 @@ pub use catalog::{
 pub use conf::{
     DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
     DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION, EngineConfig, EvictableBufferPoolConfig,
-    FileSystemConfig, LogSync, MAX_TABLE_SCAN_UNITS_PER_PARTITION, MandatoryRuntimeConfig,
-    RecoveryConfig, TableScanConfig, ThreadPoolConfig, TrxSysConfig,
+    FileSystemConfig, HotIndexBuildConfig, LogSync, MAX_TABLE_SCAN_UNITS_PER_PARTITION,
+    MandatoryRuntimeConfig, RecoveryConfig, TableScanConfig, ThreadPoolConfig, TrxSysConfig,
 };
 pub use engine::Engine;
 pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};

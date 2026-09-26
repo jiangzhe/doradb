@@ -11,7 +11,9 @@ use super::consts::{
     DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION, DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
     MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
-use super::{EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig};
+use super::{
+    EvictableBufferPoolConfig, FileSystemConfig, HotIndexBuildConfig, RecoveryConfig, TrxSysConfig,
+};
 
 /// Immutable sizing for the engine-owned thread pool.
 ///
@@ -159,6 +161,8 @@ pub struct EngineConfig {
     pub trx: TrxSysConfig,
     /// Startup recovery configuration.
     pub recovery: RecoveryConfig,
+    /// Per-index hot extraction scratch and worker limits.
+    pub hot_index_build: HotIndexBuildConfig,
     /// Engine-owned thread-pool configuration.
     pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
@@ -182,6 +186,7 @@ impl Default for EngineConfig {
             storage_root: PathBuf::from("."),
             trx: TrxSysConfig::default(),
             recovery: RecoveryConfig::default(),
+            hot_index_build: HotIndexBuildConfig::default(),
             thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
             table_scan: TableScanConfig::default(),
@@ -209,6 +214,8 @@ impl EngineConfig {
     #[inline]
     pub(crate) fn validate_inner(mut self) -> ConfigResult<Self> {
         self.thread_pool.validate()?;
+        self.hot_index_build
+            .validate(self.thread_pool.worker_threads)?;
         self.recovery.validate(self.thread_pool.worker_threads)?;
         self.mandatory_runtime.validate()?;
         self.table_scan.validate()?;
@@ -256,6 +263,12 @@ impl EngineConfig {
     #[inline]
     pub fn recovery(mut self, recovery: RecoveryConfig) -> Self {
         self.recovery = recovery;
+        self
+    }
+
+    /// Set per-index hot extraction scratch and parallelism limits.
+    pub fn hot_index_build(mut self, config: HotIndexBuildConfig) -> Self {
+        self.hot_index_build = config;
         self
     }
 

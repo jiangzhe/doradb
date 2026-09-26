@@ -296,6 +296,12 @@ mod tests {
             );
         }
         assert_eq!(run.internal_metrics.is_empty(), !stats);
+        // Phase-1 extraction is not yet called by the production recovery path.
+        assert!(
+            run.internal_metrics
+                .iter()
+                .all(|metric| !metric.name.starts_with("hot_index_build."))
+        );
         assert!(
             !run.internal_metrics
                 .iter()
@@ -865,6 +871,12 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
                 assert_eq!(verification.fingerprint.len(), 64);
                 assert_eq!(create.sampled_process_rss.is_some(), stats);
                 assert_eq!(!run.internal_metrics.is_empty(), stats);
+                // Phase-1 extraction is not yet called by public CREATE INDEX.
+                assert!(
+                    run.internal_metrics
+                        .iter()
+                        .all(|metric| !metric.name.starts_with("hot_index_build."))
+                );
                 assert_eq!(run.latency.unit, LatencyUnit::IndexCreation);
                 assert_eq!(run.latency.sum_nanos, create.create_elapsed_nanos);
                 assert_eq!(run.latency.sample_count, 1);

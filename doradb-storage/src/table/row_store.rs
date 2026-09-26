@@ -195,52 +195,36 @@ impl<D: BufferPool> RowStore<D> {
             .await)
     }
 
-    /// Reopens a captured hot row page and validates its descriptor's row range.
-    pub(super) async fn get_captured_row_page_shared(
+    /// Reopens a captured hot row page whose allocation and range remain stable.
+    ///
+    /// The caller must retain snapshot protection, DDL exclusion, or bootstrap
+    /// ownership from capture through access. Pool guards alone do not prevent
+    /// page reclamation. Recovery validates descriptors before publishing them.
+    pub(crate) async fn get_captured_row_page_shared(
         &self,
         guards: &PoolGuards,
         descriptor: RowPageDescriptor,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
+        assert!(
+            self.mem_pool.is_allocated(descriptor.page_id),
+            "captured row page is not allocated: table_id={}, descriptor={descriptor:?}, capacity={}",
+            self.table_id(),
+            self.mem_pool.capacity()
+        );
         let page_guard = self
-            .get_row_page_shared(guards, descriptor.page_id)
+            .must_get_row_page_shared(guards, descriptor.page_id)
             .await
             .attach_with(|| {
-                format!(
-                    "operation=load_table_scan_hot_page, page_id={}",
-                    descriptor.page_id
-                )
-            })?
-            .ok_or_else(|| {
-                Report::new(InternalError::CapturedRowPageUnavailable)
-                    .attach(format!(
-                        "captured page is missing: table_id={}, page_id={}, start_row_id={}, end_row_id={}",
-                        self.table_id(),
-                        descriptor.page_id,
-                        descriptor.start_row_id,
-                        descriptor.end_row_id
-                    ))
-                    .change_context(RuntimeError::TableAccess)
+                format!("operation=get_captured_row_page_shared, descriptor={descriptor:?}")
             })?;
         let page = page_guard.page();
-        let row_end = page
-            .header
-            .start_row_id
-            .checked_add(page.header.row_count() as u64);
-        if page.header.start_row_id != descriptor.start_row_id
-            || row_end.is_none_or(|row_end| row_end > descriptor.end_row_id)
-        {
-            return Err(Report::new(InternalError::CapturedRowPageUnavailable)
-                .attach(format!(
-                    "captured page identity changed: table_id={}, page_id={}, expected_start={}, expected_end={}, actual_start={}, actual_rows={}",
-                    self.table_id(),
-                    descriptor.page_id,
-                    descriptor.start_row_id,
-                    descriptor.end_row_id,
-                    page.header.start_row_id,
-                    page.header.row_count()
-                ))
-                .change_context(RuntimeError::TableAccess).into());
-        }
+        let row_end = page.header.start_row_id + u64::from(page.header.max_row_count);
+        assert_eq!(
+            (page.header.start_row_id, row_end),
+            (descriptor.start_row_id, descriptor.end_row_id),
+            "captured row page identity changed: table_id={}, descriptor={descriptor:?}",
+            self.table_id()
+        );
         Ok(page_guard)
     }
 
@@ -619,6 +603,27 @@ impl<D: BufferPool> RowStore<D> {
         guards: &PoolGuards,
         start_row_id: RowID,
     ) -> RuntimeResult<(RowID, Vec<RowPageDescriptor>)> {
+        let mut pages = Vec::new();
+        let end = self
+            .visit_original_row_pages_from(guards, start_row_id, |page| {
+                pages.push(page);
+                Ok(())
+            })
+            .await?;
+        Ok((end, pages))
+    }
+
+    /// Traverse captured page descriptors through a fallible sink before storage growth.
+    /// No row-page access is needed and only one preceding index entry is retained.
+    pub(crate) async fn visit_original_row_pages_from<F>(
+        &self,
+        guards: &PoolGuards,
+        start_row_id: RowID,
+        mut sink: F,
+    ) -> RuntimeResult<RowID>
+    where
+        F: FnMut(RowPageDescriptor) -> RuntimeResult<()>,
+    {
         let operation = "snapshot_original_row_pages";
         let meta_pool_guard = guards.meta_guard();
         let mut cursor = self.blk_idx.mem_cursor(meta_pool_guard);
@@ -632,7 +637,7 @@ impl<D: BufferPool> RowStore<D> {
                     self.table_id()
                 )
             })?;
-        let mut entries = Vec::new();
+        let mut previous = None;
         let mut upper_bound = start_row_id;
         let mut first_leaf = true;
         while let Some(leaf) = cursor
@@ -685,29 +690,28 @@ impl<D: BufferPool> RowStore<D> {
             } else {
                 0
             };
-            entries.extend_from_slice(&leaf_entries[start_idx..]);
+            for entry in &leaf_entries[start_idx..] {
+                if let Some((page_id, start_row_id)) =
+                    previous.replace((entry.page_id, entry.row_id))
+                {
+                    sink(RowPageDescriptor {
+                        page_id,
+                        start_row_id,
+                        end_row_id: entry.row_id,
+                    })?;
+                }
+            }
             upper_bound = page.header.end_row_id;
         }
 
-        let mut pages = Vec::with_capacity(entries.len());
-        for (idx, entry) in entries.iter().enumerate() {
-            let end_row_id = entries
-                .get(idx + 1)
-                .map(|next| next.row_id)
-                .unwrap_or(upper_bound);
-            assert!(
-                entry.row_id < end_row_id,
-                "block index must produce an increasing original row-page range: table_id={}, start_row_id={}, end_row_id={end_row_id}",
-                self.table_id(),
-                entry.row_id
-            );
-            pages.push(RowPageDescriptor {
-                page_id: entry.page_id,
-                start_row_id: entry.row_id,
-                end_row_id,
-            });
+        if let Some((page_id, start_row_id)) = previous {
+            sink(RowPageDescriptor {
+                page_id,
+                start_row_id,
+                end_row_id: upper_bound,
+            })?;
         }
-        Ok((upper_bound, pages))
+        Ok(upper_bound)
     }
 
     async fn scan_from_with_meta_guard<F>(

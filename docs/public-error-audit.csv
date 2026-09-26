@@ -2,7 +2,7 @@ file,function_or_method,disclose_calls
 doradb-storage/src/conf/engine.rs,EngineConfig::validate,1
 doradb-storage/src/engine.rs,Engine::new_session,1
 doradb-storage/src/engine.rs,Engine::try_shutdown,1
-doradb-storage/src/engine.rs,bootstrap_engine,28
+doradb-storage/src/engine.rs,bootstrap_engine,29
 doradb-storage/src/error.rs,LifecycleOrFatalError::disclose,2
 doradb-storage/src/error.rs,OperationOrFatalError::disclose,2
 doradb-storage/src/error.rs,OperationOrRuntimeError::disclose,2
@@ -31,6 +31,7 @@ doradb-storage/src/session/mod.rs,Session::create_table,5
 doradb-storage/src/session/mod.rs,Session::drop_index,10
 doradb-storage/src/session/mod.rs,Session::drop_table,5
 doradb-storage/src/session/mod.rs,Session::freeze_table,6
+doradb-storage/src/session/mod.rs,Session::hot_index_build_stats,1
 doradb-storage/src/session/mod.rs,Session::list_table_ids,1
 doradb-storage/src/session/mod.rs,Session::lock_table,2
 doradb-storage/src/session/mod.rs,Session::logical_lock_stats,1

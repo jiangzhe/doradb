@@ -6,6 +6,7 @@ use crate::component::{
     Component, ComponentRegistry, EnginePools, FirstPanic, IndexPool, MemPool, MetaPool,
     ShelfScope, Supplier, panic_payload_description,
 };
+use crate::conf::HotIndexBuildConfig;
 use crate::conf::{RecoveryConfig, TrxSysConfig, ValidatedTrxSysConfig};
 use crate::error::{
     CompletionErrorBridge, DataIntegrityError, DataIntegrityResult, FatalError, FatalResult,
@@ -15,6 +16,7 @@ use crate::error::{
 use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, OldRoot, TableFile};
 use crate::id::{SessionID, SessionOperationKey, TrxID};
+use crate::index::build::HotBuildPolicy;
 use crate::latch::ExclusiveGate;
 use crate::lock::FamilyLockAuthority;
 use crate::log::redo::RedoLogs;
@@ -22,6 +24,8 @@ use crate::log::{EnqueuePrecommitError, LogFileSealer, LogWriteDriver, RedoLog, 
 use crate::notify::MonotonicU64;
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::HotIndexBuildProfiler;
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::recovery::{RecoveryOutcome, RecoveryResources};
@@ -555,6 +559,9 @@ pub(crate) struct TrxSysStats {
 pub(crate) struct TransactionSystem {
     /// Value-only completed recovery measurements for engine assembly.
     pub(crate) recovery_report: RecoveryReport,
+    /// Recorder retained from bootstrap for public hot-build snapshots.
+    #[cfg(feature = "profiling")]
+    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
     /// A sequence to generate snapshot timestamp(abbr. sts) and commit timestamp(abbr. cts).
     /// They share the same sequence and start from 1.
     /// The two timestamps are used to identify which version of data a transaction should see.
@@ -632,7 +639,7 @@ pub(crate) struct TransactionSystem {
 impl TransactionSystem {
     /// Recover durable state and bootstrap transaction-system startup resources.
     pub(crate) async fn bootstrap(
-        config: (ValidatedTrxSysConfig, RecoveryConfig),
+        config: (ValidatedTrxSysConfig, RecoveryConfig, HotIndexBuildConfig),
         poisoner: QuiescentGuard<EnginePoisoner>,
         mandatory_runtime: QuiescentGuard<MandatoryRuntime>,
         thread_pool: QuiescentGuard<ThreadPool>,
@@ -640,7 +647,7 @@ impl TransactionSystem {
         table_fs: QuiescentGuard<FileSystem>,
         catalog: QuiescentGuard<Catalog>,
     ) -> RuntimeOrFatalResult<(Self, PendingTransactionWorkerStartups)> {
-        let (validated, recovery) = config;
+        let (validated, recovery, hot_index_build) = config;
         let (config, file_prefix) = validated.into_parts();
         debug_assert!(config.purge_threads != 0);
         debug_assert!(
@@ -652,8 +659,13 @@ impl TransactionSystem {
         let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
         let preparation_started = Instant::now();
+        let hot_build_policy = HotBuildPolicy::new(hot_index_build, thread_pool.worker_threads())
+            .change_context(RuntimeError::Recovery)?;
         let recovery_resources =
-            RecoveryResources::new(pools, table_fs.clone(), thread_pool, &catalog);
+            RecoveryResources::new(pools, table_fs.clone(), thread_pool, &catalog)
+                .with_hot_build_policy(hot_build_policy);
+        #[cfg(feature = "profiling")]
+        let hot_build_profiler = recovery_resources.hot_build_profiler.clone();
         let coordinator = recovery_resources.prepare(&config, &recovery, file_prefix.clone())?;
         let preparation_elapsed = preparation_started.elapsed();
         let RecoveryOutcome {
@@ -683,6 +695,10 @@ impl TransactionSystem {
             },
         );
         trx_sys.recovery_report = report;
+        #[cfg(feature = "profiling")]
+        {
+            trx_sys.hot_build_profiler = hot_build_profiler;
+        }
         Ok((
             trx_sys,
             PendingTransactionWorkerStartups {
@@ -725,6 +741,8 @@ impl TransactionSystem {
         );
         TransactionSystem {
             recovery_report: RecoveryReport::default(),
+            #[cfg(feature = "profiling")]
+            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
             published_gc_horizon: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
@@ -1711,7 +1729,7 @@ impl Supplier<TransactionRedoWorkers> for TransactionSystem {
 }
 
 impl Component for TransactionSystem {
-    type Config = (ValidatedTrxSysConfig, RecoveryConfig);
+    type Config = (ValidatedTrxSysConfig, RecoveryConfig, HotIndexBuildConfig);
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
     type Error = RuntimeOrFatalError;

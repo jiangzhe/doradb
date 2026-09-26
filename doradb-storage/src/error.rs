@@ -231,6 +231,9 @@ pub(crate) enum ConfigError {
     InvalidIoDepth,
     #[error("invalid recovery replay limit")]
     InvalidRecoveryLimit,
+    /// Hot-index extraction sizing is unusable or overflows allocation arithmetic.
+    #[error("invalid hot-index build limit")]
+    InvalidHotIndexBuildLimit,
     #[error("invalid purge thread count")]
     InvalidPurgeThreads,
     #[error("invalid transaction GC bucket count")]
@@ -474,8 +477,6 @@ pub(crate) enum InternalError {
     ReadonlyWriteBlocked,
     #[error("row page scan start is not a page boundary")]
     RowPageScanStartInvalid,
-    #[error("captured row page is unavailable")]
-    CapturedRowPageUnavailable,
     #[error("lwc builder misuse")]
     LwcBuilderMisuse,
     #[error("secondary index out of bounds")]
@@ -2188,6 +2189,15 @@ mod tests {
     use std::cell::Cell;
     use std::io::Error as StdIoError;
 
+    #[derive(Debug)]
+    struct UnknownAttachment;
+
+    impl Display for UnknownAttachment {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("unknown attachment")
+        }
+    }
+
     fn assert_runtime_disclosure<C>(
         error: Error,
         expected_context: RuntimeError,
@@ -2208,15 +2218,6 @@ mod tests {
                 output.contains(diagnostic),
                 "missing {diagnostic:?} in {output}"
             );
-        }
-    }
-
-    #[derive(Debug)]
-    struct UnknownAttachment;
-
-    impl Display for UnknownAttachment {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("unknown attachment")
         }
     }
 

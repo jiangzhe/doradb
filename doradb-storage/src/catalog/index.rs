@@ -14,13 +14,16 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::meta_block::validate_secondary_index_state;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
+use crate::index::build::{DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildSource};
 use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
     BTreeKey, BTreeKeyEncoder, ColumnBlockIndex, IndexInsert, NonUniqueMemIndex,
-    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex,
+    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex, secondary_index_encoder,
 };
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::HotIndexBuildProfiler;
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowRead;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
@@ -28,7 +31,6 @@ use crate::runtime::{POLL_BUDGET, yield_now};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{
     CreateIndexPlan, DeleteMarker, DropIndexPlan, RuntimeIndexEntry, Table, TableRuntimeLayout,
-    secondary_disk_tree_encoder,
 };
 use crate::trx::{PrivateTransaction, trx_is_committed};
 use crate::value::Val;
@@ -36,6 +38,8 @@ use error_stack::{Report, ResultExt};
 use std::any::Any;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(feature = "profiling")]
+use std::time::Instant;
 #[cfg(test)]
 use tests::CreateIndexTestFailure;
 #[cfg(test)]
@@ -245,7 +249,7 @@ impl<'a> CreateIndexCollector<'a> {
             table.row_store.blk_idx().column_route_snapshot(),
         );
         let key_encoder =
-            secondary_disk_tree_encoder(layout.metadata(), index_spec, !index_spec.unique());
+            secondary_index_encoder(layout.metadata(), index_spec, !index_spec.unique());
         Self {
             table,
             guards,
@@ -1690,6 +1694,74 @@ pub(crate) fn classify_index_ddl_root(
     }
 }
 
+/// Capture the phase-1 CREATE source from the finalized new specification.
+/// The owned gate keeps table/catalog metadata admission live through accepted jobs.
+/// The enclosing accepted DDL owner must also retain its transaction's data
+/// exclusion and this scope through settlement; capture does not acquire it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "RFC 0032 phase 5 integrates the production caller"
+    )
+)]
+pub(crate) async fn capture_hot_index_build(
+    plan: &CreateIndexPlan,
+    gates: Arc<IndexDdlGateScope>,
+    guards: PoolGuards,
+    build_ts: TrxID,
+    policy: HotBuildPolicy,
+    #[cfg(feature = "profiling")] profiler: Arc<HotIndexBuildProfiler>,
+) -> RuntimeOrFatalResult<HotBuildSource> {
+    #[cfg(feature = "profiling")]
+    let started = Instant::now();
+    assert!(
+        Arc::ptr_eq(&gates.table, plan.table()),
+        "hot-build CREATE gate/table identity mismatch"
+    );
+    assert_create_index_block_index_snapshot(
+        plan.table_id(),
+        (
+            plan.active_root().pivot_row_id,
+            plan.active_root().column_block_index_root,
+        ),
+        plan.table().row_store.blk_idx().column_route_snapshot(),
+    );
+    let spec = plan.new_index_spec();
+    let duplicates = if spec.unique() {
+        DuplicateCheck::Collect
+    } else {
+        DuplicateCheck::Skip
+    };
+    let mut source = HotBuildSource::new(
+        HotBuildCapture {
+            table: plan.table().clone(),
+            layout: plan.old_layout().clone(),
+            guards,
+            pivot: plan.active_root().pivot_row_id,
+            ddl: Some(gates),
+            #[cfg(feature = "profiling")]
+            profiler,
+        },
+        spec,
+        build_ts,
+        duplicates,
+        policy,
+    );
+    source.capture_pages().await.attach_with(|| {
+        format!(
+            "operation=hot_index_build, phase=capture_create_pages, table_id={}, index={}",
+            plan.table_id(),
+            spec.index
+        )
+    })?;
+    #[cfg(feature = "profiling")]
+    {
+        source.capture_elapsed_nanos = started.elapsed().as_nanos() as u64;
+    }
+    Ok(source)
+}
+
 async fn rollback_active_ddl_trx(trx: &mut Option<PrivateTransaction>) -> RuntimeOrFatalResult<()> {
     let Some(trx) = trx.take() else {
         return Ok(());
@@ -2186,6 +2258,26 @@ pub(crate) mod tests {
         root: ActiveRoot,
     }
 
+    /// Run the existing CREATE collector as an independent component correctness oracle.
+    pub(crate) async fn serial_hot_build_test_entries(
+        plan: &CreateIndexPlan,
+        guards: &PoolGuards,
+    ) -> Vec<(BTreeKey, RowID)> {
+        CreateIndexCollector::new(
+            plan.table(),
+            guards,
+            plan.old_layout(),
+            plan.new_index_spec(),
+            plan.active_root(),
+        )
+        .collect_current_hot()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.key, entry.row_id))
+        .collect()
+    }
+
     fn index_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> IndexDdlSnapshot {
         let CurrentTableState::Live {
             effective_cts,
@@ -2516,6 +2608,25 @@ pub(crate) mod tests {
         )
         .unwrap();
         root_with_metadata(active_metadata, TrxID::new(20))
+    }
+
+    async fn updated_hot_row(table_id: TableID, session: &mut Session) -> RowID {
+        let row_id =
+            insert_one_row(table_id, session, vec![Val::from(1), Val::from("alpha")]).await;
+        assert_eq!(
+            update_one_row(
+                table_id,
+                session,
+                &single_key(1),
+                vec![UpdateCol {
+                    idx: 1,
+                    val: Val::from("bravo"),
+                }],
+            )
+            .await,
+            row_id
+        );
+        row_id
     }
 
     /// Purpose: Distinguish durable and provisional index creation during recovery.
@@ -3210,25 +3321,6 @@ pub(crate) mod tests {
             assert_create_index_build_failure_cleanup(CreateIndexTestFailure::AfterRuntimeStaged)
                 .await;
         });
-    }
-
-    async fn updated_hot_row(table_id: TableID, session: &mut Session) -> RowID {
-        let row_id =
-            insert_one_row(table_id, session, vec![Val::from(1), Val::from("alpha")]).await;
-        assert_eq!(
-            update_one_row(
-                table_id,
-                session,
-                &single_key(1),
-                vec![UpdateCol {
-                    idx: 1,
-                    val: Val::from("bravo"),
-                }],
-            )
-            .await,
-            row_id
-        );
-        row_id
     }
 
     /// Purpose: Exclude obsolete hot keys from newly built non-unique indexes.

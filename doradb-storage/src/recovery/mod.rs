@@ -23,6 +23,7 @@ mod timeline;
 use self::dispatch::ReplayDispatcher;
 pub(crate) use self::dispatch::RowReplayCounts;
 use crate::buffer::guard::PageGuard;
+use crate::catalog::TableIndexMetadata;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
     classify_index_ddl_root,
@@ -33,12 +34,14 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
+use crate::index::build::HotBuildSource;
 use crate::log::redo::{DDLRedo, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::FastHashSet;
 use crate::obs;
 use crate::recovery::stream::{PlannedRedoRecovery, RecoveryLogStream};
 use crate::stats::{RecoveryReport, recovery_add_count};
+use crate::table::RowPageDescriptor;
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
 use decode::{DecodedGroup, DecodedRow, DecodedRowKind, DecodedTable, DecodedTrx, DecodedTrxKind};
@@ -55,6 +58,9 @@ use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 pub(crate) use timeline::{RecoveryTimeline, TableReplayBounds};
+
+#[cfg(test)]
+pub(crate) use tests::capture_hot_build_test_source;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UserTableRedoAction {
@@ -626,6 +632,61 @@ impl<'a> RecoveryCoordinator<'a> {
         recovery_add_count(count, rows as u64, &mut self.report.saturated);
     }
 
+    /// Consume one finalized replay registry after global drain and metadata reconciliation.
+    /// The bootstrap owner must retain this source/scope until accepted work settles.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "RFC 0032 phase 4 integrates the production caller"
+        )
+    )]
+    async fn capture_hot_index_build(
+        &mut self,
+        table: Arc<Table>,
+        spec: &TableIndexMetadata,
+    ) -> RuntimeOrFatalResult<HotBuildSource> {
+        use crate::index::build::{DuplicateCheck, HotBuildCapture};
+        self.dispatcher.drain_all().await?;
+        let policy = self.resources.hot_build_policy;
+        #[cfg(feature = "profiling")]
+        let started = Instant::now();
+        let layout = table.layout_snapshot();
+        let pivot = table.row_store.blk_idx().pivot_row_id();
+        let mut source = HotBuildSource::new(
+            HotBuildCapture {
+                table: table.clone(),
+                layout,
+                guards: self.resources.pool_guards.clone(),
+                pivot,
+                ddl: None,
+                #[cfg(feature = "profiling")]
+                profiler: self.resources.hot_build_profiler.clone(),
+            },
+            spec,
+            MIN_SNAPSHOT_TS,
+            DuplicateCheck::Skip,
+            policy,
+        );
+        if let Some(pages) = self.dispatcher.page_history.remove(&table.table_id()) {
+            for replay in pages.into_values() {
+                source.push_page(replay.into_descriptor()).attach_with(|| format!("operation=hot_index_build, phase=capture_recovery_pages, table_id={}, index={}", table.table_id(), spec.index))?;
+            }
+        }
+        source.finish_capture().attach_with(|| {
+            format!(
+                "operation=hot_index_build, phase=validate_recovery_pages, table_id={}, index={}",
+                table.table_id(),
+                spec.index
+            )
+        })?;
+        #[cfg(feature = "profiling")]
+        {
+            source.capture_elapsed_nanos = started.elapsed().as_nanos() as u64;
+        }
+        Ok(source)
+    }
+
     async fn rebuild_hot_indexes(&mut self) -> RuntimeOrFatalResult<()> {
         // Checkpointed cold indexes already reside in DiskTree roots. Consume
         // replay state before rebuilding hot indexes through ordinary row reads.
@@ -1023,8 +1084,6 @@ impl<'a> RecoveryCoordinator<'a> {
         {
             return Ok(());
         }
-        // Row page creation is guaranteed to be ordered in the redo log,
-        // so its safe to recreate it and the row id range must be identical.
         let table = self
             .resources
             .catalog
@@ -1034,12 +1093,33 @@ impl<'a> RecoveryCoordinator<'a> {
                     .attach(format!("replay create row page: table_id={table_id}"))
             })
             .change_context(RuntimeError::Recovery)?;
-        let count = end_row_id - start_row_id;
+        let Some(count) = end_row_id
+            .checked_sub(start_row_id)
+            .filter(|count| (1..=u64::from(u16::MAX)).contains(count))
+        else {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "replay create row page has invalid row range: table_id={table_id}, page_id={page_id}, start_row_id={start_row_id}, end_row_id={end_row_id}"
+                ))
+                .change_context(RuntimeError::Recovery).into());
+        };
         // Explicit allocation rejects duplicate pages before initializing replay state.
         let page_guard = table
             .row_store
             .allocate_row_page_at(&self.resources.pool_guards, count as usize, page_id)
             .await?;
+        // Ordered page creation must reproduce the logged reservation. Validate
+        // this once before publishing a descriptor trusted by later page access.
+        let page = page_guard.page();
+        let actual_start = page.header.start_row_id;
+        let actual_end = actual_start + u64::from(page.header.max_row_count);
+        if (actual_start, actual_end) != (start_row_id, end_row_id) {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "replay create row page range mismatch: table_id={table_id}, page_id={page_id}, expected_start={start_row_id}, expected_end={end_row_id}, actual_start={actual_start}, actual_end={actual_end}"
+                ))
+                .change_context(RuntimeError::Recovery).into());
+        }
         recovery_add_count(
             &mut self.report.work.hot_pages_reconstructed,
             1,
@@ -1052,17 +1132,13 @@ impl<'a> RecoveryCoordinator<'a> {
             .or_default()
             .insert(
                 page_id,
-                RowReplayState::new(
-                    page_guard.page_id(),
-                    page_guard.page().header.max_row_count as usize,
-                ),
+                RowReplayState::new(RowPageDescriptor {
+                    page_id,
+                    start_row_id,
+                    end_row_id,
+                }),
             );
 
-        debug_assert!({
-            let page = page_guard.page();
-            page.header.start_row_id == start_row_id
-                && page.header.start_row_id + page.header.max_row_count as u64 == end_row_id
-        });
         Ok(())
     }
 
@@ -1407,6 +1483,7 @@ mod tests {
         RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
         validate_create_table_reloaded_root_ts,
     };
+    use crate::catalog::TableIndexMetadata;
     use crate::catalog::storage::publish_first_redo_log_seq_for_test;
     use crate::catalog::storage::tests::begin_catalog_test_trx;
     use crate::catalog::{
@@ -1428,6 +1505,8 @@ mod tests {
     };
     use crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE;
     use crate::file::cow_file::tests::{corrupt_page_checksum, rewrite_page_with_checksum};
+    use crate::index::build::{HotBuildPolicy, HotBuildSource};
+    use crate::table::RowPageDescriptor;
 
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
@@ -1478,6 +1557,33 @@ mod tests {
     enum CatalogCheckpointOrder {
         BeforeTable,
         AfterTable,
+    }
+
+    /// Exercise finalized-registry capture with replay-owned sidecars in component tests.
+    pub(crate) async fn capture_hot_build_test_source(
+        engine: &Engine,
+        table: Arc<Table>,
+        spec: &TableIndexMetadata,
+        states: Vec<RowReplayState>,
+        policy: HotBuildPolicy,
+    ) -> RuntimeOrFatalResult<HotBuildSource> {
+        let mut recovery = row_recovery_for_table(engine, table.table_id());
+        recovery.dispatcher.page_history.insert(
+            table.table_id(),
+            states
+                .into_iter()
+                .map(|state| (state.page_id(), state))
+                .collect(),
+        );
+        recovery.resources.hot_build_policy = policy;
+        #[cfg(feature = "profiling")]
+        {
+            recovery.resources.hot_build_profiler =
+                engine.inner().core.trx_sys.hot_build_profiler.clone();
+        }
+        let source = recovery.capture_hot_index_build(table, spec).await?;
+        assert!(recovery.dispatcher.page_history.is_empty());
+        Ok(source)
     }
 
     // Keep the runtime carrier assertion separate from the public table error contract.
@@ -2749,6 +2855,79 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject malformed redo row ranges before they become trusted replay descriptors.
+    /// Expected: Empty, reversed, oversized, and displaced ranges return integrity errors without publishing a descriptor or counting a reconstructed page.
+    #[test]
+    fn test_replay_create_row_page_validates_captured_range() {
+        smol::block_on(async {
+            for (case, start, end, reason) in [
+                ("empty", 70, 70, "invalid row range"),
+                ("reversed", 71, 70, "invalid row range"),
+                (
+                    "oversized",
+                    70,
+                    70 + u64::from(u16::MAX) + 1,
+                    "invalid row range",
+                ),
+                ("gap", 71, 141, "range mismatch"),
+                ("overlap", 69, 139, "range mismatch"),
+            ] {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(lightweight_recovery_engine_config(
+                    temp_dir.path(),
+                    "replay-page-range",
+                ))
+                .await
+                .unwrap();
+                let table_id = create_index_ddl_base_table(&engine, vec![]).await;
+                let mut recovery = row_recovery_for_table(&engine, table_id);
+                let original_page = PageID::new(30);
+                recovery
+                    .replay_create_row_page_ddl(
+                        table_id,
+                        original_page,
+                        RowID::new(0),
+                        RowID::new(70),
+                        BTreeMap::new(),
+                        TrxID::new(10),
+                    )
+                    .await
+                    .unwrap();
+                let invalid_page = PageID::new(31);
+                let error = recovery
+                    .replay_create_row_page_ddl(
+                        table_id,
+                        invalid_page,
+                        RowID::new(start),
+                        RowID::new(end),
+                        BTreeMap::new(),
+                        TrxID::new(11),
+                    )
+                    .await
+                    .expect_err(case);
+                assert!(
+                    matches!(&error, RuntimeOrFatalError::Runtime(report) if report.current_context() == &RuntimeError::Recovery),
+                    "{case}: {error:?}"
+                );
+                let report = format!("{error:?}");
+                assert!(
+                    report.contains(&format!("table_id={table_id}")),
+                    "{case}: {report}"
+                );
+                assert!(
+                    report.contains(&format!("page_id={invalid_page}")),
+                    "{case}: {report}"
+                );
+                assert_replay_integrity(error, DataIntegrityError::InvalidPayload, reason);
+                let history = &recovery.dispatcher.page_history[&table_id];
+                assert_eq!(history.len(), 1, "{case}");
+                assert!(history.contains_key(&original_page), "{case}");
+                assert!(!history.contains_key(&invalid_page), "{case}");
+                assert_eq!(recovery.report.work.hot_pages_reconstructed, 1, "{case}");
+            }
+        });
+    }
+
     /// Purpose: Rebuild indexes from sparse replay histories with differing page allocation orders.
     /// Expected: Only live rows enter indexes, replay histories are consumed, and active version maps retain their identity.
     #[test]
@@ -3299,7 +3478,14 @@ mod tests {
                 .page_history
                 .entry(missing_table_id)
                 .or_default()
-                .insert(PageID::new(33), RowReplayState::new(PageID::new(33), 70));
+                .insert(
+                    PageID::new(33),
+                    RowReplayState::new(RowPageDescriptor {
+                        page_id: PageID::new(33),
+                        start_row_id: RowID::new(0),
+                        end_row_id: RowID::new(70),
+                    }),
+                );
             let err = recovery.rebuild_hot_indexes().await.unwrap_err();
             assert_replay_integrity(
                 err,

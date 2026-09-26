@@ -13,7 +13,8 @@ repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 workspace = true
 
 [features]
-default = ["iouring"]
+default = ["iouring", "profiling"]
+profiling = []
 libaio = []
 iouring = ["dep:io-uring"]
 

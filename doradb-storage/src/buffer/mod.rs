@@ -212,6 +212,10 @@ pub(crate) trait BufferPool: Send + Sync {
     /// Returns the number of allocated pages.
     fn allocated(&self) -> usize;
 
+    /// Test allocation membership under a caller-owned page-stability contract.
+    /// This does not pin a generation or permit racing page reuse.
+    fn is_allocated(&self, page_id: PageID) -> bool;
+
     /// Creates a new clone root for keeping this pool alive.
     ///
     /// This is a lifecycle-boundary operation, not a cheap accessor. Every
