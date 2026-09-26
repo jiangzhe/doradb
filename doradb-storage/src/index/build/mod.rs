@@ -592,11 +592,13 @@ mod tests {
                     &self.engine,
                     self.table.clone(),
                     plan.new_index_spec(),
-                    self.descriptors
-                        .iter()
-                        .copied()
-                        .map(RowReplayState::new)
-                        .collect(),
+                    Some(
+                        self.descriptors
+                            .iter()
+                            .copied()
+                            .map(RowReplayState::new)
+                            .collect(),
+                    ),
                     policy,
                 )
                 .await
@@ -1130,6 +1132,7 @@ mod tests {
             let fixture = Fixture::new(3, 25, false).await;
             let plan = fixture.plan(&[0], true);
             let policy = fixture.policy(2, 1);
+            let end = fixture.descriptors.last().unwrap().end_row_id;
             for invalid in ["out_of_range", "missing", "reused", "short", "long"] {
                 let mut source = fixture.source(&plan, policy, true).await;
                 match invalid {
@@ -1156,12 +1159,20 @@ mod tests {
                     "{invalid}: {message}"
                 );
             }
-            let mut source = fixture.source(&plan, policy, true).await;
-            source.pages[1].start_row_id = source.pages[0].start_row_id;
-            assert!(source.finish_capture().is_err());
-            let mut source = fixture.source(&plan, policy, true).await;
-            source.pages[1].page_id = source.pages[0].page_id;
-            assert!(source.finish_capture().is_err());
+            for invalid in ["overlap", "duplicate_page", "excess_end"] {
+                let mut source = fixture.source(&plan, policy, true).await;
+                let budget = source.budget.clone();
+                match invalid {
+                    "overlap" => source.pages[1].start_row_id = source.pages[0].start_row_id,
+                    "duplicate_page" => source.pages[1].page_id = source.pages[0].page_id,
+                    _ => source.pages[2].end_row_id = end + 1,
+                }
+                let error = source.finish_capture(end).unwrap_err();
+                assert_invalid_capture(&error, invalid);
+                assert!(budget.used() > 0);
+                drop(source);
+                assert_eq!(budget.used(), 0, "{invalid}");
+            }
             let mut source = fixture.source(&plan, policy, true).await;
             source.pages = BudgetedVec::new(&source.budget);
             source.pivot = fixture.descriptors[1].start_row_id;
@@ -1169,21 +1180,137 @@ mod tests {
             assert!(source.pages.is_empty());
             source.push_page(fixture.descriptors[1]).unwrap();
             assert_eq!(source.pages.len(), 1);
+            source.push_page(fixture.descriptors[2]).unwrap();
             let mut straddling = fixture.descriptors[0];
             straddling.end_row_id = source.pivot + 1;
             assert!(source.push_page(straddling).is_err());
-            source.finish_capture().unwrap();
+            source.finish_capture(end).unwrap();
             let mut sort =
                 HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
             let runs = sort.execute().await.unwrap();
             let start = fixture.descriptors[1].start_row_id;
-            let end = fixture.descriptors[1].end_row_id;
-            assert!(
-                contents(&runs)
-                    .iter()
-                    .all(|(_, row)| start <= *row && *row < end)
-            );
-            assert!(!contents(&runs).is_empty());
+            let expected: Vec<_> = fixture
+                .oracle(&plan)
+                .await
+                .into_iter()
+                .filter(|(_, row)| start <= *row && *row < end)
+                .collect();
+            assert!(!expected.is_empty());
+            assert_eq!(contents(&runs), expected);
+
+            let mut source = fixture.source(&plan, policy, true).await;
+            source.pages = BudgetedVec::new(&source.budget);
+            source.pivot = end;
+            for &page in &fixture.descriptors {
+                source.push_page(page).unwrap();
+            }
+            source.finish_capture(end).unwrap();
+            assert!(source.pages.is_empty());
+            let budget = source.budget.clone();
+            drop(source);
+            assert_eq!(budget.used(), 0);
+        });
+    }
+
+    fn assert_invalid_capture(error: &Report<RuntimeError>, case: &str) {
+        assert_eq!(
+            error.current_context(),
+            &RuntimeError::IndexAccess,
+            "{case}: {error:?}"
+        );
+        assert_eq!(
+            error.downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload),
+            "{case}: {error:?}"
+        );
+    }
+
+    /// Purpose: Reject incomplete finalized recovery registries independently of live-row occupancy.
+    /// Expected: Missing prefixes, interior pages, suffixes, and whole registries fail during capture; complete or genuinely empty coverage succeeds.
+    #[test]
+    fn recovery_capture_requires_complete_registry() {
+        smol::block_on(async {
+            for rows in [0, 25] {
+                let fixture = Fixture::new(3, rows, false).await;
+                let plan = fixture.plan(&[0], true);
+                let policy = fixture.policy(2, 1);
+                for (case, indices) in [
+                    ("complete", Some(&[2, 0, 1][..])),
+                    ("missing_first", Some(&[1, 2][..])),
+                    ("missing_middle", Some(&[0, 2][..])),
+                    ("missing_last", Some(&[0, 1][..])),
+                    ("empty", Some(&[][..])),
+                    ("absent", None),
+                ] {
+                    let states = indices.map(|indices| {
+                        indices
+                            .iter()
+                            .map(|&index| RowReplayState::new(fixture.descriptors[index]))
+                            .collect()
+                    });
+                    let result = capture_hot_build_test_source(
+                        &fixture.engine,
+                        fixture.table.clone(),
+                        plan.new_index_spec(),
+                        states,
+                        policy,
+                    )
+                    .await;
+                    if case == "complete" {
+                        let source = result.unwrap();
+                        assert_eq!(&*source.pages, &fixture.descriptors);
+                        let budget = source.budget.clone();
+                        drop(source);
+                        assert_eq!(budget.used(), 0);
+                    } else {
+                        let Err(RuntimeOrFatalError::Runtime(error)) = result else {
+                            panic!("expected invalid coverage: case={case}, rows={rows}");
+                        };
+                        assert_invalid_capture(&error, case);
+                        let report = format!("{error:?}");
+                        assert!(
+                            report.contains("phase=validate_recovery_pages"),
+                            "{case}: {report}"
+                        );
+                        assert!(
+                            report.contains(&format!("table_id={}", fixture.table.table_id())),
+                            "{case}: {report}"
+                        );
+                        assert!(
+                            report.contains("expected_start=") || report.contains("expected_end="),
+                            "{case}: {report}"
+                        );
+                    }
+                }
+            }
+
+            let fixture = Fixture::new(0, 0, false).await;
+            let plan = fixture.plan(&[0], true);
+            let policy = fixture.policy(2, 1);
+            let (end, descriptors) = fixture
+                .table
+                .row_store
+                .snapshot_original_row_pages_from(
+                    fixture.engine.inner().core.pools.pool_guards(),
+                    RowID::new(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(end, RowID::new(0));
+            assert!(descriptors.is_empty());
+            for states in [None, Some(Vec::new())] {
+                let source = capture_hot_build_test_source(
+                    &fixture.engine,
+                    fixture.table.clone(),
+                    plan.new_index_spec(),
+                    states,
+                    policy,
+                )
+                .await
+                .unwrap();
+                assert!(source.pages.is_empty());
+                assert_eq!(source.budget.used(), 0);
+            }
         });
     }
 
@@ -1533,7 +1660,7 @@ mod tests {
                         &fixture.engine,
                         fixture.table.clone(),
                         plan.new_index_spec(),
-                        take(&mut fixture.states),
+                        Some(take(&mut fixture.states)),
                         policy,
                     )
                     .await

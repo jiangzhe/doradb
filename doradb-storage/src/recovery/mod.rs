@@ -653,6 +653,19 @@ impl<'a> RecoveryCoordinator<'a> {
         let started = Instant::now();
         let layout = table.layout_snapshot();
         let pivot = table.row_store.blk_idx().pivot_row_id();
+        // Read the reserved-row boundary independently of the replay registry;
+        // even an empty registry must account for every allocated hot page.
+        let end_row_id = table
+            .row_store
+            .visit_original_row_pages_from(&self.resources.pool_guards, pivot, |_| Ok(()))
+            .await
+            .attach_with(|| {
+                format!(
+                    "operation=hot_index_build, phase=capture_recovery_boundary, table_id={}, index={}",
+                    table.table_id(),
+                    spec.index
+                )
+            })?;
         let mut source = HotBuildSource::new(
             HotBuildCapture {
                 table: table.clone(),
@@ -673,7 +686,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 source.push_page(replay.into_descriptor()).attach_with(|| format!("operation=hot_index_build, phase=capture_recovery_pages, table_id={}, index={}", table.table_id(), spec.index))?;
             }
         }
-        source.finish_capture().attach_with(|| {
+        source.finish_capture(end_row_id).attach_with(|| {
             format!(
                 "operation=hot_index_build, phase=validate_recovery_pages, table_id={}, index={}",
                 table.table_id(),
@@ -1559,22 +1572,24 @@ mod tests {
         AfterTable,
     }
 
-    /// Exercise finalized-registry capture with replay-owned sidecars in component tests.
+    /// Exercise finalized-registry capture, including absent history, in component tests.
     pub(crate) async fn capture_hot_build_test_source(
         engine: &Engine,
         table: Arc<Table>,
         spec: &TableIndexMetadata,
-        states: Vec<RowReplayState>,
+        states: Option<Vec<RowReplayState>>,
         policy: HotBuildPolicy,
     ) -> RuntimeOrFatalResult<HotBuildSource> {
         let mut recovery = row_recovery_for_table(engine, table.table_id());
-        recovery.dispatcher.page_history.insert(
-            table.table_id(),
-            states
-                .into_iter()
-                .map(|state| (state.page_id(), state))
-                .collect(),
-        );
+        if let Some(states) = states {
+            recovery.dispatcher.page_history.insert(
+                table.table_id(),
+                states
+                    .into_iter()
+                    .map(|state| (state.page_id(), state))
+                    .collect(),
+            );
+        }
         recovery.resources.hot_build_policy = policy;
         #[cfg(feature = "profiling")]
         {

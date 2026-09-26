@@ -670,7 +670,8 @@ impl<D: BufferPool> RowStore<D> {
                                 format!("operation={operation}, table_id={}", self.table_id())
                             });
                     }
-                    upper_bound = page.header.end_row_id;
+                    // Empty roots use a sentinel header end, but reserve no rows.
+                    upper_bound = start_row_id;
                     continue;
                 }
                 match leaf_entries.binary_search_by_key(&start_row_id, |entry| entry.row_id) {

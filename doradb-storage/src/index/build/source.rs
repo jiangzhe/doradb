@@ -59,7 +59,7 @@ pub(crate) struct HotBuildSource {
     pub(crate) layout: Arc<TableRuntimeLayout>,
     /// Owner-scoped pool roots retained through guarded page access.
     pub(crate) guards: PoolGuards,
-    /// Ordered disjoint page descriptors with charged capacity.
+    /// Ordered contiguous page descriptors with charged capacity.
     pub(crate) pages: BudgetedVec<RowPageDescriptor>,
     /// Selected encoding, projection, timestamp, and duplicate policy.
     pub(crate) key: HotBuildKeySpec,
@@ -153,22 +153,22 @@ impl HotBuildSource {
             .change_context(RuntimeError::IndexAccess)
     }
 
-    /// Validate finalized registry coverage without reopening or copying row pages.
-    pub(crate) fn finish_capture(&mut self) -> RuntimeResult<()> {
+    /// Validate exact coverage from the pivot to the independently captured index end.
+    /// No row pages are reopened or copied, and an empty registry requires an empty interval.
+    pub(crate) fn finish_capture(&mut self, end_row_id: RowID) -> RuntimeResult<()> {
         self.pages.sort_unstable_by_key(|page| page.start_row_id);
         // Temporary validation metadata is outside the bulk scratch budget.
         // Its size is bounded by the admitted descriptor count, and it is
         // released before any extraction jobs start.
         let mut page_ids =
             FastHashSet::with_capacity_and_hasher(self.pages.len(), FastRandomState::default());
-        let mut previous: Option<&RowPageDescriptor> = None;
+        let mut next_row_id = self.pivot;
         for page in self.pages.iter() {
-            if let Some(left) = previous
-                && left.end_row_id > page.start_row_id
-            {
+            if page.start_row_id != next_row_id {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!(
-                        "hot-build overlapping descriptors: left={left:?}, right={page:?}"
+                        "hot-build non-contiguous descriptors: expected_start={next_row_id}, page={page:?}, pivot={}, end_row_id={end_row_id}",
+                        self.pivot
                     ))
                     .change_context(RuntimeError::IndexAccess));
             }
@@ -180,7 +180,15 @@ impl HotBuildSource {
                     ))
                     .change_context(RuntimeError::IndexAccess));
             }
-            previous = Some(page);
+            next_row_id = page.end_row_id;
+        }
+        if next_row_id != end_row_id {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "hot-build incomplete or excess coverage: expected_end={end_row_id}, actual_end={next_row_id}, pivot={}",
+                    self.pivot
+                ))
+                .change_context(RuntimeError::IndexAccess));
         }
         Ok(())
     }
@@ -189,11 +197,11 @@ impl HotBuildSource {
     pub(crate) async fn capture_pages(&mut self) -> RuntimeOrFatalResult<()> {
         let table = self.table.clone();
         let guards = self.guards.clone();
-        table
+        let end_row_id = table
             .row_store
             .visit_original_row_pages_from(&guards, self.pivot, |page| self.push_page(page))
             .await?;
-        self.finish_capture()?;
+        self.finish_capture(end_row_id)?;
         Ok(())
     }
 }
