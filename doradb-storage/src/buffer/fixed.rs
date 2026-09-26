@@ -159,6 +159,12 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
+    fn is_allocated(&self, page_id: PageID) -> bool {
+        let index = usize::from(page_id);
+        index < self.capacity() && self.alloc_map.is_allocated(index)
+    }
+
+    #[inline]
     fn create_base_guard(&self) -> PoolGuard {
         self.arena.create_base_guard()
     }

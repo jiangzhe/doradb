@@ -686,9 +686,14 @@ impl Inner {
         let prefix = heap_prefix(value);
         // SAFETY: this allocates `value.len()` bytes, copies exactly that many
         // initialized bytes into the allocation, then transfers ownership into
-        // the heap variant.
+        // the heap variant. Null is rejected before copying.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(value.len(), 1));
+            assert!(
+                !ptr.is_null(),
+                "MemCmpKey allocation failed: bytes={}",
+                value.len()
+            );
             copy_nonoverlapping(value.as_ptr(), ptr, value.len());
             let data = Vec::from_raw_parts(ptr, value.len(), value.len()).into_boxed_slice();
             Inner::heap_inner(value.len(), prefix, data)
@@ -711,8 +716,13 @@ impl Inner {
         prefix[1..].copy_from_slice(&value[..MEM_CMP_KEY_HEAP_PREFIX - 1]);
         // SAFETY: this allocates `len` bytes, writes the nullable flag plus the
         // copied payload bytes, and transfers ownership into the heap variant.
+        // Null is rejected before either write.
         unsafe {
             let ptr = alloc(Layout::from_size_align_unchecked(len, 1));
+            assert!(
+                !ptr.is_null(),
+                "MemCmpKey nullable allocation failed: bytes={len}"
+            );
             // update first byte.
             *ptr = b;
             // copy data.

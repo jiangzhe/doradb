@@ -1,10 +1,12 @@
 use crate::buffer::PoolGuards;
 use crate::catalog::Catalog;
 use crate::component::EnginePools;
+use crate::conf::HotIndexBuildConfig;
 use crate::conf::path::validate_log_file_stem;
 use crate::conf::{RecoveryConfig, TrxSysConfig};
 use crate::error::RuntimeResult;
 use crate::file::fs::FileSystem;
+use crate::index::build::HotBuildPolicy;
 use crate::io::STORAGE_SECTOR_SIZE;
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{RedoLogFinalizer, discover_redo_log_files};
@@ -13,6 +15,10 @@ use crate::recovery::stream::RedoReplayPlanner;
 use crate::runtime::thread_pool::ThreadPool;
 
 use super::RecoveryCoordinator;
+#[cfg(feature = "profiling")]
+use crate::profiling::HotIndexBuildProfiler;
+#[cfg(feature = "profiling")]
+use std::sync::Arc;
 
 /// Catalog, table files, pools, and guards consumed by startup recovery.
 pub(crate) struct RecoveryResources<'a> {
@@ -26,6 +32,11 @@ pub(crate) struct RecoveryResources<'a> {
     pub(crate) thread_pool: QuiescentGuard<ThreadPool>,
     /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     pub(crate) catalog: &'a Catalog,
+    /// Validated extraction limits retained for bootstrap builds.
+    pub(crate) hot_build_policy: HotBuildPolicy,
+    /// Recorder shared by bootstrap extraction and later runtime builds.
+    #[cfg(feature = "profiling")]
+    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
 }
 
 impl<'a> RecoveryResources<'a> {
@@ -38,13 +49,25 @@ impl<'a> RecoveryResources<'a> {
         catalog: &'a Catalog,
     ) -> Self {
         let pool_guards = pools.pool_guards().clone();
+        let hot_build_policy =
+            HotBuildPolicy::new(HotIndexBuildConfig::default(), thread_pool.worker_threads())
+                .unwrap_or_else(|_| unreachable!("running pool has validated positive sizing"));
         Self {
             pools,
             pool_guards,
             table_fs,
             thread_pool,
             catalog,
+            hot_build_policy,
+            #[cfg(feature = "profiling")]
+            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
         }
+    }
+
+    /// Carry the engine-normalized policy into bootstrap before recovery runs.
+    pub(crate) fn with_hot_build_policy(mut self, policy: HotBuildPolicy) -> Self {
+        self.hot_build_policy = policy;
+        self
     }
 
     /// Prepare startup recovery from validated transaction configuration.

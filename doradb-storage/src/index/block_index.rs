@@ -378,6 +378,11 @@ mod tests {
         }
 
         #[inline]
+        fn is_allocated(&self, page_id: PageID) -> bool {
+            self.inner.is_allocated(page_id)
+        }
+
+        #[inline]
         fn create_base_guard(&self) -> PoolGuard {
             self.inner.create_base_guard()
         }

@@ -27,6 +27,8 @@ use crate::lock::{
 };
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
+#[cfg(feature = "profiling")]
+use crate::profiling::HotIndexBuildStats;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::stats::{
@@ -1498,6 +1500,22 @@ impl Session {
             .attach("operation=query_mandatory_runtime_stats")
             .disclose()?;
         Ok(session.runtime.mandatory_runtime.stats())
+    }
+
+    /// Return engine-lifetime hot-index-build profiling for completed extractions.
+    ///
+    /// Includes bootstrap samples retained by this engine. Counters and duration
+    /// sums support deltas; maxima are lifetime peaks. Failed extractions are not
+    /// sampled. Like other inspection APIs, this remains readable after poison
+    /// until shutdown, session close, or registry removal.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub fn hot_index_build_stats(&self) -> Result<HotIndexBuildStats> {
+        let session = self
+            .pin_inspection()
+            .attach("operation=query_hot_index_build_stats")
+            .disclose()?;
+        Ok(session.runtime.trx_sys.hot_build_profiler.snapshot())
     }
 
     /// Return cumulative logical-lock work and current physical-state statistics.
@@ -4925,6 +4943,11 @@ pub(crate) mod tests {
             assert!(session.buffer_pool_stats().is_ok());
             assert!(session.mandatory_runtime_stats().is_ok());
             assert!(session.logical_lock_stats().is_ok());
+            #[cfg(feature = "profiling")]
+            assert_eq!(
+                session.hot_index_build_stats().unwrap(),
+                HotIndexBuildStats::default()
+            );
             assert!(
                 session
                     .wait_for_checkpoint_retry(CheckpointDelayReason::ActiveRoot {
@@ -7315,6 +7338,8 @@ pub(crate) mod tests {
                 session.buffer_pool_stats().unwrap_err(),
                 session.mandatory_runtime_stats().unwrap_err(),
                 session.logical_lock_stats().unwrap_err(),
+                #[cfg(feature = "profiling")]
+                session.hot_index_build_stats().unwrap_err(),
             ] {
                 assert_eq!(err.kind(), ErrorKind::Lifecycle);
                 assert_eq!(
@@ -7348,6 +7373,8 @@ pub(crate) mod tests {
                 session.mandatory_runtime_stats().unwrap_err(),
             );
             assert_runtime_unavailable_after_shutdown(session.logical_lock_stats().unwrap_err());
+            #[cfg(feature = "profiling")]
+            assert_runtime_unavailable_after_shutdown(session.hot_index_build_stats().unwrap_err());
         });
     }
 
@@ -7380,6 +7407,11 @@ pub(crate) mod tests {
             assert!(session.buffer_pool_stats().is_ok());
             assert!(session.mandatory_runtime_stats().is_ok());
             assert!(session.logical_lock_stats().is_ok());
+            #[cfg(feature = "profiling")]
+            assert_eq!(
+                session.hot_index_build_stats().unwrap(),
+                HotIndexBuildStats::default()
+            );
 
             let err = session.truncate_redo_log().await.unwrap_err();
             assert_fatal_admission_error(err, FatalError::RedoWrite);

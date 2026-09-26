@@ -1156,12 +1156,13 @@ impl MemVar {
         }
     }
 
-    /// Create a new outlined PageVar.
+    /// Create a new outlined MemVar.
     #[inline]
     pub fn outline(data: &[u8]) -> Self {
         debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff); // must be in range of u16
         // SAFETY: this initializes the outlined variant fields plus a freshly
         // allocated payload buffer before assuming the union is initialized.
+        // The allocation is checked before writing through its pointer.
         unsafe {
             let mut var = MaybeUninit::<MemVar>::uninit();
             let o = &mut var.assume_init_mut().o;
@@ -1169,6 +1170,11 @@ impl MemVar {
             o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
             let layout = AllocLayout::from_size_align_unchecked(data.len(), 1);
             o.ptr = alloc(layout);
+            assert!(
+                !o.ptr.is_null(),
+                "MemVar allocation failed: bytes={}",
+                data.len()
+            );
             o.ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
             var.assume_init()
         }
