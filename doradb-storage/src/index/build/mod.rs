@@ -713,6 +713,19 @@ mod tests {
         entries
     }
 
+    fn assert_invalid_capture(error: &Report<RuntimeError>, case: &str) {
+        assert_eq!(
+            error.current_context(),
+            &RuntimeError::IndexAccess,
+            "{case}: {error:?}"
+        );
+        assert_eq!(
+            error.downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload),
+            "{case}: {error:?}"
+        );
+    }
+
     /// Purpose: Publish exactly one engine snapshot per successful extraction through either source adapter.
     /// Expected: Public counters retain prior samples, match live rows, and remain unchanged after a failed build.
     #[cfg(feature = "profiling")]
@@ -1210,19 +1223,6 @@ mod tests {
             drop(source);
             assert_eq!(budget.used(), 0);
         });
-    }
-
-    fn assert_invalid_capture(error: &Report<RuntimeError>, case: &str) {
-        assert_eq!(
-            error.current_context(),
-            &RuntimeError::IndexAccess,
-            "{case}: {error:?}"
-        );
-        assert_eq!(
-            error.downcast_ref::<DataIntegrityError>(),
-            Some(&DataIntegrityError::InvalidPayload),
-            "{case}: {error:?}"
-        );
     }
 
     /// Purpose: Reject incomplete finalized recovery registries independently of live-row occupancy.
