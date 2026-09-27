@@ -8,6 +8,8 @@ Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX 
 
 ## Reference
 
+- [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md): the five-phase hot-build program.
+- [Task 000315](../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
 - [Task 000306](../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
 - [Task 000156](../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
 - [Backlog 000104](000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
@@ -19,12 +21,18 @@ Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX 
 
 docs/tasks/000156-full-table-scan-mvcc.md; docs/tasks/000306-recovery-benchmark-and-startup-metrics.md and its profiling follow-up
 
+docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md;
+docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 1
+
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000306 measures and explains recovery cost. Changing construction order, parallel execution, temporary memory, and tree assembly across DDL and recovery is a separate design effort. The original scan-unification work was also outside task 000156's foreground MVCC scan scope.
 - Findings: Five unprofiled release runs per scenario recovered the same 1,000,000 sequential u64 keys with 128-byte values, prepared with four threads, sixteen sessions, batch size 100, and fsync. Median bootstrap was 324.036 ms without an index and 666.728 ms with one unique index. Median redo replay was 319.271 versus 321.866 ms; hot-index rebuild was 0.429 versus 335.727 ms. Thus one unique index added 342.692 ms, or 105.8%, for this clean-reopen fixture with uncontrolled caches. Post-reopen verification was outside the timer. A separate 1 kHz Samply capture attributed 140 of 338 indexed rebuild samples to memmove, all at the same caller. Address-specific DWARF lookup and disassembly identified `BTreeNode::insert_slot_at`'s `slots.copy_within(idx..old_count, idx + 1)`: repeated shifting of 8-byte slots. Recovery traverses recovered-page hash maps and inserts rows serially, so original sequential input does not preserve index-key order during rebuilding.
 - Findings: CREATE INDEX also collects current hot encoded rows into a Vec and builds MemIndex through sequential insertions. The current unique path already sorts hot keys and merges against sorted cold keys for duplicate validation; non-unique hot input retains scan order. Do not assume that the recovery profile demonstrates the same slot-shift cost in CREATE INDEX: benchmark each caller separately. Current cold construction also sorts encoded rows and retains them for cold/hot validation; coordinate its memory bounds with backlog 000104.
 - Direction Hint: Evaluate a shared staged-build pipeline with bounded page/block batches, encoded-key range partitioning, sorted runs and merging, duplicate checks across partition boundaries, bounded worker scheduling, and packed B+tree leaf/subtree construction plus upper-level assembly. Reuse existing node-packing helpers where suitable. Compare sequential sorted insertion with bulk construction and parallel construction; adding threads to arbitrary insertions into one shared tree may preserve copying costs and add contention. Share mechanisms with 000104, while keeping MemIndex allocation/publication and durable DiskTree writes/root installation explicit. PageID sorting alone is not a general substitute for sorting by each index's encoded key.
+- Phase-1 Defer Reason: Task 000315 deliberately delivers an internal extraction component; the complete production pipeline and its comparative performance acceptance belong to RFC 0032 phases 2-5. Its original task scope defers performance evaluation to caller integration, so this program-level source backlog remains open.
+- Phase-1 Findings: Both source adapters now produce immutable sorted runs with exact live-row coverage, admitted bulk scratch, bounded outstanding jobs, settled failures, and optional stage profiling. Recovery capture rejects incomplete registries using an independently captured row boundary. Component and workspace validation pass, but no standalone timing comparison or caller speedup is recorded. Existing CREATE/recovery benchmark reports omit hot-build metrics because production still uses the old builders.
+- Phase-1 Direction Hint: Retain finalized recovery descriptors across sequential index builds, preserve CREATE transaction exclusion through settlement, and consume the shared run/budget interfaces in the remaining phases. Use doradb-bench for serial, sorted-insertion, single-worker, and multi-worker comparisons with content verification outside timing. Report effective run counts, stage durations, bulk scratch versus process memory, wide-key skew, and longest synchronous sorts; do not infer performance from the correctness suite. RFC 0032's caller-selected duplicate policy governs the remaining implementation, including trusted recovery input and required CREATE UNIQUE validation.
 
 ## Scope Hint
 

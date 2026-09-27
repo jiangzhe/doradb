@@ -492,9 +492,12 @@ runtime-layout/history publication. No new persistent format or redo
 record is introduced. [D3] [D4] [C1] [C2] [C8] [U10]
 
 Each phase includes its own correctness, ordinary/fatal failure, memory, and
-performance evidence. Benchmarks belong in `doradb-bench`. Profiling is enabled
-by default and can be disabled without measurement overhead. CREATE/recovery
-reports may remain empty until caller integration. Caller phases measure
+performance evidence. The resolved Phase 1 task records one explicit exception:
+measurement semantics were verified, while comparative extraction/sort timings
+are deferred to caller integration under backlog 000110. No Phase 1 speedup
+claim is made. Benchmarks belong in `doradb-bench`. Profiling is enabled by
+default and can be disabled without measurement overhead. CREATE/recovery
+reports remain empty until caller integration. Caller phases measure
 end-to-end behavior with content verification outside timing. Compare
 current insertion, sorted sequential insertion, single-worker bulk, and the
 same bulk pipeline at increasing worker counts on identical data. Record
@@ -556,8 +559,10 @@ No broad unsafe refactor is a prerequisite. [D8] [C4] [C5]
 Phases 1-3 deliver callable internal components verified without migrating
 production callers prematurely. Phases 4-5 integrate those components into
 their distinct lifecycle owners. Every phase resolves only with its own
-failure coverage and measured results; the whole program completes after both
-callers deliver the full pipeline. [U3] [U4]
+failure coverage and records its measurement outcomes or explicit deferrals;
+Phase 1's benchmark deferral is recorded below. The whole program completes
+after both callers deliver the full pipeline and performance acceptance.
+[U3] [U4]
 
 - **Phase 1: Parallel Hot-Row Extraction and Sorted Runs**
   - Scope: Implement the stable current-state source adapters and page-group
@@ -572,23 +577,38 @@ callers deliver the full pipeline. [U3] [U4]
     fail-fast duplicate errors, or replacement of either caller's production
     build path.
   - Prerequisites: Existing caller exclusion/bootstrap proofs and ThreadPool.
-  - Phase-local Choices: Source/owner interfaces, reusable projection buffers,
-    scratch admission, and settlement mechanics within the configuration and
-    grouping contract in Decision §§2 and 5.
-  - Validation: Compare extracted keys with current serial scans for both
-    caller adapters, including pivots, retained prefixes, holes, deletes, move
-    updates, NULL/composite keys, and empty input. Verify both duplicate modes,
-    the first local duplicate pair, unchanged entry coverage after discovery,
-    and completion-order-independent run identity. Check page-target boundaries,
-    one group, the run cap, and all-empty results. Inject extraction, budget,
-    admission, and worker failures; verify drain, retained ownership on Fatal,
-    and scratch release. Measure extraction/encoding/local sort, optional local
-    checking, and capacity high-water at one and multiple workers against the
-    serial path, varying and reporting effective run counts. [U9] [U10] [U11]
+  - Phase-local Choices: `HotBuildSource` retains stable descriptors and caller
+    authority; recovery coverage is checked against an independent block-index
+    end before extraction. `HotLocalSort` owns accepted completions across
+    borrowed-future cancellation and collects in plan order. `SortedHotRuns`
+    retains shared runs and their bulk-memory reservations, checked entry
+    access, provenance ordering, and a direct single-run view. Configuration
+    and accounting follow Decision §§2 and 5.
+  - Validation: Both adapters matched the serial live-key/RowID oracle across
+    pivots, retained prefixes, holes, deletes, moved/updated rows, nullable and
+    composite keys, wide keys, and empty input. Tests covered duplicate modes,
+    local versus cross-run conflicts, page-target/run-cap boundaries, empty
+    groups, completion order, scratch growth/failure, cancellation, abandoned
+    owners, poison, and later-Fatal precedence. Recovery regressions reject
+    incomplete registries even for empty allocated pages and malformed redo
+    ranges before descriptor publication. Default workspace, alternate libaio,
+    and profiling-disabled workspace suites passed; task 000315 records counts
+    and the style/test-contract review. Profiling tests verify stage, count,
+    and peak semantics. Comparative timings are explicitly deferred to Phases
+    4-5 under backlog 000110, following the task's original integration scope;
+    Phase 1 records no benchmark speedup. [U9] [U10] [U11]
+  - After This Phase: Phase 2 can consume immutable runs, local duplicate
+    evidence, and shared scratch admission. Production CREATE/recovery still
+    use their existing builders and emit no hot-build samples. Recovery's
+    adapter consumes its table registry once, so Phase 4 must retain finalized
+    descriptors across sequential index builds. CREATE's enclosing DDL owner
+    must retain transaction data exclusion as well as the captured metadata
+    gate through settlement. Source backlog 000110 remains open for the full
+    program's construction, integration, and benchmark acceptance.
   - Task Doc: `docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md`
   - Task Issue: `#1111`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase Status: done
+  - Implementation Summary: Implemented bounded parallel hot-row extraction into immutable sorted runs with exact source coverage, retained scratch ownership, settled failures, and optional profiling. [Task Resolve Sync: docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md @ 2026-09-27]
   - Related Backlogs:
     - `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`
 
@@ -603,8 +623,11 @@ callers deliver the full pipeline. [U3] [U4]
     duplicate identity is independent of completion order for a fixed run plan.
   - Non-goals: Row extraction changes, page construction, cold/hot checks,
     speculative endpoint recomputation, or overlap of boundary and merge jobs.
-  - Prerequisites: Phase 1 run ownership, common encoded-key/provenance order,
-    duplicate policy and local summaries, budget, and job scope.
+  - Prerequisites: Phase 1 `SortedHotRuns` ownership, common encoded-key and
+    provenance order, duplicate policy/local summaries, and shared
+    `MemoryBudget`. Boundary and merge coordinators retain their own accepted
+    completions using the same cancellation and settlement contract; the
+    extraction coordinator is not a generic merge-job scope.
   - Phase-local Choices: Partition granularity and checked reference/boundary
     representation within the empty-input and single-run contracts.
   - Validation: Compare every rank on small cases and seeded varied cases
@@ -680,7 +703,11 @@ callers deliver the full pipeline. [U3] [U4]
   - Prerequisites: Phases 1-3, replay drain, final metadata reconciliation, and
     the recovered-data/exact-coverage invariants that justify trusted mode.
   - Phase-local Choices: Stable index iteration, descriptor reuse, cleanup
-    handoff on cancelled bootstrap, and recovery-report extensions.
+    handoff on cancelled bootstrap, and recovery-report extensions. Phase 1
+    consumes the replay registry once per table; retain those finalized
+    descriptors for subsequent indexes instead of recapturing an empty
+    registry. Include the deferred extraction/local-sort timing comparisons
+    when measuring the integrated pipeline.
   - Validation: Compare recovered contents with serial behavior across
     unique/non-unique, multiple-index, updated/deleted, sparse, and mixed
     cold/hot fixtures. Verify trusted-mode selection without a duplicate
