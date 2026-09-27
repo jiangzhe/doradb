@@ -1,29 +1,35 @@
 use crate::bitmap::{Bitmap, new_bitmap};
 use crate::id::PageID;
+use crate::table::RowPageDescriptor;
 
 /// Inserted-slot history exclusively moved between page history, an active page,
 /// and its outstanding replay job/result. Retirement retains the bitmap.
 /// The coordinator removes this state before page reuse, so the page ID remains
 /// bound to its allocation throughout replay and index reconstruction.
 pub(crate) struct RowReplayState {
-    page_id: PageID,
+    descriptor: RowPageDescriptor,
     inserted: Box<[u64]>,
 }
 
 impl RowReplayState {
     /// Captures an allocated page's identity and reserved row capacity.
     #[inline]
-    pub(crate) fn new(page_id: PageID, max_row_count: usize) -> Self {
+    pub(crate) fn new(descriptor: RowPageDescriptor) -> Self {
         Self {
-            page_id,
-            inserted: new_bitmap(max_row_count),
+            descriptor,
+            inserted: new_bitmap((descriptor.end_row_id - descriptor.start_row_id) as usize),
         }
     }
 
     /// Returns the row page ID.
     #[inline]
     pub(crate) fn page_id(&self) -> PageID {
-        self.page_id
+        self.descriptor.page_id
+    }
+
+    /// Consume replay-only insertion history before ordinary reads resume.
+    pub(crate) fn into_descriptor(self) -> RowPageDescriptor {
+        self.descriptor
     }
 
     /// Returns whether this slot has ever been inserted during replay.
@@ -43,16 +49,21 @@ impl RowReplayState {
 
 #[cfg(test)]
 mod tests {
-    use super::RowReplayState;
+    use super::*;
     use crate::bitmap::bitmap_required_units;
     use crate::id::PageID;
+    use crate::id::RowID;
 
     /// Purpose: Track inserted row slots across bitmap word boundaries.
     /// Expected: Only recorded slots are marked, repeated inserts are distinguished, and page identity is retained.
     #[test]
     fn test_replay_bitmap_tracks_sparse_slots() {
         let id = PageID::new(7);
-        let mut state = RowReplayState::new(id, 70);
+        let mut state = RowReplayState::new(RowPageDescriptor {
+            page_id: id,
+            start_row_id: RowID::new(10),
+            end_row_id: RowID::new(80),
+        });
         assert_eq!(state.page_id(), id);
         assert_eq!(state.inserted.len(), bitmap_required_units(70));
         for idx in [69, 64, 63, 0] {

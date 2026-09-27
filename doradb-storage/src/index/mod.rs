@@ -2,6 +2,7 @@ mod block_index;
 mod block_index_root;
 mod borrowed_stream;
 mod btree;
+pub(crate) mod build;
 mod column_block_index;
 mod column_deletion_blob;
 pub(crate) mod disk_tree;
@@ -15,11 +16,12 @@ mod unique_index;
 pub(crate) mod util;
 
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards};
-use crate::catalog::IndexRef;
+use crate::catalog::{IndexRef, TableIndexMetadata, TableMetadata};
 use crate::error::RuntimeResult;
 use crate::id::BlockID;
 use crate::table::TableRootSnapshot;
 use crate::trx::TrxReadProof;
+use crate::value::{ValKind, ValType};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -58,6 +60,37 @@ pub(crate) use secondary_index::{
     UniqueSecondaryIndex,
 };
 pub(crate) use unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
+
+/// Builds a secondary-index key encoder without a temporary type allocation.
+/// Non-unique physical keys append a non-nullable `RowID` to the logical key.
+pub(crate) fn secondary_index_encoder(
+    metadata: &TableMetadata,
+    index_spec: &TableIndexMetadata,
+    append_row_id: bool,
+) -> BTreeKeyEncoder {
+    assert!(
+        !index_spec.keys.is_empty(),
+        "secondary-index encoder invariant violated: index has no key columns"
+    );
+    let count = index_spec.keys.len() + usize::from(append_row_id);
+    BTreeKeyEncoder::new((0..count).map(|idx| {
+        let Some(key) = index_spec.keys.get(idx) else {
+            return ValType::new(ValKind::U64, false);
+        };
+        let col_no = key.column_ordinal.as_usize();
+        metadata
+            .col
+            .col_types()
+            .get(col_no)
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "secondary-index encoder invariant violated: column_no={col_no}, column_count={}",
+                    metadata.col.col_count()
+                )
+            })
+    }))
+}
 
 /// Proof-bound secondary-index root with no standalone address accessor.
 struct ProvenIndexRoot<'op> {

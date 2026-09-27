@@ -271,6 +271,7 @@ mod tests {
     use crate::row::tests::BufferValues;
     use crate::row::{RowPage, RowRead, RowValues, UpdateValues};
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
+    use crate::table::RowPageDescriptor;
     use crate::table::{DmlValidationError, tests::*};
     use crate::trx::MAX_SNAPSHOT_TS;
     use crate::value::{Val, ValRef};
@@ -279,7 +280,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn replay_state(page: &PageExclusiveGuard<RowPage>) -> RowReplayState {
-        RowReplayState::new(page.page_id(), page.page().header.max_row_count as usize)
+        RowReplayState::new(RowPageDescriptor {
+            page_id: page.page_id(),
+            start_row_id: page.page().header.start_row_id,
+            end_row_id: page.page().header.start_row_id + page.page().header.max_row_count as u64,
+        })
     }
 
     fn assert_invalid_replay(err: Report<DataIntegrityError>, reason: &str) {

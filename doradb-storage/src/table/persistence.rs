@@ -20,10 +20,10 @@ use crate::error::{
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
-use crate::index::BTreeKeyEncoder;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
+use crate::index::{BTreeKeyEncoder, secondary_index_encoder};
 use crate::index::{
     ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
     ColumnLeafEntry,
@@ -46,7 +46,7 @@ use crate::table::{
     TableRuntimeLayout,
 };
 use crate::trx::RetiredRowPageBatch;
-use crate::value::{Val, ValKind, ValType};
+use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
@@ -1106,13 +1106,13 @@ impl SecondaryIndexSidecar {
     fn new(metadata: &TableMetadata, index_spec: &TableIndexMetadata) -> Self {
         if index_spec.unique() {
             Self::Unique {
-                encoder: secondary_disk_tree_encoder(metadata, index_spec, false),
+                encoder: secondary_index_encoder(metadata, index_spec, false),
                 puts: Vec::new(),
                 deletes: Vec::new(),
             }
         } else {
             Self::NonUnique {
-                encoder: secondary_disk_tree_encoder(metadata, index_spec, true),
+                encoder: secondary_index_encoder(metadata, index_spec, true),
                 inserts: Vec::new(),
                 deletes: Vec::new(),
             }
@@ -1347,38 +1347,6 @@ pub(crate) fn prepare_checkpoint_table_operation(
             table_id,
         ),
     )
-}
-
-/// Builds the durable secondary DiskTree key encoder for one index spec.
-pub(crate) fn secondary_disk_tree_encoder(
-    metadata: &TableMetadata,
-    index_spec: &TableIndexMetadata,
-    append_row_id: bool,
-) -> BTreeKeyEncoder {
-    assert!(
-        !index_spec.keys.is_empty(),
-        "secondary-index encoder invariant violated: index has no key columns"
-    );
-    let mut types = Vec::with_capacity(index_spec.keys.len() + usize::from(append_row_id));
-    for key in &index_spec.keys {
-        let col_no = key.column_ordinal.as_usize();
-        let ty = metadata
-            .col
-            .col_types()
-            .get(col_no)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "secondary-index encoder invariant violated: column_no={col_no}, column_count={}",
-                    metadata.col.col_count()
-                )
-            });
-        types.push(ty);
-    }
-    if append_row_id {
-        types.push(ValType::new(ValKind::U64, false));
-    }
-    BTreeKeyEncoder::new(types)
 }
 
 #[inline]
@@ -2671,6 +2639,7 @@ mod tests {
         NON_FOREGROUND_STMT_NO, PrepareListenerResult, SessionOperationEntry,
         SessionOperationState,
     };
+    use crate::value::{ValKind, ValType};
     use futures::FutureExt;
     use smol::future::yield_now;
     use std::cmp::Ordering;

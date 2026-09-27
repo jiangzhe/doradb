@@ -62,6 +62,12 @@ impl<T> Completion<T> {
         }
     }
 
+    /// Inspects completion readiness without consuming a move-once result.
+    #[cfg(test)]
+    pub(crate) fn is_completed(&self) -> bool {
+        matches!(&*self.state.lock(), CompletionState::Completed(_))
+    }
+
     /// Returns the propagated terminal result if this completion has already
     /// finished.
     #[inline]

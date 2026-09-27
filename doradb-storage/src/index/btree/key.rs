@@ -1,9 +1,11 @@
+use crate::error::{ResourceError, ResourceResult};
 use crate::id::RowID;
 use crate::index::util::Maskable;
 use crate::memcmp::{
     MemCmpFormat, MemCmpKey, NormalBytes, Null, Nullable, NullableMemCmpFormat, SegmentedBytes,
 };
 use crate::value::{Val, ValKind, ValType};
+use error_stack::Report;
 use std::borrow::Borrow;
 use std::ops::{Bound, RangeBounds};
 
@@ -219,6 +221,9 @@ impl KeyEncoder for SegmentedBytesEncoder {
 
     #[inline]
     fn encode_len(&self, key: &Val) -> usize {
+        if key.is_null() {
+            return 1;
+        }
         let bs = SegmentedBytes(key.as_bytes().unwrap());
         if self.nullable {
             bs.enc_nmcf_len()
@@ -283,14 +288,21 @@ pub(crate) struct MultiKeyEncoder {
 impl MultiKeyEncoder {
     /// Create a composite key encoder from ordered key value types.
     #[inline]
-    fn new(mut val_types: Vec<ValType>) -> Self {
-        debug_assert!(val_types.len() >= 2);
-        let last_ty = val_types.pop().unwrap();
+    fn new<T>(val_types: T) -> Self
+    where
+        T: IntoIterator<Item = ValType>,
+        T::IntoIter: ExactSizeIterator + DoubleEndedIterator,
+    {
+        let mut val_types = val_types.into_iter();
+        assert!(
+            val_types.len() >= 2,
+            "composite key encoder requires at least two types"
+        );
+        let last_ty = val_types.next_back().unwrap();
         let prefix: Vec<_> = val_types
-            .into_iter()
             .map(|ty| {
                 if let ValKind::VarByte = ty.kind {
-                    // prefix var-length field key, should be encoded as segmented bytes.
+                    // Prefix variable-length fields require segmented encoding.
                     PrefixKeyEncoder::Segmented(SegmentedBytesEncoder {
                         nullable: ty.nullable,
                     })
@@ -303,9 +315,9 @@ impl MultiKeyEncoder {
         let prefix_key_len = prefix
             .iter()
             .map(|e| e.est_encode_len())
-            .try_fold(0, |acc, elem| elem.map(|b| acc + b));
+            .try_fold(0usize, |acc, elem| elem.and_then(|b| acc.checked_add(b)));
         let suffix_key_len = suffix.est_encode_len();
-        let encode_len = prefix_key_len.and_then(|p| suffix_key_len.map(|s| p + s));
+        let encode_len = prefix_key_len.and_then(|p| suffix_key_len.and_then(|s| p.checked_add(s)));
         Self {
             prefix: prefix.into_boxed_slice(),
             suffix,
@@ -375,13 +387,78 @@ pub(crate) enum BTreeKeyEncoder {
 impl BTreeKeyEncoder {
     /// Create a B-tree key encoder based on types of keys.
     #[inline]
-    pub(crate) fn new(mut val_types: Vec<ValType>) -> Self {
-        debug_assert!(!val_types.is_empty());
+    pub(crate) fn new<T>(val_types: T) -> Self
+    where
+        T: IntoIterator<Item = ValType>,
+        T::IntoIter: ExactSizeIterator + DoubleEndedIterator,
+    {
+        let mut val_types = val_types.into_iter();
+        assert!(
+            val_types.len() > 0,
+            "BTreeKeyEncoder requires at least one type"
+        );
         if val_types.len() == 1 {
-            let ty = val_types.pop().unwrap();
+            let ty = val_types.next_back().unwrap();
             return BTreeKeyEncoder::Single(SingleKeyEncoder(ty));
         }
         BTreeKeyEncoder::Multi(MultiKeyEncoder::new(val_types))
+    }
+
+    /// Compute exact encoded size, including nullable and segmented components.
+    pub(crate) fn encoded_len(&self, keys: &[Val]) -> ResourceResult<usize> {
+        match self {
+            Self::Single(encoder) => {
+                assert_eq!(keys.len(), 1, "hot-build single key arity");
+                Ok(encoder.encode_len(&keys[0]))
+            }
+            Self::Multi(encoder) => {
+                assert_eq!(
+                    keys.len(),
+                    encoder.prefix.len() + 1,
+                    "hot-build composite key arity"
+                );
+                if let Some(len) = encoder.encode_len {
+                    return Ok(len);
+                }
+                let suffix = encoder.suffix.encode_len(&keys[keys.len() - 1]);
+                encoder
+                    .prefix
+                    .iter()
+                    .zip(keys)
+                    .try_fold(suffix, |len, (part, val)| {
+                        len.checked_add(part.encode_len(val)).ok_or_else(|| {
+                            Report::new(ResourceError::InsufficientMemory)
+                                .attach("encoded key length overflow")
+                        })
+                    })
+            }
+        }
+    }
+
+    /// Encode using the exact length already computed for these unchanged values.
+    /// Callers admitting scratch must charge outlined storage before this call.
+    #[inline]
+    pub(crate) fn encode_with_len<V: Borrow<Val>>(&self, keys: &[V], len: usize) -> BTreeKey {
+        let key = match self {
+            Self::Single(encoder) => {
+                assert_eq!(keys.len(), 1, "BTreeKeyEncoder single key arity");
+                encoder.encode_single(keys[0].borrow())
+            }
+            Self::Multi(encoder) => {
+                assert_eq!(
+                    keys.len(),
+                    encoder.prefix.len() + 1,
+                    "BTreeKeyEncoder composite key arity"
+                );
+                encode_multi_keys(&encoder.prefix, &encoder.suffix, keys, len)
+            }
+        };
+        assert_eq!(
+            key.as_bytes().len(),
+            len,
+            "BTreeKeyEncoder admitted key length"
+        );
+        key
     }
 
     /// Encode keys into a memory-comparable b-tree key.
@@ -486,16 +563,10 @@ fn encode_multi_keys<V: Borrow<Val>>(
     keys: &[V],
     encode_len: usize,
 ) -> BTreeKey {
-    let mut res = BTreeKey::zeroed(encode_len);
-    let mut buf = res.modify_inplace();
-    let mut start_idx = 0usize;
-    for (encoder, key) in prefix.iter().zip(keys) {
-        start_idx = encoder.encode_copy(key.borrow(), &mut buf, start_idx);
-    }
-    let end_idx = suffix.encode_copy(keys.last().unwrap().borrow(), &mut buf, start_idx);
-    debug_assert!(end_idx == buf.len());
-    drop(buf);
-    res
+    let (last, prefix_keys) = keys
+        .split_last()
+        .unwrap_or_else(|| unreachable!("composite key encoder has a suffix"));
+    encode_key_pair(prefix, suffix, prefix_keys, last.borrow(), encode_len)
 }
 
 #[inline]
@@ -513,7 +584,11 @@ fn encode_key_pair<P: Borrow<Val>, S: Borrow<Val>>(
         start_idx = encoder.encode_copy(key.borrow(), &mut buf, start_idx);
     }
     let end_idx = suffix.encode_copy(suffix_key.borrow(), &mut buf, start_idx);
-    debug_assert!(end_idx == buf.len());
+    assert_eq!(
+        end_idx,
+        buf.len(),
+        "BTreeKeyEncoder exact composite key length"
+    );
     drop(buf);
     res
 }

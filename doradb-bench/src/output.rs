@@ -1,5 +1,7 @@
 use crate::error::Result;
 use crate::measurement::{InternalMetric, InternalMetricKind, InternalMetricUnit};
+#[cfg(feature = "profiling")]
+use doradb_storage::profiling::HotIndexBuildStats;
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, LogicalLockStats,
     MandatoryRuntimeStats, MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
@@ -12,6 +14,8 @@ pub(super) struct InternalStatsSnapshot {
     buffer: BufferPoolStats,
     mandatory: MandatoryRuntimeStats,
     logical_lock: LogicalLockStats,
+    #[cfg(feature = "profiling")]
+    hot_index_build: HotIndexBuildStats,
 }
 
 impl InternalStatsSnapshot {
@@ -22,6 +26,8 @@ impl InternalStatsSnapshot {
             buffer: session.buffer_pool_stats()?,
             mandatory: session.mandatory_runtime_stats()?,
             logical_lock: session.logical_lock_stats()?,
+            #[cfg(feature = "profiling")]
+            hot_index_build: session.hot_index_build_stats()?,
         })
     }
 }
@@ -50,12 +56,19 @@ pub(crate) fn plan_internal_metrics(
                 || metric.name.starts_with("logical_lock.current_")
             {
                 InternalMetricKind::EndGauge
-            } else if metric.name.starts_with("logical_lock.peak_") {
+            } else if metric.name.starts_with("logical_lock.peak_")
+                || (cfg!(feature = "profiling")
+                    && (metric.name.starts_with("hot_index_build.max_")
+                        || metric.name == "hot_index_build.scratch_peak_bytes"))
+            {
                 InternalMetricKind::LifetimePeak
             } else {
                 InternalMetricKind::CounterDelta
             };
-            let unit = if metric.name == "transaction.log_bytes" {
+            let unit = if metric.name == "transaction.log_bytes"
+                || (cfg!(feature = "profiling")
+                    && metric.name == "hot_index_build.scratch_peak_bytes")
+            {
                 InternalMetricUnit::Bytes
             } else if metric.name.ends_with("_nanos") {
                 InternalMetricUnit::Nanoseconds
@@ -92,7 +105,61 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
+    #[cfg(feature = "profiling")]
+    push_hot_index_build_metrics(&mut metrics, before.hot_index_build, after.hot_index_build);
     metrics
+}
+
+#[cfg(feature = "profiling")]
+fn push_hot_index_build_metrics(
+    metrics: &mut Vec<Metric>,
+    before: HotIndexBuildStats,
+    after: HotIndexBuildStats,
+) {
+    // Until production callers migrate, there are no samples to report. Also
+    // omit intervals without completed work instead of presenting lifetime peaks
+    // as measurements of the current benchmark operation.
+    if before.completed_builds == after.completed_builds {
+        return;
+    }
+    macro_rules! counter {
+        ($field:ident) => {
+            push_metric(
+                metrics,
+                concat!("hot_index_build.", stringify!($field)),
+                after.$field - before.$field,
+            );
+        };
+    }
+    counter!(completed_builds);
+    counter!(source_pages);
+    counter!(entries);
+    counter!(planned_groups);
+    counter!(nonempty_runs);
+    counter!(capture_elapsed_nanos);
+    counter!(extraction_worker_time_nanos);
+    counter!(sort_worker_time_nanos);
+    counter!(duplicate_worker_time_nanos);
+    counter!(extraction_wall_elapsed_nanos);
+    counter!(sort_wall_elapsed_nanos);
+    counter!(duplicate_wall_elapsed_nanos);
+    counter!(pipeline_wall_elapsed_nanos);
+    counter!(total_elapsed_nanos);
+    push_metric(
+        metrics,
+        "hot_index_build.max_job_elapsed_nanos",
+        after.max_job_elapsed_nanos,
+    );
+    push_metric(
+        metrics,
+        "hot_index_build.max_sort_elapsed_nanos",
+        after.max_sort_elapsed_nanos,
+    );
+    push_metric(
+        metrics,
+        "hot_index_build.scratch_peak_bytes",
+        after.scratch_peak_bytes,
+    );
 }
 
 fn push_logical_lock_metrics(
@@ -446,4 +513,106 @@ fn delta(after: usize, before: usize) -> u64 {
 
 fn delta_u64(after: u64, before: u64) -> u64 {
     after.saturating_sub(before)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "profiling")]
+    use super::{InternalStatsSnapshot, cumulative_internal_metrics, plan_internal_metrics};
+    #[cfg(feature = "profiling")]
+    use crate::measurement::{InternalMetricKind, InternalMetricUnit};
+    #[cfg(feature = "profiling")]
+    use doradb_storage::profiling::HotIndexBuildStats;
+
+    /// Purpose: Preserve hot-build delta, lifetime-peak, and fresh-engine metric semantics.
+    /// Expected: Empty intervals emit no profile; counts/times subtract while maxima retain absolute values and correct units.
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn hot_build_metrics_distinguish_deltas_and_peaks() {
+        let empty = InternalStatsSnapshot::default();
+        assert!(
+            plan_internal_metrics(&empty, &empty)
+                .iter()
+                .all(|m| !m.name.starts_with("hot_index_build."))
+        );
+        let before = InternalStatsSnapshot {
+            hot_index_build: HotIndexBuildStats {
+                completed_builds: 2,
+                entries: 20,
+                total_elapsed_nanos: 100,
+                max_job_elapsed_nanos: 80,
+                scratch_peak_bytes: 4096,
+                ..HotIndexBuildStats::default()
+            },
+            ..InternalStatsSnapshot::default()
+        };
+        assert!(
+            plan_internal_metrics(&before, &before)
+                .iter()
+                .all(|m| !m.name.starts_with("hot_index_build."))
+        );
+        let after = InternalStatsSnapshot {
+            hot_index_build: HotIndexBuildStats {
+                completed_builds: 3,
+                entries: 27,
+                total_elapsed_nanos: 140,
+                max_job_elapsed_nanos: 80,
+                scratch_peak_bytes: 8192,
+                ..HotIndexBuildStats::default()
+            },
+            ..InternalStatsSnapshot::default()
+        };
+        let metrics = plan_internal_metrics(&before, &after);
+        for (suffix, value, kind, unit) in [
+            (
+                "completed_builds",
+                1,
+                InternalMetricKind::CounterDelta,
+                InternalMetricUnit::Count,
+            ),
+            (
+                "entries",
+                7,
+                InternalMetricKind::CounterDelta,
+                InternalMetricUnit::Count,
+            ),
+            (
+                "total_elapsed_nanos",
+                40,
+                InternalMetricKind::CounterDelta,
+                InternalMetricUnit::Nanoseconds,
+            ),
+            (
+                "max_job_elapsed_nanos",
+                80,
+                InternalMetricKind::LifetimePeak,
+                InternalMetricUnit::Nanoseconds,
+            ),
+            (
+                "scratch_peak_bytes",
+                8192,
+                InternalMetricKind::LifetimePeak,
+                InternalMetricUnit::Bytes,
+            ),
+        ] {
+            let metric = metrics
+                .iter()
+                .find(|m| m.name == format!("hot_index_build.{suffix}"))
+                .unwrap();
+            assert_eq!(
+                (metric.value, metric.kind, metric.unit),
+                (value, kind, unit),
+                "{suffix}"
+            );
+        }
+        let fresh = cumulative_internal_metrics(&after);
+        let entries = fresh
+            .iter()
+            .find(|m| m.name == "hot_index_build.entries")
+            .unwrap();
+        assert_eq!(
+            (entries.value, entries.kind),
+            (27, InternalMetricKind::CumulativeCounter)
+        );
+    }
 }

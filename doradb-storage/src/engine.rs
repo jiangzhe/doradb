@@ -21,6 +21,7 @@ use crate::error::{
 };
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
+use crate::index::build::HotBuildPolicy;
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -530,6 +531,12 @@ impl Drop for Engine {
 pub(crate) struct EngineCore {
     /// Immutable deterministic table-scan planning configuration.
     table_scan_config: TableScanConfig,
+    /// Validated per-index extraction policy shared with bootstrap.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "RFC 0032 phase 5 caller policy")
+    )]
+    pub(crate) hot_build_policy: HotBuildPolicy,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned executor for finite synchronous and asynchronous jobs.
@@ -753,7 +760,7 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
     let transaction_started = Instant::now();
     builder
-        .build::<TransactionSystem>((trx_cfg, config.recovery))
+        .build::<TransactionSystem>((trx_cfg, config.recovery, config.hot_index_build))
         .await
         .disclose()?;
     let runtime_started = Instant::now();
@@ -798,6 +805,11 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     let lifecycle = Arc::new(EngineLifecycle::new());
     let core = Arc::new(EngineCore {
         table_scan_config,
+        hot_build_policy: HotBuildPolicy::new(
+            config.hot_index_build,
+            config.thread_pool.worker_threads,
+        )
+        .disclose()?,
         poisoner,
         thread_pool,
         mandatory_runtime,
@@ -847,6 +859,7 @@ mod tests {
     use super::*;
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
+    use crate::conf::HotIndexBuildConfig;
     use crate::conf::{
         EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig,
     };
@@ -967,6 +980,13 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TransactionTerminal {
+        Commit,
+        ReadonlyCommit,
+        Rollback,
+    }
+
     fn test_engine_config_for(root: &Path) -> EngineConfig {
         EngineConfig::default()
             .storage_root(root)
@@ -1024,13 +1044,6 @@ mod tests {
         finished.sort_unstable();
         assert_eq!(started, finished, "unreclaimed workers: {scenario}");
         started
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum TransactionTerminal {
-        Commit,
-        ReadonlyCommit,
-        Rollback,
     }
 
     async fn assert_session_reuse(terminal: TransactionTerminal) {
@@ -2739,7 +2752,7 @@ mod tests {
                 .validate(engine.inner().thread_pool.worker_threads())
                 .unwrap();
             let (trx_sys, startup) = TransactionSystem::bootstrap(
-                (config, recovery),
+                (config, recovery, HotIndexBuildConfig::default()),
                 engine.inner().poisoner.clone(),
                 engine.inner().mandatory_runtime.clone(),
                 engine.inner().thread_pool.clone(),

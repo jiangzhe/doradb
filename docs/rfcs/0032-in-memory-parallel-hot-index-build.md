@@ -13,12 +13,12 @@ github_issue: 1084
 
 Introduce one in-memory parallel hot secondary-index builder for recovery and
 CREATE INDEX. Page groups produce resident sorted runs; independent n-way
-merge partitions validate keys and supply parallel leaf construction; parent
-levels are packed bottom-up and installed into an empty MemIndex without
+merge partitions optionally validate keys and supply parallel leaf construction.
+Parent levels are packed bottom-up and installed into an empty MemIndex without
 changing its root PageID. The existing ThreadPool executes finite work, while
 the caller retains source stability, cleanup, and publication ownership. This
 program covers unique and non-unique hot indexes and defers cold construction,
-external sorting, and spill formats. [U1] [U2] [B1]
+external sorting, and spill formats. [U1] [U2] [U10] [B1]
 
 ## Context
 
@@ -53,8 +53,9 @@ Issue Labels:
    recovery and CREATE INDEX, with explicit caller-specific adapters.
 2. Deliver parallel extraction, n-way rank-partitioned merging, and parallel
    bottom-up tree construction on the existing ThreadPool.
-3. Preserve row coverage, key semantics, typed failures, fixed-root identity,
-   DDL publication, and recovery admission ordering.
+3. Preserve row coverage, key semantics, fixed-root identity, DDL publication,
+   and recovery admission ordering, with explicit caller-specific duplicate
+   validation and typed failures.
 4. Bound admitted work and build scratch, account for retained allocations,
    and settle every accepted child before ownership is released.
 5. Make every implementation phase independently testable and measurable;
@@ -70,6 +71,8 @@ Issue Labels:
    or a public generic sorting/build service.
 4. Global query-memory management, foreground latency isolation, concurrent
    recovery builds across indexes, or a new value-projection abstraction.
+5. Fail-fast duplicate validation; duplicate reporting follows completed
+   validation summaries in this milestone.
 
 ## Design Inputs
 
@@ -161,6 +164,17 @@ Issue Labels:
   merging. Earlier-cut seeding and ready-pair scheduling are later optimizations.
 - [U8] Follow-up research request: check the latest DuckDB release and current
   development source for algorithm changes before finalizing the reference.
+- [U9] Phase 1 review: sort owned entries by encoded key. Equal keys use
+  run/position provenance without a separate row-identifier tie-breaker.
+  Later merging preserves shared key ownership.
+- [U10] Phase 1 review: make duplicate validation optional by caller contract.
+  Recovery trusts its data-integrity invariant; CREATE UNIQUE INDEX requires
+  checking. Local sorting may produce duplicate summaries, with errors deferred
+  until required work settles. Fail-fast validation is future work.
+- [U11] Phase 1 review: configure a page target per run, defaulting to 128,
+  while retaining the cap of four runs per admitted worker. Small inputs may
+  produce one run. The shared policy defaults to 256 MiB scratch and the
+  existing pool's worker count; benchmarks vary and report actual run counts.
 
 ### Source Backlogs
 
@@ -180,23 +194,22 @@ caller-specific. [U2] [U3] [C1] [C2]
 
 ```text
 stable hot-page source
-  -> parallel extraction, encoding, and local sorting
-  -> immutable resident runs
+  -> parallel extraction, encoding, and direct sorting of owned entries
+  -> immutable resident runs with optional local duplicate summaries
   -> parallel co-rank selection, one computation per interior cut
   -> completed immutable boundary table
-  -> parallel partition merges and validation summaries
-  -> validated sorted entry references
+  -> parallel partition merges with optional duplicate validation
+  -> ordered entry references with checked or caller-guaranteed key distinctness
   -> parallel packed leaves and bottom-up parent levels
   -> installation into an empty fixed-root MemIndex
   -> caller publication or recovery admission
 ```
 
-Retain encoded keys in the runs and materialize merged order as references to
-those keys, without a second complete key copy. The coordinator handles work
-descriptors, summaries, and barriers; it must not sort, merge, validate, or
-insert all entries serially. A small upper level or root is naturally serial.
-Exact internal types, module names, and task thresholds are phase-local.
-[C5] [B1] [U3]
+Sort owned encoded entries directly within each run. Later stages retain
+immutable runs and represent merged order without copying all keys again.
+The coordinator handles work descriptions, summaries, and barriers; it must not
+sort, merge, validate, or insert all entries serially. A small upper level or
+root is naturally serial. [C4] [C5] [B1] [U3] [U9]
 
 ### 2. Stable current-state input
 
@@ -217,8 +230,14 @@ checkpointed prefixes below the pivot are excluded. [D2] [D4] [C1] [C2]
 
 Workers receive owned resource handles, not a Session or mutable Transaction.
 They release source-page guards before sorting, waiting for resource admission,
-or allocating output pages. Group pages into a bounded multiple of admitted
-workers so run fan-in does not grow with physical page count. [C3] [C6]
+or allocating output pages. The enclosing source owner retains its stability
+proof until every accepted extraction job settles. [C3] [C6]
+
+Group pages into balanced, ordered ranges using a soft page target and a cap
+of four runs per worker. Concurrency bounds outstanding jobs, including results
+awaiting collection. Small inputs use fewer groups, empty inputs submit no
+work, and empty results are omitted. Grouping is independent of completion
+order. [C3] [C6] [U11]
 
 ### 3. Ordering and validation
 
@@ -226,11 +245,34 @@ Reuse BTreeKeyEncoder and existing NULL/composite-key semantics. Unique
 physical keys are logical encoded keys with active BTreeU64 RowID values;
 non-unique keys include RowID and retain active BTreeByte values. [D2] [C4]
 
-Partitioning and merging use a total order: unique entries compare encoded
-key, RowID, then run/position provenance; non-unique entries compare encoded
-exact key, then provenance. Provenance is temporary. Unique validation compares
-logical keys only; non-unique validation rejects repeated exact identities
-while allowing equal logical keys for different rows. [C4] [B1]
+Local sorting compares encoded keys for both index kinds. Partitioning and
+merging break ties by run and position, without a separate RowID comparison.
+For a fixed source plan, completion order cannot change ordering or duplicate
+diagnostics; changing grouping may select a different conflicting row.
+[C4] [B1] [U9]
+
+Duplicate validation is an internal caller-selected policy, independent of
+index kind. Checking compares encoded keys without provenance: equality means
+a logical conflict for a unique index and repeated exact identity for a
+non-unique index. Equal non-unique logical keys with different RowIDs remain
+valid. The production caller contracts are: [C1] [C2] [U10]
+
+| Caller | Duplicate-validation policy |
+| --- | --- |
+| Recovery, either index kind | Skip; trust recovered-data and exact row-coverage invariants |
+| CREATE UNIQUE INDEX | Required; collect duplicate evidence |
+| CREATE non-unique index | Skip; trust disjoint row coverage for exact-key distinctness |
+
+Tests and primitive benchmarks may select either policy. CREATE UNIQUE INDEX
+has no public option to disable its required check. Skipping validation does
+not weaken source identity, row coverage, ordering, or cleanup contracts, and
+does not silently coalesce entries. It transfers responsibility for distinct
+physical keys to the caller's established invariant. [U10]
+
+Local duplicate evidence distinguishes unchecked input from checked input
+and identifies the first conflict within a run. Discovery does not stop
+remaining extraction work. Local evidence alone cannot establish uniqueness
+across runs. [U10]
 
 Keep these dimensions distinct; none must equal another. [U7]
 
@@ -251,6 +293,10 @@ Its end vector is the next partition's start vector. Thus Q partitions need
 Q+1 distinct vectors, of which only Q-1 require interior-cut computation.
 Empty input bypasses rank division and merging; Q=1 needs no interior cuts.
 [U2] [U7]
+
+A single run bypasses merge partitioning and reuses its local duplicate
+evidence when checking is required. CREATE's later cold/hot validation still
+applies. [U10] [U11]
 
 Use clamped-step n-way co-rank selection. Each v1 search starts from zero
 positions with remaining rank q. At each iteration, let a be the number of
@@ -283,14 +329,14 @@ Merge tasks retain shared ownership of the runs and boundary table and use a
 loser-tree kernel to emit entry references. Completion order cannot change
 the logical order of cuts or output. Boundary-stage failure prevents merge
 admission and settles accepted jobs under Decision §5. Charge the table's
-(Q+1)*K positions and task-local scratch to the build budget. Do not move cuts
-to equal-key group ends; rank balance remains separate from duplicate
+(Q+1)*K positions and substantial task-local buffers to the build budget. Do not
+move cuts to equal-key group ends; rank balance remains separate from duplicate
 validation. [C6] [U2] [U7]
 
 DuckDB can reuse a published end as the next start, compute a missing start
 without waiting for its predecessor, and seed searches from available earlier
 boundaries. Those scheduling optimizations are not part of v1. This builder
-already retains runs and must validate the complete input; computing each cut
+already retains runs and must order the complete input; computing each cut
 once gives a simpler ownership and failure contract. Its cost is the global
 boundary-stage barrier: no partition can merge before the slowest boundary
 job finishes. Measure that stage before adding overlap. [D9] [U7]
@@ -303,38 +349,42 @@ partition kernel concatenates run slices and uses Vergesort with PDQsort
 fallback; the loser-tree kernel over entry references is a DoraDB decision,
 separate from the borrowed co-rank algorithm. [D10] [D11] [U2] [U8]
 
-Validate within partitions and across adjacent nonempty partition boundaries.
-Record a detected duplicate in the partition's validation summary rather than
-immediately returning a job error or triggering general build cancellation.
-For v1, duplicate discovery does not stop admission of remaining validation
-partitions: finish the stage through normal bounded scheduling, drain all
-accepted validation jobs, and collect the required partition and boundary
-summaries. The coordinator then selects the lowest offending output rank for
-deterministic hot duplicate diagnostics. No rank-aware cancellation frontier is
-required. Resource, execution, or fatal failures may interrupt validation under
-the existing failure policy; incomplete duplicate summaries must not mask or
-replace those failures. [C6] [D5] [U6]
+For multiple runs with checking enabled, validate merged adjacency within
+partitions and across adjacent nonempty partition boundaries. Individually
+unique runs can still share a key, so local summaries cannot replace this
+check. Record a detected duplicate in the partition's validation summary
+rather than immediately returning a job error or triggering cancellation.
+For v1, duplicate discovery does not stop admission of remaining work: finish
+the stage through normal bounded scheduling, drain all accepted jobs, and
+collect the required partition and boundary summaries. The coordinator then
+selects the lowest offending output rank for deterministic hot duplicate
+diagnostics. Trusted mode skips these duplicate checks while preserving the
+ordering and settlement stages. Resource, execution, or fatal failures may
+interrupt either mode under the existing failure policy; incomplete duplicate
+summaries must not mask or replace those failures. [C6] [D5] [U6] [U10]
 
-Complete validation before allocating leaves so equal physical keys cannot
-become invalid tree fences. For CREATE UNIQUE INDEX, partitioned
-comparisons against the existing sorted cold vector also complete before leaf
-allocation. Recovery retains cold deletion interpretation and does not reject
-a hot key merely because a stale physical cold key exists. [C1] [C2] [D2]
+Before leaf allocation, ordered input must carry either completed required
+validation or the caller's guarantee of distinct physical keys. An unchecked
+run does not by itself establish either condition. For CREATE UNIQUE INDEX,
+both required hot validation and partitioned comparisons against the existing
+sorted cold vector complete before leaf allocation. Recovery retains cold
+deletion interpretation and does not reject a hot key merely because a stale
+physical cold key exists. [C1] [C2] [D2] [U10]
 
-Preserve `OperationError::DuplicateKey` for CREATE uniqueness conflicts and
-`DataIntegrityError::UnexpectedRecoveryDuplicateKey` with index/row diagnostics
-for recovery conflicts. Repeated non-unique exact input violates source
-coverage and must follow the caller's integrity/invariant contract, never be
-silently coalesced. [C1] [C2] [C7]
+CREATE retains duplicate-key errors. Current recovery defensively rejects
+duplicates; the future trusted builder intentionally relies on recovered-data
+integrity instead. Explicitly checked recovery retains integrity errors.
+No mode silently coalesces duplicate entries. [C1] [C2] [C7] [U10]
 
 ### 4. Packed construction and fixed-root installation
 
-Build detached leaves from validated partitions, with known adjacent fences
-and an unbounded first/last range. Plan fit using actual encoded bytes, values,
+Build detached leaves from ordered partitions whose physical keys are distinct
+by completed validation or caller guarantee, with known adjacent fences and
+an unbounded first/last range. Plan fit using actual encoded bytes, values,
 fences, and prefix compression; reuse KnownFenceNodeParams and packing helpers.
 Planning must avoid repeatedly scanning the entire remaining input for each
 page. Preserve existing supported key representability and online mutation
-invariants. Fill-factor tuning and local tail repair are phase-local. [C5]
+invariants. Fill-factor tuning and local tail repair are phase-local. [C5] [U10]
 
 Build parents one level at a time from ordered child descriptors, regrouping
 across merge partitions. Each parent covers adjacent children of equal height
@@ -376,30 +426,34 @@ recovery traffic. [C1] [C2] [C5]
 
 ### 5. Scratch limits, scheduling, and cleanup
 
-One immutable hot-build policy supplies a per-build scratch limit and worker
-budget to both callers. Startup configuration exposes the scratch limit;
-parallelism never exceeds the configured pool. Exact defaults and public
-configuration spelling are Phase 1 choices, validated and recorded there.
+One immutable hot-build policy supplies a per-build scratch limit, worker
+budget, and page target to both callers. Startup configuration defaults to
+256 MiB scratch, the existing pool's worker count, and 128 target pages per
+run. Limits must be positive and support checked size arithmetic; an explicit
+worker override must not exceed the configured pool. Duplicate validation is
+selected by the caller contract in Decision §3, not by a global setting.
 Recovery admits one table/index build at a time, with parallelism inside it;
 subsequent indexes reuse source descriptors but may re-extract selected keys.
-This avoids multiplying scratch by the number of indexes. [C2] [C6] [U2]
+This avoids multiplying scratch by the number of indexes. [C2] [C6] [U2] [U11]
 
-Entry storage remains linear in hot entries: owned encoded keys and entry
-capacity plus merged references. Also charge source descriptors,
-projection/packing scratch, child descriptors, allocation ledgers, the
-O((Q+1)*K) boundary table, and task-local boundary/merge state. Charge capacity
-growth before allocation and use fallible reservation where supported. Include
-cleanup headroom; inline key bytes already inside entries are not a separate
-charge. Budget exhaustion returns a typed resource failure, not a wait for
-space retained by the same build or an implicit unbounded fallback. A recovery
-build that cannot fit fails bootstrap and requires a sufficient budget. [C7]
-[B1] [U2] [U7]
+The budget covers bulk scratch: owned encoded keys, entry capacity, merged
+references, source descriptors, and substantial merge, partition, and packing
+buffers, including child descriptors and the O((Q+1)*K) boundary table. Admit
+capacity growth before allocation, including overlapping replacement buffers,
+and retain reservations until storage is freed. Inline key bytes already inside
+entries are not a separate charge. Budget exhaustion returns a typed resource
+failure, not a wait for space retained by the same build or an implicit unbounded
+fallback. A recovery build that cannot fit fails bootstrap and requires a
+sufficient budget. [C7] [B1] [U2] [U7]
 
+Small schema/job bookkeeping, bounded per-worker temporaries, and temporary
+page-identity validation metadata are outside this budget. Validation metadata
+is bounded by admitted source descriptors and released before extraction.
 Source pool pages, final index pages, allocator overhead, and CREATE's retained
-cold vector are separate real costs in process/pool high-water reporting. The
-scratch cap is not a process-wide quota, including across independent CREATE
-operations. In-memory means no sort spill; existing evictable row/index pools
-may still perform backend I/O. [D1] [C1] [C4] [B2]
+cold vector are also separate costs. The scratch cap and reported scratch peak
+cover accounted bulk buffers, not total process memory or an engine-wide quota.
+In-memory means no sort spill; existing evictable row/index pools may still
+perform backend I/O. [D1] [C1] [C4] [B2]
 
 Use finite jobs on the existing ThreadPool with caller-bounded fan-out and
 cooperative yields. Jobs never block on children or start a second executor.
@@ -421,10 +475,9 @@ cleanup owner for detached pages through pool drain and storage teardown.
 Panics preserve engine poison and Fatal precedence. Cleanup cannot require new
 pool admission after poison; ordinary cleanup must reclaim pages, while unsafe
 cleanup failure retains exact ownership under existing fatal policy. Normal
-completion retires entry/fence references and disposes of large run buffers in
-bounded owned work, avoiding a final coordinator drop of all variable-length
-keys. Every new wait documents its progress producer, authoritative result,
-poison/shutdown behavior, and cleanup owner. [D5] [D6] [C6]
+completion releases run buffers and their memory reservations after their final
+consumer finishes. Every new wait documents its progress producer, authoritative
+result, poison/shutdown behavior, and cleanup owner. [D5] [D6] [C6]
 
 ### 6. Caller integration and acceptance
 
@@ -432,20 +485,28 @@ Recovery builds each empty bootstrapped MemIndex at MIN_SNAPSHOT_TS, preserves
 loaded cold roots and replay ordering, and admits foreground work only after
 all required builds succeed. Count source pages once, independently of how many
 indexes re-extract them, and preserve successful-entry and saturation semantics.
-CREATE retains its current cold builder/vector, catalog commit, durable table
-root, and runtime-layout/history publication. No new persistent format or redo
-record is introduced. [D3] [D4] [C1] [C2] [C8]
+Recovery selects trusted duplicate mode; CREATE UNIQUE INDEX requires checking,
+while CREATE non-unique index relies on disjoint row coverage. CREATE retains
+its current cold builder/vector, catalog commit, durable table root, and
+runtime-layout/history publication. No new persistent format or redo
+record is introduced. [D3] [D4] [C1] [C2] [C8] [U10]
 
 Each phase includes its own correctness, ordinary/fatal failure, memory, and
-performance evidence. Primitive phases use focused harnesses; caller phases
-measure end-to-end behavior with content verification outside timing. Compare
+performance evidence. Benchmarks belong in `doradb-bench`. Profiling is enabled
+by default and can be disabled without measurement overhead. CREATE/recovery
+reports may remain empty until caller integration. Caller phases measure
+end-to-end behavior with content verification outside timing. Compare
 current insertion, sorted sequential insertion, single-worker bulk, and the
 same bulk pipeline at increasing worker counts on identical data. Record
 stage latency, scratch high-water, occupancy, task duration, and observed pool
 I/O; cover tiny, large, skewed, wide/composite, deleted-heavy, and multi-index
-inputs. Demonstrate caller improvements on representative large hot fixtures
-and document crossover/regression cases without promising a universal speedup.
-[B1] [C8] [U4]
+inputs. Vary the page target at fixed input and worker count, recording the
+target, planned groups, actual nonempty runs, and workers. Measure the
+single-run path and optional local duplicate checking separately; distinguish
+target changes that leave the run-count cap binding. Demonstrate caller
+improvements on representative large hot fixtures and document crossover and
+regression cases without promising a universal speedup.
+[B1] [C8] [U4] [U10] [U11]
 
 Routine implementation validation uses `rtk cargo nextest run --workspace`;
 page-pool/I/O integration also uses the supported alternate `libaio` pass.
@@ -500,23 +561,32 @@ callers deliver the full pipeline. [U3] [U4]
 
 - **Phase 1: Parallel Hot-Row Extraction and Sorted Runs**
   - Scope: Implement the stable current-state source adapters and page-group
-    extraction, existing key encoding, local sorting, resident-run ownership,
-    scratch admission, bounded jobs, and extraction/sort measurements.
+    extraction, existing key encoding, direct sorting of owned entries,
+    optional local duplicate summaries, resident-run ownership, scratch
+    admission, bounded jobs, and extraction/sort measurements.
   - Goals: Given a stable source and selected index, return immutable sorted
-    runs with exact live-row coverage, or a fully settled typed failure.
+    runs with exact live-row coverage and explicit duplicate-check status, or
+    a fully settled typed failure. Local duplicate discovery returns summary
+    evidence for the following phase.
   - Non-goals: Global merge, cross-run duplicate validation, tree allocation,
-    or replacement of either caller's production build path.
+    fail-fast duplicate errors, or replacement of either caller's production
+    build path.
   - Prerequisites: Existing caller exclusion/bootstrap proofs and ThreadPool.
-  - Phase-local Choices: Configuration defaults and validation, source/owner
-    types, page-group sizing, reusable projection buffers, and sort thresholds.
+  - Phase-local Choices: Source/owner interfaces, reusable projection buffers,
+    scratch admission, and settlement mechanics within the configuration and
+    grouping contract in Decision §§2 and 5.
   - Validation: Compare extracted keys with current serial scans for both
     caller adapters, including pivots, retained prefixes, holes, deletes, move
-    updates, NULL/composite keys, and empty input. Inject extraction, budget,
+    updates, NULL/composite keys, and empty input. Verify both duplicate modes,
+    the first local duplicate pair, unchanged entry coverage after discovery,
+    and completion-order-independent run identity. Check page-target boundaries,
+    one group, the run cap, and all-empty results. Inject extraction, budget,
     admission, and worker failures; verify drain, retained ownership on Fatal,
-    and scratch release. Measure extraction/encoding/local sort and capacity
-    high-water at one and multiple workers against the serial path.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
+    and scratch release. Measure extraction/encoding/local sort, optional local
+    checking, and capacity high-water at one and multiple workers against the
+    serial path, varying and reporting effective run counts. [U9] [U10] [U11]
+  - Task Doc: `docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md`
+  - Task Issue: `#1111`
   - Phase Status: `pending`
   - Implementation Summary: `pending`
   - Related Backlogs:
@@ -525,19 +595,25 @@ callers deliver the full pipeline. [U3] [U4]
 - **Phase 2: Parallel Merge and Hot-Key Validation**
   - Scope: Implement a parallel stage computing each interior co-rank once,
     the immutable shared boundary table and completion barrier, loser-tree
-    partition merges, owned entry references, and local/boundary duplicate
-    summaries on Phase 1 runs.
-  - Goals: Return globally ordered validated partitions with exact coverage
-    and deterministic duplicate identity, independent of completion order.
+    partition merges, owned entry references, and optional merged-adjacency
+    and boundary duplicate summaries on Phase 1 runs. A single run uses direct
+    slices and its existing local summary.
+  - Goals: Return globally ordered partitions with exact coverage and explicit
+    checked or caller-guaranteed key distinctness. When checking is required,
+    duplicate identity is independent of completion order for a fixed run plan.
   - Non-goals: Row extraction changes, page construction, cold/hot checks,
     speculative endpoint recomputation, or overlap of boundary and merge jobs.
-  - Prerequisites: Phase 1 run ownership, comparator, budget, and job scope.
-  - Phase-local Choices: Partition granularity, small-input fast paths, and
-    checked reference/boundary representation.
+  - Prerequisites: Phase 1 run ownership, common encoded-key/provenance order,
+    duplicate policy and local summaries, budget, and job scope.
+  - Phase-local Choices: Partition granularity and checked reference/boundary
+    representation within the empty-input and single-run contracts.
   - Validation: Compare every rank on small cases and seeded varied cases
     with a full-sort oracle; cover unequal/empty runs, exhausted runs, equal
-    logical keys, exact duplicates, and cuts through duplicate groups. Verify
-    vector bounds, sums, monotonicity, adjacent endpoint sharing, and exact
+    logical keys, exact duplicates, and cuts through duplicate groups in checked
+    mode. Verify equivalent valid output in trusted mode, cross-run conflicts
+    missed by local checks, and single-run summary reuse without another scan,
+    co-rank search, or merge. Verify vector bounds, sums, monotonicity,
+    adjacent endpoint sharing, and exact
     merged coverage with different K/P/Q values, including empty input and
     Q=1. Under forced out-of-order boundary completion, verify one computation
     per interior cut, no predecessor dependency, and no merge admission until
@@ -551,6 +627,7 @@ callers deliver the full pipeline. [U3] [U4]
     wall time, aggregate cut work, maximum boundary-job duration, and
     merge/validation separately, including fan-in, skew, boundary/reference
     capacity, and scaling against a sequential reference merge. [U6] [U7]
+    [U9] [U10] [U11]
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -560,17 +637,20 @@ callers deliver the full pipeline. [U3] [U4]
   - Scope: Implement byte-aware leaf planning, packed leaves and parent
     levels with the existing MemTree branch representation, staged-page
     ledgers, empty-root installation, and owned cleanup.
-  - Goals: Convert validated partitions into a fully usable private MemIndex
-    with fixed root identity and ordinary online mutation behavior.
+  - Goals: Convert ordered partitions with checked or caller-guaranteed
+    distinct physical keys into a fully usable private MemIndex with fixed
+    root identity and ordinary online mutation behavior.
   - Non-goals: Public DDL/recovery switching, DiskTree allocation/publication,
     or changing online split/merge algorithms to accept a new branch format.
-  - Prerequisites: Phase 2 validated order and retained-key ownership; the
-    empty-destination proof must exist before any build allocation.
+  - Prerequisites: Phase 2 ordered input, explicit key-distinctness authority,
+    and retained-key ownership; required validation and the empty-destination
+    proof must exist before any build allocation.
   - Phase-local Choices: Narrow packing-helper extensions, descriptor
     grouping, tail repair, root-image transfer, and cleanup-owner mechanics.
   - Validation: Check exact adjacent fences, equal child heights, both branch
-    representations and their space accounting, empty/single-leaf trees, wide
-    keys, prefix compression, and parent tails. Check a worker's first branch
+    representations and their space accounting, equivalent valid input under
+    checked and trusted contracts, empty/single-leaf trees, wide keys, prefix
+    compression, and parent tails. Check a worker's first branch
     that is not globally leftmost. Use controlled fixtures with root height
     at least 2 and at least one non-leftmost internal branch; force both full
     and partial internal sibling merges through structural maintenance, then
@@ -591,21 +671,26 @@ callers deliver the full pipeline. [U3] [U4]
 
 - **Phase 4: Recovery Hot-Index Integration**
   - Scope: Replace post-replay per-row insertion with the shared pipeline,
-    preserving recovered-page ownership, timestamps, diagnostics, and metrics.
+    selecting trusted duplicate mode while preserving recovered-page
+    ownership, timestamps, remaining typed failures, and metrics.
   - Goals: Rebuild every required hot index before foreground admission with
     one admitted index build at a time and complete bootstrap cleanup ownership.
   - Non-goals: Parallel redo changes, cold-root rebuilding, or concurrent
     builds across indexes/tables.
-  - Prerequisites: Phases 1-3, replay drain, and final metadata reconciliation.
+  - Prerequisites: Phases 1-3, replay drain, final metadata reconciliation, and
+    the recovered-data/exact-coverage invariants that justify trusted mode.
   - Phase-local Choices: Stable index iteration, descriptor reuse, cleanup
     handoff on cancelled bootstrap, and recovery-report extensions.
   - Validation: Compare recovered contents with serial behavior across
     unique/non-unique, multiple-index, updated/deleted, sparse, and mixed
-    cold/hot fixtures. Verify typed duplicates, counter meanings, budget
-    failure, failed/cancelled bootstrap, and pool drain before storage teardown.
+    cold/hot fixtures. Verify trusted-mode selection without a duplicate
+    validation pass, counter meanings, budget failure, failed/cancelled
+    bootstrap, and pool drain before storage teardown. Update the former
+    duplicate-rejection regression to reflect the intentional trusted-input
+    contract; explicit checked-adapter tests retain typed integrity errors.
     Benchmark rebuild and total startup separately against the existing path,
     sorted insertion, and one/many-worker bulk; verify content outside timing,
-    report memory/I/O, and explain small-input or multi-index regressions.
+    report memory/I/O, and explain small-input or multi-index regressions. [U10]
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -613,7 +698,9 @@ callers deliver the full pipeline. [U3] [U4]
 
 - **Phase 5: CREATE INDEX Hot-Build Integration**
   - Scope: Replace hot collection/validation/insertion with the shared
-    pipeline, adding partitioned unique validation against retained cold keys.
+    pipeline, requiring duplicate checking for unique creation and adding
+    partitioned unique validation against retained cold keys. Non-unique
+    creation uses the exact-key guarantee from disjoint row coverage.
   - Goals: Publish correct unique/non-unique indexes through existing DDL
     ownership, rollback, table-root, and layout/history protocols.
   - Non-goals: Cold builder changes, reduced cold-vector memory, online DDL,
@@ -622,13 +709,16 @@ callers deliver the full pipeline. [U3] [U4]
     provides the first production integration without changing this contract.
   - Phase-local Choices: Cold-interval lookup/comparison, DDL test hooks, and
     caller benchmark/statistics integration.
-  - Validation: Cover hot/hot and cold/hot conflicts including partition
-    edges, retained checkpointed prefixes, deleted rows, and post-build reads,
+  - Validation: Verify that unique creation always enables checking and that
+    non-unique creation admits equal logical keys. Cover local-run, cross-run,
+    and cold/hot conflicts, including single-run input and partition edges,
+    retained checkpointed prefixes, deleted rows, and post-build reads,
     writes, checkpoint, and restart. Inject failures before installation and
     through existing publication boundaries; verify observer detachment,
     rollback, and poison ownership. Benchmark hot-only and mixed CREATE
     separately with the four baselines, worker scaling, stage time, scratch,
     retained cold memory, and pool I/O; record useful crossover thresholds.
+    [U10] [U11]
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
   - Phase Status: `pending`
@@ -644,6 +734,8 @@ callers deliver the full pipeline. [U3] [U4]
   parallel work through extraction, merging, leaves, and parent levels.
 - Explicit result boundaries let phase tasks verify correctness, failures,
   and performance before caller migration.
+- Caller-selected duplicate checking avoids redundant recovery validation,
+  while local summaries support a single-run uniqueness decision. [U10]
 
 ### Negative
 
@@ -658,15 +750,23 @@ callers deliver the full pipeline. [U3] [U4]
   keys can unbalance byte work even when rank partitions have equal counts.
 - Pool eviction, shared-worker contention, and synchronous local sorts limit
   scalability and latency isolation. Mixed CREATE retains its cold bottleneck.
+- Trusted recovery no longer diagnoses duplicate-key invariant violations at
+  index reconstruction; distinct physical keys become a caller precondition.
+  Checked multi-run builds still need global checks after local summaries.
+  [U10]
+- The page target becomes a soft bound when the run-count cap binds. Changing
+  grouping may change the reported conflicting RowID, although completion
+  order cannot change the diagnostic for a fixed run plan. [U9] [U11]
 
 ## Open Questions
 
 No architectural direction is intentionally deferred. Phase-local choices
 listed above must be settled in their task designs before implementation,
-including scratch defaults, grouping thresholds, packing tails, and detailed
-bootstrap cleanup ownership. Any finding that changes row coverage, supported
-key representation, error semantics, or publication requires RFC review rather
-than an unrecorded task-local change. [U3]
+including concrete source/run interfaces, packing tails, and detailed
+bootstrap cleanup ownership. Defaults, grouping, and duplicate policies follow
+the reviewed contracts above. Any further finding that changes row coverage,
+supported key representation, error semantics, or publication requires RFC
+review rather than an unrecorded task-local change. [U3] [U9] [U10] [U11]
 
 ## Future Work
 
@@ -680,6 +780,8 @@ than an unrecorded task-local change. [U3]
   optional search optimization. [U7]
 - Reference compaction, fused merge/packing, adaptive fill factors, and other
   measured memory/throughput improvements that preserve these contracts.
+- Optional fail-fast duplicate validation with explicit diagnostic-selection
+  and accepted-work settlement contracts. [U10]
 
 ## References
 

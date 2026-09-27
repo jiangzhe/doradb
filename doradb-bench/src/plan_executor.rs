@@ -169,7 +169,15 @@ pub async fn execute_plan(storage_root: PathBuf, plan_source: PathBuf) -> Result
 
     let reopen_config = loaded.engine_config.clone();
     let mut owner = Some(Engine::bootstrap(loaded.engine_config).await?);
-    let operation_result = execute_phases(&mut owner, &reopen_config, &clock, &loaded.plan).await;
+    // Phase orchestration retains bootstrap futures and diagnostic snapshots.
+    // Allocate its large state once, before any workload measurement window.
+    let operation_result = Box::pin(execute_phases(
+        &mut owner,
+        &reopen_config,
+        &clock,
+        &loaded.plan,
+    ))
+    .await;
     if let Some(engine) = owner.take() {
         engine.shutdown();
         drop(engine);

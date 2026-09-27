@@ -138,7 +138,7 @@ impl RecoveryConfig {
 mod tests {
     use super::*;
     use crate::Engine;
-    use crate::conf::{EngineConfig, ThreadPoolConfig};
+    use crate::conf::{EngineConfig, HotIndexBuildConfig, ThreadPoolConfig};
     use crate::error::ErrorKind;
     use tempfile::TempDir;
 
@@ -167,6 +167,9 @@ mod tests {
         ] {
             let config = EngineConfig::default()
                 .thread_pool(ThreadPoolConfig::default().worker_threads(workers))
+                // This fixture probes recovery's saturating arithmetic. Hot
+                // build's checked 4P calculation has separate rejection tests.
+                .hot_index_build(HotIndexBuildConfig::default().max_workers(Some(1)))
                 .recovery(
                     default
                         .clone()

@@ -115,8 +115,8 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
-`mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `index_buffer`,
-`data_buffer`, and `file`; `meta_buffer_size` is an `[engine]` leaf.
+`mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `hot_index_build`,
+`index_buffer`, `data_buffer`, and `file`; `meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
 `concurrency_limit` because orchestration always uses one runner.
 `[table_scan]` accepts `lwc_blocks_per_partition` and
@@ -125,6 +125,27 @@ range is `1..=8192`. Byte inputs are strings such as `"512 MiB"`. The canonical
 result records the complete normalized engine configuration, including both
 effective table-scan counts. Normalized result documents must include the
 `table_scan` table.
+
+### Hot-index build settings
+
+`[engine.hot_index_build]` accepts `max_scratch_bytes` (default `"256 MiB"`),
+`max_workers` (default: the configured thread-pool size), and
+`target_pages_per_run` (default 128). Limits must be positive, and explicit
+workers cannot exceed the pool size. These settings take effect in production
+CREATE/recovery builds when RFC 0032 caller integration is complete.
+
+The scratch limit and reported scratch peak cover bulk build buffers, including
+page descriptors, entries, and encoded keys. Small bookkeeping, bounded worker
+temporaries, and temporary capture-validation metadata are excluded, so these
+values do not represent total process memory.
+
+The default-enabled `profiling` feature records hot-build statistics. Disable
+it with `--no-default-features --features iouring` (or `libaio`) to remove
+measurement overhead. `include_stats` controls reporting. Hot-build metrics
+remain absent until caller integration; successful extraction counts separately
+from completed index construction. Counts and times use interval deltas for
+CREATE and cumulative values for recovery; memory and duration peaks are
+engine-lifetime maxima.
 
 ### Recovery settings
 

@@ -522,6 +522,7 @@ mod tests {
     use crate::recovery::packed::{OwnedReplayOp, decode_test_op, pool_snapshot};
     use crate::row::ops::UpdateCol;
     use crate::row::{RowPage, RowRead};
+    use crate::table::RowPageDescriptor;
     use crate::table::tests::{create_table2_for_test, lightweight_test_engine_config};
     use crate::value::Val;
     use futures::future::poll_fn;
@@ -693,11 +694,14 @@ mod tests {
                     .await
                     .unwrap();
                 let start = page.page().header.start_row_id;
-                dispatch
-                    .page_history
-                    .entry(table_id)
-                    .or_default()
-                    .insert(page_id, RowReplayState::new(page_id, 128));
+                dispatch.page_history.entry(table_id).or_default().insert(
+                    page_id,
+                    RowReplayState::new(RowPageDescriptor {
+                        page_id,
+                        start_row_id: start,
+                        end_row_id: start + 128,
+                    }),
+                );
                 allocated.push((page_id, start));
             }
             Self {

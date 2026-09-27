@@ -13,11 +13,17 @@ path = "src/bin/doradb_bench.rs"
 [lints]
 workspace = true
 
+[features]
+default = ["iouring", "profiling"]
+iouring = ["doradb-storage/iouring"]
+libaio = ["doradb-storage/libaio"]
+profiling = ["doradb-storage/profiling"]
+
 [dependencies]
 blake3 = { workspace = true }
 byte-unit = { workspace = true }
 clap = { workspace = true }
-doradb-storage = { path = "../doradb-storage" }
+doradb-storage = { path = "../doradb-storage", default-features = false }
 easy-parallel = { workspace = true }
 event-listener = { workspace = true }
 hdrhistogram = { workspace = true }

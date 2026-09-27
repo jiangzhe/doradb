@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub struct EngineConfigOverlay {
     /// Finite sync/async thread-pool sizing overrides.
     pub thread_pool: ThreadPoolOverlay,
+    /// Per-index hot extraction limits.
+    pub hot_index_build: HotIndexBuildOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Deterministic table-scan planning overrides.
@@ -33,6 +35,7 @@ impl EngineConfigOverlay {
     #[inline]
     pub fn merge(&mut self, other: Self) {
         self.thread_pool.merge(other.thread_pool);
+        self.hot_index_build.merge(other.hot_index_build);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
@@ -42,6 +45,38 @@ impl EngineConfigOverlay {
         self.data_buffer.merge(other.data_buffer);
         self.file.merge(other.file);
     }
+}
+
+/// Strict per-index extraction overlay; omitted fields retain engine defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HotIndexBuildOverlay {
+    /// Scratch limit with byte units.
+    pub max_scratch_bytes: Option<Byte>,
+    /// Explicit maximum workers.
+    pub max_workers: Option<usize>,
+    /// Soft page target per run.
+    pub target_pages_per_run: Option<usize>,
+}
+
+impl HotIndexBuildOverlay {
+    fn merge(&mut self, other: Self) {
+        replace(&mut self.max_scratch_bytes, other.max_scratch_bytes);
+        replace(&mut self.max_workers, other.max_workers);
+        replace(&mut self.target_pages_per_run, other.target_pages_per_run);
+    }
+}
+
+/// Normalized per-index extraction configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedHotIndexBuildConfig {
+    /// Accounted scratch ceiling in bytes.
+    pub max_scratch_bytes: usize,
+    /// Effective worker limit.
+    pub max_workers: usize,
+    /// Soft page target per run.
+    pub target_pages_per_run: usize,
 }
 
 /// Strict deterministic table-scan planning overlay.
@@ -262,6 +297,8 @@ impl LogSyncValue {
 pub struct ResolvedEngineConfig {
     /// Finite sync/async thread-pool sizing.
     pub thread_pool: ResolvedThreadPoolConfig,
+    /// Normalized per-index hot extraction limits.
+    pub hot_index_build: ResolvedHotIndexBuildConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
     /// Startup recovery settings with automatic limits resolved.
@@ -284,6 +321,14 @@ impl ResolvedEngineConfig {
     #[inline]
     fn from_config(config: &EngineConfig) -> Self {
         Self {
+            hot_index_build: ResolvedHotIndexBuildConfig {
+                max_scratch_bytes: config.hot_index_build.max_scratch_bytes,
+                max_workers: config
+                    .hot_index_build
+                    .max_workers
+                    .expect("validated hot build workers"),
+                target_pages_per_run: config.hot_index_build.target_pages_per_run,
+            },
             thread_pool: ResolvedThreadPoolConfig {
                 worker_threads: config.thread_pool.worker_threads,
             },
@@ -495,6 +540,17 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.transaction.gc_buckets {
         transaction = transaction.gc_buckets(value);
     }
+    let mut hot_index_build = default.hot_index_build;
+    if let Some(value) = overlay.hot_index_build.max_scratch_bytes {
+        hot_index_build.max_scratch_bytes = byte_usize(value, "hot_index_build.max_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.hot_index_build.max_workers {
+        hot_index_build.max_workers = Some(value);
+    }
+    if let Some(value) = overlay.hot_index_build.target_pages_per_run {
+        hot_index_build.target_pages_per_run = value;
+    }
+
     let mut recovery = default.recovery;
     if let Some(value) = overlay.recovery.io_depth {
         recovery = recovery.io_depth(value);
@@ -550,6 +606,7 @@ pub fn resolve_engine_config(
     let config = EngineConfig::default()
         .storage_root(storage_root)
         .thread_pool(thread_pool)
+        .hot_index_build(hot_index_build)
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
         .trx(transaction)
@@ -958,5 +1015,62 @@ mod tests {
         assert_eq!(resolved.file.cow_file_max_size_bytes, 48 * 1024 * 1024);
         assert_eq!(resolved.file.catalog_file_name, "custom.mtb");
         assert_resolved_round_trip(&resolved);
+    }
+
+    /// Purpose: Preserve strict merged hot-build overrides and normalized automatic limits.
+    /// Expected: Leaf overrides round-trip with concrete workers and bytes; unknown fields and unusable limits fail.
+    #[test]
+    fn hot_build_overlay_merge_and_round_trip() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay = toml::from_str(
+            r#"
+            [thread_pool]
+            worker_threads = 4
+            [hot_index_build]
+            max_scratch_bytes = "32 MiB"
+            target_pages_per_run = 16
+        "#,
+        )
+        .unwrap();
+        overlay.merge(toml::from_str("[hot_index_build]\nmax_workers = 2\n").unwrap());
+        let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(config.hot_index_build.max_workers, Some(2));
+        assert_eq!(
+            resolved.hot_index_build,
+            ResolvedHotIndexBuildConfig {
+                max_scratch_bytes: 32 * 1024 * 1024,
+                max_workers: 2,
+                target_pages_per_run: 16,
+            }
+        );
+        let encoded = toml::to_string(&resolved).unwrap();
+        assert_eq!(
+            toml::from_str::<ResolvedEngineConfig>(&encoded).unwrap(),
+            resolved
+        );
+        assert!(toml::from_str::<EngineConfigOverlay>("[hot_index_build]\nunknown = 1").is_err());
+        for invalid in [
+            "max_workers = 0",
+            "max_workers = 5",
+            "target_pages_per_run = 0",
+            "max_scratch_bytes = \"0 B\"",
+        ] {
+            let mut changed = overlay.clone();
+            changed.merge(toml::from_str(&format!("[hot_index_build]\n{invalid}")).unwrap());
+            assert!(
+                resolve_engine_config(temp.path(), &changed).is_err(),
+                "{invalid}"
+            );
+        }
+        let automatic: EngineConfigOverlay =
+            toml::from_str("[thread_pool]\nworker_threads = 3").unwrap();
+        assert_eq!(
+            resolve_engine_config(temp.path(), &automatic)
+                .unwrap()
+                .1
+                .hot_index_build
+                .max_workers,
+            3
+        );
     }
 }

@@ -11,6 +11,7 @@
 //! encoded key and the leaf value is zero-width.
 
 use super::index_stream::{NonUniqueDiskTreeCandidateStream, UniqueDiskTreeCandidateStream};
+use super::secondary_index_encoder;
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
 use crate::catalog::{TableIndexMetadata, TableMetadata};
 use crate::error::{
@@ -32,7 +33,7 @@ use crate::index::util::Maskable;
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
-use crate::value::{Val, ValKind, ValType};
+use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -587,7 +588,7 @@ impl UniqueDiskTreeRuntime {
             index_spec.unique(),
             "unique DiskTree runtime received non-unique index spec"
         );
-        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, false));
+        let encoder = secondary_index_encoder(metadata, index_spec, false);
         Self::from_shape(Arc::new(encoder), file_kind, file, disk_pool)
     }
 }
@@ -611,7 +612,7 @@ impl NonUniqueDiskTreeRuntime {
             !index_spec.unique(),
             "non-unique DiskTree runtime received unique index spec"
         );
-        let encoder = BTreeKeyEncoder::new(index_key_types(metadata, index_spec, true));
+        let encoder = secondary_index_encoder(metadata, index_spec, true);
         Self::from_shape(Arc::new(encoder), file_kind, file, disk_pool)
     }
 }
@@ -2061,41 +2062,6 @@ fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
         }
     }
     Ok(())
-}
-
-/// Resolve the physical value types that form encoded DiskTree keys.
-///
-/// Non-unique trees append `RowID` to the logical key so exact entries sort by
-/// `(logical_key, row_id)` while using the same key encoder as runtime indexes.
-fn index_key_types(
-    metadata: &TableMetadata,
-    index_spec: &TableIndexMetadata,
-    append_row_id: bool,
-) -> Vec<ValType> {
-    assert!(
-        !index_spec.keys.is_empty(),
-        "secondary DiskTree invariant violated: index has no key columns"
-    );
-    let mut types = Vec::with_capacity(index_spec.keys.len() + usize::from(append_row_id));
-    for key in &index_spec.keys {
-        let col_no = key.column_ordinal.as_usize();
-        let ty = metadata
-            .col
-            .col_types()
-            .get(col_no)
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "secondary DiskTree invariant violated: column_no={col_no}, column_count={}",
-                    metadata.col.col_count()
-                )
-            });
-        types.push(ty);
-    }
-    if append_row_id {
-        types.push(ValType::new(ValKind::U64, false));
-    }
-    types
 }
 
 /// Ensure caller-provided batches are already in strict durable key order.

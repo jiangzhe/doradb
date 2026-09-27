@@ -1928,6 +1928,11 @@ mod tests {
         }
 
         #[inline]
+        fn is_allocated(&self, page_id: PageID) -> bool {
+            self.inner.is_allocated(page_id)
+        }
+
+        #[inline]
         fn create_base_guard(&self) -> PoolGuard {
             self.inner.create_base_guard()
         }
@@ -2011,6 +2016,13 @@ mod tests {
         ) -> impl Future<Output = RuntimeResult<Validation<FacadePageGuard<T>>>> + Send {
             self.inner.get_child_page(guard, p_guard, page_id, mode)
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InsertPageMode {
+        Shared,
+        Exclusive,
+        Reserved,
     }
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {
@@ -2102,13 +2114,6 @@ mod tests {
         } else {
             assert!(err.downcast_ref::<IoError>().is_some(), "{err:?}");
         }
-    }
-
-    #[derive(Clone, Copy, Debug)]
-    enum InsertPageMode {
-        Shared,
-        Exclusive,
-        Reserved,
     }
 
     async fn assert_insert_page_rollback(mode: InsertPageMode) {
