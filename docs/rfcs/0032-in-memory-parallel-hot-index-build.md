@@ -697,7 +697,9 @@ after both callers deliver the full pipeline and performance acceptance.
     completions using the same cancellation and settlement contract; the
     extraction coordinator is not a generic merge-job scope.
   - Phase-local Choices: Partition granularity and checked reference/boundary
-    representation within the empty-input and single-run contracts. Retain
+    representation within the empty-input and single-run contracts. Each cut
+    runs synchronously with stop checks between search iterations; consumers
+    yield between bounded merge pulls. Retain
     bounded validation state, local-proof reuse, and per-partition comparison
     suppression after the first conflict without skipping required consumption.
   - Validation: Compare every rank on small cases and seeded varied cases
@@ -725,10 +727,19 @@ after both callers deliver the full pipeline and performance acceptance.
     Test proof reuse, comparison suppression, bounded memory, borrowed-future
     cancellation and rejection of partial, repeated and foreign completions. [U6] [U7]
     [U9] [U10] [U11]
+  - After This Phase: Phase 3 consumes borrowed partition streams within the
+    accepted jobs and owns private-page cleanup. Installation requires settled
+    hot completion and any caller-required cold/hot validation; end-to-end
+    recovery and CREATE benchmarks follow their phase-4/5 integrations.
+    Backlog 000110 remains open for that program; backlog 000205 owns the
+    separately deferred fuzz harness over the now-implemented kernels.
   - Task Doc: `docs/tasks/000316-parallel-merge-and-hot-key-validation.md`
   - Task Issue: `#1115`
   - Phase Status: done
-  - Implementation Summary: Implemented bounded partition pull streams over resident runs with one shared co-rank computation per cut, reusable loser trees, 32,768-entry production batches, fused optional hot-key validation and deterministic conflict reduction. Retained preparation/consumption ledgers enforce bounded admission, cancellation-safe settlement, exact completion authority and Fatal precedence. Temporary primitive measurements and all required validation passed; no persistent benchmark suite or production caller/page-construction integration was added. [Task Resolve Sync: docs/tasks/000316-parallel-merge-and-hot-key-validation.md @ 2026-09-28]
+  - Implementation Summary: Implemented independent synchronous co-rank preparation, bounded loser-tree partition streams with 32,768-entry batches, optional fused validation and deterministic conflict reduction. Retained coordinators preserve bounded admission, cancellation-safe settlement, exact completion authority and Fatal precedence. Temporary benchmarks, workspace tests, code-generation checks and style/unsafe reviews are recorded in task 000316. Page packing, production caller integration and end-to-end benchmarks remain in phases 3–5. [Task Resolve Sync: docs/tasks/000316-parallel-merge-and-hot-key-validation.md @ 2026-09-28]
+  - Related Backlogs:
+    - `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`
+    - `docs/backlogs/000205-fuzz-n-way-hot-index-merge.md`
 
 - **Phase 3: Parallel Packed MemIndex Construction**
   - Scope: Implement byte-aware leaf planning, packed leaves and parent

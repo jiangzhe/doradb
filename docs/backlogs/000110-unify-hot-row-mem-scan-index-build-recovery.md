@@ -10,6 +10,7 @@ Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX 
 
 - [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md): the five-phase hot-build program.
 - [Task 000315](../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
+- [Task 000316](../tasks/000316-parallel-merge-and-hot-key-validation.md): implemented phase-2 partition streams and hot-key validation; primitive results are recorded, while page construction and caller integration remain open.
 - [Task 000306](../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
 - [Task 000156](../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
 - [Backlog 000104](000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
@@ -24,6 +25,9 @@ docs/tasks/000156-full-table-scan-mvcc.md; docs/tasks/000306-recovery-benchmark-
 docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md;
 docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 1
 
+docs/tasks/000316-parallel-merge-and-hot-key-validation.md;
+docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 2
+
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000306 measures and explains recovery cost. Changing construction order, parallel execution, temporary memory, and tree assembly across DDL and recovery is a separate design effort. The original scan-unification work was also outside task 000156's foreground MVCC scan scope.
@@ -33,6 +37,12 @@ docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 1
 - Phase-1 Defer Reason: Task 000315 deliberately delivers an internal extraction component; the complete production pipeline and its comparative performance acceptance belong to RFC 0032 phases 2-5. Its original task scope defers performance evaluation to caller integration, so this program-level source backlog remains open.
 - Phase-1 Findings: Both source adapters now produce immutable sorted runs with exact live-row coverage, admitted bulk scratch, bounded outstanding jobs, settled failures, and optional stage profiling. Recovery capture rejects incomplete registries using an independently captured row boundary. Component and workspace validation pass, but no standalone timing comparison or caller speedup is recorded. Existing CREATE/recovery benchmark reports omit hot-build metrics because production still uses the old builders.
 - Phase-1 Direction Hint: Retain finalized recovery descriptors across sequential index builds, preserve CREATE transaction exclusion through settlement, and consume the shared run/budget interfaces in the remaining phases. Use doradb-bench for serial, sorted-insertion, single-worker, and multi-worker comparisons with content verification outside timing. Report effective run counts, stage durations, bulk scratch versus process memory, wide-key skew, and longest synchronous sorts; do not infer performance from the correctness suite. RFC 0032's caller-selected duplicate policy governs the remaining implementation, including trusted recovery input and required CREATE UNIQUE validation.
+
+Phase-2 deferral update:
+
+- Defer Reason: Task 000316 completes the merge/validation component, while this backlog's acceptance requires packed-page construction, production recovery/CREATE integration and end-to-end comparisons in RFC 0032 phases 3–5. The program backlog remains open.
+- Findings: Independent synchronous cuts and bounded streams preserve exact ordering, source policy, duplicate ranking and cancellation-safe settlement. Primitive experiments support 32,768-entry batches and bounded validation memory; local sorting/checking dominates shuffled fixtures. Inline hints reduce merge work, while removing cut yields simplifies execution without establishing an overall speedup. No production page-building consumer or caller migration is present yet.
+- Direction Hint: Phase 3 should consume the bounded streams in the existing partition jobs, own private-page cleanup and require completed hot validation before installation. Phase 5 also needs cold/hot validation. Keep doradb-bench for end-to-end work after recovery phase 4 and CREATE phase 5; temporary primitive measurements belong in task records. Fuzz infrastructure is separately tracked by backlog 000205.
 
 ## Scope Hint
 
