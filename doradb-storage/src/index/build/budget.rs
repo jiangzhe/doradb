@@ -173,12 +173,6 @@ impl<T> BudgetedVec<T> {
         self.values.push(value);
     }
 
-    /// Remove a consumed prefix without changing its allocation admission.
-    #[inline]
-    pub(crate) fn drain_prefix(&mut self, count: usize) {
-        self.values.drain(..count);
-    }
-
     /// Drop elements while retaining both the allocation and its admission.
     #[inline]
     pub(crate) fn clear(&mut self) {

@@ -18,7 +18,7 @@ use crate::index::btree::algo::{
     try_plan_sibling_node,
 };
 use crate::index::btree::{
-    BTREE_BYTE_ZERO, BTREE_NODE_USABLE_SIZE, BTreeByte, BTreeNode, BTreeU64, BTreeValue,
+    BTREE_BYTE_ZERO, BTREE_NODE_USABLE_SIZE, BTreeByte, BTreeNode, BTreeSlot, BTreeU64, BTreeValue,
     PackedNodeSpace,
 };
 use crate::index::mem_index::MemIndex;
@@ -42,11 +42,8 @@ use crate::profiling::{HotMergeMeasurements, HotPackedLevel, HotPackedMeasuremen
 #[cfg(feature = "profiling")]
 use std::{mem::take, time::Instant};
 
-// Even zero-byte suffixes require an eight-byte slot and the leaf value.
-// Three maximal pages plus lookahead bound retained coordinates independently
-// of input size, batch size, and compression. The final two pages stay editable.
-const WINDOW_ENTRIES: usize = 3 * (BTREE_NODE_USABLE_SIZE / 9) + 1;
-const PARENT_WINDOW: usize = BTREE_NODE_USABLE_SIZE / 16 + 2;
+const INITIAL_CANDIDATES: usize = 64;
+const PARENT_WINDOW: usize = max_node_slots::<BTreeU64>() + 2;
 
 #[cfg(feature = "profiling")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -735,6 +732,79 @@ struct Packing<P: 'static> {
     ts: TrxID,
 }
 
+// A fixed allocation retains lookahead; consuming a prefix only advances head.
+// Initialized slots are reused after wraparound, without moving live entries.
+struct LeafWindow {
+    entries: BudgetedVec<HotEntryRef>,
+    head: usize,
+    len: usize,
+    capacity: usize,
+}
+
+impl LeafWindow {
+    fn new(budget: &MemoryBudget, capacity: usize) -> RuntimeOrFatalResult<Self> {
+        let mut entries = BudgetedVec::new(budget);
+        entries
+            .ensure_capacity(capacity, "packing window")
+            .change_context(RuntimeError::IndexAccess)?;
+        Ok(Self {
+            entries,
+            head: 0,
+            len: 0,
+            capacity,
+        })
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        self.len == self.capacity
+    }
+
+    #[inline]
+    fn get(&self, index: usize) -> Option<HotEntryRef> {
+        (index < self.len).then(|| self.entries[(self.head + index) % self.capacity])
+    }
+
+    #[inline]
+    fn push(&mut self, entry: HotEntryRef) {
+        assert!(
+            self.len < self.capacity,
+            "hot leaf window exceeds its admitted capacity"
+        );
+        let index = (self.head + self.len) % self.capacity;
+        if index == self.entries.len() {
+            self.entries.push_reserved(entry);
+        } else {
+            self.entries[index] = entry;
+        }
+        self.len += 1;
+    }
+
+    #[inline]
+    fn consume(&mut self, count: usize) {
+        assert!(
+            count <= self.len,
+            "hot leaf window consumption exceeds retained entries"
+        );
+        if count != 0 {
+            self.head = (self.head + count) % self.capacity;
+            self.len -= count;
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+}
+
 struct PackedLeafConsumer<P: 'static> {
     packing: Arc<Packing<P>>,
     stop: Arc<AtomicBool>,
@@ -762,13 +832,11 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         mut stream: PartitionMergeStream,
         value: fn(RowID) -> V,
     ) -> RuntimeOrFatalResult<CompletedPartition<BudgetedVec<ChildDescriptor>>> {
-        let mut window = BudgetedVec::new(&self.packing.runs.budget);
-        window
-            .ensure_capacity(
-                WINDOW_ENTRIES.min(stream.remaining_entries()),
-                "packing window",
-            )
-            .change_context(RuntimeError::IndexAccess)?;
+        // Retain three maximal pages plus lookahead so the final two pages
+        // remain editable. Specialize the conservative bound for the value size.
+        let window_capacity = (3 * max_node_slots::<V>() + 1).min(stream.remaining_entries());
+        let mut window = LeafWindow::new(&self.packing.runs.budget, window_capacity)?;
+        let mut entries = BudgetedVec::new(&self.packing.runs.budget);
         let mut leaves = BudgetedVec::new(&self.packing.runs.budget);
         let (left, upper) = stream.neighbors();
         let mut lower = None;
@@ -789,13 +857,13 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
                         lower = left.map(|_| coordinate);
                         first = false;
                     }
-                    window.push_reserved(coordinate);
-                    if window.len() == WINDOW_ENTRIES {
+                    window.push(coordinate);
+                    if window.is_full() {
                         let count = self
-                            .leaf::<V>(&window, lower, upper, value, &mut leaves)
+                            .leaf::<V>(&window, lower, upper, value, &mut entries, &mut leaves)
                             .await?;
-                        lower = Some(window[count]);
-                        window.drain_prefix(count);
+                        lower = window.get(count);
+                        window.consume(count);
                     }
                     if index % 1024 == 1023 {
                         yield_now().await;
@@ -804,52 +872,52 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
             }
             yield_now().await;
         }
-        while !window.is_empty() {
+        while window.len() != 0 {
             observe_stop(&self.stop)?;
             let count = self
-                .leaf::<V>(&window, lower, upper, value, &mut leaves)
+                .leaf::<V>(&window, lower, upper, value, &mut entries, &mut leaves)
                 .await?;
-            lower = window.get(count).copied();
-            window.drain_prefix(count);
+            lower = window.get(count);
+            window.consume(count);
             yield_now().await;
         }
         stream.finish(leaves)
     }
 
-    async fn leaf<V: BTreeValue + Copy + Send + Sync>(
-        &self,
-        window: &[HotEntryRef],
+    async fn leaf<'a, V: BTreeValue + Copy + Send + Sync>(
+        &'a self,
+        window: &LeafWindow,
         lower: Option<HotEntryRef>,
         upper: Option<HotEntryRef>,
         value: fn(RowID) -> V,
+        entries: &mut BudgetedVec<PackedNodeEntry<'a, V>>,
         leaves: &mut BudgetedVec<ChildDescriptor>,
     ) -> RuntimeOrFatalResult<usize> {
         #[cfg(feature = "profiling")]
         let started = Instant::now();
-        let mut entries = BudgetedVec::new(&self.packing.runs.budget);
-        entries
-            .ensure_capacity(window.len(), "packing entries")
-            .change_context(RuntimeError::IndexAccess)?;
-        for &coordinate in window {
-            let entry = coordinate.resolve(&self.packing.runs);
-            entries.push_reserved(PackedNodeEntry {
-                key: entry.key.as_bytes(),
-                value: value(entry.row_id),
-            });
-        }
-        let plan = try_plan_sibling_node(
+        let mut count = plan_candidates(
+            entries,
+            window.len(),
             PackedNodePlanParams {
                 lower_fence: fence(&self.packing.runs, lower),
                 upper_fence: upper.map(|r| fence(&self.packing.runs, Some(r))),
                 min_slots: 1,
             },
-            &entries,
-        )
-        .ok_or_else(|| execution_error("hot leaf key/fences cannot fit a node"))?;
-        let mut count = plan.packed;
+            "packing entries",
+            |index| {
+                let coordinate = window
+                    .get(index)
+                    .unwrap_or_else(|| unreachable!("bounded leaf candidate index"));
+                let entry = coordinate.resolve(&self.packing.runs);
+                PackedNodeEntry {
+                    key: entry.key.as_bytes(),
+                    value: value(entry.row_id),
+                }
+            },
+        )?;
         // A singleton final tail is legal, but repair it whenever the two final
         // candidates can share their entries under the newly proposed fences.
-        if count + 1 == entries.len() && count > 2 {
+        if count + 1 == window.len() && count > 2 {
             let cut = count - 1;
             if fits::<V>(
                 fence(&self.packing.runs, lower),
@@ -863,7 +931,7 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
                 count = cut;
             }
         }
-        let high = window.get(count).copied().or(upper);
+        let high = window.get(count).or(upper);
         if let Some(high) = high
             && entries[count - 1].key >= fence(&self.packing.runs, Some(high))
         {
@@ -908,6 +976,49 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         });
         page.set_dirty();
         Ok(count)
+    }
+}
+
+// Even zero-byte key suffixes need a slot and an encoded value. Ignoring the
+// header and fences gives a cheap upper bound independent of compression.
+const fn max_node_slots<V: BTreeValue>() -> usize {
+    BTREE_NODE_USABLE_SIZE / (size_of::<BTreeSlot>() + V::ENCODED_LEN)
+}
+
+fn plan_candidates<'a, V: BTreeValue + Copy>(
+    entries: &mut BudgetedVec<PackedNodeEntry<'a, V>>,
+    available: usize,
+    params: PackedNodePlanParams<'a>,
+    purpose: &'static str,
+    mut entry: impl FnMut(usize) -> PackedNodeEntry<'a, V>,
+) -> RuntimeOrFatalResult<usize> {
+    // One extra candidate supplies the upper fence even for a maximal node.
+    let limit = available.min(max_node_slots::<V>() + 1);
+    let mut count = limit.min(INITIAL_CANDIDATES);
+    entries.clear();
+    loop {
+        entries
+            .ensure_capacity(count, purpose)
+            .change_context(RuntimeError::IndexAccess)?;
+        for index in entries.len()..count {
+            entries.push_reserved(entry(index));
+        }
+        let plan = try_plan_sibling_node(params, entries);
+        if count < limit {
+            let reaches_end = plan.is_some_and(|plan| plan.packed + 1 >= count);
+            // The existing planner can stop at overflow once the prefix is inline.
+            // An outlined prefix may still shrink and free space at a later fence.
+            let prefix_can_shrink =
+                PackedNodeSpace::with_fences(params.lower_fence, entries[count - 1].key)
+                    .is_none_or(|space| !space.prefix_is_inline());
+            if reaches_end || prefix_can_shrink {
+                count = (count * 2).min(limit);
+                continue;
+            }
+        }
+        return plan
+            .map(|plan| plan.packed)
+            .ok_or_else(|| execution_error("hot node key/fences cannot fit a page"));
     }
 }
 
@@ -958,30 +1069,29 @@ async fn plan_groups(
     children: &[ChildDescriptor],
 ) -> RuntimeOrFatalResult<BudgetedVec<Range<usize>>> {
     let mut groups = BudgetedVec::new(&runs.budget);
+    let mut entries = BudgetedVec::new(&runs.budget);
     let mut start = 0;
     while start < children.len() {
         let end = children.len().min(start + PARENT_WINDOW);
         let header = usize::from(children[start].lower.is_none());
-        let mut entries = BudgetedVec::new(&runs.budget);
-        entries
-            .ensure_capacity(end - start - header, "parent planning window")
-            .change_context(RuntimeError::IndexAccess)?;
-        for child in &children[start + header..end] {
-            entries.push_reserved(PackedNodeEntry {
-                key: fence(runs, child.lower),
-                value: BTreeU64::from(child.page_id),
-            });
-        }
-        let plan = try_plan_sibling_node(
+        let packed = plan_candidates(
+            &mut entries,
+            end - start - header,
             PackedNodePlanParams {
                 lower_fence: fence(runs, children[start].lower),
                 upper_fence: children[end - 1].upper.map(|r| fence(runs, Some(r))),
                 min_slots: 1,
             },
-            &entries,
-        )
-        .ok_or_else(|| execution_error("branch separators cannot fit a parent"))?;
-        let mut count = plan.packed + header;
+            "parent planning window",
+            |index| {
+                let child = children[start + header + index];
+                PackedNodeEntry {
+                    key: fence(runs, child.lower),
+                    value: BTreeU64::from(child.page_id),
+                }
+            },
+        )?;
+        let mut count = packed + header;
         if start + count + 1 == children.len() && count > 2 {
             let cut = start + count - 1;
             if branch_fits(runs, &children[start..cut]) && branch_fits(runs, &children[cut..]) {
@@ -1319,6 +1429,233 @@ mod tests {
                     .map(|entry| (entry.key.clone(), entry.row_id))
             })
             .collect()
+    }
+
+    fn assert_candidate_plans<V: BTreeValue + Copy>(keys: &[BTreeKey], value: V) {
+        let budget = MemoryBudget::new(1024 * 1024);
+        let mut entries = BudgetedVec::new(&budget);
+        for (start, count) in [
+            (1, 1),
+            (1, 63),
+            (1, 64),
+            (1, 65),
+            (1, 127),
+            (1, 128),
+            (1, 129),
+            (1, keys.len() - 2),
+            (64, keys.len() - 65),
+            (keys.len() - 2, 1),
+        ] {
+            for open in [false, true] {
+                let remaining = &keys[start..start + count];
+                let params = PackedNodePlanParams {
+                    lower_fence: if open { &[] } else { remaining[0].as_bytes() },
+                    upper_fence: (!open).then(|| keys[start + count].as_bytes()),
+                    min_slots: 1,
+                };
+                let full: Vec<_> = remaining
+                    .iter()
+                    .map(|key| PackedNodeEntry {
+                        key: key.as_bytes(),
+                        value,
+                    })
+                    .collect();
+                let expected = try_plan_sibling_node(params, &full).map(|plan| plan.packed);
+                let actual = plan_candidates(
+                    &mut entries,
+                    full.len(),
+                    params,
+                    "packing entries",
+                    |index| full[index],
+                );
+                assert_eq!(
+                    actual.ok(),
+                    expected,
+                    "start={start}, count={count}, open={open}"
+                );
+                assert!(entries.capacity() <= max_node_slots::<V>() + 1);
+            }
+        }
+    }
+
+    /// Purpose: Protect retained leaf order and allocation reuse across circular-window wraparound and reset.
+    /// Expected: Consumed and refilled windows match a queue oracle without moving or reallocating backing storage.
+    #[test]
+    fn packed_leaf_window_wraparound() {
+        use std::collections::VecDeque;
+        let runs = input(100, 8, 0, DuplicateCheck::Skip);
+        for capacity in [0, 1, 7, 64] {
+            let budget = MemoryBudget::new(4096);
+            let mut window = LeafWindow::new(&budget, capacity).unwrap();
+            let allocation = window.entries.as_ptr();
+            let mut expected = VecDeque::new();
+            for round in 0..100 {
+                while !window.is_full() {
+                    let entry = HotEntryRef::new(&runs, round % 4, (round + window.len()) % 25);
+                    window.push(entry);
+                    expected.push_back(entry);
+                }
+                for (index, &entry) in expected.iter().enumerate() {
+                    assert_eq!(window.get(index), Some(entry));
+                }
+                assert_eq!(window.get(expected.len()), None);
+                assert_eq!(window.entries.as_ptr(), allocation);
+                assert_eq!(budget.used(), capacity * size_of::<HotEntryRef>());
+                let count = (round % 5 + 1).min(expected.len());
+                let retained = window.entries.to_vec();
+                window.consume(count);
+                assert_eq!(&*window.entries, retained.as_slice());
+                expected.drain(..count);
+                assert_eq!(window.len(), expected.len());
+                if round % 11 == 10 {
+                    window.clear();
+                    expected.clear();
+                }
+            }
+            drop(window);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    /// Purpose: Protect bounded planning against changing widths, candidate boundaries and open or compressed fences.
+    /// Expected: Both value specializations select the same prefix as full-window planning within a single-page scratch bound.
+    #[test]
+    fn packed_candidate_plans_match_full_window() {
+        use rand::{RngExt, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+        for (count, width, prefix) in [(20_000, 8, 0), (500, 8192, 0), (15_000, 8, 512)] {
+            let keys: Vec<_> = (0..count).map(|i| key(i, width, prefix)).collect();
+            assert_candidate_plans(&keys, BTreeU64::from(0));
+            assert_candidate_plans(&keys, BTREE_BYTE_ZERO);
+        }
+        let mut rng = ChaCha8Rng::seed_from_u64(317_001);
+        let keys: Vec<_> = (0..3000)
+            .map(|i| key(i, if rng.random_ratio(1, 8) { 2048 } else { 8 }, 0))
+            .collect();
+        assert_candidate_plans(&keys, BTreeU64::from(0));
+        assert_candidate_plans(&keys, BTREE_BYTE_ZERO);
+    }
+
+    /// Purpose: Protect planning when a later shorter prefix frees enough space after an earlier overflow.
+    /// Expected: Geometric probing passes the apparent interior split and keeps the later fitting prefix.
+    #[test]
+    fn packed_candidate_prefix_shrink() {
+        use crate::index::btree::BTreeHeader;
+        let mut keys: Vec<_> = (0..63u32)
+            .map(|i| {
+                let mut bytes = vec![b'p'; 16];
+                bytes.push(b'a');
+                bytes.extend_from_slice(&i.to_be_bytes()[1..]);
+                bytes
+            })
+            .collect();
+        // At the long fence, the first 63 byte-valued entries overflow by three
+        // bytes. The next fence makes the 17-byte prefix inline: 64 entries fit.
+        let wide_len = BTREE_NODE_USABLE_SIZE + 3 - size_of::<BTreeHeader>() - 63 * 9;
+        let mut wide = vec![b'p'; 16];
+        wide.extend_from_slice(b"a\xff");
+        wide.resize(wide_len, 0);
+        keys.push(wide);
+        for suffix in *b"bcd" {
+            let mut bytes = vec![b'p'; 16];
+            bytes.push(suffix);
+            keys.push(bytes);
+        }
+        let mut upper = vec![b'p'; 16];
+        upper.extend_from_slice(&[b'z'; 20]);
+        let full: Vec<_> = keys
+            .iter()
+            .map(|key| PackedNodeEntry {
+                key,
+                value: BTREE_BYTE_ZERO,
+            })
+            .collect();
+        let params = PackedNodePlanParams {
+            lower_fence: &keys[0],
+            upper_fence: Some(&upper),
+            min_slots: 1,
+        };
+        assert_eq!(
+            try_plan_sibling_node(params, &full[..64]).unwrap().packed,
+            62
+        );
+        assert_eq!(try_plan_sibling_node(params, &full).unwrap().packed, 64);
+        assert!(!fits::<BTreeByte>(&keys[0], &keys[63], &full[..63]));
+        assert!(fits::<BTreeByte>(&keys[0], &keys[64], &full[..64]));
+        let mut entries = BudgetedVec::new(&MemoryBudget::new(4096));
+        assert_eq!(
+            plan_candidates(&mut entries, full.len(), params, "packing entries", |i| {
+                full[i]
+            })
+            .unwrap(),
+            64
+        );
+    }
+
+    /// Purpose: Protect bounded work and retained scratch allocation across repeated wide-key node plans.
+    /// Expected: Each plan resolves only its small candidate prefix, and reused capacity succeeds even when new admission is rejected.
+    #[test]
+    fn packed_candidate_buffer_reuse() {
+        let keys: Vec<_> = (0..500).map(|i| key(i, 2048, 0)).collect();
+        let budget = MemoryBudget::new(64 * 1024);
+        let mut entries = BudgetedVec::new(&budget);
+        let params = PackedNodePlanParams {
+            lower_fence: &[],
+            upper_fence: None,
+            min_slots: 1,
+        };
+        let mut resolved = 0;
+        let mut entry = |i: usize| {
+            resolved += 1;
+            PackedNodeEntry {
+                key: keys[i].as_bytes(),
+                value: BTreeU64::from(0),
+            }
+        };
+        let first = plan_candidates(
+            &mut entries,
+            keys.len(),
+            params,
+            "packing entries",
+            &mut entry,
+        )
+        .unwrap();
+        let allocation = entries.as_ptr();
+        budget::fail_at(&budget, "packing entries");
+        let second = plan_candidates(
+            &mut entries,
+            keys.len(),
+            params,
+            "packing entries",
+            &mut entry,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(resolved, 128);
+        assert_eq!(entries.as_ptr(), allocation);
+        assert_eq!(
+            budget.used(),
+            64 * size_of::<PackedNodeEntry<'_, BTreeU64>>()
+        );
+        // A later narrow-key page needs more candidates. Failed growth must
+        // preserve the original allocation and its admission for cleanup.
+        let narrow: Vec<_> = (0..500).map(|i| key(i, 8, 0)).collect();
+        assert!(
+            plan_candidates(&mut entries, narrow.len(), params, "packing entries", |i| {
+                PackedNodeEntry {
+                    key: narrow[i].as_bytes(),
+                    value: BTreeU64::from(0),
+                }
+            },)
+            .is_err()
+        );
+        assert_eq!(entries.as_ptr(), allocation);
+        assert_eq!(
+            budget.used(),
+            64 * size_of::<PackedNodeEntry<'_, BTreeU64>>()
+        );
+        drop(entries);
+        assert_eq!(budget.used(), 0);
     }
 
     /// Purpose: Protect streaming packed contents, fences, value specialization and fixed-root ownership across input shapes.
