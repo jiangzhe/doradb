@@ -154,7 +154,21 @@ pub(crate) struct BudgetedVec<T> {
 }
 
 impl<T> BudgetedVec<T> {
+    /// Drop elements while retaining both the allocation and its admission.
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    /// Return allocated element capacity, independent of the current length.
+    #[cfg(any(test, feature = "profiling"))]
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
     /// Construct an empty charged vector without allocating element storage.
+    #[inline]
     pub(crate) fn new(budget: &MemoryBudget) -> Self {
         Self {
             values: Vec::new(),
@@ -191,6 +205,7 @@ impl<T> BudgetedVec<T> {
     }
 
     /// Append an element after admitting geometric capacity growth.
+    #[inline]
     pub(crate) fn push(&mut self, value: T, purpose: &'static str) -> ResourceResult<()> {
         if self.values.len() == self.values.capacity() {
             let capacity = self
@@ -216,12 +231,14 @@ impl<T> BudgetedVec<T> {
 impl<T> Deref for BudgetedVec<T> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &[T] {
         &self.values
     }
 }
 
 impl<T> DerefMut for BudgetedVec<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.values
     }
