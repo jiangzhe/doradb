@@ -1,6 +1,6 @@
 ---
 name: task-prune
-description: Inspect and optionally remove completed Doradb task worktrees and their local branches with deterministic safety checks. Use when listing cleanup candidates or pruning implemented, clean, fully pushed task worktrees from the main dispatch checkout; never delete remote branches.
+description: Inspect and optionally remove completed Doradb task worktrees and their local branches with deterministic safety checks. Use when listing cleanup candidates or pruning clean task worktrees marked implemented both locally and on origin/main, from the main dispatch checkout; never delete remote branches.
 ---
 
 # Task Prune Workflow
@@ -24,8 +24,12 @@ tools/task.rs purge-worktrees
 5. Mark a worktree safe only when all conditions hold:
    - its matching task document has `status: implemented`;
    - the worktree is clean;
-   - a same-name remote branch exists;
-   - that remote branch already contains the local tip.
+   - exactly one matching `docs/tasks/<task-id>-*.md` document on
+     `origin/main` has `status: implemented`;
+   - it contains no other registered worktree.
+   The task document on `origin/main` is the completion authority; neither a
+   same-name remote task branch nor local-tip ancestry is required. Apply mode
+   refreshes `origin` before checking eligibility; dry runs use locally available refs.
 6. Report candidates under `safe_to_purge`, `unfinished`, and `excluded`, with
    reasons for every non-safe worktree.
 7. Apply removal only after explicit user intent:
@@ -43,5 +47,6 @@ Apply mode may act only on direct children of the dispatch root matching
 - the local branch via `git branch -D`.
 
 Never delete a remote branch. Treat missing task documents, non-implemented
-status, dirty worktrees, missing remote branches, or unpushed local tips as
-hard reasons to retain the worktree.
+status, dirty worktrees, missing `origin/main`, missing or ambiguous task documents
+on `origin/main`, non-implemented status on `origin/main`, or nested registered
+worktrees as hard reasons to retain the worktree.
