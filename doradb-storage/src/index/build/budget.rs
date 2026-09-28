@@ -154,6 +154,25 @@ pub(crate) struct BudgetedVec<T> {
 }
 
 impl<T> BudgetedVec<T> {
+    /// Admit the next insertion before performing work that cannot fail or await.
+    #[inline]
+    pub(crate) fn reserve_one(&mut self, purpose: &'static str) -> ResourceResult<()> {
+        if self.values.len() == self.values.capacity() {
+            self.ensure_capacity(self.values.capacity().max(4).saturating_mul(2), purpose)?;
+        }
+        Ok(())
+    }
+
+    /// Append to already admitted storage without allocation or failure.
+    #[inline]
+    pub(crate) fn push_reserved(&mut self, value: T) {
+        assert!(
+            self.values.len() < self.values.capacity(),
+            "hot-build reserved insertion has no capacity"
+        );
+        self.values.push(value);
+    }
+
     /// Drop elements while retaining both the allocation and its admission.
     #[inline]
     pub(crate) fn clear(&mut self) {

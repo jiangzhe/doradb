@@ -123,47 +123,38 @@ pub(crate) fn plan_sibling_node<'a, V>(
 where
     V: BTreeValue + Copy,
 {
-    assert!(
-        params.min_slots <= entries.len(),
-        "B-tree pack invariant violated: minimum slot count {} exceeds entry count {}",
-        params.min_slots,
-        entries.len()
-    );
+    try_plan_sibling_node(params, entries)
+        .unwrap_or_else(|| panic!("B-tree pack invariant violated: no sibling plan fits the node"))
+}
 
-    let rightmost_count = entries.len();
+/// Plan a bounded candidate window, rejecting unrepresentable fences or entries.
+pub(crate) fn try_plan_sibling_node<'a, V>(
+    params: PackedNodePlanParams<'a>,
+    entries: &'a [PackedNodeEntry<'a, V>],
+) -> Option<PackedNodePlan<'a>>
+where
+    V: BTreeValue + Copy,
+{
+    if params.min_slots > entries.len() {
+        return None;
+    }
     if let Some(space) = packed_node_space::<V>(
         params.lower_fence,
         params.upper_fence,
         entries,
-        rightmost_count,
+        entries.len(),
     ) && space.total_space() <= BTREE_NODE_USABLE_SIZE
     {
-        return PackedNodePlan {
-            packed: rightmost_count,
+        return Some(PackedNodePlan {
+            packed: entries.len(),
             upper_fence: params.upper_fence,
-        };
+        });
     }
-
-    assert!(
-        rightmost_count != 0,
-        "B-tree pack invariant violated: rightmost sibling plan contains no entries"
-    );
-
-    let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries);
-    let upper_fence = packed_sibling_upper_fence(entries, packed);
-    let Some(space) = packed_node_space::<V>(params.lower_fence, upper_fence, entries, packed)
-    else {
-        panic!("B-tree pack invariant violated: packed sibling fences do not fit");
-    };
-    assert!(
-        space.total_space() <= BTREE_NODE_USABLE_SIZE,
-        "B-tree pack invariant violated: packed sibling size {} exceeds usable size {BTREE_NODE_USABLE_SIZE}",
-        space.total_space()
-    );
-    PackedNodePlan {
+    let packed = select_finite_packed_count::<V>(params.lower_fence, params.min_slots, entries)?;
+    Some(PackedNodePlan {
         packed,
-        upper_fence,
-    }
+        upper_fence: packed_sibling_upper_fence(entries, packed),
+    })
 }
 
 /// Rebuild `dst` from a fixed range of slots in `src`.
@@ -313,8 +304,58 @@ where
     } else if right_count == right.count() {
         MemTreeSiblingMergePlan::Full
     } else {
-        MemTreeSiblingMergePlan::Partial { right_count }
+        // The policy estimate uses the right page's upper fence. A partial
+        // merge instead uses its selected separator, which can be much longer
+        // after mixing full bulk separators with truncated online separators.
+        // Keep the occupancy policy, but admit only representable final images.
+        let separator = right.create_sep_key(right_count, right.is_leaf());
+        if node_ranges_fit::<V>(
+            lower_fence,
+            &separator,
+            &[
+                NodeSlotRange {
+                    node: left,
+                    range: 0..left.count(),
+                },
+                NodeSlotRange {
+                    node: right,
+                    range: 0..right_count,
+                },
+            ],
+        ) && node_ranges_fit::<V>(
+            &separator,
+            upper_fence,
+            &[NodeSlotRange {
+                node: right,
+                range: right_count..right.count(),
+            }],
+        ) {
+            MemTreeSiblingMergePlan::Partial { right_count }
+        } else {
+            MemTreeSiblingMergePlan::NoProgress
+        }
     }
+}
+
+fn node_ranges_fit<V: BTreeValue>(
+    lower: &[u8],
+    upper: &[u8],
+    ranges: &[NodeSlotRange<'_>],
+) -> bool {
+    let Some(mut space) = PackedNodeSpace::with_fences(lower, upper) else {
+        return false;
+    };
+    for source in ranges {
+        for index in source.range.clone() {
+            if space
+                .add_entry::<V>(&source.node.key(index))
+                .is_none_or(|size| size > BTREE_NODE_USABLE_SIZE)
+            {
+                return false;
+            }
+        }
+    }
+    space.total_space() <= BTREE_NODE_USABLE_SIZE
 }
 
 /// Select the exclusive upper fence for a packed sibling.
@@ -413,7 +454,7 @@ fn select_finite_packed_count<V>(
     lower_fence: &[u8],
     min_slots: usize,
     entries: &[PackedNodeEntry<'_, V>],
-) -> usize
+) -> Option<usize>
 where
     V: BTreeValue + Copy,
 {
@@ -430,7 +471,7 @@ where
         let Some(space) = PackedNodeSpace::with_fences(lower_fence, upper_fence) else {
             continue;
         };
-        if !fences_fit(lower_fence, upper_fence) {
+        if space.total_space() > BTREE_NODE_USABLE_SIZE {
             if space.prefix_is_inline() {
                 break;
             }
@@ -438,37 +479,22 @@ where
         }
         let prefix_len = space.prefix_len();
         if active_prefix_len != Some(prefix_len) || included_count > packed {
-            let Some(recomputed_space) =
-                entries[..packed].iter().try_fold(0usize, |total, entry| {
-                    let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
-                    total.checked_add(entry_space)
-                })
-            else {
-                panic!(
-                    "B-tree pack invariant violated: included entry space cannot be represented"
-                );
-            };
-            included_space = recomputed_space;
+            included_space = entries[..packed].iter().try_fold(0usize, |total, entry| {
+                let entry_space = PackedNodeSpace::entry_space::<V>(entry.key, prefix_len)?;
+                total.checked_add(entry_space)
+            })?;
             active_prefix_len = Some(prefix_len);
             included_count = packed;
         } else {
             while included_count < packed {
-                let Some(entry_space) =
-                    PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)
-                else {
-                    panic!("B-tree pack invariant violated: entry space cannot be represented");
-                };
-                included_space = included_space.checked_add(entry_space).unwrap_or_else(|| {
-                    panic!("B-tree pack invariant violated: included entry space overflow")
-                });
+                let entry_space =
+                    PackedNodeSpace::entry_space::<V>(entries[included_count].key, prefix_len)?;
+                included_space = included_space.checked_add(entry_space)?;
                 included_count += 1;
             }
         }
 
-        let total_space = space
-            .total_space()
-            .checked_add(included_space)
-            .unwrap_or_else(|| panic!("B-tree pack invariant violated: total space overflow"));
+        let total_space = space.total_space().checked_add(included_space)?;
         if total_space <= BTREE_NODE_USABLE_SIZE {
             best = Some(packed);
         } else if space.prefix_is_inline() {
@@ -476,9 +502,7 @@ where
         }
     }
 
-    best.unwrap_or_else(|| {
-        panic!("B-tree pack invariant violated: no finite sibling count fits the node")
-    })
+    best
 }
 
 fn estimate_packed_node_space<V>(

@@ -11,6 +11,7 @@ Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX 
 - [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md): the five-phase hot-build program.
 - [Task 000315](../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
 - [Task 000316](../tasks/000316-parallel-merge-and-hot-key-validation.md): implemented phase-2 partition streams and hot-key validation; primitive results are recorded, while page construction and caller integration remain open.
+- [Task 000317](../tasks/000317-parallel-packed-memindex-construction.md): implemented phase-3 packed MemIndex construction, fixed-root installation and caller-owned cleanup; production integration and end-to-end acceptance remain open.
 - [Task 000306](../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
 - [Task 000156](../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
 - [Backlog 000104](000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
@@ -28,6 +29,9 @@ docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 1
 docs/tasks/000316-parallel-merge-and-hot-key-validation.md;
 docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 2
 
+docs/tasks/000317-parallel-packed-memindex-construction.md;
+docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 3
+
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000306 measures and explains recovery cost. Changing construction order, parallel execution, temporary memory, and tree assembly across DDL and recovery is a separate design effort. The original scan-unification work was also outside task 000156's foreground MVCC scan scope.
@@ -44,6 +48,29 @@ Phase-2 deferral update:
 - Findings: Independent synchronous cuts and bounded streams preserve exact ordering, source policy, duplicate ranking and cancellation-safe settlement. Primitive experiments support 32,768-entry batches and bounded validation memory; local sorting/checking dominates shuffled fixtures. Inline hints reduce merge work, while removing cut yields simplifies execution without establishing an overall speedup. No production page-building consumer or caller migration is present yet.
 - Direction Hint: Phase 3 should consume the bounded streams in the existing partition jobs, own private-page cleanup and require completed hot validation before installation. Phase 5 also needs cold/hot validation. Keep doradb-bench for end-to-end work after recovery phase 4 and CREATE phase 5; temporary primitive measurements belong in task records. Fuzz infrastructure is separately tracked by backlog 000205.
 
+Phase-3 deferral update:
+
+- Defer Reason: Task 000317 completes private page construction and installation.
+  This program backlog remains open for recovery/CREATE migration and integrated
+  performance acceptance in RFC 0032 phases 4 and 5; closing it as implemented
+  would incorrectly claim those caller contracts are delivered.
+- Findings: Packed leaves, globally grouped parents and fixed-root installation
+  preserve normal B-tree mutation and reclamation. Cleanup is handed to the
+  caller before construction and requires no additional worker-pool admission.
+  Cancelled cleanup can resume, while unsafe failure retains exact ownership
+  under Fatal poison. Reused candidate buffers and a circular window reduced
+  final component medians from 1.885 to 1.621 ms for narrow keys, 3.123 to 2.202 ms
+  for wide keys and 15.436 to 3.572 ms for random mixed-width keys. These are
+  component measurements, not production recovery or CREATE speedups.
+- Direction Hint: Recovery must retain and drive cleanup after bootstrap
+  cancellation before storage teardown; withholding the engine handle alone
+  does not execute cleanup, and mandatory-runtime workers start after recovery.
+  CREATE INDEX must retain cleanup inside its accepted mandatory operation,
+  including panic/abort paths and cold/hot validation failure. Preserve Fatal
+  precedence and run end-to-end comparisons after each caller integration.
+  Measure byte-work skew, tiny-input crossover, serial-parent scheduling,
+  retained cold memory and pool I/O. Keep the separate fuzz follow-up in 000205.
+
 ## Scope Hint
 
 Cover unique and non-unique hot secondary-index construction for both CREATE INDEX and recovery, including multiple indexes, current hot-row filtering, and the captured cold/hot boundary. Integrate a common hot-row input abstraction where useful. Design incremental temporary-memory budgets, backpressure, worker ownership, and cleanup independently of the final index's unavoidable memory footprint. Keep foreground MVCC scan semantics, DDL visibility/exclusion, recovery replay ordering, and existing checkpointed cold roots intact. Coordinate shared split/sort/scheduling/tree-build mechanisms with 000104 without absorbing its cold LWC decoding and durable publication work. Parallel redo replay was implemented by [task 000309](../tasks/000309-pipelined-recovery-with-parallel-page-replay.md), closing [backlog 000087](closed/000087-refactor-recovery-process-parallel-log-replay.md).
@@ -52,7 +79,7 @@ Cover unique and non-unique hot secondary-index construction for both CREATE IND
 
 - Both callers use the shared hot-build mechanism, or document the precise caller-specific adapters, with bounded worker count and temporary memory.
 - Built unique and non-unique indexes match a serial reference across empty, large, skewed, multi-index, deleted/updated, and mixed cold/hot fixtures; non-unique ordering includes RowID tie-breaking.
-- Duplicate detection works within and across worker/key-range boundaries. CREATE UNIQUE INDEX preserves typed DuplicateKey failures for hot/hot and cold/hot conflicts; recovery preserves its existing integrity-error behavior. Failed or interrupted work cannot publish partial roots/layouts, leak buffers/pages, or leave workers undrained; preserve current poison, shutdown, and accepted-DDL cleanup contracts.
+- Duplicate detection works within and across worker/key-range boundaries. CREATE UNIQUE INDEX preserves typed DuplicateKey failures for hot/hot and cold/hot conflicts. Recovery selects trusted input under RFC 0032's recovered-data/exact-coverage invariants; explicitly checked adapters retain typed integrity errors. Failed or interrupted work cannot publish partial roots/layouts, leak buffers/pages, or leave workers undrained; preserve current poison, shutdown, and accepted-DDL cleanup contracts.
 - Tests cover CREATE INDEX followed by reads/restart, recovery content verification, and failures during build/assembly/publication.
 - Benchmarks report end-to-end CREATE INDEX and recovery latency, rebuild stages, CPU attribution, temporary-memory high-water marks, and worker scaling. Compare unsorted insertion, sorted sequential construction, and bounded parallel construction on identical data; keep correctness verification outside the recovery timer. Report measured improvements and cases where a sequential fallback is preferable.
 

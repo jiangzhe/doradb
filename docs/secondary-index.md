@@ -209,5 +209,9 @@ Construction may proceed privately while validation runs. Publication requires
 complete construction and all required checks to succeed. Failed or cancelled
 builds must release their resources without exposing a partial index.
 
-Extraction, merging, and hot-key validation are implemented. Page construction
-and production CREATE/recovery integration remain later phases.
+The resulting tree uses the normal mutable index representation and supports
+ordinary reads, writes, and maintenance.
+
+Recovery and index creation retain responsibility for cleanup and publication,
+including when the caller stops waiting. Index creation must complete any
+required uniqueness checks across hot and cold data before publishing the index.
