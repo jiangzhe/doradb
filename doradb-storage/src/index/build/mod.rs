@@ -1,4 +1,4 @@
-//! Finite hot-row extraction and bounded merging, without page construction or publication.
+//! Finite hot-row extraction, bounded merging, and private packed construction.
 //!
 //! Factories in catalog/recovery establish source stability. A retained local-sort
 //! coordinator owns every accepted completion independently of its borrowed execution future.
@@ -7,7 +7,24 @@ mod co_rank;
 mod loser_tree;
 /// Bounded partition streaming and separately settled completion authority.
 pub(crate) mod merge;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "caller-driven cleanup is integrated in RFC 0032 phases 4 and 5"
+    )
+)]
+mod page_cleanup;
 mod source;
+/// Private packed construction; recovery and DDL adapters follow in RFC 0032.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "production adapters follow in RFC 0032 phases 4 and 5"
+    )
+)]
+pub(crate) mod tree_builder;
 mod worker;
 
 pub(crate) use budget::{BudgetedVec, MemoryBudget, MemoryReservation};

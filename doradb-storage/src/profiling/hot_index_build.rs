@@ -301,6 +301,52 @@ pub(crate) struct HotMergeWorkerProfile {
     pub(crate) reference_bytes: u64,
 }
 
+/// Per-level allocation and occupancy evidence for a privately packed tree.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HotPackedLevel {
+    /// Height of the constructed pages.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "phase 4/5 callers consume component measurements")
+    )]
+    pub(crate) height: u16,
+    /// Detached pages materialized at this level (including the temporary root).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "phase 4/5 callers consume component measurements")
+    )]
+    pub(crate) pages: usize,
+    /// Sum of effective bytes, including page headers and excluding integrity trailers.
+    pub(crate) occupied_bytes: usize,
+    /// Sum of page allocation wait and execution time.
+    pub(crate) allocation_nanos: u64,
+    /// Sum of append packing time after allocation.
+    pub(crate) packing_nanos: u64,
+}
+
+/// Component-only construction measurements; publication remains caller-owned.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HotPackedMeasurements {
+    /// Per-level page counts, occupancy and materialization time.
+    pub(crate) levels: Vec<HotPackedLevel>,
+    /// Sum of leaf candidate planning time, separate from merge/check and allocation.
+    pub(crate) leaf_planning_nanos: u64,
+    /// Global root-fit checks and direct-parent group planning wall time.
+    pub(crate) parent_planning_nanos: u64,
+    /// Direct-parent submission through final collection wall time.
+    pub(crate) direct_parent_nanos: u64,
+    /// Serial higher-level construction wall time, excluding global planning.
+    pub(crate) serial_upper_nanos: u64,
+    /// Root guard acquisition and synchronous ownership transfer time.
+    pub(crate) install_nanos: u64,
+    /// Longest uninterrupted candidate planning or page append interval.
+    pub(crate) max_sync_nanos: u64,
+    /// Longest merge/leaf or parent worker interval, including asynchronous waits.
+    pub(crate) max_job_nanos: u64,
+    /// Peak shared scratch admission including retained input runs.
+    pub(crate) scratch_peak_bytes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

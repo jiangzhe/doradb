@@ -2224,11 +2224,24 @@ impl SpaceEstimation {
 /// Return the length of the common byte prefix shared by two keys.
 #[inline]
 pub(crate) fn common_prefix_len(key1: &[u8], key2: &[u8]) -> usize {
-    let l = key1.len().min(key2.len());
-    match key1.iter().zip(key2).position(|(a, b)| a != b) {
-        Some(idx) => idx,
-        None => l,
+    let len = key1.len().min(key2.len());
+    let (left, left_tail) = key1[..len].as_chunks::<8>();
+    let (right, right_tail) = key2[..len].as_chunks::<8>();
+    // Long fence prefixes recur throughout capacity planning. Compare whole
+    // words without alignment assumptions or unsafe loads; little-endian xor
+    // locates the first differing byte identically on either host byte order.
+    for (index, (left, right)) in left.iter().zip(right).enumerate() {
+        let difference = u64::from_le_bytes(*left) ^ u64::from_le_bytes(*right);
+        if difference != 0 {
+            return index * 8 + difference.trailing_zeros() as usize / 8;
+        }
     }
+    left.len() * 8
+        + left_tail
+            .iter()
+            .zip(right_tail)
+            .position(|(a, b)| a != b)
+            .unwrap_or(left_tail.len())
 }
 
 #[inline]
@@ -2380,6 +2393,37 @@ mod tests {
             Err(count as usize),
             "hints={hints_enabled}"
         );
+    }
+
+    /// Purpose: Protect word-at-a-time fence prefix comparison at unaligned, unequal-length and word-boundary inputs.
+    /// Expected: Every mismatch position agrees with an independent bytewise prefix oracle.
+    #[test]
+    fn test_common_prefix_word_boundaries() {
+        for len in [0, 1, 7, 8, 9, 15, 16, 31, 32, 65, 257] {
+            let backing: Vec<u8> = (0..len + 7).map(|i| (i * 31) as u8).collect();
+            for offset in 0..8 {
+                let left = &backing[offset..offset + len];
+                let mut right = left.to_vec();
+                for mismatch in 0..=len {
+                    if mismatch < len {
+                        right[mismatch] ^= 0x80;
+                    }
+                    for right_len in [len / 2, len] {
+                        let right = &right[..right_len];
+                        let expected = left.iter().zip(right).take_while(|(a, b)| a == b).count();
+                        assert_eq!(
+                            common_prefix_len(left, right),
+                            expected,
+                            "len={len}, offset={offset}, mismatch={mismatch}, right_len={right_len}"
+                        );
+                        assert_eq!(common_prefix_len(right, left), expected);
+                    }
+                    if mismatch < len {
+                        right[mismatch] ^= 0x80;
+                    }
+                }
+            }
+        }
     }
 
     /// Purpose: Protect the reserved integrity footer and key-only node layout.

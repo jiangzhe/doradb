@@ -11,7 +11,7 @@ use crate::buffer::guard::{
 };
 use crate::buffer::{BufferPool, FixedBufferPool, PoolGuard};
 use crate::error::Validation::{Invalid, Valid};
-use crate::error::{ConfigError, ConfigResult, Validation};
+use crate::error::{ConfigError, ConfigResult, RuntimeError, Validation};
 use crate::id::{PageID, TrxID};
 use crate::index::btree::algo::{
     KnownFenceNodeParams, MemTreeSiblingMergePlan, NodeSlotRange, pack_node_range_box,
@@ -26,6 +26,9 @@ use error_stack::Report;
 use std::marker::PhantomData;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+pub(crate) use tests::take_merge_observations as test_take_merge_observations;
 
 pub(crate) use cursor::{BTreeNodeCursor, BTreeNodeCursorState};
 pub(crate) use hint::*;
@@ -142,6 +145,40 @@ pub(crate) struct GenericBTree<P: 'static> {
 }
 
 impl<P: BufferPool> GenericBTree<P> {
+    /// Acquire the fixed empty root under a caller-retained private-build capability.
+    pub(crate) async fn check_empty_private_root(
+        &self,
+        pool_guard: &PoolGuard,
+    ) -> StdResult<PageExclusiveGuard<BTreeNode>, P::Error> {
+        let root = self
+            .get_node(pool_guard, self.root, LatchFallbackMode::Exclusive)
+            .await?
+            .lock_exclusive_async()
+            .await
+            .unwrap_or_else(|| unreachable!("private root exclusive latch"));
+        if root.page().height() != 0 || root.page().count() != 0 {
+            return Err(Report::new(RuntimeError::IndexAccess)
+                .attach("private packed target root is not empty")
+                .into());
+        }
+        Ok(root)
+    }
+
+    /// Copy a complete private root image without changing its allocated identity.
+    pub(crate) fn install_private_root(
+        &self,
+        destination: &mut PageExclusiveGuard<BTreeNode>,
+        source: &BTreeNode,
+    ) {
+        assert_eq!(
+            destination.page_id(),
+            self.root,
+            "private packed root identity mismatch"
+        );
+        destination.page_mut().clone_from(source);
+        self.height.store(source.height(), Ordering::Release);
+    }
+
     /// Create a new B-Tree index.
     #[inline]
     pub(crate) async fn new(
@@ -230,8 +267,13 @@ impl<P: BufferPool> GenericBTree<P> {
                         .unwrap();
                     pos.idx += 1;
                     stack.push(ParentPosition {
+                        // Only the globally leftmost branch has a header child.
+                        idx: if c_guard.page().lower_fence_value().is_deleted() {
+                            0
+                        } else {
+                            -1
+                        },
                         g: c_guard,
-                        idx: -1,
                     });
                 }
             }
@@ -843,12 +885,10 @@ impl<P: BufferPool> GenericBTree<P> {
                             // split root.
                             self.split_root::<BTreeU64>(pool_guard, p_node, false, ts)
                                 .await?;
-                            if matches!(
-                                p_node.prepare_insert::<BTreeU64>(&sep_key),
-                                BTreePrepareInsert::SplitRequired { .. }
-                            ) {
-                                return Ok(BTreeSplit::Inconsistent);
-                            }
+                            // Root growth inserted a level: c_node is now a
+                            // grandchild. Retry descent to reacquire its actual
+                            // parent before installing the child separator.
+                            return Ok(BTreeSplit::Ok);
                         }
                         // now parent and child nodes are exclusively locked and parent has enough
                         // space to insert separator key, so do actual split.
@@ -1025,6 +1065,8 @@ impl<P: BufferPool> GenericBTree<P> {
         upper_fence_key: &[u8], // upper fence key of right node.
         ts: TrxID,
     ) {
+        #[cfg(test)]
+        tests::record_merge(l_node, r_node, true);
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
@@ -1086,6 +1128,8 @@ impl<P: BufferPool> GenericBTree<P> {
         count: usize,
         ts: TrxID,
     ) {
+        #[cfg(test)]
+        tests::record_merge(l_node, r_node, false);
         debug_assert!(l_node.height() == r_node.height());
         debug_assert!(p_r_idx < p_node.count());
         debug_assert!(p_node.lookup_child_idx(lower_fence_key) == Some(p_r_idx as isize - 1));
@@ -1710,9 +1754,10 @@ impl<'a, V: BTreeValue, P: BufferPool> BTreeCompactor<'a, V, P> {
                             return Ok(BTreeCompact::OutOfSpace);
                         }
                         MemTreeSiblingMergePlan::NoProgress => {
-                            // can not add one key to left node.
-                            let res = self.skip().await?;
-                            debug_assert!(res);
+                            // The next sibling is already exclusively latched.
+                            // Calling skip() here would try to lock it again.
+                            self.coupling.node.replace(r_guard);
+                            self.coupling.parent.as_mut().unwrap().idx = p_r_idx as isize;
                             return Ok(BTreeCompact::Skip);
                         }
                         MemTreeSiblingMergePlan::Full => {
@@ -1909,11 +1954,16 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
     use rand_distr::{Distribution, Uniform};
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::mem::size_of;
+    use std::mem::{size_of, take};
     use std::sync::{Arc, Barrier, mpsc};
     use std::task::Poll;
     use std::thread;
+
+    thread_local! {
+        static MERGES: RefCell<Vec<(usize, bool, bool)>> = const { RefCell::new(Vec::new()) };
+    }
 
     const WIDE_KEY_LEN: usize = 1000;
     const WIDE_HEIGHT2_ROWS: u64 = 2_500;
@@ -1927,6 +1977,18 @@ mod tests {
         keys: usize,
         first_key_len: usize,
         prefix_len: usize,
+    }
+
+    /// Take structural maintenance observations from this test's execution thread.
+    pub(crate) fn take_merge_observations() -> Vec<(usize, bool, bool)> {
+        MERGES.with_borrow_mut(take)
+    }
+
+    /// Record actual sibling maintenance without changing production tree state.
+    pub(super) fn record_merge(left: &BTreeNode, right: &BTreeNode, full: bool) {
+        MERGES.with_borrow_mut(|events| {
+            events.push((left.height(), full, right.lower_fence_value().is_deleted()))
+        });
     }
 
     fn owned_index_pool(pool_size: usize) -> QuiescentBox<FixedBufferPool> {

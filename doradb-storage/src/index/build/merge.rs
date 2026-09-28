@@ -21,6 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(feature = "profiling")]
 use std::time::Instant;
 
+#[cfg(test)]
+pub(super) use tests::{fixture_in as test_runs, prepare_packed as test_prepare_packed};
+
 const DEFAULT_BATCH_ENTRIES: usize = 32_768;
 
 /// Coordinates established against one retained immutable run owner.
@@ -50,7 +53,7 @@ impl HotEntryRef {
     }
 
     #[inline]
-    fn resolve(self, runs: &SortedHotRuns) -> &HotRunEntry {
+    pub(super) fn resolve(self, runs: &SortedHotRuns) -> &HotRunEntry {
         &runs.runs()[self.run].entries()[self.position]
     }
 }
@@ -83,6 +86,18 @@ pub(crate) struct PreparedHotMerge {
 }
 
 impl PreparedHotMerge {
+    /// Retain immutable key and fence storage through page construction.
+    #[inline]
+    pub(super) fn runs(&self) -> &Arc<SortedHotRuns> {
+        &self.runs
+    }
+
+    /// Maximum submitted but uncollected construction jobs.
+    #[inline]
+    pub(super) fn workers(&self) -> usize {
+        self.workers
+    }
+
     #[inline]
     fn partitions(&self) -> usize {
         self.boundaries.cuts.len().saturating_sub(1)
@@ -441,6 +456,12 @@ pub(crate) struct PartitionMergeStream {
 }
 
 impl PartitionMergeStream {
+    /// Remaining assigned entries, used to avoid overallocating a tiny packing window.
+    #[inline]
+    pub(super) fn remaining_entries(&self) -> usize {
+        self.end - self.next
+    }
+
     /// Borrow retained coordinates for a packing consumer's bounded lookahead.
     #[cfg_attr(
         not(test),
@@ -1209,24 +1230,8 @@ mod tests {
         }
     }
 
-    async fn pool(workers: usize) -> (PoolScope, QuiescentGuard<ThreadPool>) {
-        let mut builder = RegistryBuilder::new();
-        builder.build::<EnginePoisoner>(()).await.unwrap();
-        builder
-            .build::<ThreadPool>(ThreadPoolConfig::default().worker_threads(workers))
-            .await
-            .unwrap();
-        builder.build::<ThreadPoolWorkers>(()).await.unwrap();
-        let registry = builder.finish();
-        let pool = registry.dependency::<ThreadPool>();
-        (PoolScope(registry), pool)
-    }
-
-    fn fixture(groups: Vec<Vec<BTreeKey>>, policy: DuplicateCheck) -> Arc<SortedHotRuns> {
-        fixture_in(groups, policy, MemoryBudget::new(usize::MAX))
-    }
-
-    fn fixture_in(
+    /// Build charged immutable runs with deterministic provenance for component tests.
+    pub(crate) fn fixture_in(
         groups: Vec<Vec<BTreeKey>>,
         policy: DuplicateCheck,
         budget: MemoryBudget,
@@ -1273,6 +1278,38 @@ mod tests {
             #[cfg(feature = "profiling")]
             measurements: HotBuildMeasurements::default(),
         })
+    }
+
+    /// Prepare component fixtures with explicit partition and batch boundaries.
+    pub(crate) async fn prepare_packed(
+        runs: Arc<SortedHotRuns>,
+        pool: QuiescentGuard<ThreadPool>,
+        workers: usize,
+        partitions: usize,
+        batch: usize,
+    ) -> Arc<PreparedHotMerge> {
+        HotMergePreparation::with_sizing(runs, pool, workers, partitions, batch)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+    }
+
+    async fn pool(workers: usize) -> (PoolScope, QuiescentGuard<ThreadPool>) {
+        let mut builder = RegistryBuilder::new();
+        builder.build::<EnginePoisoner>(()).await.unwrap();
+        builder
+            .build::<ThreadPool>(ThreadPoolConfig::default().worker_threads(workers))
+            .await
+            .unwrap();
+        builder.build::<ThreadPoolWorkers>(()).await.unwrap();
+        let registry = builder.finish();
+        let pool = registry.dependency::<ThreadPool>();
+        (PoolScope(registry), pool)
+    }
+
+    fn fixture(groups: Vec<Vec<BTreeKey>>, policy: DuplicateCheck) -> Arc<SortedHotRuns> {
+        fixture_in(groups, policy, MemoryBudget::new(usize::MAX))
     }
 
     fn numbers(groups: &[&[u32]], policy: DuplicateCheck) -> Arc<SortedHotRuns> {

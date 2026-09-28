@@ -420,7 +420,7 @@ No mode silently coalesces duplicate entries. [C1] [C2] [C7] [U10]
 Build detached leaves while consuming prepared partition streams, with known
 adjacent cut neighbors and an unbounded first/last range. Require the empty,
 private destination proof before allocation and retain every page in a staged
-ownership ledger. Discard pending packing candidates when construction becomes
+page tracker. Discard pending packing candidates when construction becomes
 inhibited; already staged pages remain owned until exact cleanup. Never finalize
 a node with a known duplicate or an exclusive fence that excludes a stored key.
 Only complete successful hot and caller-required cold/hot validation authorizes
@@ -428,11 +428,22 @@ fixed-root installation. Plan fit using actual encoded bytes, values,
 fences, and prefix compression; reuse KnownFenceNodeParams and packing helpers.
 Planning must avoid repeatedly scanning the entire remaining input for each
 page. Preserve existing supported key representability and online mutation
-invariants. Fill-factor tuning and local tail repair are phase-local. [C5] [U10]
+invariants. Use capacity-based packing without a fill-factor option. Retain a bounded
+coordinate window with enough room for the final two candidates and lookahead;
+batch boundaries do not impose page boundaries. [C5] [U10]
 
-Build parents one level at a time from ordered child descriptors, regrouping
-across merge partitions. Each parent covers adjacent children of equal height
-and preserves the existing MemTree branch representation. The globally
+After the hot-consumption barrier, test whether all ordered children fit a
+single root under its actual open fences before allocating any parent level.
+Otherwise group contiguous children globally, ignoring merge-partition
+boundaries. Materialize direct parents in bounded ThreadPool jobs and build
+height 2 and higher levels serially, yielding between bounded groups. Repeat
+the root-fit check at every level; compressed-page occupied-byte sums cannot
+establish fit under an uncompressed root. Repair singleton tails under the
+proposed final fences when possible. Task 000317 fixes this policy; parallel
+upper levels require a later measured design change.
+
+Build parents one level at a time from these ordered child descriptors. Each
+parent covers adjacent children of equal height and preserves the existing MemTree branch representation. The globally
 leftmost branch at each level, including the root, stores its first child in
 `lower_fence_value` and its remaining children in ordinary slots. Non-leftmost
 branches set that field to `BTreeU64::INVALID_VALUE` and represent every child
@@ -456,7 +467,7 @@ representation and split/merge algorithms unchanged for this milestone.
 The destination is newly private or an empty bootstrap MemIndex inaccessible
 to readers and maintenance. A staged owner tracks every allocated detached
 page, including pages not yet connected to a parent. Allocation registration
-must survive panic and require no fallible ledger growth after a page becomes
+must survive panic and require no fallible tracker growth after a page becomes
 owned. Installation copies a completed root image into the existing fixed root,
 updates height and dirty/initialization state, and transfers descendant
 ownership without an intervening await or fallible allocation. Reclaim the
@@ -464,9 +475,51 @@ temporary root exactly once. [C4] [C5] [D5]
 
 Before transfer, ordinary failure leaves the target empty and staged ownership
 responsible for detached pages. After transfer, normal tree ownership handles
-destruction; the ledger must not independently reclaim reachable descendants.
+destruction; the page tracker must not independently reclaim reachable descendants.
 Root installation does not itself publish DDL metadata or admit foreground
 recovery traffic. [C1] [C2] [C5]
+
+Construction returns a target-bound ready tree. Its successful hot completion
+is not whole-index uniqueness: CREATE's cold/hot checks remain phase 5 work,
+and a caller can explicitly abort an otherwise ready tree.
+
+`StagingMemIndex` owns the private destination's pool, guard, encoder, leaf
+representation, and timestamp. Its `start_build()` method binds those resources
+to construction; internal `check_empty()` and `install_root()` methods own
+destination validation and root transfer. The build coordinator and ready tree
+use these operations without accessing staging fields. After installation and
+successful caller-driven cleanup, synchronous `finish()` consumes staging and
+returns the completed MemIndex for publication. Abort/error paths call
+`destroy()` using the retained guard after detached cleanup. These are caller
+lifecycle requirements; neither finish nor destroy runs detached cleanup.
+Recovery's adapter for existing bootstrap indexes remains phase 4 work.
+
+`StagingMemIndex::start_build` returns `(build, cleanup)` before detached allocation.
+The separate `StagedPageCleanup` owns page tracking and pool lifetime authority;
+it does not borrow the target. The caller retains it before executing the build
+and decides whether to await `run()` inline or arrange owned task execution.
+The component does not submit a cleanup job or require cleanup admission.
+
+`execute()` returns a ready tree, duplicate evidence, or an execution error.
+Errors and duplicates drain producers and request abort before returning;
+`settle()` stops and drains construction but does not reclaim pages. Ready-tree
+`abort()` is synchronous, and dropping a build or ready tree only requests
+abort. None of these paths waits for the separately driven cleanup object.
+After installation, abort, or abandonment, the caller runs cleanup before
+reporting the enclosing operation complete or publishing the index. Cleanup
+failure takes precedence over successful construction or duplicate evidence;
+combine execution and cleanup errors using the existing Fatal-preserving policy.
+
+Cleanup waits for a terminal install/abort decision and zero producer leases,
+rather than Arc counts. Producers and the decision owner publish that predicate
+and wake its listener. Each completed deallocation is recorded before another
+await; cancelling a borrowed `run()` future leaves progress in the retained
+cleanup object for resumption. Successful root transfer disarms reclamation of
+installed pages. `run()` returns `FatalResult<()>`: unsafe reclamation failure
+or panic poisons the engine, caches the failure, and retains the exact remaining
+pages and dependencies without retry. Existing poison does not skip reclamation.
+Dropping the cleanup object does not execute it; retaining and driving it through
+cancellation, panic handling, and shutdown is an explicit caller contract.
 
 ### 5. Scratch limits, scheduling, and cleanup
 
@@ -512,15 +565,28 @@ co-rank selection are finite synchronous regions whose input size and duration
 must be measured; async syntax alone does not make them cooperative.
 [D5] [C6]
 
-The enclosing build owns accepted completions, runs, memory charges, and page
-ledgers. Ordinary terminal failure stops further submission, requests
-cooperative stop, drains accepted work, and reclaims detached state before
-returning. Duplicate discovery alone is not a terminal failure: it follows the
+The enclosing operation owns accepted completions, runs, memory charges, and the
+cleanup object. Ordinary terminal failure stops further submission, requests
+cooperative stop, drains accepted work, and awaits detached-page cleanup before
+reporting its result. The component build result alone does not certify cleanup.
+Duplicate discovery alone is not a terminal failure: it follows the
 summary collection and error selection contract in Decision §3. Resource and
 execution failures retain their existing settlement behavior and Fatal keeps
 precedence. An early return from a fallible join is insufficient. Dropping a
-DDL observer does not cancel accepted DDL. Bootstrap abandonment must retain a
-cleanup owner for detached pages through pool drain and storage teardown.
+DDL observer does not cancel accepted DDL. CREATE INDEX retains cleanup in its
+accepted operation state before construction and awaits it within that same
+mandatory task before terminal completion; no additional task or permit is
+required. Its retained panic owner must also settle cleanup or preserve unsafe
+ownership under the existing Fatal policy.
+
+Recovery can await cleanup inline on ordinary success and error. Cancelled
+bootstrap requires an execution/teardown owner that retains and drives cleanup
+before storage teardown completes, while workers and storage needed by remaining
+producers are still available. No engine handle is exposed before recovery, but
+that alone does not poll a dropped cleanup future. The current registry drains
+accepted jobs, not arbitrary returned futures, and mandatory-runtime workers
+start after recovery. Phase 4 must supply this bootstrap ownership; phase 3 does
+not claim automatic cleanup on bootstrap cancellation.
 [D5] [C2] [C6] [U6]
 
 Panics preserve engine poison and Fatal precedence. Cleanup cannot require new
@@ -728,7 +794,7 @@ after both callers deliver the full pipeline and performance acceptance.
     cancellation and rejection of partial, repeated and foreign completions. [U6] [U7]
     [U9] [U10] [U11]
   - After This Phase: Phase 3 consumes borrowed partition streams within the
-    accepted jobs and owns private-page cleanup. Installation requires settled
+    accepted jobs and supplies caller-driven private-page cleanup. Installation requires settled
     hot completion and any caller-required cold/hot validation; end-to-end
     recovery and CREATE benchmarks follow their phase-4/5 integrations.
     Backlog 000110 remains open for that program; backlog 000205 owns the
@@ -742,9 +808,10 @@ after both callers deliver the full pipeline and performance acceptance.
     - `docs/backlogs/000205-fuzz-n-way-hot-index-merge.md`
 
 - **Phase 3: Parallel Packed MemIndex Construction**
-  - Scope: Implement byte-aware leaf planning, packed leaves and parent
-    levels with the existing MemTree branch representation, staged-page
-    ledgers, empty-root installation, and owned cleanup.
+  - Scope: Implement byte-aware parallel leaf packing, global root-fit/group
+    planning, parallel direct parents and serial upper levels using the existing
+    MemTree branch representation, caller-owned staged cleanup, and separate ready
+    construction and fixed-root installation.
   - Goals: Convert ordered partitions with checked or caller-guaranteed
     distinct physical keys into a fully usable private MemIndex with fixed
     root identity and ordinary online mutation behavior.
@@ -756,7 +823,7 @@ after both callers deliver the full pipeline and performance acceptance.
     evidence before installation, with no mandatory validation prepass.
   - Phase-local Choices: Narrow packing-helper extensions, descriptor
     grouping, bounded lookahead/candidate-tail repair across batch boundaries,
-    root-image transfer, and staged cleanup-owner mechanics.
+    root-image transfer, and explicit cleanup handoff before construction.
   - Validation: Check exact adjacent fences, equal child heights, both branch
     representations and their space accounting, equivalent valid input under
     checked and trusted contracts, empty/single-leaf trees, wide keys, prefix
@@ -771,15 +838,17 @@ after both callers deliver the full pipeline and performance acceptance.
     alone do not satisfy this gate. Also cover lookup, ranges, boundary/extreme
     inserts, deletes, and compaction. Inject allocation, assembly, installation,
     panic, and abandonment failures; verify no partial target, double
-    reclamation, or lost Fatal ownership. Force late hot conflicts after other
+    reclamation, or lost Fatal ownership. Exercise caller-driven cleanup after
+    owner drop, partial cleanup cancellation/resumption, poison, and pool drain.
+    Force late hot conflicts after other
     workers stage pages; verify inhibition, exact reclamation and rejection of
     installation without settled completion authority. Compare ordinary/sorted insertion
     with one/many-worker bulk construction; report packing/allocation levels,
     occupancy, scratch, and task duration. [C5] [U5]
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000317-parallel-packed-memindex-construction.md`
+  - Task Issue: `#1118`
+  - Phase Status: done
+  - Implementation Summary: Implemented streaming packed leaves, global root-fit planning, parallel direct parents and serial upper levels, with an explicit caller-owned cleanup object returned before construction and separate fixed-root installation. Cleanup scheduling and completion belong to the integration caller. Structural regressions cover online mutation, deep reclamation, cleanup resumption and Fatal retention; measurements and validation are recorded in task 000317. Recovery and CREATE integration remain phases 4 and 5. [Task Resolve Sync: docs/tasks/000317-parallel-packed-memindex-construction.md @ 2026-09-28]
 
 - **Phase 4: Recovery Hot-Index Integration**
   - Scope: Replace post-replay per-row insertion with the shared pipeline,
@@ -792,7 +861,11 @@ after both callers deliver the full pipeline and performance acceptance.
   - Prerequisites: Phases 1-3, replay drain, final metadata reconciliation, and
     the recovered-data/exact-coverage invariants that justify trusted mode.
   - Phase-local Choices: Stable index iteration, descriptor reuse, cleanup
-    handoff on cancelled bootstrap, and recovery-report extensions. Phase 1
+    execution during cancelled bootstrap, and recovery-report extensions. Retain
+    the cleanup object before the first build await, run it inline at ordinary
+    build completion, and guarantee teardown drives it after cancellation before
+    storage shuts down. An await at the end of a dropped bootstrap future is
+    insufficient; mandatory-runtime workers are not yet running. Phase 1
     consumes the replay registry once per table; retain those finalized
     descriptors for subsequent indexes instead of recapturing an empty
     registry. Include the deferred extraction/local-sort timing comparisons
@@ -801,7 +874,9 @@ after both callers deliver the full pipeline and performance acceptance.
     unique/non-unique, multiple-index, updated/deleted, sparse, and mixed
     cold/hot fixtures. Verify trusted-mode selection without a duplicate
     validation pass, counter meanings, budget failure, failed/cancelled
-    bootstrap, and pool drain before storage teardown. Update the former
+    bootstrap, cleanup completion and producer drain before storage teardown.
+    Cancel bootstrap with staged and in-flight pages; verify exact reclamation
+    and successful subsequent bootstrap. Update the former
     duplicate-rejection regression to reflect the intentional trusted-input
     contract; explicit checked-adapter tests retain typed integrity errors.
     After recovery uses the integrated pipeline, benchmark rebuild and total
@@ -826,7 +901,10 @@ after both callers deliver the full pipeline and performance acceptance.
   - Prerequisites: Phases 1-3 and retained DDL exclusion/root capture; Phase 4
     provides the first production integration without changing this contract.
   - Phase-local Choices: Cold-interval lookup/comparison, DDL test hooks, and
-    caller benchmark/statistics integration.
+    caller benchmark/statistics integration. Retain cleanup in accepted DDL
+    progress before construction, await it inside the existing mandatory task
+    at build completion, and preserve it across panic handling. Include abort
+    after late validation failure; merge cleanup errors with Fatal precedence.
   - Validation: Verify that unique creation always enables checking and that
     non-unique creation admits equal logical keys. Cover local-run, cross-run,
     and cold/hot conflicts, including single-run input and partition edges,
@@ -851,7 +929,8 @@ after both callers deliver the full pipeline and performance acceptance.
 - Both callers share tested hot ordering and packing without coupling their
   publication or durability responsibilities.
 - Packed construction removes repeated online insertion work and exposes
-  parallel work through extraction, merging, leaves, and parent levels.
+  parallel work through extraction, merging, leaves, and direct parents; higher
+  parent levels remain serial.
 - Explicit result boundaries let phase tasks verify correctness, failures,
   and performance before caller migration.
 - Caller-selected duplicate checking avoids redundant recovery validation,
@@ -861,7 +940,7 @@ after both callers deliver the full pipeline and performance acceptance.
 
 - Linear scratch adds a real memory requirement to recovery; lowering worker
   count alone cannot make an arbitrarily large input fit.
-- Run retention, bounded active reference batches, barriers, and allocation ledgers add
+- Run retention, bounded active reference batches, barriers, and page trackers add
   implementation and memory overhead, particularly for small inputs.
 - Computing each interior cut once avoids duplicate searches but delays all
   merges until the slowest boundary job completes; the boundary table adds
