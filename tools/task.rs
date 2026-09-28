@@ -125,8 +125,8 @@ struct WorktreePurgeEntry {
     task_doc: Option<String>,
     task_status: Option<String>,
     clean: Option<bool>,
-    remote_branch: Option<String>,
-    pushed: Option<bool>,
+    merge_target: Option<String>,
+    implemented_on_origin_main: Option<bool>,
     safe: bool,
     reasons: Vec<String>,
 }
@@ -372,6 +372,10 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
     let dispatch_root = PathBuf::from(run_git_capture(&["rev-parse", "--show-toplevel"])?);
     let managed_worktrees_dir = dispatch_root.join(".worktrees");
 
+    if apply {
+        run_git_dynamic(&["fetch", "--prune", "origin"])?;
+    }
+
     let worktrees =
         parse_worktree_list_porcelain(&run_git_capture(&["worktree", "list", "--porcelain"])?);
     let mut summary = WorktreePurgeSummary {
@@ -385,8 +389,15 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
         failures: Vec::new(),
     };
 
-    for worktree in worktrees {
-        let entry = inspect_worktree_for_purge(&worktree, &managed_worktrees_dir)?;
+    for worktree in &worktrees {
+        let mut entry = inspect_worktree_for_purge(worktree, &managed_worktrees_dir)?;
+        if worktrees.iter().any(|other| {
+            other.path != worktree.path && Path::new(&other.path).starts_with(&worktree.path)
+        }) && entry.task_id.is_some()
+        {
+            entry.safe = false;
+            entry.reasons.push("contains_nested_worktree".to_string());
+        }
         summary.all_worktrees.push(entry.clone());
         if entry.reasons.iter().any(|reason| {
             matches!(
@@ -405,8 +416,6 @@ fn run_purge_worktrees(mut args: impl Iterator<Item = String>) -> Result<(), Str
     }
 
     if apply {
-        run_git_dynamic(&["fetch", "--prune", "origin"])?;
-
         for entry in summary.safe_to_purge.clone() {
             if let Err(err) = purge_worktree_entry(&entry, &managed_worktrees_dir) {
                 summary.failures.push(WorktreePurgeFailure {
@@ -1267,8 +1276,8 @@ fn inspect_worktree_for_purge(
         task_doc: None,
         task_status: None,
         clean: None,
-        remote_branch: None,
-        pushed: None,
+        merge_target: None,
+        implemented_on_origin_main: None,
         safe: false,
         reasons: Vec::new(),
     };
@@ -1335,18 +1344,21 @@ fn inspect_worktree_for_purge(
             .push("worktree_cleanliness_unknown".to_string()),
     }
 
-    if let Some(branch) = entry.branch.as_deref() {
-        let remote_ref = format!("refs/remotes/origin/{branch}");
-        if git_ref_exists(&remote_ref)? {
-            entry.remote_branch = Some(format!("origin/{branch}"));
-            let pushed = git_ref_is_ancestor(&format!("refs/heads/{branch}"), &remote_ref)?;
-            entry.pushed = Some(pushed);
-            if !pushed {
-                entry.reasons.push("local_not_pushed".to_string());
+    if entry.branch.is_some() {
+        let main_ref = "refs/remotes/origin/main";
+        entry.merge_target = Some("origin/main".to_string());
+        if git_ref_exists(main_ref)? {
+            let task_id = entry.task_id.as_deref().ok_or("missing task id")?;
+            let implemented = task_is_implemented_on_ref(task_id, main_ref)?;
+            entry.implemented_on_origin_main = Some(implemented);
+            if !implemented {
+                entry
+                    .reasons
+                    .push("task_not_implemented_on_origin_main".to_string());
             }
         } else {
-            entry.pushed = Some(false);
-            entry.reasons.push("remote_branch_missing".to_string());
+            entry.implemented_on_origin_main = Some(false);
+            entry.reasons.push("origin_main_missing".to_string());
         }
     } else {
         entry.reasons.push("no_local_branch".to_string());
@@ -1354,6 +1366,23 @@ fn inspect_worktree_for_purge(
 
     entry.safe = entry.reasons.is_empty();
     Ok(entry)
+}
+
+fn task_is_implemented_on_ref(task_id: &str, reference: &str) -> Result<bool, String> {
+    let paths = run_git_capture(&["ls-tree", "--name-only", reference, "docs/tasks/"])?;
+    let prefix = format!("docs/tasks/{task_id}-");
+    let matches: Vec<_> = paths
+        .lines()
+        .filter(|path| {
+            path.starts_with(&prefix)
+                && parse_strict_six_digit_task_name(path.trim_start_matches("docs/tasks/")).is_some()
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Ok(false);
+    }
+    let text = run_git_capture(&["show", &format!("{reference}:{}", matches[0])])?;
+    Ok(parse_task_status(&text).as_deref() == Some("implemented"))
 }
 
 fn purge_worktree_entry(
@@ -2229,15 +2258,15 @@ fn worktree_purge_entry_array_json(entries: &[WorktreePurgeEntry]) -> String {
 
 fn worktree_purge_entry_json(entry: &WorktreePurgeEntry) -> String {
     format!(
-        "{{\"path\":\"{}\",\"branch\":{},\"task_id\":{},\"task_doc\":{},\"task_status\":{},\"clean\":{},\"remote_branch\":{},\"pushed\":{},\"safe\":{},\"reasons\":{}}}",
+        "{{\"path\":\"{}\",\"branch\":{},\"task_id\":{},\"task_doc\":{},\"task_status\":{},\"clean\":{},\"merge_target\":{},\"implemented_on_origin_main\":{},\"safe\":{},\"reasons\":{}}}",
         json_escape(&entry.path),
         json_nullable(&entry.branch),
         json_nullable(&entry.task_id),
         json_nullable(&entry.task_doc),
         json_nullable(&entry.task_status),
         json_nullable_bool(entry.clean),
-        json_nullable(&entry.remote_branch),
-        json_nullable_bool(entry.pushed),
+        json_nullable(&entry.merge_target),
+        json_nullable_bool(entry.implemented_on_origin_main),
         if entry.safe { "true" } else { "false" },
         json_array(&entry.reasons),
     )
@@ -2792,8 +2821,8 @@ prunable gitdir file points to non-existent location\n\
         assert_eq!(entry.clean, None);
         assert_eq!(entry.task_doc, None);
         assert_eq!(entry.task_status, None);
-        assert_eq!(entry.remote_branch, None);
-        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.merge_target, None);
+        assert_eq!(entry.implemented_on_origin_main, None);
         assert_eq!(entry.reasons, vec!["worktree_locked".to_string()]);
     }
 
@@ -2814,8 +2843,8 @@ prunable gitdir file points to non-existent location\n\
         assert_eq!(entry.clean, None);
         assert_eq!(entry.task_doc, None);
         assert_eq!(entry.task_status, None);
-        assert_eq!(entry.remote_branch, None);
-        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.merge_target, None);
+        assert_eq!(entry.implemented_on_origin_main, None);
         assert_eq!(entry.reasons, vec!["worktree_prunable".to_string()]);
     }
 
@@ -2836,8 +2865,8 @@ prunable gitdir file points to non-existent location\n\
         assert_eq!(entry.clean, None);
         assert_eq!(entry.task_doc, None);
         assert_eq!(entry.task_status, None);
-        assert_eq!(entry.remote_branch, None);
-        assert_eq!(entry.pushed, None);
+        assert_eq!(entry.merge_target, None);
+        assert_eq!(entry.implemented_on_origin_main, None);
         assert_eq!(
             entry.reasons,
             vec![
@@ -2911,8 +2940,8 @@ prunable gitdir file points to non-existent location\n\
             task_doc: Some("docs/tasks/123456-example.md".to_string()),
             task_status: Some("implemented".to_string()),
             clean: Some(true),
-            remote_branch: Some("origin/shortbranch".to_string()),
-            pushed: Some(true),
+            merge_target: Some("origin/main".to_string()),
+            implemented_on_origin_main: Some(true),
             safe: true,
             reasons: Vec::new(),
         };
@@ -2996,8 +3025,8 @@ created: 2026-03-20\n\
             task_doc: Some("docs/tasks/000080-example.md".to_string()),
             task_status: Some("implemented".to_string()),
             clean: Some(true),
-            remote_branch: Some("origin/shortbranch".to_string()),
-            pushed: Some(true),
+            merge_target: Some("origin/main".to_string()),
+            implemented_on_origin_main: Some(true),
             safe: true,
             reasons: Vec::new(),
         };
@@ -3017,6 +3046,46 @@ created: 2026-03-20\n\
         assert!(json.contains("\"dry_run\":true"));
         assert!(json.contains("\"safe_to_purge\":[{"));
         assert!(json.contains("\"task_status\":\"implemented\""));
+    }
+
+    /// Purpose: Use committed task status as completion evidence without a task remote branch.
+    /// Expected: Only one implemented document on the chosen ref qualifies; local edits do not.
+    #[test]
+    fn task_completion_uses_document_on_reference() {
+        let root = unique_temp_dir("task-tool-main-completion");
+        fs::create_dir_all(root.join("docs/tasks")).unwrap();
+        init_test_git_repo(&root);
+        run_git_ok(&root, &["config", "user.name", "Task Tool Test"]);
+        run_git_ok(&root, &["config", "user.email", "task-tool@example.invalid"]);
+        let doc = root.join("docs/tasks/000001-example.md");
+        for (status, expected) in [("proposal", false), ("implemented", true)] {
+            fs::write(&doc, format!("---\nstatus: {status}\n---\n")).unwrap();
+            run_git_ok(&root, &["add", "docs/tasks"]);
+            run_git_ok(&root, &["commit", "-m", status]);
+            run_git_ok(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            fs::write(&doc, "---\nstatus: local-only\n---\n").unwrap();
+            with_current_dir_locked(&root, || {
+                assert_eq!(
+                    task_is_implemented_on_ref("000001", "origin/main").unwrap(),
+                    expected
+                );
+                assert!(!task_is_implemented_on_ref("000002", "origin/main").unwrap());
+                assert!(!git_ref_exists("refs/remotes/origin/task-branch").unwrap());
+            });
+        }
+        fs::write(&doc, "---\nstatus: implemented\n---\n").unwrap();
+        fs::write(
+            root.join("docs/tasks/000001-duplicate.md"),
+            "---\nstatus: implemented\n---\n",
+        )
+        .unwrap();
+        run_git_ok(&root, &["add", "docs/tasks"]);
+        run_git_ok(&root, &["commit", "-m", "ambiguous task"]);
+        run_git_ok(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        with_current_dir_locked(&root, || {
+            assert!(!task_is_implemented_on_ref("000001", "origin/main").unwrap());
+        });
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
