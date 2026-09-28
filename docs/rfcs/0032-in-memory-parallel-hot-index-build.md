@@ -818,12 +818,15 @@ after both callers deliver the full pipeline and performance acceptance.
   - Non-goals: Public DDL/recovery switching, DiskTree allocation/publication,
     or changing online split/merge algorithms to accept a new branch format.
   - Prerequisites: Phase 2 prepared streams and retained-key ownership, plus
-    the empty/private destination proof before allocation. Packing and hot
+    the empty/private destination proof before detached allocation. Packing and hot
     validation share one pass; require exhaustive completion and distinctness
     evidence before installation, with no mandatory validation prepass.
-  - Phase-local Choices: Narrow packing-helper extensions, descriptor
-    grouping, bounded lookahead/candidate-tail repair across batch boundaries,
-    root-image transfer, and explicit cleanup handoff before construction.
+  - Phase-local Choices: Reuse the exact packing helpers with geometrically
+    expanded, reusable candidate buffers and a circular coordinate window.
+    Conservative slot/value bounds cap scratch without key-dependent sizing;
+    preserve final-fence compression and tail repair across batch boundaries.
+    Root-image transfer remains separate from construction, with explicit
+    cleanup handoff before the first build await.
   - Validation: Check exact adjacent fences, equal child heights, both branch
     representations and their space accounting, equivalent valid input under
     checked and trusted contracts, empty/single-leaf trees, wide keys, prefix
@@ -844,11 +847,21 @@ after both callers deliver the full pipeline and performance acceptance.
     workers stage pages; verify inhibition, exact reclamation and rejection of
     installation without settled completion authority. Compare ordinary/sorted insertion
     with one/many-worker bulk construction; report packing/allocation levels,
-    occupancy, scratch, and task duration. [C5] [U5]
+    occupancy, scratch, and task duration. Verify bounded planning against
+    full-window results, including prefix shrinkage, wraparound, allocation
+    reuse and rejected growth. [C5] [U5]
+  - After This Phase: Phases 4/5 retain the cleanup obligation before starting
+    construction and drive it before publication or terminal completion.
+    Recovery must execute it during cancelled bootstrap before storage teardown;
+    CREATE retains it in accepted mandatory progress, including panic/abort
+    paths and late cold/hot validation failure. The component supplies hot-only
+    completion, not caller publication authority. Backlog 000110 remains open
+    for these integrations and end-to-end comparisons; component measurements
+    do not establish production caller speedups.
   - Task Doc: `docs/tasks/000317-parallel-packed-memindex-construction.md`
   - Task Issue: `#1118`
   - Phase Status: done
-  - Implementation Summary: Implemented streaming packed leaves, global root-fit planning, parallel direct parents and serial upper levels, with an explicit caller-owned cleanup object returned before construction and separate fixed-root installation. Cleanup scheduling and completion belong to the integration caller. Structural regressions cover online mutation, deep reclamation, cleanup resumption and Fatal retention; measurements and validation are recorded in task 000317. Recovery and CREATE integration remain phases 4 and 5. [Task Resolve Sync: docs/tasks/000317-parallel-packed-memindex-construction.md @ 2026-09-28]
+  - Implementation Summary: Implemented parallel packed MemIndex construction, global parent planning, fixed-root installation and caller-owned cleanup. Reusable bounded candidate buffers and a circular window reduce planning work and scratch. Structural/lifecycle regressions, all 2,162 workspace tests and the branch-wide style audit passed; component benchmarks are recorded in task 000317. Recovery/CREATE integration and end-to-end acceptance remain phases 4/5 under open backlog 000110. [Task Resolve Sync: docs/tasks/000317-parallel-packed-memindex-construction.md @ 2026-09-28]
 
 - **Phase 4: Recovery Hot-Index Integration**
   - Scope: Replace post-replay per-row insertion with the shared pipeline,

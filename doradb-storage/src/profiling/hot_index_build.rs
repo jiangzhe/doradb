@@ -331,7 +331,7 @@ pub(crate) struct HotPackedMeasurements {
     pub(crate) levels: Vec<HotPackedLevel>,
     /// Sum of leaf candidate planning time, separate from merge/check and allocation.
     pub(crate) leaf_planning_nanos: u64,
-    /// Global root-fit checks and direct-parent group planning wall time.
+    /// Global root-fit checks and parent-group planning wall time, including yields.
     pub(crate) parent_planning_nanos: u64,
     /// Direct-parent submission through final collection wall time.
     pub(crate) direct_parent_nanos: u64,
@@ -339,7 +339,8 @@ pub(crate) struct HotPackedMeasurements {
     pub(crate) serial_upper_nanos: u64,
     /// Root guard acquisition and synchronous ownership transfer time.
     pub(crate) install_nanos: u64,
-    /// Longest uninterrupted candidate planning or page append interval.
+    /// Longest uninterrupted leaf/parent planning or page append interval.
+    /// Excludes allocation waits and time suspended at cooperative yields.
     pub(crate) max_sync_nanos: u64,
     /// Longest merge/leaf or parent worker interval, including asynchronous waits.
     pub(crate) max_job_nanos: u64,

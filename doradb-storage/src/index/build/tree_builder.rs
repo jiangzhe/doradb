@@ -54,6 +54,42 @@ struct PageMeasurement {
     occupied: usize,
 }
 
+// One restartable parent-planning attempt. The interval continues across helper
+// returns and is restarted only after an actual cooperative yield resumes.
+#[cfg(feature = "profiling")]
+struct ParentPlanningProfile {
+    started: Instant,
+    interval_started: Instant,
+    max_sync_nanos: u64,
+}
+
+#[cfg(feature = "profiling")]
+impl ParentPlanningProfile {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            interval_started: started,
+            max_sync_nanos: 0,
+        }
+    }
+
+    fn record(&mut self, now: Instant) {
+        self.max_sync_nanos = self
+            .max_sync_nanos
+            .max(now.duration_since(self.interval_started).as_nanos() as u64);
+    }
+
+    fn resume(&mut self, now: Instant) {
+        self.interval_started = now;
+    }
+
+    fn finish(mut self, now: Instant, measurements: &mut HotPackedMeasurements) {
+        self.record(now);
+        measurements.parent_planning_nanos += now.duration_since(self.started).as_nanos() as u64;
+        measurements.max_sync_nanos = measurements.max_sync_nanos.max(self.max_sync_nanos);
+    }
+}
+
 /// Owns a private index through build setup, root installation, and handoff.
 /// Construction borrows this owner so the index remains inaccessible to readers.
 /// After caller-driven cleanup, finish releases a successful index; destroy
@@ -405,7 +441,7 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
 
     async fn plan_parent_level(&mut self) -> RuntimeOrFatalResult<()> {
         #[cfg(feature = "profiling")]
-        let started = Instant::now();
+        let mut profile = ParentPlanningProfile::new(Instant::now());
         let packing = self
             .packing
             .as_ref()
@@ -415,7 +451,14 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
             .as_ref()
             .unwrap_or_else(|| unreachable!("parent planning owns its child level"));
         // Planning allocates no pages and may restart after observer cancellation.
-        let (groups, direct) = if root_fits(&packing.runs, children).await {
+        let (groups, direct) = if root_fits(
+            &packing.runs,
+            children,
+            #[cfg(feature = "profiling")]
+            &mut profile,
+        )
+        .await
+        {
             let mut groups = BudgetedVec::new(&packing.runs.budget);
             groups
                 .ensure_capacity(1, "parent group plans")
@@ -423,16 +466,20 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
             groups.push_reserved(0..children.len());
             (groups, false)
         } else {
-            let groups = plan_groups(&packing.runs, children).await?;
+            let groups = plan_groups(
+                &packing.runs,
+                children,
+                #[cfg(feature = "profiling")]
+                &mut profile,
+            )
+            .await?;
             if groups.len() >= children.len() {
                 return Err(execution_error("packed parent level made no progress"));
             }
             (groups, children[0].height == 0)
         };
         #[cfg(feature = "profiling")]
-        {
-            self.measurements.parent_planning_nanos += started.elapsed().as_nanos() as u64;
-        }
+        profile.finish(Instant::now(), &mut self.measurements);
         let workers = if direct { self.max_workers } else { 1 };
         self.parent_level = Some(ParentLevel::new(
             children.clone(),
@@ -1046,7 +1093,11 @@ fn fits<V: BTreeValue + Copy>(
     space.total_space() <= BTREE_NODE_USABLE_SIZE
 }
 
-async fn root_fits(runs: &SortedHotRuns, children: &[ChildDescriptor]) -> bool {
+async fn root_fits(
+    runs: &SortedHotRuns,
+    children: &[ChildDescriptor],
+    #[cfg(feature = "profiling")] profile: &mut ParentPlanningProfile,
+) -> bool {
     let Some(mut space) = PackedNodeSpace::with_fences(&[], &[]) else {
         return false;
     };
@@ -1058,7 +1109,11 @@ async fn root_fits(runs: &SortedHotRuns, children: &[ChildDescriptor]) -> bool {
             return false;
         }
         if index % 1024 == 0 {
+            #[cfg(feature = "profiling")]
+            profile.record(Instant::now());
             yield_now().await;
+            #[cfg(feature = "profiling")]
+            profile.resume(Instant::now());
         }
     }
     true
@@ -1067,6 +1122,7 @@ async fn root_fits(runs: &SortedHotRuns, children: &[ChildDescriptor]) -> bool {
 async fn plan_groups(
     runs: &SortedHotRuns,
     children: &[ChildDescriptor],
+    #[cfg(feature = "profiling")] profile: &mut ParentPlanningProfile,
 ) -> RuntimeOrFatalResult<BudgetedVec<Range<usize>>> {
     let mut groups = BudgetedVec::new(&runs.budget);
     let mut entries = BudgetedVec::new(&runs.budget);
@@ -1102,7 +1158,11 @@ async fn plan_groups(
             .push(start..start + count, "parent group plans")
             .change_context(RuntimeError::IndexAccess)?;
         start += count;
+        #[cfg(feature = "profiling")]
+        profile.record(Instant::now());
         yield_now().await;
+        #[cfg(feature = "profiling")]
+        profile.resume(Instant::now());
     }
     Ok(groups)
 }
@@ -2197,6 +2257,37 @@ mod tests {
         });
     }
 
+    /// Purpose: Protect synchronous parent-planning measurements across yields and final partial intervals.
+    /// Expected: Maxima exclude suspended time, wall time accumulates whole attempts, and larger existing page measurements are retained.
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn packed_parent_planning_intervals() {
+        use std::time::Duration;
+        let origin = Instant::now();
+        let at = |n| origin + Duration::from_nanos(n);
+        for (yields, completed, longest) in [
+            (&[][..], 13, 13),
+            (&[(10, 100), (130, 200)][..], 205, 30),
+            (&[(10, 100), (130, 200)][..], 240, 40),
+        ] {
+            for previous_max in [0, 50] {
+                let mut measurements = HotPackedMeasurements {
+                    parent_planning_nanos: 17,
+                    max_sync_nanos: previous_max,
+                    ..Default::default()
+                };
+                let mut profile = ParentPlanningProfile::new(at(0));
+                for &(before_yield, resumed) in yields {
+                    profile.record(at(before_yield));
+                    profile.resume(at(resumed));
+                }
+                profile.finish(at(completed), &mut measurements);
+                assert_eq!(measurements.parent_planning_nanos, 17 + completed);
+                assert_eq!(measurements.max_sync_nanos, previous_max.max(longest));
+            }
+        }
+    }
+
     /// Purpose: Protect exact open-root fanout and grouping across prefix compression loss and singleton tails.
     /// Expected: Root fit matches layout byte limits and global parent groups cover adjacent children with strict progress.
     #[test]
@@ -2231,12 +2322,34 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert!(
-                    root_fits(&runs, &descriptors(capacity)).await,
+                    root_fits(
+                        &runs,
+                        &descriptors(capacity),
+                        #[cfg(feature = "profiling")]
+                        &mut ParentPlanningProfile::new(Instant::now()),
+                    )
+                    .await,
                     "width={width}"
                 );
                 let overflow = descriptors(capacity + 1);
-                assert!(!root_fits(&runs, &overflow).await, "width={width}");
-                let groups = plan_groups(&runs, &overflow).await.unwrap();
+                assert!(
+                    !root_fits(
+                        &runs,
+                        &overflow,
+                        #[cfg(feature = "profiling")]
+                        &mut ParentPlanningProfile::new(Instant::now()),
+                    )
+                    .await,
+                    "width={width}"
+                );
+                let groups = plan_groups(
+                    &runs,
+                    &overflow,
+                    #[cfg(feature = "profiling")]
+                    &mut ParentPlanningProfile::new(Instant::now()),
+                )
+                .await
+                .unwrap();
                 assert_eq!(groups.first().unwrap().start, 0);
                 assert_eq!(groups.last().unwrap().end, overflow.len());
                 assert!(groups.len() < overflow.len());
@@ -2268,7 +2381,13 @@ mod tests {
                 "finite fences compress the common prefix"
             );
             assert!(
-                !root_fits(&runs, &children).await,
+                !root_fits(
+                    &runs,
+                    &children,
+                    #[cfg(feature = "profiling")]
+                    &mut ParentPlanningProfile::new(Instant::now()),
+                )
+                .await,
                 "open root must account for complete separators"
             );
         });
