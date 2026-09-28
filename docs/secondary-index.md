@@ -200,8 +200,14 @@ conditions are satisfied.
 ## Parallel hot-index construction
 
 [RFC 0032](rfcs/0032-in-memory-parallel-hot-index-build.md) defines a shared
-pipeline for stable hot-row extraction, sorted runs, validation, and tree
-construction under bounded memory and concurrency. The first phase provides
-extraction and local duplicate evidence; global validation and production
-CREATE/recovery integration remain later phases. Existing index construction
-and publication behavior are unchanged.
+pipeline for stable hot-row extraction, parallel sorting and merging,
+duplicate validation, and tree construction under bounded memory and
+concurrency. Required uniqueness checks follow the caller's correctness
+contract for index creation or recovery.
+
+Construction may proceed privately while validation runs. Publication requires
+complete construction and all required checks to succeed. Failed or cancelled
+builds must release their resources without exposing a partial index.
+
+Extraction, merging, and hot-key validation are implemented. Page construction
+and production CREATE/recovery integration remain later phases.

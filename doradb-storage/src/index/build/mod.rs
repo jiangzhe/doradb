@@ -1,8 +1,12 @@
-//! Finite hot-row extraction, without index-page construction or publication.
+//! Finite hot-row extraction and bounded merging, without page construction or publication.
 //!
 //! Factories in catalog/recovery establish source stability. A retained local-sort
 //! coordinator owns every accepted completion independently of its borrowed execution future.
 mod budget;
+mod co_rank;
+mod loser_tree;
+/// Bounded partition streaming and separately settled completion authority.
+pub(crate) mod merge;
 mod source;
 mod worker;
 
@@ -97,27 +101,15 @@ pub(crate) struct HotRunEntry {
     /// Owned physical encoded key.
     pub(crate) key: BTreeKey,
     /// Logical identity of this live row.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 2 consumes extracted RowIDs")
-    )]
     pub(crate) row_id: RowID,
 }
 
 /// Immutable sorted entries and their allocation-lifetime reservations.
 pub(crate) struct HotSortedRun {
     /// Original deterministic group identity, independent of completion order.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 2 consumes retained run metadata")
-    )]
     pub(crate) group_id: usize,
     entries: BudgetedVec<HotRunEntry>,
     /// Local evidence selected by the invocation duplicate policy.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 2 consumes retained run metadata")
-    )]
     pub(crate) duplicates: LocalDuplicates,
     #[cfg(feature = "profiling")]
     profile: HotBuildWorkerProfile,
@@ -127,6 +119,7 @@ pub(crate) struct HotSortedRun {
 
 impl HotSortedRun {
     /// Borrow sorted owned entries without cloning keys or building references.
+    #[inline]
     pub(crate) fn entries(&self) -> &[HotRunEntry] {
         &self.entries
     }
@@ -135,54 +128,37 @@ impl HotSortedRun {
 /// Shared immutable run owners in planned order with checked coordinate access.
 pub(crate) struct SortedHotRuns {
     runs: Vec<Arc<HotSortedRun>>,
+    // Source-selected policy survives even an empty extraction.
+    duplicates: DuplicateCheck,
     /// Completed build counts, durations, and scratch high-water.
+    #[cfg(feature = "profiling")]
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "phase 2 consumes retained run metadata")
+        expect(
+            dead_code,
+            reason = "caller integrations consume extraction measurements"
+        )
     )]
-    #[cfg(feature = "profiling")]
     pub(crate) measurements: HotBuildMeasurements,
     /// Shared admission retained for run ownership and downstream phases.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 2 consumes retained run metadata")
-    )]
     pub(crate) budget: MemoryBudget,
 }
 
 impl SortedHotRuns {
     /// Borrow the retained nonempty run owners.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "immutable run interface reserved for RFC 0032 phase 2"
-        )
-    )]
+    #[inline]
     pub(crate) fn runs(&self) -> &[Arc<HotSortedRun>] {
         &self.runs
     }
 
     /// Borrow an entry only when both coordinates are in bounds.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "immutable run interface reserved for RFC 0032 phase 2"
-        )
-    )]
+    #[inline]
     pub(crate) fn entry(&self, run: usize, position: usize) -> Option<&HotRunEntry> {
         self.runs.get(run)?.entries.get(position)
     }
 
     /// Borrow the direct one-run view used by the next phase's bypass.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "immutable run interface reserved for RFC 0032 phase 2"
-        )
-    )]
+    #[inline]
     pub(crate) fn single_run(&self) -> Option<&[HotRunEntry]> {
         if self.runs.len() == 1 {
             Some(self.runs[0].entries())
@@ -192,13 +168,7 @@ impl SortedHotRuns {
     }
 
     /// Compare physical keys, then deterministic original group and position.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "immutable run interface reserved for RFC 0032 phase 2"
-        )
-    )]
+    #[inline]
     pub(crate) fn compare(&self, left: (usize, usize), right: (usize, usize)) -> Option<Ordering> {
         let l = self.entry(left.0, left.1)?;
         let r = self.entry(right.0, right.1)?;
@@ -333,6 +303,7 @@ impl HotLocalSort {
         self.source.profiler.record(measurements);
         Ok(SortedHotRuns {
             runs,
+            duplicates: self.source.key.duplicates,
             #[cfg(feature = "profiling")]
             measurements,
             budget: self.source.budget.clone(),
@@ -998,6 +969,14 @@ mod tests {
                                 policy,
                             );
                             let runs = sort.execute().await.unwrap();
+                            assert_eq!(
+                                runs.duplicates,
+                                if recovery || !unique {
+                                    DuplicateCheck::Skip
+                                } else {
+                                    DuplicateCheck::Collect
+                                }
+                            );
                             assert_eq!(
                                 contents(&runs),
                                 expected,

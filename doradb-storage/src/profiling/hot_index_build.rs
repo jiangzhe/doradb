@@ -230,6 +230,77 @@ impl HotBuildProfile {
     }
 }
 
+/// One fully consumed hot merge, independent of extraction and publication stats.
+/// Worker sums include cooperative scheduling; batch durations cover only fused
+/// synchronous merge/check work. Consumer work outside pulls is reported separately.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HotMergeMeasurements {
+    /// Total input entries.
+    pub entries: u64,
+    /// Retained nonempty runs.
+    pub runs: u64,
+    /// Outstanding-job limit.
+    pub workers: u64,
+    /// Planned partition count.
+    pub partitions: u64,
+    /// Maximum entries per pull.
+    pub batch_entries: u64,
+    /// Whether source policy requires duplicate validation.
+    pub checked: bool,
+    /// Preparation wall time through the boundary barrier.
+    pub boundary_wall_nanos: u64,
+    /// Sum of interior cut durations.
+    pub cut_worker_nanos: u64,
+    /// Longest interior cut duration.
+    pub max_cut_nanos: u64,
+    /// Consumption wall time including consumers and settlement.
+    pub consumption_wall_nanos: u64,
+    /// Preparation plus consumption start-to-first-output latency.
+    pub first_batch_nanos: u64,
+    /// Sum of synchronous fused merge/check intervals.
+    pub merge_check_nanos: u64,
+    /// Longest synchronous pull.
+    pub max_batch_nanos: u64,
+    /// Longest job, including its consumer.
+    pub max_job_nanos: u64,
+    /// Sum of whole-job durations, including setup, consumer work and waits.
+    pub job_worker_nanos: u64,
+    /// Sum of consumer durations excluding synchronous merge/check work.
+    /// Includes consumer awaits and cooperative yields, not kernel setup.
+    pub consumer_worker_nanos: u64,
+    /// Actual duplicate equality calls, including boundary checks.
+    pub duplicate_comparisons: u64,
+    /// Total retained boundary-position allocation capacity.
+    pub boundary_bytes: u64,
+    /// Maximum reference allocation capacity in any one partition.
+    pub max_reference_bytes: u64,
+    /// Upper bound on simultaneous reference capacity at the admitted worker limit.
+    pub active_reference_bytes: u64,
+    /// Incremental validation fields in the retained plan, streams and completions.
+    pub validation_bytes: u64,
+    /// Shared admission high-water, including resident source storage.
+    pub scratch_peak_bytes: u64,
+}
+
+/// Local batch counters; no per-entry clocks or shared writes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HotMergeWorkerProfile {
+    /// Start of the first returned batch, relative to job start.
+    pub(crate) first_batch: Option<Instant>,
+    /// Accumulated fused merge/check time.
+    pub(crate) merge_check_nanos: u64,
+    /// Longest synchronous pull.
+    pub(crate) max_batch_nanos: u64,
+    /// Whole consumer job duration.
+    pub(crate) job_nanos: u64,
+    /// Consumer work and waits outside synchronous pulls.
+    pub(crate) consumer_nanos: u64,
+    /// Incremental equality calls, excluding shared cuts.
+    pub(crate) duplicate_comparisons: u64,
+    /// Allocated reusable reference capacity.
+    pub(crate) reference_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
