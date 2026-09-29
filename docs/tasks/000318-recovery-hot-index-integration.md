@@ -11,15 +11,15 @@ github_issue: 1120
 
 ## Summary
 
-Recovery now rebuilds hot indexes through the shared extraction, merge, and
-packed MemIndex pipeline. One joined recovery-local thread drives serial table
-and index builds, with bounded parallel jobs inside each index. Installation
-preserves bootstrap root PageIDs, `MIN_SNAPSHOT_TS`, and loaded cold roots.
-Cancellation waits for accepted work and cleanup before storage teardown.
+Recovery rebuilds hot indexes through shared extraction, merge and packed-tree
+construction. A joined recovery-local thread drives serial table/index builds,
+with bounded parallel jobs inside each index. Installation preserves bootstrap
+root PageIDs, `MIN_SNAPSHOT_TS` and loaded cold roots. Accepted work and cleanup
+finish before storage teardown, including when bootstrap observation is dropped.
 
 ## Context
 
-Parent and comparison base: `45499bc1691893863ff003207cb620bfde358b64`.
+Parent and benchmark comparison base: `45499bc1691893863ff003207cb620bfde358b64`.
 Parent RFC:
 
 - docs/rfcs/0032-in-memory-parallel-hot-index-build.md
@@ -36,149 +36,141 @@ Issue Labels:
 - priority:high
 - codex
 
-Tasks 000315–000317 supplied extraction, merge, and private packed construction.
-Recovery previously inserted each live row into each active index. This task
-provides its production adapter and end-to-end acceptance. Backlog 000110 stays
-open for phase 5's CREATE INDEX integration and overall caller acceptance.
+Tasks 000315–000317 supplied extraction, merge and packed construction. Recovery
+previously inserted each live row into each active index. This task delivered
+the production recovery adapter and end-to-end acceptance. Source backlog
+000110 remains open because its program-wide acceptance also requires phase 5's
+CREATE INDEX integration and independent caller benchmarks.
 
 ## Goals
 
-- Rebuild every reconciled user-table hot index before engine publication.
-- Finalize authoritative replay descriptors once per table, validate their
-  structure, and reuse descriptors across indexes in deterministic order.
-- Preserve physical key/value representation, roots, timestamps, typed errors,
-  and page/entry counters while selecting trusted duplicate mode.
-- Own accepted producers and cleanup through success, error, panic, cancellation,
-  and observer loss; measure verified recovery performance and scratch use.
+- Rebuild all reconciled user-table hot indexes before foreground admission.
+- Reuse authoritative replay descriptors across deterministically ordered builds.
+- Preserve physical key/value representation, roots, timestamps, typed errors
+  and counter meanings while using recovery's trusted duplicate policy.
+- Retain accepted work and cleanup through failure, cancellation and observer
+  loss; verify recovery performance, memory use and worker scaling.
 
 ## Non-Goals
 
-- Changes to replay, persistent formats, component membership/order, or worker
-  startup/shutdown order; mandatory-runtime workers still start after recovery.
+- Replay or persistent-format changes, component reordering, or early startup of
+  mandatory-runtime workers, which still start after recovery.
 - CREATE INDEX migration, cold construction, cold/hot uniqueness validation,
-  concurrent table/index builds, shared key projection, or sort spill.
+  concurrent table/index builds, shared key projection or sort spill.
 - Prompt cancellation, bounded teardown latency, general root replacement, or
-  insertion fallback on small inputs or scratch exhaustion.
+  insertion fallback for small inputs or scratch exhaustion.
 
 ## Rejected Alternatives
 
-- A registered cleanup component would add lifecycle structure for a finite
-  recovery-local obligation. The local join handle owns it directly.
-- Starting mandatory workers early would require transferring their ownership
-  while preserving component order. The temporary worker avoids that transfer.
-- Cleanup only at the end of the caller future disappears on cancellation;
-  spawning a cleanup thread during Drop adds a fallible admission dependency.
+- A registered cleanup component adds lifecycle structure to a finite obligation
+  already owned by the recovery join handle.
+- Starting mandatory workers early requires transferring their ownership while
+  preserving component order; a temporary worker avoids that transfer.
+- Cleanup at the end of a caller future disappears on cancellation. Starting a
+  cleanup thread during Drop introduces a fallible admission dependency.
 
 ## Plan
 
-`RecoveryCoordinator` transfers owned histories and live table handles after
-replay drain and metadata reconciliation. Empty orphan histories are rejected.
-`RecoveryHotIndexWorker` starts one named `Recovery-Index` thread before detached
-allocation. Its root future runs under `runtime::block_on` and uses the existing
-ThreadPool. A capacity-one channel carries only a terminal completion bridge or
-value-only report. Normal observation awaits then joins; Drop joins exactly
-once. Disconnection is resolved through join and engine poison.
+After replay drain and metadata reconciliation, the coordinator transfers page
+histories and live table handles to a finite `Recovery-Index` thread. Normal
+observation and Drop both join it before storage teardown. Its terminal channel
+carries only a value report or completion bridge; join resolves disconnection
+and propagates worker panics.
 
-The task sorts tables by TableID and indexes by physical slot. An index-neutral
-`HotBuildTableSource` consumes sidecars and releases replay bitmaps. Replay page
-registration and drain guarantee completeness. `finish_capture()` sorts and
-validates descriptor identity and contiguity from the pivot, without a separate
-end-boundary scan. Index-free tables also validate and count source pages. Each
-index re-extracts keys with `DuplicateCheck::Skip`, without coalescing entries.
+Tables run by TableID and indexes by physical slot. Table-level capture consumes
+replay sidecars, releases their bitmaps and retains budgeted page descriptors.
+Replay registration and drain establish completeness; capture checks contiguity
+from the pivot and unique page identities without another end-boundary scan.
+Index-free tables also validate and count pages. Each index independently
+extracts its keys using `DuplicateCheck::Skip`, without coalescing entries.
 
-A table-local budget retains descriptor charges. All other scratch and cleanup
-state must be released before the next index. Peak reset asserts that only the
-descriptor allocation remains. Resource exhaustion is a typed bootstrap error.
-Construction produces a detached `ReadyHotTree<P>` without owning or borrowing
-a destination. Installation accepts a private MemIndex in the same pool and
-checks its empty root before fixed-root transfer. Recovery supplies its existing
-index at installation, preserving the cold root and build timestamp.
+`HotIndexBuild<P>` retains the source, index pool/guard, ThreadPool, stage state
+and cleanup. Its `build()` returns a detached `ReadyHotTree<P>` without owning or
+borrowing a destination. `install(&MemIndex<P>)` checks an empty private root in
+the same pool, preserves its PageID and transfers descendant ownership. Recovery
+supplies its bootstrap index; a future CREATE adapter owns its destination and
+late validation. Matching key representation and exclusion are caller contracts.
 
-`HotIndexBuild<P>` in `index/build` shares one `Arc<HotBuildSource>` with local
-sorting and retains stage coordinators, cleanup, and measurements. Its
-`thread_pool` drives construction; `build()` returns an uninstalled ready tree,
-and `settle()` drains accepted work and cleanup. Cancelling build abandons the
-attempt; settlement remains resumable. Construction panics use the shared
-builder's Fatal classification. Installation/cleanup invariant panics propagate
-through join without retry or permanent retention, revising task 000317's
-policy. Recovery retains source capture, table ordering, installation and reporting.
+Cancellation abandons a pipeline attempt; retained settlement is resumable.
+Completion ledgers drain before detached-page cleanup, and all per-index scratch
+is released before the next build. Only descriptor charges survive between
+indexes. Construction panics become Fatal; installation and deallocation
+invariant panics propagate without retry or permanent resource retention.
 
-Page counts accumulate once per table; entry counts accumulate only after
-installation and cleanup. Profiling distinguishes successful extraction from
-completed indexes, sums work/spans, and takes maxima for scratch and longest
-intervals. Capture time belongs to the table once. Packed occupancy includes the
-temporary root. Stage spans overlap and cannot be added to phase wall time.
+Page counts accumulate once per table; installed entry counts advance after
+cleanup. Profiling separates extraction from completed installations, accumulates
+work and spans, and takes maxima for peaks. Overlapping stage spans are not
+additive parts of rebuild wall time; packed occupancy includes the temporary root.
 
 ## Implementation Notes
 
-Implemented RFC 0032 phase 4 with joined recovery ownership, shared per-index orchestration,
-trusted keys, descriptor reuse, and invariant panic propagation. All 2,174 workspace
-tests, 2,013 libaio storage tests, and the 26-file style gate passed. Verified million-row medians fell
+Implemented RFC 0032 phase 4 with joined recovery ownership and shared destination-independent hot-index construction.
+All 2,175 workspace tests, 2,014 libaio storage tests and the 29-file style gate
+passed on the final implementation. Earlier verified million-row medians fell
 from 325.740 to 17.173 ms for rebuild and 497.523 to 192.155 ms for bootstrap.
-Backlog 000110 remains open for CREATE INDEX integration in phase 5.
+CREATE INDEX integration remains phase 5 under backlog 000110.
 
-### Final implementation and review
+### Material implementation and review outcomes
 
-- Removed production per-row recovery insertion and its obsolete row-read
-  helper. The checked adapter remains test-only; typed conflicts and secondary
-  cleanup diagnostics survive completion transport with the primary source intact.
-- Moved per-index orchestration into shared `HotIndexBuild`, with detached
-  construction and explicit late validation before installation. Destination
-  ownership stays with the caller. Bootstrap stays boxed; component membership
-  and teardown order are unchanged.
-- Cancellation validation exposed scratch retained by abandoned packed results
-  after producer leases ended. The pipeline retains `HotPackedBuild<P>`
-  independently of the installation destination and drains all completion ledgers
-  before page cleanup, preserving late errors and releasing scratch exactly.
-- Extended only recovery benchmark fixtures: multiple tables/indexes, skew,
-  wide/composite keys, checkpointed prefixes, deletes, and key-changing updates.
-  Verification scans every selected index and compares full table fingerprints
-  outside timing. A missing later index is a tested verification failure.
-- Style and semantic review retained distinct integration/component assertions:
-  bootstrap tests prove joined ownership and teardown ordering; builder tests
-  prove exact page reclamation, fixed-root structure, and subsequent mutations.
+- Replaced production per-row recovery insertion and removed its obsolete
+  row-read helper. Explicit checked tests retain typed duplicate diagnostics;
+  production trusts recovered-data and exact-coverage invariants.
+- Shared per-index orchestration replaced recovery-specific stage coordination.
+  Final review removed `StagingMemIndex`, its owned/borrowed generic forms and
+  the packed-state wrapper. One retained `HotPackedBuild<P>` now serves direct
+  component callers and the pipeline; callers bind the destination at installation.
+- Cancellation tests exposed completed results retaining scratch after producer
+  leases ended. Draining completion ledgers before page cleanup fixes that case
+  and preserves late Fatal errors. This obligation survives the detached refactor.
+- Deallocation failures are internal invariants. Their panics propagate through
+  join without retry or permanent page/guard retention, revising task 000317's
+  original panic-to-Fatal retention policy. Typed reopen failures remain Fatal.
+- Descriptor completeness comes from replay ownership rather than a redundant
+  row-page traversal. Counter arithmetic assumes no overflow; duration accounting
+  still asserts valid subtraction relationships.
+- Recovery fixtures gained multiple tables/indexes, skew, wide/composite keys,
+  checkpointed prefixes and mutations. Verification checks every selected index
+  and complete table fingerprints outside timing. The benchmark reuses storage
+  measurement types and enables storage's default iouring/profiling features.
+- The ten slowest correctness tests were resized to sufficient rows, pages and
+  workers. Independent oracles, full/partial internal merges, packing-window and
+  run/yield boundaries, eviction beyond capacity, and cancellation stages remain.
+  Concurrent eviction now verifies every payload after an allocation barrier;
+  the tiny unique-index benchmark explicitly checks the duplicate-key failure.
+- Three-run debug workspace median fell from 5.267 to 4.497 s; the sum of the ten
+  isolated test medians fell from 5.089 to 0.921 s. These measurements excluded
+  compilation and preceded the final detached-builder regression test. Eviction,
+  packed cancellation and internal-merge suites passed 100 repetitions per backend.
 
-### Reproducible comparison conditions
+### Benchmark conditions and limitations
 
 Measurements on 2026-09-29 used Linux 7.0.14-orbstack-00380-ga7e0a2dc9535,
-aarch64 Apple hardware with 10 exposed CPUs, 11 GiB RAM and 12 GiB swap;
-glibc 2.39 (Ubuntu 2.39-0ubuntu8.7), rustc/cargo 1.98.1. Release builds used
-normal optimization, the workspace's release debug information, `iouring`, and
-no custom RUSTFLAGS. `LD_PRELOAD` and `MALLOC_CONF` were unset; no CPU affinity or
-cache dropping was used. Same-process preparation and preverification warm
-uncontrolled caches; these are clean-reopen measurements, not crash benchmarks.
+aarch64 Apple hardware, 10 exposed CPUs, 11 GiB RAM, 12 GiB swap, glibc 2.39
+(Ubuntu 2.39-0ubuntu8.7) and Rust 1.98.1. Release builds used normal optimization,
+workspace debug information and iouring. No custom RUSTFLAGS, LD_PRELOAD,
+MALLOC_CONF, CPU affinity or cache dropping was applied. These were clean
+reopens with uncontrolled caches, not crash benchmarks.
 
-Every run prepared a fresh root in one session, committing batches of 1,000 with
-fsync. The ThreadPool had four workers; admitted bulk workers varied 1/2/4.
-Index/data memory limits were each 512 MiB, spill limits each 2 GiB, readonly
-buffer 128 MiB, bulk scratch 1 GiB, and target pages/run 32 unless stated.
-Preparation, table preverification, and table/every-index postverification were
-outside bootstrap timing. Startup below is the storage bootstrap envelope;
-rebuild includes capture, thread startup, all stages, cleanup, and join.
+Each run prepared a fresh root in one session with fsynced batches of 1,000.
+The ThreadPool had four workers; build workers varied 1/2/4. Index/data memory
+limits were each 512 MiB, spill limits each 2 GiB, readonly buffer 128 MiB,
+bulk scratch 1 GiB and target pages/run 32 unless stated. Preparation and
+pre/postverification were outside the bootstrap timer. Rebuild includes capture,
+thread startup, all build stages, cleanup and join.
 
-Parent used the base above with only the new benchmark harness backported.
-Sorted insertion was a temporary adapter using shared extraction with one
-worker, globally sorted encoded references, and ordinary sequential insertion.
-Bulk used this task's uncommitted implementation. Checked profiling temporarily
-selected `Collect`; production selects `Skip`. All temporary adapters, detached
-worktrees, binaries, and comparison drivers were removed before resolution.
-The final benchmark re-exports storage measurement types and always enables
-`iouring` and `profiling`; comparisons predate that policy and the final
-orchestration refactor.
-Current build and invocation commands (substitute a fresh root per run):
+Parent used the comparison base with the new harness backported. Sorted
+insertion used shared extraction with one worker, globally sorted encoded
+references and ordinary insertion. Bulk used this task's implementation;
+checked profiling temporarily selected `Collect`. Temporary adapters and
+comparison worktrees were removed. The measurements preceded the final
+orchestration/destination refactors and benchmark feature simplification;
+they are not fresh measurements of the final source snapshot.
 
-```bash
-rtk cargo build -p doradb-bench --release
-./target/release/doradb-bench --root /tmp/task318-run --plan target/task318/plans/large-unique-bulk-w4-r0.toml
-```
-
-The representative plan sets the limits above and one benchmark workload:
-`type = "recovery", include_stats = true`, with fixture `rows = 1000000`,
-`tables = 1`, `indexes = 1`, `index = "unique"`, `value_bytes = 64`.
-`docs/benchmark-tool.md` documents the fixture schema. Local plans, canonical
-result TOML, stdout and RSS observations remain in `target/task318/plans/` and
-`results/`; `matrix.json` and `profiles.json` summarize them. The durable numbers
-and limitations are copied below because target artifacts are ignored.
+The fixture schema is documented in `docs/benchmark-tool.md`. Local plans,
+canonical result TOML, stdout and RSS observations remain in
+`target/task318/plans/` and `results/`, summarized by `matrix.json` and
+`profiles.json`. Durable numbers are retained below because those artifacts
+are ignored. Test-sizing evidence is in `target/task318/test-sizing/report.md`.
 
 ### End-to-end results
 
@@ -266,37 +258,42 @@ to obtain these peaks; key width and repeated projection remain relevant costs.
 
 ## Impacts
 
-Recovery now activates existing hot-build worker/scratch settings. Storage and
-redo formats are unchanged. `RecoveryReport` gains profiling-gated completed
-build measurements, normalized in benchmark output. Counters retain their
-meanings, use ordinary arithmetic, and no longer report saturation. The guides
-document joined teardown, invariant panics, timing overlap, and recovery fixtures.
+Recovery now uses existing hot-build worker/scratch settings. Storage, schema
+and redo formats are unchanged. Profiling-gated recovery reports expose
+completed-build measurements through benchmark output. Recovery/profiling
+counters use ordinary arithmetic and no longer expose saturation flags.
+Benchmark fixture controls expand without adding a second measurement model.
+Design guides describe subsystem ownership and timing concepts; detailed build
+interfaces remain in the RFC and code. CREATE's production builder is unchanged.
 
 ## Test Cases
 
-- Final capture simplification: 2,174 workspace and 129 affected `libaio` tests passed.
-- Earlier full `libaio` validation passed all 2,013 storage tests.
-- Formatting, strict Clippy and style passed: 26 Rust files, 381 test contracts,
-  zero violations; fresh global inventory contained 2,187 source-visible tests.
-- Source tests retain gaps, orphan histories, pivot and identity failures. Replay
-  tests preserve empty and reactivated pages; integration tests verify admission,
-  counters, fixed roots/timestamps, typed checked conflicts, and scratch failures.
-- Channel/barrier tests cover cancellation at capture, leaf/parent producers,
-  install, cleanup and terminal publication; spawn failure, panic, disconnection,
-  observer unwind, successful completion after detachment, partial reclamation,
-  original panic propagation, teardown and subsequent reopen remain distinct.
-  Pipeline cancellation passed 100 stress iterations per I/O backend.
-- Pipeline tests cover private-index install/rejection/duplicates and cancelled
-  extraction/packing. Lower builder/table tests retain structure, mutations and
-  restart coverage; benchmark tests retain cold, mixed and missing-index cases.
-- Initial `tools/coverage.rs run` passed: production-line coverage was 98.12% for new
-  recovery integration, 97.55% for shared build code, and 88.76% for the new
-  benchmark fixture (97.34% combined). Reports are in `target/task318/coverage.md`
-  and `target/coverage/`; the public-error audit was unchanged.
+- Final workspace validation: 2,175 tests passed; full alternate libaio storage
+  validation: 2,014 passed. Final formatting and strict Clippy passed; branch
+  style/test-contract audit checked 29 Rust files and 471 contracts with no
+  violations. Its global inventory contained 2,188 source-visible tests.
+- Source/replay tests cover gaps, orphan histories, pivot/identity failures,
+  empty/reactivated pages and retained version maps. Integration verifies
+  admission, counters, fixed roots/timestamps, typed conflicts and scratch errors.
+- Channel/barrier tests cover cancellation at capture, leaf/parent production,
+  install, cleanup and terminal publication; spawn failure, disconnection,
+  observer unwind, partial reclamation and original panic propagation remain
+  distinct. Teardown and subsequent reopen are checked.
+- Pipeline tests retain install/abort/duplicate and cancelled extraction/packing
+  cases. Packed tests install into destinations created after construction and
+  reject populated destinations for both empty and nonempty builds, preserving
+  old contents and reclaiming detached pages. Mutation, eviction and full/partial
+  internal-merge assertions remain; benchmark tests cover every index and placement.
+- Earlier coverage measured 98.12% for recovery integration, 97.55% for shared
+  build code and 88.76% for the benchmark fixture (97.34% combined). It preceded
+  later refactors and is historical, not final-snapshot coverage. Reports remain
+  in `target/task318/coverage.md` and `target/coverage/`; the public-error audit
+  was unchanged at that check. Final test logs are in `target/task318/detached-build/`.
 
 ## Open Questions
 
-No blocking questions remain. CREATE INDEX ownership, late cold/hot validation,
-and caller-specific performance acceptance remain RFC phase 5 under backlog
-000110. Its update retains the tiny-input overhead, multi-index re-extraction,
-and worker-scaling evidence for phase 5.
+No blocking questions remain. CREATE INDEX accepted-operation ownership,
+cold/hot validation and caller-specific performance acceptance remain RFC
+phase 5 under [backlog 000110](../backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md).
+That follow-up retains the detached-tree interface, tiny-input overhead,
+multi-index re-extraction and worker-scaling findings.

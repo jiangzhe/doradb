@@ -516,6 +516,11 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
         let pool = self.owner.pool();
         let guard = self.owner.guard();
         let tree = index.tree();
+        if !tree.uses_pool(pool) {
+            return Err(execution_error(
+                "packed destination belongs to a different buffer pool",
+            ));
+        }
         let mut destination = tree
             .check_empty_private_root(guard)
             .await
@@ -1859,6 +1864,78 @@ mod tests {
                 index.destroy(&guard).await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }
+        });
+    }
+
+    /// Purpose: Reject foreign-pool installation before accessing its root for empty and nonempty builds.
+    /// Expected: Rejection returns an index-access error without poison or mutation, and the ready tree remains installable or reclaimable.
+    #[test]
+    fn packed_install_rejects_foreign_pool() {
+        smol::block_on(async {
+            let (_scope, workers, poisoner) = workers(1).await;
+            let pool = pages(minimum_fixed_pool_bytes() * 4);
+            let foreign_pool = pages(minimum_fixed_pool_bytes() * 4);
+            let guard = pool.create_base_guard();
+            let foreign_guard = foreign_pool.create_base_guard();
+            let foreign = empty_index(foreign_pool.guard(), true).await;
+            let foreign_root = foreign
+                .tree()
+                .check_empty_private_root(&foreign_guard)
+                .await
+                .unwrap()
+                .page_id();
+            for count in [0, 1] {
+                for install in [false, true] {
+                    let runs = input(count, 8, 0, DuplicateCheck::Collect);
+                    let expected = oracle(&runs);
+                    let plan =
+                        test_prepare_packed(runs, workers.clone(), 1, usize::from(count != 0), 1)
+                            .await;
+                    let (mut build, mut cleanup) =
+                        packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
+                    let mut ready = expect_complete(build.execute().await.unwrap());
+                    drop(build);
+                    let allocated = pool.allocated();
+                    let error = ready.install(&foreign).await.unwrap_err();
+                    let RuntimeOrFatalError::Runtime(report) = error else {
+                        panic!("foreign-pool rejection must be Runtime: {error:?}");
+                    };
+                    assert_eq!(report.current_context(), &RuntimeError::IndexAccess);
+                    assert!(
+                        format!("{report:?}")
+                            .contains("packed destination belongs to a different buffer pool")
+                    );
+                    assert!(poisoner.poison_error().is_none());
+                    assert_eq!(pool.allocated(), allocated);
+                    assert_eq!(foreign_pool.allocated(), 1);
+                    assert_eq!(
+                        foreign
+                            .tree()
+                            .check_empty_private_root(&foreign_guard)
+                            .await
+                            .unwrap()
+                            .page_id(),
+                        foreign_root,
+                    );
+                    let mut reclaim = Box::pin(cleanup.run());
+                    assert!(futures::poll!(reclaim.as_mut()).is_pending());
+                    drop(reclaim);
+                    if install {
+                        let index = empty_index(pool.guard(), true).await;
+                        ready.install(&index).await.unwrap();
+                        cleanup.run().await.unwrap();
+                        let ids = verify(index.tree(), &guard, &expected, true).await;
+                        assert_eq!(pool.allocated(), ids.len());
+                        index.destroy(&guard).await.unwrap();
+                    } else {
+                        ready.abort().unwrap();
+                        cleanup.run().await.unwrap();
+                    }
+                    assert_eq!(pool.allocated(), 0, "count={count}, install={install}");
+                }
+            }
+            foreign.destroy(&foreign_guard).await.unwrap();
+            assert_eq!(foreign_pool.allocated(), 0);
         });
     }
 

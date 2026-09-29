@@ -24,6 +24,7 @@ use cursor::{build_exhausted_parent_seek_key, make_strict_successor};
 use either::Either;
 use error_stack::Report;
 use std::marker::PhantomData;
+use std::ptr;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -145,6 +146,12 @@ pub(crate) struct GenericBTree<P: 'static> {
 }
 
 impl<P: BufferPool> GenericBTree<P> {
+    /// Test exact pool-instance identity; quiescent ownership keeps its address stable.
+    #[inline]
+    pub(crate) fn uses_pool(&self, pool: &P) -> bool {
+        ptr::eq(&*self.pool, pool)
+    }
+
     /// Acquire the fixed empty root under a caller-retained private-build capability.
     pub(crate) async fn check_empty_private_root(
         &self,

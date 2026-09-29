@@ -92,9 +92,13 @@ Phase-4 deferral update:
   returns above two workers. Six-index profiling still re-extracts keys six
   times, with 136.791 ms extraction and 33.878 ms local-sort worker sums.
 - Direction Hint: Preserve phase 5's existing mandatory ownership and late
-  validation contract, using shared `HotIndexBuild` with an uninstalled ready
-  tree and caller-driven settlement. Measure CREATE independently; recovery speedups do not
-  establish its performance. Retain scratch/page/RSS distinctions and compare
+  validation contract. Shared `HotIndexBuild<P>::build()` returns a detached
+  `ReadyHotTree<P>` without a destination borrow; the caller owns its private
+  MemIndex and supplies it to `install(&MemIndex<P>)` after validation. Retain
+  the single `HotPackedBuild<P>` completion ledger and caller-driven settlement
+  through cancellation; do not restore owned/borrowed staging wrappers.
+  Measure CREATE independently; recovery speedups do not establish its performance.
+  Retain scratch/page/RSS distinctions and compare
   worker counts, key width, repeated projection and tiny-input overhead before
   considering further tuning or a small-input policy. Task 000318 contains the
   full environment, fixture matrix, page-target and checked-mode observations.

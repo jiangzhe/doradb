@@ -920,9 +920,12 @@ after both callers deliver the full pipeline and performance acceptance.
     descriptor completeness. Capture sorts and validates contiguity from the
     pivot and unique page identities without scanning for an independent end.
     Shared `HotIndexBuild` owns per-index stage orchestration and shares one
-    source with local sorting. Accepted ThreadPool jobs settle and cleanup
-    completes before the next index. Dropping bootstrap does not force the
-    accepted task to abort; installed descendants belong to the unexposed
+    source with local sorting. It builds a detached `ReadyHotTree<P>`; recovery
+    supplies its existing MemIndex only at installation. One retained
+    `HotPackedBuild<P>` owns packed completion ledgers without a destination
+    borrow. Accepted ThreadPool jobs settle and cleanup completes before the
+    next index. Dropping bootstrap does not force the accepted task to abort;
+    installed descendants belong to the unexposed
     runtime. Installation and cleanup invariant panics propagate through join
     without retry or permanent retention. Component order remains unchanged.
     Integrated reports distinguish extraction from installation and retain
@@ -944,14 +947,17 @@ after both callers deliver the full pipeline and performance acceptance.
     and explain small-input or multi-index regressions. [U10] [U12]
   - After This Phase: Recovery uses the shared pipeline in production and its
     verified end-to-end comparisons are recorded in task 000318. Phase 5 reuses
-    `HotIndexBuild`, the private destination capability and cleanup protocol,
-    retaining its accepted mandatory owner and late cold/hot validation. Recovery's
-    joined thread is local to bootstrap. Backlog 000110 remains open for CREATE
-    integration and independent caller performance acceptance.
+    `HotIndexBuild<P>::build()`, detached `ReadyHotTree<P>` and explicit
+    settlement. CREATE owns its private destination and passes it to
+    `install(&MemIndex<P>)` after late cold/hot validation; no owned/borrowed
+    staging wrapper is required. Its accepted mandatory owner remains responsible
+    for publication and rollback. Recovery's joined thread is local to bootstrap.
+    Backlog 000110 remains open for CREATE integration and independent caller
+    performance acceptance.
   - Task Doc: `docs/tasks/000318-recovery-hot-index-integration.md`
   - Task Issue: `#1120`
   - Phase Status: done
-  - Implementation Summary: Implemented RFC 0032 phase 4 with joined recovery ownership, shared per-index orchestration, trusted keys, descriptor reuse, and invariant panic propagation. All 2,174 workspace tests, 2,013 libaio storage tests, and the 26-file style gate passed. Verified million-row medians fell from 325.740 to 17.173 ms for rebuild and 497.523 to 192.155 ms for bootstrap. Backlog 000110 remains open for CREATE INDEX integration in phase 5. [Task Resolve Sync: docs/tasks/000318-recovery-hot-index-integration.md @ 2026-09-29]
+  - Implementation Summary: Implemented RFC 0032 phase 4 with joined recovery ownership, shared detached-tree construction, trusted keys and explicit cleanup. Final validation passed 2,175 workspace tests, 2,014 libaio storage tests and the 29-file style gate. Earlier verified million-row medians fell from 325.740 to 17.173 ms for rebuild and 497.523 to 192.155 ms for bootstrap. Smaller correctness fixtures reduced the workspace median from 5.267 to 4.497 s. Backlog 000110 remains open for CREATE INDEX integration and independent acceptance in phase 5. [Task Resolve Sync: docs/tasks/000318-recovery-hot-index-integration.md @ 2026-09-29]
 
 - **Phase 5: CREATE INDEX Hot-Build Integration**
   - Scope: Replace hot collection/validation/insertion with the shared
@@ -963,13 +969,16 @@ after both callers deliver the full pipeline and performance acceptance.
     ownership, rollback, table-root, and layout/history protocols.
   - Non-goals: Cold builder changes, reduced cold-vector memory, online DDL,
     or new durability records.
-  - Prerequisites: Phases 1-3 and retained DDL exclusion/root capture; Phase 4
-    provides the first production integration without changing this contract.
+  - Prerequisites: Phases 1-3, Phase 4's shared detached-build orchestration,
+    and retained DDL exclusion/root capture. Recovery's temporary thread is not
+    part of the CREATE ownership model.
   - Phase-local Choices: Cold-interval lookup/comparison, DDL test hooks, and
-    caller benchmark/statistics integration. Retain cleanup in accepted DDL
-    progress before construction, await it inside the existing mandatory task
-    at build completion, and preserve it across panic handling. Include abort
-    after late validation failure; merge typed cleanup errors with Fatal
+    caller benchmark/statistics integration. Retain the shared pipeline in
+    accepted DDL progress before construction, settle it inside the existing
+    mandatory task, and preserve its cleanup state across panic handling.
+    The private MemIndex remains caller-owned; construction requires only the
+    captured source and pool resources, and installation binds the destination.
+    Include abort after late validation failure; merge typed cleanup errors with Fatal
     precedence, but propagate deallocation invariant panics without retry.
   - Validation: Verify that unique creation always enables checking and that
     non-unique creation admits equal logical keys. Cover local-run, cross-run,
