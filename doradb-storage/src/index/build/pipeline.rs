@@ -1,13 +1,10 @@
 //! Caller-owned orchestration from captured rows to an uninstalled packed tree.
 use super::merge::HotMergePreparation;
-use super::tree_builder::{
-    HotPackedOutcome, PackedBuildState, ReadyHotTree, StagedPageCleanup, StagingMemIndex,
-};
+use super::tree_builder::{HotPackedBuild, HotPackedOutcome, ReadyHotTree, StagedPageCleanup};
 use super::{HotBuildPolicy, HotBuildSource, HotLocalSort};
-use crate::buffer::BufferPool;
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::component::panic_payload_description;
 use crate::error::{FatalError, RuntimeOrFatalResult};
-use crate::index::mem_index::MemIndex;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
 use crate::profiling::{HotBuildMeasurements, HotMergeMeasurements, HotPackedMeasurements};
@@ -15,7 +12,6 @@ use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
 use error_stack::Report;
 use futures::FutureExt;
-use std::borrow::Borrow;
 use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -38,20 +34,22 @@ enum BuildPhase {
 
 /// One per-index construction attempt, retained independently of borrowed futures.
 ///
-/// The caller supplies stable source authority and an unpublished destination.
+/// The caller supplies stable source authority and the destination pool.
 /// Build returns an uninstalled tree so the caller can validate before installing
 /// or aborting it. After either decision, errors, or cancellation, call settle
 /// before publication or storage teardown. Dropping this owner does not run cleanup.
 #[must_use = "retain the pipeline and settle accepted work before storage teardown"]
 pub(crate) struct HotIndexBuild<P: BufferPool + 'static> {
     source: Arc<HotBuildSource>,
+    index_pool: QuiescentGuard<P>,
+    index_guard: PoolGuard,
     thread_pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
     policy: HotBuildPolicy,
     phase: BuildPhase,
     sort: Option<HotLocalSort>,
     preparation: Option<HotMergePreparation>,
-    packing: Option<PackedBuildState<P>>,
+    packing: Option<HotPackedBuild<P>>,
     cleanup: Option<StagedPageCleanup<P>>,
     #[cfg(feature = "profiling")]
     extraction: Option<HotBuildMeasurements>,
@@ -65,6 +63,8 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
     /// Share one captured key shape between extraction and the retained build owner.
     pub(crate) fn new(
         source: Arc<HotBuildSource>,
+        index_pool: QuiescentGuard<P>,
+        index_guard: PoolGuard,
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         policy: HotBuildPolicy,
@@ -76,6 +76,8 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         ));
         Self {
             source,
+            index_pool,
+            index_guard,
             thread_pool,
             poisoner,
             policy,
@@ -118,19 +120,15 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
     /// Cancellation abandons this attempt; retain this owner and call settle.
     /// Construction panics become Fatal with the stage owners still available
     /// for settlement. Installation and reclamation occur outside this catch.
-    pub(crate) async fn build<'a, I: Borrow<MemIndex<P>>>(
+    pub(crate) async fn build(
         &mut self,
-        staging: &'a mut StagingMemIndex<P, I>,
-    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
+    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<P>>> {
         assert!(
             self.phase == BuildPhase::New,
             "hot index pipeline build requires a fresh attempt"
         );
         self.phase = BuildPhase::Extraction;
-        match AssertUnwindSafe(self.construct(staging))
-            .catch_unwind()
-            .await
-        {
+        match AssertUnwindSafe(self.construct()).catch_unwind().await {
             Ok(result) => result,
             Err(payload) => {
                 let report = Report::new(FatalError::ThreadPoolTaskPanic).attach(format!(
@@ -150,10 +148,7 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         }
     }
 
-    async fn construct<'a, I: Borrow<MemIndex<P>>>(
-        &mut self,
-        staging: &'a mut StagingMemIndex<P, I>,
-    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
+    async fn construct(&mut self) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<P>>> {
         let runs = self
             .sort
             .as_mut()
@@ -179,8 +174,15 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             .await?;
         self.preparation = None;
         self.phase = BuildPhase::PackedConstruction;
-        let (packing, cleanup) =
-            staging.start_build_state(plan, self.thread_pool.clone(), self.poisoner.clone());
+        let (packing, cleanup) = HotPackedBuild::new(
+            self.index_pool.clone(),
+            self.index_guard.clone(),
+            plan,
+            self.thread_pool.clone(),
+            self.poisoner.clone(),
+            self.source.key.unique,
+            self.source.key.build_ts,
+        );
         self.packing = Some(packing);
         self.cleanup = Some(cleanup);
         #[cfg(test)]
@@ -192,7 +194,7 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             .packing
             .as_mut()
             .unwrap_or_else(|| unreachable!("pipeline owns packed construction"))
-            .build(staging)
+            .execute()
             .await;
         self.packing = None;
         let outcome = outcome?;
@@ -245,9 +247,9 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
     /// Collect component measurements after the caller installs and settles a build.
     #[cfg(feature = "profiling")]
     #[inline]
-    pub(crate) fn measurements<'a, I: Borrow<MemIndex<P>>>(
+    pub(crate) fn measurements<'a>(
         &self,
-        ready: &'a ReadyHotTree<'_, P, I>,
+        ready: &'a ReadyHotTree<P>,
     ) -> (
         HotBuildMeasurements,
         &'a HotMergeMeasurements,

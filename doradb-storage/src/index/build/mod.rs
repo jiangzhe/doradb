@@ -373,7 +373,7 @@ impl Drop for HotLocalSort {
 
 #[cfg(test)]
 mod tests {
-    use super::tree_builder::{HotPackedOutcome, StagingMemIndex};
+    use super::tree_builder::HotPackedOutcome;
     use super::*;
     use crate::Engine;
     use crate::buffer::guard::PageGuard;
@@ -391,6 +391,7 @@ mod tests {
     use crate::id::{PageID, TrxID};
     use crate::index::BTreeKeyEncoder;
     use crate::index::btree::BTreeU64;
+    use crate::index::mem_index::MemIndex;
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::quiescent::QuiescentBox;
     use crate::recovery::{
@@ -601,34 +602,32 @@ mod tests {
             &self,
             plan: &CreateIndexPlan,
             index_pool: &QuiescentBox<FixedBufferPool>,
-        ) -> (
-            HotIndexBuild<FixedBufferPool>,
-            StagingMemIndex<FixedBufferPool>,
-        ) {
+        ) -> (HotIndexBuild<FixedBufferPool>, MemIndex<FixedBufferPool>) {
             let policy = self.policy(2, 1);
             let source = Arc::new(self.source(plan, policy, false).await);
-            let types = source
+            let mut types: Vec<_> = source
                 .key
                 .columns
                 .iter()
                 .map(|&column| source.layout.metadata().col.col_type(column))
                 .collect();
-            let staging = StagingMemIndex::new(
-                index_pool.guard(),
-                index_pool.create_base_guard(),
-                types,
-                source.key.unique,
-                source.key.build_ts,
-            )
-            .await
-            .unwrap();
+            if !source.key.unique {
+                types.push(ValType::new(ValKind::U64, false));
+            }
+            let guard = index_pool.create_base_guard();
+            let index =
+                MemIndex::new_with_types(index_pool.guard(), &guard, types, source.key.build_ts)
+                    .await
+                    .unwrap();
             let build = HotIndexBuild::new(
                 source,
+                index_pool.guard(),
+                guard,
                 self.engine.inner().thread_pool.clone(),
                 self.engine.inner().poisoner.clone(),
                 policy,
             );
-            (build, staging)
+            (build, index)
         }
 
         async fn oracle(&self, plan: &CreateIndexPlan) -> Vec<(BTreeKey, RowID)> {
@@ -994,9 +993,9 @@ mod tests {
                 let column = usize::from(matches!(decision, Decision::Duplicate));
                 let plan = fixture.plan(&[column], true);
                 let expected = fixture.oracle(&plan).await;
-                let (mut build, mut staging) = fixture.pipeline(&plan, &index_pool).await;
+                let (mut build, index) = fixture.pipeline(&plan, &index_pool).await;
                 let budget = build.source().budget.clone();
-                match build.build(&mut staging).await.unwrap() {
+                match build.build().await.unwrap() {
                     HotPackedOutcome::Complete(mut ready) => {
                         assert!(!matches!(decision, Decision::Duplicate));
                         assert_eq!(ready.entries(), expected.len());
@@ -1006,7 +1005,7 @@ mod tests {
                         assert!(futures::poll!(settlement.as_mut()).is_pending());
                         drop(settlement);
                         if matches!(decision, Decision::Install) {
-                            ready.install().await.unwrap();
+                            ready.install(&index).await.unwrap();
                             build.settle().await.unwrap();
                             #[cfg(feature = "profiling")]
                             {
@@ -1017,7 +1016,7 @@ mod tests {
                             }
                         } else if matches!(decision, Decision::Abort) {
                             ready.abort().unwrap();
-                            assert!(ready.install().await.is_err());
+                            assert!(ready.install(&index).await.is_err());
                         }
                         drop(ready);
                     }
@@ -1042,7 +1041,7 @@ mod tests {
                 build.settle().await.unwrap();
                 drop(build);
                 assert_eq!(budget.used(), 0, "{decision:?}");
-                let index = staging.finish();
+
                 let guard = index_pool.create_base_guard();
                 if matches!(decision, Decision::Install) {
                     for (key, row) in &expected {
@@ -1079,7 +1078,7 @@ mod tests {
                     FixedBufferPool::with_capacity(PoolRole::Index, 16 * 1024 * 1024).unwrap(),
                 );
                 let plan = fixture.plan(&[0], true);
-                let (mut build, mut staging) = fixture.pipeline(&plan, &index_pool).await;
+                let (mut build, index) = fixture.pipeline(&plan, &index_pool).await;
                 let budget = build.source().budget.clone();
                 let (armed_tx, armed_rx) = flume::bounded(1);
                 if packing {
@@ -1103,7 +1102,7 @@ mod tests {
                         .send(build.source().test.gate(0, Fault::None))
                         .unwrap();
                 }
-                let execute = Box::pin(build.build(&mut staging));
+                let execute = Box::pin(build.build());
                 let ((entered, release), pending) =
                     match select(execute, Box::pin(armed_rx.recv_async())).await {
                         Either::Right((Ok(gate), pending)) => (gate, pending),
@@ -1127,7 +1126,7 @@ mod tests {
                 drop(build);
                 assert_eq!(budget.used(), 0, "packing={packing}");
                 assert_eq!(index_pool.allocated(), 1);
-                let index = staging.finish();
+
                 let guard = index_pool.create_base_guard();
                 drop(index.tree().check_empty_private_root(&guard).await.unwrap());
                 index.destroy(&guard).await.unwrap();

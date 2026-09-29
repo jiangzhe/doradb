@@ -220,15 +220,15 @@ stable hot-page source
 `Arc<HotBuildSource>` supplies both its retained source and `HotLocalSort`, so
 projection metadata and the encoder are constructed once per selected index.
 Its `thread_pool` drives extraction, merge preparation and packed construction.
-`build(&mut staging)` returns an uninstalled `ReadyHotTree`; callers retain the
+`build()` returns a detached `ReadyHotTree<P>`; callers retain the
 late-validation boundary and decide install or abort. `settle()` drains stage
 jobs and detached-page cleanup. A cancelled build attempt must be settled rather
 than restarted; cancellation of settlement preserves its progress for resumption.
-The pipeline retains `PackedBuildState` independently of the borrowed target,
-including leaf/parent completion ledgers. It drains those results before page
+The pipeline retains `HotPackedBuild<P>`, including leaf/parent completion
+ledgers, without a destination borrow. It drains those results before page
 cleanup: zero allocation-producer leases do not imply that completed result
-slots have released all run and scratch owners. The direct `HotPackedBuild`
-wrapper uses the same state while retaining its exclusive destination borrow.
+slots have released all run and scratch owners. Direct packed-stage callers
+use the same retained build object.
 Recovery retains table ordering, replay-source capture, bootstrap join ownership
 and report aggregation. CREATE retains its accepted operation and publication.
 
@@ -495,31 +495,29 @@ destruction; the page tracker must not independently reclaim reachable descendan
 Root installation does not itself publish DDL metadata or admit foreground
 recovery traffic. [C1] [C2] [C5]
 
-Construction returns a target-bound ready tree. Its successful hot completion
+Construction returns a detached ready tree. Its successful hot completion
 is not whole-index uniqueness: CREATE's cold/hot checks remain phase 5 work,
 and a caller can explicitly abort an otherwise ready tree.
 
-`StagingMemIndex<P, I>` retains the destination's pool, guard, leaf
-representation, and timestamp. Its index holder is either an owned `MemIndex<P>`
-or a borrowed `&MemIndex<P>`. A shared implementation constrained by
-`Borrow<MemIndex<P>>` provides `start_build()`, `check_empty()`, and
-`install_root()`. The build coordinator and ready tree borrow this wrapper
-exclusively through installation; recovery's captured table/layout retains the
-borrowed index and bootstrap exclusion keeps it inaccessible to other callers.
+`HotIndexBuild<P>` retains the index pool and guard; the captured source supplies
+the leaf representation and timestamp. Construction does not own or borrow a
+MemIndex. `ReadyHotTree<P>::install(&MemIndex<P>)` accepts a private destination
+with the same pool and physical key representation. It checks root emptiness
+under the exclusive root latch and transfers the completed tree while preserving
+the destination's root identity. Pool identity is checked through the retained
+guard; matching key representation and exclusion are caller contracts.
 
-Only the owned form exposes `finish()` and `destroy()`. After installation and
-successful caller-driven cleanup, synchronous `finish()` returns the completed
-MemIndex for publication. Abort/error paths call `destroy()` using the retained
-guard after detached cleanup. Neither operation runs detached cleanup, and the
-borrowed recovery form cannot consume or destroy the table-owned index. Both
-forms check root emptiness before allocation and at installation, preserving
-the existing root identity.
+Recovery selects its table-owned bootstrap index only at installation. CREATE
+owns its private destination and performs late validation before installation,
+then follows its existing publication or rollback protocol. Destination creation
+and destruction belong to the caller; neither construction nor installation
+publishes the index.
 
-`StagingMemIndex::start_build` returns `(build, cleanup)` before detached allocation.
-The separate `StagedPageCleanup` owns page tracking and pool lifetime authority;
-it does not borrow the target. The caller retains it before executing the build
-and decides whether to await `run()` inline or arrange owned task execution.
-The component does not submit a cleanup job or require cleanup admission.
+`HotPackedBuild::new` returns `(build, cleanup)` before detached allocation.
+The separate `StagedPageCleanup` owns page tracking and pool lifetime authority.
+The caller retains it before executing the build and decides whether to await
+`run()` inline or arrange owned task execution. The component does not submit
+a cleanup job or require cleanup admission.
 
 `execute()` returns a ready tree, duplicate evidence, or an execution error.
 Errors and duplicates drain producers and request abort before returning;

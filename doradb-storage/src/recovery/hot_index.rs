@@ -7,7 +7,7 @@ use crate::error::{
     RecoveryDuplicateKey, RuntimeError, RuntimeOrFatalResult,
 };
 use crate::id::{PageID, TableID};
-use crate::index::build::tree_builder::{HotPackedOutcome, StagingMemIndex};
+use crate::index::build::tree_builder::HotPackedOutcome;
 use crate::index::build::{
     DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildTableSource, HotIndexBuild,
     merge_build_result,
@@ -273,10 +273,10 @@ impl RecoveryHotIndexTask {
                 self.hooks
                     .at(tests::Point::Start(table.table_id(), spec.index));
                 let selected = Arc::new(source.select(spec, MIN_SNAPSHOT_TS, self.duplicates));
-                let mut staging =
-                    StagingMemIndex::for_recovery(&selected, self.index_pool.clone())?;
                 self.active = Some(HotIndexBuild::new(
                     selected.clone(),
+                    self.index_pool.clone(),
+                    selected.guards.index_guard().clone(),
                     self.thread_pool.clone(),
                     self.poisoner.clone(),
                     self.policy,
@@ -287,7 +287,7 @@ impl RecoveryHotIndexTask {
                     .unwrap_or_else(|| unreachable!("index build just installed"));
                 #[cfg(test)]
                 self.hooks.configure_build(active);
-                let mut ready = match active.build(&mut staging).await? {
+                let mut ready = match active.build().await? {
                     HotPackedOutcome::Complete(ready) => ready,
                     HotPackedOutcome::Duplicate(conflict) => {
                         return Err(Report::new(
@@ -310,7 +310,14 @@ impl RecoveryHotIndexTask {
                 self.phase = "installation";
                 #[cfg(test)]
                 self.hooks.at(tests::Point::Install);
-                ready.install().await?;
+                // Bootstrap exclusion keeps this table-owned destination private.
+                let secondary = layout.expect_secondary_index(spec.index);
+                let destination = if spec.unique() {
+                    &**secondary.unique_mem()?
+                } else {
+                    &**secondary.non_unique_mem()?
+                };
+                ready.install(destination).await?;
                 self.phase = "cleanup";
                 active.settle().await?;
                 self.report.entries += ready.entries() as u64;

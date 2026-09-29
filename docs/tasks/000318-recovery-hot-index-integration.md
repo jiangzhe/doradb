@@ -89,9 +89,10 @@ index re-extracts keys with `DuplicateCheck::Skip`, without coalescing entries.
 A table-local budget retains descriptor charges. All other scratch and cleanup
 state must be released before the next index. Peak reset asserts that only the
 descriptor allocation remains. Resource exhaustion is a typed bootstrap error.
-`StagingMemIndex` accepts an owned or borrowed MemIndex through `Borrow`, sharing
-empty-root validation, build setup, and fixed-root transfer. Only owned staging
-exposes finish/destroy; recovery preserves the cold root and build timestamp.
+Construction produces a detached `ReadyHotTree<P>` without owning or borrowing
+a destination. Installation accepts a private MemIndex in the same pool and
+checks its empty root before fixed-root transfer. Recovery supplies its existing
+index at installation, preserving the cold root and build timestamp.
 
 `HotIndexBuild<P>` in `index/build` shares one `Arc<HotBuildSource>` with local
 sorting and retains stage coordinators, cleanup, and measurements. Its
@@ -121,12 +122,13 @@ Backlog 000110 remains open for CREATE INDEX integration in phase 5.
 - Removed production per-row recovery insertion and its obsolete row-read
   helper. The checked adapter remains test-only; typed conflicts and secondary
   cleanup diagnostics survive completion transport with the primary source intact.
-- Moved per-index orchestration into shared `HotIndexBuild`, with owned and
-  borrowed staging and explicit late validation before installation. Bootstrap
-  stays boxed; component membership and teardown order are unchanged.
+- Moved per-index orchestration into shared `HotIndexBuild`, with detached
+  construction and explicit late validation before installation. Destination
+  ownership stays with the caller. Bootstrap stays boxed; component membership
+  and teardown order are unchanged.
 - Cancellation validation exposed scratch retained by abandoned packed results
-  after producer leases ended. The pipeline now retains `PackedBuildState`
-  independently of its destination borrow and drains all completion ledgers
+  after producer leases ended. The pipeline retains `HotPackedBuild<P>`
+  independently of the installation destination and drains all completion ledgers
   before page cleanup, preserving late errors and releasing scratch exactly.
 - Extended only recovery benchmark fixtures: multiple tables/indexes, skew,
   wide/composite keys, checkpointed prefixes, deletes, and key-changing updates.
@@ -284,7 +286,7 @@ document joined teardown, invariant panics, timing overlap, and recovery fixture
   observer unwind, successful completion after detachment, partial reclamation,
   original panic propagation, teardown and subsequent reopen remain distinct.
   Pipeline cancellation passed 100 stress iterations per I/O backend.
-- Pipeline tests cover owned-staging install/rejection/duplicates and cancelled
+- Pipeline tests cover private-index install/rejection/duplicates and cancelled
   extraction/packing. Lower builder/table tests retain structure, mutations and
   restart coverage; benchmark tests retain cold, mixed and missing-index cases.
 - Initial `tools/coverage.rs run` passed: production-line coverage was 98.12% for new

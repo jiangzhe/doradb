@@ -140,6 +140,18 @@ impl<P: BufferPool + 'static> StagedPageOwner<P> {
         (Self { state }, cleanup)
     }
 
+    /// Borrow the pool retaining every detached page through installation.
+    #[inline]
+    pub(super) fn pool(&self) -> &QuiescentGuard<P> {
+        &self.state.pool
+    }
+
+    /// Borrow the exact pool guard used by construction and installation.
+    #[inline]
+    pub(super) fn guard(&self) -> &PoolGuard {
+        &self.state.guard
+    }
+
     /// Retain a producer before submitting work that can allocate pages.
     pub(super) fn producer(&self) -> PageProducer<P> {
         let mut page_tracker = self.state.page_tracker.lock();
@@ -176,7 +188,7 @@ impl<P: 'static> Drop for StagedPageOwner<P> {
     }
 }
 
-/// Caller-owned cleanup obligation, independent of the build and target borrow.
+/// Caller-owned cleanup obligation, independent of the build and installation destination.
 ///
 /// Retain this object before construction starts. After installation, abort, or
 /// dropping the build/ready owner, run it to completion before reporting the

@@ -4,9 +4,9 @@ use super::merge::{
     HotPartitionConsumer, PartitionMergeStream, PreparedHotMerge, execution_error, observe_stop,
 };
 use super::page_cleanup::{PageProducer, StagedPageOwner};
-use super::{BudgetedVec, HotBuildSource, MemoryBudget, SortedHotRuns};
-use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard};
+use super::{BudgetedVec, MemoryBudget, SortedHotRuns};
+use crate::buffer::guard::PageGuard;
+use crate::buffer::{BufferPool, PoolGuard};
 use crate::completion::Completion;
 use crate::component::panic_payload_description;
 use crate::error::{
@@ -27,10 +27,8 @@ use crate::latch::LatchFallbackMode;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{thread_pool::ThreadPool, yield_now};
-use crate::value::{ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use futures::FutureExt;
-use std::borrow::Borrow;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -94,206 +92,6 @@ impl ParentPlanningProfile {
     }
 }
 
-/// Unpublished build destination, either owned staging or a borrowed bootstrap index.
-/// Construction borrows this wrapper exclusively through root installation.
-/// Only owned staging can release its index with finish or reclaim it with destroy;
-/// recovery leaves index ownership with its captured table/layout.
-pub(crate) struct StagingMemIndex<P: 'static, I = MemIndex<P>> {
-    index: I,
-    pool: QuiescentGuard<P>,
-    guard: PoolGuard,
-    unique: bool,
-    ts: TrxID,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "CREATE INDEX staging integration remains RFC 0032 phase 5"
-    )
-)]
-impl<P: BufferPool + 'static> StagingMemIndex<P> {
-    /// Create an unpublished destination; borrowing this capability excludes all readers.
-    pub(crate) async fn new(
-        pool: QuiescentGuard<P>,
-        guard: PoolGuard,
-        mut types: Vec<ValType>,
-        unique: bool,
-        ts: TrxID,
-    ) -> RuntimeOrFatalResult<Self> {
-        if !unique {
-            types.push(ValType::new(ValKind::U64, false));
-        }
-        let index = MemIndex::new_with_types(pool.clone(), &guard, types, ts)
-            .await
-            .map_err(Into::into)?;
-        Ok(Self {
-            index,
-            pool,
-            guard,
-            unique,
-            ts,
-        })
-    }
-
-    /// Hand the completed index to the caller for publication.
-    /// The caller must first install the ready tree and successfully run cleanup.
-    /// This synchronous handoff does not execute cleanup or publish the index.
-    #[inline]
-    pub(crate) fn finish(self) -> MemIndex<P> {
-        self.index
-    }
-
-    /// Destroy the private index after caller-driven detached-page cleanup.
-    /// Use this path when construction or validation fails or the caller aborts.
-    #[inline]
-    pub(crate) async fn destroy(self) -> RuntimeOrFatalResult<()> {
-        self.index.destroy(&self.guard).await.map_err(Into::into)
-    }
-}
-
-impl<'a> StagingMemIndex<EvictableBufferPool, &'a MemIndex<EvictableBufferPool>> {
-    /// Borrow recovery's captured active index under exclusive bootstrap authority.
-    /// The source pins the table/layout and exact key representation; foreground
-    /// and maintenance admission must remain closed through cleanup and join.
-    pub(crate) fn for_recovery(
-        source: &'a HotBuildSource,
-        pool: QuiescentGuard<EvictableBufferPool>,
-    ) -> RuntimeOrFatalResult<Self> {
-        let selected = source.layout.expect_secondary_index(source.key.index);
-        let index = if source.key.unique {
-            &**selected.unique_mem()?
-        } else {
-            &**selected.non_unique_mem()?
-        };
-        Ok(Self {
-            index,
-            pool,
-            guard: source.guards.index_guard().clone(),
-            unique: source.key.unique,
-            ts: source.key.build_ts,
-        })
-    }
-}
-
-impl<P: BufferPool + 'static, I: Borrow<MemIndex<P>>> StagingMemIndex<P, I> {
-    /// Bind a plan to an exclusively borrowed target for direct component use.
-    /// Retain cleanup before calling execute; run it after install, abort, or drop.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "production uses retained pipeline state")
-    )]
-    pub(crate) fn start_build(
-        &mut self,
-        plan: Arc<PreparedHotMerge>,
-        workers: QuiescentGuard<ThreadPool>,
-        poisoner: QuiescentGuard<EnginePoisoner>,
-    ) -> (HotPackedBuild<'_, P, I>, StagedPageCleanup<P>) {
-        let (state, cleanup) = self.start_build_state(plan, workers, poisoner);
-        (
-            HotPackedBuild {
-                staging: Some(self),
-                state,
-            },
-            cleanup,
-        )
-    }
-
-    /// Create packed job state that a pipeline can retain across borrowed-future cancellation.
-    pub(super) fn start_build_state(
-        &mut self,
-        plan: Arc<PreparedHotMerge>,
-        workers: QuiescentGuard<ThreadPool>,
-        poisoner: QuiescentGuard<EnginePoisoner>,
-    ) -> (PackedBuildState<P>, StagedPageCleanup<P>) {
-        let (owner, cleanup) = StagedPageOwner::new(
-            self.pool.clone(),
-            self.guard.clone(),
-            poisoner.clone(),
-            &plan.runs().budget,
-        );
-        let stop = Arc::new(AtomicBool::new(false));
-        let packing = Arc::new(Packing {
-            producer: owner.producer(),
-            runs: plan.runs().clone(),
-            ts: self.ts,
-        });
-        let max_workers = plan.workers();
-        let leaves = HotMergeConsumption::new(
-            plan,
-            workers.clone(),
-            PackedLeafConsumer {
-                packing: packing.clone(),
-                stop: stop.clone(),
-                unique: self.unique,
-            },
-        );
-        let build = PackedBuildState {
-            owner: Some(owner),
-            thread_pool: workers,
-            poisoner,
-            packing: Some(packing),
-            leaves: Some(leaves),
-            children: None,
-            parent_level: None,
-            completion: None,
-            outcome: None,
-            stop,
-            max_workers,
-            finished: false,
-            #[cfg(feature = "profiling")]
-            measurements: HotPackedMeasurements::default(),
-            #[cfg(feature = "profiling")]
-            merge: HotMergeMeasurements::default(),
-        };
-        (build, cleanup)
-    }
-
-    /// Validate the empty destination and retain its exclusive root latch.
-    async fn check_empty(&self) -> RuntimeOrFatalResult<PageExclusiveGuard<BTreeNode>> {
-        self.index
-            .borrow()
-            .tree()
-            .check_empty_private_root(&self.guard)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Install complete assembly and transfer ownership at one synchronous edge.
-    async fn install_root(
-        &mut self,
-        assembly: &Assembly,
-        owner: &StagedPageOwner<P>,
-    ) -> RuntimeOrFatalResult<()> {
-        // The pending decision blocks cleanup. The ready tree's exclusive
-        // borrow prevents abort/drop until installation returns or is cancelled.
-        let tree = self.index.borrow().tree();
-        let mut destination = self.check_empty().await?;
-        if let Some(root) = assembly.root {
-            if assembly.completion.entries() == 0 || root.lower.is_some() || root.upper.is_some() {
-                return Err(execution_error(
-                    "packed root does not cover completed input",
-                ));
-            }
-            let source = self
-                .pool
-                .get_page::<BTreeNode>(&self.guard, root.page_id, LatchFallbackMode::Exclusive)
-                .await
-                .map_err(Into::into)?
-                .lock_exclusive_async()
-                .await
-                .unwrap_or_else(|| unreachable!("exclusive temporary root latch"));
-            // No await, allocation, or fallible operation from this edge.
-            tree.install_private_root(&mut destination, source.page());
-            self.pool.deallocate_page(source);
-        }
-        owner.transferred();
-        destination.set_dirty();
-        Ok(())
-    }
-}
-
 /// Page identity and borrowed fence coordinates; ownership lives only in the page tracker.
 #[derive(Clone, Copy, Debug)]
 struct ChildDescriptor {
@@ -324,45 +122,8 @@ struct Assembly {
 
 type AssemblyResult = RuntimeOrFatalResult<HotPackedOutcome<Assembly>>;
 
-/// Exclusively borrowed destination for direct packed-stage callers.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production uses retained pipeline state")
-)]
-pub(crate) struct HotPackedBuild<'a, P: BufferPool + 'static, I = MemIndex<P>> {
-    staging: Option<&'a mut StagingMemIndex<P, I>>,
-    state: PackedBuildState<P>,
-}
-
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "production uses retained pipeline state")
-)]
-impl<'a, P: BufferPool + 'static, I: Borrow<MemIndex<P>>> HotPackedBuild<'a, P, I> {
-    /// Construct privately while retaining the destination borrow across cancellation.
-    pub(crate) async fn execute(
-        &mut self,
-    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
-        let staging = self
-            .staging
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("packed build owns its staging index"));
-        let outcome = self.state.execute(staging).await?;
-        let staging = self
-            .staging
-            .take()
-            .unwrap_or_else(|| unreachable!("packed build owns its staging index"));
-        Ok(self.state.ready(staging, outcome))
-    }
-
-    /// Stop and drain construction before the caller runs detached-page cleanup.
-    pub(crate) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
-        self.state.settle().await
-    }
-}
-
-/// Packed construction ledgers independent of the destination borrow.
-pub(super) struct PackedBuildState<P: BufferPool + 'static> {
+/// Retained packed construction, independent of any installation destination.
+pub(super) struct HotPackedBuild<P: BufferPool + 'static> {
     owner: Option<StagedPageOwner<P>>,
     thread_pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
@@ -383,42 +144,79 @@ pub(super) struct PackedBuildState<P: BufferPool + 'static> {
     merge: HotMergeMeasurements,
 }
 
-impl<P: BufferPool + 'static> PackedBuildState<P> {
-    /// Construct against a borrowed destination while the pipeline retains every job ledger.
-    pub(super) async fn build<'a, I: Borrow<MemIndex<P>>>(
-        &mut self,
-        staging: &'a mut StagingMemIndex<P, I>,
-    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
-        let outcome = self.execute(staging).await?;
-        Ok(self.ready(staging, outcome))
+impl<P: BufferPool + 'static> HotPackedBuild<P> {
+    /// Retain detached construction and hand off cleanup before allocating any page.
+    pub(super) fn new(
+        pool: QuiescentGuard<P>,
+        guard: PoolGuard,
+        plan: Arc<PreparedHotMerge>,
+        thread_pool: QuiescentGuard<ThreadPool>,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+        unique: bool,
+        ts: TrxID,
+    ) -> (Self, StagedPageCleanup<P>) {
+        let (owner, cleanup) =
+            StagedPageOwner::new(pool, guard, poisoner.clone(), &plan.runs().budget);
+        let stop = Arc::new(AtomicBool::new(false));
+        let packing = Arc::new(Packing {
+            producer: owner.producer(),
+            runs: plan.runs().clone(),
+            ts,
+        });
+        let max_workers = plan.workers();
+        let leaves = HotMergeConsumption::new(
+            plan,
+            thread_pool.clone(),
+            PackedLeafConsumer {
+                packing: packing.clone(),
+                stop: stop.clone(),
+                unique,
+            },
+        );
+        let build = Self {
+            owner: Some(owner),
+            thread_pool,
+            poisoner,
+            packing: Some(packing),
+            leaves: Some(leaves),
+            children: None,
+            parent_level: None,
+            completion: None,
+            outcome: None,
+            stop,
+            max_workers,
+            finished: false,
+            #[cfg(feature = "profiling")]
+            measurements: HotPackedMeasurements::default(),
+            #[cfg(feature = "profiling")]
+            merge: HotMergeMeasurements::default(),
+        };
+        (build, cleanup)
     }
 
-    async fn execute<I: Borrow<MemIndex<P>>>(
+    /// Construct once, retaining job ledgers across cancellation of this borrow.
+    pub(super) async fn execute(
         &mut self,
-        staging: &StagingMemIndex<P, I>,
-    ) -> AssemblyResult {
+    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<P>>> {
         assert!(!self.finished, "packed build reused after settlement");
         if self.outcome.is_none() {
-            self.run_build(staging).await;
+            self.run_build().await;
         }
         // Retain the outcome across draining so cancellation cannot lose it.
         if !matches!(&self.outcome, Some(Ok(HotPackedOutcome::Complete(_)))) {
             self.stop_and_drain().await;
         }
         self.finished = true;
-        self.outcome
+        let outcome = self
+            .outcome
             .take()
-            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))
+            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))?;
+        Ok(self.ready(outcome))
     }
 
-    fn ready<'a, I>(
-        &mut self,
-        staging: &'a mut StagingMemIndex<P, I>,
-        outcome: HotPackedOutcome<Assembly>,
-    ) -> HotPackedOutcome<ReadyHotTree<'a, P, I>> {
+    fn ready(&mut self, outcome: HotPackedOutcome<Assembly>) -> HotPackedOutcome<ReadyHotTree<P>> {
         match outcome {
             HotPackedOutcome::Complete(assembly) => HotPackedOutcome::Complete(ReadyHotTree {
-                staging,
                 owner: self
                     .owner
                     .take()
@@ -450,10 +248,8 @@ impl<P: BufferPool + 'static> PackedBuildState<P> {
             .map(|_| ())
     }
 
-    async fn run_build<I: Borrow<MemIndex<P>>>(&mut self, staging: &StagingMemIndex<P, I>) {
-        let result = AssertUnwindSafe(self.build_tree(staging))
-            .catch_unwind()
-            .await;
+    async fn run_build(&mut self) {
+        let result = AssertUnwindSafe(self.build_tree()).catch_unwind().await;
         self.outcome = Some(match result {
             Ok(result) => result,
             Err(payload) => {
@@ -466,11 +262,10 @@ impl<P: BufferPool + 'static> PackedBuildState<P> {
         });
     }
 
-    async fn build_tree<I: Borrow<MemIndex<P>>>(
-        &mut self,
-        staging: &StagingMemIndex<P, I>,
-    ) -> AssemblyResult {
-        self.check_staging(staging).await?;
+    async fn build_tree(&mut self) -> AssemblyResult {
+        if let Some(error) = self.poisoner.poison_error() {
+            return Err(error.into());
+        }
         observe_stop(&self.stop)?;
         match self.build_leaves().await? {
             HotPackedOutcome::Complete(()) => (),
@@ -492,16 +287,6 @@ impl<P: BufferPool + 'static> PackedBuildState<P> {
             self.build_parent_level().await?;
         }
         Ok(HotPackedOutcome::Complete(self.finish_build()))
-    }
-
-    async fn check_staging<I: Borrow<MemIndex<P>>>(
-        &self,
-        staging: &StagingMemIndex<P, I>,
-    ) -> RuntimeOrFatalResult<()> {
-        if let Some(error) = self.poisoner.poison_error() {
-            return Err(error.into());
-        }
-        staging.check_empty().await.map(|_| ())
     }
 
     async fn build_leaves(&mut self) -> RuntimeOrFatalResult<HotPackedOutcome<()>> {
@@ -695,7 +480,7 @@ impl<P: BufferPool + 'static> PackedBuildState<P> {
     }
 }
 
-impl<P: BufferPool + 'static> Drop for PackedBuildState<P> {
+impl<P: BufferPool + 'static> Drop for HotPackedBuild<P> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         // Release coordinator leases before the staging owner requests cleanup.
@@ -706,29 +491,57 @@ impl<P: BufferPool + 'static> Drop for PackedBuildState<P> {
     }
 }
 
-/// Complete private tree, bound to its destination and exhaustive hot consumption.
+/// Complete detached tree with exhaustive hot consumption and retained pool authority.
 /// Dropping or aborting requests reclamation by the caller's cleanup object.
-pub(crate) struct ReadyHotTree<'a, P: 'static, I = MemIndex<P>> {
-    staging: &'a mut StagingMemIndex<P, I>,
+pub(crate) struct ReadyHotTree<P: 'static> {
     owner: StagedPageOwner<P>,
     assembly: Assembly,
     installed: bool,
     aborted: bool,
 }
 
-impl<P: BufferPool + 'static, I: Borrow<MemIndex<P>>> ReadyHotTree<'_, P, I> {
-    /// Install into the fixed root after acquiring every fallible guard/check.
+impl<P: BufferPool + 'static> ReadyHotTree<P> {
+    /// Install into a private empty index with the same pool and physical key shape.
+    /// The caller retains bootstrap or DDL exclusion through installation and cleanup.
     /// Cancellation before transfer retains this ready tree; after transfer the
     /// index owns descendants and the caller runs cleanup before publication.
-    pub(crate) async fn install(&mut self) -> RuntimeOrFatalResult<()> {
+    pub(crate) async fn install(&mut self, index: &MemIndex<P>) -> RuntimeOrFatalResult<()> {
         if self.aborted || self.installed {
             return Err(execution_error("ready packed tree was already settled"));
         }
         #[cfg(feature = "profiling")]
         let started = Instant::now();
-        self.staging
-            .install_root(&self.assembly, &self.owner)
-            .await?;
+        // The pending decision blocks cleanup, and this exclusive ready-tree
+        // borrow prevents abort/drop until installation returns or is cancelled.
+        let pool = self.owner.pool();
+        let guard = self.owner.guard();
+        let tree = index.tree();
+        let mut destination = tree
+            .check_empty_private_root(guard)
+            .await
+            .map_err(Into::into)?;
+        if let Some(root) = self.assembly.root {
+            if self.assembly.completion.entries() == 0
+                || root.lower.is_some()
+                || root.upper.is_some()
+            {
+                return Err(execution_error(
+                    "packed root does not cover completed input",
+                ));
+            }
+            let source = pool
+                .get_page::<BTreeNode>(guard, root.page_id, LatchFallbackMode::Exclusive)
+                .await
+                .map_err(Into::into)?
+                .lock_exclusive_async()
+                .await
+                .unwrap_or_else(|| unreachable!("exclusive temporary root latch"));
+            // No await, allocation, or fallible operation from this edge.
+            tree.install_private_root(&mut destination, source.page());
+            pool.deallocate_page(source);
+        }
+        self.owner.transferred();
+        destination.set_dirty();
         self.installed = true;
         #[cfg(feature = "profiling")]
         {
@@ -1429,18 +1242,19 @@ fn collect_level(measurements: &mut HotPackedMeasurements, children: &[ChildDesc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::EvictableBufferPool;
     use crate::buffer::minimum_fixed_pool_bytes;
     use crate::buffer::{FixedBufferPool, PoolRole};
     use crate::component::{ComponentRegistry, RegistryBuilder};
     use crate::conf::ThreadPoolConfig;
     use crate::id::RowID;
     use crate::index::BTreeKey;
-    use crate::index::btree::BTree;
+    use crate::index::btree::{BTree, BTreeInsert};
     use crate::index::build::merge::{test_prepare_packed, test_runs};
     use crate::index::build::{DuplicateCheck, MemoryBudget, budget};
     use crate::quiescent::QuiescentBox;
     use crate::runtime::thread_pool::ThreadPoolWorkers;
-    use crate::value::ValKind;
+    use crate::value::{ValKind, ValType};
     use futures::future::{Either, select};
     use std::collections::BTreeMap;
 
@@ -1574,19 +1388,41 @@ mod tests {
         );
     }
 
-    async fn staging(
-        pool: &QuiescentBox<FixedBufferPool>,
+    async fn empty_index<P: BufferPool + 'static>(
+        pool: QuiescentGuard<P>,
         unique: bool,
-    ) -> StagingMemIndex<FixedBufferPool> {
-        StagingMemIndex::new(
-            pool.guard(),
-            pool.create_base_guard(),
-            vec![ValType::new(ValKind::VarByte, false)],
-            unique,
+    ) -> MemIndex<P> {
+        let mut types = vec![ValType::new(ValKind::VarByte, false)];
+        if !unique {
+            types.push(ValType::new(ValKind::U64, false));
+        }
+        MemIndex::new_with_types(
+            pool.clone(),
+            &pool.create_base_guard(),
+            types,
             TrxID::new(7),
         )
         .await
         .unwrap()
+    }
+
+    fn packed_build<P: BufferPool>(
+        pool: QuiescentGuard<P>,
+        plan: Arc<PreparedHotMerge>,
+        thread_pool: QuiescentGuard<ThreadPool>,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+        unique: bool,
+    ) -> (HotPackedBuild<P>, StagedPageCleanup<P>) {
+        let guard = pool.create_base_guard();
+        HotPackedBuild::new(
+            pool,
+            guard,
+            plan,
+            thread_pool,
+            poisoner,
+            unique,
+            TrxID::new(7),
+        )
     }
 
     async fn verify(
@@ -1885,8 +1721,8 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// Purpose: Protect streaming packed contents, fences, value specialization and fixed-root ownership across input shapes.
-    /// Expected: Checked and trusted builds match the sorted oracle and destroying installed trees reclaims every page.
+    /// Purpose: Protect detached packed contents, fences, value specialization and fixed-root ownership across input shapes.
+    /// Expected: Checked and trusted builds install into destinations created after construction, match the sorted oracle and reclaim every page on destruction.
     #[test]
     fn packed_contents_and_fixed_root() {
         smol::block_on(async {
@@ -1907,13 +1743,23 @@ mod tests {
                     let expected = oracle(&runs);
                     let plan =
                         test_prepare_packed(runs, workers.clone(), 2, partitions, batch).await;
-                    let mut staging = staging(&pool, unique).await;
-                    let root_id = staging.check_empty().await.unwrap().page_id();
-                    let (mut build, mut cleanup) =
-                        staging.start_build(plan, workers.clone(), poisoner.clone());
+                    let (mut build, mut cleanup) = packed_build(
+                        pool.guard(),
+                        plan,
+                        workers.clone(),
+                        poisoner.clone(),
+                        unique,
+                    );
                     let mut ready = expect_complete(build.execute().await.unwrap());
+                    let index = empty_index(pool.guard(), unique).await;
+                    let root_id = index
+                        .tree()
+                        .check_empty_private_root(&pool.create_base_guard())
+                        .await
+                        .unwrap()
+                        .page_id();
                     assert_eq!(ready.assembly.completion.entries(), count);
-                    ready.install().await.unwrap();
+                    ready.install(&index).await.unwrap();
                     cleanup.run().await.unwrap();
                     #[cfg(feature = "profiling")]
                     {
@@ -1936,12 +1782,12 @@ mod tests {
                         );
                     }
                     assert!(
-                        ready.install().await.is_err(),
+                        ready.install(&index).await.is_err(),
                         "installation evidence is move-once"
                     );
                     drop(ready);
                     drop(build);
-                    let index = staging.finish();
+
                     if count > 1 {
                         assert!(
                             index.tree().height() >= 1,
@@ -1959,6 +1805,63 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject installation into a populated index after destination-independent construction.
+    /// Expected: Empty and nonempty builds preserve the existing entry on rejection, and abort cleanup reclaims only detached pages.
+    #[test]
+    fn packed_install_rejects_nonempty_destination() {
+        smol::block_on(async {
+            let (_scope, workers, poisoner) = workers(1).await;
+            let pool = pages(16 * 1024 * 1024);
+            let guard = pool.create_base_guard();
+            for count in [0, 3] {
+                let plan = test_prepare_packed(
+                    input(count, 8, 0, DuplicateCheck::Collect),
+                    workers.clone(),
+                    1,
+                    usize::from(count != 0),
+                    2,
+                )
+                .await;
+                let (mut build, mut cleanup) =
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
+                let mut ready = expect_complete(build.execute().await.unwrap());
+                drop(build);
+                // The destination is created only after construction completes.
+                let index = empty_index(pool.guard(), true).await;
+                let key = key(42, 8, 0);
+                let row = RowID::new(42);
+                assert!(matches!(
+                    index
+                        .tree()
+                        .insert(
+                            &guard,
+                            key.as_bytes(),
+                            BTreeU64::from(row),
+                            false,
+                            TrxID::new(7)
+                        )
+                        .await
+                        .unwrap(),
+                    BTreeInsert::Ok(false)
+                ));
+                let allocated = pool.allocated();
+                assert!(matches!(
+                    ready.install(&index).await,
+                    Err(RuntimeOrFatalError::Runtime(_))
+                ));
+                assert_eq!(pool.allocated(), allocated);
+                ready.abort().unwrap();
+                cleanup.run().await.unwrap();
+                drop(ready);
+                let ids = verify(index.tree(), &guard, &BTreeMap::from([(key, row)]), true).await;
+                assert_eq!(pool.allocated(), ids.len());
+                assert!(poisoner.poison_error().is_none());
+                index.destroy(&guard).await.unwrap();
+                assert_eq!(pool.allocated(), 0);
+            }
+        });
+    }
+
     /// Purpose: Protect global parent planning and arbitrary-depth destruction with wide separators.
     /// Expected: Multiple serial upper levels preserve every entry and reclaim non-leftmost branches completely.
     #[test]
@@ -1969,16 +1872,16 @@ mod tests {
             let runs = input(1800, 8192, 0, DuplicateCheck::Collect);
             let expected = oracle(&runs);
             let plan = test_prepare_packed(runs, workers.clone(), 4, 8, 137).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             let mut ready = expect_complete(build.execute().await.unwrap());
             assert!(ready.assembly.root.unwrap().height >= 3);
-            ready.install().await.unwrap();
+            ready.install(&index).await.unwrap();
             cleanup.run().await.unwrap();
             drop(ready);
             drop(build);
-            let index = staging.finish();
+
             let guard = pool.create_base_guard();
             let ids = verify(index.tree(), &guard, &expected, true).await;
             assert_eq!(pool.allocated(), ids.len());
@@ -2014,9 +1917,9 @@ mod tests {
                 let budget = runs.budget.clone();
                 let plan = test_prepare_packed(runs, workers.clone(), 2, 4, 17).await;
                 budget::fail_at(&budget, purpose);
-                let mut staging = staging(&pool, true).await;
+                let index = empty_index(pool.guard(), true).await;
                 let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                 assert!(
                     build.execute().await.is_err(),
                     "missing rejection: {purpose}"
@@ -2024,8 +1927,14 @@ mod tests {
                 cleanup.run().await.unwrap();
                 drop(build);
                 assert_eq!(pool.allocated(), 1, "{purpose}");
-                drop(staging.check_empty().await.unwrap());
-                staging.destroy().await.unwrap();
+                drop(
+                    index
+                        .tree()
+                        .check_empty_private_root(&pool.create_base_guard())
+                        .await
+                        .unwrap(),
+                );
+                index.destroy(&pool.create_base_guard()).await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }
         });
@@ -2041,9 +1950,9 @@ mod tests {
             for abandon in [false, true] {
                 let runs = input(500, 256, 0, DuplicateCheck::Collect);
                 let plan = test_prepare_packed(runs, workers.clone(), 1, 4, 33).await;
-                let mut staging = staging(&pool, true).await;
+                let index = empty_index(pool.guard(), true).await;
                 let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                 let mut ready = expect_complete(build.execute().await.unwrap());
                 let allocated = pool.allocated();
                 let mut reclaim = Box::pin(cleanup.run());
@@ -2052,7 +1961,7 @@ mod tests {
                 assert_eq!(pool.allocated(), allocated);
                 if !abandon {
                     ready.abort().unwrap();
-                    assert!(ready.install().await.is_err());
+                    assert!(ready.install(&index).await.is_err());
                 }
                 drop(ready);
                 drop(build);
@@ -2060,8 +1969,14 @@ mod tests {
                 cleanup.run().await.unwrap();
                 cleanup.run().await.unwrap();
                 assert_eq!(pool.allocated(), 1);
-                drop(staging.check_empty().await.unwrap());
-                staging.destroy().await.unwrap();
+                drop(
+                    index
+                        .tree()
+                        .check_empty_private_root(&pool.create_base_guard())
+                        .await
+                        .unwrap(),
+                );
+                index.destroy(&pool.create_base_guard()).await.unwrap();
             }
         });
     }
@@ -2074,16 +1989,16 @@ mod tests {
             let (_scope, workers, poisoner) = workers(2).await;
             let pool = pages(32 * 1024 * 1024);
             let plan = test_prepare_packed(duplicate_input(), workers.clone(), 2, 4, 23).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             assert_duplicate(build.execute().await.unwrap());
             assert!(pool.allocated() > 1);
             cleanup.run().await.unwrap();
             assert_eq!(pool.allocated(), 1);
             drop(build);
             assert!(poisoner.poison_error().is_none());
-            staging.destroy().await.unwrap();
+            index.destroy(&pool.create_base_guard()).await.unwrap();
         });
     }
 
@@ -2096,9 +2011,9 @@ mod tests {
             let (_scope, workers, poisoner) = workers(2).await;
             let pool = pages(32 * 1024 * 1024);
             let plan = test_prepare_packed(duplicate_input(), workers.clone(), 2, 4, 23).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             assert_duplicate(build.execute().await.unwrap());
             drop(build);
             let allocated = test_remaining(&cleanup);
@@ -2121,12 +2036,16 @@ mod tests {
             assert_eq!(pool.allocated(), 1);
             assert!(allocated.iter().all(|&id| !pool.is_allocated(id)));
             assert!(poisoner.poison_error().is_none());
-            let root = staging.check_empty().await.unwrap();
+            let root = index
+                .tree()
+                .check_empty_private_root(&pool.create_base_guard())
+                .await
+                .unwrap();
             assert!(root.page().lower_fence_key().is_empty());
             assert!(root.page().upper_fence_key().is_empty());
             assert!(root.page().lower_fence_value().is_deleted());
             drop(root);
-            staging.destroy().await.unwrap();
+            index.destroy(&pool.create_base_guard()).await.unwrap();
             assert_eq!(pool.allocated(), 0);
         });
     }
@@ -2142,9 +2061,9 @@ mod tests {
             let (_scope, workers, poisoner) = workers(2).await;
             let pool = pages(32 * 1024 * 1024);
             let plan = test_prepare_packed(duplicate_input(), workers.clone(), 2, 4, 23).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             let (entered, release) = test_gate(&cleanup, TestPoint::Reclaim, 1, TestFault::Runtime);
             assert_duplicate(build.execute().await.unwrap());
             drop(build);
@@ -2161,7 +2080,7 @@ mod tests {
             assert_eq!(test_remaining(&cleanup), retained);
             test_recover(&cleanup).await;
             assert_eq!(pool.allocated(), 1);
-            staging.destroy().await.unwrap();
+            index.destroy(&pool.create_base_guard()).await.unwrap();
             assert_eq!(pool.allocated(), 0);
         });
     }
@@ -2206,9 +2125,9 @@ mod tests {
                     let runs = input(count, width, 0, DuplicateCheck::Collect);
                     let expected = oracle(&runs);
                     let plan = test_prepare_packed(runs, workers.clone(), 2, 4, 27).await;
-                    let mut staging = staging(&pool, true).await;
+                    let index = empty_index(pool.guard(), true).await;
                     let (mut build, mut cleanup) =
-                        staging.start_build(plan, workers.clone(), poisoner.clone());
+                        packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                     let (entered, release) = test_gate(
                         &cleanup,
                         TestPoint::Allocated(height),
@@ -2228,7 +2147,7 @@ mod tests {
                     let allocated = test_remaining(&cleanup);
                     assert!(!allocated.is_empty(), "{stage:?}, {action:?}");
                     if height != 0 {
-                        let level = build.state.parent_level.as_ref().unwrap();
+                        let level = build.parent_level.as_ref().unwrap();
                         assert!(level.collected >= collected, "{stage:?}, {action:?}");
                         assert_eq!(level.children[0].height + 1, height);
                         assert_eq!(
@@ -2247,11 +2166,11 @@ mod tests {
                         Action::Resume => {
                             release.send(()).unwrap();
                             let mut ready = expect_complete(build.execute().await.unwrap());
-                            ready.install().await.unwrap();
+                            ready.install(&index).await.unwrap();
                             cleanup.run().await.unwrap();
                             drop(ready);
                             drop(build);
-                            let index = staging.finish();
+
                             let guard = pool.create_base_guard();
                             let reachable = verify(index.tree(), &guard, &expected, true).await;
                             assert_eq!(
@@ -2270,7 +2189,7 @@ mod tests {
                             drop(build);
                             cleanup.run().await.unwrap();
                             assert_eq!(pool.allocated(), 1, "{stage:?}");
-                            staging.destroy().await.unwrap();
+                            index.destroy(&pool.create_base_guard()).await.unwrap();
                         }
                         Action::Abandon => {
                             drop(build);
@@ -2280,7 +2199,7 @@ mod tests {
                             release.send(()).unwrap();
                             reclaim.await.unwrap();
                             assert_eq!(pool.allocated(), 1, "{stage:?}");
-                            staging.destroy().await.unwrap();
+                            index.destroy(&pool.create_base_guard()).await.unwrap();
                         }
                     }
                     assert_eq!(pool.allocated(), 0, "{stage:?}, {action:?}");
@@ -2310,13 +2229,17 @@ mod tests {
                 77,
             )
             .await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             let mut ready = expect_complete(build.execute().await.unwrap());
-            let root = ready.staging.check_empty().await.unwrap();
+            let root = index
+                .tree()
+                .check_empty_private_root(&pool.create_base_guard())
+                .await
+                .unwrap();
             let allocated = pool.allocated();
-            let mut install = Box::pin(ready.install());
+            let mut install = Box::pin(ready.install(&index));
             assert!(futures::poll!(install.as_mut()).is_pending());
             let mut reclaim = Box::pin(cleanup.run());
             assert!(futures::poll!(reclaim.as_mut()).is_pending());
@@ -2326,11 +2249,11 @@ mod tests {
             assert_eq!(pool.allocated(), allocated);
             assert_eq!(root.page().count(), 0);
             drop(root);
-            ready.install().await.unwrap();
+            ready.install(&index).await.unwrap();
             reclaim.await.unwrap();
             drop(ready);
             drop(build);
-            let index = staging.finish();
+
             let guard = pool.create_base_guard();
             index.destroy(&guard).await.unwrap();
             assert_eq!(pool.allocated(), 0);
@@ -2356,9 +2279,9 @@ mod tests {
                     77,
                 )
                 .await;
-                let mut staging = staging(&pool, true).await;
+                let index = empty_index(pool.guard(), true).await;
                 let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                 let mut ready = expect_complete(build.execute().await.unwrap());
                 let all = test_remaining(&cleanup);
                 let (entered, release) = test_gate(&cleanup, TestPoint::Reclaim, 2, fault);
@@ -2393,7 +2316,7 @@ mod tests {
                 test_recover(&cleanup).await;
                 drop(ready);
                 drop(build);
-                staging.destroy().await.unwrap();
+                index.destroy(&pool.create_base_guard()).await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }
         });
@@ -2416,9 +2339,9 @@ mod tests {
                     77,
                 )
                 .await;
-                let mut staging = staging(&pool, true).await;
+                let index = empty_index(pool.guard(), true).await;
                 let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                 let (first, release_first) = test_gate(
                     &cleanup,
                     TestPoint::Allocated(height),
@@ -2439,7 +2362,7 @@ mod tests {
                 drop(build);
                 assert!(cleanup.run().await.is_err());
                 assert_eq!(pool.allocated(), 1);
-                staging.destroy().await.unwrap();
+                index.destroy(&pool.create_base_guard()).await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }
         });
@@ -2604,15 +2527,15 @@ mod tests {
             let runs = input(INITIAL_ENTRIES, 8192, 0, DuplicateCheck::Collect);
             let mut expected = oracle(&runs);
             let plan = test_prepare_packed(runs, workers.clone(), 2, 4, 23).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             let mut ready = expect_complete(build.execute().await.unwrap());
-            ready.install().await.unwrap();
+            ready.install(&index).await.unwrap();
             cleanup.run().await.unwrap();
             drop(ready);
             drop(build);
-            let index = staging.finish();
+
             let guard = pool.create_base_guard();
             let tree = index.tree();
             let initial_height = tree.height();
@@ -2709,18 +2632,24 @@ mod tests {
                     77,
                 )
                 .await;
-                let mut staging = staging(&pool, true).await;
+                let index = empty_index(pool.guard(), true).await;
                 if reject {
                     poisoner.poison(Report::new(FatalError::StorageIo));
                 }
                 let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                    packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                 assert!(build.execute().await.is_err());
                 drop(build);
                 assert_eq!(cleanup.run().await.is_err(), reject);
                 assert_eq!(pool.allocated(), 1);
-                drop(staging.check_empty().await.unwrap());
-                staging.destroy().await.unwrap();
+                drop(
+                    index
+                        .tree()
+                        .check_empty_private_root(&pool.create_base_guard())
+                        .await
+                        .unwrap(),
+                );
+                index.destroy(&pool.create_base_guard()).await.unwrap();
             }
         });
     }
@@ -2742,9 +2671,9 @@ mod tests {
                         77,
                     )
                     .await;
-                    let mut staging = staging(&pool, true).await;
+                    let index = empty_index(pool.guard(), true).await;
                     let (mut build, mut cleanup) =
-                        staging.start_build(plan, workers.clone(), poisoner.clone());
+                        packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
                     let mut reclaim = Box::pin(cleanup.run());
                     assert!(futures::poll!(reclaim.as_mut()).is_pending());
                     drop(reclaim);
@@ -2761,7 +2690,7 @@ mod tests {
                     assert_eq!(cleanup.run().await.is_err(), poison);
                     assert_eq!(pool.allocated(), 1);
                     assert_eq!(cleanup.run().await.is_err(), poison);
-                    staging.destroy().await.unwrap();
+                    index.destroy(&pool.create_base_guard()).await.unwrap();
                     assert_eq!(pool.allocated(), 0);
                 }
             }
@@ -2791,24 +2720,21 @@ mod tests {
                 let runs = input(600, 256, 0, DuplicateCheck::Collect);
                 let expected = oracle(&runs);
                 let plan = test_prepare_packed(runs, core.thread_pool.clone(), 1, 4, 71).await;
-                let mut staging = StagingMemIndex::new(
+                let index = empty_index(pool.clone(), true).await;
+                let (mut build, mut cleanup) = packed_build(
                     pool.clone(),
-                    pool.create_base_guard(),
-                    vec![ValType::new(ValKind::VarByte, false)],
+                    plan,
+                    core.thread_pool.clone(),
+                    core.poisoner.clone(),
                     true,
-                    TrxID::new(7),
-                )
-                .await
-                .unwrap();
-                let (mut build, mut cleanup) =
-                    staging.start_build(plan, core.thread_pool.clone(), core.poisoner.clone());
+                );
                 let mut ready = expect_complete(build.execute().await.unwrap());
                 let ids = test_remaining(&cleanup);
                 for &id in &ids {
                     test_evict_existing_page(pool.clone(), id).await;
                 }
                 if install {
-                    ready.install().await.unwrap();
+                    ready.install(&index).await.unwrap();
                 } else {
                     ready.abort().unwrap();
                 }
@@ -2816,7 +2742,6 @@ mod tests {
                 drop(ready);
                 drop(build);
                 if install {
-                    let index = staging.finish();
                     let guard = pool.create_base_guard();
                     for (key, row) in &expected {
                         assert_eq!(
@@ -2830,7 +2755,7 @@ mod tests {
                     }
                     index.destroy(&guard).await.unwrap();
                 } else {
-                    staging.destroy().await.unwrap();
+                    index.destroy(&pool.create_base_guard()).await.unwrap();
                 }
                 assert_eq!(pool.allocated(), baseline);
                 for id in ids {
@@ -2851,9 +2776,9 @@ mod tests {
             let runs = input(500, 8192, 0, DuplicateCheck::Skip);
             let expected = oracle(&runs);
             let plan = test_prepare_packed(runs, workers.clone(), 2, 4, 73).await;
-            let mut staging = staging(&pool, true).await;
+            let index = empty_index(pool.guard(), true).await;
             let (mut build, mut cleanup) =
-                staging.start_build(plan, workers.clone(), poisoner.clone());
+                packed_build(pool.guard(), plan, workers.clone(), poisoner.clone(), true);
             let (first, release) = test_gate(&cleanup, TestPoint::Allocated(1), 1, TestFault::None);
             let (later, continue_later) =
                 test_gate(&cleanup, TestPoint::Packed(1), 1, TestFault::None);
@@ -2872,11 +2797,11 @@ mod tests {
             };
             let (result, ()) = futures::join!(build.execute(), control);
             let mut ready = expect_complete(result.unwrap());
-            ready.install().await.unwrap();
+            ready.install(&index).await.unwrap();
             cleanup.run().await.unwrap();
             drop(ready);
             drop(build);
-            let index = staging.finish();
+
             let guard = pool.create_base_guard();
             verify(index.tree(), &guard, &expected, true).await;
             index.destroy(&guard).await.unwrap();
@@ -2901,7 +2826,7 @@ mod tests {
                 if !unique {
                     types.push(ValType::new(ValKind::U64, false));
                 }
-                let encoder = BTreeKeyEncoder::new(types);
+                let encoder = BTreeKeyEncoder::new(types.clone());
                 let keys: Vec<_> = (0..1500)
                     .map(|i| {
                         let mut values = vec![
@@ -2925,15 +2850,27 @@ mod tests {
                 );
                 let expected = oracle(&runs);
                 let plan = test_prepare_packed(runs, workers.clone(), 1, 1, 37).await;
-                let mut staging = staging(&pool, unique).await;
-                let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
+                let index = MemIndex::new_with_types(
+                    pool.guard(),
+                    &pool.create_base_guard(),
+                    types,
+                    TrxID::new(7),
+                )
+                .await
+                .unwrap();
+                let (mut build, mut cleanup) = packed_build(
+                    pool.guard(),
+                    plan,
+                    workers.clone(),
+                    poisoner.clone(),
+                    unique,
+                );
                 let mut ready = expect_complete(build.execute().await.unwrap());
-                ready.install().await.unwrap();
+                ready.install(&index).await.unwrap();
                 cleanup.run().await.unwrap();
                 drop(ready);
                 drop(build);
-                let index = staging.finish();
+
                 let guard = pool.create_base_guard();
                 verify(index.tree(), &guard, &expected, unique).await;
                 if !unique {
