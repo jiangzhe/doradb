@@ -4,9 +4,9 @@ use super::merge::{
     HotPartitionConsumer, PartitionMergeStream, PreparedHotMerge, execution_error, observe_stop,
 };
 use super::page_cleanup::{PageProducer, StagedPageOwner};
-use super::{BudgetedVec, MemoryBudget, SortedHotRuns};
+use super::{BudgetedVec, HotBuildSource, MemoryBudget, SortedHotRuns};
 use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
-use crate::buffer::{BufferPool, PoolGuard};
+use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard};
 use crate::completion::Completion;
 use crate::component::panic_payload_description;
 use crate::error::{
@@ -30,12 +30,16 @@ use crate::runtime::{thread_pool::ThreadPool, yield_now};
 use crate::value::{ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use futures::FutureExt;
+use std::borrow::Borrow;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) use super::page_cleanup::StagedPageCleanup;
+
+#[cfg(test)]
+pub(crate) use tests::{assert_recovery_root, gate_recovery_allocation, panic_recovery_cleanup};
 
 #[cfg(feature = "profiling")]
 use crate::profiling::{HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements};
@@ -90,18 +94,25 @@ impl ParentPlanningProfile {
     }
 }
 
-/// Owns a private index through build setup, root installation, and handoff.
-/// Construction borrows this owner so the index remains inaccessible to readers.
-/// After caller-driven cleanup, finish releases a successful index; destroy
-/// reclaims a rejected index. Neither operation drives detached-page cleanup.
-pub(crate) struct StagingMemIndex<P: 'static> {
-    index: MemIndex<P>,
+/// Unpublished build destination, either owned staging or a borrowed bootstrap index.
+/// Construction borrows this wrapper exclusively through root installation.
+/// Only owned staging can release its index with finish or reclaim it with destroy;
+/// recovery leaves index ownership with its captured table/layout.
+pub(crate) struct StagingMemIndex<P: 'static, I = MemIndex<P>> {
+    index: I,
     pool: QuiescentGuard<P>,
     guard: PoolGuard,
     unique: bool,
     ts: TrxID,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "CREATE INDEX staging integration remains RFC 0032 phase 5"
+    )
+)]
 impl<P: BufferPool + 'static> StagingMemIndex<P> {
     /// Create an unpublished destination; borrowing this capability excludes all readers.
     pub(crate) async fn new(
@@ -126,14 +137,76 @@ impl<P: BufferPool + 'static> StagingMemIndex<P> {
         })
     }
 
-    /// Bind one plan to the staging index and hand cleanup ownership to the caller.
+    /// Hand the completed index to the caller for publication.
+    /// The caller must first install the ready tree and successfully run cleanup.
+    /// This synchronous handoff does not execute cleanup or publish the index.
+    #[inline]
+    pub(crate) fn finish(self) -> MemIndex<P> {
+        self.index
+    }
+
+    /// Destroy the private index after caller-driven detached-page cleanup.
+    /// Use this path when construction or validation fails or the caller aborts.
+    #[inline]
+    pub(crate) async fn destroy(self) -> RuntimeOrFatalResult<()> {
+        self.index.destroy(&self.guard).await.map_err(Into::into)
+    }
+}
+
+impl<'a> StagingMemIndex<EvictableBufferPool, &'a MemIndex<EvictableBufferPool>> {
+    /// Borrow recovery's captured active index under exclusive bootstrap authority.
+    /// The source pins the table/layout and exact key representation; foreground
+    /// and maintenance admission must remain closed through cleanup and join.
+    pub(crate) fn for_recovery(
+        source: &'a HotBuildSource,
+        pool: QuiescentGuard<EvictableBufferPool>,
+    ) -> RuntimeOrFatalResult<Self> {
+        let selected = source.layout.expect_secondary_index(source.key.index);
+        let index = if source.key.unique {
+            &**selected.unique_mem()?
+        } else {
+            &**selected.non_unique_mem()?
+        };
+        Ok(Self {
+            index,
+            pool,
+            guard: source.guards.index_guard().clone(),
+            unique: source.key.unique,
+            ts: source.key.build_ts,
+        })
+    }
+}
+
+impl<P: BufferPool + 'static, I: Borrow<MemIndex<P>>> StagingMemIndex<P, I> {
+    /// Bind a plan to an exclusively borrowed target for direct component use.
     /// Retain cleanup before calling execute; run it after install, abort, or drop.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "production uses retained pipeline state")
+    )]
     pub(crate) fn start_build(
         &mut self,
         plan: Arc<PreparedHotMerge>,
         workers: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
-    ) -> (HotPackedBuild<'_, P>, StagedPageCleanup<P>) {
+    ) -> (HotPackedBuild<'_, P, I>, StagedPageCleanup<P>) {
+        let (state, cleanup) = self.start_build_state(plan, workers, poisoner);
+        (
+            HotPackedBuild {
+                staging: Some(self),
+                state,
+            },
+            cleanup,
+        )
+    }
+
+    /// Create packed job state that a pipeline can retain across borrowed-future cancellation.
+    pub(super) fn start_build_state(
+        &mut self,
+        plan: Arc<PreparedHotMerge>,
+        workers: QuiescentGuard<ThreadPool>,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+    ) -> (PackedBuildState<P>, StagedPageCleanup<P>) {
         let (owner, cleanup) = StagedPageOwner::new(
             self.pool.clone(),
             self.guard.clone(),
@@ -156,10 +229,9 @@ impl<P: BufferPool + 'static> StagingMemIndex<P> {
                 unique: self.unique,
             },
         );
-        let build = HotPackedBuild {
-            staging: Some(self),
+        let build = PackedBuildState {
             owner: Some(owner),
-            pool: workers,
+            thread_pool: workers,
             poisoner,
             packing: Some(packing),
             leaves: Some(leaves),
@@ -178,24 +250,10 @@ impl<P: BufferPool + 'static> StagingMemIndex<P> {
         (build, cleanup)
     }
 
-    /// Hand the completed index to the caller for publication.
-    /// The caller must first install the ready tree and successfully run cleanup.
-    /// This synchronous handoff does not execute cleanup or publish the index.
-    #[inline]
-    pub(crate) fn finish(self) -> MemIndex<P> {
-        self.index
-    }
-
-    /// Destroy the private index after caller-driven detached-page cleanup.
-    /// Use this path when construction or validation fails or the caller aborts.
-    #[inline]
-    pub(crate) async fn destroy(self) -> RuntimeOrFatalResult<()> {
-        self.index.destroy(&self.guard).await.map_err(Into::into)
-    }
-
     /// Validate the empty destination and retain its exclusive root latch.
     async fn check_empty(&self) -> RuntimeOrFatalResult<PageExclusiveGuard<BTreeNode>> {
         self.index
+            .borrow()
             .tree()
             .check_empty_private_root(&self.guard)
             .await
@@ -210,7 +268,7 @@ impl<P: BufferPool + 'static> StagingMemIndex<P> {
     ) -> RuntimeOrFatalResult<()> {
         // The pending decision blocks cleanup. The ready tree's exclusive
         // borrow prevents abort/drop until installation returns or is cancelled.
-        let tree = self.index.tree();
+        let tree = self.index.borrow().tree();
         let mut destination = self.check_empty().await?;
         if let Some(root) = assembly.root {
             if assembly.completion.entries() == 0 || root.lower.is_some() || root.upper.is_some() {
@@ -266,11 +324,47 @@ struct Assembly {
 
 type AssemblyResult = RuntimeOrFatalResult<HotPackedOutcome<Assembly>>;
 
-/// Retains stage progress and accepted jobs across cancellation of borrowed futures.
-pub(crate) struct HotPackedBuild<'a, P: BufferPool + 'static> {
-    staging: Option<&'a mut StagingMemIndex<P>>,
+/// Exclusively borrowed destination for direct packed-stage callers.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production uses retained pipeline state")
+)]
+pub(crate) struct HotPackedBuild<'a, P: BufferPool + 'static, I = MemIndex<P>> {
+    staging: Option<&'a mut StagingMemIndex<P, I>>,
+    state: PackedBuildState<P>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "production uses retained pipeline state")
+)]
+impl<'a, P: BufferPool + 'static, I: Borrow<MemIndex<P>>> HotPackedBuild<'a, P, I> {
+    /// Construct privately while retaining the destination borrow across cancellation.
+    pub(crate) async fn execute(
+        &mut self,
+    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
+        let staging = self
+            .staging
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("packed build owns its staging index"));
+        let outcome = self.state.execute(staging).await?;
+        let staging = self
+            .staging
+            .take()
+            .unwrap_or_else(|| unreachable!("packed build owns its staging index"));
+        Ok(self.state.ready(staging, outcome))
+    }
+
+    /// Stop and drain construction before the caller runs detached-page cleanup.
+    pub(crate) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
+        self.state.settle().await
+    }
+}
+
+/// Packed construction ledgers independent of the destination borrow.
+pub(super) struct PackedBuildState<P: BufferPool + 'static> {
     owner: Option<StagedPageOwner<P>>,
-    pool: QuiescentGuard<ThreadPool>,
+    thread_pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
     packing: Option<Arc<Packing<P>>>,
     // Present until leaf results are collected or accepted leaf jobs settle.
@@ -289,42 +383,52 @@ pub(crate) struct HotPackedBuild<'a, P: BufferPool + 'static> {
     merge: HotMergeMeasurements,
 }
 
-impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
-    /// Construct privately; cancellation retains stage progress in this owner.
-    /// Errors and duplicate outcomes settle producers and request abort; the
-    /// caller must run its cleanup object before reporting the final outcome.
-    pub(crate) async fn execute(
+impl<P: BufferPool + 'static> PackedBuildState<P> {
+    /// Construct against a borrowed destination while the pipeline retains every job ledger.
+    pub(super) async fn build<'a, I: Borrow<MemIndex<P>>>(
         &mut self,
-    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P>>> {
+        staging: &'a mut StagingMemIndex<P, I>,
+    ) -> RuntimeOrFatalResult<HotPackedOutcome<ReadyHotTree<'a, P, I>>> {
+        let outcome = self.execute(staging).await?;
+        Ok(self.ready(staging, outcome))
+    }
+
+    async fn execute<I: Borrow<MemIndex<P>>>(
+        &mut self,
+        staging: &StagingMemIndex<P, I>,
+    ) -> AssemblyResult {
         assert!(!self.finished, "packed build reused after settlement");
         if self.outcome.is_none() {
-            self.run_build().await;
+            self.run_build(staging).await;
         }
         // Retain the outcome across draining so cancellation cannot lose it.
         if !matches!(&self.outcome, Some(Ok(HotPackedOutcome::Complete(_)))) {
             self.stop_and_drain().await;
         }
         self.finished = true;
-        let outcome = self
-            .outcome
+        self.outcome
             .take()
-            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))?;
-        Ok(match outcome {
+            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))
+    }
+
+    fn ready<'a, I>(
+        &mut self,
+        staging: &'a mut StagingMemIndex<P, I>,
+        outcome: HotPackedOutcome<Assembly>,
+    ) -> HotPackedOutcome<ReadyHotTree<'a, P, I>> {
+        match outcome {
             HotPackedOutcome::Complete(assembly) => HotPackedOutcome::Complete(ReadyHotTree {
-                staging: self
-                    .staging
-                    .take()
-                    .unwrap_or_else(|| unreachable!("build owns its staging index")),
+                staging,
                 owner: self
                     .owner
                     .take()
-                    .unwrap_or_else(|| unreachable!("build owns its staged page tracker")),
+                    .unwrap_or_else(|| unreachable!("finished build owns its page tracker")),
                 assembly,
                 installed: false,
                 aborted: false,
             }),
             HotPackedOutcome::Duplicate(conflict) => HotPackedOutcome::Duplicate(conflict),
-        })
+        }
     }
 
     /// Stop submission, drain accepted jobs, and request detached-page cleanup.
@@ -332,7 +436,7 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
     /// Pool jobs own their accepted execution through poison and shutdown; their
     /// retained completion slots survive cancellation of this wait. The staged
     /// cleanup object reclaims only after those jobs and our leases settle.
-    pub(crate) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
+    pub(super) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
         assert!(!self.finished, "packed build reused after settlement");
         self.stop.store(true, Ordering::Release);
         if self.outcome.is_none() {
@@ -346,8 +450,10 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
             .map(|_| ())
     }
 
-    async fn run_build(&mut self) {
-        let result = AssertUnwindSafe(self.build_tree()).catch_unwind().await;
+    async fn run_build<I: Borrow<MemIndex<P>>>(&mut self, staging: &StagingMemIndex<P, I>) {
+        let result = AssertUnwindSafe(self.build_tree(staging))
+            .catch_unwind()
+            .await;
         self.outcome = Some(match result {
             Ok(result) => result,
             Err(payload) => {
@@ -360,8 +466,11 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
         });
     }
 
-    async fn build_tree(&mut self) -> AssemblyResult {
-        self.check_staging().await?;
+    async fn build_tree<I: Borrow<MemIndex<P>>>(
+        &mut self,
+        staging: &StagingMemIndex<P, I>,
+    ) -> AssemblyResult {
+        self.check_staging(staging).await?;
         observe_stop(&self.stop)?;
         match self.build_leaves().await? {
             HotPackedOutcome::Complete(()) => (),
@@ -385,14 +494,13 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
         Ok(HotPackedOutcome::Complete(self.finish_build()))
     }
 
-    async fn check_staging(&self) -> RuntimeOrFatalResult<()> {
+    async fn check_staging<I: Borrow<MemIndex<P>>>(
+        &self,
+        staging: &StagingMemIndex<P, I>,
+    ) -> RuntimeOrFatalResult<()> {
         if let Some(error) = self.poisoner.poison_error() {
             return Err(error.into());
         }
-        let staging = self
-            .staging
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("pending build owns its staging index"));
         staging.check_empty().await.map(|_| ())
     }
 
@@ -500,7 +608,9 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
             .packing
             .as_ref()
             .unwrap_or_else(|| unreachable!("parent construction owns packing resources"));
-        level.execute(&self.pool, packing, &self.stop).await?;
+        level
+            .execute(&self.thread_pool, packing, &self.stop)
+            .await?;
         let level = self
             .parent_level
             .take()
@@ -585,7 +695,7 @@ impl<'a, P: BufferPool + 'static> HotPackedBuild<'a, P> {
     }
 }
 
-impl<P: BufferPool + 'static> Drop for HotPackedBuild<'_, P> {
+impl<P: BufferPool + 'static> Drop for PackedBuildState<P> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         // Release coordinator leases before the staging owner requests cleanup.
@@ -598,15 +708,15 @@ impl<P: BufferPool + 'static> Drop for HotPackedBuild<'_, P> {
 
 /// Complete private tree, bound to its destination and exhaustive hot consumption.
 /// Dropping or aborting requests reclamation by the caller's cleanup object.
-pub(crate) struct ReadyHotTree<'a, P: 'static> {
-    staging: &'a mut StagingMemIndex<P>,
+pub(crate) struct ReadyHotTree<'a, P: 'static, I = MemIndex<P>> {
+    staging: &'a mut StagingMemIndex<P, I>,
     owner: StagedPageOwner<P>,
     assembly: Assembly,
     installed: bool,
     aborted: bool,
 }
 
-impl<P: BufferPool + 'static> ReadyHotTree<'_, P> {
+impl<P: BufferPool + 'static, I: Borrow<MemIndex<P>>> ReadyHotTree<'_, P, I> {
     /// Install into the fixed root after acquiring every fallible guard/check.
     /// Cancellation before transfer retains this ready tree; after transfer the
     /// index owns descendants and the caller runs cleanup before publication.
@@ -627,8 +737,28 @@ impl<P: BufferPool + 'static> ReadyHotTree<'_, P> {
         Ok(())
     }
 
+    /// Return exhaustive consumed entries after construction completes.
+    #[inline]
+    pub(crate) fn entries(&self) -> usize {
+        self.assembly.completion.entries()
+    }
+
+    /// Borrow completed component measurements without exporting builder state.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub(crate) fn measurements(&self) -> (&HotMergeMeasurements, &HotPackedMeasurements) {
+        (&self.assembly.merge, &self.assembly.measurements)
+    }
+
     /// Reject an otherwise ready tree without publishing any destination state.
     /// The caller must run its cleanup object to reclaim detached pages.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "late DDL validation is integrated in RFC 0032 phase 5"
+        )
+    )]
     pub(crate) fn abort(&mut self) -> RuntimeOrFatalResult<()> {
         if self.installed {
             return Err(execution_error("installed packed tree cannot be aborted"));
@@ -1322,6 +1452,43 @@ mod tests {
         }
     }
 
+    /// Verify that the original bootstrap root now holds the expected live entries.
+    pub(crate) async fn assert_recovery_root(
+        pool: &EvictableBufferPool,
+        guard: &PoolGuard,
+        root: PageID,
+        entries: usize,
+    ) {
+        let page = pool
+            .get_page::<BTreeNode>(guard, root, LatchFallbackMode::Shared)
+            .await
+            .unwrap()
+            .lock_shared_async()
+            .await
+            .unwrap();
+        assert_eq!(page.page().ts(), crate::trx::MIN_SNAPSHOT_TS);
+        assert_eq!(page.page().count(), entries);
+    }
+
+    /// Pause a recovery producer after recording an allocated leaf or parent page.
+    pub(crate) fn gate_recovery_allocation<P: BufferPool>(
+        cleanup: &StagedPageCleanup<P>,
+        height: u16,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        use super::super::page_cleanup::{TestFault, TestPoint, test_gate};
+        test_gate(cleanup, TestPoint::Allocated(height), 1, TestFault::None)
+    }
+
+    /// Inject a recovery cleanup invariant panic after one successful reclamation.
+    pub(crate) fn panic_recovery_cleanup<P: BufferPool>(
+        cleanup: &StagedPageCleanup<P>,
+    ) -> flume::Receiver<()> {
+        use super::super::page_cleanup::{TestFault, TestPoint, test_gate};
+        let (entered, release) = test_gate(cleanup, TestPoint::Reclaim, 2, TestFault::Panic);
+        release.send(()).unwrap();
+        entered
+    }
+
     async fn workers(
         count: usize,
     ) -> (
@@ -1723,22 +1890,23 @@ mod tests {
     #[test]
     fn packed_contents_and_fixed_root() {
         smol::block_on(async {
-            let (_scope, workers, poisoner) = workers(4).await;
-            let pool = pages(128 * 1024 * 1024);
+            let (_scope, workers, poisoner) = workers(2).await;
+            let pool = pages(16 * 1024 * 1024);
             for (count, width, prefix, unique, partitions, batch) in [
                 (0, 8, 0, true, 0, 11),
                 (1, 8, 0, true, 1, 11),
-                (100, 8, 0, false, 4, 7),
-                (30_000, 8, 0, true, 16, 19),
-                (3500, 256, 0, true, 8, 31),
-                (3000, 64, 800, false, 8, 23),
-                (90_000, 8, 0, true, 4, 32_768),
+                (32, 8, 0, false, 2, 7),
+                (128, 8, 0, true, 4, 19),
+                (600, 256, 0, true, 2, 31),
+                (64, 64, 800, false, 2, 23),
+                // One entry beyond the packing window forces wraparound within a batch.
+                (3 * max_node_slots::<BTreeU64>() + 2, 8, 0, true, 1, 32_768),
             ] {
                 for policy in [DuplicateCheck::Collect, DuplicateCheck::Skip] {
                     let runs = input(count, width, prefix, policy);
                     let expected = oracle(&runs);
                     let plan =
-                        test_prepare_packed(runs, workers.clone(), 4, partitions, batch).await;
+                        test_prepare_packed(runs, workers.clone(), 2, partitions, batch).await;
                     let mut staging = staging(&pool, unique).await;
                     let root_id = staging.check_empty().await.unwrap().page_id();
                     let (mut build, mut cleanup) =
@@ -1774,6 +1942,12 @@ mod tests {
                     drop(ready);
                     drop(build);
                     let index = staging.finish();
+                    if count > 1 {
+                        assert!(
+                            index.tree().height() >= 1,
+                            "case={count}/{width}/{partitions}/{batch}"
+                        );
+                    }
                     let guard = pool.create_base_guard();
                     let ids = verify(index.tree(), &guard, &expected, unique).await;
                     assert!(ids.contains(&root_id));
@@ -1958,39 +2132,37 @@ mod tests {
     }
 
     /// Purpose: Protect cleanup failure handling after the caller receives duplicate evidence.
-    /// Expected: Cleanup failure or panic returns Fatal, poisons the engine, and retains the exact unreclaimed pages across repeated calls.
+    /// Expected: A reopen error returns Fatal, poisons the engine, and preserves unreclaimed pages without retrying cleanup.
     #[test]
     fn packed_duplicate_cleanup_failure_is_fatal() {
         use super::super::page_cleanup::{
             TestFault, TestPoint, test_gate, test_recover, test_remaining,
         };
         smol::block_on(async {
-            for fault in [TestFault::Runtime, TestFault::Panic] {
-                let (_scope, workers, poisoner) = workers(2).await;
-                let pool = pages(32 * 1024 * 1024);
-                let plan = test_prepare_packed(duplicate_input(), workers.clone(), 2, 4, 23).await;
-                let mut staging = staging(&pool, true).await;
-                let (mut build, mut cleanup) =
-                    staging.start_build(plan, workers.clone(), poisoner.clone());
-                let (entered, release) = test_gate(&cleanup, TestPoint::Reclaim, 1, fault);
-                assert_duplicate(build.execute().await.unwrap());
-                drop(build);
-                release.send(()).unwrap();
-                let failure = cleanup.run().await.unwrap_err();
-                assert_eq!(failure.current_context(), &FatalError::PurgeDeallocate);
-                entered.recv_async().await.unwrap();
-                let retained = test_remaining(&cleanup);
-                assert!(!retained.is_empty());
-                assert_eq!(pool.allocated(), retained.len() + 1);
-                assert!(retained.iter().all(|&id| pool.is_allocated(id)));
-                assert!(poisoner.poison_error().is_some());
-                assert!(cleanup.run().await.is_err());
-                assert_eq!(test_remaining(&cleanup), retained);
-                test_recover(&cleanup).await;
-                assert_eq!(pool.allocated(), 1);
-                staging.destroy().await.unwrap();
-                assert_eq!(pool.allocated(), 0);
-            }
+            let (_scope, workers, poisoner) = workers(2).await;
+            let pool = pages(32 * 1024 * 1024);
+            let plan = test_prepare_packed(duplicate_input(), workers.clone(), 2, 4, 23).await;
+            let mut staging = staging(&pool, true).await;
+            let (mut build, mut cleanup) =
+                staging.start_build(plan, workers.clone(), poisoner.clone());
+            let (entered, release) = test_gate(&cleanup, TestPoint::Reclaim, 1, TestFault::Runtime);
+            assert_duplicate(build.execute().await.unwrap());
+            drop(build);
+            release.send(()).unwrap();
+            let failure = cleanup.run().await.unwrap_err();
+            assert_eq!(failure.current_context(), &FatalError::PurgeDeallocate);
+            entered.recv_async().await.unwrap();
+            let retained = test_remaining(&cleanup);
+            assert!(!retained.is_empty());
+            assert_eq!(pool.allocated(), retained.len() + 1);
+            assert!(retained.iter().all(|&id| pool.is_allocated(id)));
+            assert!(poisoner.poison_error().is_some());
+            assert!(cleanup.run().await.is_err());
+            assert_eq!(test_remaining(&cleanup), retained);
+            test_recover(&cleanup).await;
+            assert_eq!(pool.allocated(), 1);
+            staging.destroy().await.unwrap();
+            assert_eq!(pool.allocated(), 0);
         });
     }
 
@@ -2017,7 +2189,7 @@ mod tests {
 
         smol::block_on(async {
             let (_scope, workers, poisoner) = workers(2).await;
-            let pool = pages(128 * 1024 * 1024);
+            let pool = pages(16 * 1024 * 1024);
             for stage in [
                 Stage::Leaf,
                 Stage::DirectParent,
@@ -2025,10 +2197,10 @@ mod tests {
                 Stage::Root,
             ] {
                 let (count, width, height, ordinal, collected) = match stage {
-                    Stage::Leaf => (1000, 256, 0, 1, 0),
-                    Stage::DirectParent => (500, 8192, 1, 3, 2),
-                    Stage::UpperParent => (1800, 8192, 2, 2, 1),
-                    Stage::Root => (1000, 8, 1, 1, 0),
+                    Stage::Leaf => (16, 256, 0, 1, 0),
+                    Stage::DirectParent => (128, 8192, 1, 3, 2),
+                    Stage::UpperParent => (384, 8192, 2, 2, 1),
+                    Stage::Root => (16, 8, 1, 1, 0),
                 };
                 for action in [Action::Resume, Action::Settle, Action::Abandon] {
                     let runs = input(count, width, 0, DuplicateCheck::Collect);
@@ -2056,7 +2228,7 @@ mod tests {
                     let allocated = test_remaining(&cleanup);
                     assert!(!allocated.is_empty(), "{stage:?}, {action:?}");
                     if height != 0 {
-                        let level = build.parent_level.as_ref().unwrap();
+                        let level = build.state.parent_level.as_ref().unwrap();
                         assert!(level.collected >= collected, "{stage:?}, {action:?}");
                         assert_eq!(level.children[0].height + 1, height);
                         assert_eq!(
@@ -2165,10 +2337,10 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect terminal cleanup ownership when reopen fails or caller-driven reclamation panics.
-    /// Expected: Cleanup reports Fatal, poisons admission, and retains exactly the unreclaimed IDs after partial deallocation.
+    /// Purpose: Distinguish typed reopen errors from invariant panics after partial reclamation.
+    /// Expected: Reopen errors cache Fatal without retry; panics escape unchanged without poisoning, and both preserve the exact remaining page IDs.
     #[test]
-    fn packed_cleanup_failure_retains_exact_pages() {
+    fn packed_cleanup_errors_and_panics_preserve_progress() {
         use super::super::page_cleanup::{
             TestFault, TestPoint, test_gate, test_recover, test_remaining,
         };
@@ -2192,16 +2364,32 @@ mod tests {
                 let (entered, release) = test_gate(&cleanup, TestPoint::Reclaim, 2, fault);
                 ready.abort().unwrap();
                 release.send(()).unwrap();
-                let failure = cleanup.run().await.unwrap_err();
-                assert_eq!(failure.current_context(), &FatalError::PurgeDeallocate);
+                let outcome = AssertUnwindSafe(cleanup.run()).catch_unwind().await;
+                match fault {
+                    TestFault::Runtime => {
+                        let failure = outcome.unwrap().unwrap_err();
+                        assert_eq!(failure.current_context(), &FatalError::PurgeDeallocate);
+                        assert!(poisoner.poison_error().is_some());
+                        // A cached typed failure must not restart reclamation.
+                        assert!(cleanup.run().await.is_err());
+                    }
+                    TestFault::Panic => {
+                        let payload = outcome.unwrap_err();
+                        assert_eq!(
+                            payload.downcast_ref::<&str>(),
+                            Some(&"injected staged panic")
+                        );
+                        assert!(poisoner.poison_error().is_none());
+                    }
+                    TestFault::None => unreachable!(),
+                }
                 entered.recv_async().await.unwrap();
                 assert!(!pool.is_allocated(all[0]));
-                let retained = test_remaining(&cleanup);
-                assert_eq!(retained, all[1..]);
-                assert_eq!(pool.allocated(), retained.len() + 1);
-                assert!(poisoner.poison_error().is_some());
-                assert!(cleanup.run().await.is_err());
-                assert_eq!(test_remaining(&cleanup), retained);
+                let remaining = test_remaining(&cleanup);
+                assert_eq!(remaining, all[1..]);
+                assert_eq!(pool.allocated(), remaining.len() + 1);
+                // This injected fault precedes pool access, so test teardown can
+                // reclaim safely. Production must abandon cleanup after a panic.
                 test_recover(&cleanup).await;
                 drop(ready);
                 drop(build);
@@ -2398,9 +2586,12 @@ mod tests {
     #[test]
     fn packed_online_splits_and_internal_merges() {
         use crate::index::btree::{BTreeCompactConfig, test_take_merge_observations};
+        const INITIAL_ENTRIES: usize = 64;
+        const FINAL_ENTRIES: usize = 512;
+
         fn mutation_key(index: usize) -> BTreeKey {
-            let base = key(index % 240, 8192, 0);
-            if index < 240 {
+            let base = key(index % INITIAL_ENTRIES, 8192, 0);
+            if index < INITIAL_ENTRIES {
                 return base;
             }
             let mut bytes = base.as_bytes().to_vec();
@@ -2408,11 +2599,11 @@ mod tests {
             BTreeKey::from(bytes.as_slice())
         }
         smol::block_on(async {
-            let (_scope, workers, poisoner) = workers(4).await;
-            let pool = pages(128 * 1024 * 1024);
-            let runs = input(240, 8192, 0, DuplicateCheck::Collect);
+            let (_scope, workers, poisoner) = workers(2).await;
+            let pool = pages(16 * 1024 * 1024);
+            let runs = input(INITIAL_ENTRIES, 8192, 0, DuplicateCheck::Collect);
             let mut expected = oracle(&runs);
-            let plan = test_prepare_packed(runs, workers.clone(), 4, 8, 23).await;
+            let plan = test_prepare_packed(runs, workers.clone(), 2, 4, 23).await;
             let mut staging = staging(&pool, true).await;
             let (mut build, mut cleanup) =
                 staging.start_build(plan, workers.clone(), poisoner.clone());
@@ -2426,7 +2617,7 @@ mod tests {
             let tree = index.tree();
             let initial_height = tree.height();
             assert!(initial_height >= 2);
-            for index in 240..2400 {
+            for index in INITIAL_ENTRIES..FINAL_ENTRIES {
                 let key = mutation_key(index);
                 let row = RowID::new(index as u64);
                 assert!(
@@ -2441,7 +2632,7 @@ mod tests {
                 tree.height() > initial_height,
                 "online additions must force a root split"
             );
-            for index in (0..2400).step_by(11) {
+            for index in (0..FINAL_ENTRIES).step_by(11) {
                 let key = mutation_key(index);
                 let replacement = RowID::new(index as u64 + 2_000_000);
                 tree.update(
@@ -2455,7 +2646,11 @@ mod tests {
                 .unwrap();
                 expected.insert(key, replacement);
             }
-            for index in (0..2400).filter(|i| i % 4 != 0) {
+            // Sparse lower keys beside dense upper keys exercise both full and
+            // partial internal sibling merges.
+            for index in (0..FINAL_ENTRIES)
+                .filter(|i| i % INITIAL_ENTRIES < INITIAL_ENTRIES / 2 && i % 4 != 0)
+            {
                 let key = mutation_key(index);
                 let old = expected.remove(&key).unwrap();
                 assert!(

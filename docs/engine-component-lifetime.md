@@ -682,6 +682,17 @@ This is why the pool owner must outlive every arena, page, and readonly-cache
 guard derived from it, and why explicit worker shutdown happens before owner
 drop starts waiting on quiescent guards.
 
+## Recovery-local index construction
+
+Hot-index reconstruction is a finite bootstrap obligation. Its owner remains
+responsible for accepted work and cleanup even when startup is cancelled.
+Workers and storage must outlive this obligation, and successful startup waits
+for it to finish.
+
+Ordinary failures settle accepted work and reclaim temporary resources. Internal
+invariant violations during installation or reclamation propagate as panics;
+reclamation is never retried after such a failure.
+
 ## Test Patterns
 
 Worker-backed test owners such as started table-file systems and started buffer

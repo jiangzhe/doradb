@@ -319,8 +319,8 @@ temperature:
    `DiskTree` roots.
 2. Heap redo reconstructs hot RowStore pages without updating `MemIndex`
    inline.
-3. After log replay, recovery scans those pages once to build the latest hot
-   `MemIndex` state.
+3. After replay and metadata reconciliation, recovery rebuilds hot indexes
+   from the latest committed rows using bounded parallel bulk construction.
 4. Replayed cold deletes populate `ColumnDeletionBuffer` and shadow stale cold
    `DiskTree` entries until a later deletion checkpoint publishes matching
    `DiskTree` deletes.
@@ -328,6 +328,19 @@ temperature:
 No active transaction survives restart, so recovery needs the latest committed
 mapping rather than historical pre-crash index visibility. See
 [Secondary Index Design](./secondary-index.md) for the runtime shadowing rules.
+
+Replay guarantees a complete source of recovered hot rows. Each live row
+contributes once to every relevant index. Reconstruction trusts previously
+enforced uniqueness constraints and preserves checkpointed cold-index state and
+its shadowing rules.
+
+Recovery builds one index at a time, with bounded parallelism and scratch memory.
+Exceeding the scratch limit fails recovery.
+
+All required indexes must be ready before foreground access. Accepted work and
+cleanup remain owned through failure or cancellation, and supporting resources
+stay alive until that work finishes. See
+[recovery construction lifetime](engine-component-lifetime.md#recovery-local-index-construction).
 
 ## Completion State
 
@@ -351,7 +364,10 @@ traffic.
 Successful bootstrap exposes immutable diagnostics for startup timing, redo
 work, and hot-index reconstruction. Later engine activity does not change the
 report. Diagnostics do not affect recovery ordering, durability, or success.
-Timings describe elapsed wall time; overlapping read-ahead work is not additive.
+Timings describe elapsed wall time; overlapping work is not additive. Hot-index
+timing includes construction and cleanup. Source pages count once per table,
+while entries count across completed index builds. Detailed profiling describes
+build work and scratch-memory use.
 
 See [public diagnostics](public-api.md#diagnostics-and-statistics) for access and
 [the recovery benchmark](benchmark-tool.md#clean-reopen-recovery) for measurement

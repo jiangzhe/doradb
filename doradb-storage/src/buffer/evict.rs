@@ -3423,24 +3423,18 @@ pub(crate) mod tests {
     /// Expected: Distinct logical pages remain allocated while resident usage stays within its limit.
     #[test]
     fn test_evict_buffer_pool_alloc() {
-        // max pages 16k, max in-mem 1k
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .swap_file(temp_dir.path().join("data.swp"))
-                .max_mem_size(1024u64 * 1024 * 64)
-                .max_file_size(1024u64 * 1024 * 128),
+                .max_mem_size(PAGE_SIZE * (MIN_IN_MEM_PAGES + 2))
+                .max_file_size(PAGE_SIZE * (MIN_IN_MEM_PAGES + 2) * 2),
         );
         let pool_guard = pool.create_base_guard();
-
-        println!(
-            "max_nbr={}, max_nbr_in_mem={}",
-            pool.capacity(),
-            pool.in_mem.max_count
-        );
+        let page_count = pool.in_mem.max_count + 1;
         smol::block_on(async {
             let mut pages = vec![];
-            for _ in 0..2048 {
+            for _ in 0..page_count {
                 let g = pool
                     .allocate_page::<RowPage>(&pool_guard)
                     .await
@@ -3448,8 +3442,8 @@ pub(crate) mod tests {
                 pages.push(g.page_id());
             }
             let unique_pages: BTreeSet<_> = pages.iter().copied().collect();
-            assert_eq!(unique_pages.len(), 2048);
-            assert_eq!(pool.allocated(), 2048);
+            assert_eq!(unique_pages.len(), page_count);
+            assert_eq!(pool.allocated(), page_count);
             assert!(pool.allocated() > pool.in_mem.max_count);
             assert!(pool.in_mem.count.load(Ordering::Acquire) <= pool.in_mem.max_count);
         });
@@ -3549,21 +3543,50 @@ pub(crate) mod tests {
     fn test_evict_buffer_pool_multi_threads() {
         use rand::{RngExt, SeedableRng, prelude::IndexedRandom};
         use rand_chacha::ChaCha8Rng;
+        use std::sync::Barrier;
 
         const SEED: u64 = 0x6275_6666_6572;
-        const THREADS: usize = 10;
-        const PAGES_PER_THREAD: usize = 200;
+        const THREADS: usize = 2;
+        const PAGES_PER_THREAD: usize = MIN_IN_MEM_PAGES / THREADS + 2;
+
+        async fn assert_payload(
+            pool: &EvictableBufferPool,
+            guard: &PoolGuard,
+            page_id: PageID,
+            expected: &[u8],
+            thread_id: usize,
+            step: usize,
+        ) {
+            let seed = SEED + thread_id as u64;
+            let page = pool
+                .get_page::<Page>(guard, page_id, LatchFallbackMode::Shared)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("read failed: thread={thread_id}, seed={seed}, step={step}, page={page_id}, error={err:?}");
+                })
+                .lock_shared_async()
+                .await
+                .expect("allocated page must remain valid");
+            assert_eq!(
+                &page.page()[..expected.len()],
+                expected,
+                "thread={thread_id}, seed={seed}, step={step}, page={page_id}"
+            );
+        }
+
         let temp_dir = TempDir::new().unwrap();
         let pool = StartedEvictPool::new(
             EvictableBufferPoolConfig::default()
                 .swap_file(temp_dir.path().join("data.swp"))
-                .max_mem_size(64u64 * 1024 * 1024)
-                .max_file_size(64u64 * 1024 * 2048),
+                .max_mem_size(PAGE_SIZE * (MIN_IN_MEM_PAGES + 2))
+                .max_file_size(PAGE_SIZE * (MIN_IN_MEM_PAGES + 2) * 2),
         );
         let pool_guard = pool.create_base_guard();
+        let allocated = Arc::new(Barrier::new(THREADS));
 
         let mut handles = vec![];
         for thread_id in 0..THREADS {
+            let allocated = Arc::clone(&allocated);
             let pool_guard = pool_guard.clone();
             let pool_ref = pool.owner_guard();
             let handle = thread::spawn(move || {
@@ -3587,21 +3610,22 @@ pub(crate) mod tests {
 
                         if rng.random_bool(0.3) {
                             let (page_id, expected) = pages.choose(&mut rng).copied().unwrap();
-                            let page = pool_ref
-                                .get_page::<Page>(&pool_guard, page_id, LatchFallbackMode::Shared)
-                                .await
-                                .unwrap_or_else(|err| {
-                                    panic!("read failed: thread={thread_id}, seed={seed}, step={page_index}, page={page_id}, error={err:?}");
-                                })
-                                .lock_shared_async()
-                                .await
-                                .expect("allocated page must remain valid");
-                            assert_eq!(
-                                &page.page()[..expected.len()],
+                            assert_payload(
+                                &pool_ref,
+                                &pool_guard,
+                                page_id,
                                 &expected,
-                                "thread={thread_id}, seed={seed}, step={page_index}, page={page_id}"
-                            );
+                                thread_id,
+                                page_index,
+                            )
+                            .await;
                         }
+                    }
+                    // Both workers exceed resident capacity before final verification.
+                    allocated.wait();
+                    for (step, (page_id, expected)) in pages.into_iter().enumerate() {
+                        assert_payload(&pool_ref, &pool_guard, page_id, &expected, thread_id, step)
+                            .await;
                     }
                 })
             });

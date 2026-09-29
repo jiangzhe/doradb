@@ -1895,6 +1895,74 @@ pub(crate) mod tests {
         assert_eq!(current_replay_start_ts, replay_start_ts);
     }
 
+    async fn assert_catalog_root_load_error(
+        storage: &CatalogStorage,
+        root: CatalogTableRootDesc,
+        expected: DataIntegrityError,
+    ) -> String {
+        let table = storage.get_catalog_table(root.table_id).unwrap();
+        let disk_guard = storage.disk_pool.create_base_guard();
+        let measurement = catalog_measurement(storage);
+        let error = storage
+            .load_rows_from_root(table.metadata(), &disk_guard, root, &measurement)
+            .await
+            .unwrap_err();
+        let report = expect_runtime_report(error);
+        assert_eq!(*report.current_context(), RuntimeError::CatalogAccess);
+        assert_eq!(report.downcast_ref::<DataIntegrityError>(), Some(&expected));
+        format!("{report:?}")
+    }
+
+    async fn assert_checkpoint_table_row(
+        engine: &Engine,
+        batch: CatalogCheckpointBatch,
+        expected: Vec<Val>,
+    ) {
+        let catalog = engine.inner().core.catalog();
+        catalog
+            .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
+            .await
+            .unwrap();
+        let rows = assert_compact_catalog_root(&catalog.storage, TABLE_ID_TABLES).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vals, expected);
+    }
+
+    async fn assert_canceled_insert_keeps_root(
+        engine: &Engine,
+        root: CatalogTableRootDesc,
+        table_id: TableID,
+        cts: TrxID,
+    ) {
+        let storage = &engine.inner().core.catalog().storage;
+        let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
+        let table_ops = vec![
+            RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
+            RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
+                CatalogIndexNo::new(0),
+                vec![Val::from(table_id)],
+            )),
+        ];
+        let mut mutable =
+            MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+        let mut measurement = catalog_measurement(storage);
+        let (next_root, blocks_changed) = storage
+            .apply_table_ops(
+                &mut mutable,
+                TABLE_ID_TABLES,
+                table.metadata(),
+                root,
+                &table_ops,
+                cts,
+                engine.inner().core.pools.pool_guards().disk_guard(),
+                &mut measurement,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_root, root);
+        assert!(!blocks_changed);
+    }
+
     /// Purpose: Keep catalog row identity unambiguous and non-nullable.
     /// Expected: Each checked catalog definition has an unambiguous primary key over required
     /// columns.
@@ -2245,24 +2313,6 @@ pub(crate) mod tests {
             assert!(report.contains("catalog checkpoint LWC row"), "{report}");
             assert!(report.contains("column_no=0"), "{report}");
         }
-    }
-
-    async fn assert_catalog_root_load_error(
-        storage: &CatalogStorage,
-        root: CatalogTableRootDesc,
-        expected: DataIntegrityError,
-    ) -> String {
-        let table = storage.get_catalog_table(root.table_id).unwrap();
-        let disk_guard = storage.disk_pool.create_base_guard();
-        let measurement = catalog_measurement(storage);
-        let error = storage
-            .load_rows_from_root(table.metadata(), &disk_guard, root, &measurement)
-            .await
-            .unwrap_err();
-        let report = expect_runtime_report(error);
-        assert_eq!(*report.current_context(), RuntimeError::CatalogAccess);
-        assert_eq!(report.downcast_ref::<DataIntegrityError>(), Some(&expected));
-        format!("{report:?}")
     }
 
     /// Purpose: Require compact catalog roots during loading.
@@ -2714,21 +2764,6 @@ pub(crate) mod tests {
         });
     }
 
-    async fn assert_checkpoint_table_row(
-        engine: &Engine,
-        batch: CatalogCheckpointBatch,
-        expected: Vec<Val>,
-    ) {
-        let catalog = engine.inner().core.catalog();
-        catalog
-            .apply_checkpoint_batch(batch, engine.inner().core.pools.pool_guards().disk_guard())
-            .await
-            .unwrap();
-        let rows = assert_compact_catalog_root(&catalog.storage, TABLE_ID_TABLES).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].vals, expected);
-    }
-
     /// Purpose: Apply checkpoint updates to rows inserted in the same batch.
     /// Expected: The compact result preserves the updated row without duplicate identities.
     #[test]
@@ -2929,41 +2964,6 @@ pub(crate) mod tests {
             assert_eq!(active_after.meta_block_id, active_meta_before);
             assert_eq!(active_after.root_ts, active_root_ts_before);
         });
-    }
-
-    async fn assert_canceled_insert_keeps_root(
-        engine: &Engine,
-        root: CatalogTableRootDesc,
-        table_id: TableID,
-        cts: TrxID,
-    ) {
-        let storage = &engine.inner().core.catalog().storage;
-        let table = storage.get_catalog_table(TABLE_ID_TABLES).unwrap();
-        let table_ops = vec![
-            RowRedoKind::Insert(PageID::new(0), catalog_table_vals(table_id, 0)),
-            RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
-                CatalogIndexNo::new(0),
-                vec![Val::from(table_id)],
-            )),
-        ];
-        let mut mutable =
-            MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-        let mut measurement = catalog_measurement(storage);
-        let (next_root, blocks_changed) = storage
-            .apply_table_ops(
-                &mut mutable,
-                TABLE_ID_TABLES,
-                table.metadata(),
-                root,
-                &table_ops,
-                cts,
-                engine.inner().core.pools.pool_guards().disk_guard(),
-                &mut measurement,
-            )
-            .await
-            .unwrap();
-        assert_eq!(next_root, root);
-        assert!(!blocks_changed);
     }
 
     /// Purpose: Avoid materializing an empty root for a cancelled insertion.
@@ -3199,11 +3199,18 @@ pub(crate) mod tests {
     /// column in key order.
     #[test]
     fn test_catalog_checkpoint_compact_rewrite_uses_dense_row_ids_after_large_append() {
+        use crate::conf::ThreadPoolConfig;
+        use crate::table::tests::lightweight_test_engine_config;
+
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
-            let engine =
-                open_catalog_test_engine(main_dir, Some("catalog-compact-large-append")).await;
+            let engine = Engine::bootstrap(
+                lightweight_test_engine_config(main_dir, "catalog-compact-large-append")
+                    .thread_pool(ThreadPoolConfig::default().worker_threads(1)),
+            )
+            .await
+            .unwrap();
 
             let storage = &engine.inner().core.catalog().storage;
             let table_id = USER_TABLE_ID_START + 9000;
@@ -3246,8 +3253,24 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(entries1.len(), 1);
 
-            // Two varying integer columns exceed one 64 KiB block even when bit-packed.
-            let second_batch = (1..=32768)
+            // Append only through the first row that no longer fits one block.
+            // The independent row oracle and block-range assertions below still
+            // verify that checkpoint rewriting preserves the whole append.
+            let mut boundary =
+                LwcBuilder::new(Arc::clone(&catalog_definition_of_columns().metadata.col));
+            let append_end = (0..=u16::MAX)
+                .find(|&column_no| {
+                    let row = catalog_column_row_record(
+                        RowID::new(u64::from(column_no)),
+                        table_id,
+                        column_no,
+                    );
+                    !boundary.append_row_values(row.row_id, &row.vals)
+                })
+                .expect("column fixture must cross one block");
+            let row_count = usize::from(append_end) + 1;
+            drop(boundary);
+            let second_batch = (1..=append_end)
                 .map(|column_no| catalog_column_insert(table_id, column_no))
                 .collect();
             engine
@@ -3265,12 +3288,12 @@ pub(crate) mod tests {
             let columns_root2 = snap2.meta.table_roots[1];
             let measurement2 = CatalogCheckpointMeasurement::new(&snap2.meta.table_roots, 0);
             let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
-            assert_eq!(rows.len(), 32769);
+            assert_eq!(rows.len(), row_count);
             for (column_id, row) in rows.iter().enumerate() {
                 assert_eq!(row.vals[0], Val::from(table_id));
                 assert_eq!(row.vals[1], Val::from(column_id as u32));
             }
-            assert_eq!(columns_root2.pivot_row_id(), RowID::new(32769));
+            assert_eq!(columns_root2.pivot_row_id(), RowID::new(row_count as u64));
             let entries2 = storage
                 .collect_index_entries(
                     &disk_pool_guard,
@@ -3285,12 +3308,7 @@ pub(crate) mod tests {
                 columns_root2.state != columns_root1.state,
                 "changed catalog tables should publish a rewritten compact root"
             );
-            assert!(
-                entries2.len() > entries1.len(),
-                "large append must span more LWC blocks: before={}, after={}",
-                entries1.len(),
-                entries2.len()
-            );
+            assert_eq!(entries2.len(), 2, "append must just cross one LWC block");
             assert_eq!(entries2[0].start_row_id, RowID::new(0));
             for pair in entries2.windows(2) {
                 assert_eq!(pair[1].start_row_id, pair[0].end_row_id());

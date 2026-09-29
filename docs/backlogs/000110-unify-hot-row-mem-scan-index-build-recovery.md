@@ -12,11 +12,12 @@ Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX 
 - [Task 000315](../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
 - [Task 000316](../tasks/000316-parallel-merge-and-hot-key-validation.md): implemented phase-2 partition streams and hot-key validation; primitive results are recorded, while page construction and caller integration remain open.
 - [Task 000317](../tasks/000317-parallel-packed-memindex-construction.md): implemented phase-3 packed MemIndex construction, fixed-root installation and caller-owned cleanup; production integration and end-to-end acceptance remain open.
+- [Task 000318](../tasks/000318-recovery-hot-index-integration.md): implemented phase-4 production recovery, joined cleanup ownership and verified end-to-end comparisons; CREATE INDEX integration and caller acceptance remain phase 5.
 - [Task 000306](../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
 - [Task 000156](../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
 - [Backlog 000104](000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
 - doradb-storage/src/catalog/index.rs: CreateIndexCollector::collect_current_hot, CreateIndexKeyValidator::prepare_hot, CreateIndexRuntimeBuilder, and insert_create_index_*_hot_rows.
-- doradb-storage/src/recovery/mod.rs: RecoveryCoordinator::rebuild_hot_indexes; doradb-storage/src/table/recover.rs: Table::populate_index_via_row_page.
+- doradb-storage/src/recovery/mod.rs: RecoveryCoordinator::rebuild_hot_indexes; doradb-storage/src/recovery/hot_index.rs: joined task, descriptor reuse, serial admission and terminal cleanup.
 - doradb-storage/src/index/btree/node.rs: BTreeNode::insert_slot_at; doradb-storage/src/index/btree/algo.rs: existing node-packing helpers to assess for reuse.
 
 ## Deferred From (Optional)
@@ -32,6 +33,9 @@ docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 2
 docs/tasks/000317-parallel-packed-memindex-construction.md;
 docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 3
 
+docs/tasks/000318-recovery-hot-index-integration.md;
+docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 4
+
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000306 measures and explains recovery cost. Changing construction order, parallel execution, temporary memory, and tree assembly across DDL and recovery is a separate design effort. The original scan-unification work was also outside task 000156's foreground MVCC scan scope.
@@ -39,7 +43,7 @@ docs/rfcs/0032-in-memory-parallel-hot-index-build.md phase 3
 - Findings: CREATE INDEX also collects current hot encoded rows into a Vec and builds MemIndex through sequential insertions. The current unique path already sorts hot keys and merges against sorted cold keys for duplicate validation; non-unique hot input retains scan order. Do not assume that the recovery profile demonstrates the same slot-shift cost in CREATE INDEX: benchmark each caller separately. Current cold construction also sorts encoded rows and retains them for cold/hot validation; coordinate its memory bounds with backlog 000104.
 - Direction Hint: Evaluate a shared staged-build pipeline with bounded page/block batches, encoded-key range partitioning, sorted runs and merging, duplicate checks across partition boundaries, bounded worker scheduling, and packed B+tree leaf/subtree construction plus upper-level assembly. Reuse existing node-packing helpers where suitable. Compare sequential sorted insertion with bulk construction and parallel construction; adding threads to arbitrary insertions into one shared tree may preserve copying costs and add contention. Share mechanisms with 000104, while keeping MemIndex allocation/publication and durable DiskTree writes/root installation explicit. PageID sorting alone is not a general substitute for sorting by each index's encoded key.
 - Phase-1 Defer Reason: Task 000315 deliberately delivers an internal extraction component; the complete production pipeline and its comparative performance acceptance belong to RFC 0032 phases 2-5. Its original task scope defers performance evaluation to caller integration, so this program-level source backlog remains open.
-- Phase-1 Findings: Both source adapters now produce immutable sorted runs with exact live-row coverage, admitted bulk scratch, bounded outstanding jobs, settled failures, and optional stage profiling. Recovery capture rejects incomplete registries using an independently captured row boundary. Component and workspace validation pass, but no standalone timing comparison or caller speedup is recorded. Existing CREATE/recovery benchmark reports omit hot-build metrics because production still uses the old builders.
+- Phase-1 Findings: Both source adapters now produce immutable sorted runs with exact live-row coverage, admitted bulk scratch, bounded outstanding jobs, settled failures, and optional stage profiling. Recovery originally checked an independent row boundary; task 000318 replaces that scan with the replay registration/drain completeness invariant and retains descriptor structure validation. Component and workspace validation pass, but no standalone timing comparison or caller speedup is recorded. Existing CREATE/recovery benchmark reports omit hot-build metrics because production still uses the old builders.
 - Phase-1 Direction Hint: Retain finalized recovery descriptors across sequential index builds, preserve CREATE transaction exclusion through settlement, and consume the shared run/budget interfaces in the remaining phases. Use doradb-bench for serial, sorted-insertion, single-worker, and multi-worker comparisons with content verification outside timing. Report effective run counts, stage durations, bulk scratch versus process memory, wide-key skew, and longest synchronous sorts; do not infer performance from the correctness suite. RFC 0032's caller-selected duplicate policy governs the remaining implementation, including trusted recovery input and required CREATE UNIQUE validation.
 
 Phase-2 deferral update:
@@ -57,8 +61,8 @@ Phase-3 deferral update:
 - Findings: Packed leaves, globally grouped parents and fixed-root installation
   preserve normal B-tree mutation and reclamation. Cleanup is handed to the
   caller before construction and requires no additional worker-pool admission.
-  Cancelled cleanup can resume, while unsafe failure retains exact ownership
-  under Fatal poison. Reused candidate buffers and a circular window reduced
+  Cancelled cleanup can resume. The original failure-retention policy is revised
+  by phase 4 below. Reused candidate buffers and a circular window reduced
   final component medians from 1.885 to 1.621 ms for narrow keys, 3.123 to 2.202 ms
   for wide keys and 15.436 to 3.572 ms for random mixed-width keys. These are
   component measurements, not production recovery or CREATE speedups.
@@ -70,6 +74,30 @@ Phase-3 deferral update:
   precedence and run end-to-end comparisons after each caller integration.
   Measure byte-work skew, tiny-input crossover, serial-parent scheduling,
   retained cold memory and pool I/O. Keep the separate fuzz follow-up in 000205.
+
+Phase-4 deferral update:
+
+- Defer Reason: Task 000318 completes recovery integration and its end-to-end
+  acceptance. CREATE INDEX still needs its accepted mandatory-operation owner,
+  late cold/hot validation and publication adapter in RFC 0032 phase 5. Keep
+  this program backlog open until that caller is integrated and measured.
+- Findings: Recovery now joins one finite local task through cancellation and
+  terminal cleanup before component teardown. Deallocation invariant panics
+  propagate through join without retry or permanent page/guard retention;
+  component order is unchanged.
+  Sixty-five unprofiled and ten profiled runs verified full table contents and
+  every selected index. For one million narrow unique keys, median rebuild fell
+  from 325.740 to 17.173 ms and startup from 497.523 to 192.155 ms at four workers.
+  Tiny rebuild adds about 0.1 ms; skew and multiple indexes show diminishing
+  returns above two workers. Six-index profiling still re-extracts keys six
+  times, with 136.791 ms extraction and 33.878 ms local-sort worker sums.
+- Direction Hint: Preserve phase 5's existing mandatory ownership and late
+  validation contract, using shared `HotIndexBuild` with an uninstalled ready
+  tree and caller-driven settlement. Measure CREATE independently; recovery speedups do not
+  establish its performance. Retain scratch/page/RSS distinctions and compare
+  worker counts, key width, repeated projection and tiny-input overhead before
+  considering further tuning or a small-input policy. Task 000318 contains the
+  full environment, fixture matrix, page-target and checked-mode observations.
 
 ## Scope Hint
 

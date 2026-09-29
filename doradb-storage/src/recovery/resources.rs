@@ -10,6 +10,7 @@ use crate::index::build::HotBuildPolicy;
 use crate::io::STORAGE_SECTOR_SIZE;
 use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
 use crate::log::{RedoLogFinalizer, discover_redo_log_files};
+use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::RedoReplayPlanner;
 use crate::runtime::thread_pool::ThreadPool;
@@ -30,6 +31,8 @@ pub(crate) struct RecoveryResources<'a> {
     pub(crate) table_fs: QuiescentGuard<FileSystem>,
     /// Existing finite-job pool, already running before recovery starts.
     pub(crate) thread_pool: QuiescentGuard<ThreadPool>,
+    /// Bootstrap-owned poison publication authority.
+    pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Catalog runtime being rebuilt from checkpointed metadata and redo logs.
     pub(crate) catalog: &'a Catalog,
     /// Validated extraction limits retained for bootstrap builds.
@@ -47,6 +50,7 @@ impl<'a> RecoveryResources<'a> {
         table_fs: QuiescentGuard<FileSystem>,
         thread_pool: QuiescentGuard<ThreadPool>,
         catalog: &'a Catalog,
+        poisoner: QuiescentGuard<EnginePoisoner>,
     ) -> Self {
         let pool_guards = pools.pool_guards().clone();
         let hot_build_policy =
@@ -57,6 +61,7 @@ impl<'a> RecoveryResources<'a> {
             pool_guards,
             table_fs,
             thread_pool,
+            poisoner,
             catalog,
             hot_build_policy,
             #[cfg(feature = "profiling")]

@@ -4,7 +4,9 @@
 //! and publication. Required build resource accounting is independent of profiling.
 mod hot_index_build;
 
-pub use hot_index_build::{HotBuildMeasurements, HotIndexBuildStats, HotMergeMeasurements};
+pub use hot_index_build::{
+    HotBuildMeasurements, HotIndexBuildStats, HotMergeMeasurements, RecoveryHotIndexMeasurements,
+};
 pub(crate) use hot_index_build::{
     HotBuildProfile, HotBuildWorkerProfile, HotIndexBuildProfiler, HotMergeWorkerProfile,
     HotPackedLevel, HotPackedMeasurements,

@@ -131,21 +131,21 @@ effective table-scan counts. Normalized result documents must include the
 `[engine.hot_index_build]` accepts `max_scratch_bytes` (default `"256 MiB"`),
 `max_workers` (default: the configured thread-pool size), and
 `target_pages_per_run` (default 128). Limits must be positive, and explicit
-workers cannot exceed the pool size. These settings take effect in production
-CREATE/recovery builds when RFC 0032 caller integration is complete.
+workers cannot exceed the pool size. These settings control recovery index builds.
 
-The scratch limit and reported scratch peak cover bulk build buffers, including
-page descriptors, entries, and encoded keys. Small bookkeeping, bounded worker
-temporaries, and temporary capture-validation metadata are excluded, so these
-values do not represent total process memory.
+The scratch limit bounds bulk-build working memory. Its reported peak excludes
+auxiliary overhead and does not represent total process memory.
 
-The default-enabled `profiling` feature records hot-build statistics. Disable
-it with `--no-default-features --features iouring` (or `libaio`) to remove
-measurement overhead. `include_stats` controls reporting. Hot-build metrics
-remain absent until caller integration; successful extraction counts separately
-from completed index construction. Counts and times use interval deltas for
-CREATE and cumulative values for recovery; memory and duration peaks are
-engine-lifetime maxima.
+The benchmark uses io_uring and always collects profiling data. `include_stats`
+controls whether general engine statistics appear in the output. Recovery's
+optional `hot_indexes` measurements describe completed index builds and are
+reported independently of `include_stats`. Successful extraction and completed
+index construction are counted separately.
+
+Recovery counters accumulate over startup; its scratch peak is the maximum
+across builds. Build page counts and occupancy describe construction work and
+can exceed final resident size. Stage timings may overlap, and worker-time sums
+are not additive with elapsed wall time.
 
 ### Recovery settings
 
@@ -487,9 +487,9 @@ leaked.
 ## Clean-reopen recovery
 
 `recovery` measures one public `Engine::bootstrap` of a prepared root. It is
-benchmark-only, requires zero warm-ups and one measured run, and accepts only
-`include_stats`. Worker and sizing controls are rejected. Redo durability must
-be `fsync` or `fdatasync`.
+benchmark-only, requires zero warm-ups and one measured run, and accepts
+`include_stats` and an optional `fixture`. Worker and sizing controls belong in
+the engine configuration. Redo durability must be `fsync` or `fdatasync`.
 
 ```toml
 [[phase]]
@@ -499,9 +499,11 @@ measured_runs = 1
 workload = { type = "recovery", include_stats = true }
 ```
 
-The fixture may be empty or contain one ordinary benchmark table, optionally
-indexed. Multiple tables, managed bindings, pending catalog checkpoints, and
-active freezes are rejected. Completed index-free checkpoints are supported.
+Without `fixture`, preparation may leave an empty database or one ordinary
+benchmark table, optionally indexed. Managed bindings, pending catalog
+checkpoints, and active freezes are rejected. Completed index-free checkpoints
+are supported. For multiple tables or richer data, use a
+[varied recovery fixture](#varied-recovery-fixtures) with an otherwise empty plan.
 
 Preparation, content verification, shutdown, engine teardown, and profiler
 attachment are outside the timer. The profiler pause occurs after the original
@@ -514,9 +516,9 @@ is outside the sample. A failure retains the root and emits no success result.
 
 The result always includes the startup report and verification outcome, even
 when `include_stats = false`. Duration fields use `_nanos` names and `u64`
-integers. Out-of-range durations, saturated reports, and inconsistent accounting
-are rejected. Generic counters contain only `operations = 1`; verification
-counts are reported separately. The latency unit is `engine-recovery`.
+integers. Out-of-range durations and inconsistent accounting are rejected.
+Generic counters contain only `operations = 1`; verification counts are reported
+separately. The latency unit is `engine-recovery`.
 
 Optional generic statistics are captured from the fresh engine before
 verification. Counters use `cumulative-counter`; gauges and peaks retain their
@@ -669,3 +671,23 @@ fixture preparation, and ends with its benchmark workload. Recovery templates
 cover empty, loaded index-free, unique-indexed, and prefix-checkpointed fixtures;
 each uses one measured reopen, zero warm-ups, and diagnostics enabled. CREATE
 INDEX templates cover the placements listed above for both index modes.
+
+### Varied recovery fixtures
+
+The optional `fixture` settings prepare multiple tables and indexes, composite
+keys, skewed payloads, checkpointed rows, and deletes or updates. Preparation
+and verification of every table and selected index occur outside recovery timing.
+For example:
+
+```toml
+[[phase]]
+kind = "benchmark"
+workload = { type = "recovery", include_stats = true, fixture = { tables = 2, rows = 100000, indexes = 2, index = "unique", composite = true, cardinality = 16, value_bytes = 128, cold_rows = 10000, mutate_every = 7 } }
+```
+
+`rows` is per table; `indexes = 0` requires `index = "none"`. Payloads are
+8–1024 bytes. `cardinality = 0` uses distinct payload identities, and zero
+`cold_rows` or `mutate_every` disables that preparation. A mutation stride of
+one is invalid. Non-unique indexes support repeated logical keys.
+Run separate invocations with fresh roots for repetitions and worker/page-target
+comparisons.

@@ -3,7 +3,6 @@ use super::merge::execution_error;
 use super::{BudgetedVec, MemoryBudget};
 use crate::buffer::guard::PageExclusiveGuard;
 use crate::buffer::{BufferPool, PoolGuard};
-use crate::component::panic_payload_description;
 use crate::error::{
     FatalError, FatalResult, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
     SharedFatalError,
@@ -14,11 +13,9 @@ use crate::latch::LatchFallbackMode;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::yield_now;
-use error_stack::{Report, ResultExt};
+use error_stack::ResultExt;
 use event_listener::{Event, listener};
-use futures::FutureExt;
 use parking_lot::Mutex;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -46,10 +43,6 @@ struct Staging<P: 'static> {
     pool: QuiescentGuard<P>,
     guard: PoolGuard,
     poisoner: QuiescentGuard<EnginePoisoner>,
-    // A fatal cleanup failure intentionally retains this page tracker and its
-    // dependencies, even after every observer disappears. Never infer success
-    // from a failed reopen or retry a possibly completed deallocation.
-    terminal_retention: Mutex<Option<Arc<Self>>>,
     #[cfg(test)]
     hooks: tests::Hooks,
 }
@@ -137,7 +130,6 @@ impl<P: BufferPool + 'static> StagedPageOwner<P> {
             pool,
             guard,
             poisoner,
-            terminal_retention: Mutex::new(None),
             #[cfg(test)]
             hooks: tests::Hooks::default(),
         });
@@ -202,7 +194,8 @@ impl<P: BufferPool + 'static> StagedPageCleanup<P> {
     /// This future can run inline or in a caller-owned task without pool
     /// admission. Cancelling its borrow preserves reclamation progress; retain
     /// this object and call run again. Successful installation disarms page
-    /// reclamation. A terminal failure is retained and never retried.
+    /// reclamation. Reopen errors are cached; deallocation invariant panics unwind
+    /// directly, and callers must abandon the failed cleanup object without retry.
     pub(crate) async fn run(&mut self) -> FatalResult<()> {
         if self.outcome.is_none() {
             self.outcome = Some(self.reclaim_or_poison().await);
@@ -219,20 +212,14 @@ impl<P: BufferPool + 'static> StagedPageCleanup<P> {
     }
 
     async fn reclaim_or_poison(&self) -> Result<(), SharedFatalError> {
-        let result = AssertUnwindSafe(self.state.reclaim_pages())
-            .catch_unwind()
-            .await;
-        let failure = match result {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(RuntimeOrFatalError::Runtime(report))) => {
+        let failure = match self.state.reclaim_pages().await {
+            Ok(()) => return Ok(()),
+            Err(RuntimeOrFatalError::Runtime(report)) => {
                 report.change_context(FatalError::PurgeDeallocate)
             }
-            Ok(Err(RuntimeOrFatalError::Fatal(report))) => report,
-            Err(payload) => Report::new(FatalError::PurgeDeallocate)
-                .attach(panic_payload_description(payload.as_ref()).to_owned()),
+            Err(RuntimeOrFatalError::Fatal(report)) => report,
         }
-        .attach("operation=hot_packed_build, phase=staged_cleanup, remaining_pages_retained=true");
-        *self.state.terminal_retention.lock() = Some(self.state.clone());
+        .attach("operation=hot_packed_build, phase=staged_cleanup");
         Err(self.state.poisoner.poison(failure))
     }
 }
@@ -374,11 +361,9 @@ mod tests {
             .collect()
     }
 
-    /// Release test-induced terminal retention after a fault known to precede pool access.
+    /// Reclaim test pages after an injected fault known to precede pool access.
     pub(crate) async fn recover<P: BufferPool>(cleanup: &StagedPageCleanup<P>) {
-        assert!(cleanup.state.terminal_retention.lock().is_some());
         cleanup.state.reclaim_pages().await.unwrap();
-        cleanup.state.terminal_retention.lock().take();
     }
 
     /// Signal completed page materialization after its page latch has been released.

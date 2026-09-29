@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
-pub(super) use tests::{BudgetFailure, fail_at};
+pub(super) use tests::BudgetFailure;
+#[cfg(test)]
+pub(crate) use tests::fail_at;
 
 struct BudgetState {
     limit: usize,
@@ -17,7 +19,7 @@ struct BudgetState {
     test: BudgetFailure,
 }
 
-/// Concurrent admission for bulk scratch buffers shared by one index build.
+/// Concurrent bulk scratch admission within each of a table's serial index builds.
 /// Bookkeeping and bounded worker temporaries are outside this accounting.
 #[derive(Clone)]
 pub(crate) struct MemoryBudget(Arc<BudgetState>);
@@ -84,6 +86,17 @@ impl MemoryBudget {
     /// Return admitted bulk allocation bytes.
     pub(crate) fn used(&self) -> usize {
         self.0.used.load(Ordering::Acquire)
+    }
+
+    /// Assert quiescence and reset the next build's high-water to retained descriptors.
+    pub(crate) fn reset_peak(&self, retained: usize) {
+        assert_eq!(
+            self.used(),
+            retained,
+            "hot-build scratch remains at index boundary"
+        );
+        #[cfg(feature = "profiling")]
+        self.0.peak.store(retained, Ordering::Release);
     }
 
     /// Return the highest simultaneous bulk allocation capacity admitted.

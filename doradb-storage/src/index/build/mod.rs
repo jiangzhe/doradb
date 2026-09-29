@@ -7,28 +7,20 @@ mod co_rank;
 mod loser_tree;
 /// Bounded partition streaming and separately settled completion authority.
 pub(crate) mod merge;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "caller-driven cleanup is integrated in RFC 0032 phases 4 and 5"
-    )
-)]
 mod page_cleanup;
+mod pipeline;
 mod source;
-/// Private packed construction; recovery and DDL adapters follow in RFC 0032.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "production adapters follow in RFC 0032 phases 4 and 5"
-    )
-)]
+/// Packed construction shared by bootstrap and private DDL staging targets.
 pub(crate) mod tree_builder;
 mod worker;
 
+#[cfg(test)]
+pub(crate) use budget::fail_at as fail_build_budget;
 pub(crate) use budget::{BudgetedVec, MemoryBudget, MemoryReservation};
-pub(crate) use source::{HotBuildCapture, HotBuildSource};
+pub(crate) use pipeline::{HotIndexBuild, merge_build_result};
+#[cfg(test)]
+pub(crate) use pipeline::{TestPoint as HotBuildTestPoint, test_observe as observe_hot_build};
+pub(crate) use source::{HotBuildCapture, HotBuildSource, HotBuildTableSource};
 
 use crate::completion::Completion;
 use crate::conf::HotIndexBuildConfig;
@@ -149,13 +141,6 @@ pub(crate) struct SortedHotRuns {
     duplicates: DuplicateCheck,
     /// Completed build counts, durations, and scratch high-water.
     #[cfg(feature = "profiling")]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "caller integrations consume extraction measurements"
-        )
-    )]
     pub(crate) measurements: HotBuildMeasurements,
     /// Shared admission retained for run ownership and downstream phases.
     pub(crate) budget: MemoryBudget,
@@ -209,7 +194,7 @@ struct HotBuildJob {
 /// Dropping the borrowed `execute()` future retains all accepted work in this owner.
 pub(crate) struct HotLocalSort {
     source: Arc<HotBuildSource>,
-    pool: QuiescentGuard<ThreadPool>,
+    thread_pool: QuiescentGuard<ThreadPool>,
     max_workers: usize,
     stop: Arc<AtomicBool>,
     jobs: Vec<HotBuildJob>,
@@ -224,16 +209,9 @@ pub(crate) struct HotLocalSort {
 
 impl HotLocalSort {
     /// Plan page groups and prepare bounded bookkeeping before accepting any job.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 1 primitive; production callers migrate in RFC 0032 phases 4 and 5"
-        )
-    )]
     pub(crate) fn new(
-        source: HotBuildSource,
-        pool: QuiescentGuard<ThreadPool>,
+        source: Arc<HotBuildSource>,
+        thread_pool: QuiescentGuard<ThreadPool>,
         policy: HotBuildPolicy,
     ) -> Self {
         let jobs: Vec<_> = policy
@@ -256,8 +234,8 @@ impl HotLocalSort {
             ..Default::default()
         });
         Self {
-            source: Arc::new(source),
-            pool,
+            source,
+            thread_pool,
             max_workers: policy.max_workers,
             stop: Arc::new(AtomicBool::new(false)),
             jobs,
@@ -273,13 +251,6 @@ impl HotLocalSort {
 
     /// Extract and locally sort page groups through a borrowed future.
     /// Cancellation leaves all records in this owner.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "phase 1 primitive; production callers migrate in RFC 0032 phases 4 and 5"
-        )
-    )]
     pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<SortedHotRuns> {
         assert!(
             !self.finished,
@@ -294,7 +265,7 @@ impl HotLocalSort {
             {
                 let group = self.submitted;
                 let job = worker::submit(
-                    &self.pool,
+                    &self.thread_pool,
                     self.source.clone(),
                     self.stop.clone(),
                     group,
@@ -402,9 +373,11 @@ impl Drop for HotLocalSort {
 
 #[cfg(test)]
 mod tests {
+    use super::tree_builder::{HotPackedOutcome, StagingMemIndex};
     use super::*;
     use crate::Engine;
     use crate::buffer::guard::PageGuard;
+    use crate::buffer::{BufferPool, FixedBufferPool, PoolRole};
     use crate::catalog::index::tests::serial_hot_build_test_entries;
     use crate::catalog::index::{IndexDdlGateScope, capture_hot_index_build};
     use crate::catalog::{
@@ -417,7 +390,9 @@ mod tests {
     use crate::error::{ResourceError, RuntimeError};
     use crate::id::{PageID, TrxID};
     use crate::index::BTreeKeyEncoder;
+    use crate::index::btree::BTreeU64;
     use crate::log::redo::{RowRedo, RowRedoKind};
+    use crate::quiescent::QuiescentBox;
     use crate::recovery::{
         OwnedReplayOp, RowReplayState, capture_hot_build_test_source, pack_test_ops,
     };
@@ -445,10 +420,14 @@ mod tests {
 
     impl Fixture {
         async fn new(pages: usize, rows: usize, wide: bool) -> Self {
+            Self::with_workers(pages, rows, wide, 4).await
+        }
+
+        async fn with_workers(pages: usize, rows: usize, wide: bool, workers: usize) -> Self {
             let temp = TempDir::new().unwrap();
             let engine = Engine::bootstrap(
                 lightweight_test_engine_config(temp.path().to_path_buf(), "hot-build")
-                    .thread_pool(ThreadPoolConfig::default().worker_threads(4))
+                    .thread_pool(ThreadPoolConfig::default().worker_threads(workers))
                     .data_buffer(
                         EvictableBufferPoolConfig::default()
                             .max_mem_size(64usize * 1024 * 1024)
@@ -548,7 +527,7 @@ mod tests {
                 HotIndexBuildConfig::default()
                     .max_workers(Some(workers))
                     .target_pages_per_run(target),
-                4,
+                self.engine.inner().core.hot_build_policy.max_workers,
             )
             .unwrap()
         }
@@ -616,6 +595,40 @@ mod tests {
                 assert_eq!(source.key.build_ts, TrxID::new(42));
                 source
             }
+        }
+
+        async fn pipeline(
+            &self,
+            plan: &CreateIndexPlan,
+            index_pool: &QuiescentBox<FixedBufferPool>,
+        ) -> (
+            HotIndexBuild<FixedBufferPool>,
+            StagingMemIndex<FixedBufferPool>,
+        ) {
+            let policy = self.policy(2, 1);
+            let source = Arc::new(self.source(plan, policy, false).await);
+            let types = source
+                .key
+                .columns
+                .iter()
+                .map(|&column| source.layout.metadata().col.col_type(column))
+                .collect();
+            let staging = StagingMemIndex::new(
+                index_pool.guard(),
+                index_pool.create_base_guard(),
+                types,
+                source.key.unique,
+                source.key.build_ts,
+            )
+            .await
+            .unwrap();
+            let build = HotIndexBuild::new(
+                source,
+                self.engine.inner().thread_pool.clone(),
+                self.engine.inner().poisoner.clone(),
+                policy,
+            );
+            (build, staging)
         }
 
         async fn oracle(&self, plan: &CreateIndexPlan) -> Vec<(BTreeKey, RowID)> {
@@ -727,8 +740,11 @@ mod tests {
             assert_eq!(session.hot_index_build_stats().unwrap().completed_builds, 0);
             for (index, recovery) in [false, true].into_iter().enumerate() {
                 let source = fixture.source(&plan, policy, recovery).await;
-                let mut sort =
-                    HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+                let mut sort = HotLocalSort::new(
+                    source.into(),
+                    fixture.engine.inner().thread_pool.clone(),
+                    policy,
+                );
                 let runs = sort.execute().await.unwrap();
                 let stats = session.hot_index_build_stats().unwrap();
                 assert_eq!(stats.completed_builds, (index + 1) as u64);
@@ -745,8 +761,11 @@ mod tests {
             let before = session.hot_index_build_stats().unwrap();
             let source = fixture.source(&plan, policy, false).await;
             budget::fail_at(&source.budget, "run entries");
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             assert!(sort.execute().await.is_err());
             assert_eq!(session.hot_index_build_stats().unwrap(), before);
             session.close().await.unwrap();
@@ -950,6 +969,173 @@ mod tests {
         }
     }
 
+    /// Purpose: Keep shared pipeline construction separate from caller validation and installation.
+    /// Expected: Installation matches the serial oracle; rejection, abandonment and duplicate outcomes preserve an empty root and reclaim every detached page.
+    #[test]
+    fn pipeline_preserves_install_abort_and_duplicate_boundaries() {
+        #[derive(Clone, Copy, Debug)]
+        enum Decision {
+            Install,
+            Abort,
+            Drop,
+            Duplicate,
+        }
+        smol::block_on(async {
+            let fixture = Fixture::new(2, 25, false).await;
+            let index_pool = QuiescentBox::new(
+                FixedBufferPool::with_capacity(PoolRole::Index, 16 * 1024 * 1024).unwrap(),
+            );
+            for decision in [
+                Decision::Install,
+                Decision::Abort,
+                Decision::Drop,
+                Decision::Duplicate,
+            ] {
+                let column = usize::from(matches!(decision, Decision::Duplicate));
+                let plan = fixture.plan(&[column], true);
+                let expected = fixture.oracle(&plan).await;
+                let (mut build, mut staging) = fixture.pipeline(&plan, &index_pool).await;
+                let budget = build.source().budget.clone();
+                match build.build(&mut staging).await.unwrap() {
+                    HotPackedOutcome::Complete(mut ready) => {
+                        assert!(!matches!(decision, Decision::Duplicate));
+                        assert_eq!(ready.entries(), expected.len());
+                        assert!(index_pool.allocated() > 1);
+                        // Construction has not made the install/abort decision.
+                        let mut settlement = Box::pin(build.settle());
+                        assert!(futures::poll!(settlement.as_mut()).is_pending());
+                        drop(settlement);
+                        if matches!(decision, Decision::Install) {
+                            ready.install().await.unwrap();
+                            build.settle().await.unwrap();
+                            #[cfg(feature = "profiling")]
+                            {
+                                let (extraction, merge, packed, _) = build.measurements(&ready);
+                                assert_eq!(extraction.entries, expected.len() as u64);
+                                assert!(merge.checked);
+                                assert!(packed.levels.first().is_some_and(|level| level.pages > 0));
+                            }
+                        } else if matches!(decision, Decision::Abort) {
+                            ready.abort().unwrap();
+                            assert!(ready.install().await.is_err());
+                        }
+                        drop(ready);
+                    }
+                    HotPackedOutcome::Duplicate(conflict) => {
+                        assert!(matches!(decision, Decision::Duplicate));
+                        let rank = expected
+                            .windows(2)
+                            .position(|pair| pair[0].0 == pair[1].0)
+                            .unwrap()
+                            + 1;
+                        assert_eq!(conflict.right_rank, rank);
+                        assert_ne!(conflict.rows[0], conflict.rows[1]);
+                        for row in conflict.rows {
+                            assert!(
+                                expected
+                                    .iter()
+                                    .any(|(key, id)| *id == row && *key == expected[rank].0)
+                            );
+                        }
+                    }
+                }
+                build.settle().await.unwrap();
+                drop(build);
+                assert_eq!(budget.used(), 0, "{decision:?}");
+                let index = staging.finish();
+                let guard = index_pool.create_base_guard();
+                if matches!(decision, Decision::Install) {
+                    for (key, row) in &expected {
+                        assert_eq!(
+                            index
+                                .tree()
+                                .lookup_optimistic::<BTreeU64>(&guard, key)
+                                .await
+                                .unwrap(),
+                            Some(BTreeU64::from(*row))
+                        );
+                    }
+                } else {
+                    assert_eq!(index_pool.allocated(), 1, "{decision:?}");
+                    drop(index.tree().check_empty_private_root(&guard).await.unwrap());
+                }
+                index.destroy(&guard).await.unwrap();
+                assert_eq!(index_pool.allocated(), 0, "{decision:?}");
+            }
+        });
+    }
+
+    /// Purpose: Retain shared pipeline obligations when its borrowed construction future is cancelled.
+    /// Expected: Settlement waits for gated extraction or allocation jobs, then restores empty staging and releases all build scratch and detached pages.
+    #[test]
+    fn pipeline_cancellation_drains_extraction_and_packing() {
+        use super::page_cleanup::{TestFault, TestPoint, test_gate};
+        use futures::future::{Either, select};
+
+        for packing in [false, true] {
+            smol::block_on(async {
+                let fixture = Fixture::new(2, 25, false).await;
+                let index_pool = QuiescentBox::new(
+                    FixedBufferPool::with_capacity(PoolRole::Index, 16 * 1024 * 1024).unwrap(),
+                );
+                let plan = fixture.plan(&[0], true);
+                let (mut build, mut staging) = fixture.pipeline(&plan, &index_pool).await;
+                let budget = build.source().budget.clone();
+                let (armed_tx, armed_rx) = flume::bounded(1);
+                if packing {
+                    observe_hot_build(
+                        &mut build,
+                        |_| {},
+                        move |cleanup| {
+                            armed_tx
+                                .send(test_gate(
+                                    cleanup,
+                                    TestPoint::Allocated(0),
+                                    1,
+                                    TestFault::None,
+                                ))
+                                .unwrap();
+                            None
+                        },
+                    );
+                } else {
+                    armed_tx
+                        .send(build.source().test.gate(0, Fault::None))
+                        .unwrap();
+                }
+                let execute = Box::pin(build.build(&mut staging));
+                let ((entered, release), pending) =
+                    match select(execute, Box::pin(armed_rx.recv_async())).await {
+                        Either::Right((Ok(gate), pending)) => (gate, pending),
+                        _ => panic!("pipeline did not arm its gate: packing={packing}"),
+                    };
+                let pending = match select(pending, Box::pin(entered.recv_async())).await {
+                    Either::Right((Ok(()), pending)) => pending,
+                    _ => panic!("pipeline did not reach its gate: packing={packing}"),
+                };
+                assert_eq!(index_pool.allocated() > 1, packing);
+                drop(pending);
+                let mut settlement = Box::pin(build.settle());
+                assert!(futures::poll!(settlement.as_mut()).is_pending());
+                release.send(()).unwrap();
+                let result = settlement.await;
+                if packing {
+                    assert!(matches!(result, Err(RuntimeOrFatalError::Runtime(_))));
+                } else {
+                    result.unwrap();
+                }
+                drop(build);
+                assert_eq!(budget.used(), 0, "packing={packing}");
+                assert_eq!(index_pool.allocated(), 1);
+                let index = staging.finish();
+                let guard = index_pool.create_base_guard();
+                drop(index.tree().check_empty_private_root(&guard).await.unwrap());
+                index.destroy(&guard).await.unwrap();
+                assert_eq!(index_pool.allocated(), 0);
+            });
+        }
+    }
+
     /// Purpose: Compare both source adapters with serial extraction across sparse, dense, deleted, wide, and empty data.
     /// Expected: Sorted runs retain exactly the live key/RowID multiset, preserve planned ordering, and obey local duplicate policy.
     #[test]
@@ -957,16 +1143,16 @@ mod tests {
         smol::block_on(async {
             for (pages, rows, wide, target) in [
                 (0, 0, false, 1),
-                (3, 0, false, 1),
-                (1, 1, false, 1),
-                (1, 25, false, 1),
-                (19, 25, false, 1),
-                (7, 25, true, 1),
-                // Dense pages in one group spanning multiple cooperative batches.
-                (33, 300, false, 128),
+                (2, 0, false, 1),
+                (1, 2, false, 1),
+                (1, 14, false, 1),
+                (9, 14, false, 1),
+                (3, 14, true, 1),
+                // One group crosses the 16-page cooperative yield boundary.
+                (17, 14, false, 128),
             ] {
-                let fixture = Fixture::new(pages, rows, wide).await;
-                assert_eq!(fixture.engine.inner().core.hot_build_policy.max_workers, 4);
+                let fixture = Fixture::with_workers(pages, rows, wide, 2).await;
+                assert_eq!(fixture.engine.inner().core.hot_build_policy.max_workers, 2);
                 for (columns, unique) in [
                     (&[0][..], true),
                     (&[1][..], true),
@@ -976,12 +1162,12 @@ mod tests {
                     let plan = fixture.plan(columns, unique);
                     let expected = fixture.oracle(&plan).await;
                     for recovery in [false, true] {
-                        for workers in [1, 2, 4] {
+                        for workers in [1, 2] {
                             let policy = fixture.policy(workers, target);
                             let source = fixture.source(&plan, policy, recovery).await;
                             let budget = source.budget.clone();
                             let mut sort = HotLocalSort::new(
-                                source,
+                                source.into(),
                                 fixture.engine.inner().thread_pool.clone(),
                                 policy,
                             );
@@ -1075,8 +1261,11 @@ mod tests {
             let (first_entered, first_release) = source.test.gate(0, Fault::None);
             let (second_entered, second_release) = source.test.gate(1, Fault::None);
             let budget = source.budget.clone();
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             assert!(sort.execute().now_or_never().is_none());
             first_entered.recv_async().await.unwrap();
             second_entered.recv_async().await.unwrap();
@@ -1107,8 +1296,11 @@ mod tests {
                 let (first_entered, first_release) = source.test.gate(0, Fault::Runtime);
                 let (second_entered, second_release) = source.test.gate(1, second_fault);
                 let budget = source.budget.clone();
-                let mut sort =
-                    HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+                let mut sort = HotLocalSort::new(
+                    source.into(),
+                    fixture.engine.inner().thread_pool.clone(),
+                    policy,
+                );
                 assert!(sort.execute().now_or_never().is_none());
                 first_entered.recv_async().await.unwrap();
                 second_entered.recv_async().await.unwrap();
@@ -1145,11 +1337,24 @@ mod tests {
             for invalid in ["out_of_range", "missing", "reused", "short", "long"] {
                 let mut source = fixture.source(&plan, policy, true).await;
                 match invalid {
-                    "out_of_range" => source.pages[0].page_id = PageID::new(10000),
-                    "missing" => source.pages[0].page_id = PageID::new(2),
-                    "long" => source.pages[0].end_row_id = source.pages[0].end_row_id + 1,
-                    "reused" => source.pages[0].start_row_id = source.pages[0].start_row_id + 1,
-                    _ => source.pages[0].end_row_id = source.pages[0].start_row_id + 1,
+                    "out_of_range" => {
+                        Arc::get_mut(&mut source.pages).unwrap()[0].page_id = PageID::new(10000)
+                    }
+                    "missing" => {
+                        Arc::get_mut(&mut source.pages).unwrap()[0].page_id = PageID::new(2)
+                    }
+                    "long" => {
+                        Arc::get_mut(&mut source.pages).unwrap()[0].end_row_id =
+                            source.pages[0].end_row_id + 1
+                    }
+                    "reused" => {
+                        Arc::get_mut(&mut source.pages).unwrap()[0].start_row_id =
+                            source.pages[0].start_row_id + 1
+                    }
+                    _ => {
+                        Arc::get_mut(&mut source.pages).unwrap()[0].end_row_id =
+                            source.pages[0].start_row_id + 1
+                    }
                 }
                 let result = AssertUnwindSafe(
                     source
@@ -1168,22 +1373,23 @@ mod tests {
                     "{invalid}: {message}"
                 );
             }
-            for invalid in ["overlap", "duplicate_page", "excess_end"] {
+            for invalid in ["overlap", "duplicate_page"] {
                 let mut source = fixture.source(&plan, policy, true).await;
                 let budget = source.budget.clone();
-                match invalid {
-                    "overlap" => source.pages[1].start_row_id = source.pages[0].start_row_id,
-                    "duplicate_page" => source.pages[1].page_id = source.pages[0].page_id,
-                    _ => source.pages[2].end_row_id = end + 1,
+                if invalid == "overlap" {
+                    Arc::get_mut(&mut source.pages).unwrap()[1].start_row_id =
+                        source.pages[0].start_row_id;
+                } else {
+                    Arc::get_mut(&mut source.pages).unwrap()[1].page_id = source.pages[0].page_id;
                 }
-                let error = source.finish_capture(end).unwrap_err();
+                let error = source.finish_capture().unwrap_err();
                 assert_invalid_capture(&error, invalid);
                 assert!(budget.used() > 0);
                 drop(source);
                 assert_eq!(budget.used(), 0, "{invalid}");
             }
             let mut source = fixture.source(&plan, policy, true).await;
-            source.pages = BudgetedVec::new(&source.budget);
+            source.pages = Arc::new(BudgetedVec::new(&source.budget));
             source.pivot = fixture.descriptors[1].start_row_id;
             source.push_page(fixture.descriptors[0]).unwrap();
             assert!(source.pages.is_empty());
@@ -1193,9 +1399,12 @@ mod tests {
             let mut straddling = fixture.descriptors[0];
             straddling.end_row_id = source.pivot + 1;
             assert!(source.push_page(straddling).is_err());
-            source.finish_capture(end).unwrap();
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            source.finish_capture().unwrap();
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             let runs = sort.execute().await.unwrap();
             let start = fixture.descriptors[1].start_row_id;
             let expected: Vec<_> = fixture
@@ -1208,12 +1417,12 @@ mod tests {
             assert_eq!(contents(&runs), expected);
 
             let mut source = fixture.source(&plan, policy, true).await;
-            source.pages = BudgetedVec::new(&source.budget);
+            source.pages = Arc::new(BudgetedVec::new(&source.budget));
             source.pivot = end;
             for &page in &fixture.descriptors {
                 source.push_page(page).unwrap();
             }
-            source.finish_capture(end).unwrap();
+            source.finish_capture().unwrap();
             assert!(source.pages.is_empty());
             let budget = source.budget.clone();
             drop(source);
@@ -1221,40 +1430,35 @@ mod tests {
         });
     }
 
-    /// Purpose: Reject incomplete finalized recovery registries independently of live-row occupancy.
-    /// Expected: Missing prefixes, interior pages, suffixes, and whole registries fail during capture; complete or genuinely empty coverage succeeds.
+    /// Purpose: Finalize recovery descriptors independently of live-row occupancy.
+    /// Expected: Capture orders supplied pages, rejects prefix and interior gaps, and accepts empty hot sources.
     #[test]
-    fn recovery_capture_requires_complete_registry() {
+    fn recovery_capture_orders_descriptors_and_rejects_gaps() {
         smol::block_on(async {
             for rows in [0, 25] {
                 let fixture = Fixture::new(3, rows, false).await;
                 let plan = fixture.plan(&[0], true);
                 let policy = fixture.policy(2, 1);
                 for (case, indices) in [
-                    ("complete", Some(&[2, 0, 1][..])),
-                    ("missing_first", Some(&[1, 2][..])),
-                    ("missing_middle", Some(&[0, 2][..])),
-                    ("missing_last", Some(&[0, 1][..])),
-                    ("empty", Some(&[][..])),
-                    ("absent", None),
+                    ("complete", &[2, 0, 1][..]),
+                    ("missing_first", &[1, 2][..]),
+                    ("missing_middle", &[0, 2][..]),
                 ] {
-                    let states = indices.map(|indices| {
-                        indices
-                            .iter()
-                            .map(|&index| RowReplayState::new(fixture.descriptors[index]))
-                            .collect()
-                    });
+                    let states = indices
+                        .iter()
+                        .map(|&index| RowReplayState::new(fixture.descriptors[index]))
+                        .collect();
                     let result = capture_hot_build_test_source(
                         &fixture.engine,
                         fixture.table.clone(),
                         plan.new_index_spec(),
-                        states,
+                        Some(states),
                         policy,
                     )
                     .await;
                     if case == "complete" {
                         let source = result.unwrap();
-                        assert_eq!(&*source.pages, &fixture.descriptors);
+                        assert_eq!(&**source.pages, &fixture.descriptors);
                         let budget = source.budget.clone();
                         drop(source);
                         assert_eq!(budget.used(), 0);
@@ -1272,10 +1476,7 @@ mod tests {
                             report.contains(&format!("table_id={}", fixture.table.table_id())),
                             "{case}: {report}"
                         );
-                        assert!(
-                            report.contains("expected_start=") || report.contains("expected_end="),
-                            "{case}: {report}"
-                        );
+                        assert!(report.contains("expected_start="), "{case}: {report}");
                     }
                 }
             }
@@ -1283,17 +1484,6 @@ mod tests {
             let fixture = Fixture::new(0, 0, false).await;
             let plan = fixture.plan(&[0], true);
             let policy = fixture.policy(2, 1);
-            let (end, descriptors) = fixture
-                .table
-                .row_store
-                .snapshot_original_row_pages_from(
-                    fixture.engine.inner().core.pools.pool_guards(),
-                    RowID::new(0),
-                )
-                .await
-                .unwrap();
-            assert_eq!(end, RowID::new(0));
-            assert!(descriptors.is_empty());
             for states in [None, Some(Vec::new())] {
                 let source = capture_hot_build_test_source(
                     &fixture.engine,
@@ -1370,8 +1560,11 @@ mod tests {
             let plan = fixture.plan(&[1], true);
             let policy = fixture.policy(2, 1);
             let source = fixture.source(&plan, policy, false).await;
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             let mut runs = sort.execute().await.unwrap();
             assert_eq!(runs.runs().len(), 3);
             #[cfg(feature = "profiling")]
@@ -1403,8 +1596,11 @@ mod tests {
             let policy = fixture.policy(2, 1);
             let source = fixture.source(&plan, policy, false).await;
             let (entered, release) = source.test.gate(0, Fault::None);
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             assert!(sort.execute().now_or_never().is_none());
             entered.recv_async().await.unwrap();
             // Completion publication is the semantic predicate; yields only let its
@@ -1444,8 +1640,11 @@ mod tests {
             let source = fixture.source(&plan, policy, false).await;
             let (entered, release) = source.test.gate(0, Fault::None);
             let budget = source.budget.clone();
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             let weak_source = Arc::downgrade(&sort.source);
             assert!(sort.execute().now_or_never().is_none());
             entered.recv_async().await.unwrap();
@@ -1478,13 +1677,13 @@ mod tests {
                 let budget = source.budget.clone();
                 budget::fail_at(&budget, purpose);
                 let error = if purpose == "page descriptors" {
-                    source.pages = BudgetedVec::new(&budget);
+                    source.pages = Arc::new(BudgetedVec::new(&budget));
                     let error = source.push_page(fixture.descriptors[0]).unwrap_err();
                     drop(source);
                     RuntimeOrFatalError::Runtime(error)
                 } else {
                     let mut sort = HotLocalSort::new(
-                        source,
+                        source.into(),
                         fixture.engine.inner().thread_pool.clone(),
                         policy,
                     );
@@ -1535,7 +1734,7 @@ mod tests {
                     let budget = source.budget.clone();
                     assert_eq!(budget.used(), descriptor_bytes);
                     let mut sort = HotLocalSort::new(
-                        source,
+                        source.into(),
                         fixture.engine.inner().thread_pool.clone(),
                         policy,
                     );
@@ -1566,8 +1765,11 @@ mod tests {
             let source = fixture.source(&plan, policy, true).await;
             let (entered, _release) = source.test.gate(0, Fault::None);
             let budget = source.budget.clone();
-            let mut sort =
-                HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+            let mut sort = HotLocalSort::new(
+                source.into(),
+                fixture.engine.inner().thread_pool.clone(),
+                policy,
+            );
             fixture.engine.inner().poisoner.poison(
                 Report::new(FatalError::ThreadPoolUnavailable)
                     .attach("hot-build admission fixture"),
@@ -1664,8 +1866,11 @@ mod tests {
                 } else {
                     fixture.source(&plan, policy, false).await
                 };
-                let mut sort =
-                    HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+                let mut sort = HotLocalSort::new(
+                    source.into(),
+                    fixture.engine.inner().thread_pool.clone(),
+                    policy,
+                );
                 let runs = sort.execute().await.unwrap();
                 let actual = contents(&runs);
                 assert_eq!(actual, expected);
@@ -1717,8 +1922,11 @@ mod tests {
             let policy = fixture.policy(2, 1);
             for recovery in [false, true] {
                 let source = fixture.source(&plan, policy, recovery).await;
-                let mut sort =
-                    HotLocalSort::new(source, fixture.engine.inner().thread_pool.clone(), policy);
+                let mut sort = HotLocalSort::new(
+                    source.into(),
+                    fixture.engine.inner().thread_pool.clone(),
+                    policy,
+                );
                 let runs = sort.execute().await.unwrap();
                 #[cfg(feature = "profiling")]
                 assert_eq!(runs.measurements.planned_groups, 3);

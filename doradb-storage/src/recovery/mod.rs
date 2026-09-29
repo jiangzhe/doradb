@@ -14,6 +14,7 @@
 //! 2. DML-only transactions
 mod decode;
 mod dispatch;
+mod hot_index;
 mod packed;
 mod resources;
 mod row_state;
@@ -23,7 +24,6 @@ mod timeline;
 use self::dispatch::ReplayDispatcher;
 pub(crate) use self::dispatch::RowReplayCounts;
 use crate::buffer::guard::PageGuard;
-use crate::catalog::TableIndexMetadata;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
     classify_index_ddl_root,
@@ -34,13 +34,12 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::id::{PageID, RowID, TableID, TrxID};
-use crate::index::build::HotBuildSource;
 use crate::log::redo::{DDLRedo, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::FastHashSet;
 use crate::obs;
 use crate::recovery::stream::{PlannedRedoRecovery, RecoveryLogStream};
-use crate::stats::{RecoveryReport, recovery_add_count};
+use crate::stats::RecoveryReport;
 use crate::table::RowPageDescriptor;
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
@@ -220,9 +219,8 @@ impl<'a> RecoveryCoordinator<'a> {
             replayed_logs
         );
         self.report.phases.redo_replay_elapsed = started.elapsed();
-        let (metrics, saturated) = stream.recovery_metrics();
-        self.report.redo = metrics;
-        self.report.saturated |= saturated;
+        self.report.redo = stream.recovery_metrics();
+
         let started = Instant::now();
         let unsealed_terminals = stream.take_unsealed_terminals();
         // 2. Validate every final catalog satellite against catalog.tables.
@@ -444,11 +442,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     .insert(table.table_id);
             }
             self.timeline.seed_table_bounds(state);
-            recovery_add_count(
-                &mut self.report.work.checkpoint_user_tables,
-                1,
-                &mut self.report.saturated,
-            );
+            self.report.work.checkpoint_user_tables += 1;
         }
         Ok(())
     }
@@ -629,109 +623,24 @@ impl<'a> RecoveryCoordinator<'a> {
         } else {
             &mut self.report.work.user_row_ops_seen
         };
-        recovery_add_count(count, rows as u64, &mut self.report.saturated);
-    }
-
-    /// Consume one finalized replay registry after global drain and metadata reconciliation.
-    /// The bootstrap owner must retain this source/scope until accepted work settles.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "RFC 0032 phase 4 integrates the production caller"
-        )
-    )]
-    async fn capture_hot_index_build(
-        &mut self,
-        table: Arc<Table>,
-        spec: &TableIndexMetadata,
-    ) -> RuntimeOrFatalResult<HotBuildSource> {
-        use crate::index::build::{DuplicateCheck, HotBuildCapture};
-        self.dispatcher.drain_all().await?;
-        let policy = self.resources.hot_build_policy;
-        #[cfg(feature = "profiling")]
-        let started = Instant::now();
-        let layout = table.layout_snapshot();
-        let pivot = table.row_store.blk_idx().pivot_row_id();
-        // Read the reserved-row boundary independently of the replay registry;
-        // even an empty registry must account for every allocated hot page.
-        let end_row_id = table
-            .row_store
-            .visit_original_row_pages_from(&self.resources.pool_guards, pivot, |_| Ok(()))
-            .await
-            .attach_with(|| {
-                format!(
-                    "operation=hot_index_build, phase=capture_recovery_boundary, table_id={}, index={}",
-                    table.table_id(),
-                    spec.index
-                )
-            })?;
-        let mut source = HotBuildSource::new(
-            HotBuildCapture {
-                table: table.clone(),
-                layout,
-                guards: self.resources.pool_guards.clone(),
-                pivot,
-                ddl: None,
-                #[cfg(feature = "profiling")]
-                profiler: self.resources.hot_build_profiler.clone(),
-            },
-            spec,
-            MIN_SNAPSHOT_TS,
-            DuplicateCheck::Skip,
-            policy,
-        );
-        if let Some(pages) = self.dispatcher.page_history.remove(&table.table_id()) {
-            for replay in pages.into_values() {
-                source.push_page(replay.into_descriptor()).attach_with(|| format!("operation=hot_index_build, phase=capture_recovery_pages, table_id={}, index={}", table.table_id(), spec.index))?;
-            }
-        }
-        source.finish_capture(end_row_id).attach_with(|| {
-            format!(
-                "operation=hot_index_build, phase=validate_recovery_pages, table_id={}, index={}",
-                table.table_id(),
-                spec.index
-            )
-        })?;
-        #[cfg(feature = "profiling")]
-        {
-            source.capture_elapsed_nanos = started.elapsed().as_nanos() as u64;
-        }
-        Ok(source)
+        *count += rows as u64;
     }
 
     async fn rebuild_hot_indexes(&mut self) -> RuntimeOrFatalResult<()> {
-        // Checkpointed cold indexes already reside in DiskTree roots. Consume
-        // replay state before rebuilding hot indexes through ordinary row reads.
-        for (table_id, pages) in mem::take(&mut self.dispatcher.page_history) {
-            let table = self
-                .resources
-                .catalog
-                .get_table(table_id)
-                .ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-                        "rebuild hot indexes requires live runtime: table_id={table_id}"
-                    ))
-                })
-                .change_context(RuntimeError::Recovery)?;
-            for replay in pages.into_values() {
-                let page_id = replay.page_id();
-                drop(replay);
-                let (entries, saturated) = table
-                    .populate_index_via_row_page(&self.resources.pool_guards, page_id)
-                    .await?;
-                self.report.saturated |= saturated;
-                recovery_add_count(
-                    &mut self.report.work.index_rebuild_pages,
-                    1,
-                    &mut self.report.saturated,
-                );
-                recovery_add_count(
-                    &mut self.report.work.index_entries_inserted,
-                    entries,
-                    &mut self.report.saturated,
-                );
-            }
+        let tables = self.resources.catalog.snapshot_live_user_tables();
+        let histories = mem::take(&mut self.dispatcher.page_history);
+        let Some(worker) =
+            hot_index::RecoveryHotIndexWorker::start(&self.resources, tables, histories)?
+        else {
+            return Ok(());
+        };
+        let report = worker.wait().await?;
+        self.report.work.index_rebuild_pages += report.pages;
+        self.report.work.index_entries_inserted += report.entries;
+
+        #[cfg(feature = "profiling")]
+        {
+            self.report.hot_indexes = report.measurements;
         }
         Ok(())
     }
@@ -1133,11 +1042,7 @@ impl<'a> RecoveryCoordinator<'a> {
                 ))
                 .change_context(RuntimeError::Recovery).into());
         }
-        recovery_add_count(
-            &mut self.report.work.hot_pages_reconstructed,
-            1,
-            &mut self.report.saturated,
-        );
+        self.report.work.hot_pages_reconstructed += 1;
         page_guard.unwrap_vmap().set_create_cts(cts);
         self.dispatcher
             .page_history
@@ -1353,11 +1258,7 @@ impl<'a> RecoveryCoordinator<'a> {
                     unreachable!()
                 }
             }
-            recovery_add_count(
-                &mut self.report.work.catalog_row_ops_applied,
-                1,
-                &mut self.report.saturated,
-            );
+            self.report.work.catalog_row_ops_applied += 1;
         }
         Ok(())
     }
@@ -1394,11 +1295,7 @@ impl<'a> RecoveryCoordinator<'a> {
                         table.recover_cold_row_delete(row.row_id, cts)
                             .change_context(RuntimeError::Recovery)
                             .attach_with(|| format!("operation=recover_cold_row_delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id))?;
-                        recovery_add_count(
-                            &mut self.report.work.cold_deletes,
-                            1,
-                            &mut self.report.saturated,
-                        );
+                        self.report.work.cold_deletes += 1;
                         continue;
                     }
                     if cts < heap_redo_start_ts {
@@ -1492,6 +1389,7 @@ fn should_replay_heap_row(
 mod tests {
     use super::decode::{DecodedTable, DecodedTrxKind, decode_log};
     use super::dispatch::recycled_snapshot;
+    use super::hot_index::checked_rebuild;
     use super::{
         RecoveryCoordinator, invalid_user_table_keyed_redo, should_replay_heap_row,
         validate_create_table_reloaded_root_ts,
@@ -1511,6 +1409,7 @@ mod tests {
         EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig,
     };
     use crate::engine::Engine;
+    use crate::error::RecoveryDuplicateKey;
     use crate::error::RuntimeOrFatalError;
     use crate::error::{
         CompletionErrorBridge, DataIntegrityError, ErrorKind, InternalError, OperationError,
@@ -1570,6 +1469,59 @@ mod tests {
     enum CatalogCheckpointOrder {
         BeforeTable,
         AfterTable,
+    }
+
+    impl RecoveryCoordinator<'_> {
+        /// Consume one finalized replay registry after global drain and metadata reconciliation.
+        /// The bootstrap owner must retain this source/scope until accepted work settles.
+        async fn capture_hot_index_build(
+            &mut self,
+            table: Arc<Table>,
+            spec: &TableIndexMetadata,
+        ) -> RuntimeOrFatalResult<HotBuildSource> {
+            use crate::index::build::{DuplicateCheck, HotBuildCapture};
+            use error_stack::ResultExt;
+            #[cfg(feature = "profiling")]
+            use std::time::Instant;
+            self.dispatcher.drain_all().await?;
+            let policy = self.resources.hot_build_policy;
+            #[cfg(feature = "profiling")]
+            let started = Instant::now();
+            let layout = table.layout_snapshot();
+            let pivot = table.row_store.blk_idx().pivot_row_id();
+            let mut source = HotBuildSource::new(
+                HotBuildCapture {
+                    table: table.clone(),
+                    layout,
+                    guards: self.resources.pool_guards.clone(),
+                    pivot,
+                    ddl: None,
+                    #[cfg(feature = "profiling")]
+                    profiler: self.resources.hot_build_profiler.clone(),
+                },
+                spec,
+                MIN_SNAPSHOT_TS,
+                DuplicateCheck::Skip,
+                policy,
+            );
+            if let Some(pages) = self.dispatcher.page_history.remove(&table.table_id()) {
+                for replay in pages.into_values() {
+                    source.push_page(replay.into_descriptor()).attach_with(|| format!("operation=hot_index_build, phase=capture_recovery_pages, table_id={}, index={}", table.table_id(), spec.index))?;
+                }
+            }
+            source.finish_capture().attach_with(|| {
+                format!(
+                    "operation=hot_index_build, phase=validate_recovery_pages, table_id={}, index={}",
+                    table.table_id(),
+                    spec.index
+                )
+            })?;
+            #[cfg(feature = "profiling")]
+            {
+                source.capture_elapsed_nanos = started.elapsed().as_nanos() as u64;
+            }
+            Ok(source)
+        }
     }
 
     /// Exercise finalized-registry capture, including absent history, in component tests.
@@ -1632,7 +1584,6 @@ mod tests {
     }
 
     fn assert_report_accounting(report: &RecoveryReport) {
-        assert!(!report.saturated, "{report:?}");
         assert_eq!(
             report.bootstrap_elapsed,
             report.engine_setup_elapsed
@@ -1943,6 +1894,7 @@ mod tests {
             engine.inner().table_fs.clone(),
             engine.inner().thread_pool.clone(),
             engine.inner().core.catalog(),
+            engine.inner().poisoner.clone(),
         );
         let config = &engine.inner().trx_sys.config;
         let file_prefix = config.file_prefix().unwrap();
@@ -2947,6 +2899,7 @@ mod tests {
     /// Expected: Only live rows enter indexes, replay histories are consumed, and active version maps retain their identity.
     #[test]
     fn test_replay_rebuild_consumes_sidecars_and_retains_version_maps() {
+        use crate::index::build::tree_builder::assert_recovery_root;
         smol::block_on(async {
             for ids in [[30, 31, 32], [32, 31, 30]] {
                 let temp_dir = TempDir::new().unwrap();
@@ -2963,6 +2916,20 @@ mod tests {
                 .await;
                 let table = engine.inner().core.catalog().get_table(table_id).unwrap();
                 let mut recovery = row_recovery_for_table(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let mut roots = Vec::new();
+                for (_, index) in layout.active_secondary_indexes() {
+                    let tree = if index.is_unique() {
+                        index.unique_mem().unwrap().tree()
+                    } else {
+                        index.non_unique_mem().unwrap().tree()
+                    };
+                    let root = tree
+                        .check_empty_private_root(recovery.resources.pool_guards.index_guard())
+                        .await
+                        .unwrap();
+                    roots.push(root.page_id());
+                }
                 let mut maps = Vec::new();
                 for (n, id) in ids.into_iter().enumerate() {
                     let page_id = PageID::new(id);
@@ -3032,6 +2999,15 @@ mod tests {
                 assert_eq!(recovery.dispatcher.page_history[&table_id].len(), 3);
                 recovery.rebuild_hot_indexes().await.unwrap();
                 assert!(recovery.dispatcher.page_history.is_empty());
+                for root in roots {
+                    assert_recovery_root(
+                        &recovery.resources.pools.index,
+                        recovery.resources.pool_guards.index_guard(),
+                        root,
+                        2,
+                    )
+                    .await;
+                }
                 assert_eq!(recovery.report.work.hot_pages_reconstructed, 3);
                 assert_eq!(recovery.report.work.index_rebuild_pages, 3);
                 assert_eq!(recovery.report.work.index_entries_inserted, 4);
@@ -3479,7 +3455,15 @@ mod tests {
                     .unwrap();
                 }
             }
-            let err = recovery.rebuild_hot_indexes().await.unwrap_err();
+            let err = checked_rebuild(&mut recovery).await.unwrap_err();
+            let RuntimeOrFatalError::Runtime(report) = &err else {
+                panic!("{err:?}");
+            };
+            let conflict = report.downcast_ref::<RecoveryDuplicateKey>().unwrap();
+            assert_eq!(conflict.index_slot, 0);
+            assert!([RowID::new(0), RowID::new(70)].contains(&conflict.row_id));
+            assert!(!conflict.deleted);
+            assert!(format!("{report:?}").contains("conflicting_rows"));
             assert_replay_integrity(
                 err,
                 DataIntegrityError::UnexpectedRecoveryDuplicateKey,
@@ -3501,6 +3485,18 @@ mod tests {
                         end_row_id: RowID::new(70),
                     }),
                 );
+            let err = recovery.rebuild_hot_indexes().await.unwrap_err();
+            assert_replay_integrity(
+                err,
+                DataIntegrityError::InvalidRootInvariant,
+                "requires live runtime",
+            );
+            assert!(recovery.dispatcher.page_history.is_empty());
+            recovery
+                .dispatcher
+                .page_history
+                .entry(missing_table_id + 1)
+                .or_default();
             let err = recovery.rebuild_hot_indexes().await.unwrap_err();
             assert_replay_integrity(
                 err,
@@ -3567,7 +3563,7 @@ mod tests {
                 .await
                 .unwrap();
             recovery.report.finish_transaction(Duration::ZERO);
-            assert!(!recovery.report.saturated);
+
             assert_eq!(recovery.report.work.catalog_row_ops_seen, 2);
             assert_eq!(recovery.report.work.catalog_row_ops_skipped, 2);
             assert_eq!(recovery.report.work.user_row_ops_seen, 4);

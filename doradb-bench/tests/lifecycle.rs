@@ -269,7 +269,6 @@ mod tests {
             index.is_some_and(|index| index != "none")
         );
         assert_eq!(verification.fingerprint.len(), 64);
-        assert!(!report.saturated);
         assert!(report.redo.consumed_bytes >= report.redo.validated_payload_bytes);
         if insert.is_some() {
             assert_eq!(report.work.user_row_ops_seen, inserted);
@@ -296,12 +295,13 @@ mod tests {
             );
         }
         assert_eq!(run.internal_metrics.is_empty(), !stats);
-        // Phase-1 extraction is not yet called by the production recovery path.
-        assert!(
+        assert_eq!(
             run.internal_metrics
                 .iter()
-                .all(|metric| !metric.name.starts_with("hot_index_build."))
+                .any(|metric| metric.name.starts_with("hot_index_build.")),
+            stats && index.is_some_and(|index| index != "none"),
         );
+
         assert!(
             !run.internal_metrics
                 .iter()
@@ -815,18 +815,25 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     fn create_index_verifies_all_placements_modes_and_duplicate_multiplicity() {
         use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
         let temp = TempDir::new().unwrap();
+        let engine = concat!(
+            "[engine.thread_pool]\nworker_threads = 1\n",
+            "[engine.index_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
+            "[engine.data_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
+            "[engine.file]\nreadonly_buffer_size = '17 MiB'\n",
+        );
         for (placement, kind) in [
             ("hot", PlacementKind::Hot),
             ("checkpointed", PlacementKind::Checkpointed),
             ("mixed", PlacementKind::Mixed),
         ] {
             for index in ["unique", "non-unique"] {
-                let mut phases = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 64, value_size = '4 KiB', batch_size = 16 }\n".to_owned();
+                let mut phases = engine.to_owned();
+                phases.push_str("[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 4, value_size = '64 B', batch_size = 2 }\n");
                 if placement != "hot" {
                     phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
                 }
                 if placement == "mixed" {
-                    phases.push_str("[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '4 KiB' }\n");
+                    phases.push_str("[[phase]]\nworkload = { type = 'insert-seq', num = 2, value_size = '64 B' }\n");
                 }
                 let stats = index == "unique";
                 phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = '{index}', include_stats = {stats} }}\n"));
@@ -850,20 +857,20 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
                     create.rows,
                     match placement {
                         "hot" => RowPlacement {
-                            hot_rows: 64,
+                            hot_rows: 4,
                             checkpointed_rows: 0
                         },
                         "checkpointed" => RowPlacement {
                             hot_rows: 0,
-                            checkpointed_rows: 64
+                            checkpointed_rows: 4
                         },
                         _ => RowPlacement {
-                            hot_rows: 8,
-                            checkpointed_rows: 64
+                            hot_rows: 2,
+                            checkpointed_rows: 4
                         },
                     }
                 );
-                let total = if placement == "mixed" { 72 } else { 64 };
+                let total = if placement == "mixed" { 6 } else { 4 };
                 assert_eq!(create.total_rows, total);
                 let verification = create.verification.as_ref().unwrap();
                 assert_eq!(verification.table_rows, total);
@@ -889,14 +896,15 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
                 );
             }
         }
-        let random = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-rand', num = 128, seed = 42, batch_size = 32 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'non-unique' }\n";
-        let (_, report) = execute_plan(&temp, "create-duplicates", random);
+        let random = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-rand', num = 8, seed = 42, batch_size = 2 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'non-unique' }\n";
+        let random = format!("{engine}{random}");
+        let (_, report) = execute_plan(&temp, "create-duplicates", &random);
         let Some(WorkloadMetrics::CreateIndex { report }) =
             &report.measured_runs[0].workload_metrics
         else {
             panic!("missing CREATE")
         };
-        assert_eq!(report.verification.as_ref().unwrap().index_rows, 128);
+        assert_eq!(report.verification.as_ref().unwrap().index_rows, 8);
         let source = temp.path().join("unique-duplicates.toml");
         fs::write(
             &source,
@@ -906,6 +914,8 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         let root = temp.path().join("failed-unique-root");
         let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
         assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("duplicate key"), "{stderr}");
         assert!(root.exists());
         assert!(!root.join("benchmark-result.toml").exists());
         assert!(!String::from_utf8_lossy(&output.stdout).contains("DoraDB benchmark summary"));

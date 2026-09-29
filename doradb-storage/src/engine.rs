@@ -285,7 +285,8 @@ impl Engine {
     #[inline]
     pub async fn bootstrap(config: EngineConfig) -> Result<Self> {
         obs::info!("event=engine_lifecycle component=engine action=build_start result=ok");
-        let result = bootstrap_engine(config).await;
+        // Keep bootstrap diagnostics and component assembly off caller future stacks.
+        let result = Box::pin(bootstrap_engine(config)).await;
         result
             .inspect(|_| {
                 obs::info!("event=engine_lifecycle component=engine action=build_finish result=ok");

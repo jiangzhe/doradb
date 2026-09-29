@@ -1,6 +1,5 @@
 use crate::error::Result;
 use crate::measurement::{InternalMetric, InternalMetricKind, InternalMetricUnit};
-#[cfg(feature = "profiling")]
 use doradb_storage::profiling::HotIndexBuildStats;
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, LogicalLockStats,
@@ -14,7 +13,6 @@ pub(super) struct InternalStatsSnapshot {
     buffer: BufferPoolStats,
     mandatory: MandatoryRuntimeStats,
     logical_lock: LogicalLockStats,
-    #[cfg(feature = "profiling")]
     hot_index_build: HotIndexBuildStats,
 }
 
@@ -26,7 +24,6 @@ impl InternalStatsSnapshot {
             buffer: session.buffer_pool_stats()?,
             mandatory: session.mandatory_runtime_stats()?,
             logical_lock: session.logical_lock_stats()?,
-            #[cfg(feature = "profiling")]
             hot_index_build: session.hot_index_build_stats()?,
         })
     }
@@ -57,17 +54,15 @@ pub(crate) fn plan_internal_metrics(
             {
                 InternalMetricKind::EndGauge
             } else if metric.name.starts_with("logical_lock.peak_")
-                || (cfg!(feature = "profiling")
-                    && (metric.name.starts_with("hot_index_build.max_")
-                        || metric.name == "hot_index_build.scratch_peak_bytes"))
+                || metric.name.starts_with("hot_index_build.max_")
+                || metric.name == "hot_index_build.scratch_peak_bytes"
             {
                 InternalMetricKind::LifetimePeak
             } else {
                 InternalMetricKind::CounterDelta
             };
             let unit = if metric.name == "transaction.log_bytes"
-                || (cfg!(feature = "profiling")
-                    && metric.name == "hot_index_build.scratch_peak_bytes")
+                || metric.name == "hot_index_build.scratch_peak_bytes"
             {
                 InternalMetricUnit::Bytes
             } else if metric.name.ends_with("_nanos") {
@@ -105,12 +100,10 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
-    #[cfg(feature = "profiling")]
     push_hot_index_build_metrics(&mut metrics, before.hot_index_build, after.hot_index_build);
     metrics
 }
 
-#[cfg(feature = "profiling")]
 fn push_hot_index_build_metrics(
     metrics: &mut Vec<Metric>,
     before: HotIndexBuildStats,
@@ -517,16 +510,12 @@ fn delta_u64(after: u64, before: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "profiling")]
     use super::{InternalStatsSnapshot, cumulative_internal_metrics, plan_internal_metrics};
-    #[cfg(feature = "profiling")]
     use crate::measurement::{InternalMetricKind, InternalMetricUnit};
-    #[cfg(feature = "profiling")]
     use doradb_storage::profiling::HotIndexBuildStats;
 
     /// Purpose: Preserve hot-build delta, lifetime-peak, and fresh-engine metric semantics.
     /// Expected: Empty intervals emit no profile; counts/times subtract while maxima retain absolute values and correct units.
-    #[cfg(feature = "profiling")]
     #[test]
     fn hot_build_metrics_distinguish_deltas_and_peaks() {
         let empty = InternalStatsSnapshot::default();
