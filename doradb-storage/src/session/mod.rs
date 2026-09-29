@@ -239,6 +239,12 @@ impl AcceptedDdlScope {
         self.finish_state = DdlFinishState::TerminalReady;
     }
 
+    /// Return whether failed execution retained the operation and its logical locks.
+    #[inline]
+    pub(crate) fn is_failed_retained(&self) -> bool {
+        matches!(self.finish_state, DdlFinishState::FailedRetained)
+    }
+
     /// Publish normal completion or defensively retain an invalid finish state.
     #[inline]
     pub(crate) fn finish(&mut self) {
@@ -258,7 +264,7 @@ impl AcceptedDdlScope {
     }
 
     /// Retain unsafe nested ownership before the supervisor publishes poison.
-    #[inline]
+    #[cold]
     pub(crate) fn handle_panic(&mut self) {
         self.operation.fail_retained();
         self.finish_state = DdlFinishState::FailedRetained;
@@ -1502,12 +1508,14 @@ impl Session {
         Ok(session.runtime.mandatory_runtime.stats())
     }
 
-    /// Return engine-lifetime hot-index-build profiling for completed extractions.
+    /// Return engine-lifetime extraction and completed CREATE profiling.
     ///
-    /// Includes bootstrap samples retained by this engine. Counters and duration
-    /// sums support deltas; maxima are lifetime peaks. Failed extractions are not
-    /// sampled. Like other inspection APIs, this remains readable after poison
-    /// until shutdown, session close, or registry removal.
+    /// Extraction counters include bootstrap and builds whose later stages fail.
+    /// The separate `create` subsection records only installed, cleaned and
+    /// published indexes. Counters and duration sums support deltas; maxima and
+    /// settings are lifetime peaks. Failed extractions are not sampled. Like
+    /// other inspection APIs, this remains readable after poison until shutdown,
+    /// session close, or registry removal.
     #[cfg(feature = "profiling")]
     #[inline]
     pub fn hot_index_build_stats(&self) -> Result<HotIndexBuildStats> {

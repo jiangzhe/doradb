@@ -617,7 +617,6 @@ impl CreateIndexReport {
             .as_ref()
             .ok_or_else(|| BenchError::message("CREATE verification is incomplete"))?;
         if self.index == IndexMode::None
-            || self.total_rows == 0
             || self.placement != self.rows.kind()
             || verification.table_rows != self.total_rows
             || verification.index_rows != self.total_rows

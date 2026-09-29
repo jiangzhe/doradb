@@ -399,9 +399,11 @@ A create or drop failure is invocation-fatal.
 
 ### CREATE INDEX
 
-`create-index` builds and retains one index over a loaded, index-free table.
-It accepts required `index = "unique"` or `"non-unique"` and optional
-`include_stats`. It runs only as the final benchmark, with zero warm-ups, one
+`create-index` builds and retains one index. It can use a prepared, index-free
+table or prepare its own fixture.
+It accepts required `index = "unique"` or `"non-unique"`, optional `include_stats`,
+and `key = "key"` (default), `"payload"`, or `"composite"` (payload then numeric
+identity). It runs only as the final benchmark, with zero warm-ups, one
 measured run, and one thread/session. Worker defaults apply to preparation.
 
 ```toml
@@ -427,6 +429,22 @@ checkpoints are rejected. A prefix checkpoint leaves exact placement unknown;
 use `all = true` to prepare a checkpointed CREATE fixture. Random inserts into
 an index-free table may produce duplicate keys and make unique CREATE fail.
 
+An optional `fixture` prepares one table before measurement. It requires an
+otherwise empty plan and `tables = 1`; supported scenarios include empty input,
+existing indexes, repeated payloads, wide/composite keys, mixed hot/cold data,
+deletes and updates. See the [fixture settings](#varied-recovery-fixtures).
+For example:
+
+```toml
+[[phase]]
+kind = "benchmark"
+workload = { type = "create-index", index = "unique", key = "composite", include_stats = true, fixture = { tables = 1, rows = 100000, indexes = 1, index = "unique", value_bytes = 512, cardinality = 31, cold_rows = 90000, mutate_every = 7 } }
+```
+
+The table and existing indexes are verified before timing; the new index is
+verified afterward, including row content and multiplicity. A unique
+payload-only build requires distinct payloads.
+
 `create_elapsed_nanos` times the complete public CREATE call; preparation,
 profiler attachment, and full table/index verification are outside it.
 `process_cpu_nanos` measures all process threads. The summary derives rows per
@@ -439,6 +457,13 @@ RSS exclude content verification; CPU measurement remains enabled when
 statistics are disabled. Results also retain stable table/index IDs, exact row
 placement, and verification counts. Checkpointed placement does not imply cold
 OS/device caches, and sampled RSS does not measure temporary allocations alone.
+
+Statistics distinguish successful extraction from successful CREATE publication;
+a failed build can contribute extraction work without counting as a completed
+CREATE. Worker durations can overlap, so their sum may exceed elapsed time.
+Counter differences describe the measured interval, while peak values describe
+lifetime maxima. Cold preparation memory and hot construction memory are
+reported separately from process RSS.
 
 ### Maintenance controls and terminal policy
 

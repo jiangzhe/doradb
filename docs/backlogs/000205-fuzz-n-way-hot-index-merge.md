@@ -12,7 +12,7 @@ Add an opt-in fuzz-testing harness for the n-way merge path introduced by task 0
 - `doradb-storage/src/index/build/mod.rs`: retained sorted runs and encoded-key/group/position ordering; implemented phase-2 kernels are in `co_rank.rs`, `loser_tree.rs`, and `merge.rs` under the same module.
 - `Cargo.toml`, `doradb-storage/Cargo.toml`, and `docs/process/unit-test.md`: current workspace and normal test conventions.
 - Related [backlog 000112](000112-proptest-critical-storage-invariants.md) owns reusable property-test generators; [backlog 000204](000204-test-architecture-quality-auditing-and-reproducible-model-validation.md) owns broader reproducible model/fault validation. Coordinate generators, replay, and minimization with them.
-- [Backlog 000110](000110-unify-hot-row-mem-scan-index-build-recovery.md) tracks the parent hot-build program. The duplicate detector also returned [backlog 000104](000104-stream-parallel-create-index-cold-build.md); those items cover index construction rather than the requested fuzz harness.
+- [Backlog 000110](closed/000110-unify-hot-row-mem-scan-index-build-recovery.md) tracks the parent hot-build program. The duplicate detector also returned [backlog 000104](000104-stream-parallel-create-index-cold-build.md); those items cover index construction rather than the requested fuzz harness.
 
 ## Deferred From (Optional)
 

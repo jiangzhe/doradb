@@ -533,10 +533,6 @@ pub(crate) struct EngineCore {
     /// Immutable deterministic table-scan planning configuration.
     table_scan_config: TableScanConfig,
     /// Validated per-index extraction policy shared with bootstrap.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RFC 0032 phase 5 caller policy")
-    )]
     pub(crate) hot_build_policy: HotBuildPolicy,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,

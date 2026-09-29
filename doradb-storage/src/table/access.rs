@@ -32,11 +32,13 @@ use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::{LwcBlock, PersistedLwcBlock, PreparedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
 use crate::poison::PoisonAwareListener;
+#[cfg(test)]
+use crate::row::Row;
 use crate::row::ops::{
     LinkForUniqueIndex, ReadRow, RowMutation, ScanMvcc, SelectMvcc, TableMutationOutcome,
     UniqueMutation, UniqueMutationOutcome, UpdateCol,
 };
-use crate::row::{Row, RowPage, RowRead};
+use crate::row::{RowPage, RowRead};
 use crate::table::{
     ColdVisibilityOverride, ColumnDeletionBuffer, ColumnStorage, DeleteMarker, DeletionClaim,
     DeletionError, DeletionState, DmlValidator, RowPageDescriptor, RowStore, Table,
@@ -1184,6 +1186,7 @@ impl<'op> UserTableAccessor<'op> {
         self.row_store().table_id()
     }
 
+    #[cfg(test)]
     #[inline]
     async fn mem_scan_from<F>(
         &self,
@@ -1932,6 +1935,7 @@ impl<'op> UserTableAccessor<'op> {
     /// persisted column-store rows. Foreground logical reads must use
     /// `table_scan_mvcc_stream`, which binds cold and hot phases to one root
     /// snapshot.
+    #[cfg(test)]
     pub(crate) async fn mem_scan_uncommitted_from<F>(
         &self,
         guards: &PoolGuards,

@@ -54,9 +54,11 @@ pub struct HotBuildMeasurements {
 /// no overflow. They are monotonic and support before/after deltas.
 /// Maxima are lifetime high-water marks and must not be subtracted. Failed or
 /// cancelled builds publish no sample. A completed extraction is not a published
-/// index; later merge, validation, packing, and publication are outside this report.
+/// index; the separate `create` subsection covers completed CREATE publication.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HotIndexBuildStats {
+    /// Completed CREATE publications, separate from successful extraction.
+    pub create: CreateIndexMeasurements,
     /// Number of successful extraction samples published after child settlement.
     pub completed_builds: u64,
     /// Accumulated `source_pages` across completed builds.
@@ -94,6 +96,33 @@ pub struct HotIndexBuildStats {
     pub scratch_peak_bytes: u64,
 }
 
+/// Successful CREATE publications, with worker sums distinct from wall durations.
+/// Byte capacities, settings and longest intervals are engine-lifetime maxima.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateIndexMeasurements {
+    /// Shared installed-tree measurements; completed builds count published CREATEs.
+    pub hot: HotIndexMeasurements,
+    /// Total live cold entries in completed builds.
+    pub cold_entries: u64,
+    /// Largest retained cold vector capacity plus outlined keys; excludes allocator overhead.
+    pub retained_cold_bytes: u64,
+    /// Sum of cold collection wall durations.
+    pub cold_collect_nanos: u64,
+    /// Sum of cold sorting and cold/cold validation wall durations.
+    pub cold_sort_nanos: u64,
+    /// Sum of unpublished DiskTree construction wall durations.
+    pub cold_build_nanos: u64,
+    /// Cross-tier key comparisons including cold interval searches.
+    pub cold_hot_comparisons: u64,
+    /// Sum of cross-tier partition-boundary search and batch validation time.
+    pub cold_hot_worker_nanos: u64,
+    /// Longest cross-tier partition-boundary search or full batch validation interval.
+    pub max_cold_hot_sync_nanos: u64,
+    /// Sum of accepted CREATE wall durations through layout/history publication.
+    pub total_elapsed_nanos: u64,
+}
+
 /// Shared engine recorder; one short update per successful extraction.
 #[derive(Default)]
 pub(crate) struct HotIndexBuildProfiler(Mutex<HotIndexBuildStats>);
@@ -102,6 +131,31 @@ impl HotIndexBuildProfiler {
     /// Read a coherent snapshot without resetting counters or maxima.
     pub(crate) fn snapshot(&self) -> HotIndexBuildStats {
         *self.0.lock()
+    }
+
+    /// Record only after installation, cleanup and layout/history publication succeed.
+    pub(crate) fn record_create(
+        &self,
+        sample: &CreateIndexMeasurements,
+        extraction: HotBuildMeasurements,
+        merge: &HotMergeMeasurements,
+        packed: &HotPackedMeasurements,
+        cleanup_nanos: u64,
+    ) {
+        let mut stats = self.0.lock();
+        let create = &mut stats.create;
+        create.hot.record(extraction, merge, packed, cleanup_nanos);
+        create.cold_entries += sample.cold_entries;
+        create.retained_cold_bytes = create.retained_cold_bytes.max(sample.retained_cold_bytes);
+        create.cold_collect_nanos += sample.cold_collect_nanos;
+        create.cold_sort_nanos += sample.cold_sort_nanos;
+        create.cold_build_nanos += sample.cold_build_nanos;
+        create.cold_hot_comparisons += sample.cold_hot_comparisons;
+        create.cold_hot_worker_nanos += sample.cold_hot_worker_nanos;
+        create.max_cold_hot_sync_nanos = create
+            .max_cold_hot_sync_nanos
+            .max(sample.max_cold_hot_sync_nanos);
+        create.total_elapsed_nanos += sample.total_elapsed_nanos;
     }
 
     /// Publish once after all accepted children have completed successfully.
@@ -343,17 +397,18 @@ pub(crate) struct HotPackedMeasurements {
     pub(crate) scratch_peak_bytes: usize,
 }
 
-/// Recovery-only completed index measurements, distinct from extraction samples.
+/// Shared completed index measurements, distinct from extraction samples.
 /// Worker sums and overlapping stage spans are attribution within phase wall time.
 /// Extraction and merge counts, work, and wall spans add across indexes. Settings,
 /// byte capacities, longest intervals, and merge first-batch latency use maxima.
-/// Source capture is charged once per table here; selected extraction samples
-/// reuse captured descriptors and carry zero capture time.
+/// Recovery charges source capture once per table here; its selected extraction
+/// samples carry zero capture time. CREATE records capture in its extraction
+/// sample because it builds one newly selected index per operation.
 /// Occupancy includes temporary-root materialization, which installation reclaims.
 /// Counts and nanosecond duration sums assume no overflow.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RecoveryHotIndexMeasurements {
+pub struct HotIndexMeasurements {
     /// Accumulated extraction samples for installed indexes; settings and peaks use maxima.
     pub extraction: HotBuildMeasurements,
     /// Accumulated merge samples; limits and high-water values use maxima.
@@ -394,7 +449,7 @@ pub struct RecoveryHotIndexMeasurements {
     pub scratch_peak_bytes: u64,
 }
 
-impl RecoveryHotIndexMeasurements {
+impl HotIndexMeasurements {
     /// Accumulate one installed and cleaned index, assuming no arithmetic overflow.
     pub(crate) fn record(
         &mut self,
@@ -483,6 +538,9 @@ impl RecoveryHotIndexMeasurements {
         }
     }
 }
+
+/// Recovery's completed hot indexes, with table capture charged once per table.
+pub type RecoveryHotIndexMeasurements = HotIndexMeasurements;
 
 #[cfg(test)]
 mod tests {

@@ -24,6 +24,11 @@ pub(super) use tests::{
     recover as test_recover, remaining as test_remaining,
 };
 
+#[cfg(test)]
+pub(crate) use tests::{
+    Fault as BuildPageFault, Point as BuildPagePoint, gate as gate_build_pages,
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Decision {
     Pending,

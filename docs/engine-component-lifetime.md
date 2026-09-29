@@ -335,9 +335,9 @@ the synchronous `PreparedExecution::accept` edge. The bounded-poll audit found:
 
 - CREATE/DROP TABLE and DROP INDEX perform bounded state transitions around
   awaited storage, transaction, lifecycle, or publication boundaries.
-- CREATE INDEX hot-row collection and construction yield after their named
-  128-row batches; cold input proceeds through awaited storage batches. Its
-  larger bounded-memory/parallel redesign remains backlog 000104.
+- CREATE INDEX performs hot construction in bounded work units with cooperative
+  scheduling. The accepted operation retains table protection until its child
+  work and cleanup have settled.
 - freeze/checkpoint, catalog checkpoint, redo retention/truncation, and
   secondary `MemIndex` cleanup proceed through operation-specific awaited IO,
   retry, scan-batch, or transaction boundaries. Synchronous filesystem regions
@@ -346,9 +346,9 @@ the synchronous `PreparedExecution::accept` edge. The bounded-poll audit found:
   same row/index undo paths. Those paths explicitly yield after 128 completed
   undo entries, after the current entry is unlinked and popped and before the
   next entry is borrowed.
-- normal finish and panic preservation perform fixed ownership publication or
-  move residual payloads into fatal retention; they do not reacquire operation
-  authority or loop on scheduler state.
+- normal completion releases settled ownership. After a CREATE panic,
+  supervision completes safe cleanup and retains resources that cannot safely
+  be reclaimed. Cleanup uses the accepted operation's existing authority.
 
 These boundaries provide cooperative progress evidence for the fixed runtime;
 they do not establish preemption or a general starvation-free scheduler.

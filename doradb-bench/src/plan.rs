@@ -240,7 +240,7 @@ pub struct RecoveryConfig {
     pub fixture: Option<RecoveryFixture>,
 }
 
-/// Deterministic recovery-only fixture settings; preparation and verification are untimed.
+/// Shared deterministic index-build fixture; preparation and verification are untimed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryFixture {
@@ -413,10 +413,28 @@ pub struct UpdateSpec {
     pub include_stats: Option<bool>,
 }
 
+/// Physical columns selected by a CREATE acceptance workload.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CreateIndexKey {
+    /// Numeric logical key.
+    #[default]
+    Key,
+    /// Payload bytes, permitting skewed non-unique builds.
+    Payload,
+    /// Payload followed by numeric identity, permitting wide unique keys.
+    Composite,
+}
+
 /// Strict single-run CREATE INDEX controls.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexSpec {
+    /// Physical columns; defaults to the numeric logical key.
+    #[serde(default)]
+    pub key: CreateIndexKey,
+    /// Optional untimed fixture; requires an empty plan and exactly one table.
+    pub fixture: Option<RecoveryFixture>,
     /// Required secondary-index mode; none is rejected during resolution.
     pub index: IndexMode,
     /// Optional engine-statistics and process-RSS override.
@@ -427,7 +445,11 @@ pub struct CreateIndexSpec {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexConfig {
-    /// Secondary-index mode built over the logical-key column.
+    /// Physical columns selected for the new index.
+    pub key: CreateIndexKey,
+    /// Optional untimed shared index-build fixture.
+    pub fixture: Option<RecoveryFixture>,
+    /// Secondary-index uniqueness mode for the selected physical columns.
     pub index: IndexMode,
     /// Whether to capture engine statistics and sampled process RSS.
     pub include_stats: bool,
@@ -1044,6 +1066,9 @@ impl ResolvedWorkload {
     /// Return the fixture capability consumed by this workload.
     pub(crate) fn fixture_requirement(&self) -> FixtureRequirement {
         match self {
+            Self::CreateIndex(config) if config.fixture.is_some() => {
+                FixtureRequirement::AbsentPrimary
+            }
             Self::CreateIndex(_) => FixtureRequirement::CreateIndex,
             Self::Recovery(_) => FixtureRequirement::Recoverable,
             Self::CreateTable(_) => FixtureRequirement::AbsentPrimary,
@@ -1438,12 +1463,27 @@ fn resolve_workload(
                     "create-index requires unique or non-unique index",
                 ));
             }
+            if let Some(recipe) = spec.fixture {
+                recipe.validate()?;
+                if recipe.tables != 1 {
+                    return Err(BenchError::message(
+                        "CREATE fixture requires exactly one table",
+                    ));
+                }
+                fixture.validate(FixtureRequirement::AbsentPrimary)?;
+            }
             Ok((
                 ResolvedWorkload::CreateIndex(CreateIndexConfig {
                     index: spec.index,
+                    key: spec.key,
+                    fixture: spec.fixture,
                     include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
                 }),
-                FixturePlanEffect::CreateIndex { index: spec.index },
+                if spec.fixture.is_some() {
+                    FixturePlanEffect::None
+                } else {
+                    FixturePlanEffect::CreateIndex { index: spec.index }
+                },
             ))
         }
         WorkloadSpec::Recovery(spec) => {

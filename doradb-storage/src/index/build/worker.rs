@@ -1,5 +1,5 @@
 use super::{
-    BudgetedVec, DuplicateCheck, HotBuildSource, HotRunEntry, HotSortedRun, JobCompletion,
+    BudgetedVec, DuplicateCheck, HotBuildSource, HotSortedRun, IndexBuildEntry, JobCompletion,
     LocalDuplicates, MemoryReservation,
 };
 use crate::buffer::guard::PageGuard;
@@ -43,7 +43,7 @@ pub(super) fn submit(
 
 /// Collect first adjacent equality only when the invocation requires checking.
 pub(super) fn local_duplicates(
-    entries: &[HotRunEntry],
+    entries: &[IndexBuildEntry],
     policy: DuplicateCheck,
     stop: &AtomicBool,
 ) -> LocalDuplicates {
@@ -162,7 +162,7 @@ async fn extract_rows(
             let key = source.key.encoder.encode_with_len(&projection, len);
             run.entries
                 .push(
-                    HotRunEntry {
+                    IndexBuildEntry {
                         key,
                         row_id: row.row_id(),
                     },
