@@ -65,47 +65,44 @@ validation preserves Phase 5's contract; disk-backed validation remains 000104.
 
 ## Plan
 
-`IndexBuildEntry` replaces both `HotRunEntry` and the duplicate CREATE entry
-record without changing its key/RowID representation. Hot runs retain budgeted
-storage. Sorted, cold/cold-validated entries move without copying into
-`ColdUniqueKeys(Arc<Vec<IndexBuildEntry>>)`. Unique CREATE always supplies
-`ColdValidation::Required`, including an empty vector, and captured extraction
-selects `Collect`; non-unique CREATE and recovery supply `NotRequired`.
+CREATE reuses captured extraction, sorted runs, merge and packed construction.
+Hot and cold entries share `IndexBuildEntry`; hot scratch is budgeted, while
+sorted, distinct cold entries remain in a separate retained allocation. Unique
+CREATE supplies `ColdValidation::Required` even for empty cold input;
+non-unique CREATE and recovery supply `NotRequired`.
 
-Each partition derives an inclusive cold interval from completed co-rank hot
-endpoints. Equal-key cuts may overlap cold intervals without overlapping hot
-ranks. A retained cursor uses exponential/binary forward search to validate each
-bounded 32,768-entry batch synchronously before packing; the caller yields between
-batches. A local cold conflict stops comparisons and inhibits construction;
-merge consumption, coverage and hot/hot validation continue. No additional
-hot-key sequence or validation merge is materialized.
+Each hot partition validates against an inclusive cold-key interval. Adjacent
+intervals may overlap without duplicating hot coverage. A monotonic cursor
+validates each 32,768-entry batch synchronously before packing, with yields
+between batches. Its first conflict stops further cold comparisons and inhibits
+construction; merge consumption and hot/hot checking continue to completion.
 
-Cold summaries travel through `CompletedPartition` and bind the exact plan,
-cold owner, partition and consumed coverage. Hot/hot diagnostics take precedence
-over cold/hot, with earliest-rank selection within each origin. Execution and
-resource failures override duplicates, preserving Fatal precedence. Separate
-hot and cold completion authority gates parent assembly and `ReadyHotTree`.
+Cold completion evidence binds the exact plan, cold owner, partition and consumed
+range. Separate hot and cold evidence gates assembly and installation. Hot/hot
+diagnostics precede cold/hot, with earliest-rank selection within each origin;
+execution failures override duplicates and preserve Fatal precedence.
 
-`AcceptedCreateIndex` shares its metadata gate with captured sources and retains
-its logical locks and private transaction. Progress owns the empty runtime
-before capture, the pipeline before child admission, and the ready tree before
-later awaits. Only successful installation and cleanup permit runtime staging.
-Catalog commit, durable table-root publication and atomic layout/history
-publication retain their existing order.
+The accepted DDL operation retains the transaction, locks and metadata gates.
+Cold work borrows that protection; captured hot sources retain shared gate
+ownership through worker completion. Progress retains the private runtime,
+pipeline and ready tree across awaits. Installation and settlement precede
+catalog commit, durable table-root publication and atomic layout/history
+publication.
 
-Ordinary rejection aborts an uninstalled tree, drains stage ledgers and detached
-cleanup, destroys the private runtime and rolls back. Construction unwind parks
-raw-reference-sensitive transaction state and settles retained work before the
-failed-retained transition. Four hot states guard installation and settlement;
-runtime destruction consumes its owner. Supervision contains cleanup panic,
-preserves the original failure and never retries unsafe deallocation or traverses a
-possibly transferred runtime. Borrowed pipeline settlement remains resumable.
-Wait ownership and shutdown/poison behavior are documented in secondary-index.md.
+Ordinary failure drains work, destroys private state and rolls back. Construction
+unwind parks unsafe transaction ownership and settles safe work under mandatory
+supervision. Installation and reclamation attempts cannot be retried after an
+invariant panic; secondary cleanup failures preserve the original error. Borrowed
+pipeline settlement remains resumable. Shutdown and poison retain these cleanup
+obligations and the storage needed to finish them.
 
 ## Implementation Notes
 
-All 255 original comparisons verified complete content, multiplicity and fresh
-stable index identity. The latency and stage tables below retain their evidence.
+CREATE INDEX now shares recovery's parallel hot builder under retained DDL ownership.
+Cross-tier validation and existing publication guarantees are preserved.
+Independent CREATE measurements verified 255 comparisons; four-worker million-row
+medians were 29.188 ms unique and 28.536 ms non-unique, versus 205.255/234.702 ms
+for the original path. Final orchestration passed both backend test suites.
 
 ### Integration and review
 
@@ -119,6 +116,10 @@ stable index identity. The latency and stage tables below retain their evidence.
   versus not-required completion. Installation-panic tests inject after root
   copy, before ownership transfer. Reclamation panic follows a successful free
   and must not be retried. Ready-tree and DDL-scope decisions are not duplicated.
+- Final review separated cold construction, catalog commit and publication into
+  typed phases. Cold failure retains the private file through rollback; fatal
+  hot failure retains its distinct supervision policy. Existing failure hooks
+  and publication-only measurement boundaries were preserved.
 
 ### Measurement setup and reproducibility
 
@@ -140,16 +141,13 @@ The original path used the comparison base with the new harness backported.
 Sorted insertion adds encoded-key sorting before non-unique insertion. Original
 unique CREATE already sorts, so its sorted comparison uses the original binary.
 Bulk uses production construction. Temporary adapters/worktree were removed.
-The original matrix predates item/test cleanup, cleanup-state refactoring and
-synchronous batch validation; follow-up batch timing is recorded below.
-
-Commands: `rtk cargo build --release -p doradb-bench`, then
-`python3 target/000319-acceptance/run_matrix.py`. Individual saved binaries use
-`target/000319-acceptance/bin/bulk --root <fresh-root> --plan <plan.toml>`.
+The original matrix predates the final ownership, synchronous-validation and
+orchestration refactors; follow-up batch timing is recorded below.
 
 Local plans, result TOML, logs, binaries, adapter patch and runner remain under
-`target/000319-acceptance/`. `matrix.json` has all 255 samples; `summary.json`
-retains medians, ranges, CPU/RSS and engine metrics. Durable evidence follows.
+`target/000319-acceptance/`; `run_matrix.py` reproduces the comparison matrix.
+`matrix.json` has all 255 samples; `summary.json` retains medians, ranges, CPU/RSS
+and engine metrics. The tables below preserve evidence beyond those local files.
 
 ### Public CREATE latency
 
@@ -223,6 +221,7 @@ Dense, sparse and wide-composite cases used 65,536/524,288/262,144 cold rows,
 intervals were 0.590/1.935/0.613 ms; the largest observed interval was 2.191 ms.
 All contents verified. Reproduce with
 `python3 target/000319-validation-batches/run.py`; plans/results are alongside it.
+These timings predate the final annotation and orchestration-only refactors.
 
 | Bulk-4 fixture | Hot scratch MiB | Retained cold MiB | Final index frames, original → bulk | RSS peak above baseline MiB, original → bulk |
 | --- | ---: | ---: | ---: | ---: |
@@ -258,18 +257,19 @@ references but sacrifices parallelism. Worker scaling also changes the run cap.
 
 ### Validation
 
-- Workspace nextest: 2,186 passed. Storage libaio without defaults: 2,022 passed.
-  Original iouring without defaults/profiling: 2,020 passed. Both backend Clippy
-  commands passed with warnings denied; formatting and diff checks passed.
+- After the final orchestration refactor, workspace nextest passed 2,186 tests
+  and storage libaio without defaults/profiling passed 2,022. Strict Clippy
+  passed for both configurations; formatting and diff checks passed.
 - Cold-validation, conflict-precedence, observer-detachment and panic/cleanup tests
-  passed 50 stress iterations. Scheduling uses semantic gates, not elapsed time.
-- Branch style audit: 24 Rust files, 418 selected contracts, zero violations.
+  passed 50 stress iterations before that refactor. Scheduling uses semantic
+  gates, not elapsed time.
+- Resolve-time branch style audit: 24 Rust files, 418 selected contracts, zero violations.
   Semantic review covered changed assertions and related component/caller oracles;
   intentional overlap preserves coverage, lifecycle and feature distinctions.
 - Focused production coverage: 94.19% combined; catalog index 83.31%, shared
   builder 97.48%, cold validation 98.34%, profiling and benchmark output 100%,
-  CREATE benchmark 93.85%, shared fixture 91.67%. Coverage predates the four-state
-  cleanup and synchronous-validation refactors. Reports are in
+  CREATE benchmark 93.85%, shared fixture 91.67%. Coverage predates the final
+  ownership, synchronous-validation and orchestration refactors. Reports are in
   `target/000319-acceptance/coverage.md` and `target/coverage/`.
 
 ## Impacts
@@ -293,7 +293,8 @@ Existing cancellation/resumption component tests remain independent.
 
 ## Open Questions
 
-No blocker remains. Cold streaming/bounded validation stays in backlog 000104;
-broader packed-tree fuzzing stays in 000205. Small-input policy and worker/page
-tuning need separate evidence. Backlog 000110 closes on both caller integrations
-and their independent acceptance; RFC 0032 resolution remains separate.
+Cold streaming and bounded validation remain in
+[backlog 000104](../backlogs/000104-stream-parallel-create-index-cold-build.md),
+including hybrid lookup direction and cursor selection based on implementation
+and benchmark evidence. N-way merge fuzzing remains the independent
+[backlog 000205](../backlogs/000205-fuzz-n-way-hot-index-merge.md) follow-up.

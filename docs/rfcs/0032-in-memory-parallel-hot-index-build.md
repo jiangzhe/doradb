@@ -975,8 +975,10 @@ after both callers deliver the full pipeline and performance acceptance.
   - Phase-local Choices: `IndexBuildEntry` is shared by budgeted hot runs and
     the retained cold vector. Unique CREATE always supplies `ColdValidation::Required`
     and checked extraction. Inclusive co-rank endpoints bound each partition's
-    monotonic cold cursor; checks precede packing each batch. Summaries bind the
-    cold owner, plan, partition and coverage. Hot/hot diagnostics precede cold/hot;
+    monotonic cold cursor. Each batch is checked synchronously before packing,
+    with yields between batches. A local conflict stops further cold comparisons;
+    hot merge consumption and checking still complete. Summaries bind the cold
+    owner, plan, partition and coverage. Hot/hot diagnostics precede cold/hot;
     native execution failures retain precedence. Ready trees retain separate hot
     and cold completion authority.
     Accepted DDL progress retains the private runtime, shared metadata gate,
@@ -989,20 +991,24 @@ after both callers deliver the full pipeline and performance acceptance.
     direct-run and empty cases, late conflicts after allocation, deterministic
     duplicate precedence, publication failures, current hot/cold mutations,
     observer detachment, partial root-transfer panic and failed cleanup are
-    covered. Default workspace, libaio and profiling-disabled iouring suites
-    pass. Independent CREATE acceptance comprises 255 verified public calls,
+    covered. Final workspace and profiling-disabled libaio suites pass, along
+    with strict Clippy and the branch style gate. Earlier CREATE measurements
+    comprise 255 verified public calls,
     original/sorted/bulk paths, worker and page-target sweeps, tiny/large input,
     wide/composite and skewed keys, existing indexes, mutations and cold-heavy
     fixtures. Four-worker million-row medians are 29.188 ms unique and 28.536 ms
     non-unique, versus 205.255/234.702 ms original. Cold-dominated and tiny-input
     limitations, worker sums, memory and I/O are retained in task 000319.
+    The task distinguishes the original matrix and synchronous-validation
+    follow-up from final orchestration validation.
   - After This Phase: Both production callers use the shared builder and have
     independent acceptance evidence. No following phase remains. Cold streaming
-    stays in backlog 000104; full RFC resolution is a separate operation.
+    and bounded hybrid cross-tier validation stay in backlog 000104; n-way merge
+    fuzzing stays in 000205. Full RFC resolution is a separate operation.
   - Task Doc: `docs/tasks/000319-create-index-hot-build-integration.md`
   - Task Issue: `#1122`
   - Phase Status: done
-  - Implementation Summary: CREATE INDEX now uses the shared hot pipeline under retained accepted-DDL ownership, with inclusive partition-local cold checking, separate completion evidence, deterministic typed duplicate diagnostics and Fatal-preserving settlement. Publication-only CREATE metrics and shared untimed benchmark fixtures support 255 verified comparisons: million-row unique/non-unique medians fell from 205.255/234.702 ms to 29.188/28.536 ms at four workers. Workspace and both backend/feature suites, stress validation and the branch style gate passed. Backlog 000110 is complete; cold-build scope remains 000104 and full RFC resolution remains separate. [Task Resolve Sync: docs/tasks/000319-create-index-hot-build-integration.md @ 2026-09-29]
+  - Implementation Summary: CREATE INDEX now shares recovery's parallel hot builder under retained DDL ownership. [Task Resolve Sync: docs/tasks/000319-create-index-hot-build-integration.md @ 2026-09-29]
 
 ## Consequences
 
