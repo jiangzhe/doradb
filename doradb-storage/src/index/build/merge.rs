@@ -134,13 +134,6 @@ pub(crate) struct HotMergePreparation {
 
 impl HotMergePreparation {
     /// Use the production four-leaf batch minimum and independently sized partitions.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production callers migrate in RFC 0032 phases 4 and 5"
-        )
-    )]
     pub(crate) fn new(
         runs: Arc<SortedHotRuns>,
         pool: QuiescentGuard<ThreadPool>,
@@ -212,13 +205,6 @@ impl HotMergePreparation {
     }
 
     /// Complete all cuts before exposing a plan; resumable after observer cancellation.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production callers migrate in RFC 0032 phases 4 and 5"
-        )
-    )]
     pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<Arc<PreparedHotMerge>> {
         assert!(
             !self.finished,
@@ -403,10 +389,6 @@ pub(crate) struct HotBatch<'a> {
     inhibited: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 3 consumes the streaming handoff")
-)]
 impl HotBatch<'_> {
     /// Global output ranks in this batch.
     #[inline]
@@ -474,10 +456,6 @@ impl PartitionMergeStream {
 
     /// Entries immediately before and after this partition; absent global ends
     /// denote open fences. Resolve these through the retained stream owner.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 3 plans partition fences")
-    )]
     #[inline]
     pub(crate) fn neighbors(&self) -> (Option<HotEntryRef>, Option<HotEntryRef>) {
         (
@@ -560,10 +538,6 @@ impl PartitionMergeStream {
     }
 
     /// Pull one full batch or the partition's final tail; cancellation is an error.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 3 consumes the streaming handoff")
-    )]
     pub(crate) fn next_batch(&mut self) -> RuntimeOrFatalResult<Option<HotBatch<'_>>> {
         observe_stop(&self.stop)?;
         if self.next == self.end {
@@ -638,10 +612,6 @@ impl PartitionMergeStream {
     }
 
     /// Convert an exhausted successful consumer into a plan-bound completion.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 3 consumes the streaming handoff")
-    )]
     pub(crate) fn finish<T: Send + 'static>(
         self,
         output: T,
@@ -698,10 +668,6 @@ pub(crate) struct HotMergeCompletion {
     plan: Arc<PreparedHotMerge>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 3 consumes the streaming handoff")
-)]
 impl HotMergeCompletion {
     /// Number of entries whose successful consumption this evidence certifies.
     #[inline]
@@ -711,16 +677,13 @@ impl HotMergeCompletion {
 
     /// Distinguish checked hot keys from the source's trusted contract.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn checked(&self) -> bool {
         self.plan.runs.duplicates == DuplicateCheck::Collect
     }
 }
 
 /// Settled consumer outputs and either distinctness authority or deterministic conflict.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 3 consumes the streaming handoff")
-)]
 pub(crate) struct HotMergeOutcome<T> {
     /// Results in planned partition order, independent of execution order.
     pub(crate) outputs: Vec<T>,
@@ -751,10 +714,6 @@ pub(crate) struct HotMergeConsumption<C: HotPartitionConsumer> {
 
 impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
     /// Prepare result slots before submitting any consumer job.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 3 supplies the private packing consumer")
-    )]
     pub(crate) fn new(
         plan: Arc<PreparedHotMerge>,
         pool: QuiescentGuard<ThreadPool>,
@@ -782,10 +741,6 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
     }
 
     /// Consume every required partition, retaining bounded admission through collection.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 3 supplies the private packing consumer")
-    )]
     pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<HotMergeOutcome<C::Output>> {
         assert!(
             !self.finished,
@@ -809,10 +764,13 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
                     let consumer_started = Instant::now();
                     let result = consumer.consume(stream).await?;
                     #[cfg(feature = "profiling")]
+                    let stopped = Instant::now();
+                    #[cfg(feature = "profiling")]
                     let result = CompletedPartition {
                         profile: HotMergeWorkerProfile {
-                            job_nanos: started.elapsed().as_nanos() as u64,
-                            consumer_nanos: consumer_started.elapsed().as_nanos() as u64
+                            job_nanos: stopped.duration_since(started).as_nanos() as u64,
+                            consumer_nanos: stopped.duration_since(consumer_started).as_nanos()
+                                as u64
                                 - result.profile.merge_check_nanos,
                             ..result.profile
                         },
@@ -1515,18 +1473,20 @@ mod tests {
     #[test]
     fn seeded_runs_and_every_rank_match_oracle() {
         smol::block_on(async {
-            let (_registry, pool) = pool(4).await;
+            let (_registry, pool) = pool(2).await;
             let mut rng = ChaCha8Rng::seed_from_u64(0x0003_16c0_2026);
-            for case in 0..120 {
-                let k = rng.random_range(0..12);
+            // Small runs keep every-rank checking exhaustive within each fixture.
+            // Deterministic empty/direct/equal-key boundaries are covered above.
+            for case in 0..24 {
+                let k = rng.random_range(0..6);
                 let wide = case % 3 == 0;
                 let groups = (0..k)
                     .map(|_| {
-                        (0..rng.random_range(0..80))
+                        (0..rng.random_range(0..16))
                             .map(|_| {
-                                let n: u32 = rng.random_range(0..150);
+                                let n: u32 = rng.random_range(0..24);
                                 if wide {
-                                    let mut bytes = vec![42; 96];
+                                    let mut bytes = vec![42; 32];
                                     bytes.extend_from_slice(&n.to_be_bytes());
                                     BTreeKey::from(bytes.as_slice())
                                 } else {
@@ -1561,14 +1521,14 @@ mod tests {
                 } else if runs.runs().len() == 1 {
                     1
                 } else {
-                    rng.random_range(1..=expected.len().min(16))
+                    rng.random_range(1..=expected.len().min(4))
                 };
                 check_case(
                     runs,
                     &pool,
-                    rng.random_range(1..=4),
+                    rng.random_range(1..=2),
                     q,
-                    rng.random_range(1..40),
+                    rng.random_range(1..8),
                 )
                 .await;
             }

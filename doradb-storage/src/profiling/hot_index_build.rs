@@ -1,11 +1,13 @@
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 /// Stage measurements; worker durations are sums, not stage wall durations.
 ///
 /// Counts, byte sizes, and nanosecond timings use `u64`; overflow is assumed
 /// impossible for supported workloads.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HotBuildMeasurements {
     /// Wall duration of source and descriptor capture.
     pub capture_elapsed_nanos: u64,
@@ -233,7 +235,8 @@ impl HotBuildProfile {
 /// One fully consumed hot merge, independent of extraction and publication stats.
 /// Worker sums include cooperative scheduling; batch durations cover only fused
 /// synchronous merge/check work. Consumer work outside pulls is reported separately.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HotMergeMeasurements {
     /// Total input entries.
     pub entries: u64,
@@ -305,16 +308,8 @@ pub(crate) struct HotMergeWorkerProfile {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HotPackedLevel {
     /// Height of the constructed pages.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 4/5 callers consume component measurements")
-    )]
     pub(crate) height: u16,
     /// Detached pages materialized at this level (including the temporary root).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "phase 4/5 callers consume component measurements")
-    )]
     pub(crate) pages: usize,
     /// Sum of effective bytes, including page headers and excluding integrity trailers.
     pub(crate) occupied_bytes: usize,
@@ -348,12 +343,223 @@ pub(crate) struct HotPackedMeasurements {
     pub(crate) scratch_peak_bytes: usize,
 }
 
+/// Recovery-only completed index measurements, distinct from extraction samples.
+/// Worker sums and overlapping stage spans are attribution within phase wall time.
+/// Extraction and merge counts, work, and wall spans add across indexes. Settings,
+/// byte capacities, longest intervals, and merge first-batch latency use maxima.
+/// Source capture is charged once per table here; selected extraction samples
+/// reuse captured descriptors and carry zero capture time.
+/// Occupancy includes temporary-root materialization, which installation reclaims.
+/// Counts and nanosecond duration sums assume no overflow.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryHotIndexMeasurements {
+    /// Accumulated extraction samples for installed indexes; settings and peaks use maxima.
+    pub extraction: HotBuildMeasurements,
+    /// Accumulated merge samples; limits and high-water values use maxima.
+    pub merge: HotMergeMeasurements,
+    /// Indexes installed and cleaned successfully.
+    pub completed_builds: u64,
+    /// Source finalization wall time, counted once per table including index-free tables.
+    pub capture_elapsed_nanos: u64,
+    /// Detached leaf pages materialized, including a temporary leaf root.
+    pub leaf_pages: u64,
+    /// Detached branch pages materialized, including the temporary branch root.
+    pub branch_pages: u64,
+    /// Effective occupied leaf bytes including headers.
+    pub leaf_occupied_bytes: u64,
+    /// Effective occupied branch bytes including headers.
+    pub branch_occupied_bytes: u64,
+    /// Sum of page allocation work and waits.
+    pub allocation_nanos: u64,
+    /// Sum of leaf and branch append packing work.
+    pub packing_nanos: u64,
+    /// Sum of leaf planning work.
+    pub leaf_planning_nanos: u64,
+    /// Sum of parent planning wall spans including yields.
+    pub parent_planning_nanos: u64,
+    /// Sum of direct-parent construction wall spans.
+    pub direct_parent_nanos: u64,
+    /// Sum of upper-level construction wall spans.
+    pub serial_upper_nanos: u64,
+    /// Sum of fixed-root installation wall time.
+    pub install_nanos: u64,
+    /// Sum of terminal cleanup wall time.
+    pub cleanup_nanos: u64,
+    /// Longest uninterrupted construction planning or packing interval.
+    pub max_sync_nanos: u64,
+    /// Longest construction worker including waits.
+    pub max_job_nanos: u64,
+    /// Maximum shared scratch admission across completed indexes; excludes pool pages.
+    pub scratch_peak_bytes: u64,
+}
+
+impl RecoveryHotIndexMeasurements {
+    /// Accumulate one installed and cleaned index, assuming no arithmetic overflow.
+    pub(crate) fn record(
+        &mut self,
+        extraction: HotBuildMeasurements,
+        merge: &HotMergeMeasurements,
+        packed: &HotPackedMeasurements,
+        cleanup_nanos: u64,
+    ) {
+        self.completed_builds += 1;
+        self.cleanup_nanos += cleanup_nanos;
+        self.extraction.capture_elapsed_nanos += extraction.capture_elapsed_nanos;
+        self.extraction.extraction_worker_time_nanos += extraction.extraction_worker_time_nanos;
+        self.extraction.sort_worker_time_nanos += extraction.sort_worker_time_nanos;
+        self.extraction.duplicate_worker_time_nanos += extraction.duplicate_worker_time_nanos;
+        self.extraction.max_job_elapsed_nanos = self
+            .extraction
+            .max_job_elapsed_nanos
+            .max(extraction.max_job_elapsed_nanos);
+        self.extraction.max_sort_elapsed_nanos = self
+            .extraction
+            .max_sort_elapsed_nanos
+            .max(extraction.max_sort_elapsed_nanos);
+        self.extraction.extraction_wall_elapsed_nanos += extraction.extraction_wall_elapsed_nanos;
+        self.extraction.sort_wall_elapsed_nanos += extraction.sort_wall_elapsed_nanos;
+        self.extraction.duplicate_wall_elapsed_nanos += extraction.duplicate_wall_elapsed_nanos;
+        self.extraction.pipeline_wall_elapsed_nanos += extraction.pipeline_wall_elapsed_nanos;
+        self.extraction.total_elapsed_nanos += extraction.total_elapsed_nanos;
+        self.extraction.scratch_peak_bytes = self
+            .extraction
+            .scratch_peak_bytes
+            .max(extraction.scratch_peak_bytes);
+        self.extraction.source_pages += extraction.source_pages;
+        self.extraction.entries += extraction.entries;
+        self.extraction.workers = self.extraction.workers.max(extraction.workers);
+        self.extraction.page_target = self.extraction.page_target.max(extraction.page_target);
+        self.extraction.planned_groups += extraction.planned_groups;
+        self.extraction.nonempty_runs += extraction.nonempty_runs;
+        self.merge.entries += merge.entries;
+        self.merge.runs += merge.runs;
+        self.merge.workers = self.merge.workers.max(merge.workers);
+        self.merge.partitions += merge.partitions;
+        self.merge.batch_entries = self.merge.batch_entries.max(merge.batch_entries);
+        self.merge.boundary_wall_nanos += merge.boundary_wall_nanos;
+        self.merge.cut_worker_nanos += merge.cut_worker_nanos;
+        self.merge.max_cut_nanos = self.merge.max_cut_nanos.max(merge.max_cut_nanos);
+        self.merge.consumption_wall_nanos += merge.consumption_wall_nanos;
+        self.merge.first_batch_nanos = self.merge.first_batch_nanos.max(merge.first_batch_nanos);
+        self.merge.merge_check_nanos += merge.merge_check_nanos;
+        self.merge.max_batch_nanos = self.merge.max_batch_nanos.max(merge.max_batch_nanos);
+        self.merge.max_job_nanos = self.merge.max_job_nanos.max(merge.max_job_nanos);
+        self.merge.job_worker_nanos += merge.job_worker_nanos;
+        self.merge.consumer_worker_nanos += merge.consumer_worker_nanos;
+        self.merge.duplicate_comparisons += merge.duplicate_comparisons;
+        self.merge.boundary_bytes = self.merge.boundary_bytes.max(merge.boundary_bytes);
+        self.merge.max_reference_bytes = self
+            .merge
+            .max_reference_bytes
+            .max(merge.max_reference_bytes);
+        self.merge.active_reference_bytes = self
+            .merge
+            .active_reference_bytes
+            .max(merge.active_reference_bytes);
+        self.merge.validation_bytes = self.merge.validation_bytes.max(merge.validation_bytes);
+        self.merge.scratch_peak_bytes = self.merge.scratch_peak_bytes.max(merge.scratch_peak_bytes);
+        self.merge.checked |= merge.checked;
+        self.leaf_planning_nanos += packed.leaf_planning_nanos;
+        self.parent_planning_nanos += packed.parent_planning_nanos;
+        self.direct_parent_nanos += packed.direct_parent_nanos;
+        self.serial_upper_nanos += packed.serial_upper_nanos;
+        self.install_nanos += packed.install_nanos;
+        self.max_sync_nanos = self.max_sync_nanos.max(packed.max_sync_nanos);
+        self.max_job_nanos = self.max_job_nanos.max(packed.max_job_nanos);
+        self.scratch_peak_bytes = self
+            .scratch_peak_bytes
+            .max(packed.scratch_peak_bytes as u64);
+        for level in &packed.levels {
+            if level.height == 0 {
+                self.leaf_pages += level.pages as u64;
+                self.leaf_occupied_bytes += level.occupied_bytes as u64;
+            } else {
+                self.branch_pages += level.pages as u64;
+                self.branch_occupied_bytes += level.occupied_bytes as u64;
+            }
+            self.allocation_nanos += level.allocation_nanos;
+            self.packing_nanos += level.packing_nanos;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HotBuildMeasurements, HotBuildProfile, HotBuildWorkerProfile, HotIndexBuildProfiler,
     };
     use std::time::{Duration, Instant};
+
+    /// Purpose: Distinguish accumulated recovery installation work from per-build maxima.
+    /// Expected: Counts and stage work add, peaks take maxima, and temporary-root occupancy is counted by height.
+    #[test]
+    fn recovery_aggregate_adds_work_and_preserves_peaks() {
+        use super::{
+            HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements,
+            RecoveryHotIndexMeasurements,
+        };
+        let mut stats = RecoveryHotIndexMeasurements::default();
+        for peak in [4096, 2048] {
+            stats.record(
+                HotBuildMeasurements {
+                    entries: 7,
+                    max_sort_elapsed_nanos: peak,
+                    ..Default::default()
+                },
+                &HotMergeMeasurements {
+                    partitions: 2,
+                    max_job_nanos: peak,
+                    ..Default::default()
+                },
+                &HotPackedMeasurements {
+                    levels: vec![
+                        HotPackedLevel {
+                            height: 0,
+                            pages: 2,
+                            occupied_bytes: 100,
+                            ..Default::default()
+                        },
+                        HotPackedLevel {
+                            height: 1,
+                            pages: 1,
+                            occupied_bytes: 30,
+                            ..Default::default()
+                        },
+                    ],
+                    scratch_peak_bytes: peak as usize,
+                    ..Default::default()
+                },
+                5,
+            );
+        }
+        assert_eq!(stats.completed_builds, 2);
+        assert_eq!(
+            (
+                stats.extraction.entries,
+                stats.merge.partitions,
+                stats.cleanup_nanos
+            ),
+            (14, 4, 10)
+        );
+        assert_eq!(
+            (
+                stats.extraction.max_sort_elapsed_nanos,
+                stats.merge.max_job_nanos,
+                stats.scratch_peak_bytes
+            ),
+            (4096, 4096, 4096)
+        );
+        assert_eq!(
+            (
+                stats.leaf_pages,
+                stats.branch_pages,
+                stats.leaf_occupied_bytes,
+                stats.branch_occupied_bytes
+            ),
+            (4, 2, 200, 60)
+        );
+    }
 
     /// Purpose: Aggregate overlapping stage intervals without inventing work for skipped checks.
     /// Expected: Worker durations add, wall spans cover their endpoints, maxima select the longest job, and skipped checking stays zero.

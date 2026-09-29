@@ -1,5 +1,7 @@
 //! Public storage-engine runtime statistics.
 
+#[cfg(feature = "profiling")]
+use crate::profiling::RecoveryHotIndexMeasurements;
 use std::time::Duration;
 
 use crate::file::fs::StorageServiceStats as InternalStorageServiceStats;
@@ -263,95 +265,47 @@ pub struct RecoveryReport {
     pub work: RecoveryWorkCounts,
     /// Consumer-side redo stream attribution.
     pub redo: RecoveryRedoMetrics,
-    /// At least one diagnostic overflow or invalid subtraction occurred.
-    pub saturated: bool,
+    /// Successfully installed hot indexes, with overlapping stage attribution.
+    #[cfg(feature = "profiling")]
+    pub hot_indexes: RecoveryHotIndexMeasurements,
 }
 
 impl RecoveryReport {
-    /// Completes derived intervals and counts without changing recovery success.
+    /// Completes derived intervals and counts from disjoint recovery measurements.
     pub(crate) fn finish_transaction(&mut self, elapsed: Duration) {
         self.transaction_bootstrap_elapsed = elapsed;
-        let mut accounted = Duration::ZERO;
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.preparation_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.user_table_bootstrap_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.redo_planning_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.redo_replay_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.validation_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.absent_file_cleanup_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.hot_index_rebuild_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.redo_repair_planning_elapsed,
-            &mut self.saturated,
-        );
-        recovery_add_duration(
-            &mut accounted,
-            self.phases.redo_finalize_elapsed,
-            &mut self.saturated,
-        );
-        self.phases.other_elapsed = recovery_sub_duration(elapsed, accounted, &mut self.saturated);
+        let phases = &mut self.phases;
+        let accounted = phases.preparation_elapsed
+            + phases.user_table_bootstrap_elapsed
+            + phases.redo_planning_elapsed
+            + phases.redo_replay_elapsed
+            + phases.validation_elapsed
+            + phases.absent_file_cleanup_elapsed
+            + phases.hot_index_rebuild_elapsed
+            + phases.redo_repair_planning_elapsed
+            + phases.redo_finalize_elapsed;
+        // Phase measurements are disjoint intervals inside transaction bootstrap.
+        phases.other_elapsed = elapsed
+            .checked_sub(accounted)
+            .expect("recovery phase timings must fit inside transaction bootstrap");
         let work = &mut self.work;
-        for count in [
-            work.hot_inserts,
-            work.hot_updates,
-            work.hot_deletes,
-            work.cold_deletes,
-        ] {
-            recovery_add_count(&mut work.user_row_ops_applied, count, &mut self.saturated);
-        }
-        work.catalog_row_ops_skipped = recovery_sub_count(
-            work.catalog_row_ops_seen,
-            work.catalog_row_ops_applied,
-            &mut self.saturated,
-        );
-        work.user_row_ops_skipped = recovery_sub_count(
-            work.user_row_ops_seen,
-            work.user_row_ops_applied,
-            &mut self.saturated,
-        );
+        work.user_row_ops_applied =
+            work.hot_inserts + work.hot_updates + work.hot_deletes + work.cold_deletes;
+        work.catalog_row_ops_skipped = work.catalog_row_ops_seen - work.catalog_row_ops_applied;
+        work.user_row_ops_skipped = work.user_row_ops_seen - work.user_row_ops_applied;
         let redo = &mut self.redo;
-        let mut nested = redo.receive_wait_elapsed;
-        recovery_add_duration(&mut nested, redo.group_decode_elapsed, &mut self.saturated);
-        recovery_add_duration(
-            &mut nested,
-            redo.reader_shutdown_elapsed,
-            &mut self.saturated,
-        );
-        redo.stream_other_elapsed =
-            recovery_sub_duration(redo.stream_refill_elapsed, nested, &mut self.saturated);
-        redo.apply_and_dispatch_elapsed = recovery_sub_duration(
-            self.phases.redo_replay_elapsed,
-            redo.stream_refill_elapsed,
-            &mut self.saturated,
-        );
+        let nested =
+            redo.receive_wait_elapsed + redo.group_decode_elapsed + redo.reader_shutdown_elapsed;
+        // Receives, decoding, and shutdown are disjoint work within refill;
+        // all refill calls finish inside the coordinator's replay interval.
+        redo.stream_other_elapsed = redo
+            .stream_refill_elapsed
+            .checked_sub(nested)
+            .expect("recovery receive, decode and shutdown timings must fit inside refill");
+        redo.apply_and_dispatch_elapsed = phases
+            .redo_replay_elapsed
+            .checked_sub(redo.stream_refill_elapsed)
+            .expect("recovery refill timing must fit inside redo replay");
     }
 }
 
@@ -496,26 +450,6 @@ pub(crate) fn buffer_pool_runtime_stats_snapshot(
     }
 }
 
-/// Accumulates a diagnostic count and flags overflow.
-pub(crate) fn recovery_add_count(value: &mut u64, increment: u64, saturated: &mut bool) {
-    *value = value.checked_add(increment).unwrap_or_else(|| {
-        *saturated = true;
-        u64::MAX
-    });
-}
-
-/// Accumulates diagnostic elapsed time and flags overflow.
-pub(crate) fn recovery_add_duration(
-    value: &mut Duration,
-    increment: Duration,
-    saturated: &mut bool,
-) {
-    *value = value.checked_add(increment).unwrap_or_else(|| {
-        *saturated = true;
-        Duration::MAX
-    });
-}
-
 #[inline]
 fn io_backend_stats_snapshot(stats: InternalIoBackendStats) -> IoBackendStats {
     IoBackendStats {
@@ -523,96 +457,5 @@ fn io_backend_stats_snapshot(stats: InternalIoBackendStats) -> IoBackendStats {
         submitted_ops: stats.submitted_ops,
         submit_and_wait_nanos: stats.submit_and_wait_nanos,
         wait_completions: stats.wait_completions,
-    }
-}
-
-fn recovery_sub_count(value: u64, decrement: u64, saturated: &mut bool) -> u64 {
-    value.checked_sub(decrement).unwrap_or_else(|| {
-        *saturated = true;
-        0
-    })
-}
-
-fn recovery_sub_duration(value: Duration, decrement: Duration, saturated: &mut bool) -> Duration {
-    value.checked_sub(decrement).unwrap_or_else(|| {
-        *saturated = true;
-        Duration::ZERO
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Purpose: Protect recovery diagnostics at arithmetic boundaries.
-    /// Expected: Overflow and underflow clamp safely and mark the report as saturated.
-    #[test]
-    fn recovery_diagnostic_arithmetic_saturates_without_panicking() {
-        for (initial, increment, expected, overflow) in
-            [(2, 3, 5, false), (u64::MAX, 1, u64::MAX, true)]
-        {
-            let mut value = initial;
-            let mut saturated = false;
-            recovery_add_count(&mut value, increment, &mut saturated);
-            assert_eq!(
-                (value, saturated),
-                (expected, overflow),
-                "count add: {initial} + {increment}"
-            );
-        }
-        for (initial, decrement, expected, underflow) in [(3, 1, 2, false), (0, 1, 0, true)] {
-            let mut saturated = false;
-            let value = recovery_sub_count(initial, decrement, &mut saturated);
-            assert_eq!(
-                (value, saturated),
-                (expected, underflow),
-                "count subtract: {initial} - {decrement}"
-            );
-        }
-        for (initial, increment, expected, overflow) in [
-            (
-                Duration::from_nanos(2),
-                Duration::from_nanos(3),
-                Duration::from_nanos(5),
-                false,
-            ),
-            (Duration::MAX, Duration::from_nanos(1), Duration::MAX, true),
-        ] {
-            let mut value = initial;
-            let mut saturated = false;
-            recovery_add_duration(&mut value, increment, &mut saturated);
-            assert_eq!(
-                (value, saturated),
-                (expected, overflow),
-                "duration add: {initial:?} + {increment:?}"
-            );
-        }
-        for (initial, decrement, expected, underflow) in [
-            (
-                Duration::from_nanos(3),
-                Duration::from_nanos(1),
-                Duration::from_nanos(2),
-                false,
-            ),
-            (
-                Duration::ZERO,
-                Duration::from_nanos(1),
-                Duration::ZERO,
-                true,
-            ),
-        ] {
-            let mut saturated = false;
-            let value = recovery_sub_duration(initial, decrement, &mut saturated);
-            assert_eq!(
-                (value, saturated),
-                (expected, underflow),
-                "duration subtract: {initial:?} - {decrement:?}"
-            );
-        }
-        let mut report = RecoveryReport::default();
-        report.phases.redo_replay_elapsed = Duration::from_nanos(1);
-        report.finish_transaction(Duration::ZERO);
-        assert!(report.saturated);
-        assert_eq!(report.phases.other_elapsed, Duration::ZERO);
     }
 }

@@ -216,6 +216,22 @@ stable hot-page source
   -> caller publication or recovery admission
 ```
 
+`HotIndexBuild<P>` owns per-index stage orchestration in `index/build`. One
+`Arc<HotBuildSource>` supplies both its retained source and `HotLocalSort`, so
+projection metadata and the encoder are constructed once per selected index.
+Its `thread_pool` drives extraction, merge preparation and packed construction.
+`build()` returns a detached `ReadyHotTree<P>`; callers retain the
+late-validation boundary and decide install or abort. `settle()` drains stage
+jobs and detached-page cleanup. A cancelled build attempt must be settled rather
+than restarted; cancellation of settlement preserves its progress for resumption.
+The pipeline retains `HotPackedBuild<P>`, including leaf/parent completion
+ledgers, without a destination borrow. It drains those results before page
+cleanup: zero allocation-producer leases do not imply that completed result
+slots have released all run and scratch owners. Direct packed-stage callers
+use the same retained build object.
+Recovery retains table ordering, replay-source capture, bootstrap join ownership
+and report aggregation. CREATE retains its accepted operation and publication.
+
 Sort owned encoded entries directly within each run. Later stages retain
 immutable runs and represent merged order in reusable bounded batches without
 copying keys or materializing the complete merged-reference sequence. The later
@@ -479,26 +495,29 @@ destruction; the page tracker must not independently reclaim reachable descendan
 Root installation does not itself publish DDL metadata or admit foreground
 recovery traffic. [C1] [C2] [C5]
 
-Construction returns a target-bound ready tree. Its successful hot completion
+Construction returns a detached ready tree. Its successful hot completion
 is not whole-index uniqueness: CREATE's cold/hot checks remain phase 5 work,
 and a caller can explicitly abort an otherwise ready tree.
 
-`StagingMemIndex` owns the private destination's pool, guard, encoder, leaf
-representation, and timestamp. Its `start_build()` method binds those resources
-to construction; internal `check_empty()` and `install_root()` methods own
-destination validation and root transfer. The build coordinator and ready tree
-use these operations without accessing staging fields. After installation and
-successful caller-driven cleanup, synchronous `finish()` consumes staging and
-returns the completed MemIndex for publication. Abort/error paths call
-`destroy()` using the retained guard after detached cleanup. These are caller
-lifecycle requirements; neither finish nor destroy runs detached cleanup.
-Recovery's adapter for existing bootstrap indexes remains phase 4 work.
+`HotIndexBuild<P>` retains the index pool and guard; the captured source supplies
+the leaf representation and timestamp. Construction does not own or borrow a
+MemIndex. `ReadyHotTree<P>::install(&MemIndex<P>)` accepts a private destination
+with the same pool and physical key representation. It checks root emptiness
+under the exclusive root latch and transfers the completed tree while preserving
+the destination's root identity. Pool identity is checked through the retained
+guard; matching key representation and exclusion are caller contracts.
 
-`StagingMemIndex::start_build` returns `(build, cleanup)` before detached allocation.
-The separate `StagedPageCleanup` owns page tracking and pool lifetime authority;
-it does not borrow the target. The caller retains it before executing the build
-and decides whether to await `run()` inline or arrange owned task execution.
-The component does not submit a cleanup job or require cleanup admission.
+Recovery selects its table-owned bootstrap index only at installation. CREATE
+owns its private destination and performs late validation before installation,
+then follows its existing publication or rollback protocol. Destination creation
+and destruction belong to the caller; neither construction nor installation
+publishes the index.
+
+`HotPackedBuild::new` returns `(build, cleanup)` before detached allocation.
+The separate `StagedPageCleanup` owns page tracking and pool lifetime authority.
+The caller retains it before executing the build and decides whether to await
+`run()` inline or arrange owned task execution. The component does not submit
+a cleanup job or require cleanup admission.
 
 `execute()` returns a ready tree, duplicate evidence, or an execution error.
 Errors and duplicates drain producers and request abort before returning;
@@ -515,11 +534,14 @@ rather than Arc counts. Producers and the decision owner publish that predicate
 and wake its listener. Each completed deallocation is recorded before another
 await; cancelling a borrowed `run()` future leaves progress in the retained
 cleanup object for resumption. Successful root transfer disarms reclamation of
-installed pages. `run()` returns `FatalResult<()>`: unsafe reclamation failure
-or panic poisons the engine, caches the failure, and retains the exact remaining
-pages and dependencies without retry. Existing poison does not skip reclamation.
+installed pages. `run()` returns `FatalResult<()>`: a typed page-reopen error
+poisons the engine and is cached without retry. Deallocation failures are
+internal invariant panics and unwind directly; callers must abandon the failed
+cleanup object without retrying reclamation. No self-reference permanently pins
+pages or dependencies. Existing poison does not skip ordinary reclamation.
 Dropping the cleanup object does not execute it; retaining and driving it through
-cancellation, panic handling, and shutdown is an explicit caller contract.
+cancellation, construction-panic settlement, and shutdown is a caller contract.
+Task 000318 revises task 000317's original panic-to-Fatal retention policy.
 
 ### 5. Scratch limits, scheduling, and cleanup
 
@@ -576,22 +598,36 @@ precedence. An early return from a fallible join is insufficient. Dropping a
 DDL observer does not cancel accepted DDL. CREATE INDEX retains cleanup in its
 accepted operation state before construction and awaits it within that same
 mandatory task before terminal completion; no additional task or permit is
-required. Its retained panic owner must also settle cleanup or preserve unsafe
-ownership under the existing Fatal policy.
+required. Its retained construction-panic owner must also settle cleanup.
+Installation and cleanup invariant panics must propagate without a reclamation
+retry; phase 5 must preserve that distinction at its caller boundary.
 
-Recovery can await cleanup inline on ordinary success and error. Cancelled
-bootstrap requires an execution/teardown owner that retains and drives cleanup
-before storage teardown completes, while workers and storage needed by remaining
-producers are still available. No engine handle is exposed before recovery, but
-that alone does not poll a dropped cleanup future. The current registry drains
-accepted jobs, not arbitrary returned futures, and mandatory-runtime workers
-start after recovery. Phase 4 must supply this bootstrap ownership; phase 3 does
-not claim automatic cleanup on bootstrap cancellation.
-[D5] [C2] [C6] [U6]
+Recovery uses one temporary caller-owned `Recovery-Index` thread running one
+finite root future through `runtime::block_on`. Tables and physical index slots
+are processed in stable order; parallel jobs continue to use the existing
+ThreadPool. The local handle asynchronously observes a capacity-one terminal
+report and then joins. Dropping bootstrap joins the accepted task through
+terminal settlement and cleanup before component teardown. The task does not
+force partial cancellation: a successful installation after observer loss owns
+its descendants through the unexposed runtime.
 
-Panics preserve engine poison and Fatal precedence. Cleanup cannot require new
-pool admission after poison; ordinary cleanup must reclaim pages, while unsafe
-cleanup failure retains exact ownership under existing fatal policy. Normal
+Finalized, charged descriptors survive all indexes for one table. Each index
+re-extracts its selected keys, and all other scratch is released before the next
+admission. Peak accounting resets only at that quiescent boundary. Recovery
+reports distinguish completed extraction from installed-and-cleaned indexes,
+count pages once per table, and retain a separate maximum scratch peak.
+
+Shared pipeline supervision catches construction panics so accepted jobs and
+ordinary cleanup can settle. Installation and cleanup invariant panics unwind to the joined owner,
+which resumes the original payload without retrying cleanup. When the observer
+is already unwinding, join preserves that original panic and suppresses a second
+unwind. Guards release normally; no retention signal or registry change is
+needed. No component, early mandatory worker startup, nested executor, or
+cleanup-time thread spawn is introduced. Phase 5's accepted-DDL ownership and
+publication prerequisites remain unchanged. [D5] [C2] [C6] [U6]
+
+Typed errors preserve engine poison and Fatal precedence. Cleanup cannot require
+new pool admission after poison; ordinary cleanup must reclaim pages. Normal
 completion releases run buffers and their memory reservations after their final
 consumer finishes. Every new wait documents its progress producer, authoritative
 result, poison/shutdown behavior, and cleanup owner. [D5] [D6] [C6]
@@ -601,7 +637,8 @@ result, poison/shutdown behavior, and cleanup owner. [D5] [D6] [C6]
 Recovery builds each empty bootstrapped MemIndex at MIN_SNAPSHOT_TS, preserves
 loaded cold roots and replay ordering, and admits foreground work only after
 all required builds succeed. Count source pages once, independently of how many
-indexes re-extract them, and preserve successful-entry and saturation semantics.
+indexes re-extract them, and preserve successful-entry counter meanings.
+Recovery measurements use ordinary arithmetic assuming no overflow.
 Recovery selects trusted duplicate mode; CREATE UNIQUE INDEX requires checking,
 while CREATE non-unique index relies on disjoint row coverage. CREATE retains
 its current cold builder/vector, catalog commit, durable table root, and
@@ -709,9 +746,10 @@ after both callers deliver the full pipeline and performance acceptance.
     build path.
   - Prerequisites: Existing caller exclusion/bootstrap proofs and ThreadPool.
   - Phase-local Choices: `HotBuildSource` retains stable descriptors and caller
-    authority; recovery coverage is checked against an independent block-index
-    end before extraction. `HotLocalSort` owns accepted completions across
-    borrowed-future cancellation and collects in plan order. `SortedHotRuns`
+    authority. Recovery originally checked an independent block-index end;
+    phase 4 replaces that scan with the replay completeness invariant.
+    `HotLocalSort` owns accepted completions across borrowed-future cancellation
+    and collects in plan order. `SortedHotRuns`
     retains shared runs and their bulk-memory reservations, checked entry
     access, provenance ordering, and a direct single-run view. Configuration
     and accounting follow Decision §§2 and 5.
@@ -720,10 +758,11 @@ after both callers deliver the full pipeline and performance acceptance.
     composite keys, wide keys, and empty input. Tests covered duplicate modes,
     local versus cross-run conflicts, page-target/run-cap boundaries, empty
     groups, completion order, scratch growth/failure, cancellation, abandoned
-    owners, poison, and later-Fatal precedence. Recovery regressions reject
-    incomplete registries even for empty allocated pages and malformed redo
-    ranges before descriptor publication. Default workspace, alternate libaio,
-    and profiling-disabled workspace suites passed; task 000315 records counts
+    owners, poison, and later-Fatal precedence. Recovery regressions originally
+    rejected incomplete registries against an independent end; phase 4 retains
+    descriptor structure tests and replay lifecycle coverage. Malformed redo
+    ranges are rejected before descriptor publication. Default workspace,
+    alternate libaio, and profiling-disabled workspace suites passed; task 000315 records counts
     and the style/test-contract review. Profiling tests verify stage, count,
     and peak semantics. Comparative timings are explicitly deferred to Phases
     4-5 under backlog 000110, following the task's original integration scope;
@@ -873,21 +912,31 @@ after both callers deliver the full pipeline and performance acceptance.
     builds across indexes/tables.
   - Prerequisites: Phases 1-3, replay drain, final metadata reconciliation, and
     the recovered-data/exact-coverage invariants that justify trusted mode.
-  - Phase-local Choices: Stable index iteration, descriptor reuse, cleanup
-    execution during cancelled bootstrap, and recovery-report extensions. Retain
-    the cleanup object before the first build await, run it inline at ordinary
-    build completion, and guarantee teardown drives it after cancellation before
-    storage shuts down. An await at the end of a dropped bootstrap future is
-    insufficient; mandatory-runtime workers are not yet running. Phase 1
-    consumes the replay registry once per table; retain those finalized
-    descriptors for subsequent indexes instead of recapturing an empty
-    registry. Include the deferred extraction/local-sort timing comparisons
-    when measuring the integrated pipeline.
+  - Phase-local Choices: One temporary recovery-owned thread drives a single
+    finite root future and is joined on success, failure, cancellation, and
+    unwind before component teardown. It admits tables by TableID and indexes
+    by physical slot, retaining finalized descriptors and their budget charge
+    across each table's indexes. Page registration and replay drain guarantee
+    descriptor completeness. Capture sorts and validates contiguity from the
+    pivot and unique page identities without scanning for an independent end.
+    Shared `HotIndexBuild` owns per-index stage orchestration and shares one
+    source with local sorting. It builds a detached `ReadyHotTree<P>`; recovery
+    supplies its existing MemIndex only at installation. One retained
+    `HotPackedBuild<P>` owns packed completion ledgers without a destination
+    borrow. Accepted ThreadPool jobs settle and cleanup completes before the
+    next index. Dropping bootstrap does not force the accepted task to abort;
+    installed descendants belong to the unexposed
+    runtime. Installation and cleanup invariant panics propagate through join
+    without retry or permanent retention. Component order remains unchanged.
+    Integrated reports distinguish extraction from installation and retain
+    per-stage sums, maxima, occupancy, and scratch peaks. Deferred extraction
+    and sort measurements are part of end-to-end acceptance.
   - Validation: Compare recovered contents with serial behavior across
     unique/non-unique, multiple-index, updated/deleted, sparse, and mixed
     cold/hot fixtures. Verify trusted-mode selection without a duplicate
     validation pass, counter meanings, budget failure, failed/cancelled
     bootstrap, cleanup completion and producer drain before storage teardown.
+    Verify original installation/cleanup panic propagation and subsequent reopen.
     Cancel bootstrap with staged and in-flight pages; verify exact reclamation
     and successful subsequent bootstrap. Update the former
     duplicate-rejection regression to reflect the intentional trusted-input
@@ -896,10 +945,19 @@ after both callers deliver the full pipeline and performance acceptance.
     startup separately against the existing path, sorted insertion, and
     one/many-worker bulk; verify content outside timing, report memory/I/O,
     and explain small-input or multi-index regressions. [U10] [U12]
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - After This Phase: Recovery uses the shared pipeline in production and its
+    verified end-to-end comparisons are recorded in task 000318. Phase 5 reuses
+    `HotIndexBuild<P>::build()`, detached `ReadyHotTree<P>` and explicit
+    settlement. CREATE owns its private destination and passes it to
+    `install(&MemIndex<P>)` after late cold/hot validation; no owned/borrowed
+    staging wrapper is required. Its accepted mandatory owner remains responsible
+    for publication and rollback. Recovery's joined thread is local to bootstrap.
+    Backlog 000110 remains open for CREATE integration and independent caller
+    performance acceptance.
+  - Task Doc: `docs/tasks/000318-recovery-hot-index-integration.md`
+  - Task Issue: `#1120`
+  - Phase Status: done
+  - Implementation Summary: Implemented RFC 0032 phase 4 with joined recovery ownership, shared detached-tree construction, trusted keys and explicit cleanup. Final validation passed 2,175 workspace tests, 2,014 libaio storage tests and the 29-file style gate. Earlier verified million-row medians fell from 325.740 to 17.173 ms for rebuild and 497.523 to 192.155 ms for bootstrap. Smaller correctness fixtures reduced the workspace median from 5.267 to 4.497 s. Backlog 000110 remains open for CREATE INDEX integration and independent acceptance in phase 5. [Task Resolve Sync: docs/tasks/000318-recovery-hot-index-integration.md @ 2026-09-29]
 
 - **Phase 5: CREATE INDEX Hot-Build Integration**
   - Scope: Replace hot collection/validation/insertion with the shared
@@ -911,13 +969,17 @@ after both callers deliver the full pipeline and performance acceptance.
     ownership, rollback, table-root, and layout/history protocols.
   - Non-goals: Cold builder changes, reduced cold-vector memory, online DDL,
     or new durability records.
-  - Prerequisites: Phases 1-3 and retained DDL exclusion/root capture; Phase 4
-    provides the first production integration without changing this contract.
+  - Prerequisites: Phases 1-3, Phase 4's shared detached-build orchestration,
+    and retained DDL exclusion/root capture. Recovery's temporary thread is not
+    part of the CREATE ownership model.
   - Phase-local Choices: Cold-interval lookup/comparison, DDL test hooks, and
-    caller benchmark/statistics integration. Retain cleanup in accepted DDL
-    progress before construction, await it inside the existing mandatory task
-    at build completion, and preserve it across panic handling. Include abort
-    after late validation failure; merge cleanup errors with Fatal precedence.
+    caller benchmark/statistics integration. Retain the shared pipeline in
+    accepted DDL progress before construction, settle it inside the existing
+    mandatory task, and preserve its cleanup state across panic handling.
+    The private MemIndex remains caller-owned; construction requires only the
+    captured source and pool resources, and installation binds the destination.
+    Include abort after late validation failure; merge typed cleanup errors with Fatal
+    precedence, but propagate deallocation invariant panics without retry.
   - Validation: Verify that unique creation always enables checking and that
     non-unique creation admits equal logical keys. Cover local-run, cross-run,
     and cold/hot conflicts, including single-run input and partition edges,

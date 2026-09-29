@@ -18,7 +18,7 @@ use crate::id::{PageID, TableID};
 use crate::map::FastHashMap;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
-use crate::stats::{RecoveryReport, recovery_add_count};
+use crate::stats::RecoveryReport;
 use crate::table::Table;
 use error_stack::Report;
 use futures::future::{BoxFuture, Either, select};
@@ -120,7 +120,6 @@ pub(super) struct ReplayDispatcher {
     guards: PoolGuards,
     disable_validation: bool,
     counts: RowReplayCounts,
-    saturated: bool,
     #[cfg(test)]
     test_hook: Option<tests::BatchHook>,
 }
@@ -150,7 +149,6 @@ impl ReplayDispatcher {
             guards,
             disable_validation: config.disable_dml_validation,
             counts: RowReplayCounts::default(),
-            saturated: false,
             #[cfg(test)]
             test_hook: tests::installed_hook(),
         }
@@ -300,21 +298,9 @@ impl ReplayDispatcher {
                     )
                 })
         })??;
-        recovery_add_count(
-            &mut self.counts.inserts,
-            output.counts.inserts,
-            &mut self.saturated,
-        );
-        recovery_add_count(
-            &mut self.counts.updates,
-            output.counts.updates,
-            &mut self.saturated,
-        );
-        recovery_add_count(
-            &mut self.counts.deletes,
-            output.counts.deletes,
-            &mut self.saturated,
-        );
+        self.counts.inserts += output.counts.inserts;
+        self.counts.updates += output.counts.updates;
+        self.counts.deletes += output.counts.deletes;
         let page = self
             .active_pages
             .get_mut(&key)
@@ -443,25 +429,12 @@ impl ReplayDispatcher {
         error
     }
 
-    /// Merge successfully collected hot work once, retaining report saturation.
+    /// Merge successfully collected hot work once.
     pub(super) fn merge_counts(&mut self, report: &mut RecoveryReport) {
         let counts = mem::take(&mut self.counts);
-        recovery_add_count(
-            &mut report.work.hot_inserts,
-            counts.inserts,
-            &mut report.saturated,
-        );
-        recovery_add_count(
-            &mut report.work.hot_updates,
-            counts.updates,
-            &mut report.saturated,
-        );
-        recovery_add_count(
-            &mut report.work.hot_deletes,
-            counts.deletes,
-            &mut report.saturated,
-        );
-        report.saturated |= self.saturated;
+        report.work.hot_inserts += counts.inserts;
+        report.work.hot_updates += counts.updates;
+        report.work.hot_deletes += counts.deletes;
     }
 }
 

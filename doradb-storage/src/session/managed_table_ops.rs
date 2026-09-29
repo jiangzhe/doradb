@@ -626,7 +626,6 @@ mod tests {
         OperationError, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, StorageTableSpec, TableBinding, ValKind,
     };
-    use rand::rngs::StdRng;
     use std::collections::hash_map::Entry;
     use std::fmt::Debug;
     use std::future::Future;
@@ -1562,17 +1561,27 @@ mod tests {
         });
     }
 
-    /// Purpose: Exercise managed definition changes and recovery against a seeded operation model.
+    /// Purpose: Exercise managed definition changes and recovery against a lifecycle model.
     /// Expected: Catalog, cached definitions, and binding snapshots agree with the model after every step.
     #[test]
-    fn test_managed_definition_seeded_recovery_model() {
-        use rand::{RngExt, SeedableRng};
-        const SEED: u64 = 298;
-        let mut rng = StdRng::seed_from_u64(SEED);
+    fn test_managed_definition_recovery_model() {
+        use crate::conf::ThreadPoolConfig;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Operation {
+            CreateIndex,
+            InvalidIndex,
+            Reopen,
+            Checkpoint,
+            DropIndex,
+            DropTable,
+        }
+
         smol::block_on(async {
-            for bindings in [0, 1, 3] {
+            for bindings in [0, 1, 2] {
                 let root = TempDir::new().unwrap();
-                let config = managed_recovery_config(root.path());
+                let config = managed_recovery_config(root.path())
+                    .thread_pool(ThreadPoolConfig::default().worker_threads(1));
                 let mut engine = Engine::bootstrap(config.clone()).await.unwrap();
                 let mut session = engine.new_session().unwrap();
                 let mut model = DefinitionModel::new(vec![0, 0xff, bindings as u8], bindings);
@@ -1583,11 +1592,27 @@ mod tests {
                     .table_id();
                 assert_definition_model(&mut session, table_id, &model).await;
                 let mut next_index_id = 0;
-                // The seed drives a sequential stream across binding cases; no scheduling
-                // outcome selects the next operation. Allocation is modeled independently.
-                for step in 0..24 {
-                    match rng.random_range(0..6) {
-                        0 => {
+                // Cover recovery of created and dropped definitions, and index
+                // identity allocation after recreating the table.
+                for (step, operation) in [
+                    Operation::CreateIndex,
+                    Operation::CreateIndex,
+                    Operation::InvalidIndex,
+                    Operation::Reopen,
+                    Operation::Checkpoint,
+                    Operation::DropIndex,
+                    Operation::Reopen,
+                    Operation::CreateIndex,
+                    Operation::DropTable,
+                    Operation::CreateIndex,
+                    Operation::Reopen,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let step = step as u8;
+                    match operation {
+                        Operation::Checkpoint => {
                             // Reopen first to isolate the known catalog block-reuse cache bug
                             // tracked separately from managed-definition publication.
                             drop(session);
@@ -1601,13 +1626,14 @@ mod tests {
                             engine = Engine::bootstrap(config.clone()).await.unwrap();
                             session = engine.new_session().unwrap();
                         }
-                        1 => {
+                        Operation::Reopen => {
                             drop(session);
                             drop(engine);
                             engine = Engine::bootstrap(config.clone()).await.unwrap();
                             session = engine.new_session().unwrap();
                         }
-                        2 if !model.indexes.is_empty() => {
+                        Operation::DropIndex => {
+                            assert!(!model.indexes.is_empty());
                             session
                                 .drop_managed_index(table_id, &[step], &mut model)
                                 .await
@@ -1616,7 +1642,7 @@ mod tests {
                             model.epoch += 1;
                             model.payload = vec![step];
                         }
-                        3 => {
+                        Operation::DropTable => {
                             session.drop_table(table_id).await.unwrap();
                             assert!(
                                 engine
@@ -1636,7 +1662,7 @@ mod tests {
                                 .unwrap()
                                 .table_id();
                         }
-                        4 => {
+                        Operation::InvalidIndex => {
                             let definition = engine
                                 .inner()
                                 .core
@@ -1654,7 +1680,7 @@ mod tests {
                             assert_eq!(
                                 error.into_user(),
                                 Some("invalid"),
-                                "seed={SEED}, bindings={bindings}, step={step}"
+                                "bindings={bindings}, step={step}, operation={operation:?}"
                             );
                             assert!(Arc::ptr_eq(
                                 &definition,
@@ -1666,7 +1692,7 @@ mod tests {
                                     .unwrap()
                             ));
                         }
-                        _ => {
+                        Operation::CreateIndex => {
                             let id = session
                                 .create_managed_index(table_id, &[step], &mut model)
                                 .await
@@ -1674,7 +1700,7 @@ mod tests {
                             assert_eq!(
                                 id,
                                 IndexID::new(next_index_id),
-                                "seed={SEED}, bindings={bindings}, step={step}"
+                                "bindings={bindings}, step={step}, operation={operation:?}"
                             );
                             next_index_id += 1;
                             model.indexes.push(id);

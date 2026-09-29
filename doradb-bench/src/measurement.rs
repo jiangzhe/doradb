@@ -1,6 +1,7 @@
 use crate::error::{BenchError, Result};
 use crate::fixture::{CatalogCardinalities, IndexMode, KeyRange, PlacementKind, RowPlacement};
 use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
+pub use doradb_storage::profiling::RecoveryHotIndexMeasurements;
 use doradb_storage::{
     CatalogCheckpointReport, RecoveryPhaseTimings as StorageRecoveryPhaseTimings,
     RecoveryRedoMetrics as StorageRecoveryRedoMetrics, RecoveryReport as StorageRecoveryReport,
@@ -252,8 +253,9 @@ pub struct RecoveryReport {
     pub work: RecoveryWorkCounts,
     /// Consumer-side redo stream attribution.
     pub redo: RecoveryRedoMetrics,
-    /// At least one diagnostic overflow or invalid subtraction occurred.
-    pub saturated: bool,
+    /// Completed-index attribution; absent in older reports recorded without profiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_indexes: Option<RecoveryHotIndexMeasurements>,
 }
 
 impl RecoveryReport {
@@ -281,7 +283,7 @@ impl RecoveryReport {
             phases: RecoveryPhaseTimings::from_storage(&report.phases)?,
             work: RecoveryWorkCounts::from_storage(&report.work),
             redo: RecoveryRedoMetrics::from_storage(&report.redo)?,
-            saturated: report.saturated,
+            hot_indexes: Some(report.hot_indexes),
         };
         validate_recovery_report(&report)?;
         Ok(report)
@@ -465,7 +467,7 @@ impl RecoveryRedoMetrics {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryVerification {
-    /// Number of verified ordinary user tables, zero or one.
+    /// Number of independently verified ordinary user tables.
     pub table_count: u64,
     /// Public table identity, present for the single-table fixture.
     pub table_id: Option<u64>,
@@ -475,7 +477,7 @@ pub struct RecoveryVerification {
     pub candidate_range: Option<KeyRange>,
     /// Checked row count, also compared with successful preparation inserts.
     pub verified_rows: u64,
-    /// Sum of BLAKE3 row hashes modulo 2^256, encoded in little-endian byte order.
+    /// Per-table sums of BLAKE3 row hashes modulo 2^256, separated by colons.
     pub fingerprint: String,
     /// Whether the complete unbounded index stream matched the table scan.
     pub index_verified: bool,
@@ -1012,11 +1014,6 @@ fn check_recovery_sum(actual: u64, components: &[u64]) -> Result<()> {
 }
 
 fn validate_recovery_report(report: &RecoveryReport) -> Result<()> {
-    if report.saturated {
-        return Err(BenchError::message(
-            "recovery report contains saturated diagnostics",
-        ));
-    }
     check_recovery_sum(
         report.bootstrap_elapsed_nanos,
         &[
@@ -1132,6 +1129,7 @@ fn parse_statm_rss(contents: &str, page_size: usize) -> Result<usize> {
 mod tests {
     use super::*;
     use doradb_storage::id::{TableID, TrxID};
+    use doradb_storage::profiling::{HotBuildMeasurements, HotMergeMeasurements};
     use doradb_storage::{
         CatalogCheckpointOutcome, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
     };
@@ -1499,6 +1497,44 @@ mod tests {
         assert!(error.to_string().contains("failed to read process RSS"));
     }
 
+    /// Purpose: Preserve the recovery report schema while reusing storage measurement types.
+    /// Expected: Measurements round-trip losslessly and unknown fields at every nested level are rejected.
+    #[test]
+    fn recovery_measurements_round_trip_with_strict_fields() {
+        let storage = StorageRecoveryReport {
+            hot_indexes: RecoveryHotIndexMeasurements {
+                extraction: HotBuildMeasurements {
+                    entries: u64::MAX,
+                    source_pages: 7,
+                    ..HotBuildMeasurements::default()
+                },
+                merge: HotMergeMeasurements {
+                    checked: true,
+                    partitions: 3,
+                    ..HotMergeMeasurements::default()
+                },
+                completed_builds: 2,
+                scratch_peak_bytes: 4096,
+                ..RecoveryHotIndexMeasurements::default()
+            },
+            ..StorageRecoveryReport::default()
+        };
+        let report = RecoveryReport::from_storage(&storage).unwrap();
+        assert_eq!(report.hot_indexes, Some(storage.hot_indexes));
+        let encoded = toml::to_string(&report).unwrap();
+        assert_eq!(toml::from_str::<RecoveryReport>(&encoded).unwrap(), report);
+        for path in ["hot_indexes", "hot_indexes.extraction", "hot_indexes.merge"] {
+            let header = format!("[{path}]\n");
+            let invalid =
+                encoded.replacen(&header, &format!("{header}unknown_measurement = 1\n"), 1);
+            let error = toml::from_str::<RecoveryReport>(&invalid).unwrap_err();
+            assert!(
+                error.to_string().contains("unknown_measurement"),
+                "{path}: {error}"
+            );
+        }
+    }
+
     /// Purpose: Preserve recovery timing precision across conversion and serialization.
     /// Expected: Representable durations remain lossless and out-of-range timings are rejected.
     #[test]
@@ -1665,15 +1701,11 @@ mod tests {
     }
 
     /// Purpose: Require complete and internally consistent recovery metrics.
-    /// Expected: Balanced reports are accepted while saturation and inconsistent work or timing
-    /// totals are rejected.
+    /// Expected: Balanced reports are accepted while inconsistent work or timing totals are rejected.
     #[test]
-    fn recovery_conversion_rejects_saturation_and_inconsistent_accounting() {
+    fn recovery_conversion_rejects_inconsistent_accounting() {
         let mut report = StorageRecoveryReport::default();
         assert!(RecoveryReport::from_storage(&report).is_ok());
-        report.saturated = true;
-        assert!(RecoveryReport::from_storage(&report).is_err());
-        report.saturated = false;
         report.work.user_row_ops_seen = 1;
         assert!(RecoveryReport::from_storage(&report).is_err());
         report.work.user_row_ops_skipped = 1;

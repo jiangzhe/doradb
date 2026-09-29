@@ -1,18 +1,13 @@
 use crate::buffer::PoolGuards;
 use crate::buffer::guard::PageExclusiveGuard;
-use crate::catalog::{IndexSlot, TableMetadata};
+use crate::catalog::TableMetadata;
 use crate::error::{
-    DataIntegrityError, DataIntegrityResult, RecoveryDuplicateKey, RuntimeError,
-    RuntimeOrFatalResult, RuntimeResult,
+    DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
-use crate::id::{PageID, RowID, TrxID};
-use crate::index::IndexInsert;
+use crate::id::{RowID, TrxID};
 use crate::recovery::{PackedPageBatch, ReplayKind, ReplayOp, RowReplayCounts, RowReplayState};
-use crate::row::ops::ReadRow;
-use crate::row::{RowPage, RowRead};
-use crate::stats::recovery_add_count;
+use crate::row::RowPage;
 use crate::table::{DeletionError, DmlValidator, Table};
-use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
 
 impl Table {
@@ -145,125 +140,21 @@ impl Table {
                 }
             })
     }
-
-    /// Populate active indexes from one row page and return successful entry count
-    /// plus an arithmetic saturation flag.
-    pub(crate) async fn populate_index_via_row_page(
-        &self,
-        guards: &PoolGuards,
-        page_id: PageID,
-    ) -> RuntimeOrFatalResult<(u64, bool)> {
-        let mut entries = 0;
-        let mut saturated = false;
-        let page_guard = self
-            .row_store
-            .must_get_row_page_shared(guards, page_id)
-            .await?;
-        let layout = self.layout_snapshot();
-        let metadata = layout.metadata();
-        let index_pool_guard = guards.index_guard();
-        for (index_slot, index_spec) in metadata.idx.active_indexes() {
-            let sec_idx = layout.expect_secondary_index(index_spec.index);
-            let read_set: Vec<_> = index_spec
-                .keys
-                .iter()
-                .map(|c| c.column_ordinal.as_usize())
-                .collect();
-            for row_access in page_guard.read_all_rows() {
-                let row_id = row_access.row().row_id();
-                match row_access.read_row_latest(metadata, &read_set, None) {
-                    ReadRow::Ok(vals) => {
-                        if index_spec.unique() {
-                            let index = sec_idx
-                                .unique_mem()
-                                .change_context(RuntimeError::TableAccess)
-                                .attach_with(|| {
-                                    format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
-                                        self.table_id()
-                                    )
-                                })?;
-                            let res = index
-                                .bind(index_pool_guard)
-                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
-                                .await?;
-                            ensure_recovery_index_insert(sec_idx.index_slot(), res)
-                                .change_context(RuntimeError::TableAccess)
-                                .attach_with(|| {
-                                    format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}, row_id={row_id}",
-                                        self.table_id()
-                                    )
-                                })?;
-                        } else {
-                            let index = sec_idx
-                                .non_unique_mem()
-                                .change_context(RuntimeError::TableAccess)
-                                .attach_with(|| {
-                                    format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}",
-                                        self.table_id()
-                                    )
-                                })?;
-                            let res = index
-                                .bind(index_pool_guard)
-                                .insert_if_not_exists(&vals, row_id, false, MIN_SNAPSHOT_TS)
-                                .await?;
-                            ensure_recovery_index_insert(sec_idx.index_slot(), res)
-                                .change_context(RuntimeError::TableAccess)
-                                .attach_with(|| {
-                                    format!(
-                                        "operation=populate_index_via_row_page, table_id={}, page_id={page_id}, index_slot={index_slot}, row_id={row_id}",
-                                        self.table_id()
-                                    )
-                                })?;
-                        }
-                        recovery_add_count(&mut entries, 1, &mut saturated);
-                    }
-                    ReadRow::NotFound => (),
-                    ReadRow::InvalidIndex => unreachable!(),
-                }
-            }
-        }
-        Ok((entries, saturated))
-    }
-}
-
-/// Reject duplicate secondary-index entries during recovery rebuild.
-#[inline]
-pub(super) fn ensure_recovery_index_insert(
-    index_slot: IndexSlot,
-    res: IndexInsert,
-) -> DataIntegrityResult<()> {
-    match res {
-        IndexInsert::Ok(_) => Ok(()),
-        IndexInsert::DuplicateKey(row_id, deleted) => Err(Report::new(
-            DataIntegrityError::UnexpectedRecoveryDuplicateKey,
-        )
-        .attach(RecoveryDuplicateKey {
-            index_slot: index_slot.as_usize(),
-            row_id,
-            deleted,
-        })),
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_recovery_index_insert;
     use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_no_dropped_table_operational_state,
         wait_for_no_dropped_table_operational_state,
     };
-    use crate::catalog::{IndexSlot, TableMetadata, USER_TABLE_ID_START};
+    use crate::catalog::{TableMetadata, USER_TABLE_ID_START};
     use crate::engine::Engine;
     use crate::error::RuntimeOrFatalError;
-    use crate::error::{DataIntegrityError, RecoveryDuplicateKey, RuntimeError};
-    use crate::id::RowID;
+    use crate::error::{DataIntegrityError, RuntimeError};
     use crate::id::TrxID;
-    use crate::index::IndexInsert;
     use crate::log::redo::{RowRedo, RowRedoKind};
     use crate::recovery::RowReplayState;
     use crate::recovery::{OwnedReplayOp, pack_test_ops};
@@ -417,33 +308,6 @@ mod tests {
         assert_eq!(page.page().header.var_field_offset(), offset_before);
         assert!(!page.page().is_deleted(1));
         assert_eq!(page.page().row(1).val(&metadata.col, 1), Val::from("name"));
-    }
-
-    /// Purpose: Protect recovery acceptance of successful index insert outcomes.
-    /// Expected: Both successful insert variants are accepted.
-    #[test]
-    fn test_ensure_recovery_index_insert_accepts_ok_variants() {
-        let index_slot = IndexSlot::new(1);
-        assert!(ensure_recovery_index_insert(index_slot, IndexInsert::Ok(false)).is_ok());
-        assert!(ensure_recovery_index_insert(index_slot, IndexInsert::Ok(true)).is_ok());
-    }
-
-    /// Purpose: Protect duplicate-key diagnostics during index recovery.
-    /// Expected: The error retains the conflicting index slot, row identity, and deletion
-    /// state.
-    #[test]
-    fn test_ensure_recovery_index_insert_rejects_duplicate_key() {
-        let err = ensure_recovery_index_insert(
-            IndexSlot::new(3),
-            IndexInsert::DuplicateKey(RowID::new(42), false),
-        )
-        .unwrap_err();
-        let duplicate = err
-            .downcast_ref::<RecoveryDuplicateKey>()
-            .unwrap_or_else(|| panic!("unexpected error: {err:?}"));
-        assert_eq!(duplicate.index_slot, 3);
-        assert_eq!(duplicate.row_id, RowID::new(42));
-        assert!(!duplicate.deleted);
     }
 
     /// Purpose: Protect cold-delete replay boundaries and idempotency.

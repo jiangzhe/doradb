@@ -456,6 +456,8 @@ pub(crate) enum FatalError {
     MandatoryTaskPanic,
     #[error("thread pool task panicked")]
     ThreadPoolTaskPanic,
+    #[error("recovery hot-index task panicked")]
+    RecoveryHotIndexPanic,
     #[error("thread pool is unavailable")]
     ThreadPoolUnavailable,
 }
@@ -1738,6 +1740,7 @@ impl ReplayContext {
 enum ReplayAttachment {
     Diagnostic(SharedDiagnostic),
     BackendError(BackendError),
+    RecoveryDuplicateKey(RecoveryDuplicateKey),
 }
 
 impl ReplayAttachment {
@@ -1751,8 +1754,16 @@ impl ReplayAttachment {
         if let Some(value) = frame.downcast_ref::<&'static str>() {
             return Self::Diagnostic(SharedDiagnostic(Arc::from(*value)));
         }
+        if let Some(value) = frame.downcast_ref::<RuntimeOrFatalAttachment>() {
+            // The selected report retains its typed source. Secondary cleanup
+            // evidence is diagnostic when replayed across a completion handoff.
+            return Self::Diagnostic(SharedDiagnostic(Arc::from(value.to_string())));
+        }
         if let Some(value) = frame.downcast_ref::<BackendError>() {
             return Self::BackendError(value.clone());
+        }
+        if let Some(value) = frame.downcast_ref::<RecoveryDuplicateKey>() {
+            return Self::RecoveryDuplicateKey(*value);
         }
         panic!(
             "unregistered printable completion attachment: frame_position={position}, type_id={:?}",
@@ -1767,6 +1778,7 @@ impl ReplayAttachment {
         match self {
             Self::Diagnostic(value) => report.attach(value.clone()),
             Self::BackendError(value) => report.attach(value.clone()),
+            Self::RecoveryDuplicateKey(value) => report.attach(*value),
         }
     }
 }
@@ -1911,7 +1923,7 @@ impl fmt::Display for SecondaryIndexBinding {
 pub struct RecoveryDuplicateKey {
     /// Table index slot being rebuilt.
     pub index_slot: usize,
-    /// Duplicate row id reported by the index insert.
+    /// Conflicting row identity selected by the checked recovery adapter.
     pub row_id: RowID,
     /// Whether the duplicate row id was already marked deleted.
     pub deleted: bool,
@@ -2550,63 +2562,78 @@ mod tests {
     }
 
     /// Purpose: Protect error precedence when operation and cleanup failures coexist.
-    /// Expected: Fatal failures outrank runtime failures while equal-domain failures retain the primary reason and secondary diagnostics.
+    /// Expected: Fatal outranks Runtime, and equal-domain failures preserve the primary reason and secondary diagnostics both directly and through completion transport.
     #[test]
     fn test_runtime_or_fatal_cleanup_precedence_preserves_typed_sources() {
-        let source_fatal = RuntimeOrFatalError::Fatal(
-            Report::new(FatalError::RedoWrite).attach("fatal operation source"),
-        );
-        let cleanup_runtime = RuntimeOrFatalError::Runtime(
-            Report::new(RuntimeError::CatalogAccess).attach("runtime cleanup source"),
-        );
-        let RuntimeOrFatalError::Fatal(report) = source_fatal.merge_cleanup(cleanup_runtime) else {
-            panic!("fatal operation source must outrank runtime cleanup")
-        };
-        assert_eq!(*report.current_context(), FatalError::RedoWrite);
-        let output = format!("{report:?}");
-        assert!(output.contains("fatal operation source"));
-        assert!(output.contains("runtime cleanup source"));
-        assert!(output.contains("secondary cleanup failure"));
+        for transported in [false, true] {
+            let merge = |source: RuntimeOrFatalError, cleanup| {
+                let error = source.merge_cleanup(cleanup);
+                if transported {
+                    let context = match &error {
+                        RuntimeOrFatalError::Runtime(report) => *report.current_context(),
+                        RuntimeOrFatalError::Fatal(_) => RuntimeError::Recovery,
+                    };
+                    CompletionErrorBridge::capture_runtime_or_fatal(error)
+                        .into_runtime_or_fatal(context)
+                } else {
+                    error
+                }
+            };
+            let source_fatal = RuntimeOrFatalError::Fatal(
+                Report::new(FatalError::RedoWrite).attach("fatal operation source"),
+            );
+            let cleanup_runtime = RuntimeOrFatalError::Runtime(
+                Report::new(RuntimeError::CatalogAccess).attach("runtime cleanup source"),
+            );
+            let RuntimeOrFatalError::Fatal(report) = merge(source_fatal, cleanup_runtime) else {
+                panic!("fatal operation source must outrank runtime cleanup")
+            };
+            assert_eq!(*report.current_context(), FatalError::RedoWrite);
+            let output = format!("{report:?}");
+            assert!(output.contains("fatal operation source"));
+            assert!(output.contains("runtime cleanup source"));
+            assert!(output.contains("secondary cleanup failure"));
 
-        let source_runtime = RuntimeOrFatalError::Runtime(
-            Report::new(RuntimeError::IndexAccess).attach("runtime operation source"),
-        );
-        let cleanup_fatal = RuntimeOrFatalError::Fatal(
-            Report::new(FatalError::RollbackAccess).attach("fatal cleanup source"),
-        );
-        let RuntimeOrFatalError::Fatal(report) = source_runtime.merge_cleanup(cleanup_fatal) else {
-            panic!("fatal cleanup must outrank runtime operation source")
-        };
-        assert_eq!(*report.current_context(), FatalError::RollbackAccess);
-        let output = format!("{report:?}");
-        assert!(output.contains("runtime operation source"));
-        assert!(output.contains("fatal cleanup source"));
-        assert!(output.contains("primary operation failure before fatal cleanup"));
+            let source_runtime = RuntimeOrFatalError::Runtime(
+                Report::new(RuntimeError::IndexAccess).attach("runtime operation source"),
+            );
+            let cleanup_fatal = RuntimeOrFatalError::Fatal(
+                Report::new(FatalError::RollbackAccess).attach("fatal cleanup source"),
+            );
+            let RuntimeOrFatalError::Fatal(report) = merge(source_runtime, cleanup_fatal) else {
+                panic!("fatal cleanup must outrank runtime operation source")
+            };
+            assert_eq!(*report.current_context(), FatalError::RollbackAccess);
+            let output = format!("{report:?}");
+            assert!(output.contains("runtime operation source"));
+            assert!(output.contains("fatal cleanup source"));
+            assert!(output.contains("primary operation failure before fatal cleanup"));
 
-        let source_fatal = RuntimeOrFatalError::Fatal(
-            Report::new(FatalError::RedoWrite).attach("first fatal source"),
-        );
-        let cleanup_fatal = RuntimeOrFatalError::Fatal(
-            Report::new(FatalError::RollbackAccess).attach("later fatal cleanup"),
-        );
-        let RuntimeOrFatalError::Fatal(report) = source_fatal.merge_cleanup(cleanup_fatal) else {
-            panic!("first fatal source must retain equal-domain precedence")
-        };
-        assert_eq!(*report.current_context(), FatalError::RedoWrite);
-        assert!(format!("{report:?}").contains("later fatal cleanup"));
+            let source_fatal = RuntimeOrFatalError::Fatal(
+                Report::new(FatalError::RedoWrite).attach("first fatal source"),
+            );
+            let cleanup_fatal = RuntimeOrFatalError::Fatal(
+                Report::new(FatalError::RollbackAccess).attach("later fatal cleanup"),
+            );
+            let RuntimeOrFatalError::Fatal(report) = merge(source_fatal, cleanup_fatal) else {
+                panic!("first fatal source must retain equal-domain precedence")
+            };
+            assert_eq!(*report.current_context(), FatalError::RedoWrite);
+            assert!(format!("{report:?}").contains("later fatal cleanup"));
 
-        let source_runtime = RuntimeOrFatalError::Runtime(
-            Report::new(RuntimeError::IndexAccess).attach("first runtime source"),
-        );
-        let cleanup_runtime = RuntimeOrFatalError::Runtime(
-            Report::new(RuntimeError::CatalogAccess).attach("later runtime cleanup"),
-        );
-        let RuntimeOrFatalError::Runtime(report) = source_runtime.merge_cleanup(cleanup_runtime)
-        else {
-            panic!("runtime operation source must retain equal-domain precedence")
-        };
-        assert_eq!(*report.current_context(), RuntimeError::IndexAccess);
-        assert!(format!("{report:?}").contains("later runtime cleanup"));
+            let source_runtime = RuntimeOrFatalError::Runtime(
+                Report::new(RuntimeError::IndexAccess).attach("first runtime source"),
+            );
+            let cleanup_runtime = RuntimeOrFatalError::Runtime(
+                Report::new(RuntimeError::CatalogAccess).attach("later runtime cleanup"),
+            );
+            let RuntimeOrFatalError::Runtime(report) = merge(source_runtime, cleanup_runtime)
+            else {
+                panic!("runtime operation source must retain equal-domain precedence")
+            };
+            assert_eq!(*report.current_context(), RuntimeError::IndexAccess);
+            assert!(format!("{report:?}").contains("later runtime cleanup"));
+        }
     }
 
     /// Purpose: Protect lazy attachment evaluation on a successful multi-domain result.

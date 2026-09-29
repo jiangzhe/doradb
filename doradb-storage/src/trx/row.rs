@@ -131,31 +131,6 @@ impl<'a> RowReadAccess<'a> {
         self.guard.as_ref().map(|head| head.next.main.entry.clone())
     }
 
-    /// Reads the latest physical row image without walking MVCC undo.
-    #[inline]
-    pub(crate) fn read_row_latest(
-        &self,
-        metadata: &TableMetadata,
-        read_set: &[usize],
-        key: Option<(IndexSlot, &[Val])>,
-    ) -> ReadRow {
-        let row = self.row();
-        // latest version in row page.
-        if row.is_deleted() {
-            return ReadRow::NotFound;
-        }
-        if let Some((index_slot, key_vals)) = key {
-            let Some(index_spec) = metadata.idx.index_spec(index_slot) else {
-                return ReadRow::InvalidIndex;
-            };
-            if row.is_key_different(metadata.col.as_ref(), index_spec, key_vals) {
-                return ReadRow::InvalidIndex;
-            }
-        }
-        let vals = row.vals_for_read_set(metadata.col.as_ref(), read_set);
-        ReadRow::Ok(vals)
-    }
-
     /// Reads the latest row image and validates exact index candidate identity.
     #[inline]
     pub(crate) fn read_row_latest_index_candidate(
@@ -2487,19 +2462,6 @@ pub(crate) mod tests {
             access.guard.purge_undo_chain(TrxID::new(21));
         }
         assert_eq!(row_ver.frozen_mutation_version(), prepared_version + 2);
-    }
-
-    /// Purpose: Protect optional latest-row lookup through an inactive index.
-    /// Expected: The missing index reports an invalid-index result.
-    #[test]
-    fn test_read_row_latest_inactive_index_returns_invalid_index() {
-        let (metadata, page, row_ver) = row_fixture();
-        let access = test_row_read_access(&page, &row_ver, 0);
-        let key = SelectKey::new(IndexSlot::new(1), vec![Val::from(10i32)]);
-
-        let res = access.read_row_latest(&metadata, &[0], Some((key.index_slot, &key.vals)));
-
-        assert!(matches!(res, ReadRow::InvalidIndex));
     }
 
     /// Purpose: Protect historical key matching through an inactive index.

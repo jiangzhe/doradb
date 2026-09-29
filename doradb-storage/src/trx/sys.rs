@@ -661,9 +661,14 @@ impl TransactionSystem {
         let preparation_started = Instant::now();
         let hot_build_policy = HotBuildPolicy::new(hot_index_build, thread_pool.worker_threads())
             .change_context(RuntimeError::Recovery)?;
-        let recovery_resources =
-            RecoveryResources::new(pools, table_fs.clone(), thread_pool, &catalog)
-                .with_hot_build_policy(hot_build_policy);
+        let recovery_resources = RecoveryResources::new(
+            pools,
+            table_fs.clone(),
+            thread_pool,
+            &catalog,
+            poisoner.clone(),
+        )
+        .with_hot_build_policy(hot_build_policy);
         #[cfg(feature = "profiling")]
         let hot_build_profiler = recovery_resources.hot_build_profiler.clone();
         let coordinator = recovery_resources.prepare(&config, &recovery, file_prefix.clone())?;

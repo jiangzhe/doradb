@@ -220,12 +220,14 @@ pub enum WorkloadSpec {
     CatalogCheckpoint(CatalogCheckpointSpec),
 }
 
-/// Strict clean-reopen controls. Preparation sizing is deliberately excluded.
+/// Strict clean-reopen controls with optional recovery-only fixture preparation.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoverySpec {
     /// Optional cumulative fresh-engine diagnostics; recovery metrics are mandatory.
     pub include_stats: Option<bool>,
+    /// Optional varied recovery fixture, prepared before the bootstrap timer.
+    pub fixture: Option<RecoveryFixture>,
 }
 
 /// Resolved coordinator-owned clean-reopen controls.
@@ -234,6 +236,55 @@ pub struct RecoverySpec {
 pub struct RecoveryConfig {
     /// Capture cumulative fresh-engine diagnostics before verification.
     pub include_stats: bool,
+    /// Optional recovery-only preparation for an otherwise empty plan fixture.
+    pub fixture: Option<RecoveryFixture>,
+}
+
+/// Deterministic recovery-only fixture settings; preparation and verification are untimed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryFixture {
+    /// Number of independently verified tables.
+    pub tables: usize,
+    /// Inserted rows per table before optional mutation.
+    pub rows: u64,
+    /// Number of indexes per table, including differing physical key orders.
+    pub indexes: usize,
+    /// Unique or non-unique indexes; none requires zero indexes.
+    pub index: IndexMode,
+    /// Include the payload in physical keys, alternating composite key order.
+    #[serde(default)]
+    pub composite: bool,
+    /// Number of repeated payload values for skewed non-unique keys; zero uses row identity.
+    #[serde(default)]
+    pub cardinality: u64,
+    /// Bytes in each payload, at least eight.
+    pub value_bytes: usize,
+    /// Load and checkpoint this prefix before loading remaining hot rows.
+    #[serde(default)]
+    pub cold_rows: u64,
+    /// Delete every nth row and change the following row's payload; zero disables mutation.
+    #[serde(default)]
+    pub mutate_every: u64,
+}
+
+impl RecoveryFixture {
+    fn validate(self) -> Result<()> {
+        if self.tables == 0
+            || self.indexes > u32::MAX as usize
+            || self.rows.checked_mul(self.tables as u64).is_none()
+            || self.value_bytes < 8
+            || self.value_bytes > 1024
+            || self.cold_rows > self.rows
+            || (self.index == IndexMode::None) != (self.indexes == 0)
+            || self.mutate_every == 1
+        {
+            return Err(BenchError::message(
+                "invalid recovery fixture sizing, index shape, or mutation stride",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Strict managed-binding fixture controls.
@@ -1395,9 +1446,16 @@ fn resolve_workload(
                 FixturePlanEffect::CreateIndex { index: spec.index },
             ))
         }
-        WorkloadSpec::Recovery(spec) => no_effect(ResolvedWorkload::Recovery(RecoveryConfig {
-            include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
-        })),
+        WorkloadSpec::Recovery(spec) => {
+            if let Some(recipe) = spec.fixture {
+                recipe.validate()?;
+                fixture.validate(FixtureRequirement::AbsentPrimary)?;
+            }
+            no_effect(ResolvedWorkload::Recovery(RecoveryConfig {
+                include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+                fixture: spec.fixture,
+            }))
+        }
         WorkloadSpec::CreateTable(spec) => {
             let shape = PrimaryTableShape { index: spec.index };
             let table_count = spec.tables.map_or(1, NonZeroUsize::get);

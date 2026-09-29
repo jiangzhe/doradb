@@ -921,9 +921,9 @@ cleanup completion matters.
 
 `Engine::recovery_report() -> &RecoveryReport` returns immutable diagnostics for
 successful bootstrap, without a session, including after explicit shutdown.
-It reports elapsed stages (`Duration`), observed work (`u64`), and a `saturated`
-flag for inexact arithmetic. Failed bootstrap produces no report. Field meanings
-are documented on the [report types](../doradb-storage/src/stats.rs).
+It reports stage durations and observed work. Failed bootstrap produces no
+report. Field meanings are documented on the
+[report types](../doradb-storage/src/stats.rs).
 
 Sessions expose point-in-time or cumulative snapshots:
 

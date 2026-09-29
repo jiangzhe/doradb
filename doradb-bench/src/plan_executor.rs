@@ -281,6 +281,7 @@ async fn execute_phases(
                             clock,
                             table,
                             config.include_stats,
+                            config.fixture,
                             || {
                                 if measurement.pause {
                                     pause_for_profiler(phase_index, workload.identity())

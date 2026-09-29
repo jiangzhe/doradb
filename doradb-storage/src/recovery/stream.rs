@@ -1,5 +1,5 @@
 use super::decode::DecodedGroup;
-use crate::stats::{RecoveryRedoMetrics, recovery_add_count, recovery_add_duration};
+use crate::stats::RecoveryRedoMetrics;
 use std::time::Instant;
 
 use crate::error::{
@@ -523,12 +523,6 @@ enum RedoLogStreamState {
     Failed,
 }
 
-#[derive(Default)]
-struct StreamMetrics {
-    redo: RecoveryRedoMetrics,
-    saturated: bool,
-}
-
 /// Owning transaction adapter used by catalog checkpoint scans.
 ///
 /// Enforces whole-group validation and terminal failure from the
@@ -557,11 +551,7 @@ impl RedoLogStream {
         let started = self.groups.metrics.as_ref().map(|_| Instant::now());
         let result = self.fill_buffer_inner().await;
         if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
-            recovery_add_duration(
-                &mut metrics.redo.stream_refill_elapsed,
-                started.elapsed(),
-                &mut metrics.saturated,
-            );
+            metrics.stream_refill_elapsed += started.elapsed();
         }
         result
     }
@@ -586,22 +576,10 @@ impl RedoLogStream {
                     }
                 }
                 if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
-                    recovery_add_duration(
-                        &mut metrics.redo.group_decode_elapsed,
-                        started.elapsed(),
-                        &mut metrics.saturated,
-                    );
-                    recovery_add_count(&mut metrics.redo.groups_decoded, 1, &mut metrics.saturated);
-                    recovery_add_count(
-                        &mut metrics.redo.transactions_decoded,
-                        (self.buffer.len() - before) as u64,
-                        &mut metrics.saturated,
-                    );
-                    recovery_add_count(
-                        &mut metrics.redo.validated_payload_bytes,
-                        payload_bytes,
-                        &mut metrics.saturated,
-                    );
+                    metrics.group_decode_elapsed += started.elapsed();
+                    metrics.groups_decoded += 1;
+                    metrics.transactions_decoded += (self.buffer.len() - before) as u64;
+                    metrics.validated_payload_bytes += payload_bytes;
                 }
                 return Ok(());
             }
@@ -641,7 +619,7 @@ impl RecoveryLogStream {
         read_depth: usize,
     ) -> RuntimeResult<Self> {
         let mut groups = RedoGroupReader::from_planned_segments(segments, read_depth)?;
-        groups.metrics = Some(StreamMetrics::default());
+        groups.metrics = Some(RecoveryRedoMetrics::default());
         Ok(Self { groups })
     }
 
@@ -650,11 +628,7 @@ impl RecoveryLogStream {
         let started = Instant::now();
         let result = self.read_group().await;
         if let Some(metrics) = &mut self.groups.metrics {
-            recovery_add_duration(
-                &mut metrics.redo.stream_refill_elapsed,
-                started.elapsed(),
-                &mut metrics.saturated,
-            );
+            metrics.stream_refill_elapsed += started.elapsed();
         }
         result
     }
@@ -672,29 +646,17 @@ impl RecoveryLogStream {
             )
         })?;
         if let Some(metrics) = &mut self.groups.metrics {
-            recovery_add_duration(
-                &mut metrics.redo.group_decode_elapsed,
-                started.elapsed(),
-                &mut metrics.saturated,
-            );
-            recovery_add_count(&mut metrics.redo.groups_decoded, 1, &mut metrics.saturated);
-            recovery_add_count(
-                &mut metrics.redo.transactions_decoded,
-                group.transactions.len() as u64,
-                &mut metrics.saturated,
-            );
-            recovery_add_count(
-                &mut metrics.redo.validated_payload_bytes,
-                payload_bytes,
-                &mut metrics.saturated,
-            );
+            metrics.group_decode_elapsed += started.elapsed();
+            metrics.groups_decoded += 1;
+            metrics.transactions_decoded += group.transactions.len() as u64;
+            metrics.validated_payload_bytes += payload_bytes;
         }
         Ok(Some(group))
     }
 
     /// Returns startup measurements after stream termination.
     #[inline]
-    pub(crate) fn recovery_metrics(&self) -> (RecoveryRedoMetrics, bool) {
+    pub(crate) fn recovery_metrics(&self) -> RecoveryRedoMetrics {
         self.groups.recovery_metrics()
     }
 
@@ -707,7 +669,7 @@ impl RecoveryLogStream {
 
 /// Buffered stream of transaction redo records across a sequence of redo files.
 struct RedoGroupReader {
-    metrics: Option<StreamMetrics>,
+    metrics: Option<RecoveryRedoMetrics>,
     /// Direct-IO read-ahead worker for the planned logical stream.
     reader: Option<RedoReadAheadHandle>,
     /// Parser state for the current redo segment.
@@ -975,22 +937,10 @@ impl RedoGroupReader {
             )
         });
         if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
-            recovery_add_duration(
-                &mut metrics.redo.receive_wait_elapsed,
-                started.elapsed(),
-                &mut metrics.saturated,
-            );
+            metrics.receive_wait_elapsed += started.elapsed();
             if let RedoReadItem::Block { buf, .. } = &item {
-                recovery_add_count(
-                    &mut metrics.redo.data_blocks_consumed,
-                    1,
-                    &mut metrics.saturated,
-                );
-                recovery_add_count(
-                    &mut metrics.redo.consumed_bytes,
-                    buf.as_bytes().len() as u64,
-                    &mut metrics.saturated,
-                );
+                metrics.data_blocks_consumed += 1;
+                metrics.consumed_bytes += buf.as_bytes().len() as u64;
             }
         }
         Ok(item)
@@ -1011,11 +961,7 @@ impl RedoGroupReader {
         }
         self.reader.take();
         if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
-            recovery_add_duration(
-                &mut metrics.redo.reader_shutdown_elapsed,
-                started.elapsed(),
-                &mut metrics.saturated,
-            );
+            metrics.reader_shutdown_elapsed += started.elapsed();
         }
     }
 
@@ -1035,11 +981,8 @@ impl RedoGroupReader {
     }
 
     /// Returns startup-only consumer measurements after stream termination.
-    pub(crate) fn recovery_metrics(&self) -> (RecoveryRedoMetrics, bool) {
-        self.metrics.as_ref().map_or_else(
-            || (RecoveryRedoMetrics::default(), false),
-            |metrics| (metrics.redo, metrics.saturated),
-        )
+    pub(crate) fn recovery_metrics(&self) -> RecoveryRedoMetrics {
+        self.metrics.unwrap_or_default()
     }
 
     /// Take accepted-prefix metadata for unsealed segments observed by this stream.
@@ -2992,8 +2935,8 @@ mod tests {
                 Some((TrxID::new(5), TrxID::new(5))),
             )
             .await;
-            let (metrics, saturated) = stream.recovery_metrics();
-            assert!(!saturated);
+            let metrics = stream.recovery_metrics();
+
             assert_eq!(metrics.groups_decoded, 1);
             assert_eq!(metrics.transactions_decoded, 1);
             assert_eq!(metrics.data_blocks_consumed, 2);
@@ -3263,8 +3206,8 @@ mod tests {
             );
             assert!(stream.try_next().await.unwrap().is_some());
             assert!(stream.try_next().await.unwrap().is_none());
-            let (metrics, saturated) = stream.recovery_metrics();
-            assert!(!saturated);
+            let metrics = stream.recovery_metrics();
+
             assert_eq!(metrics.groups_decoded, 1);
             assert_eq!(metrics.transactions_decoded, 1);
             assert_eq!(metrics.data_blocks_consumed, blocks.len() as u64 + 1);
@@ -3376,8 +3319,8 @@ mod tests {
                 matches!(row.kind, DecodedRowKind::Delete(Some(page)) if page == test_page_id(5))
             );
             assert!(stream.try_next().await.unwrap().is_none());
-            let (metrics, saturated) = stream.recovery_metrics();
-            assert!(!saturated);
+            let metrics = stream.recovery_metrics();
+
             assert_eq!(metrics.transactions_decoded, 2);
             assert_eq!(metrics.groups_decoded, 1);
             assert_eq!(metrics.validated_payload_bytes, payload_bytes);
@@ -3438,8 +3381,8 @@ mod tests {
             assert_eq!(first.transactions[0].header.cts, TrxID::new(1));
             assert_eq!(second.transactions[0].header.cts, TrxID::new(2));
             assert!(stream.try_next().await.unwrap().is_none());
-            let (metrics, saturated) = stream.recovery_metrics();
-            assert!(!saturated);
+            let metrics = stream.recovery_metrics();
+
             assert_eq!(metrics.transactions_decoded, 2);
             assert_eq!(metrics.groups_decoded, 2);
             assert_eq!(metrics.data_blocks_consumed, 2);

@@ -25,16 +25,13 @@ pub(crate) struct HotBuildKeySpec {
     /// Whether physical encoding omits the RowID suffix.
     pub(crate) unique: bool,
     /// Caller timestamp retained for later tree construction.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "RFC 0032 phase 3 timestamps built pages")
-    )]
     pub(crate) build_ts: TrxID,
     /// Local evidence selected by the invocation duplicate policy.
     pub(crate) duplicates: DuplicateCheck,
 }
 
 /// Caller-owned stable layout, pivot, pool roots, and optional DDL gate.
+#[derive(Clone)]
 pub(crate) struct HotBuildCapture {
     /// Stable table owner supplied by the capture factory.
     pub(crate) table: Arc<Table>,
@@ -60,7 +57,7 @@ pub(crate) struct HotBuildSource {
     /// Owner-scoped pool roots retained through guarded page access.
     pub(crate) guards: PoolGuards,
     /// Ordered contiguous page descriptors with charged capacity.
-    pub(crate) pages: BudgetedVec<RowPageDescriptor>,
+    pub(crate) pages: Arc<BudgetedVec<RowPageDescriptor>>,
     /// Selected encoding, projection, timestamp, and duplicate policy.
     pub(crate) key: HotBuildKeySpec,
     /// Shared admission retained for run ownership and downstream phases.
@@ -90,118 +87,167 @@ impl HotBuildSource {
         duplicates: DuplicateCheck,
         policy: HotBuildPolicy,
     ) -> Self {
-        let HotBuildCapture {
-            table,
-            layout,
-            guards,
-            pivot,
-            ddl,
-            #[cfg(feature = "profiling")]
-            profiler,
-        } = capture;
-        let budget = MemoryBudget::new(policy.max_scratch_bytes);
-        let columns = spec
-            .keys
-            .iter()
-            .map(|key| key.column_ordinal.as_usize())
-            .collect();
-        let unique = spec.unique();
-        let encoder = secondary_index_encoder(layout.metadata(), spec, !unique);
-        let pages = BudgetedVec::new(&budget);
-        Self {
-            table,
-            layout,
-            guards,
-            pages,
-            key: HotBuildKeySpec {
-                index: spec.index,
-                columns,
-                encoder,
-                unique,
-                build_ts,
-                duplicates,
-            },
-            budget,
-            pivot,
-            #[cfg(feature = "profiling")]
-            capture_elapsed_nanos: 0,
-            #[cfg(feature = "profiling")]
-            profiler,
-            _ddl: ddl,
-            #[cfg(test)]
-            test: WorkerHooks::default(),
-        }
+        HotBuildTableSource::new(capture, policy).select(spec, build_ts, duplicates)
     }
 
-    /// Admit one descriptor, excluding fully checkpointed prefixes.
+    /// Admit one descriptor before source sharing begins.
+    #[inline]
     pub(crate) fn push_page(&mut self, page: RowPageDescriptor) -> RuntimeResult<()> {
-        if page.start_row_id >= page.end_row_id
-            || (page.start_row_id < self.pivot && page.end_row_id > self.pivot)
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "hot-build invalid range or pivot: page={page:?}, pivot={}",
-                    self.pivot
-                ))
-                .change_context(RuntimeError::IndexAccess));
-        }
-        if page.end_row_id <= self.pivot {
-            return Ok(());
-        }
-        self.pages
-            .push(page, "page descriptors")
-            .change_context(RuntimeError::IndexAccess)
+        push_page(&mut self.pages, self.pivot, page)
     }
 
-    /// Validate exact coverage from the pivot to the independently captured index end.
-    /// No row pages are reopened or copied, and an empty registry requires an empty interval.
-    pub(crate) fn finish_capture(&mut self, end_row_id: RowID) -> RuntimeResult<()> {
-        self.pages.sort_unstable_by_key(|page| page.start_row_id);
-        // Temporary validation metadata is outside the bulk scratch budget.
-        // Its size is bounded by the admitted descriptor count, and it is
-        // released before any extraction jobs start.
-        let mut page_ids =
-            FastHashSet::with_capacity_and_hasher(self.pages.len(), FastRandomState::default());
-        let mut next_row_id = self.pivot;
-        for page in self.pages.iter() {
-            if page.start_row_id != next_row_id {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "hot-build non-contiguous descriptors: expected_start={next_row_id}, page={page:?}, pivot={}, end_row_id={end_row_id}",
-                        self.pivot
-                    ))
-                    .change_context(RuntimeError::IndexAccess));
-            }
-            if !page_ids.insert(page.page_id) {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "hot-build repeated page identity: page_id={}",
-                        page.page_id
-                    ))
-                    .change_context(RuntimeError::IndexAccess));
-            }
-            next_row_id = page.end_row_id;
-        }
-        if next_row_id != end_row_id {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "hot-build incomplete or excess coverage: expected_end={end_row_id}, actual_end={next_row_id}, pivot={}",
-                    self.pivot
-                ))
-                .change_context(RuntimeError::IndexAccess));
-        }
-        Ok(())
+    /// Sort and validate descriptor contiguity and identity before source sharing.
+    /// The caller must supply every original hot page.
+    #[inline]
+    pub(crate) fn finish_capture(&mut self) -> RuntimeResult<()> {
+        finish_capture(&mut self.pages, self.pivot)
     }
 
     /// Capture CREATE's original pages directly through the budgeted sink.
     pub(crate) async fn capture_pages(&mut self) -> RuntimeOrFatalResult<()> {
         let table = self.table.clone();
         let guards = self.guards.clone();
-        let end_row_id = table
+        table
             .row_store
             .visit_original_row_pages_from(&guards, self.pivot, |page| self.push_page(page))
             .await?;
-        self.finish_capture(end_row_id)?;
+        self.finish_capture()?;
         Ok(())
     }
+}
+
+/// Index-neutral captured table; descriptor admission survives every selected index.
+pub(crate) struct HotBuildTableSource {
+    capture: HotBuildCapture,
+    pages: Arc<BudgetedVec<RowPageDescriptor>>,
+    /// Shared table-local budget, reset only between settled index builds.
+    pub(crate) budget: MemoryBudget,
+}
+
+impl HotBuildTableSource {
+    /// Begin source capture under the caller's bootstrap or DDL exclusion.
+    pub(crate) fn new(capture: HotBuildCapture, policy: HotBuildPolicy) -> Self {
+        let budget = MemoryBudget::new(policy.max_scratch_bytes);
+        Self {
+            capture,
+            pages: Arc::new(BudgetedVec::new(&budget)),
+            budget,
+        }
+    }
+
+    /// Admit an authoritative replay descriptor, excluding checkpointed prefixes.
+    #[inline]
+    pub(crate) fn push_page(&mut self, page: RowPageDescriptor) -> RuntimeResult<()> {
+        push_page(&mut self.pages, self.capture.pivot, page)
+    }
+
+    /// Sort and validate descriptor contiguity and identity before source sharing.
+    /// The replay owner must supply every surviving hot page after draining jobs.
+    #[inline]
+    pub(crate) fn finish_capture(&mut self) -> RuntimeResult<()> {
+        finish_capture(&mut self.pages, self.capture.pivot)
+    }
+
+    /// Count final hot pages once, independently of the number of active indexes.
+    #[inline]
+    pub(crate) fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Bind immutable descriptors to one physical key shape without reallocation.
+    pub(crate) fn select(
+        &self,
+        spec: &TableIndexMetadata,
+        build_ts: TrxID,
+        duplicates: DuplicateCheck,
+    ) -> HotBuildSource {
+        let capture = &self.capture;
+        let unique = spec.unique();
+        HotBuildSource {
+            table: capture.table.clone(),
+            layout: capture.layout.clone(),
+            guards: capture.guards.clone(),
+            pages: self.pages.clone(),
+            key: HotBuildKeySpec {
+                index: spec.index,
+                columns: spec
+                    .keys
+                    .iter()
+                    .map(|key| key.column_ordinal.as_usize())
+                    .collect(),
+                encoder: secondary_index_encoder(capture.layout.metadata(), spec, !unique),
+                unique,
+                build_ts,
+                duplicates,
+            },
+            budget: self.budget.clone(),
+            pivot: capture.pivot,
+            #[cfg(feature = "profiling")]
+            capture_elapsed_nanos: 0,
+            #[cfg(feature = "profiling")]
+            profiler: capture.profiler.clone(),
+            _ddl: capture.ddl.clone(),
+            #[cfg(test)]
+            test: WorkerHooks::default(),
+        }
+    }
+}
+
+#[inline]
+fn push_page(
+    pages: &mut Arc<BudgetedVec<RowPageDescriptor>>,
+    pivot: RowID,
+    page: RowPageDescriptor,
+) -> RuntimeResult<()> {
+    if page.start_row_id >= page.end_row_id
+        || (page.start_row_id < pivot && page.end_row_id > pivot)
+    {
+        return Err(Report::new(DataIntegrityError::InvalidPayload)
+            .attach(format!(
+                "hot-build invalid range or pivot: page={page:?}, pivot={}",
+                pivot
+            ))
+            .change_context(RuntimeError::IndexAccess));
+    }
+    if page.end_row_id <= pivot {
+        return Ok(());
+    }
+    Arc::get_mut(pages)
+        .unwrap_or_else(|| unreachable!("descriptor capture precedes source sharing"))
+        .push(page, "page descriptors")
+        .change_context(RuntimeError::IndexAccess)
+}
+
+fn finish_capture(
+    pages: &mut Arc<BudgetedVec<RowPageDescriptor>>,
+    pivot: RowID,
+) -> RuntimeResult<()> {
+    Arc::get_mut(pages)
+        .unwrap_or_else(|| unreachable!("descriptor validation precedes source sharing"))
+        .sort_unstable_by_key(|page| page.start_row_id);
+    // Temporary validation metadata is outside the bulk scratch budget.
+    // Its size is bounded by the admitted descriptor count, and it is
+    // released before any extraction jobs start.
+    let mut page_ids =
+        FastHashSet::with_capacity_and_hasher(pages.len(), FastRandomState::default());
+    let mut next_row_id = pivot;
+    for page in pages.iter() {
+        if page.start_row_id != next_row_id {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!(
+                        "hot-build non-contiguous descriptors: expected_start={next_row_id}, page={page:?}, pivot={pivot}"
+                    ))
+                    .change_context(RuntimeError::IndexAccess));
+        }
+        if !page_ids.insert(page.page_id) {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!(
+                    "hot-build repeated page identity: page_id={}",
+                    page.page_id
+                ))
+                .change_context(RuntimeError::IndexAccess));
+        }
+        next_row_id = page.end_row_id;
+    }
+    Ok(())
 }
