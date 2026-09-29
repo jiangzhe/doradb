@@ -1,14 +1,16 @@
 //! One retained public CREATE INDEX call with verification after the runner ends.
 
+use super::index_fixture::prepare_index_fixture;
 use crate::error::{BenchError, Result};
 use crate::fixture::{
-    FixturePlanEffect, FixtureRuntimeEffect, IndexMode, PrimaryBinding, benchmark_index_specs,
+    FixtureBinding, FixturePlanEffect, FixtureRuntimeEffect, IndexMode, KeyRange, PrimaryBinding,
+    PrimaryTableShape,
 };
 use crate::measurement::{
     CreateIndexReport, CreateIndexVerification, LatencyDistribution, LatencyUnit, MeasurementClock,
     ProcessRssSampler, WorkloadCounters, WorkloadMetrics, process_cpu_delta, process_cpu_nanos,
 };
-use crate::plan::CreateIndexConfig;
+use crate::plan::{CreateIndexConfig, CreateIndexKey};
 use crate::plan_executor::{
     SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
 };
@@ -18,7 +20,9 @@ use crate::workload::util::{
 use crate::workload::verification::scan_content;
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
-use doradb_storage::{Engine, IndexID, Session, StorageIndexSpec};
+use doradb_storage::{
+    Engine, IndexID, Session, StorageIndexFlags, StorageIndexKey, StorageIndexSpec,
+};
 
 /// Fixed one-session executor; it leaves the new index installed.
 #[derive(Clone)]
@@ -36,9 +40,9 @@ impl SessionExecutor for CreateIndexExecutor {
 
     fn new(config: Self::Config) -> Result<Self> {
         let primary = require_primary(config.binding, Self::IDENTITY)?;
-        if primary.shape.index != IndexMode::None
-            || primary.inserted_rows == 0
-            || primary.latest_write_fence.is_none()
+        if (config.resolved.fixture.is_none()
+            && (primary.shape.index != IndexMode::None || primary.inserted_rows == 0))
+            || (primary.inserted_rows != 0 && primary.latest_write_fence.is_none())
             || primary.frozen.is_some()
         {
             return Err(BenchError::message(
@@ -49,9 +53,22 @@ impl SessionExecutor for CreateIndexExecutor {
             .placement
             .ok_or_else(|| BenchError::message("CREATE placement is unknown"))?
             .validate(primary.inserted_rows)?;
-        let index_spec = benchmark_index_specs(config.resolved.index)
-            .pop()
-            .ok_or_else(|| BenchError::message("CREATE requires a secondary-index mode"))?;
+        let columns = match config.resolved.key {
+            CreateIndexKey::Key => vec![0],
+            CreateIndexKey::Payload => vec![1],
+            CreateIndexKey::Composite => vec![1, 0],
+        };
+        let flags = match config.resolved.index {
+            IndexMode::Unique => StorageIndexFlags::UK,
+            IndexMode::NonUnique => StorageIndexFlags::empty(),
+            IndexMode::None => {
+                return Err(BenchError::message("CREATE requires a secondary index"));
+            }
+        };
+        let index_spec = StorageIndexSpec::new(
+            columns.into_iter().map(StorageIndexKey::new).collect(),
+            flags,
+        );
         Ok(Self {
             config: config.resolved,
             primary,
@@ -150,9 +167,13 @@ impl SessionExecutor for CreateIndexExecutor {
                 .sum_nanos
                 != report.create_elapsed_nanos
             || *planned_effect
-                != (FixturePlanEffect::CreateIndex {
-                    index: self.config.index,
-                })
+                != if self.config.fixture.is_some() {
+                    FixturePlanEffect::None
+                } else {
+                    FixturePlanEffect::CreateIndex {
+                        index: self.config.index,
+                    }
+                }
         {
             return Err(BenchError::message(
                 "CREATE sample or planned effect mismatch",
@@ -199,6 +220,56 @@ impl SessionOutcome for CreateIndexOutcome {
     fn into_measurement(self) -> SessionMeasurement {
         self.measurement
     }
+}
+
+/// Prepare a varied fixture and verify existing indexes before any measurement window.
+pub(crate) async fn prepare_create_fixture(
+    engine: &Engine,
+    config: CreateIndexConfig,
+) -> Result<FixtureBinding> {
+    let recipe = config
+        .fixture
+        .ok_or_else(|| BenchError::message("missing CREATE fixture"))?;
+    let mut tables = prepare_index_fixture(engine, recipe).await?;
+    let table = tables
+        .pop()
+        .ok_or_else(|| BenchError::message("missing prepared CREATE table"))?;
+    if !tables.is_empty() {
+        return Err(BenchError::message("CREATE requires one prepared table"));
+    }
+    let mut session = engine.new_session()?;
+    let result = async {
+        let expected = scan_content(&mut session, table.table_id, None).await?;
+        if expected.rows() != table.rows {
+            return Err(BenchError::message("CREATE fixture row count mismatch"));
+        }
+        for index in &table.indexes {
+            if scan_content(&mut session, table.table_id, Some(*index)).await? != expected {
+                return Err(BenchError::message(
+                    "CREATE fixture existing index content mismatch",
+                ));
+            }
+        }
+        Ok::<_, BenchError>(())
+    }
+    .await;
+    let close = session.close().await;
+    result?;
+    close?;
+    Ok(FixtureBinding::Primary(PrimaryBinding {
+        placement: Some(table.placement),
+        table_id: table.table_id,
+        shape: PrimaryTableShape {
+            index: recipe.index,
+        },
+        loaded_range: Some(KeyRange {
+            start: 0,
+            len: recipe.rows,
+        }),
+        inserted_rows: table.rows,
+        latest_write_fence: table.fence,
+        frozen: None,
+    }))
 }
 
 /// Verify after session close and engine-stat capture, then authorize the fixture effect.
@@ -265,6 +336,73 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// Purpose: Exercise untimed shared CREATE fixtures with skew, mutations, mixed storage, existing indexes and wide composite keys.
+    /// Expected: Measured public CREATE returns a fresh stable identity whose full contents match the mutated table and whose live placement accounting is exact.
+    #[test]
+    fn varied_create_fixture_verifies_contents_and_identity() {
+        use crate::plan::RecoveryFixture;
+        smol::block_on(async {
+            for (rows, mode, key) in [
+                (0, IndexMode::Unique, CreateIndexKey::Key),
+                (97, IndexMode::NonUnique, CreateIndexKey::Payload),
+                (97, IndexMode::Unique, CreateIndexKey::Composite),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(
+                    EngineConfig::default().storage_root(temp.path().join("root")),
+                )
+                .await
+                .unwrap();
+                let config = CreateIndexConfig {
+                    index: mode,
+                    key,
+                    include_stats: false,
+                    fixture: Some(RecoveryFixture {
+                        tables: 1,
+                        rows,
+                        indexes: 1,
+                        index: IndexMode::Unique,
+                        composite: false,
+                        cardinality: 3,
+                        value_bytes: 512,
+                        cold_rows: rows / 2,
+                        mutate_every: 7,
+                    }),
+                };
+                let binding = prepare_create_fixture(&engine, config).await.unwrap();
+                let executor = CreateIndexExecutor::new(SessionExecutorConfig {
+                    resolved: config,
+                    binding,
+                    execution_ordinal: 0,
+                })
+                .unwrap();
+                let mut session = engine.new_session().unwrap();
+                let outcome = executor
+                    .execute(
+                        &engine,
+                        &mut session,
+                        &executor.session_plans().unwrap()[0],
+                        &MeasurementClock::new(),
+                        true,
+                        &RunCancellation::new(),
+                    )
+                    .await
+                    .unwrap();
+                session.close().await.unwrap();
+                executor
+                    .verify_outcome(&FixturePlanEffect::None, &outcome, 1)
+                    .unwrap();
+                let mut report = outcome.report.unwrap();
+                assert_eq!(report.index_id, 1);
+                assert_eq!(report.total_rows, rows - rows.div_ceil(7));
+                report.rows.validate(report.total_rows).unwrap();
+                complete_create_index(&engine, &mut report).await.unwrap();
+                assert_eq!(report.verification.unwrap().index_rows, report.total_rows);
+                engine.shutdown();
+            }
+        });
+    }
 
     /// Purpose: Isolate index-creation timing while preserving failure precedence.
     /// Expected: Measurements exclude surrounding work, clock initialization gates execution,

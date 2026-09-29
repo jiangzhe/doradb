@@ -1,33 +1,38 @@
-use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
+use crate::buffer::{EvictableBufferPool, PoolGuards};
 use crate::catalog::storage::{TABLE_ID_INDEXES, TABLE_ID_TABLE_DESCRIPTORS, TABLE_ID_TABLES};
 use crate::catalog::{
     Catalog, CatalogDefinitionEffects, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot,
     SecondaryIndexSlot, TableIndexMetadata, TableMetadata,
 };
+use crate::component::panic_payload_description;
 use crate::engine::EngineCore;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
-    MultiDomainResultExt, OperationError, OperationResult, QuadResult, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
+    MultiDomainResultExt, OperationError, OperationResult, QuadError, QuadResult, RuntimeError,
+    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::meta_block::validate_secondary_index_state;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::index::build::{DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildSource};
+use crate::index::build::cold_validation::{ColdUniqueKeys, ColdValidation};
+use crate::index::build::tree_builder::{HotPackedOutcome, ReadyHotTree};
+use crate::index::build::{
+    DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildSource, HotIndexBuild,
+    IndexBuildEntry, merge_build_result,
+};
 use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
-    BTreeKey, BTreeKeyEncoder, ColumnBlockIndex, IndexInsert, NonUniqueMemIndex,
-    SecondaryDiskTreeRuntime, SecondaryIndex, UniqueMemIndex, secondary_index_encoder,
+    BTreeKey, BTreeKeyEncoder, ColumnBlockIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
+    SecondaryIndex, UniqueMemIndex, secondary_index_encoder,
 };
 use crate::obs;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::HotIndexBuildProfiler;
+use crate::profiling::{CreateIndexMeasurements, HotIndexBuildProfiler};
 use crate::quiescent::QuiescentGuard;
-use crate::row::RowRead;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::runtime::{POLL_BUDGET, yield_now};
+use crate::runtime::yield_now;
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
 use crate::table::{
     CreateIndexPlan, DeleteMarker, DropIndexPlan, RuntimeIndexEntry, Table, TableRuntimeLayout,
@@ -35,8 +40,11 @@ use crate::table::{
 use crate::trx::{PrivateTransaction, trx_is_committed};
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
+use futures::FutureExt;
 use std::any::Any;
 use std::collections::BTreeSet;
+use std::mem;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 #[cfg(feature = "profiling")]
 use std::time::Instant;
@@ -152,12 +160,6 @@ impl Drop for IndexDdlGateScope {
     }
 }
 
-#[derive(Clone, Debug)]
-struct CreateIndexRowEntry {
-    key: BTreeKey,
-    row_id: RowID,
-}
-
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CreateIndexKeyValidator {
     Unique,
@@ -174,7 +176,7 @@ impl CreateIndexKeyValidator {
         }
     }
 
-    fn prepare_cold(self, rows: &mut [CreateIndexRowEntry]) -> OperationResult<()> {
+    fn prepare_cold(self, rows: &mut [IndexBuildEntry]) -> OperationResult<()> {
         rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
         if self == Self::NonUnique {
             return Ok(());
@@ -187,36 +189,6 @@ impl CreateIndexKeyValidator {
                 "create unique index found duplicate cold key: row_id={}",
                 pair[1].row_id
             )));
-        }
-        Ok(())
-    }
-
-    fn prepare_hot(
-        self,
-        rows: &mut [CreateIndexRowEntry],
-        cold_rows: &[CreateIndexRowEntry],
-    ) -> OperationResult<()> {
-        if self == Self::NonUnique {
-            return Ok(());
-        }
-        rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-        if let Some(pair) = rows.windows(2).find(|pair| pair[0].key == pair[1].key) {
-            return Err(Report::new(OperationError::DuplicateKey).attach(format!(
-                "create unique index found duplicate hot key: row_id={}",
-                pair[1].row_id
-            )));
-        }
-        let mut cold_pos = 0;
-        for row in rows {
-            while cold_pos < cold_rows.len() && cold_rows[cold_pos].key < row.key {
-                cold_pos += 1;
-            }
-            if cold_pos < cold_rows.len() && cold_rows[cold_pos].key == row.key {
-                return Err(Report::new(OperationError::DuplicateKey).attach(format!(
-                    "create unique index found duplicate cold/hot key: row_id={}",
-                    row.row_id
-                )));
-            }
         }
         Ok(())
     }
@@ -263,7 +235,7 @@ impl<'a> CreateIndexCollector<'a> {
 
     // Future improvement: stream/batch and parallelize this cold-row build to
     // avoid materializing every persisted row. See docs/backlogs/000104.
-    async fn collect_current_cold(&self) -> QuadResult<Vec<CreateIndexRowEntry>> {
+    async fn collect_current_cold(&self) -> QuadResult<Vec<IndexBuildEntry>> {
         let table = self.table;
         let guards = self.guards;
         let metadata = self.layout.metadata();
@@ -355,14 +327,16 @@ impl<'a> CreateIndexCollector<'a> {
                         )
                     })?;
                 let key = self.encode_key(&key_vals, row_id);
-                rows.push(CreateIndexRowEntry { key, row_id });
+                rows.push(IndexBuildEntry { key, row_id });
             }
             yield_now().await;
         }
         Ok(rows)
     }
 
-    async fn collect_current_hot(&self) -> RuntimeOrFatalResult<Vec<CreateIndexRowEntry>> {
+    #[cfg(test)]
+    async fn collect_current_hot(&self) -> RuntimeOrFatalResult<Vec<IndexBuildEntry>> {
+        use crate::row::RowRead;
         let mut rows = Vec::new();
         self.table
             .accessor_with_layout(self.layout)
@@ -378,7 +352,7 @@ impl<'a> CreateIndexCollector<'a> {
                     .map(|index_key| row.val(col_layout, index_key.column_ordinal.as_usize()))
                     .collect::<Vec<_>>();
                 let key = self.encode_key(&key_vals, row_id);
-                rows.push(CreateIndexRowEntry { key, row_id });
+                rows.push(IndexBuildEntry { key, row_id });
                 true
             })
             .await?;
@@ -395,140 +369,14 @@ impl<'a> CreateIndexCollector<'a> {
     }
 }
 
-struct CreateIndexRuntimeBuilder<'a> {
-    index_pool: QuiescentGuard<EvictableBufferPool>,
-    index_guard: &'a PoolGuard,
-    metadata: &'a TableMetadata,
-    index_spec: &'a TableIndexMetadata,
-    build_ts: TrxID,
-    #[cfg(test)]
-    test: tests::IndexDdlTestController,
-}
-
-impl<'a> CreateIndexRuntimeBuilder<'a> {
-    #[inline]
-    fn new(
-        engine: &'a EngineCore,
-        guards: &'a PoolGuards,
-        metadata: &'a TableMetadata,
-        index_spec: &'a TableIndexMetadata,
-        build_ts: TrxID,
-    ) -> Self {
-        Self {
-            index_pool: engine.pools.index.clone(),
-            index_guard: guards.index_guard(),
-            metadata,
-            index_spec,
-            build_ts,
-            #[cfg(test)]
-            test: engine.index_ddl_test.clone(),
-        }
-    }
-
-    async fn build_unique(
-        self,
-        disk_runtime: SecondaryDiskTreeRuntime,
-        hot_rows: Vec<CreateIndexRowEntry>,
-    ) -> QuadResult<SecondaryIndex<EvictableBufferPool>> {
-        let Self {
-            index_pool,
-            index_guard,
-            metadata,
-            index_spec,
-            build_ts,
-            #[cfg(test)]
-            test,
-        } = self;
-        let ty_infer = |col_no| metadata.col.col_type(col_no);
-        let mem =
-            UniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
-        let insert_res = insert_create_index_unique_hot_rows(
-            &mem,
-            index_guard,
-            &hot_rows,
-            build_ts,
-            #[cfg(test)]
-            &test,
-        )
-        .await;
-        if let Err(err) = insert_res {
-            if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach_with(|| {
-                    format!(
-                        "operation=rollback_create_unique_index_build, index_slot={}",
-                        disk_runtime.index_slot()
-                    )
-                });
-                obs::error!(
-                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
-                );
-            }
-            return Err(err);
-        }
-        Ok(SecondaryIndex::Unique {
-            mem,
-            disk: disk_runtime,
-        })
-    }
-
-    async fn build_non_unique(
-        self,
-        disk_runtime: SecondaryDiskTreeRuntime,
-        hot_rows: Vec<CreateIndexRowEntry>,
-    ) -> QuadResult<SecondaryIndex<EvictableBufferPool>> {
-        #[cfg(test)]
-        use tests::CreateIndexTestFailure;
-
-        let Self {
-            index_pool,
-            index_guard,
-            metadata,
-            index_spec,
-            build_ts,
-            #[cfg(test)]
-            test,
-        } = self;
-        let ty_infer = |col_no| metadata.col.col_type(col_no);
-        let mem =
-            NonUniqueMemIndex::new(index_pool, index_guard, index_spec, ty_infer, build_ts).await?;
-        #[cfg(test)]
-        let forced_population_failure =
-            test.maybe_fail_create(CreateIndexTestFailure::PopulateNonUnique);
-        #[cfg(not(test))]
-        let forced_population_failure: RuntimeResult<()> = Ok(());
-        let insert_res = match forced_population_failure {
-            Ok(()) => {
-                insert_create_index_non_unique_hot_rows(
-                    &mem,
-                    index_guard,
-                    &hot_rows,
-                    build_ts,
-                    #[cfg(test)]
-                    &test,
-                )
-                .await
-            }
-            Err(err) => Err(err.into()),
-        };
-        if let Err(err) = insert_res {
-            if let Err(report) = mem.destroy(index_guard).await {
-                let report = report.attach_with(|| {
-                    format!(
-                        "operation=rollback_create_non_unique_index_build, index_slot={}",
-                        disk_runtime.index_slot()
-                    )
-                });
-                obs::error!(
-                    "event=index_ddl_cleanup component=catalog_index action=destroy_unpublished result=error error={report:?}"
-                );
-            }
-            return Err(err.into());
-        }
-        Ok(SecondaryIndex::NonUnique {
-            mem,
-            disk: disk_runtime,
-        })
-    }
+// Mark destructive attempts before awaiting. An invariant unwind must never
+// retry installation or reclamation, unlike cancellation of a borrowed pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateHotPhase {
+    Unsettled,
+    Installing,
+    Settling,
+    Settled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +397,9 @@ struct CreateIndexProgress {
     trx: Option<PrivateTransaction>,
     staged_index: Option<Arc<SecondaryIndex<EvictableBufferPool>>>,
     new_layout: Option<TableRuntimeLayout>,
+    hot_build: Option<HotIndexBuild<EvictableBufferPool>>,
+    ready: Option<ReadyHotTree<EvictableBufferPool>>,
+    hot_phase: CreateHotPhase,
 }
 
 impl CreateIndexProgress {
@@ -563,6 +414,9 @@ impl CreateIndexProgress {
             trx: Some(trx),
             staged_index: None,
             new_layout: None,
+            hot_build: None,
+            ready: None,
+            hot_phase: CreateHotPhase::Unsettled,
         }
     }
 
@@ -578,12 +432,236 @@ impl CreateIndexProgress {
         self.build_ts
     }
 
-    #[inline]
-    fn stage_runtime_index(&mut self, index: SecondaryIndex<EvictableBufferPool>) {
-        debug_assert_eq!(self.phase, CreateIndexBuildPhase::Building);
-        debug_assert!(self.staged_index.is_none());
+    // The accepted caller retains the DDL gates throughout this awaited phase;
+    // hot extraction workers instead retain their own shared gate ownership.
+    async fn build_cold(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        plan: &mut CreateIndexPlan,
+        #[cfg(feature = "profiling")] measurements: &mut CreateIndexMeasurements,
+    ) -> QuadResult<(MutableTableFile, SecondaryDiskTreeRuntime, ColdValidation)> {
+        let index_slot = self.index.slot();
+        let mut secondary_index_slots = plan.take_secondary_index_slots();
+        let key_validator = CreateIndexKeyValidator::new(plan.new_index_spec());
+        let collector = CreateIndexCollector::new(
+            plan.table(),
+            guards,
+            plan.old_layout().as_ref(),
+            plan.new_index_spec(),
+            plan.active_root(),
+        );
+        let mut mutable_file = MutableTableFile::fork(
+            plan.table().file(),
+            engine.table_fs.background_writes(),
+            plan.table().disk_pool().clone(),
+            guards.disk_guard().clone(),
+        );
+        // Keep the private file and its writer claim alive through rollback.
+        let result: QuadResult<_> = async {
+            let disk_runtime = SecondaryDiskTreeRuntime::new(
+                index_slot,
+                Arc::clone(plan.new_metadata()),
+                Arc::clone(plan.table().file()),
+                plan.table().disk_pool().clone(),
+            )?;
+            #[cfg(feature = "profiling")]
+            let cold_started = Instant::now();
+            let mut cold_rows = collector.collect_current_cold().await?;
+            #[cfg(feature = "profiling")]
+            {
+                measurements.cold_collect_nanos = cold_started.elapsed().as_nanos() as u64;
+            }
+            #[cfg(test)]
+            engine
+                .index_ddl_test
+                .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
+                .await;
+            #[cfg(feature = "profiling")]
+            let sort_started = Instant::now();
+            key_validator.prepare_cold(&mut cold_rows)?;
+            #[cfg(feature = "profiling")]
+            {
+                measurements.cold_sort_nanos = sort_started.elapsed().as_nanos() as u64;
+            }
+            #[cfg(feature = "profiling")]
+            let disk_started = Instant::now();
+            let cold_root = build_create_index_disk_tree(
+                &mut mutable_file,
+                &disk_runtime,
+                guards,
+                plan.new_index_spec(),
+                &cold_rows,
+                self.build_ts(),
+            )
+            .await?;
+            #[cfg(feature = "profiling")]
+            {
+                measurements.cold_build_nanos = disk_started.elapsed().as_nanos() as u64;
+                measurements.cold_entries = cold_rows.len() as u64;
+            }
+            let cold_keys = ColdUniqueKeys::new(cold_rows);
+            #[cfg(feature = "profiling")]
+            {
+                measurements.retained_cold_bytes = cold_keys.retained_bytes();
+            }
+            #[cfg(test)]
+            engine
+                .index_ddl_test
+                .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
+                .await;
+            secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
+                index_id: self.index.id(),
+                root: SecondaryIndexRoot::from_block_id(cold_root),
+            };
+            mutable_file.replace_metadata_and_secondary_index_slots(
+                Arc::clone(plan.new_metadata()),
+                secondary_index_slots,
+            );
+            let cold = if plan.new_index_spec().unique() {
+                ColdValidation::Required(cold_keys)
+            } else {
+                drop(cold_keys);
+                ColdValidation::NotRequired
+            };
+            Ok((disk_runtime, cold))
+        }
+        .await;
+        match result {
+            Ok((disk_runtime, cold)) => Ok((mutable_file, disk_runtime, cold)),
+            Err(source) => {
+                let cleanup = self.rollback_before_catalog_commit(guards).await;
+                Err(merge_create_failure(source, cleanup))
+            }
+        }
+    }
+
+    async fn build_hot(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        plan: &CreateIndexPlan,
+        gates: Arc<IndexDdlGateScope>,
+        disk: SecondaryDiskTreeRuntime,
+        cold: ColdValidation,
+    ) -> QuadResult<()> {
+        let index = create_empty_index_runtime(engine, guards, plan, disk, self.build_ts).await?;
+        // The fixed empty root belongs to progress before capture or child admission.
         self.staged_index = Some(Arc::new(index));
+        let source = capture_hot_index_build(
+            plan,
+            gates,
+            guards.clone(),
+            self.build_ts,
+            engine.hot_build_policy,
+            #[cfg(feature = "profiling")]
+            engine.trx_sys.hot_build_profiler.clone(),
+        )
+        .await?;
+        let build = self.hot_build.insert(HotIndexBuild::new(
+            Arc::new(source),
+            engine.pools.index.clone(),
+            guards.index_guard().clone(),
+            engine.thread_pool.clone(),
+            engine.poisoner.clone(),
+            engine.hot_build_policy,
+            cold,
+        ));
+        #[cfg(test)]
+        {
+            engine.index_ddl_test.configure_hot_build(build);
+            engine
+                .index_ddl_test
+                .reach_phase(IndexDdlTestPhase::CreateHotSourceCaptured)
+                .await;
+            if !plan.new_index_spec().unique() {
+                engine
+                    .index_ddl_test
+                    .maybe_fail_create(CreateIndexTestFailure::PopulateNonUnique)?;
+            }
+        }
+        let ready = match build.build().await? {
+            HotPackedOutcome::Complete(ready) => ready,
+            HotPackedOutcome::Duplicate(conflict) => {
+                return Err(Report::new(OperationError::DuplicateKey)
+                    .attach(format!(
+                        "operation=create_index, table_id={}, index={}, origin={:?}, hot_rank={}, rows={:?}",
+                        self.table_id, self.index, conflict.origin, conflict.right_rank, conflict.rows
+                    ))
+                    .into());
+            }
+        };
+        self.install_hot(
+            ready,
+            #[cfg(test)]
+            &engine.index_ddl_test,
+        )
+        .await?;
+        self.settle_hot().await?;
         self.phase = CreateIndexBuildPhase::RuntimeStaged;
+        Ok(())
+    }
+
+    async fn install_hot(
+        &mut self,
+        ready: ReadyHotTree<EvictableBufferPool>,
+        #[cfg(test)] test: &IndexDdlTestController,
+    ) -> RuntimeOrFatalResult<()> {
+        let ready = self.ready.insert(ready);
+        #[cfg(test)]
+        test.reach_phase(IndexDdlTestPhase::CreateHotTreeReady)
+            .await;
+        self.hot_phase = CreateHotPhase::Installing;
+        #[cfg(test)]
+        {
+            test.configure_install(ready);
+            test.reach_phase(IndexDdlTestPhase::CreateInstalling).await;
+        }
+        let destination = self
+            .staged_index
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("private runtime retained before build"));
+        let mem = match destination.as_ref() {
+            SecondaryIndex::Unique { mem, .. } => &**mem,
+            SecondaryIndex::NonUnique { mem, .. } => &**mem,
+        };
+        let result = ready.install(mem).await;
+        // Typed installation failures happen before transfer; only an unwind
+        // leaves Installing set and forbids traversing possibly transferred pages.
+        self.hot_phase = CreateHotPhase::Unsettled;
+        result
+    }
+
+    // Obligation drain in the existing accepted task: stage producers and ready
+    // decisions provide progress, retained completion slots authorize completion.
+    // Poison/shutdown do not cancel this wait. The accepted owner retains logical
+    // locks, source metadata admission and storage until settlement finishes.
+    async fn settle_hot(&mut self) -> RuntimeOrFatalResult<()> {
+        if self.hot_phase == CreateHotPhase::Settled {
+            return Ok(());
+        }
+        assert_ne!(
+            self.hot_phase,
+            CreateHotPhase::Installing,
+            "CREATE cannot retry an invariant-failed ownership transfer"
+        );
+        if self.hot_phase == CreateHotPhase::Unsettled
+            && let Some(ready) = &mut self.ready
+            && !ready.is_installed()
+        {
+            ready.abort()?;
+        }
+        self.hot_phase = CreateHotPhase::Settling;
+        // Cancellation of this borrow can resume the retained pipeline. Only
+        // mandatory panic supervision interprets Settling as a failed attempt
+        // and refuses to retry possibly partial deallocation.
+        let result = if let Some(build) = &mut self.hot_build {
+            build.settle().await
+        } else {
+            Ok(())
+        };
+        self.hot_phase = CreateHotPhase::Settled;
+        result
     }
 
     #[inline]
@@ -611,6 +689,55 @@ impl CreateIndexProgress {
         debug_assert!(self.new_layout.is_none());
         self.new_layout = Some(layout);
         self.phase = CreateIndexBuildPhase::LayoutStaged;
+    }
+
+    async fn stage_and_commit_catalog(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        plan: &CreateIndexPlan,
+    ) -> RuntimeOrFatalResult<TrxID> {
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateRuntimeStaged)
+            .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_create(CreateIndexTestFailure::AfterRuntimeStaged)
+        {
+            let cleanup = self.rollback_before_catalog_commit(guards).await;
+            return merge_build_result(Err(err.into()), cleanup);
+        }
+        let new_layout = build_created_index_runtime_layout(
+            plan.old_layout(),
+            Arc::clone(plan.new_metadata()),
+            self.index,
+            self.clone_staged_index_for_layout(),
+        );
+        self.stage_layout(new_layout);
+        self.execute_catalog_update(
+            engine,
+            guards,
+            plan.new_metadata().as_ref(),
+            plan.definition_effects(),
+        )
+        .await?;
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateCatalogStaged)
+            .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogStaged)
+        {
+            let cleanup = self.rollback_before_catalog_commit(guards).await;
+            return merge_build_result(Err(err.into()), cleanup);
+        }
+        self.commit_catalog(guards).await
     }
 
     async fn execute_catalog_update(
@@ -668,11 +795,119 @@ impl CreateIndexProgress {
                 Ok(cts)
             }
             Err(err) => {
-                self.cleanup_staged_runtime(guards).await;
+                let cleanup = self.cleanup_staged_runtime(guards).await;
                 self.phase = CreateIndexBuildPhase::Aborted;
-                Err(err)
+                merge_build_result(Err(err), cleanup)
             }
         }
+    }
+
+    async fn publish_created_index(
+        &mut self,
+        engine: &EngineCore,
+        guards: &PoolGuards,
+        plan: &CreateIndexPlan,
+        mutable_file: MutableTableFile,
+        create_cts: TrxID,
+    ) -> RuntimeOrFatalResult<()> {
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateCatalogCommitted)
+            .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogCommitted)
+        {
+            return Err(self
+                .cleanup_after_catalog_commit_failure(
+                    engine,
+                    guards,
+                    "test_CatalogCommitted",
+                    RuntimeOrFatalError::from(err),
+                )
+                .await);
+        }
+        if let Err(err) = engine
+            .trx_sys
+            .publish_table_file_root(mutable_file, create_cts, false)
+            .await
+        {
+            return Err(self
+                .cleanup_after_catalog_commit_failure(engine, guards, "table_root_publish", err)
+                .await);
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateRootPublished)
+            .await;
+        #[cfg(test)]
+        if let Err(err) = engine
+            .index_ddl_test
+            .maybe_fail_phase(IndexDdlTestPhase::CreateRootPublished)
+        {
+            return Err(self
+                .cleanup_after_catalog_commit_failure(
+                    engine,
+                    guards,
+                    "test_RootPublished",
+                    RuntimeOrFatalError::from(err),
+                )
+                .await);
+        }
+        let new_layout = self.take_layout_for_install();
+        if engine
+            .catalog()
+            .install_created_index_layout_and_publish_history(
+                create_cts,
+                plan,
+                new_layout,
+                #[cfg(test)]
+                &engine.index_ddl_test,
+            )
+            .is_none()
+        {
+            let cleanup = self.cleanup_staged_runtime(guards).await;
+            self.phase = CreateIndexBuildPhase::Aborted;
+            let source = poison_index_publication_invariant(
+                &engine.poisoner,
+                IndexDdlKind::Create,
+                self.table_id,
+                self.index,
+            );
+            return Err(match cleanup {
+                Ok(()) => source,
+                Err(cleanup) => source.merge_cleanup(cleanup),
+            });
+        }
+        self.mark_installed();
+        Ok(())
+    }
+
+    #[cfg(feature = "profiling")]
+    fn record_create_measurements(
+        &self,
+        profiler: &HotIndexBuildProfiler,
+        mut measurements: CreateIndexMeasurements,
+        create_started: Instant,
+    ) {
+        let build = self
+            .hot_build
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("published CREATE owns completed build"));
+        let ready = self
+            .ready
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("published CREATE owns installed tree"));
+        let (extraction, merge, packed, cleanup) = build.measurements(ready);
+        let cold = ready.cold_measurements();
+        measurements.cold_hot_comparisons = cold.comparisons;
+        measurements.cold_hot_worker_nanos = cold.worker_nanos;
+        measurements.max_cold_hot_sync_nanos = cold.max_sync_nanos;
+        measurements.total_elapsed_nanos = create_started.elapsed().as_nanos() as u64;
+        profiler.record_create(&measurements, extraction, merge, packed, cleanup);
     }
 
     fn take_layout_for_install(&mut self) -> TableRuntimeLayout {
@@ -701,11 +936,10 @@ impl CreateIndexProgress {
         &mut self,
         guards: &PoolGuards,
     ) -> RuntimeOrFatalResult<()> {
-        self.cleanup_staged_runtime(guards).await;
-        let rollback_res = rollback_active_ddl_trx(&mut self.trx).await;
+        let cleanup = self.cleanup_staged_runtime(guards).await;
+        let rollback = rollback_active_ddl_trx(&mut self.trx).await;
         self.phase = CreateIndexBuildPhase::Aborted;
-        rollback_res?;
-        Ok(())
+        merge_build_result(cleanup, rollback)
     }
 
     async fn cleanup_after_catalog_commit_failure(
@@ -715,7 +949,10 @@ impl CreateIndexProgress {
         operation: &'static str,
         source: RuntimeOrFatalError,
     ) -> RuntimeOrFatalError {
-        self.cleanup_staged_runtime(guards).await;
+        let source = match self.cleanup_staged_runtime(guards).await {
+            Ok(()) => source,
+            Err(cleanup) => source.merge_cleanup(cleanup),
+        };
         self.phase = CreateIndexBuildPhase::Aborted;
         poison_index_after_catalog_commit_with_source(
             &engine.poisoner,
@@ -727,23 +964,17 @@ impl CreateIndexProgress {
         )
     }
 
-    async fn cleanup_staged_runtime(&mut self, guards: &PoolGuards) {
+    async fn cleanup_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeOrFatalResult<()> {
+        let settlement = self.settle_hot().await;
         self.new_layout = None;
-        if let Some(index) = self.staged_index.take() {
-            // Preserve the existing best-effort cleanup policy. A destroy
-            // failure is observed but does not replace the DDL source.
-            if let Err(report) = destroy_uninstalled_staged_index(index, guards).await {
-                let report = report.attach_with(|| {
-                    format!(
-                        "operation=cleanup_create_index_staged_runtime, table_id={}, index={}",
-                        self.table_id, self.index
-                    )
-                });
-                obs::error!(
-                    "event=index_ddl_cleanup component=catalog_index action=destroy_staged result=error error={report:?}"
-                );
-            }
-        }
+        self.ready = None;
+        // Taking the runtime before awaiting disarms destruction even if it unwinds.
+        let destruction = if let Some(index) = self.staged_index.take() {
+            destroy_uninstalled_staged_index(index, guards).await
+        } else {
+            Ok(())
+        };
+        merge_build_result(settlement, destruction)
     }
 }
 
@@ -949,7 +1180,7 @@ impl PreparedExecution for PreparedCreateIndex {
         let table_id = plan.table_id();
         let index = plan.index();
         AcceptedCreateIndex {
-            gates: Some(gates),
+            gates: Some(Arc::new(gates)),
             scope: scope.accept(),
             table_id,
             index,
@@ -961,7 +1192,7 @@ impl PreparedExecution for PreparedCreateIndex {
 
 /// Mandatory-runtime owner of accepted CREATE INDEX execution.
 pub(crate) struct AcceptedCreateIndex {
-    gates: Option<IndexDdlGateScope>,
+    gates: Option<Arc<IndexDdlGateScope>>,
     scope: AcceptedDdlScope,
     table_id: TableID,
     index: IndexRef,
@@ -975,7 +1206,9 @@ impl AcceptedExecution for AcceptedCreateIndex {
     #[inline]
     async fn execute(&mut self) -> CompletionResult<Self::Output> {
         let result = self.execute_inner().await;
-        self.scope.mark_terminal_ready();
+        if !self.scope.is_failed_retained() {
+            self.scope.mark_terminal_ready();
+        }
         result
     }
 
@@ -987,35 +1220,64 @@ impl AcceptedExecution for AcceptedCreateIndex {
         self.scope.finish();
     }
 
-    #[inline]
-    async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
-        if let Some(progress) = self.progress.as_mut() {
-            progress.park_active_transaction();
-        }
-        self.scope.handle_panic();
+    #[cold]
+    async fn handle_panic(&mut self, panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
         let phase = self
             .progress
             .as_ref()
-            .map_or(CreateIndexBuildPhase::Building, |progress| progress.phase);
-        CompletionErrorBridge::capture(Report::new(FatalError::MandatoryTaskPanic).attach(format!(
-            "accepted CREATE INDEX panicked: table_id={}, index={}, phase={phase:?}",
-            self.table_id, self.index
-        )))
+            .map_or(CreateIndexBuildPhase::Building, |p| p.phase);
+        let mut source: RuntimeOrFatalError = Report::new(FatalError::MandatoryTaskPanic)
+            .attach(format!(
+                "accepted CREATE INDEX panicked: table_id={}, index={}, phase={phase:?}, panic={}",
+                self.table_id,
+                self.index,
+                panic_payload_description(panic.as_ref())
+            ))
+            .into();
+        mem::forget(panic);
+        if let Some(progress) = self.progress.as_mut() {
+            progress.park_active_transaction();
+            if progress.phase == CreateIndexBuildPhase::Building
+                && !matches!(
+                    progress.hot_phase,
+                    CreateHotPhase::Installing | CreateHotPhase::Settling
+                )
+            {
+                let runtime = self.scope.engine().clone();
+                match AssertUnwindSafe(progress.cleanup_staged_runtime(runtime.pool_guards()))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => (),
+                    Ok(Err(cleanup)) => source = source.merge_cleanup(cleanup),
+                    Err(payload) => {
+                        let cleanup = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+                            "CREATE panic settlement also panicked: {}",
+                            panic_payload_description(payload.as_ref())
+                        ));
+                        mem::forget(payload);
+                        source = source.merge_cleanup(cleanup.into());
+                    }
+                }
+            }
+        }
+        self.scope.handle_panic();
+        CompletionErrorBridge::capture_runtime_or_fatal(source)
     }
 }
 
 impl AcceptedCreateIndex {
     async fn execute_inner(&mut self) -> CompletionResult<IndexID> {
+        #[cfg(feature = "profiling")]
+        let create_started = Instant::now();
+        #[cfg(feature = "profiling")]
+        let mut measurements = CreateIndexMeasurements::default();
         let mut plan = self.plan.take().unwrap_or_else(|| {
             panic!("accepted CREATE INDEX invariant violated: execution plan is missing")
         });
         let runtime = self.scope.engine().clone();
         let engine = runtime.core();
         let guards = runtime.pool_guards();
-        let table_id = plan.table_id();
-        let index = plan.index();
-        let index_slot = index.slot();
-        let mut secondary_index_slots = plan.take_secondary_index_slots();
 
         #[cfg(test)]
         engine
@@ -1028,15 +1290,9 @@ impl AcceptedCreateIndex {
                 err.attach("operation=create_index, phase=begin_private_transaction"),
             )
         })?;
-        self.progress = Some(CreateIndexProgress::new(table_id, index, trx));
-        let progress = self
-            .progress
-            .as_mut()
-            .unwrap_or_else(|| {
-                panic!(
-                    "accepted CREATE INDEX invariant violated: progress state is missing after transaction initialization"
-                )
-            });
+        let progress =
+            self.progress
+                .insert(CreateIndexProgress::new(self.table_id, self.index, trx));
 
         #[cfg(test)]
         engine
@@ -1044,273 +1300,85 @@ impl AcceptedCreateIndex {
             .reach_phase(IndexDdlTestPhase::CreatePrivateTransactionBegun)
             .await;
 
-        let build_ts = progress.build_ts();
-        let key_validator = CreateIndexKeyValidator::new(plan.new_index_spec());
-        let collector = CreateIndexCollector::new(
-            plan.table(),
-            guards,
-            plan.old_layout().as_ref(),
-            plan.new_index_spec(),
-            plan.active_root(),
-        );
-        let mut mutable_file = MutableTableFile::fork(
-            plan.table().file(),
-            engine.table_fs.background_writes(),
-            plan.table().disk_pool().clone(),
-            guards.disk_guard().clone(),
-        );
-        let disk_runtime = match SecondaryDiskTreeRuntime::new(
-            index_slot,
-            Arc::clone(plan.new_metadata()),
-            Arc::clone(plan.table().file()),
-            plan.table().disk_pool().clone(),
-        ) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-                }
-                return Err(CompletionErrorBridge::capture(err));
-            }
-        };
-
-        let mut cold_rows = match collector.collect_current_cold().await {
-            Ok(cold_rows) => cold_rows,
-            Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-                }
-                return Err(CompletionErrorBridge::capture_quad(err));
-            }
-        };
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
-            .await;
-        if let Err(err) = key_validator.prepare_cold(&mut cold_rows) {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-            }
-            return Err(CompletionErrorBridge::capture(err));
-        }
-
-        let cold_root = match build_create_index_disk_tree(
-            &mut mutable_file,
-            &disk_runtime,
-            guards,
-            plan.new_index_spec(),
-            &cold_rows,
-            build_ts,
-        )
-        .await
-        {
-            Ok(root) => root,
-            Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-                }
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
-            }
-        };
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
-            .await;
-        secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
-            index_id: plan.index().id(),
-            root: SecondaryIndexRoot::from_block_id(cold_root),
-        };
-        mutable_file.replace_metadata_and_secondary_index_slots(
-            Arc::clone(plan.new_metadata()),
-            secondary_index_slots,
-        );
-
-        let runtime_builder = CreateIndexRuntimeBuilder::new(
-            engine,
-            guards,
-            plan.new_metadata().as_ref(),
-            plan.new_index_spec(),
-            build_ts,
-        );
-        let mut hot_rows = match collector.collect_current_hot().await {
-            Ok(hot_rows) => hot_rows,
-            Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-                }
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
-            }
-        };
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateHotCollectionComplete)
-            .await;
-        if let Err(err) = key_validator.prepare_hot(&mut hot_rows, &cold_rows) {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-            }
-            return Err(CompletionErrorBridge::capture(err));
-        }
-        let runtime_index = if plan.new_index_spec().unique() {
-            runtime_builder.build_unique(disk_runtime, hot_rows).await
-        } else {
-            runtime_builder
-                .build_non_unique(disk_runtime, hot_rows)
-                .await
-        };
-        match runtime_index {
-            Ok(index) => progress.stage_runtime_index(index),
-            Err(err) => {
-                if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                    return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-                }
-                return Err(CompletionErrorBridge::capture_quad(err));
-            }
-        }
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateRuntimeStaged)
-            .await;
-
-        #[cfg(test)]
-        if let Err(err) = engine
-            .index_ddl_test
-            .maybe_fail_create(CreateIndexTestFailure::AfterRuntimeStaged)
-        {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-            }
-            return Err(CompletionErrorBridge::capture(err));
-        }
-
-        let new_layout = build_created_index_runtime_layout(
-            plan.old_layout(),
-            Arc::clone(plan.new_metadata()),
-            index,
-            progress.clone_staged_index_for_layout(),
-        );
-        progress.stage_layout(new_layout);
-
-        if let Err(err) = progress
-            .execute_catalog_update(
+        let (mutable_file, disk_runtime, cold) = progress
+            .build_cold(
                 engine,
                 guards,
-                plan.new_metadata().as_ref(),
-                plan.definition_effects(),
+                &mut plan,
+                #[cfg(feature = "profiling")]
+                &mut measurements,
             )
             .await
+            .map_err(CompletionErrorBridge::capture_quad)?;
+        let gates = self
+            .gates
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("accepted CREATE retains gates"))
+            .clone();
+        if let Err(source) = progress
+            .build_hot(engine, guards, &plan, gates, disk_runtime, cold)
+            .await
         {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(err));
-        }
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateCatalogStaged)
-            .await;
-        #[cfg(test)]
-        if let Err(err) = engine
-            .index_ddl_test
-            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogStaged)
-        {
-            if let Err(cleanup) = progress.rollback_before_catalog_commit(guards).await {
-                return Err(CompletionErrorBridge::capture_runtime_or_fatal(cleanup));
-            }
-            return Err(CompletionErrorBridge::capture(err));
+            return Err(CompletionErrorBridge::capture_quad(
+                self.handle_hot_build_failure(guards, source).await,
+            ));
         }
         let create_cts = progress
-            .commit_catalog(guards)
+            .stage_and_commit_catalog(engine, guards, &plan)
             .await
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateCatalogCommitted)
-            .await;
-        #[cfg(test)]
-        if let Err(err) = engine
-            .index_ddl_test
-            .maybe_fail_phase(IndexDdlTestPhase::CreateCatalogCommitted)
-        {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                progress
-                    .cleanup_after_catalog_commit_failure(
-                        engine,
-                        guards,
-                        "test_CatalogCommitted",
-                        RuntimeOrFatalError::from(err),
-                    )
-                    .await,
-            ));
-        }
-
-        if let Err(err) = engine
-            .trx_sys
-            .publish_table_file_root(mutable_file, create_cts, false)
+        progress
+            .publish_created_index(engine, guards, &plan, mutable_file, create_cts)
             .await
-        {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                progress
-                    .cleanup_after_catalog_commit_failure(engine, guards, "table_root_publish", err)
-                    .await,
-            ));
-        }
-        #[cfg(test)]
-        engine
-            .index_ddl_test
-            .reach_phase(IndexDdlTestPhase::CreateRootPublished)
-            .await;
-        #[cfg(test)]
-        if let Err(err) = engine
-            .index_ddl_test
-            .maybe_fail_phase(IndexDdlTestPhase::CreateRootPublished)
-        {
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                progress
-                    .cleanup_after_catalog_commit_failure(
-                        engine,
-                        guards,
-                        "test_RootPublished",
-                        RuntimeOrFatalError::from(err),
-                    )
-                    .await,
-            ));
-        }
-
-        let new_layout = progress.take_layout_for_install();
-        if engine
-            .catalog()
-            .install_created_index_layout_and_publish_history(
-                create_cts,
-                &plan,
-                new_layout,
-                #[cfg(test)]
-                &engine.index_ddl_test,
-            )
-            .is_none()
-        {
-            progress.cleanup_staged_runtime(guards).await;
-            progress.phase = CreateIndexBuildPhase::Aborted;
-            return Err(CompletionErrorBridge::capture_runtime_or_fatal(
-                poison_index_publication_invariant(
-                    &engine.poisoner,
-                    IndexDdlKind::Create,
-                    table_id,
-                    index,
-                ),
-            ));
-        }
-        progress.mark_installed();
+            .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
+        #[cfg(feature = "profiling")]
+        progress.record_create_measurements(
+            &engine.trx_sys.hot_build_profiler,
+            measurements,
+            create_started,
+        );
         #[cfg(test)]
         engine
             .index_ddl_test
             .reach_phase(IndexDdlTestPhase::CreateLayoutHistoryPublished)
             .await;
         engine.trx_sys.request_metadata_history_purge();
-        Ok(index.id())
+        Ok(self.index.id())
+    }
+
+    #[cold]
+    async fn handle_hot_build_failure(
+        &mut self,
+        guards: &PoolGuards,
+        source: QuadError,
+    ) -> QuadError {
+        let progress = self
+            .progress
+            .as_mut()
+            .unwrap_or_else(|| unreachable!("CREATE hot build retains progress before execution"));
+        let cleanup = if matches!(&source, QuadError::Fatal(_)) {
+            // The pipeline catches construction unwind with ledgers intact.
+            // Park raw-reference-sensitive transaction ownership before drain.
+            progress.park_active_transaction();
+            let cleanup = AssertUnwindSafe(progress.cleanup_staged_runtime(guards))
+                .catch_unwind()
+                .await;
+            self.scope.handle_panic();
+            match cleanup {
+                Ok(result) => result,
+                Err(payload) => {
+                    let report = Report::new(FatalError::MandatoryTaskPanic).attach(format!(
+                        "operation=create_index, phase=panic_settlement, panic={}",
+                        panic_payload_description(payload.as_ref())
+                    ));
+                    mem::forget(payload);
+                    Err(report.into())
+                }
+            }
+        } else {
+            progress.rollback_before_catalog_commit(guards).await
+        };
+        merge_create_failure(source, cleanup)
     }
 }
 
@@ -1404,7 +1472,6 @@ impl AcceptedExecution for AcceptedDropIndex {
         self.scope.finish();
     }
 
-    #[inline]
     async fn handle_panic(&mut self, _panic: Box<dyn Any + Send>) -> CompletionErrorBridge {
         if let Some(progress) = self.progress.as_mut() {
             progress.park_active_transaction();
@@ -1698,13 +1765,6 @@ pub(crate) fn classify_index_ddl_root(
 /// The owned gate keeps table/catalog metadata admission live through accepted jobs.
 /// The enclosing accepted DDL owner must also retain its transaction's data
 /// exclusion and this scope through settlement; capture does not acquire it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "RFC 0032 phase 5 integrates the production caller"
-    )
-)]
 pub(crate) async fn capture_hot_index_build(
     plan: &CreateIndexPlan,
     gates: Arc<IndexDdlGateScope>,
@@ -1760,6 +1820,44 @@ pub(crate) async fn capture_hot_index_build(
         source.capture_elapsed_nanos = started.elapsed().as_nanos() as u64;
     }
     Ok(source)
+}
+
+async fn create_empty_index_runtime(
+    engine: &EngineCore,
+    guards: &PoolGuards,
+    plan: &CreateIndexPlan,
+    disk: SecondaryDiskTreeRuntime,
+    build_ts: TrxID,
+) -> RuntimeOrFatalResult<SecondaryIndex<EvictableBufferPool>> {
+    let pool = engine.pools.index.clone();
+    let guard = guards.index_guard();
+    let spec = plan.new_index_spec();
+    let ty_infer = |column| plan.new_metadata().col.col_type(column);
+    if spec.unique() {
+        let mem = UniqueMemIndex::new(pool, guard, spec, ty_infer, build_ts).await?;
+        Ok(SecondaryIndex::Unique { mem, disk })
+    } else {
+        let mem = NonUniqueMemIndex::new(pool, guard, spec, ty_infer, build_ts).await?;
+        Ok(SecondaryIndex::NonUnique { mem, disk })
+    }
+}
+
+fn merge_create_failure(source: QuadError, cleanup: RuntimeOrFatalResult<()>) -> QuadError {
+    let Err(cleanup) = cleanup else {
+        return source;
+    };
+    match source {
+        QuadError::Runtime(report) => RuntimeOrFatalError::Runtime(report)
+            .merge_cleanup(cleanup)
+            .into(),
+        QuadError::Fatal(report) => RuntimeOrFatalError::Fatal(report)
+            .merge_cleanup(cleanup)
+            .into(),
+        source => match cleanup {
+            RuntimeOrFatalError::Runtime(report) => QuadError::Runtime(report.attach(source)),
+            RuntimeOrFatalError::Fatal(report) => QuadError::Fatal(report.attach(source)),
+        },
+    }
 }
 
 async fn rollback_active_ddl_trx(trx: &mut Option<PrivateTransaction>) -> RuntimeOrFatalResult<()> {
@@ -1818,7 +1916,7 @@ async fn build_create_index_disk_tree(
     disk_runtime: &SecondaryDiskTreeRuntime,
     guards: &PoolGuards,
     index_spec: &TableIndexMetadata,
-    rows: &[CreateIndexRowEntry],
+    rows: &[IndexBuildEntry],
     build_ts: TrxID,
 ) -> RuntimeOrFatalResult<Option<BlockID>> {
     if rows.is_empty() {
@@ -1853,69 +1951,6 @@ async fn build_create_index_disk_tree(
         writer.batch_insert_encoded(&batch)?;
         writer.finish().await
     }
-}
-
-async fn insert_create_index_unique_hot_rows(
-    mem: &UniqueMemIndex<EvictableBufferPool>,
-    index_guard: &PoolGuard,
-    hot_rows: &[CreateIndexRowEntry],
-    build_ts: TrxID,
-    #[cfg(test)] test: &tests::IndexDdlTestController,
-) -> QuadResult<()> {
-    for (row_no, row) in hot_rows.iter().enumerate() {
-        match mem
-            .bind(index_guard)
-            .insert_encoded_if_not_exists(&row.key, row.row_id, false, build_ts)
-            .await?
-        {
-            IndexInsert::Ok(_) => (),
-            IndexInsert::DuplicateKey(..) => {
-                return Err(Report::new(OperationError::DuplicateKey).attach(format!(
-                    "create unique index found duplicate hot key during MemIndex build: row_id={}",
-                    row.row_id
-                ))
-                .into());
-            }
-        }
-        if row_no % POLL_BUDGET == POLL_BUDGET - 1 {
-            #[cfg(test)]
-            test.reach_phase(tests::IndexDdlTestPhase::CreateHotBuildBatchComplete)
-                .await;
-            yield_now().await;
-        }
-    }
-    Ok(())
-}
-
-async fn insert_create_index_non_unique_hot_rows(
-    mem: &NonUniqueMemIndex<EvictableBufferPool>,
-    index_guard: &PoolGuard,
-    hot_rows: &[CreateIndexRowEntry],
-    build_ts: TrxID,
-    #[cfg(test)] test: &tests::IndexDdlTestController,
-) -> RuntimeOrFatalResult<()> {
-    for (row_no, row) in hot_rows.iter().enumerate() {
-        match mem
-            .bind(index_guard)
-            .insert_encoded_if_not_exists(&row.key, row.row_id, false, build_ts)
-            .await?
-        {
-            IndexInsert::Ok(_) => (),
-            IndexInsert::DuplicateKey(..) => {
-                panic!(
-                    "create-index build invariant violated: current non-unique exact key duplicated for row_id={}",
-                    row.row_id
-                );
-            }
-        }
-        if row_no % POLL_BUDGET == POLL_BUDGET - 1 {
-            #[cfg(test)]
-            test.reach_phase(tests::IndexDdlTestPhase::CreateHotBuildBatchComplete)
-                .await;
-            yield_now().await;
-        }
-    }
-    Ok(())
 }
 
 fn build_created_index_runtime_layout(
@@ -2034,6 +2069,7 @@ fn poison_index_publication_invariant(
 pub(crate) mod tests {
     use super::*;
     use crate::buffer::BufferPool;
+    use crate::buffer::guard::PageGuard;
     use crate::catalog::{
         ActiveIndexSpec, CurrentTableState, ResolvedVisibleTableMetadata, SecondaryIndexSlot,
         StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
@@ -2042,9 +2078,11 @@ pub(crate) mod tests {
     use crate::conf::MandatoryRuntimeConfig;
     use crate::engine::Engine;
     use crate::error::LifecycleError;
+    use crate::error::RuntimeResult;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::IndexBatchStream;
+    use crate::index::build::tree_builder::panic_install_transfer;
     use crate::row::ops::{SelectKey, UniqueMutationOutcome, UpdateCol};
     use crate::session::Session;
     use crate::session::tests::{
@@ -2082,8 +2120,9 @@ pub(crate) mod tests {
         CreatePrivateTransactionBegun,
         CreateColdCollectionComplete,
         CreateDiskTreeBuilt,
-        CreateHotCollectionComplete,
-        CreateHotBuildBatchComplete,
+        CreateHotSourceCaptured,
+        CreateHotTreeReady,
+        CreateInstalling,
         CreateRuntimeStaged,
         CreateCatalogStaged,
         CreateCatalogCommitted,
@@ -2111,8 +2150,11 @@ pub(crate) mod tests {
         release: flume::Receiver<()>,
     }
 
+    type HotBuildHook = Arc<dyn Fn(&mut HotIndexBuild<EvictableBufferPool>) + Send + Sync>;
+
     #[derive(Default)]
     struct IndexDdlTestState {
+        hot_build: parking_lot::Mutex<Option<HotBuildHook>>,
         create_failure: parking_lot::Mutex<Option<CreateIndexTestFailure>>,
         panic_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
         failure_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
@@ -2127,6 +2169,23 @@ pub(crate) mod tests {
     }
 
     impl IndexDdlTestController {
+        /// Move installation panic injection to the actual partial-transfer edge.
+        pub(super) fn configure_install(&self, ready: &mut ReadyHotTree<EvictableBufferPool>) {
+            let mut phase = self.state.panic_phase.lock();
+            if *phase == Some(IndexDdlTestPhase::CreateInstalling) {
+                *phase = None;
+                panic_install_transfer(ready);
+            }
+        }
+
+        /// Configure one retained build before any child admission.
+        pub(super) fn configure_hot_build(&self, build: &mut HotIndexBuild<EvictableBufferPool>) {
+            let hook = self.state.hot_build.lock().take();
+            if let Some(hook) = hook {
+                hook(build);
+            }
+        }
+
         pub(super) fn maybe_fail_create(
             &self,
             failure: CreateIndexTestFailure,
@@ -2256,6 +2315,8 @@ pub(crate) mod tests {
         layout_generation: u64,
         runtime_slots: Vec<bool>,
         root: ActiveRoot,
+        #[cfg(feature = "profiling")]
+        published_creates: u64,
     }
 
     /// Run the existing CREATE collector as an independent component correctness oracle.
@@ -2294,6 +2355,15 @@ pub(crate) mod tests {
         };
         let layout = table.layout_snapshot();
         IndexDdlSnapshot {
+            #[cfg(feature = "profiling")]
+            published_creates: engine
+                .inner()
+                .trx_sys
+                .hot_build_profiler
+                .snapshot()
+                .create
+                .hot
+                .completed_builds,
             current_effective_cts: effective_cts,
             current_metadata: metadata,
             history_count: engine
@@ -2317,6 +2387,19 @@ pub(crate) mod tests {
         table_id: TableID,
         table: &Table,
     ) {
+        #[cfg(feature = "profiling")]
+        assert_eq!(
+            before.published_creates,
+            engine
+                .inner()
+                .trx_sys
+                .hot_build_profiler
+                .snapshot()
+                .create
+                .hot
+                .completed_builds,
+            "failed DDL must not publish a successful CREATE sample"
+        );
         let CurrentTableState::Live {
             effective_cts,
             metadata,
@@ -2802,12 +2885,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Purpose: Preserve the different ordering needs of cold and hot index construction.
-    /// Expected: Cold entries are sorted for durable construction while hot entry order is
-    /// preserved.
+    /// Purpose: Order non-unique cold input before durable index construction.
+    /// Expected: Physical keys are sorted while their associated RowIDs are preserved.
     #[test]
-    fn create_index_key_validator_only_sorts_non_unique_cold_entries() {
-        let row = |key: &[u8], row_id| CreateIndexRowEntry {
+    fn create_index_key_validator_sorts_non_unique_cold_entries() {
+        let row = |key: &[u8], row_id| IndexBuildEntry {
             key: BTreeKey::from(key),
             row_id: RowID::new(row_id),
         };
@@ -2817,17 +2899,15 @@ pub(crate) mod tests {
         assert_eq!(cold_rows[0].key.as_bytes(), b"cold-a");
         assert_eq!(cold_rows[1].key.as_bytes(), b"cold-b");
 
-        let mut hot_rows = vec![row(b"hot-b", 4), row(b"hot-a", 3)];
-        validator.prepare_hot(&mut hot_rows, &cold_rows).unwrap();
-        assert_eq!(hot_rows[0].key.as_bytes(), b"hot-b");
-        assert_eq!(hot_rows[1].key.as_bytes(), b"hot-a");
+        assert_eq!(cold_rows[0].row_id, RowID::new(1));
+        assert_eq!(cold_rows[1].row_id, RowID::new(2));
     }
 
     /// Purpose: Enforce uniqueness while preparing cold index entries.
     /// Expected: Duplicate cold keys are rejected before index construction.
     #[test]
     fn create_index_key_validator_rejects_unique_cold_duplicate() {
-        let row = |row_id| CreateIndexRowEntry {
+        let row = |row_id| IndexBuildEntry {
             key: BTreeKey::from(&b"duplicate"[..]),
             row_id: RowID::new(row_id),
         };
@@ -3071,7 +3151,7 @@ pub(crate) mod tests {
                         let (entered, release) = engine
                             .inner()
                             .index_ddl_test
-                            .install_gate(IndexDdlTestPhase::CreateHotBuildBatchComplete);
+                            .install_gate(IndexDdlTestPhase::CreateHotTreeReady);
                         let mut create = Box::pin(ddl_session.create_index(
                             table_id,
                             StorageIndexSpec::new(
@@ -3207,6 +3287,456 @@ pub(crate) mod tests {
             remove_session_for_test(&engine.inner().session_registry, session_id);
             drop(session);
             engine.shutdown();
+        });
+    }
+
+    /// Purpose: Keep accepted CREATE alive when its observer detaches during extraction or packed allocation.
+    /// Expected: Source exclusion lasts through child completion, and the accepted owner publishes the full index with no engine poison.
+    #[test]
+    fn create_observer_detaches_during_hot_build() {
+        use crate::index::build::tree_builder::{BuildPageFault, BuildPagePoint, gate_build_pages};
+        use crate::index::build::{gate_extraction, observe_hot_build};
+        smol::block_on(async {
+            for packing in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp, "create_detached_build").await;
+                let table_id = table2(&engine).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let mut session = engine.new_session().unwrap();
+                insert_rows(table_id, &mut session, 0, 129, "detached").await;
+                let (gate_tx, gate_rx) = flume::bounded(1);
+                *engine.inner().index_ddl_test.state.hot_build.lock() =
+                    Some(Arc::new(move |build| {
+                        if packing {
+                            let sender = gate_tx.clone();
+                            observe_hot_build(
+                                build,
+                                |_| {},
+                                move |cleanup| {
+                                    sender
+                                        .send(gate_build_pages(
+                                            cleanup,
+                                            BuildPagePoint::Allocated(0),
+                                            1,
+                                            BuildPageFault::None,
+                                        ))
+                                        .unwrap();
+                                    None
+                                },
+                            );
+                        } else {
+                            gate_tx
+                                .send(gate_extraction(build.source(), false))
+                                .unwrap();
+                        }
+                    }));
+                let (published, finish) = engine
+                    .inner()
+                    .index_ddl_test
+                    .install_gate(IndexDdlTestPhase::CreateLayoutHistoryPublished);
+                let mut create = Box::pin(session.create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                ));
+                assert!(futures::poll!(create.as_mut()).is_pending());
+                let (entered, release) = gate_rx.recv_async().await.unwrap();
+                entered.recv_async().await.unwrap();
+                drop(create);
+                assert!(
+                    table
+                        .layout_snapshot()
+                        .metadata()
+                        .idx
+                        .index_spec(IndexSlot::new(1))
+                        .is_none()
+                );
+                release.send_async(()).await.unwrap();
+                published.recv_async().await.unwrap();
+                let layout = table.layout_snapshot();
+                let index = layout.secondary_index(IndexSlot::new(1)).unwrap();
+                let mut actual = 0;
+                let mut cursor = index
+                    .non_unique_mem()
+                    .unwrap()
+                    .tree()
+                    .cursor(engine.inner().pools.pool_guards().index_guard(), 0);
+                cursor.seek(&[]).await.unwrap();
+                while let Some(page) = cursor.next().await.unwrap() {
+                    actual += page.page().count();
+                }
+                assert_eq!(actual, 129, "packing={packing}");
+                assert!(engine.inner().poisoner.poison_error().is_none());
+                finish.send_async(()).await.unwrap();
+            }
+        });
+    }
+
+    /// Purpose: Preserve CREATE construction ownership through worker unwind, ready-tree unwind, installation panic and failed panic cleanup.
+    /// Expected: Safe construction failures reclaim private pages; unsafe destructive attempts are never retried, original Fatal evidence survives, and operation ownership is retained.
+    #[test]
+    fn create_hot_build_panic_and_cleanup_ownership() {
+        use crate::index::build::tree_builder::{BuildPageFault, BuildPagePoint, gate_build_pages};
+        use crate::index::build::{HotBuildTestPoint, gate_extraction, observe_hot_build};
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            Extraction,
+            Ready,
+            Installing,
+            CleanupTyped,
+            CleanupPanic,
+        }
+        smol::block_on(async {
+            for case in [
+                Case::Extraction,
+                Case::Ready,
+                Case::Installing,
+                Case::CleanupTyped,
+                Case::CleanupPanic,
+            ] {
+                let temp = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp, "create_panic_build").await;
+                let table_id = table2(&engine).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let mut session = engine.new_session().unwrap();
+                let session_id = session.id();
+                insert_rows(table_id, &mut session, 0, 4097, &"wide".repeat(100)).await;
+                let before = index_ddl_snapshot(&engine, table_id, &table);
+                let allocated = engine.inner().pools.index.allocated();
+                #[cfg(feature = "profiling")]
+                let stats = engine.inner().trx_sys.hot_build_profiler.snapshot();
+                match case {
+                    Case::Ready => engine
+                        .inner()
+                        .index_ddl_test
+                        .set_panic_phase(Some(IndexDdlTestPhase::CreateHotTreeReady)),
+                    Case::Installing => engine
+                        .inner()
+                        .index_ddl_test
+                        .set_panic_phase(Some(IndexDdlTestPhase::CreateInstalling)),
+                    _ => {
+                        *engine.inner().index_ddl_test.state.hot_build.lock() =
+                            Some(Arc::new(move |build| {
+                                if matches!(case, Case::Extraction) {
+                                    let (entered, release) = gate_extraction(build.source(), true);
+                                    release.send(()).unwrap();
+                                    // Retain the notification receiver until the worker has run.
+                                    observe_hot_build(
+                                        build,
+                                        move |_| {
+                                            let _ = &entered;
+                                        },
+                                        |_| None,
+                                    );
+                                } else {
+                                    observe_hot_build(
+                                        build,
+                                        |point| {
+                                            if matches!(point, HotBuildTestPoint::Ready) {
+                                                panic!("CREATE construction unwind before handoff");
+                                            }
+                                        },
+                                        move |cleanup| {
+                                            let fault = if matches!(case, Case::CleanupTyped) {
+                                                BuildPageFault::Runtime
+                                            } else {
+                                                BuildPageFault::Panic
+                                            };
+                                            let (entered, release) = gate_build_pages(
+                                                cleanup,
+                                                BuildPagePoint::Reclaim,
+                                                2,
+                                                fault,
+                                            );
+                                            release.send(()).unwrap();
+                                            Some(entered)
+                                        },
+                                    );
+                                }
+                            }));
+                    }
+                }
+                let err = session
+                    .create_index(
+                        table_id,
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                let expected = if matches!(case, Case::Ready | Case::Installing) {
+                    FatalError::MandatoryTaskPanic
+                } else {
+                    FatalError::ThreadPoolTaskPanic
+                };
+                assert_eq!(
+                    err.report().current_context(),
+                    &crate::error::ErrorKind::Fatal,
+                    "{case:?}: {err:?}"
+                );
+                assert!(
+                    format!("{err:?}").contains(&expected.to_string()),
+                    "{case:?}: {err:?}"
+                );
+                if matches!(case, Case::CleanupTyped) {
+                    assert!(format!("{err:?}").contains("staged_cleanup"), "{err:?}");
+                }
+                assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
+                if matches!(case, Case::Extraction | Case::Ready) {
+                    assert_eq!(
+                        engine.inner().pools.index.allocated(),
+                        allocated,
+                        "{case:?}"
+                    );
+                } else {
+                    assert!(
+                        engine.inner().pools.index.allocated() > allocated,
+                        "{case:?}: unsafe cleanup was retried"
+                    );
+                }
+                #[cfg(feature = "profiling")]
+                assert_eq!(
+                    engine
+                        .inner()
+                        .trx_sys
+                        .hot_build_profiler
+                        .snapshot()
+                        .create
+                        .hot
+                        .completed_builds,
+                    stats.create.hot.completed_builds
+                );
+                assert_eq!(
+                    active_operation_count(&engine.inner().session_registry),
+                    1,
+                    "{case:?}"
+                );
+                remove_session_for_test(&engine.inner().session_registry, session_id);
+                drop(session);
+                engine.shutdown();
+            }
+        });
+    }
+
+    /// Purpose: Disarm private runtime destruction when it unwinds after consuming the retained owner.
+    /// Expected: Retrying cleanup with valid guards leaves the abandoned root untouched and still permits transaction rollback.
+    #[test]
+    fn create_runtime_destruction_panic_is_not_retried() {
+        use crate::buffer::PoolRole;
+        use crate::buffer::page::Page;
+        use crate::latch::LatchFallbackMode;
+        use crate::session::tests::begin_test_mandatory_private_trx;
+
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "create_destroy_panic").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let session = engine.new_session().unwrap();
+            let guards = engine.inner().pools.pool_guards();
+            let pool = &engine.inner().pools.index;
+            for flags in [StorageIndexFlags::UK, StorageIndexFlags::empty()] {
+                let plan = table
+                    .finalize_create_index(StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        flags,
+                    ))
+                    .unwrap();
+                let (mut operation, trx) = begin_test_mandatory_private_trx(&session);
+                let mut progress = CreateIndexProgress::new(table_id, plan.index(), trx);
+                let disk = SecondaryDiskTreeRuntime::new(
+                    plan.index().slot(),
+                    plan.new_metadata().clone(),
+                    table.file().clone(),
+                    table.disk_pool().clone(),
+                )
+                .unwrap();
+                let before = pool.allocated();
+                let index = create_empty_index_runtime(
+                    &engine.inner().core,
+                    guards,
+                    &plan,
+                    disk,
+                    progress.build_ts(),
+                )
+                .await
+                .unwrap();
+                let mem = match &index {
+                    SecondaryIndex::Unique { mem, .. } => &**mem,
+                    SecondaryIndex::NonUnique { mem, .. } => &**mem,
+                };
+                let root = mem
+                    .tree()
+                    .check_empty_private_root(guards.index_guard())
+                    .await
+                    .unwrap()
+                    .page_id();
+                progress.staged_index = Some(Arc::new(index));
+                let allocated = pool.allocated();
+                assert!(allocated > before, "{flags:?}");
+
+                // Trigger a real pool-identity invariant after destruction takes ownership.
+                let invalid = PoolGuards::builder()
+                    .push(PoolRole::Index, guards.mem_guard().clone())
+                    .build();
+                let panic = AssertUnwindSafe(progress.cleanup_staged_runtime(&invalid))
+                    .catch_unwind()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    panic_payload_description(panic.as_ref())
+                        .contains("pool guard identity mismatch"),
+                    "{flags:?}: {}",
+                    panic_payload_description(panic.as_ref())
+                );
+                assert!(progress.staged_index.is_none(), "{flags:?}");
+                progress
+                    .rollback_before_catalog_commit(guards)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    pool.allocated(),
+                    allocated,
+                    "{flags:?}: destruction retried"
+                );
+                operation.assert_finish_ready();
+                operation.finish();
+
+                // The injected failure precedes any deallocation, so this test can reclaim
+                // its known empty root after proving production cleanup left it alone.
+                let page = pool
+                    .get_page::<Page>(guards.index_guard(), root, LatchFallbackMode::Exclusive)
+                    .await
+                    .unwrap()
+                    .lock_exclusive_async()
+                    .await
+                    .unwrap();
+                pool.deallocate_page(page);
+                assert_eq!(pool.allocated(), before, "{flags:?}");
+            }
+        });
+    }
+
+    /// Purpose: Distinguish successful extraction from completed CREATE publication and rollback resource failures in the accepted owner.
+    /// Expected: Empty and populated builds publish once; duplicates and packing-budget failures publish no CREATE sample, reclaim private roots, and preserve the table layout.
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn create_completion_stats_require_successful_publication() {
+        use crate::index::build::fail_build_budget;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "create_completion_stats").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            let initial = session.hot_index_build_stats().unwrap();
+            let id = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap();
+            let empty = session.hot_index_build_stats().unwrap();
+            assert_eq!(
+                empty.create.hot.completed_builds,
+                initial.create.hot.completed_builds + 1
+            );
+            assert_eq!(
+                empty.create.hot.extraction.entries,
+                initial.create.hot.extraction.entries
+            );
+            session.drop_index(table_id, id).await.unwrap();
+            insert_rows(table_id, &mut session, 0, 17, "profile").await;
+            let before = session.hot_index_build_stats().unwrap();
+            let before_layout = index_ddl_snapshot(&engine, table_id, &table);
+            let allocated = engine.inner().pools.index.allocated();
+            *engine.inner().index_ddl_test.state.hot_build.lock() = Some(Arc::new(|build| {
+                fail_build_budget(&build.source().budget, "packing window");
+            }));
+            let err = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.report().downcast_ref::<RuntimeError>().copied(),
+                Some(RuntimeError::IndexAccess)
+            );
+            let failed = session.hot_index_build_stats().unwrap();
+            assert_eq!(failed.completed_builds, before.completed_builds + 1);
+            assert_eq!(failed.create, before.create);
+            assert_eq!(engine.inner().pools.index.allocated(), allocated);
+            assert_index_ddl_snapshot_unchanged(&before_layout, &engine, table_id, &table);
+            let id = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let published = session.hot_index_build_stats().unwrap();
+            assert_eq!(
+                published.create.hot.completed_builds,
+                before.create.hot.completed_builds + 1
+            );
+            assert_eq!(
+                published.create.hot.extraction.entries,
+                before.create.hot.extraction.entries + 17
+            );
+            assert_eq!(
+                published.create.cold_hot_comparisons,
+                before.create.cold_hot_comparisons
+            );
+            assert!(
+                table
+                    .layout_snapshot()
+                    .metadata()
+                    .idx
+                    .active_indexes()
+                    .any(|(_, spec)| spec.index.id() == id)
+            );
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(17), Val::from("duplicate")],
+            )
+            .await;
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(18), Val::from("duplicate")],
+            )
+            .await;
+            let before_duplicate = session.hot_index_build_stats().unwrap();
+            let before_layout = index_ddl_snapshot(&engine, table_id, &table);
+            let err = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
+            let duplicate = session.hot_index_build_stats().unwrap();
+            assert_eq!(
+                duplicate.completed_builds,
+                before_duplicate.completed_builds + 1
+            );
+            assert_eq!(duplicate.create, before_duplicate.create);
+            assert_index_ddl_snapshot_unchanged(&before_layout, &engine, table_id, &table);
         });
     }
 

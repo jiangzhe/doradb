@@ -4,18 +4,18 @@
 
 Design a shared, bounded parallel hot secondary-index build path for CREATE INDEX and recovery. Extend the original hot-row scan-unification scope into a complete build path, retaining the shared scan abstraction as its input layer. Partition and encode input, sort by index key, construct independent B+tree ranges or subtrees, and assemble a complete unpublished MemIndex while reducing repeated tree searches and slot shifts.
 
-Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX cold-row builds](000104-stream-parallel-create-index-cold-build.md). Hot and cold builders should share suitable low-level mechanisms for work splitting, sorting and merging, scheduling, key validation, and B+tree node/subtree construction; their storage allocation, durability, and publication adapters can remain distinct.
+Coordinate the design with [backlog 000104, Stream and parallelize CREATE INDEX cold-row builds](../000104-stream-parallel-create-index-cold-build.md). Hot and cold builders should share suitable low-level mechanisms for work splitting, sorting and merging, scheduling, key validation, and B+tree node/subtree construction; their storage allocation, durability, and publication adapters can remain distinct.
 
 ## Reference
 
-- [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md): the five-phase hot-build program.
-- [Task 000315](../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
-- [Task 000316](../tasks/000316-parallel-merge-and-hot-key-validation.md): implemented phase-2 partition streams and hot-key validation; primitive results are recorded, while page construction and caller integration remain open.
-- [Task 000317](../tasks/000317-parallel-packed-memindex-construction.md): implemented phase-3 packed MemIndex construction, fixed-root installation and caller-owned cleanup; production integration and end-to-end acceptance remain open.
-- [Task 000318](../tasks/000318-recovery-hot-index-integration.md): implemented phase-4 production recovery, joined cleanup ownership and verified end-to-end comparisons; CREATE INDEX integration and caller acceptance remain phase 5.
-- [Task 000306](../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
-- [Task 000156](../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
-- [Backlog 000104](000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
+- [RFC 0032](../../rfcs/0032-in-memory-parallel-hot-index-build.md): the five-phase hot-build program.
+- [Task 000315](../../tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md): implemented phase-1 extraction and sorted runs; production integration and benchmark acceptance remain open.
+- [Task 000316](../../tasks/000316-parallel-merge-and-hot-key-validation.md): implemented phase-2 partition streams and hot-key validation; primitive results are recorded, while page construction and caller integration remain open.
+- [Task 000317](../../tasks/000317-parallel-packed-memindex-construction.md): implemented phase-3 packed MemIndex construction, fixed-root installation and caller-owned cleanup; production integration and end-to-end acceptance remain open.
+- [Task 000318](../../tasks/000318-recovery-hot-index-integration.md): implemented phase-4 production recovery, joined cleanup ownership and verified end-to-end comparisons; CREATE INDEX integration and caller acceptance remain phase 5.
+- [Task 000306](../../tasks/000306-recovery-benchmark-and-startup-metrics.md): indexed/unindexed comparison and Samply investigation on 2026-09-16.
+- [Task 000156](../../tasks/000156-full-table-scan-mvcc.md): original hot-row scan unification context for backlog 000110.
+- [Backlog 000104](../000104-stream-parallel-create-index-cold-build.md): complementary cold DiskTree construction work.
 - doradb-storage/src/catalog/index.rs: CreateIndexCollector::collect_current_hot, CreateIndexKeyValidator::prepare_hot, CreateIndexRuntimeBuilder, and insert_create_index_*_hot_rows.
 - doradb-storage/src/recovery/mod.rs: RecoveryCoordinator::rebuild_hot_indexes; doradb-storage/src/recovery/hot_index.rs: joined task, descriptor reuse, serial admission and terminal cleanup.
 - doradb-storage/src/index/btree/node.rs: BTreeNode::insert_slot_at; doradb-storage/src/index/btree/algo.rs: existing node-packing helpers to assess for reuse.
@@ -103,9 +103,22 @@ Phase-4 deferral update:
   considering further tuning or a small-input policy. Task 000318 contains the
   full environment, fixture matrix, page-target and checked-mode observations.
 
+Phase-5 completion update:
+
+- [Task 000319](../../tasks/000319-create-index-hot-build-integration.md) completes
+  accepted CREATE integration with required partition-local cold/hot validation,
+  retained construction and panic/cleanup ownership, and publication-only metrics.
+- All 255 profiled public CREATE comparisons verified complete contents and stable
+  identity. Four-worker million-row medians fell from 205.255/234.702 ms to
+  29.188/28.536 ms for unique/non-unique keys. Tiny and cold-dominated limitations
+  are recorded separately from recovery results.
+- Both caller integrations and their independent acceptance are complete.
+  Cold streaming/memory bounds remain [000104](../000104-stream-parallel-create-index-cold-build.md),
+  and broad fuzzing remains [000205](../000205-fuzz-n-way-hot-index-merge.md).
+
 ## Scope Hint
 
-Cover unique and non-unique hot secondary-index construction for both CREATE INDEX and recovery, including multiple indexes, current hot-row filtering, and the captured cold/hot boundary. Integrate a common hot-row input abstraction where useful. Design incremental temporary-memory budgets, backpressure, worker ownership, and cleanup independently of the final index's unavoidable memory footprint. Keep foreground MVCC scan semantics, DDL visibility/exclusion, recovery replay ordering, and existing checkpointed cold roots intact. Coordinate shared split/sort/scheduling/tree-build mechanisms with 000104 without absorbing its cold LWC decoding and durable publication work. Parallel redo replay was implemented by [task 000309](../tasks/000309-pipelined-recovery-with-parallel-page-replay.md), closing [backlog 000087](closed/000087-refactor-recovery-process-parallel-log-replay.md).
+Cover unique and non-unique hot secondary-index construction for both CREATE INDEX and recovery, including multiple indexes, current hot-row filtering, and the captured cold/hot boundary. Integrate a common hot-row input abstraction where useful. Design incremental temporary-memory budgets, backpressure, worker ownership, and cleanup independently of the final index's unavoidable memory footprint. Keep foreground MVCC scan semantics, DDL visibility/exclusion, recovery replay ordering, and existing checkpointed cold roots intact. Coordinate shared split/sort/scheduling/tree-build mechanisms with 000104 without absorbing its cold LWC decoding and durable publication work. Parallel redo replay was implemented by [task 000309](../../tasks/000309-pipelined-recovery-with-parallel-page-replay.md), closing [backlog 000087](000087-refactor-recovery-process-parallel-log-replay.md).
 
 ## Acceptance Hint
 
@@ -132,3 +145,12 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented through tasks 000315–000319. Recovery and CREATE now share captured extraction, sorted runs, bounded merge/validation, packed construction and explicit caller-owned settlement. Task 000318 records independent recovery acceptance; task 000319 records 255 verified public CREATE comparisons, required cross-tier checks, accepted-DDL panic/cleanup ownership, all backend suites and the passing style gate. Four-worker million-row CREATE medians were 29.188 ms unique and 28.536 ms non-unique versus 205.255/234.702 ms original. Cold streaming and retained-cold-memory bounds remain backlog 000104.
+- Closed By: backlog close
+- Reference: docs/tasks/000318-recovery-hot-index-integration.md; docs/tasks/000319-create-index-hot-build-integration.md; docs/rfcs/0032-in-memory-parallel-hot-index-build.md
+
+- Closed At: 2026-09-29

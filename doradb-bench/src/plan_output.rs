@@ -539,13 +539,15 @@ mod tests {
     fn create_output_requires_complete_verification_and_preserves_raw_units() {
         use crate::fixture::{IndexMode, PlacementKind, RowPlacement};
         use crate::measurement::{CreateIndexReport, CreateIndexVerification, SampledProcessRss};
-        use crate::plan::CreateIndexConfig;
+        use crate::plan::{CreateIndexConfig, CreateIndexKey};
         let temp = TempDir::new().unwrap();
         let mut report = report(temp.path());
         let Phase::Benchmark { workload, .. } = &mut report.plan.phases[0] else {
             panic!("benchmark")
         };
         *workload = ResolvedWorkload::CreateIndex(CreateIndexConfig {
+            key: CreateIndexKey::Key,
+            fixture: None,
             index: IndexMode::Unique,
             include_stats: true,
         });

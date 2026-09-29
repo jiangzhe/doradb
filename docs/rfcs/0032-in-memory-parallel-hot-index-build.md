@@ -188,7 +188,7 @@ Issue Labels:
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`
+- [B1] `docs/backlogs/closed/000110-unify-hot-row-mem-scan-index-build-recovery.md`
   - source item, recovery profile, shared hot-build scope, and acceptance.
 - [B2] `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
   - related deferred program; suitable mechanics may later be reused, while
@@ -780,7 +780,7 @@ after both callers deliver the full pipeline and performance acceptance.
   - Phase Status: done
   - Implementation Summary: Implemented bounded parallel hot-row extraction into immutable sorted runs with exact source coverage, retained scratch ownership, settled failures, and optional profiling. [Task Resolve Sync: docs/tasks/000315-parallel-hot-row-extraction-and-sorted-runs.md @ 2026-09-27]
   - Related Backlogs:
-    - `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`
+    - `docs/backlogs/closed/000110-unify-hot-row-mem-scan-index-build-recovery.md`
 
 - **Phase 2: Parallel Merge and Hot-Key Validation**
   - Scope: Implement a parallel stage computing each interior co-rank once,
@@ -843,7 +843,7 @@ after both callers deliver the full pipeline and performance acceptance.
   - Phase Status: done
   - Implementation Summary: Implemented independent synchronous co-rank preparation, bounded loser-tree partition streams with 32,768-entry batches, optional fused validation and deterministic conflict reduction. Retained coordinators preserve bounded admission, cancellation-safe settlement, exact completion authority and Fatal precedence. Temporary benchmarks, workspace tests, code-generation checks and style/unsafe reviews are recorded in task 000316. Page packing, production caller integration and end-to-end benchmarks remain in phases 3–5. [Task Resolve Sync: docs/tasks/000316-parallel-merge-and-hot-key-validation.md @ 2026-09-28]
   - Related Backlogs:
-    - `docs/backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md`
+    - `docs/backlogs/closed/000110-unify-hot-row-mem-scan-index-build-recovery.md`
     - `docs/backlogs/000205-fuzz-n-way-hot-index-merge.md`
 
 - **Phase 3: Parallel Packed MemIndex Construction**
@@ -972,30 +972,43 @@ after both callers deliver the full pipeline and performance acceptance.
   - Prerequisites: Phases 1-3, Phase 4's shared detached-build orchestration,
     and retained DDL exclusion/root capture. Recovery's temporary thread is not
     part of the CREATE ownership model.
-  - Phase-local Choices: Cold-interval lookup/comparison, DDL test hooks, and
-    caller benchmark/statistics integration. Retain the shared pipeline in
-    accepted DDL progress before construction, settle it inside the existing
-    mandatory task, and preserve its cleanup state across panic handling.
-    The private MemIndex remains caller-owned; construction requires only the
-    captured source and pool resources, and installation binds the destination.
-    Include abort after late validation failure; merge typed cleanup errors with Fatal
-    precedence, but propagate deallocation invariant panics without retry.
-  - Validation: Verify that unique creation always enables checking and that
-    non-unique creation admits equal logical keys. Cover local-run, cross-run,
-    and cold/hot conflicts, including single-run input and partition edges,
-    late cold/hot conflicts after private pages have been staged, exact staged
-    cleanup and installation gating, retained checkpointed prefixes, deleted
-    rows, and post-build reads,
-    writes, checkpoint, and restart. Inject failures before installation and
-    through existing publication boundaries; verify observer detachment,
-    rollback, and poison ownership. After CREATE INDEX uses the integrated
-    pipeline, benchmark hot-only and mixed CREATE separately with the four
-    baselines, worker scaling, stage time, scratch, retained cold memory, and
-    pool I/O; record useful crossover thresholds. [U10] [U11] [U12]
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Phase-local Choices: `IndexBuildEntry` is shared by budgeted hot runs and
+    the retained cold vector. Unique CREATE always supplies `ColdValidation::Required`
+    and checked extraction. Inclusive co-rank endpoints bound each partition's
+    monotonic cold cursor. Each batch is checked synchronously before packing,
+    with yields between batches. A local conflict stops further cold comparisons;
+    hot merge consumption and checking still complete. Summaries bind the cold
+    owner, plan, partition and coverage. Hot/hot diagnostics precede cold/hot;
+    native execution failures retain precedence. Ready trees retain separate hot
+    and cold completion authority.
+    Accepted DDL progress retains the private runtime, shared metadata gate,
+    logical locks, transaction, pipeline and ready tree. Settlement runs in the
+    existing mandatory owner. Attempted installation/reclamation is recorded
+    before awaits; mandatory panic policy contains secondary cleanup panic
+    without retrying unsafe deallocation. CREATE statistics are published only
+    after installation, cleanup and layout/history publication.
+  - Validation: Component membership and coverage oracles, equal-key cuts,
+    direct-run and empty cases, late conflicts after allocation, deterministic
+    duplicate precedence, publication failures, current hot/cold mutations,
+    observer detachment, partial root-transfer panic and failed cleanup are
+    covered. Final workspace and profiling-disabled libaio suites pass, along
+    with strict Clippy and the branch style gate. Earlier CREATE measurements
+    comprise 255 verified public calls,
+    original/sorted/bulk paths, worker and page-target sweeps, tiny/large input,
+    wide/composite and skewed keys, existing indexes, mutations and cold-heavy
+    fixtures. Four-worker million-row medians are 29.188 ms unique and 28.536 ms
+    non-unique, versus 205.255/234.702 ms original. Cold-dominated and tiny-input
+    limitations, worker sums, memory and I/O are retained in task 000319.
+    The task distinguishes the original matrix and synchronous-validation
+    follow-up from final orchestration validation.
+  - After This Phase: Both production callers use the shared builder and have
+    independent acceptance evidence. No following phase remains. Cold streaming
+    and bounded hybrid cross-tier validation stay in backlog 000104; n-way merge
+    fuzzing stays in 000205. Full RFC resolution is a separate operation.
+  - Task Doc: `docs/tasks/000319-create-index-hot-build-integration.md`
+  - Task Issue: `#1122`
+  - Phase Status: done
+  - Implementation Summary: CREATE INDEX now shares recovery's parallel hot builder under retained DDL ownership. [Task Resolve Sync: docs/tasks/000319-create-index-hot-build-integration.md @ 2026-09-29]
 
 ## Consequences
 
@@ -1061,7 +1074,7 @@ review rather than an unrecorded task-local change. [U3] [U9] [U10] [U11]
 
 ## References
 
-- [Backlog 000110](../backlogs/000110-unify-hot-row-mem-scan-index-build-recovery.md)
+- [Backlog 000110](../backlogs/closed/000110-unify-hot-row-mem-scan-index-build-recovery.md)
 - [Deferred cold construction: backlog 000104](../backlogs/000104-stream-parallel-create-index-cold-build.md)
 - [CREATE/DROP INDEX RFC](0018-create-drop-index.md)
 - [Recovery benchmark and startup metrics](../tasks/000306-recovery-benchmark-and-startup-metrics.md)

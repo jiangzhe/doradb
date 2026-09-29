@@ -1,6 +1,9 @@
 //! Caller-owned orchestration from captured rows to an uninstalled packed tree.
+use super::cold_validation::ColdValidation;
 use super::merge::HotMergePreparation;
-use super::tree_builder::{HotPackedBuild, HotPackedOutcome, ReadyHotTree, StagedPageCleanup};
+use super::tree_builder::{
+    HotPackedBuild, HotPackedOutcome, HotPackedSpec, ReadyHotTree, StagedPageCleanup,
+};
 use super::{HotBuildPolicy, HotBuildSource, HotLocalSort};
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::component::panic_payload_description;
@@ -46,6 +49,7 @@ pub(crate) struct HotIndexBuild<P: BufferPool + 'static> {
     thread_pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
     policy: HotBuildPolicy,
+    cold_validation: ColdValidation,
     phase: BuildPhase,
     sort: Option<HotLocalSort>,
     preparation: Option<HotMergePreparation>,
@@ -68,7 +72,13 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         policy: HotBuildPolicy,
+        cold_validation: ColdValidation,
     ) -> Self {
+        assert!(
+            !matches!(&cold_validation, ColdValidation::Required(_))
+                || (source.key.unique && source.key.duplicates == super::DuplicateCheck::Collect),
+            "required cold validation needs checked unique hot extraction"
+        );
         let sort = Some(HotLocalSort::new(
             source.clone(),
             thread_pool.clone(),
@@ -81,6 +91,7 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             thread_pool,
             poisoner,
             policy,
+            cold_validation,
             phase: BuildPhase::New,
             sort,
             preparation: None,
@@ -180,8 +191,11 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             plan,
             self.thread_pool.clone(),
             self.poisoner.clone(),
-            self.source.key.unique,
-            self.source.key.build_ts,
+            HotPackedSpec {
+                unique: self.source.key.unique,
+                ts: self.source.key.build_ts,
+                cold_validation: self.cold_validation.clone(),
+            },
         );
         self.packing = Some(packing);
         self.cleanup = Some(cleanup);

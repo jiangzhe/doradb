@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::measurement::{InternalMetric, InternalMetricKind, InternalMetricUnit};
-use doradb_storage::profiling::HotIndexBuildStats;
+use doradb_storage::profiling::{CreateIndexMeasurements, HotIndexBuildStats};
 use doradb_storage::{
     BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, LogicalLockStats,
     MandatoryRuntimeStats, MandatoryTaskStats, Session, StorageIoStats, TransactionSystemStats,
@@ -56,13 +56,13 @@ pub(crate) fn plan_internal_metrics(
             } else if metric.name.starts_with("logical_lock.peak_")
                 || metric.name.starts_with("hot_index_build.max_")
                 || metric.name == "hot_index_build.scratch_peak_bytes"
+                || create_index_peak(&metric.name)
             {
                 InternalMetricKind::LifetimePeak
             } else {
                 InternalMetricKind::CounterDelta
             };
-            let unit = if metric.name == "transaction.log_bytes"
-                || metric.name == "hot_index_build.scratch_peak_bytes"
+            let unit = if metric.name == "transaction.log_bytes" || metric.name.ends_with("_bytes")
             {
                 InternalMetricUnit::Bytes
             } else if metric.name.ends_with("_nanos") {
@@ -100,14 +100,23 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
-    push_hot_index_build_metrics(&mut metrics, before.hot_index_build, after.hot_index_build);
+    push_hot_index_build_metrics(
+        &mut metrics,
+        &before.hot_index_build,
+        &after.hot_index_build,
+    );
+    push_create_index_metrics(
+        &mut metrics,
+        &before.hot_index_build.create,
+        &after.hot_index_build.create,
+    );
     metrics
 }
 
 fn push_hot_index_build_metrics(
     metrics: &mut Vec<Metric>,
-    before: HotIndexBuildStats,
-    after: HotIndexBuildStats,
+    before: &HotIndexBuildStats,
+    after: &HotIndexBuildStats,
 ) {
     // Until production callers migrate, there are no samples to report. Also
     // omit intervals without completed work instead of presenting lifetime peaks
@@ -153,6 +162,165 @@ fn push_hot_index_build_metrics(
         "hot_index_build.scratch_peak_bytes",
         after.scratch_peak_bytes,
     );
+}
+
+fn push_create_index_metrics(
+    metrics: &mut Vec<Metric>,
+    before: &CreateIndexMeasurements,
+    after: &CreateIndexMeasurements,
+) {
+    if before.hot.completed_builds == after.hot.completed_builds {
+        return;
+    }
+    macro_rules! counter {
+        ($name:literal, $($field:ident).+) => {
+            push_metric(metrics, concat!("create_index.", $name), after.$($field).+ - before.$($field).+);
+        };
+    }
+    macro_rules! peak {
+        ($name:literal, $($field:ident).+) => {
+            push_metric(metrics, concat!("create_index.", $name), after.$($field).+);
+        };
+    }
+    counter!("cold_entries", cold_entries);
+    counter!("cold_collect_nanos", cold_collect_nanos);
+    counter!("cold_sort_nanos", cold_sort_nanos);
+    counter!("cold_build_nanos", cold_build_nanos);
+    counter!("cold_hot_comparisons", cold_hot_comparisons);
+    counter!("cold_hot_worker_nanos", cold_hot_worker_nanos);
+    counter!("total_elapsed_nanos", total_elapsed_nanos);
+    peak!("retained_cold_bytes", retained_cold_bytes);
+    peak!("max_cold_hot_sync_nanos", max_cold_hot_sync_nanos);
+    counter!("completed_builds", hot.completed_builds);
+    counter!("leaf_pages", hot.leaf_pages);
+    counter!("branch_pages", hot.branch_pages);
+    counter!("leaf_occupied_bytes", hot.leaf_occupied_bytes);
+    counter!("branch_occupied_bytes", hot.branch_occupied_bytes);
+    counter!("allocation_nanos", hot.allocation_nanos);
+    counter!("packing_nanos", hot.packing_nanos);
+    counter!("leaf_planning_nanos", hot.leaf_planning_nanos);
+    counter!("parent_planning_nanos", hot.parent_planning_nanos);
+    counter!("direct_parent_nanos", hot.direct_parent_nanos);
+    counter!("serial_upper_nanos", hot.serial_upper_nanos);
+    counter!("install_nanos", hot.install_nanos);
+    counter!("cleanup_nanos", hot.cleanup_nanos);
+    peak!("max_sync_nanos", hot.max_sync_nanos);
+    peak!("max_job_nanos", hot.max_job_nanos);
+    peak!("scratch_peak_bytes", hot.scratch_peak_bytes);
+    counter!(
+        "extraction.capture_elapsed_nanos",
+        hot.extraction.capture_elapsed_nanos
+    );
+    counter!(
+        "extraction.extraction_worker_time_nanos",
+        hot.extraction.extraction_worker_time_nanos
+    );
+    counter!(
+        "extraction.sort_worker_time_nanos",
+        hot.extraction.sort_worker_time_nanos
+    );
+    counter!(
+        "extraction.duplicate_worker_time_nanos",
+        hot.extraction.duplicate_worker_time_nanos
+    );
+    counter!(
+        "extraction.extraction_wall_elapsed_nanos",
+        hot.extraction.extraction_wall_elapsed_nanos
+    );
+    counter!(
+        "extraction.sort_wall_elapsed_nanos",
+        hot.extraction.sort_wall_elapsed_nanos
+    );
+    counter!(
+        "extraction.duplicate_wall_elapsed_nanos",
+        hot.extraction.duplicate_wall_elapsed_nanos
+    );
+    counter!(
+        "extraction.pipeline_wall_elapsed_nanos",
+        hot.extraction.pipeline_wall_elapsed_nanos
+    );
+    counter!(
+        "extraction.total_elapsed_nanos",
+        hot.extraction.total_elapsed_nanos
+    );
+    counter!("extraction.source_pages", hot.extraction.source_pages);
+    counter!("extraction.entries", hot.extraction.entries);
+    counter!("extraction.planned_groups", hot.extraction.planned_groups);
+    counter!("extraction.nonempty_runs", hot.extraction.nonempty_runs);
+    peak!(
+        "extraction.max_job_elapsed_nanos",
+        hot.extraction.max_job_elapsed_nanos
+    );
+    peak!(
+        "extraction.max_sort_elapsed_nanos",
+        hot.extraction.max_sort_elapsed_nanos
+    );
+    peak!(
+        "extraction.scratch_peak_bytes",
+        hot.extraction.scratch_peak_bytes
+    );
+    peak!("extraction.workers", hot.extraction.workers);
+    peak!("extraction.page_target", hot.extraction.page_target);
+    counter!("merge.entries", hot.merge.entries);
+    counter!("merge.runs", hot.merge.runs);
+    counter!("merge.partitions", hot.merge.partitions);
+    counter!("merge.boundary_wall_nanos", hot.merge.boundary_wall_nanos);
+    counter!("merge.cut_worker_nanos", hot.merge.cut_worker_nanos);
+    counter!(
+        "merge.consumption_wall_nanos",
+        hot.merge.consumption_wall_nanos
+    );
+    counter!("merge.merge_check_nanos", hot.merge.merge_check_nanos);
+    counter!("merge.job_worker_nanos", hot.merge.job_worker_nanos);
+    counter!(
+        "merge.consumer_worker_nanos",
+        hot.merge.consumer_worker_nanos
+    );
+    counter!(
+        "merge.duplicate_comparisons",
+        hot.merge.duplicate_comparisons
+    );
+    peak!("merge.workers", hot.merge.workers);
+    peak!("merge.batch_entries", hot.merge.batch_entries);
+    peak!("merge.max_cut_nanos", hot.merge.max_cut_nanos);
+    peak!("merge.first_batch_nanos", hot.merge.first_batch_nanos);
+    peak!("merge.max_batch_nanos", hot.merge.max_batch_nanos);
+    peak!("merge.max_job_nanos", hot.merge.max_job_nanos);
+    peak!("merge.boundary_bytes", hot.merge.boundary_bytes);
+    peak!("merge.max_reference_bytes", hot.merge.max_reference_bytes);
+    peak!(
+        "merge.active_reference_bytes",
+        hot.merge.active_reference_bytes
+    );
+    peak!("merge.validation_bytes", hot.merge.validation_bytes);
+    peak!("merge.scratch_peak_bytes", hot.merge.scratch_peak_bytes);
+}
+
+fn create_index_peak(name: &str) -> bool {
+    matches!(
+        name,
+        "create_index.retained_cold_bytes"
+            | "create_index.max_cold_hot_sync_nanos"
+            | "create_index.max_sync_nanos"
+            | "create_index.max_job_nanos"
+            | "create_index.scratch_peak_bytes"
+            | "create_index.extraction.max_job_elapsed_nanos"
+            | "create_index.extraction.max_sort_elapsed_nanos"
+            | "create_index.extraction.scratch_peak_bytes"
+            | "create_index.extraction.workers"
+            | "create_index.extraction.page_target"
+            | "create_index.merge.workers"
+            | "create_index.merge.batch_entries"
+            | "create_index.merge.max_cut_nanos"
+            | "create_index.merge.first_batch_nanos"
+            | "create_index.merge.max_batch_nanos"
+            | "create_index.merge.max_job_nanos"
+            | "create_index.merge.boundary_bytes"
+            | "create_index.merge.max_reference_bytes"
+            | "create_index.merge.active_reference_bytes"
+            | "create_index.merge.validation_bytes"
+            | "create_index.merge.scratch_peak_bytes"
+    )
 }
 
 fn push_logical_lock_metrics(
@@ -513,6 +681,63 @@ mod tests {
     use super::{InternalStatsSnapshot, cumulative_internal_metrics, plan_internal_metrics};
     use crate::measurement::{InternalMetricKind, InternalMetricUnit};
     use doradb_storage::profiling::HotIndexBuildStats;
+
+    /// Purpose: Report successful CREATE intervals independently of extraction and preserve capacities as lifetime peaks.
+    /// Expected: Failed or idle publication intervals omit CREATE metrics; completed intervals subtract additive work and retain absolute peaks with correct units.
+    #[test]
+    fn create_metrics_require_publication_and_distinguish_peaks() {
+        let mut before = InternalStatsSnapshot::default();
+        before.hot_index_build.create.hot.completed_builds = 2;
+        before.hot_index_build.create.cold_hot_worker_nanos = 70;
+        before.hot_index_build.create.retained_cold_bytes = 4096;
+        before.hot_index_build.create.hot.extraction.workers = 8;
+        let mut after = before;
+        after.hot_index_build.completed_builds = 1;
+        assert!(
+            plan_internal_metrics(&before, &after)
+                .iter()
+                .all(|m| !m.name.starts_with("create_index."))
+        );
+        after.hot_index_build.create.hot.completed_builds = 3;
+        after.hot_index_build.create.cold_hot_worker_nanos = 95;
+        let metrics = plan_internal_metrics(&before, &after);
+        for (name, value, kind, unit) in [
+            (
+                "completed_builds",
+                1,
+                InternalMetricKind::CounterDelta,
+                InternalMetricUnit::Count,
+            ),
+            (
+                "cold_hot_worker_nanos",
+                25,
+                InternalMetricKind::CounterDelta,
+                InternalMetricUnit::Nanoseconds,
+            ),
+            (
+                "retained_cold_bytes",
+                4096,
+                InternalMetricKind::LifetimePeak,
+                InternalMetricUnit::Bytes,
+            ),
+            (
+                "extraction.workers",
+                8,
+                InternalMetricKind::LifetimePeak,
+                InternalMetricUnit::Count,
+            ),
+        ] {
+            let metric = metrics
+                .iter()
+                .find(|metric| metric.name == format!("create_index.{name}"))
+                .unwrap();
+            assert_eq!(
+                (metric.value, metric.kind, metric.unit),
+                (value, kind, unit),
+                "{name}"
+            );
+        }
+    }
 
     /// Purpose: Preserve hot-build delta, lifetime-peak, and fresh-engine metric semantics.
     /// Expected: Empty intervals emit no profile; counts/times subtract while maxima retain absolute values and correct units.

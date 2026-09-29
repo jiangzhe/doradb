@@ -1,4 +1,7 @@
 //! Private streaming construction with globally planned branch levels.
+use super::cold_validation::{
+    ColdHotCompletion, ColdHotCursor, ColdHotDuplicate, ColdHotSummary, ColdValidation,
+};
 use super::merge::{
     CompletedPartition, HotDuplicate, HotEntryRef, HotMergeCompletion, HotMergeConsumption,
     HotPartitionConsumer, PartitionMergeStream, PreparedHotMerge, execution_error, observe_stop,
@@ -37,8 +40,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use super::page_cleanup::StagedPageCleanup;
 
 #[cfg(test)]
-pub(crate) use tests::{assert_recovery_root, gate_recovery_allocation, panic_recovery_cleanup};
+pub(crate) use super::page_cleanup::{BuildPageFault, BuildPagePoint, gate_build_pages};
+#[cfg(test)]
+pub(crate) use tests::{
+    assert_recovery_root, gate_recovery_allocation, panic_install_transfer, panic_recovery_cleanup,
+};
 
+#[cfg(feature = "profiling")]
+use super::cold_validation::ColdHotMeasurements;
 #[cfg(feature = "profiling")]
 use crate::profiling::{HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements};
 #[cfg(feature = "profiling")]
@@ -108,12 +117,53 @@ pub(crate) enum HotPackedOutcome<T> {
     /// Construction completed with all required hot-key validation satisfied.
     Complete(T),
     /// Earliest duplicate found after consuming all required input.
-    Duplicate(HotDuplicate),
+    Duplicate(HotBuildDuplicate),
+}
+
+/// Origin of settled duplicate evidence; hot/hot has diagnostic precedence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DuplicateOrigin {
+    /// Two retained hot rows have the same key.
+    HotHot,
+    /// A retained cold row matches a hot row.
+    ColdHot,
+}
+
+/// Caller-neutral duplicate evidence with stable rank and participating rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HotBuildDuplicate {
+    /// Validation domain that produced this conflict.
+    pub(crate) origin: DuplicateOrigin,
+    /// Global hot rank; the right entry for a hot/hot pair.
+    pub(crate) right_rank: usize,
+    /// Rows in hot/hot order, or cold/hot order.
+    pub(crate) rows: [RowID; 2],
+}
+
+impl From<HotDuplicate> for HotBuildDuplicate {
+    fn from(conflict: HotDuplicate) -> Self {
+        Self {
+            origin: DuplicateOrigin::HotHot,
+            right_rank: conflict.right_rank,
+            rows: conflict.rows,
+        }
+    }
+}
+
+impl From<ColdHotDuplicate> for HotBuildDuplicate {
+    fn from(conflict: ColdHotDuplicate) -> Self {
+        Self {
+            origin: DuplicateOrigin::ColdHot,
+            right_rank: conflict.hot_rank,
+            rows: [conflict.cold_row, conflict.hot_row],
+        }
+    }
 }
 
 struct Assembly {
     root: Option<ChildDescriptor>,
     completion: HotMergeCompletion,
+    cold_completion: ColdHotCompletion,
     #[cfg(feature = "profiling")]
     measurements: HotPackedMeasurements,
     #[cfg(feature = "profiling")]
@@ -121,6 +171,16 @@ struct Assembly {
 }
 
 type AssemblyResult = RuntimeOrFatalResult<HotPackedOutcome<Assembly>>;
+
+/// Physical shape and caller-required validation for one private tree.
+pub(super) struct HotPackedSpec {
+    /// Whether leaf values store RowIDs instead of physical-key suffixes.
+    pub(super) unique: bool,
+    /// Timestamp stamped into every packed node.
+    pub(super) ts: TrxID,
+    /// Separate cross-tier completion requirement.
+    pub(super) cold_validation: ColdValidation,
+}
 
 /// Retained packed construction, independent of any installation destination.
 pub(super) struct HotPackedBuild<P: BufferPool + 'static> {
@@ -134,6 +194,9 @@ pub(super) struct HotPackedBuild<P: BufferPool + 'static> {
     children: Option<Arc<BudgetedVec<ChildDescriptor>>>,
     parent_level: Option<ParentLevel>,
     completion: Option<HotMergeCompletion>,
+    cold_completion: Option<ColdHotCompletion>,
+    cold_validation: ColdValidation,
+    plan: Arc<PreparedHotMerge>,
     outcome: Option<AssemblyResult>,
     stop: Arc<AtomicBool>,
     max_workers: usize,
@@ -152,9 +215,13 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         plan: Arc<PreparedHotMerge>,
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
-        unique: bool,
-        ts: TrxID,
+        spec: HotPackedSpec,
     ) -> (Self, StagedPageCleanup<P>) {
+        let HotPackedSpec {
+            unique,
+            ts,
+            cold_validation,
+        } = spec;
         let (owner, cleanup) =
             StagedPageOwner::new(pool, guard, poisoner.clone(), &plan.runs().budget);
         let stop = Arc::new(AtomicBool::new(false));
@@ -165,12 +232,13 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         });
         let max_workers = plan.workers();
         let leaves = HotMergeConsumption::new(
-            plan,
+            plan.clone(),
             thread_pool.clone(),
             PackedLeafConsumer {
                 packing: packing.clone(),
                 stop: stop.clone(),
                 unique,
+                cold_validation: cold_validation.clone(),
             },
         );
         let build = Self {
@@ -182,6 +250,9 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             children: None,
             parent_level: None,
             completion: None,
+            cold_completion: None,
+            cold_validation,
+            plan,
             outcome: None,
             stop,
             max_workers,
@@ -224,6 +295,8 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
                 assembly,
                 installed: false,
                 aborted: false,
+                #[cfg(test)]
+                panic_install: false,
             }),
             HotPackedOutcome::Duplicate(conflict) => HotPackedOutcome::Duplicate(conflict),
         }
@@ -300,10 +373,20 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         let outcome = leaves.execute().await?;
         // No await between consuming the merge result and retaining its output.
         self.leaves = None;
+        // Check separate cross-tier coverage even when hot/hot evidence exists.
+        // Execution/coverage failures precede all settled duplicate diagnostics.
+        let cold = self.cold_validation.complete(
+            &self.plan,
+            outcome.outputs.iter().map(|output| output.cold.as_ref()),
+        )?;
         // Merge has consumed all required input and selected the earliest conflict.
         let completion = match outcome.validation {
             Ok(completion) => completion,
-            Err(conflict) => return Ok(HotPackedOutcome::Duplicate(conflict)),
+            Err(conflict) => return Ok(HotPackedOutcome::Duplicate(conflict.into())),
+        };
+        let cold_completion = match cold {
+            Ok(completion) => completion,
+            Err(conflict) => return Ok(HotPackedOutcome::Duplicate(conflict.into())),
         };
         let packing = self
             .packing
@@ -312,12 +395,12 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         let mut children = BudgetedVec::new(&packing.runs.budget);
         children
             .ensure_capacity(
-                outcome.outputs.iter().map(|v| v.len()).sum(),
+                outcome.outputs.iter().map(|v| v.leaves.len()).sum(),
                 "child descriptors",
             )
             .change_context(RuntimeError::IndexAccess)?;
         for partition in outcome.outputs {
-            for &child in partition.iter() {
+            for &child in partition.leaves.iter() {
                 children.push_reserved(child);
             }
         }
@@ -329,6 +412,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         }
         self.children = Some(Arc::new(children));
         self.completion = Some(completion);
+        self.cold_completion = Some(cold_completion);
         Ok(HotPackedOutcome::Complete(()))
     }
 
@@ -439,6 +523,10 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
                 .unwrap_or_else(|| unreachable!("finished build owns merge completion")),
             #[cfg(feature = "profiling")]
             measurements: take(&mut self.measurements),
+            cold_completion: self
+                .cold_completion
+                .take()
+                .unwrap_or_else(|| unreachable!("finished build owns cold completion")),
             #[cfg(feature = "profiling")]
             merge: self.merge,
         }
@@ -498,6 +586,8 @@ pub(crate) struct ReadyHotTree<P: 'static> {
     assembly: Assembly,
     installed: bool,
     aborted: bool,
+    #[cfg(test)]
+    panic_install: bool,
 }
 
 impl<P: BufferPool + 'static> ReadyHotTree<P> {
@@ -508,6 +598,9 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
     pub(crate) async fn install(&mut self, index: &MemIndex<P>) -> RuntimeOrFatalResult<()> {
         if self.aborted || self.installed {
             return Err(execution_error("ready packed tree was already settled"));
+        }
+        if self.assembly.cold_completion.entries() != self.assembly.completion.entries() {
+            return Err(execution_error("ready tree cold/hot coverage mismatch"));
         }
         #[cfg(feature = "profiling")]
         let started = Instant::now();
@@ -543,6 +636,11 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
                 .unwrap_or_else(|| unreachable!("exclusive temporary root latch"));
             // No await, allocation, or fallible operation from this edge.
             tree.install_private_root(&mut destination, source.page());
+            #[cfg(test)]
+            assert!(
+                !self.panic_install,
+                "injected panic after private root copy"
+            );
             pool.deallocate_page(source);
         }
         self.owner.transferred();
@@ -553,6 +651,12 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
             self.assembly.measurements.install_nanos = started.elapsed().as_nanos() as u64;
         }
         Ok(())
+    }
+
+    /// Return whether installation transferred descendants into the destination.
+    #[inline]
+    pub(crate) fn is_installed(&self) -> bool {
+        self.installed
     }
 
     /// Return exhaustive consumed entries after construction completes.
@@ -568,15 +672,15 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
         (&self.assembly.merge, &self.assembly.measurements)
     }
 
+    /// Completed cross-tier measurements, separate from hot-only merge work.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub(crate) fn cold_measurements(&self) -> ColdHotMeasurements {
+        self.assembly.cold_completion.measurements()
+    }
+
     /// Reject an otherwise ready tree without publishing any destination state.
     /// The caller must run its cleanup object to reclaim detached pages.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "late DDL validation is integrated in RFC 0032 phase 5"
-        )
-    )]
     pub(crate) fn abort(&mut self) -> RuntimeOrFatalResult<()> {
         if self.installed {
             return Err(execution_error("installed packed tree cannot be aborted"));
@@ -800,33 +904,51 @@ impl LeafWindow {
     }
 }
 
+struct PackedLeaves {
+    leaves: BudgetedVec<ChildDescriptor>,
+    cold: Option<ColdHotSummary>,
+}
+
 struct PackedLeafConsumer<P: 'static> {
     packing: Arc<Packing<P>>,
     stop: Arc<AtomicBool>,
     unique: bool,
+    cold_validation: ColdValidation,
 }
 
 impl<P: BufferPool + 'static> HotPartitionConsumer for PackedLeafConsumer<P> {
-    type Output = BudgetedVec<ChildDescriptor>;
+    type Output = PackedLeaves;
 
     async fn consume(
         &self,
         stream: PartitionMergeStream,
     ) -> RuntimeOrFatalResult<CompletedPartition<Self::Output>> {
-        if self.unique {
-            self.pack::<BTreeU64>(stream, BTreeU64::from).await
-        } else {
-            self.pack::<BTreeByte>(stream, |_| BTREE_BYTE_ZERO).await
+        match &self.cold_validation {
+            ColdValidation::Required(keys) => {
+                let (plan, partition) = stream.identity();
+                let cursor = ColdHotCursor::new(keys.clone(), plan, partition);
+                self.pack::<BTreeU64, true>(stream, BTreeU64::from, Some(cursor))
+                    .await
+            }
+            ColdValidation::NotRequired if self.unique => {
+                self.pack::<BTreeU64, false>(stream, BTreeU64::from, None)
+                    .await
+            }
+            ColdValidation::NotRequired => {
+                self.pack::<BTreeByte, false>(stream, |_| BTREE_BYTE_ZERO, None)
+                    .await
+            }
         }
     }
 }
 
 impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
-    async fn pack<V: BTreeValue + Copy + Send + Sync>(
+    async fn pack<V: BTreeValue + Copy + Send + Sync, const CHECK: bool>(
         &self,
         mut stream: PartitionMergeStream,
         value: fn(RowID) -> V,
-    ) -> RuntimeOrFatalResult<CompletedPartition<BudgetedVec<ChildDescriptor>>> {
+        mut cold: Option<ColdHotCursor>,
+    ) -> RuntimeOrFatalResult<CompletedPartition<PackedLeaves>> {
         // Retain three maximal pages plus lookahead so the final two pages
         // remain editable. Specialize the conservative bound for the value size.
         let window_capacity = (3 * max_node_slots::<V>() + 1).min(stream.remaining_entries());
@@ -839,6 +961,11 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         let mut inhibited = false;
         while let Some(batch) = stream.next_batch()? {
             observe_stop(&self.stop)?;
+            if CHECK {
+                cold.as_mut()
+                    .unwrap_or_else(|| unreachable!("checked consumer owns cold cursor"))
+                    .validate(&batch, &self.stop)?;
+            }
             if batch.construction_inhibited() {
                 inhibited = true;
                 window.clear();
@@ -876,7 +1003,10 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
             window.consume(count);
             yield_now().await;
         }
-        stream.finish(leaves)
+        stream.finish(PackedLeaves {
+            leaves,
+            cold: cold.map(ColdHotCursor::finish),
+        })
     }
 
     async fn leaf<'a, V: BTreeValue + Copy + Send + Sync>(
@@ -1247,6 +1377,7 @@ fn collect_level(measurements: &mut HotPackedMeasurements, children: &[ChildDesc
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::buffer::EvictableBufferPool;
     use crate::buffer::minimum_fixed_pool_bytes;
     use crate::buffer::{FixedBufferPool, PoolRole};
@@ -1269,6 +1400,11 @@ mod tests {
         fn drop(&mut self) {
             assert!(!self.0.shutdown_all().is_degraded());
         }
+    }
+
+    /// Exercise mandatory supervision after the root copy and before descendant transfer.
+    pub(crate) fn panic_install_transfer<P>(ready: &mut ReadyHotTree<P>) {
+        ready.panic_install = true;
     }
 
     /// Verify that the original bootstrap root now holds the expected live entries.
@@ -1390,6 +1526,7 @@ mod tests {
                 right_rank: 2501,
                 rows: [RowID::new(999_997_500), RowID::new(999_900_000)],
             }
+            .into()
         );
     }
 
@@ -1425,8 +1562,11 @@ mod tests {
             plan,
             thread_pool,
             poisoner,
-            unique,
-            TrxID::new(7),
+            HotPackedSpec {
+                unique,
+                ts: TrxID::new(7),
+                cold_validation: ColdValidation::NotRequired,
+            },
         )
     }
 
@@ -1764,7 +1904,9 @@ mod tests {
                         .unwrap()
                         .page_id();
                     assert_eq!(ready.assembly.completion.entries(), count);
+                    assert!(!ready.is_installed());
                     ready.install(&index).await.unwrap();
+                    assert!(ready.is_installed());
                     cleanup.run().await.unwrap();
                     #[cfg(feature = "profiling")]
                     {
@@ -1854,6 +1996,7 @@ mod tests {
                     ready.install(&index).await,
                     Err(RuntimeOrFatalError::Runtime(_))
                 ));
+                assert!(!ready.is_installed());
                 assert_eq!(pool.allocated(), allocated);
                 ready.abort().unwrap();
                 cleanup.run().await.unwrap();
@@ -2965,6 +3108,89 @@ mod tests {
                     }
                 }
                 index.destroy(&guard).await.unwrap();
+                assert_eq!(pool.allocated(), 0);
+            }
+        });
+    }
+
+    /// Purpose: Settle late cross-tier conflicts after private pages exist and preserve hot/hot diagnostic precedence.
+    /// Expected: Duplicate builds yield no ready tree, select the earliest conflict of the preferred kind, and reclaim all detached allocations.
+    #[test]
+    fn packed_cold_conflicts_reclaim_pages_and_preserve_precedence() {
+        use crate::index::build::IndexBuildEntry;
+        use crate::index::build::cold_validation::ColdUniqueKeys;
+        smol::block_on(async {
+            let (_scope, thread_pool, poisoner) = workers(2).await;
+            let pool = pages(32 * 1024 * 1024);
+            for (hot_duplicate, multiple_runs) in [(false, false), (false, true), (true, true)] {
+                let count = 3 * max_node_slots::<BTreeU64>() + 1025;
+                let runs = if hot_duplicate {
+                    duplicate_input()
+                } else {
+                    let groups = if multiple_runs {
+                        vec![
+                            (0..count / 2).map(|i| key(i, 256, 0)).collect(),
+                            (count / 2..count).map(|i| key(i, 256, 0)).collect(),
+                        ]
+                    } else {
+                        vec![(0..count).map(|i| key(i, 256, 0)).collect()]
+                    };
+                    test_runs(
+                        groups,
+                        DuplicateCheck::Collect,
+                        MemoryBudget::new(16 * 1024 * 1024),
+                    )
+                };
+                let cold_rank = if hot_duplicate { 0 } else { count - 1 };
+                let cold_key = key(cold_rank, 256, 0);
+                let hot_row = runs
+                    .runs()
+                    .iter()
+                    .flat_map(|run| run.entries())
+                    .find(|entry| entry.key == cold_key)
+                    .unwrap()
+                    .row_id;
+                let cold = ColdValidation::Required(ColdUniqueKeys::new(vec![IndexBuildEntry {
+                    key: cold_key,
+                    row_id: RowID::new(42),
+                }]));
+                let plan = test_prepare_packed(
+                    runs,
+                    thread_pool.clone(),
+                    2,
+                    if multiple_runs { 9 } else { 1 },
+                    128,
+                )
+                .await;
+                let (mut build, mut cleanup) = HotPackedBuild::new(
+                    pool.guard(),
+                    pool.create_base_guard(),
+                    plan,
+                    thread_pool.clone(),
+                    poisoner.clone(),
+                    HotPackedSpec {
+                        unique: true,
+                        ts: TrxID::new(7),
+                        cold_validation: cold,
+                    },
+                );
+                let outcome = build.execute().await.unwrap();
+                if hot_duplicate {
+                    assert_duplicate(outcome);
+                } else {
+                    let HotPackedOutcome::Duplicate(conflict) = outcome else {
+                        panic!("cold duplicate authorized install");
+                    };
+                    assert_eq!(conflict.origin, DuplicateOrigin::ColdHot);
+                    assert_eq!(conflict.right_rank, cold_rank);
+                    assert_eq!(conflict.rows, [RowID::new(42), hot_row]);
+                    assert!(
+                        pool.allocated() > 1,
+                        "late conflict must follow leaf allocation"
+                    );
+                }
+                drop(build);
+                cleanup.run().await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }
         });

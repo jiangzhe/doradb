@@ -19,7 +19,8 @@ use crate::workload::{
     LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
     ParallelTableScanExecutor, ParallelTableScanExecutorConfig, ResolveTableBindingExecutor,
     RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor, TableScanExecutor,
-    TrxNoopExecutor, UpdateRandExecutor, complete_create_index, run_recovery,
+    TrxNoopExecutor, UpdateRandExecutor, complete_create_index, prepare_create_fixture,
+    run_recovery,
 };
 use doradb_storage::{Engine, EngineConfig, Session};
 use easy_parallel::Parallel;
@@ -446,6 +447,11 @@ async fn dispatch_workload(
             "recovery must execute at the coordinator lifecycle boundary",
         )),
         ResolvedWorkload::CreateIndex(config) => {
+            let binding = if config.fixture.is_some() {
+                prepare_create_fixture(engine, *config).await?
+            } else {
+                binding
+            };
             let mut outcome = run_executor::<CreateIndexExecutor>(
                 engine,
                 clock,
@@ -462,7 +468,12 @@ async fn dispatch_workload(
                     "CREATE coordinator received no measurements",
                 ));
             };
-            outcome.effect = complete_create_index(engine, report).await?;
+            let effect = complete_create_index(engine, report).await?;
+            outcome.effect = if config.fixture.is_some() {
+                FixtureRuntimeEffect::None
+            } else {
+                effect
+            };
             Ok(outcome)
         }
         ResolvedWorkload::CreateTable(config) => {

@@ -215,3 +215,12 @@ ordinary reads, writes, and maintenance.
 Recovery and index creation retain responsibility for cleanup and publication,
 including when the caller stops waiting. Index creation must complete any
 required uniqueness checks across hot and cold data before publishing the index.
+
+Index creation keeps table contents and metadata stable until its construction
+work and cleanup have settled. Shutdown and engine failure do not cancel these
+obligations. Supervision retains resources when safe reclamation cannot be
+established.
+
+The hot construction memory limit does not bound cold-data preparation.
+Bounded, streaming cold construction remains
+[follow-up work](backlogs/000104-stream-parallel-create-index-cold-build.md).

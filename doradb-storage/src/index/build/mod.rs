@@ -4,6 +4,8 @@
 //! coordinator owns every accepted completion independently of its borrowed execution future.
 mod budget;
 mod co_rank;
+/// Retained cold-key validation for unique CREATE builds.
+pub(crate) mod cold_validation;
 mod loser_tree;
 /// Bounded partition streaming and separately settled completion authority.
 pub(crate) mod merge;
@@ -21,6 +23,8 @@ pub(crate) use pipeline::{HotIndexBuild, merge_build_result};
 #[cfg(test)]
 pub(crate) use pipeline::{TestPoint as HotBuildTestPoint, test_observe as observe_hot_build};
 pub(crate) use source::{HotBuildCapture, HotBuildSource, HotBuildTableSource};
+#[cfg(test)]
+pub(crate) use tests::gate_extraction;
 
 use crate::completion::Completion;
 use crate::conf::HotIndexBuildConfig;
@@ -106,7 +110,7 @@ pub(crate) enum LocalDuplicates {
 
 /// One owned encoded entry; unique keys have no separate RowID sort tie-breaker.
 #[derive(Debug)]
-pub(crate) struct HotRunEntry {
+pub(crate) struct IndexBuildEntry {
     /// Owned physical encoded key.
     pub(crate) key: BTreeKey,
     /// Logical identity of this live row.
@@ -117,7 +121,7 @@ pub(crate) struct HotRunEntry {
 pub(crate) struct HotSortedRun {
     /// Original deterministic group identity, independent of completion order.
     pub(crate) group_id: usize,
-    entries: BudgetedVec<HotRunEntry>,
+    entries: BudgetedVec<IndexBuildEntry>,
     /// Local evidence selected by the invocation duplicate policy.
     pub(crate) duplicates: LocalDuplicates,
     #[cfg(feature = "profiling")]
@@ -129,7 +133,7 @@ pub(crate) struct HotSortedRun {
 impl HotSortedRun {
     /// Borrow sorted owned entries without cloning keys or building references.
     #[inline]
-    pub(crate) fn entries(&self) -> &[HotRunEntry] {
+    pub(crate) fn entries(&self) -> &[IndexBuildEntry] {
         &self.entries
     }
 }
@@ -155,13 +159,13 @@ impl SortedHotRuns {
 
     /// Borrow an entry only when both coordinates are in bounds.
     #[inline]
-    pub(crate) fn entry(&self, run: usize, position: usize) -> Option<&HotRunEntry> {
+    pub(crate) fn entry(&self, run: usize, position: usize) -> Option<&IndexBuildEntry> {
         self.runs.get(run)?.entries.get(position)
     }
 
     /// Borrow the direct one-run view used by the next phase's bypass.
     #[inline]
-    pub(crate) fn single_run(&self) -> Option<&[HotRunEntry]> {
+    pub(crate) fn single_run(&self) -> Option<&[IndexBuildEntry]> {
         if self.runs.len() == 1 {
             Some(self.runs[0].entries())
         } else {
@@ -626,6 +630,7 @@ mod tests {
                 self.engine.inner().thread_pool.clone(),
                 self.engine.inner().poisoner.clone(),
                 policy,
+                cold_validation::ColdValidation::NotRequired,
             );
             (build, index)
         }
@@ -697,6 +702,16 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// Gate accepted extraction for caller-owner lifecycle tests.
+    pub(crate) fn gate_extraction(
+        source: &HotBuildSource,
+        panic: bool,
+    ) -> (flume::Receiver<()>, flume::Sender<()>) {
+        source
+            .test
+            .gate(0, if panic { Fault::Panic } else { Fault::None })
     }
 
     fn contents(runs: &SortedHotRuns) -> Vec<(BTreeKey, RowID)> {
@@ -1512,7 +1527,7 @@ mod tests {
                 }
             );
             let long_unique: Vec<_> = (0..1024u32)
-                .map(|value| HotRunEntry {
+                .map(|value| IndexBuildEntry {
                     key: BTreeKey::from(value),
                     row_id: RowID::new(u64::from(value)),
                 })
@@ -1526,15 +1541,15 @@ mod tests {
                 LocalDuplicates::Unchecked
             );
             let entries = vec![
-                HotRunEntry {
+                IndexBuildEntry {
                     key: BTreeKey::from(1u32),
                     row_id: RowID::new(90),
                 },
-                HotRunEntry {
+                IndexBuildEntry {
                     key: BTreeKey::from(1u32),
                     row_id: RowID::new(1),
                 },
-                HotRunEntry {
+                IndexBuildEntry {
                     key: BTreeKey::from(2u32),
                     row_id: RowID::new(3),
                 },

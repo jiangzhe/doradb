@@ -1,7 +1,7 @@
 //! Retained boundary/consumer ledgers and the private streaming handoff.
 use super::co_rank::{self, HotMergeCut};
 use super::loser_tree::LoserTree;
-use super::{BudgetedVec, DuplicateCheck, HotRunEntry, LocalDuplicates, SortedHotRuns};
+use super::{BudgetedVec, DuplicateCheck, IndexBuildEntry, LocalDuplicates, SortedHotRuns};
 use crate::completion::Completion;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::RowID;
@@ -53,7 +53,7 @@ impl HotEntryRef {
     }
 
     #[inline]
-    pub(super) fn resolve(self, runs: &SortedHotRuns) -> &HotRunEntry {
+    pub(super) fn resolve(self, runs: &SortedHotRuns) -> &IndexBuildEntry {
         &runs.runs()[self.run].entries()[self.position]
     }
 }
@@ -92,19 +92,33 @@ impl PreparedHotMerge {
         &self.runs
     }
 
+    /// Inclusive hot endpoints of a nonempty partition, from completed co-ranks.
+    #[inline]
+    pub(super) fn endpoints(&self, partition: usize) -> (&IndexBuildEntry, &IndexBuildEntry) {
+        let first = self.boundaries.cuts[partition]
+            .right
+            .unwrap_or_else(|| unreachable!("nonempty partition has a first entry"));
+        let last = self.boundaries.cuts[partition + 1]
+            .left
+            .unwrap_or_else(|| unreachable!("nonempty partition has a last entry"));
+        (first.resolve(&self.runs), last.resolve(&self.runs))
+    }
+
     /// Maximum submitted but uncollected construction jobs.
     #[inline]
     pub(super) fn workers(&self) -> usize {
         self.workers
     }
 
+    /// Number of disjoint hot-rank partitions in the completed boundary plan.
     #[inline]
-    fn partitions(&self) -> usize {
+    pub(super) fn partitions(&self) -> usize {
         self.boundaries.cuts.len().saturating_sub(1)
     }
 
+    /// Exact hot-rank coverage expected from one partition completion.
     #[inline]
-    fn range(&self, partition: usize) -> Range<usize> {
+    pub(super) fn range(&self, partition: usize) -> Range<usize> {
         self.boundaries.cuts[partition].rank..self.boundaries.cuts[partition + 1].rank
     }
 }
@@ -376,7 +390,7 @@ struct ValidationState {
 enum BatchEntries<'a> {
     Direct {
         start: usize,
-        entries: &'a [HotRunEntry],
+        entries: &'a [IndexBuildEntry],
     },
     Merged(&'a [HotEntryRef]),
 }
@@ -386,7 +400,7 @@ pub(crate) struct HotBatch<'a> {
     runs: &'a SortedHotRuns,
     data: BatchEntries<'a>,
     ranks: Range<usize>,
-    inhibited: bool,
+    inhibited: &'a AtomicBool,
 }
 
 impl HotBatch<'_> {
@@ -399,12 +413,18 @@ impl HotBatch<'_> {
     /// Whether duplicate evidence prohibits further private construction.
     #[inline]
     pub(crate) fn construction_inhibited(&self) -> bool {
-        self.inhibited
+        self.inhibited.load(AtomicOrdering::Acquire)
+    }
+
+    /// Publish monotonic construction inhibition before packing this batch.
+    #[inline]
+    pub(super) fn inhibit_construction(&self) {
+        self.inhibited.store(true, AtomicOrdering::Release);
     }
 
     /// Borrow an entry and its stable coordinates without copying its key.
     #[inline]
-    pub(crate) fn entry(&self, index: usize) -> Option<(HotEntryRef, &HotRunEntry)> {
+    pub(crate) fn entry(&self, index: usize) -> Option<(HotEntryRef, &IndexBuildEntry)> {
         match self.data {
             BatchEntries::Direct { start, entries } => entries.get(index).map(|entry| {
                 (
@@ -438,6 +458,12 @@ pub(crate) struct PartitionMergeStream {
 }
 
 impl PartitionMergeStream {
+    /// Bind separate cold validation evidence to this stream's plan and partition.
+    #[inline]
+    pub(super) fn identity(&self) -> (Arc<PreparedHotMerge>, usize) {
+        (self.plan.clone(), self.partition)
+    }
+
     /// Remaining assigned entries, used to avoid overallocating a tiny packing window.
     #[inline]
     pub(super) fn remaining_entries(&self) -> usize {
@@ -450,7 +476,7 @@ impl PartitionMergeStream {
         expect(dead_code, reason = "phase 3 retains packing candidates")
     )]
     #[inline]
-    pub(crate) fn entry(&self, reference: HotEntryRef) -> Option<&HotRunEntry> {
+    pub(crate) fn entry(&self, reference: HotEntryRef) -> Option<&IndexBuildEntry> {
         self.plan.runs.entry(reference.run, reference.position)
     }
 
@@ -572,7 +598,7 @@ impl PartitionMergeStream {
             runs: &self.plan.runs,
             data,
             ranks: start..self.next,
-            inhibited: self.plan.inhibited.load(AtomicOrdering::Acquire),
+            inhibited: &self.plan.inhibited,
         }))
     }
 
@@ -1210,7 +1236,7 @@ mod tests {
                 }
                 entries
                     .push(
-                        HotRunEntry {
+                        IndexBuildEntry {
                             key,
                             row_id: RowID::new(1_000_000_000 - (group * 100_000 + position) as u64),
                         },
@@ -1967,7 +1993,7 @@ mod tests {
                 PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false))).unwrap();
             assert_eq!(stream.buffer.capacity(), 4);
             let n = DEFAULT_BATCH_ENTRIES;
-            let budget = MemoryBudget::new(n * size_of::<HotRunEntry>() + 32 * 1024);
+            let budget = MemoryBudget::new(n * size_of::<IndexBuildEntry>() + 32 * 1024);
             let runs = fixture_in(
                 (0..2)
                     .map(|r| {

@@ -7,6 +7,7 @@ mod binding;
 mod catalog;
 mod create_index;
 mod ddl;
+mod index_fixture;
 mod insert;
 mod lock;
 mod maintenance;
@@ -20,7 +21,7 @@ mod verification;
 
 pub(crate) use binding::{ManagedBindingsPrepareExecutor, ResolveTableBindingExecutor};
 pub(crate) use catalog::{CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor};
-pub(crate) use create_index::{CreateIndexExecutor, complete_create_index};
+pub(crate) use create_index::{CreateIndexExecutor, complete_create_index, prepare_create_fixture};
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;
