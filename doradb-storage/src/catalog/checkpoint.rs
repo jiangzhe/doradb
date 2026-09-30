@@ -25,6 +25,7 @@ use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -122,6 +123,7 @@ pub enum CatalogCheckpointOutcome {
         catalog_replay_start_ts: TrxID,
     },
     /// The batch had no publishable work or was already superseded.
+    #[serde(deserialize_with = "deserialize_checkpoint_noop")]
     Noop,
 }
 
@@ -742,6 +744,16 @@ impl Catalog {
     }
 }
 
+fn deserialize_checkpoint_noop<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    // Serde's internally tagged unit variant accepts leftover fields. An empty
+    // struct enforces the enum's strict field policy while preserving Noop.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoopFields {}
+
+    NoopFields::deserialize(deserializer).map(|_| ())
+}
+
 fn drop_table_has_catalog_table_delete(
     table_id: TableID,
     dml: &BTreeMap<TableID, TableDML>,
@@ -810,12 +822,11 @@ mod tests {
         dml
     }
 
-    /// Purpose: Preserve the catalog checkpoint result schema without profiling.
-    /// Expected: Both outcomes round-trip inside an outcome field, without metrics, and
-    /// unknown result fields are rejected.
-    #[cfg(not(feature = "profiling"))]
+    /// Purpose: Preserve strict checkpoint serialization across profiling configurations.
+    /// Expected: Both outcomes and their result wrappers retain their wire shapes and
+    /// round-trip without accepting unknown result or outcome fields.
     #[test]
-    fn test_catalog_checkpoint_result_serialization_without_profiling() {
+    fn test_catalog_checkpoint_serialization_strictly() {
         use toml::Value;
 
         for (case, outcome, expected) in [
@@ -832,20 +843,66 @@ mod tests {
                 "[outcome]\ntype = \"noop\"\n",
             ),
         ] {
-            let result = CatalogCheckpointResult { outcome };
+            let expected_outcome = toml::from_str::<Value>(expected).unwrap()["outcome"].clone();
+            let encoded_outcome = toml::to_string(&outcome).unwrap();
+            assert_eq!(
+                toml::from_str::<Value>(&encoded_outcome).unwrap(),
+                expected_outcome,
+                "{case}: outcome schema"
+            );
+            assert_eq!(
+                toml::from_str::<CatalogCheckpointOutcome>(&encoded_outcome).unwrap(),
+                outcome,
+                "{case}: outcome round trip"
+            );
+            let invalid = format!("unknown = 1\n{encoded_outcome}");
+            assert!(
+                toml::from_str::<CatalogCheckpointOutcome>(&invalid).is_err(),
+                "{case}: unknown field accepted in outcome"
+            );
+
+            let result = CatalogCheckpointResult {
+                outcome,
+                #[cfg(feature = "profiling")]
+                report: CatalogCheckpointReport {
+                    catalog_ddl_txn_count: 0,
+                    table_changes: Box::new([]),
+                    table_io: Box::new([]),
+                    metadata_bytes_written: 0,
+                },
+            };
+            let expected = if cfg!(feature = "profiling") {
+                format!(
+                    "catalog_ddl_txn_count = 0\ntable_changes = []\ntable_io = []\nmetadata_bytes_written = 0\n{expected}"
+                )
+            } else {
+                expected.to_owned()
+            };
             let encoded = toml::to_string(&result).unwrap();
             let value: Value = toml::from_str(&encoded).unwrap();
-            assert_eq!(value, toml::from_str::<Value>(expected).unwrap(), "{case}");
+            assert_eq!(value, toml::from_str::<Value>(&expected).unwrap(), "{case}");
             assert_eq!(
                 toml::from_str::<CatalogCheckpointResult>(&encoded).unwrap(),
                 result,
                 "{case}"
             );
-            let invalid = format!("unknown = 1\n{encoded}");
-            assert!(
-                toml::from_str::<CatalogCheckpointResult>(&invalid).is_err(),
-                "{case}: unknown field accepted in result"
-            );
+            for level in ["result", "outcome"] {
+                let mut invalid = value.clone();
+                let target = if level == "result" {
+                    &mut invalid
+                } else {
+                    &mut invalid["outcome"]
+                };
+                target
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("unknown".to_owned(), Value::Integer(1));
+                assert!(
+                    toml::from_str::<CatalogCheckpointResult>(&toml::to_string(&invalid).unwrap())
+                        .is_err(),
+                    "{case}: unknown field accepted in {level}"
+                );
+            }
         }
     }
 

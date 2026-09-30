@@ -10,30 +10,28 @@ github_issue: 1125
 
 ## Summary
 
-Storage snapshots, component-owned recorders, metric projection, recovery
-serialization, and reusable process probes now live under
-`doradb-storage/src/profiling/`. The former `doradb_storage::stats` module is
-removed. The profiling module, diagnostic methods, and crate-root stats exports
-require `profiling`; stats getters retain their enabled signatures.
+Storage diagnostics, component-owned recorders, metric projection, recovery
+serialization, and reusable process probes now live in
+`doradb_storage::profiling`. The former `doradb_storage::stats` module is removed.
+Profiling remains enabled by default and uses Quanta 0.13 for elapsed wall time.
 
-Profiling uses Quanta 0.13 for elapsed wall time and remains enabled by default.
-Disabling it removes diagnostic recorder state, updates, clocks, argument work,
-transport, and stats APIs while preserving operational behavior. Benchmark schemas and
-measurement windows remain unchanged.
+Disabling profiling removes diagnostic APIs, recorder state, updates, clocks,
+and measurement transport while preserving operational behavior. Maintenance
+results retain their operational meaning with optional measurement fields.
+Enabled benchmark schemas, metrics, and measurement windows are preserved.
 
 ## Context
 
 This standalone task was designed against
-`07356ac4457dde661db192edfaadc1f31b29df8b`; it has no parent RFC or source backlog.
-Previously, the profiling feature primarily covered hot-index builds. Other
-collectors remained active in buffer pools, I/O, redo, purge, locks, recovery,
-mandatory runtime, and checkpoints. Storage-oriented projection and process
-probes also lived in the benchmark crate.
+`07356ac4457dde661db192edfaadc1f31b29df8b`. It has no parent RFC or source backlog.
+Previously, profiling primarily covered hot-index builds; other collectors
+remained active across storage, and reusable measurement code lived in the
+benchmark crate.
 
-Some measured values were coupled to correctness: replay counts controlled page
-dirtying, redo bytes determined synchronization, and admission/resource counters
-controlled capacity and drain. Those operational responsibilities remain active
-independently of profiling.
+Some counters also controlled correctness: replay counts determined page
+dirtying, redo bytes determined synchronization, and admission/resource counts
+controlled capacity and drain. Separating those responsibilities from diagnostics
+was necessary before instrumentation could be compiled out.
 
 Issue Labels:
 
@@ -42,254 +40,222 @@ Issue Labels:
 - codex
 
 References: [storage architecture](../architecture.md),
-[public diagnostics](../public-api.md#diagnostics-and-statistics),
-[benchmark contracts](../benchmark-tool.md), and the
-[profiling module](../../doradb-storage/src/profiling/mod.rs).
-
-### Clock evaluation
-
-A standalone release experiment on 2026-09-29 used Quanta 0.13.0 without default
-features, rustc 1.97.1/LLVM 22.1.6, and an Apple aarch64 Linux host under OrbStack.
-Guest CPU affinity was fixed to CPU 0. Each case warmed for 200,000 iterations,
-then ran 16 rounds of 3,000,000 iterations, rotating case order. `black_box`
-retained reads and interval starts; outer measurement used the standard clock.
-The following medians are average loop costs, not timestamp resolution or an
-engine performance claim:
-
-| Primitive | Read overhead | Two reads plus elapsed nanoseconds |
-| --- | ---: | ---: |
-| `std::time::Instant` | 9.986 ns | 25.005 ns |
-| `quanta::Instant` | 1.134 ns | 2.353 ns |
-| Explicit `quanta::Clock::now` | 0.901 ns | 1.645 ns |
-| `Clock::raw` with `delta_as_nanos` | 0.679 ns | 1.137 ns |
-
-Eleven fresh-process initializations had a median calibration cost of 523,230 ns
-(range 522,396 to 524,479 ns). Quanta allows calibration to run for up to 200 ms,
-so the observed half millisecond is not a portable bound. A smoke check of
-400,000 mutex-ordered samples across four threads found no backward scaled or
-raw samples; this does not establish correctness across all hardware or VM
-migration conditions. Enabling Quanta's mock feature increased its global
-Instant pair cost to 5.512 ns in a separate run, supporting test-only mock use.
-
-Ignored research artifacts are in the dispatch checkout at
-`target/profiling-clock-eval-20260929/`, including `report.md`, the standalone
-harness, `production-clean.csv`, and `cold-init.txt`. The summarized method and
-results above are the durable evidence; implementation does not depend on those
-local files being present. No x86-64 or end-to-end engine speedup is claimed.
+[public diagnostics](../public-api.md#diagnostics-and-statistics), and
+[benchmark contracts](../benchmark-tool.md).
 
 ## Goals
 
-- Centralize existing types, collectors, calculations, and reusable probes while
-  retaining ownership by the existing components.
-- Preserve all 202 benchmark internal metrics, including ordering, units, kinds,
-  delta/cumulative interpretation, conditional families, and publication rules.
-- Compile out profiling-only state and work in disabled production builds.
-- Preserve enabled diagnostic lifecycles and persistent formats, and keep
-  operational behavior correct with either feature setting and I/O backend.
-- Keep new storage dependencies optional and process probes explicitly activated.
+- Centralize existing diagnostics while retaining component ownership.
+- Preserve all 202 ordered benchmark internal metrics, including units, kinds,
+  delta/cumulative interpretation, conditional emission, and publication rules.
+- Remove profiling-only work and dependencies from disabled storage builds.
+- Preserve correctness, enabled diagnostic lifecycles, and persistent formats
+  with either profiling setting and I/O backend.
+- Keep process probes explicitly activated by callers.
 
 ## Non-Goals
 
-- New metrics, schemas, exporters, sampling policies, or a profiling service.
+- New metrics, exporters, sampling policies, or an engine-wide profiling service.
 - Changes to storage algorithms, scheduling, resource limits, or default features.
 - Compatibility for the removed `doradb_storage::stats` import path.
 - Replacing operational deadlines or process CPU clocks with Quanta.
-- Cached/recent clocks, upkeep threads, raw storage timestamps, or universal
-  performance targets.
-- Automatic sampling, engine-exclusive CPU/RSS attribution, or exact peak RSS.
+- Cached clocks, upkeep threads, automatic sampling, engine-exclusive resource
+  attribution, exact peak RSS, or universal performance guarantees.
 
 ## Rejected Alternatives
 
-- An engine-wide service or registry would change recorder ownership without
-  being necessary for centralization.
-- A new event/recorder protocol would add interfaces and translation rules
+- A global service or registry would change recorder ownership without being
+  necessary for centralization.
+- A new event/recorder protocol would introduce translation and lifecycle rules
   beyond the existing component boundaries.
-- Relocating definitions alone would retain disabled-feature overhead from
+- Relocating definitions alone would preserve disabled-feature overhead from
   fields, updates, argument construction, and asynchronous captures.
 
 ## Plan
 
-Public diagnostic types and getters require `profiling`. Private domain modules
-contain buffer, I/O, transaction, lock, runtime, recovery, checkpoint, cleanup,
-and hot-index measurement code. Feature gates cover the complete construction,
-recording, snapshot, and transport paths. Components retain recorder ownership.
-Maintenance operations remain available independently of profiling.
-`CatalogCheckpointResult` belongs to the catalog checkpoint module: the named
-struct always contains `outcome`, with a metrics-only `CatalogCheckpointReport`
-field when profiling is enabled. Row replay likewise returns a named struct with
-feature-gated counts. Its result and the hot-index recovery result alias also live
-in their operational owner modules.
-This leaves the entire profiling module feature-gated with no disabled stubs.
+The profiling module and public diagnostic types, methods, and root exports are
+feature-gated. Private domain modules contain the existing recorders and shared
+measurement logic. Gates cover construction, recording, snapshots, argument
+work, and transport; disabled builds do not manufacture empty diagnostics.
 
-The disabled API follows these contracts:
+Maintenance result definitions remain with their operational owners.
+`CatalogCheckpointResult` is a named struct in both builds: `outcome` is always
+available, and the metrics-only `report` field requires profiling. Row replay
+also returns a named result with profiling-gated counts; it has no payload when
+profiling is disabled. Cleanup results retain their actual delay outcome.
 
-| API or state | Behavior without profiling |
+| Contract | Behavior without profiling |
 | --- | --- |
-| Session stats getters and their diagnostic types | Absent |
-| `Engine::recovery_report()` and recovery report types | Absent |
-| Internal stats producers | Absent; no synthetic snapshots or static report |
-| Catalog checkpoint | `CatalogCheckpointResult` retains `outcome`; `report` field absent |
-| MemIndex cleanup | Actual `live_delay`; `stats` field absent |
-| Capacity, allocation, admission, and drain bookkeeping | Remains operational |
+| Stats getters, recovery reports, and diagnostic types | Absent |
+| Catalog checkpoint result | Operational outcome remains; report field absent |
+| Row replay result | Successful completion remains; counts field absent |
+| MemIndex cleanup result | Actual live-cleanup delay remains; stats field absent |
+| Capacity, admission, synchronization, and drain accounting | Remains operational |
 
-Replay now retains a separate mutation marker. Every successful insert, update,
-or delete marks its page dirty even when a later operation in the batch fails.
-Optional counts are no longer the dirty-page oracle. Redo byte accounting needed
-for synchronization and admission/resource state needed for capacity or drain
-remain operational. Mandatory completion counters are published before observers
-can consume completion when profiling is enabled.
+Replay retains independent mutation evidence. Every successful insert, update,
+or delete marks its page dirty even when a later operation fails. Redo byte
+accounting required for synchronization and counters required for resource
+limits remain active. Enabled mandatory-runtime completion statistics become
+visible before observers consume completion.
 
-`InternalStatsSnapshot` captures public component snapshots and produces the
-ordered delta or fresh-engine cumulative metric list. Benchmark callers use
-its methods directly. `RecoveryMeasurements::try_from(&RecoveryReport)` converts
-durations to nanoseconds and validates accounting. Its strict serialized schema
-retains optional historical `hot_indexes` deserialization.
+Shared metric projection produces ordered interval deltas or fresh-engine
+cumulative values. Benchmark callers use it directly; workload timing,
+histograms, fixture verification, sampling windows, and workload error precedence
+remain benchmark responsibilities. Recovery serialization validates accounting
+and retains compatibility with historical omission of hot-index measurements.
 
-Profiling arithmetic assumes values fit their numeric types. Duration differences
-saturate at zero. Recovery accounting checks and RSS parsing continue to report
-invalid measurements.
+Profiling arithmetic assumes representable counts, sizes, and timings. Duration
+differences and snapshot deltas saturate at zero. Logical-lock decrements retain
+a release assertion for balanced lifecycle accounting. Recovery consistency
+checks and RSS parsing retain typed measurement errors.
 
-All storage profiling timestamps use the central Quanta clock, including nested
-bootstrap and redo intervals. Shared calibration initializes before the first
-reported bootstrap instant. Operational deadlines remain on the standard clock;
-process CPU measurements continue to use the OS process CPU clock.
+All storage profiling timestamps share Quanta calibration, initialized before
+the first reported bootstrap instant. Operational deadlines use the standard
+clock, and CPU sampling uses the OS process CPU clock.
 
-CPU sampling returns nanoseconds directly. Linux RSS helpers use typed errors,
-including `RuntimeError::ProfilingMeasurement`, underlying I/O context, and attachments.
-RSS retains synchronous baseline/readiness, 1 ms sampling, terminal sampling,
-saturating peak-above-baseline, and explicit stop/join. Enabling profiling or
-constructing an engine does not activate probes. Benchmark workload timing,
-histograms, fixture verification, activation windows, and error precedence remain
-in the benchmark crate.
+RSS sampling captures a synchronous baseline, waits for worker readiness, samples
+at one-millisecond intervals, and includes a terminal sample on explicit stop.
+Both stop and Drop join the worker. Explicit stop returns measurements or worker
+errors; implicit cleanup discards them. No engine startup activates probes.
 
-Storage's optional Quanta and rustix dependencies activate through `profiling`.
-The benchmark explicitly enables storage profiling and enables Quanta's mock
-feature only as a development dependency. Its normal rustix dependency retains
-process signaling; storage enables the CPU-clock and page-size capabilities.
+Storage's Quanta and rustix dependencies are optional behind profiling.
+The benchmark explicitly enables storage profiling and keeps rustix for process
+signaling. Quanta's mock feature is a benchmark development dependency only.
 
 ## Implementation Notes
 
-Centralized storage profiling and benchmark measurement helpers with preserved
-enabled output and compile-time removal of disabled instrumentation. Public
-API documentation records diagnostic feature availability, maintenance behavior,
-and canonical imports. The generated public error inventory was refreshed.
+Centralized storage profiling with preserved enabled measurement contracts and
+compile-time removal of disabled instrumentation. Operational correctness no
+longer depends on diagnostic counters, and maintenance result types retain a
+consistent named-struct interface across feature configurations.
 
-A fixed baseline captured before moving the metric emitter verifies all 202
-ordered metrics in both delta and cumulative modes. Additional checks preserve
-conditional emission, lifetime peaks, saturating deltas, and failed-build versus
-successful CREATE publication behavior. Recovery tests retain numeric precision,
-accounting validation, and saturating duration differences. They cover unknown
-fields at every nested level and historical omission of hot-index measurements.
-Probe failures retain typed measurement and underlying I/O diagnostics.
+### Review outcomes
 
-Review removed profiling overflow guards and fallible numeric conversions.
-CPU sampling is infallible, and benchmark callers subtract CPU samples directly
-instead of using a separate delta helper. Overflow-rejection cases were removed;
-Timing tests cover positive, equal, and exceeding nested intervals.
+Review made the complete profiling module and pure diagnostic APIs conditional,
+removed disabled fallback producers, and separated catalog outcomes from metrics.
+The initial feature-dependent catalog and row-replay aliases were replaced with
+named structs whose measurement fields are gated. Enabled checkpoint serialization
+retains its flattened benchmark schema; disabled serialization wraps the outcome
+in the common result structure.
 
-Mixed correctness tests continue running with profiling disabled. Readonly-cache
-and I/O synchronization use dedicated test hooks or actual state instead of
-production statistics. Restart tests verify recovered values through index
-lookups. A direct replay regression covers successful insert/update/delete
-followed by invalid payloads, and malformed first operations leave pages clean.
+The benchmark's redundant output wrappers were removed. Storage measurement
+helpers now serve both benchmark callers and other explicit consumers, while
+benchmark orchestration retains its timing and error responsibilities.
 
-Review and repeated runs exposed test assumptions about background cleanup:
-a dropped runtime could be reclaimed between allocation snapshots, and metadata
-history could be purged between failed-DDL snapshots. The publication test now
-retains the relevant layout and transaction horizon. Retired-runtime cleanup
-checks observe completed purge cycles. Both affected tests passed 30 consecutive
-stress iterations without changing production cleanup behavior.
+Numeric overflow guards and fallible conversions were removed under the
+representability assumption. Saturating duration subtraction was retained, and
+the logical-lock underflow assertion was restored as a lifecycle invariant.
 
-Final backend/feature validation on 2026-09-30:
+The public RSS sampler now stops and joins on Drop, including early errors and
+unwinding. Tests distinguish explicit worker-error reporting from implicit
+cleanup and establish release of worker ownership without scheduling sleeps.
+
+Mixed correctness tests remain active without profiling. Dedicated hooks and
+actual state replace production counters as synchronization predicates. The
+index-DDL overlap test awaits rollback while the DDL gate remains held, so its
+cleanup-progress guarantee does not depend on profiling counters.
+
+Review also exposed background-cleanup assumptions in allocation and failed-DDL
+snapshots. Tests retain the relevant layout or transaction horizon and observe
+completed purge cycles. Both affected tests passed 30 consecutive stress runs
+without changing production cleanup behavior.
+
+Checkpoint serialization testing exposed an existing Noop parsing inconsistency:
+unknown fields inside the outcome were accepted. Strict parsing now rejects them
+for both outcome variants and their result wrappers, preserving the public
+variants and valid report schemas across profiling configurations.
+
+### Clock evaluation
+
+A release experiment on 2026-09-29 used Quanta 0.13.0, rustc 1.97.1/LLVM 22.1.6,
+and Apple aarch64 Linux under OrbStack, pinned to guest CPU 0. Each case warmed
+for 200,000 iterations and ran 16 rotating rounds of 3,000,000 iterations.
+`black_box` retained reads and starts; the standard clock measured outer loops.
+These medians are loop costs, not resolution or end-to-end engine speedups:
+
+| Primitive | Read | Two reads plus elapsed nanoseconds |
+| --- | ---: | ---: |
+| Standard Instant | 9.986 ns | 25.005 ns |
+| Quanta Instant | 1.134 ns | 2.353 ns |
+| Explicit Quanta Clock | 0.901 ns | 1.645 ns |
+| Raw Clock with delta conversion | 0.679 ns | 1.137 ns |
+
+Eleven fresh-process initializations had a median calibration cost of 523,230 ns
+(range 522,396–524,479 ns). Quanta permits up to 200 ms for calibration, so this
+is not a portable bound. A four-thread, mutex-ordered smoke check of 400,000
+samples observed no backward timestamps; it does not establish behavior across
+all hardware or VM migration. Mock-enabled Instant pairs cost 5.512 ns in a
+separate run. No x86-64 speedup is claimed.
+
+The summarized evidence is durable; ignored research artifacts remain under
+`target/profiling-clock-eval-20260929/` in the dispatch checkout.
+
+### Final verification
+
+The profiling reorganization, including review fixes and field ordering, passed
+the following matrix on 2026-09-30 before the final Noop parsing fix:
 
 | Configuration | Result |
 | --- | --- |
-| Workspace defaults (profiling + io_uring) | 2,189 tests passed |
-| Storage only, io_uring without profiling | 2,014 tests passed |
-| Storage only, libaio without profiling | 2,016 tests passed |
-| Storage only, libaio with profiling | 2,044 tests passed |
+| Workspace defaults, profiling with io_uring | 2,193 tests passed |
+| Storage, io_uring without profiling | 2,015 tests passed |
+| Storage, libaio without profiling | 2,017 tests passed |
+| Storage, libaio with profiling | 2,048 tests passed |
 
-Follow-up cleanup on 2026-09-30 removed the redundant benchmark `output.rs`
-module and its three forwarding functions. Plan execution and recovery call
-`InternalStatsSnapshot` directly, retaining error conversion and session cleanup
-at their existing boundaries. All 146 benchmark tests passed after this change.
+The subsequent Noop parsing fix passed 2,194 workspace tests and 2,015 storage
+tests without profiling on io_uring. Its regression first reproduced the bug,
+then verified strict direct and wrapped outcomes in both feature configurations.
 
-Review made the profiling module and all pure stats APIs feature-gated and
-removed disabled zero/empty fallback producers. The six session stats getters,
-engine recovery report, and diagnostic type exports require profiling. Catalog
-checkpoint returns the same named struct in both builds, with an unconditional
-outcome and a feature-gated report containing only metrics. Result definitions
-stay in their operational modules, including the row-replay result with feature-gated
-counts and the hot-index recovery alias. Redundant inner feature gates were removed
-from profiling modules.
+Formatting and Clippy passed for the full reorganization matrix. The final
+parsing fix also passed workspace and profiling-disabled io_uring checks.
+The resolve style gate passed 80 branch-diff Rust files and
+1,300 selected test contracts with zero violations. Assertion review retained
+operational, lifecycle, backend-specific, and profiling-only coverage. Existing
+Clippy tooling reports an unknown allowance for `unused_async_trait_impl` but
+exits successfully; no lint or timeout configuration was changed.
 
-External callers verify the checkpoint result in both builds, the metrics-only
-report, and the absence of the disabled profiling module; previous API checks
-also verified that diagnostic methods are unavailable without the feature.
-Checkpoint serialization retains its flat benchmark schema and rejects unknown
-fields at the result, published outcome, table-change, and table-I/O levels. Disabled
-maintenance tests destructure checkpoint and cleanup results with only operational
-fields. Runtime lifecycle tests use authoritative blocker counts in both builds;
-metric-only checks require profiling. The two dedicated snapshot/report tests
-run only when those APIs exist, explaining the
-reduced disabled test counts.
-
-Formatting, workspace Clippy, and all three explicit storage feature/backend
-Clippy passes succeeded. The final style gate passed 67 branch-diff Rust files;
-the profiling directory pass covered 13 files, including new modules. Their
-test-contract checks reported zero violations (1,260 and 19 selected tests,
-respectively). Semantic review preserved operational, lifecycle, backend-specific,
-and profiling-only assertions. The installed Clippy reports the repository's
-pre-existing unknown `clippy::unused_async_trait_impl` allowance; commands still
-exit successfully. No lint or timeout configuration was changed.
-
-Storage-only normal dependency graphs contain no Quanta, rustix, or
-portable-atomic without profiling and include them when enabled. A disabled
-release LLVM build contains no recorder, profiling clock, process-probe, or
-new test-hook symbols. Representative emitted buffer, io_uring, mandatory-runtime,
-recovery, and hot-index-build functions have no profiling references; source
-review also checked feature-gated fields, call arguments, and asynchronous
-transport. Operational counters and standard-clock retry deadlines remain.
-
-The local lockfile was regenerated with one Quanta 0.13.0 version. `Cargo.lock`
-is ignored by this repository, so dependency requirements are the tracked
-artifact rather than a newly forced lockfile. There are no deferred implementation
-items, source backlogs to close, or parent RFC phases to synchronize.
+The fixed pre-relocation baseline verifies all 202 metrics in delta and
+cumulative modes. Earlier dependency and release-LLVM checks confirmed that
+disabled storage omits Quanta, rustix, portable-atomic, profiling clocks,
+recorders, probes, and test-hook symbols while retaining operational counters
+and standard-clock deadlines. The ignored local lockfile resolved one Quanta
+0.13.0 version; tracked manifests carry the dependency contract.
 
 ## Impacts
 
-- Canonical profiling imports replace the removed stats namespace. The module,
-  stats getters, diagnostic types, and crate-root stats exports require profiling.
-- Buffer, storage I/O, redo/purge, locks, runtime, recovery, checkpoint, cleanup,
-  and index-build instrumentation is optional across its complete lifetime.
-- Enabled native duration reports and benchmark schemas retain their contracts.
-  Disabled catalog checkpoint and cleanup results omit measurement fields.
-  Configuration and persisted storage formats are unchanged.
-- Optional process probes are reusable outside the benchmark; RSS failures return
-  storage errors. Benchmark callers retain workload-specific conversion and validation.
-- Profiling clock setup occurs outside internal reported startup time; the
-  recorded microbenchmark is local evidence, not an end-to-end speedup claim.
+- Diagnostic import paths and availability follow the profiling feature;
+  maintenance outcomes remain available in every build.
+- Buffer, I/O, redo/purge, locks, runtime, recovery, checkpoint, cleanup, and
+  index-build instrumentation is optional across its lifetime.
+- Enabled benchmark schemas and measurement windows are preserved. Disabled
+  checkpoint consumers use the common result's outcome field.
+- Configuration and persistent storage formats are unchanged.
+- Process probes are reusable, caller-owned resources; dropping an RSS sampler
+  now waits for worker cleanup.
+- Local clock measurements support the selected implementation but make no
+  end-to-end performance guarantee.
 
 ## Test Cases
 
-- Exact metric inventory/order/value/kind/unit baselines and conditional family,
-  delta, lifetime-peak, cumulative, and publication semantics.
-- Strict recovery round trips, historical optional fields, numeric precision,
-  byte and work accounting, saturating duration differences, and shared-clock intervals.
-- Compile-time availability of the profiling module, stats methods, and fields;
-  feature-specific checkpoint result types; enabled recovery-report lifetime and inspection
-  lifecycle errors; actual capacity and admission/drain state in both builds.
-- Replay ordering, partial-failure dirty pages, restart values/indexes, required
-  redo sync, lock cancellation, admission/drain, and resource limits.
-- Checkpoint publication/reopen and cleanup outcomes in both feature settings.
-- Shared recorder ownership, backend-specific I/O accounting, runtime completion
-  visibility, and cancelled/failed build publication.
-- Process CPU sampling, RSS parsing/unavailable input, readiness,
-  peak consistency, activation windows, joining, and primary-error precedence.
-- Separate backend/feature test and Clippy passes, release-code inspection, and
-  storage-only normal dependency graph checks.
+- Exact metric names, ordering, values, units, kinds, conditional families,
+  saturating deltas, lifetime peaks, and successful-publication rules.
+- Recovery serialization, historical optional fields, duration precision,
+  saturating residuals, accounting consistency, and shared-clock intervals.
+- Feature-gated API availability and named maintenance/replay result shapes;
+  enabled recovery-report lifetime and operational behavior in both builds.
+- Replay ordering, partial-failure dirty pages, restart values and indexes,
+  required redo synchronization, lock accounting, cancellation, and drain.
+- Checkpoint publication/reopen, strict outcome and result serialization in both
+  profiling configurations, cleanup outcomes, and cleanup progress while accepted
+  index DDL remains gated.
+- Shared recorder ownership, backend I/O accounting, completion visibility,
+  resource limits, and cancelled or failed build publication.
+- CPU sampling, RSS parsing and errors, readiness, peaks, activation windows,
+  explicit stop, Drop on error or unwind, joining, and error precedence.
 
 ## Open Questions
 
-None. Broader clock performance evaluation on other architectures and a future
-profiling service remain outside this task's scope.
+No implementation questions or deferred parsing issues remain.
+
+Broader clock evaluation on other architectures and an engine-wide profiling
+service remain outside this task's scope.
