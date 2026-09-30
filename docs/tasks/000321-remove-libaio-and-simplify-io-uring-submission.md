@@ -11,8 +11,9 @@ github_issue: 1127
 ## Summary
 
 Made io_uring the sole storage I/O backend and removed libaio implementation,
-ABI bindings, native linkage, backend-selection features, and alternate CI
-validation. Profiling remains independently optional and enabled by default.
+ABI bindings, native linkage, backend-selection features, and alternate-backend
+CI validation. Profiling remains independently optional and enabled by default;
+CI requires validation with profiling enabled and disabled on io_uring.
 
 The private backend interface now stages operations directly into a submission
 batch and returns completions without an external event buffer. Submission
@@ -119,7 +120,10 @@ original submission containers throughout this path.
 
 CI retains workspace Clippy, reusable test audit, change detection, and
 intentional-skip handling. The existing coverage workflow remains the workspace
-nextest execution path; the libaio job and alternate Clippy step are gone.
+nextest execution path. A required profiling-disabled job runs storage Clippy
+and nextest with the same io_uring backend. The build aggregate rejects failed,
+cancelled, or unexpectedly skipped required jobs while allowing intentional
+skips when no build changes are detected.
 
 Coverage no longer checks obsolete backend features. It still records resolved
 features, evaluates declared cfg predicates, rejects unmodeled overrides, and
@@ -135,6 +139,12 @@ submission ownership and storage/redo/recovery failure behavior.
 
 Material discoveries and adjustments:
 
+- Review identified that removing the alternate-backend job also removed CI's
+  only profiling-disabled storage test pass. Added dedicated storage Clippy and
+  nextest validation without default features, required by the build aggregate,
+  with the existing CI profile and JUnit artifact handling.
+- Documentation review kept top-level design changes conceptual and removed
+  obsolete backend descriptions without adding private interface or CI details.
 - Recovery streaming contained a fifth mock, `WaitErrorBackend`, beyond the
   four listed in the proposal. It now uses direct staging with its scripted
   wait failure and drain assertions unchanged.
@@ -158,20 +168,24 @@ Validation completed in this worktree on 2026-09-30:
 | --- | --- |
 | Workspace build | Passed |
 | Workspace nextest | 2,192 passed |
-| Storage nextest without default features | 2,013 passed |
+| Storage nextest without default features, CI profile | 2,013 passed |
 | Storage all-feature, all-target check | Passed |
 | Profiling-disabled strict Clippy | Passed |
 | Branch style audit against origin/main | 17 Rust files passed; 233 selected tests, zero contract violations |
 | Coverage-tool unit tests | 23 passed |
-| Fresh workspace coverage | 2,192 passed; 90.14% production-line coverage |
+| Workspace coverage, implementation snapshot | 2,192 passed; 90.14% production-line coverage |
 | Focused I/O coverage | 90.40%, 829/917 production lines |
 | Cargo metadata | Only default/profiling features; io-uring nonoptional |
-| CI aggregate branch checks | Success, intentional skip, invalid output, and required-job failures handled correctly |
+| Workflow YAML and shell syntax | Passed; job dependencies and JUnit upload configuration verified |
+| CI aggregate branch checks | 13 success, failure, cancellation, invalid-output, and skip cases passed |
 | Unsafe inventory and diff whitespace | Refreshed and passed |
 
 Coverage provenance records storage features `default` and `profiling` without
-requiring either removed backend name. The focused report is generated at
-`target/coverage/io.md`.
+requiring either removed backend name. The focused report was generated at
+`target/coverage/io.md`. These measurements precede the final import formatting
+and CI/documentation review updates; runtime behavior did not change afterward.
+Final resolution reran the branch style gate and retained the successful
+profiling-disabled CI-profile test results.
 
 The concrete io_uring backend measured 77.69% (188/242 lines), below the per-file
 80% review bar. Uncovered paths include real syscall interruption/pressure,
@@ -218,12 +232,13 @@ production contracts.
 6. Integration tests retain root-write-before-fsync, failed-sync root stability,
    redo fsync/fdatasync, out-of-order completion, poisoning, waiter settlement,
    and recovery drain contracts.
-7. Coverage fixtures and fresh collection work with current feature metadata;
-   CI aggregates only the remaining jobs and preserves intentional skips.
+7. Coverage fixtures and collection work with current feature metadata; CI
+   requires profiling-disabled validation and preserves intentional skips.
 
 ## Open Questions
 
-None for this implementation. Batched io_uring benchmarking remains tracked by
+No unresolved review issues or newly deferred work. Batched io_uring benchmarking
+remains tracked by
 [backlog 000072](../backlogs/000072-add-batch-io-backend-efficiency-benchmark-baseline.md)
 and is not an acceptance dependency. Waitable lock upgrades remain tracked by
 [backlog 000181](../backlogs/000181-waitable-comparable-same-scope-lock-upgrades.md).

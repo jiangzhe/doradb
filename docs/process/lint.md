@@ -121,8 +121,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The `profiling` feature is independently optional and enabled by default.
-All-feature builds are supported. When changing feature-sensitive code,
-validate disabled profiling with the same backend:
+All-feature builds are supported. CI also requires storage Clippy and nextest
+with profiling disabled, using the same io_uring backend and the nextest `ci`
+profile. For local feature-sensitive validation, run:
 
 ```bash
 cargo clippy -p doradb-storage --no-default-features --all-targets -- -D warnings
