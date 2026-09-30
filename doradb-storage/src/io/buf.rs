@@ -9,8 +9,7 @@ const DIRECT_BUF_MAX_LEN: usize = if usize::BITS < u32::BITS {
     u32::MAX as usize
 };
 
-/// IOBuf represents one aligned direct-I/O buffer shared by the supported
-/// storage backends.
+/// IOBuf represents one aligned direct-I/O buffer used by storage operations.
 pub(crate) trait IOBuf: Send + 'static {
     /// Returns reference to underlying byte slice.
     fn as_bytes(&self) -> &[u8];
@@ -129,18 +128,6 @@ impl DirectBuf {
     pub(crate) fn reset(&mut self) {
         self.full_slice_mut().fill(0);
         self.len = 0;
-    }
-
-    /// Truncate length to given number.
-    ///
-    /// If the provided length exceeds capacity, it will be clamped to capacity.
-    #[inline]
-    pub(crate) fn truncate(&mut self, len: usize) {
-        if len <= self.capacity() {
-            self.len = len;
-        } else {
-            self.len = self.capacity();
-        }
     }
 }
 
@@ -279,39 +266,16 @@ mod tests {
         }
     }
 
-    /// Purpose: Preserve appended data and clear a direct buffer for reuse.
-    /// Expected: Growth retains existing bytes and reset clears the allocation and logical length.
+    /// Purpose: Clear direct-buffer data and padding for reuse.
+    /// Expected: Reset clears the entire allocation and sets logical length to zero.
     #[test]
-    fn test_direct_buf_data_operations() {
-        let mut buf = DirectBuf::zeroed(0);
-        let data = [1, 2, 3, 4, 5];
-
-        buf.truncate(data.len());
-        buf.data_mut().copy_from_slice(&data);
-        assert_eq!(buf.data(), &data);
-
-        let more_data = [6, 7, 8];
-        let old_len = buf.len();
-        buf.truncate(old_len + more_data.len());
-        buf.data_mut()[old_len..].copy_from_slice(&more_data);
-        assert_eq!(buf.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
-
+    fn test_direct_buf_reset() {
+        let mut buf = DirectBuf::from(&[1, 2, 3, 4, 5][..]);
         let len = buf.len();
         buf.as_bytes_mut()[len..].fill(0xff);
         buf.reset();
         assert_eq!(buf.len(), 0);
         assert!(buf.as_bytes().iter().all(|&b| b == 0));
-    }
-
-    /// Purpose: Bound direct-buffer logical length when truncation requests exceed capacity.
-    /// Expected: The logical length stops at the allocated capacity.
-    #[test]
-    fn test_direct_buf_truncate_clamps_to_capacity() {
-        let mut buf = DirectBuf::zeroed(32);
-        let capacity = buf.capacity();
-
-        buf.truncate(capacity + 1);
-        assert_eq!(buf.len(), capacity);
     }
 
     /// Purpose: Exercise repeated allocation and release across direct-buffer size boundaries.

@@ -45,9 +45,7 @@ pub(crate) struct TrxSysStats {
     pub(crate) seal_failure_count: usize,
     /// Number of backend submit-or-wait calls observed by the log thread.
     ///
-    /// On `libaio`, one logical IO commonly contributes separate submit and
-    /// wait syscalls, so this count can be roughly doubled compared with
-    /// `io_uring` for serialized workloads.
+    /// Counts io_uring submit calls and blocking submit-and-wait calls.
     pub(crate) io_submit_and_wait_count: usize,
     /// Total non-overlapping nanoseconds spent in backend submit-or-wait calls.
     pub(crate) io_submit_and_wait_nanos: usize,

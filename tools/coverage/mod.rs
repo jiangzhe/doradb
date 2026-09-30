@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 const HELP: &str = "Usage: tools/coverage.rs <run|report> [options]
 
-run     Collect fresh stable default-feature iouring workspace coverage.
+run     Collect fresh stable default-feature workspace coverage (io_uring).
 report  Validate and render completed artifacts without running Cargo or tests.
 
   --output-dir <dir>    Run artifacts (default: target/coverage)

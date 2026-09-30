@@ -13,30 +13,14 @@ For a complete runnable program, see
 
 ## Platform and Cargo features
 
-Doradb currently targets Linux and uses direct asynchronous IO. Exactly one
-storage backend feature must be enabled:
+Doradb targets Linux and requires usable `io_uring` for direct asynchronous
+I/O. The optional `profiling` feature is enabled by default.
 
-| Feature | Status | Notes |
-| --- | --- | --- |
-| `iouring` | Default | Uses Linux `io_uring`. |
-| `libaio` | Alternate | Intended for kernels or environments where `io_uring` is unavailable; development packages `libaio1` and `libaio-dev` are required. |
-
-A path dependency uses the default `io_uring` backend:
+A path dependency uses the default feature set:
 
 ```toml
 [dependencies]
 doradb-storage = { path = "../doradb-storage" }
-```
-
-Select `libaio` explicitly by disabling default features:
-
-```toml
-[dependencies]
-doradb-storage = {
-    path = "../doradb-storage",
-    default-features = false,
-    features = ["libaio"],
-}
 ```
 
 Public operations return standard Rust futures and do not require a particular

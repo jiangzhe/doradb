@@ -113,23 +113,20 @@ and execution failures do not publish stale reports. Aggregate `verify` accepts
 the intentional skip when no build changes are detected and requires audit
 success when `run_build` is true.
 
-CI build workflow runs strict clippy for both the default backend and the
-alternate `libaio` backend:
+CI runs the default workspace Clippy gate with io_uring as the sole storage
+backend:
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings
 ```
 
-This keeps the default local and CI lint behavior aligned while preventing
-feature-specific lint regressions in the alternate backend.
-
-Do not use `--all-features` for `doradb-storage`: the `iouring` and `libaio`
-backend features are mutually exclusive. Validate the alternate backend tests
-with a separate explicit feature command when needed:
+The `profiling` feature is independently optional and enabled by default.
+All-feature builds are supported. When changing feature-sensitive code,
+validate disabled profiling with the same backend:
 
 ```bash
-cargo nextest run -p doradb-storage --no-default-features --features libaio
+cargo clippy -p doradb-storage --no-default-features --all-targets -- -D warnings
+cargo nextest run -p doradb-storage --no-default-features
 ```
 
 The undocumented-unsafe-block policy is enabled in the workspace lint manifest

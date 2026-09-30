@@ -1119,10 +1119,8 @@ mod tests {
 
             // write
             let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-            buf.reset();
             let data = b"hello, world";
-            buf.truncate(data.len());
-            buf.data_mut().copy_from_slice(data);
+            buf.data_mut()[..data.len()].copy_from_slice(data);
             let global = global_readonly_pool_scope(64 * 1024 * 1024);
             let test_disk_pool = table_readonly_pool(&global, table_id, &table_file);
             let mutable = MutableTableFile::fork(

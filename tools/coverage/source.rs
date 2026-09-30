@@ -896,14 +896,14 @@ mod tests {
                 "target_arch=\"aarch64\"".into(),
                 "coverage".into(),
             ]),
-            features: BTreeSet::from(["iouring".into()]),
-            declared_features: BTreeSet::from(["iouring".into(), "libaio".into()]),
+            features: BTreeSet::from(["enabled".into()]),
+            declared_features: BTreeSet::from(["enabled".into(), "disabled".into()]),
         };
         assert!(
             config
                 .evaluate(
                     &syn::parse_quote!(all(
-                        feature = "iouring",
+                        feature = "enabled",
                         target_arch = "aarch64",
                         not(windows),
                         coverage
@@ -914,7 +914,7 @@ mod tests {
         );
         assert!(
             !config
-                .evaluate(&syn::parse_quote!(any(feature = "libaio", windows)), true)
+                .evaluate(&syn::parse_quote!(any(feature = "disabled", windows)), true)
                 .unwrap()
         );
         assert!(

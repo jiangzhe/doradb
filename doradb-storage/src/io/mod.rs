@@ -2,65 +2,36 @@ mod backend;
 
 mod buf;
 
-#[cfg(feature = "iouring")]
 mod iouring_backend;
-
-#[cfg(feature = "libaio")]
-mod libaio_abi;
-
-#[cfg(feature = "libaio")]
-mod libaio_backend;
-
-#[cfg(feature = "profiling")]
-use crate::error::{IoError, IoResult};
-use crate::obs;
-#[cfg(feature = "profiling")]
-use error_stack::Report;
-#[cfg(feature = "profiling")]
-use std::{fs, path::Path};
-
-use flume::{Receiver, SendError, Sender};
-
-use std::collections::VecDeque;
-
-use std::mem::{forget, replace, take};
-
-use std::os::unix::io::RawFd;
-
-use std::ptr::null_mut;
-
-use std::result::Result as StdResult;
-
-use std::time::Duration;
-
-pub(crate) use backend::*;
-
-pub(crate) use buf::*;
-
-/// Canonical storage backend selected by cargo features.
-#[cfg(feature = "iouring")]
-pub(crate) use iouring_backend::{BACKEND_NAME, IouringBackend as StorageBackend};
-
-/// Canonical storage backend selected by cargo features.
-#[cfg(feature = "libaio")]
-pub(crate) use libaio_backend::{BACKEND_NAME, LibaioBackend as StorageBackend};
 
 #[cfg(test)]
 pub(crate) use self::tests::{
     StorageBackendFileIdentity, StorageBackendOp, StorageBackendTestHook,
     current_storage_backend_test_hook, install_storage_backend_test_hook,
 };
+#[cfg(feature = "profiling")]
+use crate::error::{IoError, IoResult};
+use crate::obs;
+pub(crate) use backend::*;
+pub(crate) use buf::*;
+#[cfg(feature = "profiling")]
+use error_stack::Report;
+use flume::{Receiver, SendError, Sender};
+/// Canonical io_uring storage backend.
+pub(crate) use iouring_backend::{BACKEND_NAME, IouringBackend as StorageBackend};
+use std::collections::VecDeque;
+use std::mem::{forget, replace, take};
+use std::os::unix::io::RawFd;
+use std::ptr::null_mut;
+use std::result::Result as StdResult;
+use std::time::Duration;
+#[cfg(feature = "profiling")]
+use std::{fs, path::Path};
 
 /// Logical sector size required by storage Direct I/O buffers and offsets.
 pub(crate) const STORAGE_SECTOR_SIZE: usize = 4096;
 
 const INVALID_SLOT: u32 = u32::MAX;
-
-#[cfg(all(feature = "libaio", feature = "iouring"))]
-compile_error!("Enable exactly one storage IO backend feature: `libaio` or `iouring`.");
-
-#[cfg(not(any(feature = "libaio", feature = "iouring")))]
-compile_error!("One storage IO backend feature must be enabled: `libaio` or `iouring`.");
 
 /// Buffer ownership model for one backend-agnostic IO operation.
 ///
@@ -81,8 +52,7 @@ unsafe impl Send for IOMemory {}
 /// Backend-agnostic description of one submitted kernel IO operation.
 ///
 /// This type is backend-agnostic: it describes one read/write/sync operation
-/// and owns or borrows the memory that data operations bind into their prepared
-/// submission shape.
+/// and owns or borrows the memory referenced by the staged kernel request.
 pub(crate) struct Operation {
     kind: IOKind,
     fd: RawFd,
@@ -453,9 +423,8 @@ impl<T> InflightSlots<T> {
     }
 }
 
-struct InflightEntry<S, P> {
+struct InflightEntry<S> {
     submission: S,
-    _prepared: P,
     submitted: bool,
 }
 
@@ -469,15 +438,15 @@ struct SubmittedIoLeak {
 /// Field order on `SubmissionDriver` drops this quarantine after the backend.
 /// Backends that can prove submitted IO is no longer touching user memory allow
 /// normal drop; io_uring may request memory-bound entries to be leaked.
-struct SubmittedIoQuarantine<S, P>
+struct SubmittedIoQuarantine<S>
 where
     S: IOSubmission,
 {
-    entries: Vec<InflightEntry<S, P>>,
+    entries: Vec<InflightEntry<S>>,
     leak: Option<SubmittedIoLeak>,
 }
 
-impl<S, P> SubmittedIoQuarantine<S, P>
+impl<S> SubmittedIoQuarantine<S>
 where
     S: IOSubmission,
 {
@@ -490,7 +459,7 @@ where
     }
 
     #[inline]
-    fn retain(&mut self, entries: Vec<InflightEntry<S, P>>, cleanup: SubmittedIoCleanup) {
+    fn retain(&mut self, entries: Vec<InflightEntry<S>>, cleanup: SubmittedIoCleanup) {
         debug_assert!(self.entries.is_empty());
         match cleanup {
             SubmittedIoCleanup::DropAfterBackend => {
@@ -504,7 +473,7 @@ where
     }
 }
 
-impl<S, P> Drop for SubmittedIoQuarantine<S, P>
+impl<S> Drop for SubmittedIoQuarantine<S>
 where
     S: IOSubmission,
 {
@@ -550,7 +519,7 @@ pub(crate) struct CompletedSubmission<S> {
 
 /// Backend-neutral direct submission driver.
 ///
-/// The driver owns inflight slots, backend-prepared state, staged submission
+/// The driver owns inflight slots, submission owners, staged submission
 /// batches, completion-token validation, and backend submit/wait calls. Callers
 /// keep domain scheduling policy outside this type and push backend-facing
 /// submissions directly when capacity is available.
@@ -560,10 +529,9 @@ where
     B: Backend,
 {
     backend: B,
-    submitted_quarantine: SubmittedIoQuarantine<S, B::Prepared>,
-    events: B::Events,
+    submitted_quarantine: SubmittedIoQuarantine<S>,
     submit_batch: B::SubmitBatch,
-    slots: InflightSlots<InflightEntry<S, B::Prepared>>,
+    slots: InflightSlots<InflightEntry<S>>,
     staged_slots: VecDeque<u32>,
     submitted: usize,
     completed: VecDeque<CompletedSubmission<S>>,
@@ -587,13 +555,11 @@ where
         backend: B,
         submit_retry_timeout: Duration,
     ) -> Self {
-        let events = backend.new_events();
         let submit_batch = backend.new_submit_batch();
         let capacity = backend.io_depth();
         SubmissionDriver {
             backend,
             submitted_quarantine: SubmittedIoQuarantine::new(),
-            events,
             submit_batch,
             slots: InflightSlots::new(capacity),
             staged_slots: VecDeque::with_capacity(capacity),
@@ -685,14 +651,12 @@ where
             .slots
             .reserve()
             .expect("slot reservation should succeed when capacity is available");
-        let mut prepared = self.backend.prepare(token, submission.operation());
         self.backend
-            .push_prepared(&mut self.submit_batch, &mut prepared);
+            .stage_operation(&mut self.submit_batch, token, submission.operation());
         self.slots.occupy_reserved(
             slot,
             InflightEntry {
                 submission,
-                _prepared: prepared,
                 submitted: false,
             },
         );
@@ -768,7 +732,7 @@ where
                     self.submitted != 0,
                     "wait_at_least_one requires at least one backend-submitted operation"
                 );
-                let completions = self.backend.wait_at_least(&mut self.events, 1)?;
+                let completions = self.backend.wait_at_least(1)?;
                 let completed_count = completions.len();
                 assert!(
                     completed_count <= self.submitted,
@@ -818,7 +782,7 @@ where
     }
 
     #[inline]
-    fn take_submitted_entries(&mut self) -> Vec<InflightEntry<S, B::Prepared>> {
+    fn take_submitted_entries(&mut self) -> Vec<InflightEntry<S>> {
         if self.submitted == 0 {
             return Vec::new();
         }
@@ -937,14 +901,17 @@ pub(crate) fn align_to_sector_size(len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::error::IoResult;
+    use crate::file::{SparseFile, UNTRACKED_FILE_ID};
     use std::fs::metadata;
     use std::io::Error as StdIoError;
     use std::mem::MaybeUninit;
     use std::num::NonZeroUsize;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    use tempfile::TempDir;
 
     static STORAGE_BACKEND_TEST_HOOK_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     static STORAGE_BACKEND_TEST_HOOK: Mutex<Option<StorageBackendHook>> = Mutex::new(None);
@@ -1098,9 +1065,7 @@ mod tests {
     }
 
     impl Backend for DriverBackend {
-        type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
-        type Events = ();
 
         fn setup(io_depth: usize) -> IoResult<Self> {
             Ok(Self::new(io_depth))
@@ -1114,14 +1079,13 @@ mod tests {
             VecDeque::with_capacity(self.io_depth)
         }
 
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            token
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
+        fn stage_operation(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            token: BackendToken,
+            _operation: &mut Operation,
+        ) {
+            batch.push_back(token);
         }
 
         fn submit_batch(
@@ -1151,7 +1115,6 @@ mod tests {
 
         fn wait_at_least(
             &mut self,
-            _events: &mut Self::Events,
             min_nr: usize,
         ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(!self.panic_on_wait, "backend wait must not be called");
@@ -1211,22 +1174,39 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum CleanupEvent {
-        PreparedDropped(BackendToken),
+        SubmissionDropped(usize),
         BackendDropped,
     }
 
-    struct PreparedDropRecorder {
-        token: BackendToken,
+    struct CleanupSubmission {
+        submission: DriverSubmission,
         events: Arc<Mutex<Vec<CleanupEvent>>>,
     }
 
-    impl Drop for PreparedDropRecorder {
+    impl IOSubmission for CleanupSubmission {
+        fn operation(&mut self) -> &mut Operation {
+            self.submission.operation()
+        }
+    }
+
+    impl Drop for CleanupSubmission {
         #[inline]
         fn drop(&mut self) {
             self.events
                 .lock()
                 .unwrap()
-                .push(CleanupEvent::PreparedDropped(self.token));
+                .push(CleanupEvent::SubmissionDropped(self.submission.op.id));
+        }
+    }
+
+    struct FileSubmission {
+        file: Arc<SparseFile>,
+        operation: Operation,
+    }
+
+    impl IOSubmission for FileSubmission {
+        fn operation(&mut self) -> &mut Operation {
+            &mut self.operation
         }
     }
 
@@ -1269,9 +1249,7 @@ mod tests {
     }
 
     impl Backend for CleanupBackend {
-        type Prepared = PreparedDropRecorder;
         type SubmitBatch = VecDeque<BackendToken>;
-        type Events = ();
 
         fn setup(io_depth: usize) -> IoResult<Self> {
             Ok(Self::new(
@@ -1291,17 +1269,13 @@ mod tests {
             VecDeque::with_capacity(self.io_depth)
         }
 
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            PreparedDropRecorder {
-                token,
-                events: Arc::clone(&self.drop_events),
-            }
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(prepared.token);
+        fn stage_operation(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            token: BackendToken,
+            _operation: &mut Operation,
+        ) {
+            batch.push_back(token);
         }
 
         fn submit_batch(
@@ -1326,7 +1300,6 @@ mod tests {
 
         fn wait_at_least(
             &mut self,
-            _events: &mut Self::Events,
             _min_nr: usize,
         ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             panic!("cleanup tests must not wait for completions")
@@ -1783,6 +1756,58 @@ mod tests {
         assert!(err.to_string().contains("submit_retry_reason=NO_PROGRESS"));
     }
 
+    /// Purpose: Round-trip aligned file data through the submission driver and storage backend.
+    /// Expected: Completions report full transfers, preserve the file owner, and read back the exact payload.
+    #[test]
+    fn test_submission_driver_with_storage_backend() {
+        let backend = StorageBackend::setup(16).unwrap();
+        assert_eq!(backend.io_depth(), 16);
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("driver.bin");
+        let file = Arc::new(
+            SparseFile::create_or_trunc(
+                file_path.to_str().unwrap(),
+                STORAGE_SECTOR_SIZE,
+                UNTRACKED_FILE_ID,
+            )
+            .unwrap(),
+        );
+        let owner = Arc::downgrade(&file);
+        let mut driver = SubmissionDriver::new(backend);
+        let expected: Vec<u8> = (0..STORAGE_SECTOR_SIZE).map(|i| (i % 251) as u8).collect();
+        let mut buf = DirectBuf::zeroed(STORAGE_SECTOR_SIZE);
+        buf.data_mut().copy_from_slice(&expected);
+        let operation = Operation::pwrite_owned(file.as_raw_fd(), 0, buf);
+        assert!(driver.push(FileSubmission { file, operation }).is_ok());
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        assert!(owner.upgrade().is_some());
+        let completed = driver.wait_at_least_one().unwrap();
+        assert_eq!(completed.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(completed.submission.operation.kind(), IOKind::Write);
+
+        let file = completed.submission.file;
+        let operation =
+            Operation::pread_owned(file.as_raw_fd(), 0, DirectBuf::zeroed(STORAGE_SECTOR_SIZE));
+        assert!(driver.push(FileSubmission { file, operation }).is_ok());
+        assert_eq!(
+            driver.submit_ready().unwrap(),
+            SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
+        );
+        let completed = driver.wait_at_least_one().unwrap();
+        assert_eq!(completed.result.unwrap(), STORAGE_SECTOR_SIZE);
+        assert_eq!(completed.submission.operation.kind(), IOKind::Read);
+        assert_eq!(
+            completed.submission.operation.buf().unwrap().as_bytes(),
+            expected
+        );
+        assert!(owner.upgrade().is_some());
+        drop(completed.submission);
+        assert!(owner.upgrade().is_none());
+    }
+
     /// Purpose: Separate staged and accepted work during fatal backend cleanup.
     /// Expected: Staged entries drop immediately and accepted entries remain alive until backend drop.
     #[test]
@@ -1797,7 +1822,16 @@ mod tests {
             Arc::clone(&cleanup_submitted),
         );
         let mut driver = SubmissionDriver::new(backend);
-        stage_two_writes(&mut driver, 42);
+        for id in [1, 2] {
+            assert!(
+                driver
+                    .push(CleanupSubmission {
+                        submission: DriverSubmission::new(id, 42, (id - 1) * STORAGE_SECTOR_SIZE),
+                        events: Arc::clone(&drop_events),
+                    })
+                    .is_ok()
+            );
+        }
         assert_eq!(
             driver.submit_ready().unwrap(),
             SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap())
@@ -1809,16 +1843,16 @@ mod tests {
         assert_eq!(driver.submitted_len(), 0);
         assert_eq!(
             *drop_events.lock().unwrap(),
-            vec![CleanupEvent::PreparedDropped(BackendToken::new(0, 1))],
+            vec![CleanupEvent::SubmissionDropped(2)],
             "staged entry should drop immediately"
         );
         drop(driver);
         assert_eq!(
             *drop_events.lock().unwrap(),
             vec![
-                CleanupEvent::PreparedDropped(BackendToken::new(0, 1)),
+                CleanupEvent::SubmissionDropped(2),
                 CleanupEvent::BackendDropped,
-                CleanupEvent::PreparedDropped(BackendToken::new(0, 0)),
+                CleanupEvent::SubmissionDropped(1),
             ],
             "submitted entry should drop from quarantine after backend drop"
         );
@@ -1839,7 +1873,7 @@ mod tests {
                 DriverSubmission::sync(1, 42),
                 vec![
                     CleanupEvent::BackendDropped,
-                    CleanupEvent::PreparedDropped(BackendToken::new(0, 0)),
+                    CleanupEvent::SubmissionDropped(1),
                 ],
             ),
         ] {
@@ -1856,7 +1890,15 @@ mod tests {
                 Arc::clone(&cleanup_submitted),
             );
             let mut driver = SubmissionDriver::new(backend);
-            assert!(driver.push(submission).is_ok(), "{case}");
+            assert!(
+                driver
+                    .push(CleanupSubmission {
+                        submission,
+                        events: Arc::clone(&drop_events),
+                    })
+                    .is_ok(),
+                "{case}"
+            );
             assert_eq!(
                 driver.submit_ready().unwrap(),
                 SubmitAttempt::Submitted(NonZeroUsize::new(1).unwrap()),

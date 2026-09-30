@@ -24,7 +24,7 @@ After backlog 000167 lands, implement waitable conversion for comparable modes h
 
 ## Acceptance Hint
 
-A comparable same-scope upgrade that is temporarily blocked waits and later promotes instead of returning LockUpgradeWouldBlock. Two families that hold S and request X on the same resource terminate through the deadlock policy from backlog 000167. Cancellation, timeout, poison, or victim cleanup leaves the original mode valid until transaction cleanup or permits documented retry, with no leaked waiter or holder state. Covered repeated acquisition remains owner-local, FIFO behavior is documented and tested, and cross-scope strengthening remains rejected. Incomparable S-plus-IX composition remains an explicit future SIX or mode-set decision and is not silently promoted to X. Workspace and alternate-libaio validation pass.
+A comparable same-scope upgrade that is temporarily blocked waits and later promotes instead of returning LockUpgradeWouldBlock. Two families that hold S and request X on the same resource terminate through the deadlock policy from backlog 000167. Cancellation, timeout, poison, or victim cleanup leaves the original mode valid until transaction cleanup or permits documented retry, with no leaked waiter or holder state. Covered repeated acquisition remains owner-local, FIFO behavior is documented and tested, and cross-scope strengthening remains rejected. Incomparable S-plus-IX composition remains an explicit future SIX or mode-set decision and is not silently promoted to X. Workspace validation passes.
 
 ## Notes (Optional)
 

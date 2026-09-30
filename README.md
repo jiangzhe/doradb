@@ -150,7 +150,7 @@ I'm glad to have discussions if someone is interested in details.
 - [compression](./doradb-storage/src/compression): Compression algorithms for column store.
 - [file](./doradb-storage/src/file): Storage of table data, index and delete bitmap. The file is page based and organized as CoW B+Tree, to enable simple recovery and fast access.
 - [index](./doradb-storage/src/index): Block index and B+Tree index.
-- [io](./doradb-storage/src/io): Async direct IO system with compile-time-selected `libaio` and `io_uring` backends, by default `io_uring`.
+- [io](./doradb-storage/src/io): Async direct IO system using Linux `io_uring`, which must be available in the runtime environment.
 - [latch](./doradb-storage/src/latch): Async latch primitives including Mutex, RWLock and HybridLatch(enhanced RWLock with optimistic mode).
 - [lock](./doradb-storage/src/lock): Metadata lock and table-level lock.
 - [log](./doradb-storage/src/log): Redo log record encoding, append, and initialization.

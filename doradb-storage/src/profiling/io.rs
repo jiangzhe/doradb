@@ -39,43 +39,17 @@ pub struct IoBackendStats {
 pub(crate) struct BackendStats {
     /// Number of backend kernel-entry calls spent submitting work or waiting.
     ///
-    /// On `libaio`, one logical IO commonly contributes one submit call and
-    /// one wait call, so this count can be roughly doubled compared with
-    /// `io_uring` for serialized workloads.
+    /// Counts io_uring submit calls and blocking submit-and-wait calls.
     pub(crate) submit_and_wait_calls: usize,
     /// Number of operations accepted by the backend submit path.
     pub(crate) submitted_ops: usize,
     /// Total nanoseconds spent in backend submit-or-wait calls.
     ///
-    /// This is a non-overlapping total. `libaio` contributes separate submit
-    /// and wait syscall time, while `io_uring` contributes fused
-    /// `submit_and_wait()` time once.
+    /// This is a non-overlapping total: io_uring fused `submit_and_wait()`
+    /// time is counted once.
     pub(crate) submit_and_wait_nanos: usize,
     /// Number of completions observed by the backend wait path.
     pub(crate) wait_completions: usize,
-}
-
-impl BackendStats {
-    /// Returns the saturating delta from one earlier snapshot.
-    #[inline]
-    #[cfg_attr(
-        any(not(test), feature = "iouring"),
-        expect(dead_code, reason = "internal io backend stats")
-    )]
-    pub(crate) fn delta_since(self, earlier: BackendStats) -> BackendStats {
-        BackendStats {
-            submit_and_wait_calls: self
-                .submit_and_wait_calls
-                .saturating_sub(earlier.submit_and_wait_calls),
-            submitted_ops: self.submitted_ops.saturating_sub(earlier.submitted_ops),
-            submit_and_wait_nanos: self
-                .submit_and_wait_nanos
-                .saturating_sub(earlier.submit_and_wait_nanos),
-            wait_completions: self
-                .wait_completions
-                .saturating_sub(earlier.wait_completions),
-        }
-    }
 }
 
 #[derive(Default)]

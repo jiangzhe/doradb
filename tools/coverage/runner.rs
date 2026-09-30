@@ -186,11 +186,6 @@ pub(super) fn preflight(root: &Path) -> Result<Preflight> {
             .get(&package.id)
             .ok_or("workspace package missing from metadata resolve")?
             .clone();
-        if package.name == "doradb-storage"
-            && (!selected.contains("iouring") || selected.contains("libaio"))
-        {
-            return Err("coverage requires the default iouring backend without libaio".into());
-        }
         let manifest: toml::Value =
             toml::from_str(&fs::read_to_string(&package.manifest_path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -548,7 +543,7 @@ pub(super) fn collect_coverage(
         ),
     ];
     for (name, args) in commands {
-        eprintln!("coverage: {name} (stable, default iouring workspace)");
+        eprintln!("coverage: {name} (stable, default-feature workspace; io_uring)");
         let mut command = stable_cargo(root);
         command
             .args(args)

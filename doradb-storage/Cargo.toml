@@ -13,10 +13,8 @@ repository = "https://github.com/jiangzhe/doradb/doradb-storage/"
 workspace = true
 
 [features]
-default = ["iouring", "profiling"]
+default = ["profiling"]
 profiling = ["dep:quanta", "dep:rustix"]
-libaio = []
-iouring = ["dep:io-uring"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -43,7 +41,7 @@ blake3 = { workspace = true }
 crc32fast = { workspace = true }
 ordered-float = { workspace = true }
 dashmap = { workspace = true }
-io-uring = { workspace = true, optional = true }
+io-uring = { workspace = true }
 
 quanta = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["param", "time"], optional = true }

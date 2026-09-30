@@ -35,7 +35,7 @@ impl FixedBufferPool {
     /// Pool size if total available bytes of this buffer pool.
     /// We will determine the number of pages accordingly.
     /// We separate pages and frames so that pages are always aligned
-    /// to the unit of direct IO and can be flushed via libaio.
+    /// to the unit of direct IO and can be flushed via io_uring.
     #[inline]
     pub(crate) fn with_capacity(role: PoolRole, pool_size: usize) -> ResourceResult<Self> {
         role.assert_valid("fixed buffer pool");

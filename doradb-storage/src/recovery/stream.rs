@@ -29,7 +29,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::panic::resume_unwind;
 use std::path::PathBuf;
 use std::thread::{JoinHandle, panicking};
-
 #[cfg(test)]
 pub(super) use tests::decode_owning_group;
 #[cfg(test)]
@@ -2037,9 +2036,7 @@ mod tests {
     }
 
     impl Backend for WaitErrorBackend {
-        type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
-        type Events = ();
 
         fn setup(io_depth: usize) -> IoResult<Self> {
             Ok(Self::new(io_depth))
@@ -2053,14 +2050,13 @@ mod tests {
             VecDeque::with_capacity(self.io_depth)
         }
 
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            token
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
+        fn stage_operation(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            token: BackendToken,
+            _operation: &mut Operation,
+        ) {
+            batch.push_back(token);
         }
 
         fn submit_batch(
@@ -2083,7 +2079,6 @@ mod tests {
 
         fn wait_at_least(
             &mut self,
-            _events: &mut Self::Events,
             _min_nr: usize,
         ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             Err(BackendError::wait(

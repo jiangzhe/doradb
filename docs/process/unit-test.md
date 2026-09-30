@@ -11,11 +11,11 @@ Run the standard validation pass:
 cargo nextest run --workspace
 ```
 
-When changing storage backend code or backend-neutral I/O paths, also run the
-alternate-backend pass:
+When changing feature-sensitive storage code, also validate with profiling
+disabled. Both configurations use io_uring:
 
 ```bash
-cargo nextest run -p doradb-storage --no-default-features --features libaio
+cargo nextest run -p doradb-storage --no-default-features
 ```
 
 ## Doc Tests
@@ -72,8 +72,8 @@ consolidation preserves it; matching text alone does not justify deleting tests.
 
 -   Ensure existing tests continue to pass after code changes.
 -   Add tests for new features and bug fixes.
--   I/O changes should pass both default `io_uring` and alternate `libaio`
-    validation paths.
+-   I/O changes use the sole `io_uring` backend, which must be available in the
+    test environment. Feature-sensitive changes also validate disabled profiling.
 
 See [Coding Guidance](coding-guidance.md) for test structure and test-only code
 conventions.
@@ -101,8 +101,8 @@ the predicates and lost-wakeup behavior.
 
 ## Production Line Coverage
 
-`tools/coverage.rs` measures production-line coverage for the default `iouring`
-workspace, excluding test-only code. Requires `nightly-2026-05-22` for the script,
+`tools/coverage.rs` measures production-line coverage for the default-feature
+workspace using io_uring, excluding test-only code. Requires `nightly-2026-05-22` for the script,
 stable Rust with matching `llvm-tools`, `cargo-nextest`, and `cargo-llvm-cov`.
 
 ```bash
