@@ -2739,9 +2739,7 @@ mod tests {
     }
 
     impl Backend for LogTestBackend {
-        type Prepared = (BackendToken, IOKind);
         type SubmitBatch = VecDeque<(BackendToken, IOKind)>;
-        type Events = ();
 
         fn setup(io_depth: usize) -> IoResult<Self> {
             Ok(Self::complete_all(io_depth))
@@ -2755,14 +2753,13 @@ mod tests {
             VecDeque::with_capacity(self.io_depth)
         }
 
-        fn new_events(&self) -> Self::Events {}
-
-        fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
-            (token, operation.kind())
-        }
-
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
+        fn stage_operation(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            token: BackendToken,
+            operation: &mut Operation,
+        ) {
+            batch.push_back((token, operation.kind()));
         }
 
         fn submit_batch(
@@ -2785,7 +2782,6 @@ mod tests {
 
         fn wait_at_least(
             &mut self,
-            _events: &mut Self::Events,
             min_nr: usize,
         ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(

@@ -365,5 +365,4 @@ statement/system rollback, purge, B-tree callbacks, DiskTree rewrite cleanup,
 completion fan-out, and terminal unlink/cleanup.
 
 The standard validation is workspace formatting, build, clippy with warnings
-denied, nextest, the alternate `libaio` clippy/nextest pass, style audit, and
-`git diff --check`.
+denied, nextest, style audit, and `git diff --check`.

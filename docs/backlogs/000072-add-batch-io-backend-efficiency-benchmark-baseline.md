@@ -2,7 +2,7 @@
 
 ## Summary
 
-Track a follow-up benchmark that exercises multiple outstanding IO operations so the repository can demonstrate backend efficiency under batched work and preserve a reproducible baseline for future io_uring and libaio optimization.
+Track a follow-up benchmark that exercises multiple outstanding IO operations so the repository can demonstrate backend efficiency under batched work and preserve a reproducible baseline for future io_uring optimization.
 
 ## Reference
 
@@ -10,11 +10,11 @@ Track a follow-up benchmark that exercises multiple outstanding IO operations so
 
 ## Scope Hint
 
-Add one dedicated batched-IO benchmark scenario, likely under doradb-storage/examples/, that runs the same block-backed workload under default io_uring and explicit libaio with configurable outstanding depth or batch size, reports backend stats plus throughput/latency summaries, and uses a workload shape that keeps multiple operations in flight so backend API efficiency is visible rather than hidden by serialized miss cost.
+Add one dedicated batched-IO benchmark scenario, likely under doradb-storage/examples/, that runs a block-backed workload under io_uring with configurable outstanding depth or batch size, reports backend stats plus throughput/latency summaries, and uses a workload shape that keeps multiple operations in flight so backend API efficiency is visible rather than hidden by serialized miss cost.
 
 ## Acceptance Hint
 
-The repository includes a reproducible batched-IO benchmark that can be run against both backends on the same block-backed filesystem, the output makes backend efficiency comparable with a stable baseline for future optimization work, and the scenario is documented clearly enough that later changes can use it as a before/after performance reference without conflating it with the serialized single-miss benchmark.
+The repository includes a reproducible batched-IO benchmark that can be run using io_uring on the same block-backed filesystem, the output provides a stable backend-efficiency baseline for future optimization work, and the scenario is documented clearly enough that later changes can use it as a before/after performance reference without conflating it with the serialized single-miss benchmark.
 
 ## Notes (Optional)
 

@@ -8,9 +8,9 @@
 ## Build, Test, and Development Commands
 - `cargo build --workspace` builds all workspace crates.
 - `cargo nextest run --workspace` runs the standard unit/integration validation pass across workspace members.
-- `cargo nextest run -p doradb-storage --no-default-features --features libaio` validates the alternate storage I/O backend.
+- `cargo nextest run -p doradb-storage --no-default-features` validates storage with profiling disabled when changing feature-sensitive code.
 - `cargo run -p doradb-bench -- --help` shows the standalone benchmark tool commands.
-- Linux development environments must provide `libaio1` and `libaio-dev`.
+- Linux development and runtime environments must support usable `io_uring`.
 
 ## Architecture Notes
 - The storage engine combines in-memory row store and on-disk column store with full transactions.

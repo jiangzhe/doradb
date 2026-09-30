@@ -246,10 +246,6 @@ pub(crate) enum SubmittedIoCleanup {
     /// Submitted state can be dropped after the backend owner is dropped.
     DropAfterBackend,
     /// The backend could not prove submitted user memory is no longer in use.
-    #[cfg_attr(
-        not(feature = "iouring"),
-        allow(dead_code, reason = "io_uring-only submitted cleanup disposition")
-    )]
     LeakAfterBackend {
         backend: &'static str,
         reason: String,
@@ -261,7 +257,6 @@ enum BackendErrorDetail {
     Submit {
         staged: usize,
         pending: usize,
-        note: Option<&'static str>,
     },
     Wait,
     SubmitRetryExpired {
@@ -295,28 +290,11 @@ impl BackendError {
         staged: usize,
         pending: usize,
     ) -> Self {
-        Self::submit_with_note(backend, source, call_count, staged, pending, None)
-    }
-
-    /// Builds a submit failure with an optional backend-specific static note.
-    #[inline]
-    pub(crate) fn submit_with_note(
-        backend: &'static str,
-        source: StdIoError,
-        call_count: usize,
-        staged: usize,
-        pending: usize,
-        note: Option<&'static str>,
-    ) -> Self {
         Self::new(
             backend,
             source,
             call_count,
-            BackendErrorDetail::Submit {
-                staged,
-                pending,
-                note,
-            },
+            BackendErrorDetail::Submit { staged, pending },
         )
     }
 
@@ -406,15 +384,8 @@ impl fmt::Display for BackendError {
             self.call_count
         )?;
         match &self.detail {
-            BackendErrorDetail::Submit {
-                staged,
-                pending,
-                note,
-            } => {
+            BackendErrorDetail::Submit { staged, pending } => {
                 write!(f, " queue={{staged={staged} pending={pending}}}")?;
-                if let Some(note) = note {
-                    write!(f, " note={note}")?;
-                }
             }
             BackendErrorDetail::Wait => {}
             BackendErrorDetail::SubmitRetryExpired {
@@ -475,19 +446,12 @@ impl BackendToken {
     }
 }
 
-/// Backend-specific submit/wait contract used by storage IO schedulers.
+/// Kernel submission and completion contract used by storage IO schedulers.
 ///
-/// The worker owns scheduling and inflight lifetime. The backend owns:
-/// - how one [`super::Operation`] is prepared for the kernel
-/// - how prepared submissions are staged into one batch
-/// - how completion buffers are allocated and interpreted
-///
-/// This keeps libaio-specific `*mut *mut iocb` layout and future io_uring
-/// submission queue layout out of the IO scheduler.
+/// The caller owns scheduling and submission lifetimes. The backend stages
+/// kernel requests into a batch and returns completion tokens and results.
 pub(crate) trait Backend: Sized {
-    type Prepared;
     type SubmitBatch;
-    type Events;
 
     /// Set up one backend with the requested concurrent IO depth.
     fn setup(io_depth: usize) -> IoResult<Self>;
@@ -498,14 +462,17 @@ pub(crate) trait Backend: Sized {
     /// Allocates one empty backend-owned submit batch.
     fn new_submit_batch(&self) -> Self::SubmitBatch;
 
-    /// Allocates one backend-owned completion-event buffer.
-    fn new_events(&self) -> Self::Events;
-
-    /// Prepares one kernel submission for the given worker token and IO operation.
-    fn prepare(&mut self, token: BackendToken, operation: &mut super::Operation) -> Self::Prepared;
-
-    /// Appends one prepared submission to a backend-owned batch.
-    fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared);
+    /// Stages one kernel request without submitting it or taking operation ownership.
+    ///
+    /// The caller retains the submission and all referenced memory through
+    /// completion or the fatal-cleanup ownership path. Staging cannot complete
+    /// the operation; it only appends its kernel representation to the batch.
+    fn stage_operation(
+        &mut self,
+        batch: &mut Self::SubmitBatch,
+        token: BackendToken,
+        operation: &mut super::Operation,
+    );
 
     /// Submits up to `limit` staged operations from the front of `batch`.
     ///
@@ -520,7 +487,6 @@ pub(crate) trait Backend: Sized {
     /// Waits for at least `min_nr` completions and returns worker tokens plus results.
     fn wait_at_least(
         &mut self,
-        events: &mut Self::Events,
         min_nr: usize,
     ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>>;
 
@@ -563,25 +529,6 @@ mod tests {
         assert_eq!(
             report.current_context().kind(),
             StdIoErrorKind::PermissionDenied
-        );
-    }
-
-    /// Purpose: Include backend-specific guidance in submit failure diagnostics.
-    /// Expected: The optional note accompanies the operation, source error, and queue state.
-    #[test]
-    fn test_backend_error_submit_formats_optional_note() {
-        let failure = BackendError::submit_with_note(
-            "test_backend",
-            StdIoError::new(StdIoErrorKind::InvalidInput, "unsupported submit"),
-            1,
-            2,
-            1,
-            Some("backend-specific note"),
-        );
-
-        assert_eq!(
-            failure.to_string(),
-            "backend=test_backend op=submit errno=None error=unsupported submit calls=1 queue={staged=2 pending=1} note=backend-specific note"
         );
     }
 

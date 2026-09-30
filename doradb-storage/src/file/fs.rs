@@ -1056,10 +1056,9 @@ impl<T> StorageInflightSlots<T> {
     }
 }
 
-/// Prepared backend state retained until the submission completes.
-struct StorageInflightEntry<S, P> {
+/// Submission owner retained until the operation completes.
+struct StorageInflightEntry<S> {
     submission: S,
-    _prepared: P,
     submitted: bool,
 }
 
@@ -1071,15 +1070,14 @@ struct SubmittedStorageIoLeak {
 /// Submitted entries retained after a fatal backend progress failure.
 ///
 /// Field order on `StorageIOWorker` drops this quarantine after the backend.
-/// That makes libaio cleanup rely on `io_destroy` first, while io_uring can
-/// intentionally leak memory-bound entries when sync cancel cannot prove
+/// io_uring can intentionally leak memory-bound entries when sync cancel cannot prove
 /// submitted user memory is safe to free.
-struct SubmittedStorageIoQuarantine<P> {
-    entries: Vec<StorageInflightEntry<StorageSubmission, P>>,
+struct SubmittedStorageIoQuarantine {
+    entries: Vec<StorageInflightEntry<StorageSubmission>>,
     leak: Option<SubmittedStorageIoLeak>,
 }
 
-impl<P> SubmittedStorageIoQuarantine<P> {
+impl SubmittedStorageIoQuarantine {
     #[inline]
     fn new() -> Self {
         Self {
@@ -1091,7 +1089,7 @@ impl<P> SubmittedStorageIoQuarantine<P> {
     #[inline]
     fn retain(
         &mut self,
-        entries: Vec<StorageInflightEntry<StorageSubmission, P>>,
+        entries: Vec<StorageInflightEntry<StorageSubmission>>,
         cleanup: SubmittedIoCleanup,
     ) {
         debug_assert!(self.entries.is_empty());
@@ -1107,7 +1105,7 @@ impl<P> SubmittedStorageIoQuarantine<P> {
     }
 }
 
-impl<P> Drop for SubmittedStorageIoQuarantine<P> {
+impl Drop for SubmittedStorageIoQuarantine {
     #[inline]
     fn drop(&mut self) {
         if self.entries.is_empty() {
@@ -1233,13 +1231,13 @@ where
 /// Backend-owning event loop for the shared storage service.
 struct StorageIOWorker<B: Backend = StorageBackend> {
     backend: B,
-    submitted_quarantine: SubmittedStorageIoQuarantine<B::Prepared>,
+    submitted_quarantine: SubmittedStorageIoQuarantine,
     scheduler: StorageRequestScheduler,
     submitted: usize,
     staged_slots: VecDeque<u32>,
     submit_batch: B::SubmitBatch,
     submit_backoff: SubmitRetryBackoff,
-    slots: StorageInflightSlots<StorageInflightEntry<StorageSubmission, B::Prepared>>,
+    slots: StorageInflightSlots<StorageInflightEntry<StorageSubmission>>,
     state_machine: StorageStateMachine,
     poisoner: QuiescentGuard<EnginePoisoner>,
 }
@@ -1247,7 +1245,6 @@ struct StorageIOWorker<B: Backend = StorageBackend> {
 impl<B> StorageIOWorker<B>
 where
     B: Backend,
-    B::Prepared: Send + 'static,
     B::SubmitBatch: Send + 'static,
 {
     /// Spawn the shared storage event loop on its dedicated thread.
@@ -1283,7 +1280,7 @@ where
         );
     }
 
-    /// Move queued submissions into backend-prepared staged slots.
+    /// Stage queued operations while retaining their submission owners in slots.
     #[inline]
     fn prepare_staged(&mut self, queue: &mut IOQueue<StorageSubmission>) {
         while self.slots.has_vacant() {
@@ -1294,14 +1291,12 @@ where
                 .slots
                 .reserve()
                 .expect("slot reservation should succeed while vacant slots exist");
-            let mut prepared = self.backend.prepare(token, sub.operation());
             self.backend
-                .push_prepared(&mut self.submit_batch, &mut prepared);
+                .stage_operation(&mut self.submit_batch, token, sub.operation());
             self.slots.occupy_reserved(
                 slot,
                 StorageInflightEntry {
                     submission: sub,
-                    _prepared: prepared,
                     submitted: false,
                 },
             );
@@ -1342,9 +1337,7 @@ where
     }
 
     #[inline]
-    fn take_submitted_entries(
-        &mut self,
-    ) -> Vec<StorageInflightEntry<StorageSubmission, B::Prepared>> {
+    fn take_submitted_entries(&mut self) -> Vec<StorageInflightEntry<StorageSubmission>> {
         if self.submitted == 0 {
             return Vec::new();
         }
@@ -1413,7 +1406,6 @@ where
     }
 
     fn run(mut self) {
-        let mut results = self.backend.new_events();
         let mut queue: IOQueue<StorageSubmission> = IOQueue::with_capacity(self.io_depth());
         loop {
             debug_assert!(queue.consistent());
@@ -1503,7 +1495,7 @@ where
             }
 
             if self.submitted != 0 {
-                let completions = match self.backend.wait_at_least(&mut results, 1) {
+                let completions = match self.backend.wait_at_least(1) {
                     Ok(completions) => completions,
                     Err(err) => {
                         self.handle_backend_progress_failure(&mut queue, err);
@@ -2409,9 +2401,7 @@ pub(crate) mod tests {
     }
 
     impl Backend for SubmittedWaitFailureBackend {
-        type Prepared = BackendToken;
         type SubmitBatch = VecDeque<BackendToken>;
-        type Events = ();
 
         #[inline]
         fn setup(io_depth: usize) -> IoResult<Self> {
@@ -2429,16 +2419,13 @@ pub(crate) mod tests {
         }
 
         #[inline]
-        fn new_events(&self) -> Self::Events {}
-
-        #[inline]
-        fn prepare(&mut self, token: BackendToken, _operation: &mut Operation) -> Self::Prepared {
-            token
-        }
-
-        #[inline]
-        fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-            batch.push_back(*prepared);
+        fn stage_operation(
+            &mut self,
+            batch: &mut Self::SubmitBatch,
+            token: BackendToken,
+            _operation: &mut Operation,
+        ) {
+            batch.push_back(token);
         }
 
         #[inline]
@@ -2463,7 +2450,6 @@ pub(crate) mod tests {
         #[inline]
         fn wait_at_least(
             &mut self,
-            _events: &mut Self::Events,
             min_nr: usize,
         ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
             assert!(
@@ -2482,15 +2468,6 @@ pub(crate) mod tests {
             self.cleanup_submitted
                 .fetch_add(submitted, Ordering::SeqCst);
             SubmittedIoCleanup::DropAfterBackend
-        }
-    }
-
-    struct DropCounter(Arc<AtomicUsize>);
-
-    impl Drop for DropCounter {
-        #[inline]
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2704,7 +2681,8 @@ pub(crate) mod tests {
     #[test]
     fn test_submitted_io_quarantine_leaks_memory_bound_entries_only() {
         let temp_dir = TempDir::new().unwrap();
-        let sparse = create_sparse_for_test(&temp_dir.path().join("quarantine.tbl"));
+        let sparse = create_sparse_for_test(&temp_dir.path().join("quarantine-write.tbl"));
+        let write_owner = Arc::downgrade(&sparse);
         let block_key = BlockKey::new(UNTRACKED_FILE_ID, BlockID::new(0));
         let (write, _write_waiter) = WriteSubmission::prepare(
             block_key,
@@ -2713,10 +2691,9 @@ pub(crate) mod tests {
             DirectBuf::zeroed(COW_FILE_PAGE_SIZE),
             None,
         );
-        let write_drops = Arc::new(AtomicUsize::new(0));
+        drop(sparse);
         let write_entry = StorageInflightEntry {
             submission: StorageSubmission::table(TableFsSubmission::Write(write.into_prepared())),
-            _prepared: DropCounter(Arc::clone(&write_drops)),
             submitted: true,
         };
         {
@@ -2729,13 +2706,16 @@ pub(crate) mod tests {
                 },
             );
         }
-        assert_eq!(write_drops.load(Ordering::SeqCst), 0);
+        assert!(
+            write_owner.upgrade().is_some(),
+            "quarantined write must retain its file"
+        );
 
+        let sparse = create_sparse_for_test(&temp_dir.path().join("quarantine-sync.tbl"));
+        let sync_owner = Arc::downgrade(&sparse);
         let (sync, _sync_waiter) = SyncSubmission::prepare_fsync(sparse);
-        let sync_drops = Arc::new(AtomicUsize::new(0));
         let sync_entry = StorageInflightEntry {
             submission: StorageSubmission::table(TableFsSubmission::Sync(sync.into_prepared())),
-            _prepared: DropCounter(Arc::clone(&sync_drops)),
             submitted: true,
         };
         {
@@ -2748,7 +2728,10 @@ pub(crate) mod tests {
                 },
             );
         }
-        assert_eq!(sync_drops.load(Ordering::SeqCst), 1);
+        assert!(
+            sync_owner.upgrade().is_none(),
+            "memoryless sync must release its file"
+        );
     }
 
     /// Purpose: Settle submitted sync waiters after backend failure with or without prior poison.
@@ -2873,15 +2856,15 @@ pub(crate) mod tests {
                 .slots
                 .reserve()
                 .expect("test worker should have one free slot");
-            let mut prepared = worker.backend.prepare(token, staged_submission.operation());
-            worker
-                .backend
-                .push_prepared(&mut worker.submit_batch, &mut prepared);
+            worker.backend.stage_operation(
+                &mut worker.submit_batch,
+                token,
+                staged_submission.operation(),
+            );
             worker.slots.occupy_reserved(
                 slot,
                 StorageInflightEntry {
                     submission: staged_submission,
-                    _prepared: prepared,
                     submitted: false,
                 },
             );

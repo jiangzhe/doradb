@@ -89,7 +89,7 @@ pub(super) fn render(report: &CoverageReport, selections: &[Selection], top: usi
         .collect();
     let totals = Totals::from_report(&files);
     let mut result = format!(
-        "# Production line coverage\n\nBuild: stable, default-feature iouring workspace; test build, nextest ci.\nMetric: distinct retained LLVM executable lines; covered iff count > 0.\n\nCombined: {} — {} covered, {} uncovered, {} lines across {} files.\n",
+        "# Production line coverage\n\nBuild: stable, default-feature workspace (io_uring); test build, nextest ci.\nMetric: distinct retained LLVM executable lines; covered iff count > 0.\n\nCombined: {} — {} covered, {} uncovered, {} lines across {} files.\n",
         percentage(totals),
         totals.covered,
         totals.uncovered,

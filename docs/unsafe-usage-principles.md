@@ -8,7 +8,7 @@ Scope:
 ## 1. Allowed Unsafe Categories
 
 `unsafe` is allowed only when required by one of the following:
-1. FFI/syscalls and ABI boundaries (`libaio`, `pread/pwrite`, `mmap/mlock`).
+1. FFI/syscalls and ABI boundaries (`pread/pwrite`, `mmap/mlock`).
 2. Packed or binary on-page layout access where safe alternatives are not viable.
 3. SIMD intrinsics.
 4. Lock-free/atomic primitives that require raw pointer or aliasing operations.

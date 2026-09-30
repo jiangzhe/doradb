@@ -11,19 +11,16 @@ use self::fs::BackgroundWriteRequest;
 pub(crate) use self::fs::tests::{build_test_fs, build_test_fs_in};
 #[cfg(test)]
 pub(crate) use self::tests::{test_block_id, test_file_id};
-use crate::id::{BlockID, FileID};
-
 use crate::buffer::{ReadSubmission, ReadonlyWriteLease};
 use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, IoError, IoResult, ResourceError, ResourceResult,
     SharedFatalError,
 };
-use crate::free_list::FreeList;
+use crate::id::{BlockID, FileID};
 use crate::io::DirectBuf;
 use crate::io::{
-    IOClient, IOKind, IOQueue, IOSubmission, Operation, STORAGE_SECTOR_SIZE, StdIoResult,
-    align_to_sector_size,
+    IOClient, IOKind, IOQueue, IOSubmission, Operation, StdIoResult, align_to_sector_size,
 };
 use error_stack::Report;
 use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};
@@ -32,7 +29,6 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::io::{Error as StdIoError, ErrorKind as IoErrorKind};
 use std::mem::MaybeUninit;
-use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -643,51 +639,6 @@ impl TableFsStateMachine {
     }
 }
 
-/// Fixed size buffer free list hold a given number of
-/// buffer pages.
-/// It's used to reuse pages in heavy IO environment.
-#[derive(Clone)]
-pub(crate) struct FixedSizeBufferFreeList(Arc<FreeList<DirectBuf>>);
-
-impl FixedSizeBufferFreeList {
-    /// Create a new buffer free list with given number of
-    /// pre-allocated buffer pages.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    #[cfg_attr(
-        all(feature = "iouring", test),
-        expect(dead_code, reason = "pending dead-code audit")
-    )]
-    pub(crate) fn new(page_size: usize, init_pages: usize, max_pages: usize) -> Self {
-        debug_assert!(page_size.is_multiple_of(STORAGE_SECTOR_SIZE));
-        let free_list: FreeList<_> = FreeList::new(init_pages, max_pages, move || {
-            let mut buf = DirectBuf::zeroed(page_size);
-            buf.truncate(0);
-            buf
-        });
-        FixedSizeBufferFreeList(Arc::new(free_list))
-    }
-
-    /// Recycle the buffer for future use.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    #[cfg_attr(test, expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn recycle(&self, mut buf: DirectBuf) {
-        buf.reset();
-        buf.truncate(0);
-        self.push(buf);
-    }
-}
-
-impl Deref for FixedSizeBufferFreeList {
-    type Target = FreeList<DirectBuf>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Return the logical size and allocated size for one sparse-file descriptor.
 #[inline]
 pub(crate) fn sparse_file_size(fd: RawFd) -> IoResult<(usize, usize)> {
@@ -856,7 +807,7 @@ mod tests {
     use crate::file::fs::tests::{TestFileSystem, build_test_fs};
     use crate::file::table_file::TableFile;
     use crate::id::TrxID;
-    use crate::io::BackendError;
+    use crate::io::{BackendError, STORAGE_SECTOR_SIZE};
     use crate::serde::{Deser, Ser};
     use crate::value::ValKind;
     use std::fmt::Debug;
@@ -1275,7 +1226,7 @@ mod tests {
     }
 
     /// Purpose: Protect logical sizing and sparse allocation during file resizing.
-    /// Expected: Growth preserves a sparse tail, smaller extensions do not shrink, and truncation does.
+    /// Expected: Equal extensions are idempotent, growth stays sparse, smaller extensions do not shrink, and truncation does.
     #[test]
     fn test_sparse_file_resize_tracks_logical_length_and_preserves_sparse_tail() {
         let temp_dir = TempDir::new().unwrap();
@@ -1287,6 +1238,9 @@ mod tests {
 
         assert_eq!(file.logical_len(), initial_len);
         let (_, allocated_before) = file.size().unwrap();
+        file.extend_to(initial_len).unwrap();
+        assert_eq!(file.logical_len(), initial_len);
+        assert_eq!(file.size().unwrap(), (initial_len, allocated_before));
         file.extend_to(expanded_len).unwrap();
         assert_eq!(file.logical_len(), expanded_len);
         assert_eq!(file.size().unwrap().0, expanded_len);

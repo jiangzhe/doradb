@@ -54,7 +54,7 @@ We rely on tooling to enforce style.
 ### I/O Abstraction
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.
     *   **Do not** use `std::fs` or `tokio::fs` for data path operations.
-*   **Compile-Time Backends**: `crate::io` supports compile-time-selected `io_uring` and `libaio` backends. `io_uring` is the repository default, and `libaio` remains the explicitly supported alternate path for older kernels that cannot run `io_uring`.
+*   **Storage Backend**: `crate::io` uses `io_uring` unconditionally. Linux environments must allow its use. The default-enabled `profiling` feature can be disabled independently; backend-selection features are not available.
 *   **Alignment**: Respect `crate::io::STORAGE_SECTOR_SIZE` (4096 bytes) for Direct I/O buffers.
 
 ## 4. Testing
@@ -71,7 +71,7 @@ We rely on tooling to enforce style.
 *   **Semantic Wait Review**: Every new potentially unbounded engine wait must document the five properties in [Shutdown and Engine Poison](../shutdown-and-poison.md#review-contract-for-new-waits): progress producer, authoritative wake/result, poison behavior, shutdown behavior, and exact cancellation/cleanup owner. Identify its acceptance linearization point and classify its behavior using the overview's wait categories. Record subsystem algorithms and new wait-family details in the owning subsystem document or code, keeping the overview conceptual.
 *   **Randomized Tests**: Prefer randomized tests over exhaustive parameter permutations when broad input variation is useful. Keep deterministic edge-case tests separate from randomized tests, especially for error paths, boundary conditions, and format verification.
 *   **Routine Validation**: Run `cargo nextest run --workspace`.
-*   **Alternate Backend Validation**: Run `cargo nextest run -p doradb-storage --no-default-features --features libaio` manually when you need to validate the legacy-kernel alternate backend path.
+*   **Feature-Sensitive Validation**: Run `cargo nextest run -p doradb-storage --no-default-features` when changing feature-sensitive code to validate disabled profiling with the same io_uring backend. All-feature builds are also supported.
 *   **Doc Tests**: This project currently does not have doctests, and routine validation does not run `cargo test --doc`.
 
 ## 5. Unsafe Code

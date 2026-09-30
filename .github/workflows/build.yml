@@ -101,41 +101,40 @@ jobs:
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
-    - name: Clippy (default backend)
+    - name: Clippy (workspace)
       run: cargo clippy --workspace --all-targets -- -D warnings
-    - name: Clippy (libaio backend)
-      run: cargo clippy -p doradb-storage --no-default-features --features libaio --all-targets -- -D warnings
 
-  libaio:
+  profiling-disabled:
     needs: changes
     if: needs.changes.outputs.run_build == 'true'
     runs-on: ubuntu-22.04
     steps:
-    - name: Install libaio
-      run: sudo apt-get install -y libaio1 libaio-dev
     - name: Checkout repository
       uses: actions/checkout@v4
     - name: Setup Rust
       uses: actions-rust-lang/setup-rust-toolchain@v1
       with:
         toolchain: stable
+        components: clippy
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
-    - name: Validate alternate libaio backend
+    - name: Clippy (profiling disabled)
+      run: cargo clippy -p doradb-storage --no-default-features --all-targets -- -D warnings
+    - name: Test storage with profiling disabled
       env:
         RUST_BACKTRACE: "full"
-      run: cargo nextest run -p doradb-storage --no-default-features --features libaio --profile ci
-    - name: Upload libaio nextest JUnit report
+      run: cargo nextest run -p doradb-storage --no-default-features --profile ci
+    - name: Upload profiling-disabled nextest JUnit report
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
-        name: nextest-junit-libaio
+        name: nextest-junit-profiling-disabled
         if-no-files-found: warn
         overwrite: true
         path: target/nextest/ci/junit.xml
 
   verify:
-    needs: [changes, test-audit, clippy, libaio]
+    needs: [changes, test-audit, clippy, profiling-disabled]
     if: ${{ always() }}
     runs-on: ubuntu-22.04
     permissions: {}
@@ -147,7 +146,7 @@ jobs:
         DIFF_RANGE: ${{ needs.changes.outputs.diff_range }}
         RUN_BUILD: ${{ needs.changes.outputs.run_build }}
         CLIPPY_RESULT: ${{ needs.clippy.result }}
-        LIBAIO_RESULT: ${{ needs.libaio.result }}
+        PROFILING_DISABLED_RESULT: ${{ needs.profiling-disabled.result }}
       run: |
         set -euo pipefail
 
@@ -179,7 +178,7 @@ jobs:
 
         verify_result "test-audit" "$TEST_AUDIT_RESULT"
         verify_result "clippy" "$CLIPPY_RESULT"
-        verify_result "libaio" "$LIBAIO_RESULT"
+        verify_result "profiling-disabled" "$PROFILING_DISABLED_RESULT"
 
         if [[ "$failed" == "true" ]]; then
           exit 1

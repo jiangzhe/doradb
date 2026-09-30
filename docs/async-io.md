@@ -1,8 +1,8 @@
 # Async I/O
 
 This document describes the storage engine's asynchronous I/O model in
-`doradb-storage`, the supported compile-time backends, and the main integration
-points that depend on the shared completion core.
+`doradb-storage`, the io_uring backend, and the main integration points that
+depend on the shared completion core.
 
 ## Overview
 
@@ -14,21 +14,20 @@ generic `crate::io` layer owns:
 - submission batching and completion dispatch into subsystem state machines; and
 - per-driver submit/wait statistics.
 
-Backend-specific code only prepares kernel submission objects, stages them into
-the backend's submission format, submits batches, and decodes completions back
-into worker tokens.
+Backend code stages kernel requests directly into a submission batch, submits
+batches, and decodes completions back into worker tokens.
 
 Backend submit and wait progress is fallible. A backend-level syscall failure
 before a normal per-operation completion exists is reported as a
 `Report<IoError>` with typed backend-progress attachments. The backend-owned
-attachment records the backend name, syscall phase, errno, call count, queue
-state, and backend notes; worker-owned context such as the first known
-operation kind is attached separately. Unknown queue values are left unknown
+attachment records the backend name, syscall phase, errno, call count, and queue
+state; worker-owned context such as the first known operation kind is attached
+separately. Unknown queue values are left unknown
 rather than encoded as zero. Transient progress conditions keep their local
-policy: `EINTR` is retried, `io_uring` `EAGAIN` / `EBUSY` submit pressure and
-`libaio` `io_submit` `EAGAIN` are reported as explicit submit-retry outcomes.
-Schedulers wait on already-accepted work when possible and otherwise use a
-bounded submit backoff before retrying staged submissions.
+policy: `EINTR` is retried, and `EAGAIN` / `EBUSY` submit pressure is reported
+as an explicit submit-retry outcome. Schedulers wait on already-accepted work
+when possible and otherwise use a bounded submit backoff before retrying staged
+submissions.
 
 In the current runtime topology, the storage engine uses one shared
 storage-adjacent worker plus one redo driver owned by the transaction log
@@ -63,21 +62,11 @@ The completion core preserves two invariants:
 1. submitted memory remains valid until the backend reports completion; and
 2. each completion token maps back to exactly one in-flight worker slot.
 
-That is the shared contract across both supported backends.
-
 ## Backend Contract
 
-`crate::io::Backend` is the backend boundary. Each implementation provides:
-
-- one prepared submission type;
-- one backend-owned submit-batch type;
-- one backend-owned completion-event buffer type;
-- translation from `Operation` to the backend submission format; and
-- fallible batch submit plus completion wait methods that return
-  `BackendToken`s when progress succeeds. Runtime progress failures use
-  `BackendResult<T> = Result<T, BackendError>` until a completion, Fatal, or
-  public reporting owner converts them to an IO report. Backend setup remains
-  `IoResult`, and each normal operation completion remains `StdIoResult`.
+The backend translates operations into kernel requests, submits batches, and
+reports completions or I/O failures. Scheduling and ownership remain with the
+caller, which keeps files and memory valid until completion or safe cleanup.
 
 Schedulers remain backend-neutral. The shared storage service uses
 domain-specific state-machine methods to decide how requests become
@@ -90,23 +79,10 @@ stale completion tokens, impossible completion counts, and state-machine
 ownership mismatches remain assertion or panic boundaries because they indicate
 internal corruption rather than kernel IO failure.
 
-## Supported Backends
+## Supported Backend
 
-Two compile-time backends are supported:
-
-- `io_uring`
-  - repository default;
-  - selected by the default Cargo feature set;
-  - validated by `cargo nextest run --workspace`.
-- `libaio`
-  - explicitly supported alternate backend for older Linux kernels that cannot
-    use `io_uring`;
-  - requires Linux 4.18+ for native async redo `fsync` / `fdatasync`
-    submissions through `IO_CMD_FSYNC` / `IO_CMD_FDSYNC`;
-  - selected with
-    `cargo nextest run -p doradb-storage --no-default-features --features libaio`.
-
-Exactly one backend feature must be enabled at compile time.
+The storage engine uses io_uring and requires a Linux environment that permits
+its use.
 
 ## Integration Points
 
@@ -177,12 +153,3 @@ shared-worker fairness from raw backend saturation.
 ## Operational Notes
 
 - Linux direct I/O still requires aligned buffers and offsets.
-- `libaio1` and `libaio-dev` remain required for environments that validate or
-  build the alternate `libaio` backend.
-- The `libaio` backend does not provide a fallback for kernels before Linux
-  4.18, where native async file-sync opcodes may be rejected by `io_submit`
-  with `EINVAL`; this is reported as a backend progress error with an
-  unsupported native sync diagnostic.
-- The initial phase-6 performance bar is manual: compare the default
-  `io_uring` path against explicit `libaio` builds using the existing storage
-  examples on the same machine.

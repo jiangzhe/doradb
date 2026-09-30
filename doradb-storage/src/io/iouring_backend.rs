@@ -58,8 +58,9 @@ impl IouringBackend {
             let push_res = {
                 let mut sq = self.ring.submission();
                 // SAFETY: the SQE is copied into the ring submission queue. The
-                // pointed-to IO memory is owned by the worker inflight entry and
-                // stays valid until completion is processed.
+                // referenced IO memory and file are retained by the original
+                // submission in an inflight slot through completion or the
+                // fatal-cleanup quarantine path.
                 unsafe { sq.push(entry) }
             };
             if push_res.is_err() {
@@ -145,9 +146,7 @@ impl IouringBackend {
 }
 
 impl Backend for IouringBackend {
-    type Prepared = squeue::Entry;
     type SubmitBatch = IouringSubmitBatch;
-    type Events = ();
 
     #[inline]
     fn setup(io_depth: usize) -> IoResult<Self> {
@@ -193,10 +192,12 @@ impl Backend for IouringBackend {
     }
 
     #[inline]
-    fn new_events(&self) -> Self::Events {}
-
-    #[inline]
-    fn prepare(&mut self, token: BackendToken, operation: &mut Operation) -> Self::Prepared {
+    fn stage_operation(
+        &mut self,
+        batch: &mut Self::SubmitBatch,
+        token: BackendToken,
+        operation: &mut Operation,
+    ) {
         let fd = types::Fd(operation.fd());
         let entry = match operation.kind() {
             IOKind::Read => {
@@ -214,12 +215,7 @@ impl Backend for IouringBackend {
             IOKind::Fsync => Fsync::new(fd).build(),
             IOKind::Fdatasync => Fsync::new(fd).flags(FsyncFlags::DATASYNC).build(),
         };
-        entry.user_data(token.raw())
-    }
-
-    #[inline]
-    fn push_prepared(&mut self, batch: &mut Self::SubmitBatch, prepared: &mut Self::Prepared) {
-        batch.staged.push_back(prepared.clone());
+        batch.staged.push_back(entry.user_data(token.raw()));
     }
 
     #[inline]
@@ -270,7 +266,6 @@ impl Backend for IouringBackend {
     #[inline]
     fn wait_at_least(
         &mut self,
-        _events: &mut Self::Events,
         min_nr: usize,
     ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
         {

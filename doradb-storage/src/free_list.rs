@@ -26,16 +26,6 @@ impl<T> FreeList<T> {
         }
     }
 
-    /// Push data into free list.
-    #[inline]
-    pub(crate) fn push(&self, data: T) {
-        let mut g = self.data.lock();
-        if g.len() >= self.max_size {
-            return;
-        }
-        g.push(data);
-    }
-
     /// Push a batch of data into free list.
     #[inline]
     pub(crate) fn push_batch(&self, mut data: Vec<T>) {
@@ -109,34 +99,13 @@ mod tests {
         assert_eq!(next.load(Ordering::SeqCst), 3);
     }
 
-    /// Purpose: Protect reuse and the retention limit for individually returned elements.
-    /// Expected: Only elements within capacity are retained in stack order.
-    #[test]
-    fn test_free_list_push_retains_up_to_max_size() {
-        for (name, maximum, start, returned) in [
-            ("within_capacity", 10, 42, vec![1, 2]),
-            ("overflow", 2, 100, vec![1, 2, 3]),
-        ] {
-            let (list, next) = counted_free_list(0, maximum, start);
-            for item in returned {
-                list.push(item);
-            }
-            assert_eq!(list.pop(), 2, "{name}");
-            assert_eq!(list.pop(), 1, "{name}");
-            assert_eq!(list.pop(), start, "{name}");
-            assert_eq!(next.load(Ordering::SeqCst), start + 1, "{name}");
-        }
-    }
-
     /// Purpose: Protect batch allocation when retained elements are insufficient.
     /// Expected: Retained elements are reused before the factory fills only the shortfall.
     #[test]
     fn test_free_list_pop_batch_reuses_and_creates_missing_elements() {
         let (list, next) = counted_free_list(0, 10, 100);
 
-        list.push(1);
-        list.push(2);
-
+        list.push_batch(vec![1, 2]);
         let batch = list.pop_batch(4);
 
         assert_eq!(batch, vec![2, 1, 100, 101]);
@@ -149,7 +118,7 @@ mod tests {
     fn test_free_list_pop_batch_zero_count() {
         let (list, next) = counted_free_list(0, 10, 100);
 
-        list.push(7);
+        list.push_batch(vec![7]);
         assert!(list.pop_batch(0).is_empty());
         assert_eq!(list.pop(), 7, "empty batch must retain cached elements");
         assert_eq!(next.load(Ordering::SeqCst), 100);
@@ -161,7 +130,7 @@ mod tests {
     fn test_free_list_push_batch_retains_up_to_max_size() {
         let (list, _next) = counted_free_list(0, 2, 100);
 
-        list.push(1);
+        list.push_batch(vec![1]);
         list.push_batch(vec![2, 3, 4]);
 
         assert_eq!(list.pop_batch(3), vec![2, 1, 100]);
@@ -177,7 +146,7 @@ mod tests {
         for i in 0..10 {
             let free_list = Arc::clone(&free_list);
             handles.push(thread::spawn(move || {
-                free_list.push(i);
+                free_list.push_batch(vec![i]);
             }));
         }
 
