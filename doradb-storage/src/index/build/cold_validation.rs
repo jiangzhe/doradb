@@ -4,11 +4,11 @@ use super::merge::{HotBatch, PreparedHotMerge, execution_error, observe_stop};
 use crate::error::RuntimeOrFatalResult;
 use crate::id::RowID;
 use crate::index::BTreeKey;
+#[cfg(feature = "profiling")]
+use crate::profiling::{ColdHotMeasurements, clock::Instant};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 
 /// Immutable ownership transferred after cold sorting and cold/cold validation.
 #[derive(Clone)]
@@ -162,18 +162,6 @@ impl ColdHotCompletion {
             Self::Checked { measurements, .. } => *measurements,
         }
     }
-}
-
-/// Cross-tier worker sums and longest uninterrupted work interval.
-#[cfg(feature = "profiling")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ColdHotMeasurements {
-    /// Key comparisons, including partition-boundary searches.
-    pub(crate) comparisons: u64,
-    /// Sum of partition-boundary search and batch validation time.
-    pub(crate) worker_nanos: u64,
-    /// Longest partition-boundary search or full batch validation interval.
-    pub(crate) max_sync_nanos: u64,
 }
 
 /// Monotonic cold slice cursor retained across all batches in one hot partition.

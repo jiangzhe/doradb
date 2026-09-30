@@ -25,14 +25,15 @@ use crate::notify::MonotonicU64;
 use crate::obs;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::HotIndexBuildProfiler;
+pub(crate) use crate::profiling::TrxSysStats;
+#[cfg(feature = "profiling")]
+use crate::profiling::{HotIndexBuildProfiler, RecoveryReport, clock::Instant};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::recovery::{RecoveryOutcome, RecoveryResources};
 use crate::runtime::mandatory::{MandatoryInternalTask, MandatoryRuntime, MandatoryTaskMetadata};
 use crate::runtime::thread_pool::ThreadPool;
 use crate::session::{SessionRuntime, TrxAttachment, WeakSessionRef};
-use crate::stats::RecoveryReport;
 use crate::thread;
 use crate::trx::group::{Commit, CommitJoin, GroupCommit};
 #[cfg(test)]
@@ -61,7 +62,6 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 /// In-memory catalog-safe redo segment progress from a published catalog checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,37 +490,6 @@ impl MandatoryInternalTask for TerminalRollbackCleanupJob {
     }
 }
 
-/// Aggregated transaction-system and redo worker statistics.
-#[derive(Default)]
-pub(crate) struct TrxSysStats {
-    /// Number of transactions durably or logically committed.
-    pub(crate) commit_count: usize,
-    /// Number of transactions processed by the log thread.
-    pub(crate) trx_count: usize,
-    /// Total redo log bytes written.
-    pub(crate) log_bytes: usize,
-    /// Number of log sync operations.
-    pub(crate) sync_count: usize,
-    /// Nanoseconds spent syncing redo.
-    pub(crate) sync_nanos: usize,
-    /// Number of redo file seal failures observed.
-    pub(crate) seal_failure_count: usize,
-    /// Number of backend submit-or-wait calls observed by the log thread.
-    ///
-    /// On `libaio`, one logical IO commonly contributes separate submit and
-    /// wait syscalls, so this count can be roughly doubled compared with
-    /// `io_uring` for serialized workloads.
-    pub(crate) io_submit_and_wait_count: usize,
-    /// Total non-overlapping nanoseconds spent in backend submit-or-wait calls.
-    pub(crate) io_submit_and_wait_nanos: usize,
-    /// Number of committed transactions processed by purge.
-    pub(crate) purge_trx_count: usize,
-    /// Number of row undo entries processed by purge.
-    pub(crate) purge_row_count: usize,
-    /// Number of index entries processed by purge.
-    pub(crate) purge_index_count: usize,
-}
-
 /// TransactionSystem controls lifecycle of all transactions.
 ///
 /// 1. Transaction begin:
@@ -558,6 +527,7 @@ pub(crate) struct TrxSysStats {
 /// to perform very fast CTS backfill.
 pub(crate) struct TransactionSystem {
     /// Value-only completed recovery measurements for engine assembly.
+    #[cfg(feature = "profiling")]
     pub(crate) recovery_report: RecoveryReport,
     /// Recorder retained from bootstrap for public hot-build snapshots.
     #[cfg(feature = "profiling")]
@@ -658,6 +628,7 @@ impl TransactionSystem {
 
         let pool_guards = pools.pool_guards().clone();
         let (purge_tx, purge_rx) = flume::unbounded();
+        #[cfg(feature = "profiling")]
         let preparation_started = Instant::now();
         let hot_build_policy = HotBuildPolicy::new(hot_index_build, thread_pool.worker_threads())
             .change_context(RuntimeError::Recovery)?;
@@ -672,21 +643,30 @@ impl TransactionSystem {
         #[cfg(feature = "profiling")]
         let hot_build_profiler = recovery_resources.hot_build_profiler.clone();
         let coordinator = recovery_resources.prepare(&config, &recovery, file_prefix.clone())?;
+        #[cfg(feature = "profiling")]
         let preparation_elapsed = preparation_started.elapsed();
         let RecoveryOutcome {
             max_recovered_cts,
             finalizer,
+            #[cfg(feature = "profiling")]
             mut report,
         } = coordinator.recover_all().await?;
-        report.phases.preparation_elapsed = preparation_elapsed;
+        #[cfg(feature = "profiling")]
+        {
+            report.phases.preparation_elapsed = preparation_elapsed;
+        }
         let initial_trx_ts =
             recovery_initial_trx_ts(max_recovered_cts).change_context(RuntimeError::Recovery)?;
+        #[cfg(feature = "profiling")]
         let finalize_started = Instant::now();
         let (redo_log, initial_redo_header) = finalizer.finalize(purge_tx.clone())?;
-        report.phases.redo_finalize_elapsed = finalize_started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            report.phases.redo_finalize_elapsed = finalize_started.elapsed();
+        }
         let redo_log = CachePadded::new(redo_log);
 
-        let mut trx_sys = Self::new(
+        let trx_sys = Self::new(
             config,
             file_prefix,
             poisoner,
@@ -699,7 +679,12 @@ impl TransactionSystem {
                 purge_tx: purge_tx.clone(),
             },
         );
-        trx_sys.recovery_report = report;
+        #[cfg(feature = "profiling")]
+        let mut trx_sys = {
+            let mut trx_sys = trx_sys;
+            trx_sys.recovery_report = report;
+            trx_sys
+        };
         #[cfg(feature = "profiling")]
         {
             trx_sys.hot_build_profiler = hot_build_profiler;
@@ -745,6 +730,7 @@ impl TransactionSystem {
             catalog.snapshot_dropped_table_file_cleanups(),
         );
         TransactionSystem {
+            #[cfg(feature = "profiling")]
             recovery_report: RecoveryReport::default(),
             #[cfg(feature = "profiling")]
             hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
@@ -1514,22 +1500,9 @@ impl TransactionSystem {
 
     /// Returns statistics of group commit.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn trx_sys_stats(&self) -> TrxSysStats {
-        let mut stats = TrxSysStats::default();
-        let redo_log = &*self.redo_log;
-        stats.trx_count += redo_log.stats.trx_count.load(Ordering::Relaxed);
-        stats.commit_count += redo_log.stats.commit_count.load(Ordering::Relaxed);
-        stats.log_bytes += redo_log.stats.log_bytes.load(Ordering::Relaxed);
-        stats.sync_count += redo_log.stats.sync_count.load(Ordering::Relaxed);
-        stats.sync_nanos += redo_log.stats.sync_nanos.load(Ordering::Relaxed);
-        stats.seal_failure_count += redo_log.stats.seal_failure_count.load(Ordering::Relaxed);
-        let io_stats = redo_log.io_backend_stats();
-        stats.io_submit_and_wait_count += io_stats.submit_and_wait_calls;
-        stats.io_submit_and_wait_nanos += io_stats.submit_and_wait_nanos;
-        stats.purge_trx_count += redo_log.stats.purge_trx_count.load(Ordering::Relaxed);
-        stats.purge_row_count += redo_log.stats.purge_row_count.load(Ordering::Relaxed);
-        stats.purge_index_count += redo_log.stats.purge_index_count.load(Ordering::Relaxed);
-        stats
+        TrxSysStats::capture(&self.redo_log)
     }
 
     /// Returns global visible snapshot timestamp.

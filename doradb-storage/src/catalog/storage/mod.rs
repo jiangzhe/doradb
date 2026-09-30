@@ -3,7 +3,6 @@ mod ddl;
 mod indexes;
 mod integrity;
 pub(crate) mod layout;
-mod measure;
 mod merge;
 mod object;
 mod table_bindings;
@@ -20,7 +19,6 @@ pub(crate) use layout::{
 use crate::buffer::{FixedBufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
 use crate::catalog::storage::columns::*;
 use crate::catalog::storage::indexes::*;
-use crate::catalog::storage::measure::{CatalogCheckpointMeasurement, MeasurableMutableCowFile};
 use crate::catalog::storage::merge::{CatalogFoldedRows, CatalogMergeKeyBuilder};
 pub(crate) use crate::catalog::storage::object::*;
 pub(crate) use crate::catalog::storage::table_bindings::TableBindings;
@@ -36,7 +34,7 @@ use crate::catalog::storage::table_descriptors::{
 use crate::catalog::storage::table_replay_silent_watermarks::*;
 pub(crate) use crate::catalog::storage::tables::*;
 use crate::catalog::{
-    CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogRedoEntry,
+    CatalogCheckpointBatch, CatalogCheckpointOutcome, CatalogCheckpointResult, CatalogRedoEntry,
     CatalogTable, TableMetadata, catalog_table_id_from_slot, catalog_table_slot,
 };
 use crate::error::{
@@ -45,6 +43,7 @@ use crate::error::{
 };
 use crate::file::FileKind;
 #[cfg(test)]
+#[cfg(feature = "profiling")]
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::fs::FileSystem;
@@ -52,14 +51,16 @@ use crate::file::multi_table_file::{
     CATALOG_TABLE_ROOT_DESC_COUNT, CatalogTableRootDesc, MultiTableActiveRoot, MultiTableFile,
     MultiTableFileSnapshot, MutableMultiTableFile,
 };
-#[cfg(test)]
-use crate::file::super_block::SUPER_BLOCK_SIZE;
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::{BlockIndex, ColumnBlockEntryShape, ColumnBlockIndex, ColumnLeafEntry};
 use crate::io::DirectBuf;
 use crate::log::redo::RowRedoKind;
 use crate::lwc::{LwcBuilder, PersistedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
+#[cfg(feature = "profiling")]
+use crate::profiling::{
+    CatalogCheckpointMeasurement, CatalogCheckpointReport, MeasurableMutableCowFile,
+};
 use crate::quiescent::QuiescentGuard;
 use crate::table::TableRedoReplayFloor;
 use crate::value::Val;
@@ -67,6 +68,7 @@ use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+#[cfg(feature = "profiling")]
 use std::sync::atomic::Ordering;
 
 #[cfg(test)]
@@ -292,6 +294,7 @@ impl CatalogStorage {
         guards: &PoolGuards,
         disable_dml_validation: bool,
     ) -> RuntimeOrFatalResult<()> {
+        #[cfg(feature = "profiling")]
         let measurement = CatalogCheckpointMeasurement::new(&snapshot.meta.table_roots, 0);
         for (idx, root) in snapshot.meta.table_roots.iter().copied().enumerate() {
             if idx >= self.tables.len() {
@@ -316,6 +319,7 @@ impl CatalogStorage {
                     self.tables[idx].metadata(),
                     guards.disk_guard(),
                     root,
+                    #[cfg(feature = "profiling")]
                     &measurement,
                 )
                 .await?;
@@ -337,6 +341,7 @@ impl CatalogStorage {
                 guards.disk_guard(),
                 snapshot.meta.table_roots
                     [must_catalog_table_slot(TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)],
+                #[cfg(feature = "profiling")]
                 &measurement,
             )
             .await?;
@@ -355,6 +360,7 @@ impl CatalogStorage {
             replay_start_ts,
             safe_cts,
             catalog_ops,
+            #[cfg(feature = "profiling")]
             catalog_ddl_txn_count,
             ..
         } = batch;
@@ -371,6 +377,7 @@ impl CatalogStorage {
                 return Ok(PreparedCatalogCheckpoint::Noop {
                     catalog_replay_start_ts: current_catalog_replay_start_ts,
                     checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
+                    #[cfg(feature = "profiling")]
                     catalog_ddl_txn_count,
                 });
             }
@@ -391,6 +398,7 @@ impl CatalogStorage {
             return Ok(PreparedCatalogCheckpoint::Noop {
                 catalog_replay_start_ts: current_catalog_replay_start_ts,
                 checkpointed_silent_watermarks: self.checkpointed_silent_watermarks(),
+                #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count,
             });
         }
@@ -398,6 +406,7 @@ impl CatalogStorage {
 
         let mut mutable = MutableMultiTableFile::fork(&self.mtb, background_writes);
         let mut new_roots = snapshot.meta.table_roots;
+        #[cfg(feature = "profiling")]
         let mut measurement = CatalogCheckpointMeasurement::new(&new_roots, catalog_ddl_txn_count);
         let mut catalog_blocks_changed = false;
         if !catalog_ops.is_empty() {
@@ -431,6 +440,7 @@ impl CatalogStorage {
                         &ops_by_table[idx],
                         safe_cts,
                         disk_guard,
+                        #[cfg(feature = "profiling")]
                         &mut measurement,
                     )
                     .await?;
@@ -439,8 +449,13 @@ impl CatalogStorage {
             }
         }
 
-        self.validate_projected_catalog_integrity(&new_roots, disk_guard, &measurement)
-            .await?;
+        self.validate_projected_catalog_integrity(
+            &new_roots,
+            disk_guard,
+            #[cfg(feature = "profiling")]
+            &measurement,
+        )
+        .await?;
 
         // Publishing the metadata block advances the durable catalog replay
         // boundary even for metadata-only checkpoints, such as DML-only
@@ -450,8 +465,13 @@ impl CatalogStorage {
             // Rewriting catalog table roots can make arbitrary old catalog
             // blocks unreachable, so rebuild the allocation map from the new
             // root graph before publishing.
-            self.rebuild_catalog_alloc_map(&mut mutable, disk_guard, &mut measurement)
-                .await?;
+            self.rebuild_catalog_alloc_map(
+                &mut mutable,
+                disk_guard,
+                #[cfg(feature = "profiling")]
+                &mut measurement,
+            )
+            .await?;
         } else {
             // Metadata-only checkpoints do not change catalog table root
             // reachability. Reclaim the displaced metadata block directly and
@@ -472,6 +492,7 @@ impl CatalogStorage {
             .load_checkpointed_table_replay_silent_watermark_map(
                 disk_guard,
                 new_roots[must_catalog_table_slot(TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS)],
+                #[cfg(feature = "profiling")]
                 &measurement,
             )
             .await?;
@@ -480,6 +501,7 @@ impl CatalogStorage {
                 mutable,
                 catalog_replay_start_ts: next_catalog_replay_start_ts,
                 checkpointed_silent_watermarks: Arc::new(checkpointed_silent_watermarks),
+                #[cfg(feature = "profiling")]
                 measurement,
             },
         )))
@@ -497,7 +519,7 @@ impl CatalogStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<FastHashMap<TableID, TableRedoReplayFloor>> {
         let rows = self
             .load_rows_from_root(
@@ -505,6 +527,7 @@ impl CatalogStorage {
                     .metadata(),
                 disk_pool_guard,
                 root,
+                #[cfg(feature = "profiling")]
                 measurement,
             )
             .await?;
@@ -528,14 +551,19 @@ impl CatalogStorage {
         &self,
         mutable: &mut MutableMultiTableFile,
         disk_guard: &PoolGuard,
-        measurement: &mut CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &mut CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<usize> {
         mutable
             .reserve_publish_meta_block()
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=rebuild_catalog_alloc_map, phase=reserve_meta_block")?;
         let reachable = self
-            .collect_catalog_reachable_blocks(mutable.root(), disk_guard, measurement)
+            .collect_catalog_reachable_blocks(
+                mutable.root(),
+                disk_guard,
+                #[cfg(feature = "profiling")]
+                measurement,
+            )
             .await?;
         Ok(mutable.rebuild_alloc_map_from_reachable(&reachable))
     }
@@ -544,7 +572,7 @@ impl CatalogStorage {
         &self,
         root: &MultiTableActiveRoot,
         disk_guard: &PoolGuard,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<BTreeSet<BlockID>> {
         let mut reachable = BTreeSet::new();
         reachable.insert(SUPER_BLOCK_ID);
@@ -565,6 +593,7 @@ impl CatalogStorage {
                 .map_err(Into::into);
             }
             let Some(root_block_id) = table_root.checkpoint_root_block_id() else {
+                #[cfg(feature = "profiling")]
                 measurement.set_final_compact_blocks(table_root.table_id, 0);
                 continue;
             };
@@ -576,6 +605,7 @@ impl CatalogStorage {
                         table_root.table_id
                     )
                 })?;
+            #[cfg(feature = "profiling")]
             let reachable_before = reachable.len();
             let column_index = ColumnBlockIndex::new(
                 root_block_id,
@@ -584,8 +614,10 @@ impl CatalogStorage {
                 self.mtb.sparse_file(),
                 &self.disk_pool,
                 disk_guard,
-            )
-            .with_logical_read_counter(measurement.compact_read_counter(table_root.table_id));
+            );
+            #[cfg(feature = "profiling")]
+            let column_index = column_index
+                .with_logical_read_counter(measurement.compact_read_counter(table_root.table_id));
             column_index
                 .collect_reachable_blocks(&mut reachable)
                 .await
@@ -596,6 +628,7 @@ impl CatalogStorage {
                         table_root.table_id
                     )
                 })?;
+            #[cfg(feature = "profiling")]
             measurement
                 .set_final_compact_blocks(table_root.table_id, reachable.len() - reachable_before);
         }
@@ -625,11 +658,18 @@ impl CatalogStorage {
         table_ops: &[RowRedoKind],
         checkpoint_cts: TrxID,
         disk_guard: &PoolGuard,
-        measurement: &mut CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &mut CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<(CatalogTableRootDesc, bool)> {
         let base_rows = self
-            .load_rows_from_root(metadata, disk_guard, root, measurement)
+            .load_rows_from_root(
+                metadata,
+                disk_guard,
+                root,
+                #[cfg(feature = "profiling")]
+                measurement,
+            )
             .await?;
+        #[cfg(feature = "profiling")]
         let before_row_count = base_rows.len();
         let mut folded = CatalogFoldedRows::from_base_rows(metadata, base_rows)
             .change_context(RuntimeError::CatalogAccess)
@@ -683,6 +723,7 @@ impl CatalogStorage {
         }
 
         let output_vals = folded.materialize_output_rows();
+        #[cfg(feature = "profiling")]
         measurement.record_table_change(table_id, before_row_count, output_vals.len());
         if output_vals.is_empty() {
             return Ok((
@@ -724,6 +765,7 @@ impl CatalogStorage {
                         "operation=apply_catalog_table_ops, phase=write_lwc_block, table_id={table_id}, block_id={block_id}, persist catalog LWC block"
                     )
                 })?;
+            #[cfg(feature = "profiling")]
             measurement
                 .table(table_id)
                 .lwc_blocks_written
@@ -739,13 +781,17 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_guard,
         );
+        #[cfg(feature = "profiling")]
         let mut index_writer = MeasurableMutableCowFile {
             mutable,
             successful_writes: &measurement.table(table_id).index_blocks_written,
         };
         let root_block_id = column_index
             .batch_insert(
+                #[cfg(feature = "profiling")]
                 &mut index_writer,
+                #[cfg(not(feature = "profiling"))]
+                mutable,
                 &new_entries,
                 pivot_row_id,
                 checkpoint_cts,
@@ -767,8 +813,8 @@ impl CatalogStorage {
         &self,
         disk_pool_guard: &PoolGuard,
         root_block_id: BlockID,
-        table_id: TableID,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] table_id: TableID,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<Vec<CatalogIndexEntry>> {
         assert_ne!(
             root_block_id, SUPER_BLOCK_ID,
@@ -782,6 +828,7 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
+        #[cfg(feature = "profiling")]
         let index = index.with_logical_read_counter(measurement.compact_read_counter(table_id));
         index
             .collect_leaf_entries()
@@ -813,7 +860,7 @@ impl CatalogStorage {
         metadata: &TableMetadata,
         disk_pool_guard: &PoolGuard,
         root: CatalogTableRootDesc,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<Vec<RowRecord>> {
         if root.checkpoint_root_block_id().is_none() {
             return Ok(Vec::new());
@@ -821,16 +868,26 @@ impl CatalogStorage {
         let root_block_id = root
             .checkpoint_root_block_id()
             .expect("root_block_id checked above");
+        #[cfg(feature = "profiling")]
         let index_reads_before = measurement
             .compact_read_counter(root.table_id)
             .load(Ordering::Relaxed);
         let entries = self
-            .collect_index_entries(disk_pool_guard, root_block_id, root.table_id, measurement)
+            .collect_index_entries(
+                disk_pool_guard,
+                root_block_id,
+                #[cfg(feature = "profiling")]
+                root.table_id,
+                #[cfg(feature = "profiling")]
+                measurement,
+            )
             .await?;
+        #[cfg(feature = "profiling")]
         let index_blocks = measurement
             .compact_read_counter(root.table_id)
             .load(Ordering::Relaxed)
             .saturating_sub(index_reads_before);
+        #[cfg(feature = "profiling")]
         measurement.set_final_compact_blocks(root.table_id, index_blocks + entries.len());
         let column_index = ColumnBlockIndex::new(
             root_block_id,
@@ -840,6 +897,7 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
+        #[cfg(feature = "profiling")]
         let column_index =
             column_index.with_logical_read_counter(measurement.compact_read_counter(root.table_id));
         let key_builder = CatalogMergeKeyBuilder::new(metadata)
@@ -859,6 +917,7 @@ impl CatalogStorage {
                     disk_pool_guard,
                     &column_index,
                     &entry,
+                    #[cfg(feature = "profiling")]
                     measurement,
                     root.table_id,
                 )
@@ -937,7 +996,7 @@ impl CatalogStorage {
         disk_pool_guard: &PoolGuard,
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
         table_id: TableID,
     ) -> RuntimeOrFatalResult<Vec<RowRecord>> {
         let file_kind = self.mtb.file_kind();
@@ -956,6 +1015,7 @@ impl CatalogStorage {
                 "operation=decode_catalog_lwc_page_rows, phase=load_lwc_block, block_id={block_id}"
             )
         })?;
+        #[cfg(feature = "profiling")]
         measurement
             .compact_read_counter(table_id)
             .fetch_add(1, Ordering::Relaxed);
@@ -1014,7 +1074,7 @@ impl CatalogStorage {
         expected_table_id: TableID,
         column_no: usize,
         disk_pool_guard: &PoolGuard,
-        measurement: &CatalogCheckpointMeasurement,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
         mut visitor: F,
     ) -> RuntimeOrFatalResult<()>
     where
@@ -1048,16 +1108,26 @@ impl CatalogStorage {
         let Some(root_block_id) = root.checkpoint_root_block_id() else {
             return Ok(());
         };
+        #[cfg(feature = "profiling")]
         let index_reads_before = measurement
             .compact_read_counter(root.table_id)
             .load(Ordering::Relaxed);
         let entries = self
-            .collect_index_entries(disk_pool_guard, root_block_id, root.table_id, measurement)
+            .collect_index_entries(
+                disk_pool_guard,
+                root_block_id,
+                #[cfg(feature = "profiling")]
+                root.table_id,
+                #[cfg(feature = "profiling")]
+                measurement,
+            )
             .await?;
+        #[cfg(feature = "profiling")]
         let index_blocks = measurement
             .compact_read_counter(root.table_id)
             .load(Ordering::Relaxed)
             .saturating_sub(index_reads_before);
+        #[cfg(feature = "profiling")]
         measurement.set_final_compact_blocks(root.table_id, index_blocks + entries.len());
         let column_index = ColumnBlockIndex::new(
             root_block_id,
@@ -1067,6 +1137,7 @@ impl CatalogStorage {
             &self.disk_pool,
             disk_pool_guard,
         );
+        #[cfg(feature = "profiling")]
         let column_index =
             column_index.with_logical_read_counter(measurement.compact_read_counter(root.table_id));
         for entry in entries {
@@ -1105,6 +1176,7 @@ impl CatalogStorage {
                     root.table_id
                 )
             })?;
+            #[cfg(feature = "profiling")]
             measurement
                 .compact_read_counter(root.table_id)
                 .fetch_add(1, Ordering::Relaxed);
@@ -1176,6 +1248,7 @@ pub(crate) enum PreparedCatalogCheckpoint {
         /// Current checkpoint-durable silent watermark overlay.
         checkpointed_silent_watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
         /// Catalog DDL transactions represented by the superseded or empty batch.
+        #[cfg(feature = "profiling")]
         catalog_ddl_txn_count: usize,
     },
 }
@@ -1230,13 +1303,14 @@ impl PreparedCatalogCheckpoint {
     pub(crate) async fn commit(
         self,
         storage: &CatalogStorage,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
         match self {
             PreparedCatalogCheckpoint::Published(publish) => {
                 let PreparedCatalogPublish {
                     mutable,
                     catalog_replay_start_ts,
                     checkpointed_silent_watermarks,
+                    #[cfg(feature = "profiling")]
                     measurement,
                 } = *publish;
                 let (_, old_root) = mutable
@@ -1246,20 +1320,43 @@ impl PreparedCatalogCheckpoint {
                     .attach("operation=commit_catalog_checkpoint")?;
                 drop(old_root);
                 storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
-                Ok(measurement.finish(CatalogCheckpointOutcome::Published {
+                let outcome = CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
-                }))
+                };
+                #[cfg(feature = "profiling")]
+                {
+                    Ok(CatalogCheckpointResult {
+                        outcome,
+                        report: measurement.finish(),
+                    })
+                }
+                #[cfg(not(feature = "profiling"))]
+                {
+                    Ok(outcome)
+                }
             }
             PreparedCatalogCheckpoint::Noop {
+                #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count,
                 ..
-            } => Ok(CatalogCheckpointReport {
-                outcome: CatalogCheckpointOutcome::Noop,
-                catalog_ddl_txn_count,
-                table_changes: Box::new([]),
-                table_io: Box::new([]),
-                metadata_bytes_written: 0,
-            }),
+            } => {
+                #[cfg(feature = "profiling")]
+                {
+                    Ok(CatalogCheckpointResult {
+                        outcome: CatalogCheckpointOutcome::Noop,
+                        report: CatalogCheckpointReport {
+                            catalog_ddl_txn_count,
+                            table_changes: Box::new([]),
+                            table_io: Box::new([]),
+                            metadata_bytes_written: 0,
+                        },
+                    })
+                }
+                #[cfg(not(feature = "profiling"))]
+                {
+                    Ok(CatalogCheckpointOutcome::Noop)
+                }
+            }
         }
     }
 }
@@ -1269,11 +1366,13 @@ pub(crate) struct PreparedCatalogPublish {
     mutable: MutableMultiTableFile,
     catalog_replay_start_ts: TrxID,
     checkpointed_silent_watermarks: Arc<FastHashMap<TableID, TableRedoReplayFloor>>,
+    #[cfg(feature = "profiling")]
     measurement: CatalogCheckpointMeasurement,
 }
 
+/// Resolve an already validated built-in catalog table identity.
 #[inline]
-fn must_catalog_table_slot(table_id: TableID) -> usize {
+pub(crate) fn must_catalog_table_slot(table_id: TableID) -> usize {
     catalog_table_slot(table_id).expect("built-in catalog table id must be in catalog range")
 }
 
@@ -1493,6 +1592,8 @@ pub(crate) mod tests {
     use crate::file::multi_table_file::{
         CATALOG_MTB_FILE_ID, CatalogTableRootState, MutableMultiTableFile,
     };
+    #[cfg(feature = "profiling")]
+    use crate::file::super_block::SUPER_BLOCK_SIZE;
     use crate::id::{BlockID, PageID};
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::lock::{LockMode, LockResource};
@@ -1626,9 +1727,9 @@ pub(crate) mod tests {
 
     fn expect_runtime_report(error: RuntimeOrFatalError) -> Report<RuntimeError> {
         match error {
-            RuntimeOrFatalError::Runtime(report) => report,
-            RuntimeOrFatalError::Fatal(report) => {
-                panic!("expected Runtime catalog failure, got Fatal: {report:?}")
+            RuntimeOrFatalError::Runtime(_report) => _report,
+            RuntimeOrFatalError::Fatal(_report) => {
+                panic!("expected Runtime catalog failure, got Fatal: {_report:?}")
             }
         }
     }
@@ -1640,12 +1741,13 @@ pub(crate) mod tests {
             first_retained_file_seq: 0,
             sealed_redo_segments: Vec::new(),
             catalog_ops: Vec::new(),
+            #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
     }
 
-    async fn apply_metadata_only_checkpoint(catalog: &Catalog) -> Result<CatalogCheckpointReport> {
+    async fn apply_metadata_only_checkpoint(catalog: &Catalog) -> Result<CatalogCheckpointResult> {
         let storage = &catalog.storage;
         let replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         let disk_guard = storage.disk_pool.create_base_guard();
@@ -1666,6 +1768,7 @@ pub(crate) mod tests {
             first_retained_file_seq: 0,
             sealed_redo_segments: Vec::new(),
             catalog_ops,
+            #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
@@ -1736,6 +1839,7 @@ pub(crate) mod tests {
         ]
     }
 
+    #[cfg(feature = "profiling")]
     fn catalog_measurement(storage: &CatalogStorage) -> CatalogCheckpointMeasurement {
         CatalogCheckpointMeasurement::new(&storage.checkpoint_snapshot().meta.table_roots, 0)
     }
@@ -1745,9 +1849,16 @@ pub(crate) mod tests {
             storage.checkpoint_snapshot().meta.table_roots[must_catalog_table_slot(table_id)];
         let table = storage.get_catalog_table(table_id).unwrap();
         let disk_pool_guard = storage.disk_pool.create_base_guard();
+        #[cfg(feature = "profiling")]
         let measurement = catalog_measurement(storage);
         storage
-            .load_rows_from_root(table.metadata(), &disk_pool_guard, root, &measurement)
+            .load_rows_from_root(
+                table.metadata(),
+                &disk_pool_guard,
+                root,
+                #[cfg(feature = "profiling")]
+                &measurement,
+            )
             .await
             .unwrap()
     }
@@ -1770,9 +1881,17 @@ pub(crate) mod tests {
         assert_eq!(root.pivot_row_id(), RowID::new(rows.len() as u64));
         let root_block_id = root.checkpoint_root_block_id().unwrap();
         let disk_pool_guard = storage.disk_pool.create_base_guard();
+        #[cfg(feature = "profiling")]
         let measurement = catalog_measurement(storage);
         let entries = storage
-            .collect_index_entries(&disk_pool_guard, root_block_id, table_id, &measurement)
+            .collect_index_entries(
+                &disk_pool_guard,
+                root_block_id,
+                #[cfg(feature = "profiling")]
+                table_id,
+                #[cfg(feature = "profiling")]
+                &measurement,
+            )
             .await
             .unwrap();
         assert!(!entries.is_empty());
@@ -1870,6 +1989,7 @@ pub(crate) mod tests {
                 table_id: TABLE_ID_TABLES,
                 kind: RowRedoKind::DeleteByPrimaryKey(key),
             }],
+            #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
@@ -1889,8 +2009,8 @@ pub(crate) mod tests {
             err.downcast_ref::<DataIntegrityError>().copied(),
             Some(DataIntegrityError::InvalidPayload)
         );
-        let report = format!("{err:?}");
-        assert!(report.contains(expected_message), "{report}");
+        let _report = format!("{err:?}");
+        assert!(_report.contains(expected_message), "{_report}");
         let current_replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
         assert_eq!(current_replay_start_ts, replay_start_ts);
     }
@@ -1902,15 +2022,25 @@ pub(crate) mod tests {
     ) -> String {
         let table = storage.get_catalog_table(root.table_id).unwrap();
         let disk_guard = storage.disk_pool.create_base_guard();
+        #[cfg(feature = "profiling")]
         let measurement = catalog_measurement(storage);
         let error = storage
-            .load_rows_from_root(table.metadata(), &disk_guard, root, &measurement)
+            .load_rows_from_root(
+                table.metadata(),
+                &disk_guard,
+                root,
+                #[cfg(feature = "profiling")]
+                &measurement,
+            )
             .await
             .unwrap_err();
-        let report = expect_runtime_report(error);
-        assert_eq!(*report.current_context(), RuntimeError::CatalogAccess);
-        assert_eq!(report.downcast_ref::<DataIntegrityError>(), Some(&expected));
-        format!("{report:?}")
+        let _report = expect_runtime_report(error);
+        assert_eq!(*_report.current_context(), RuntimeError::CatalogAccess);
+        assert_eq!(
+            _report.downcast_ref::<DataIntegrityError>(),
+            Some(&expected)
+        );
+        format!("{_report:?}")
     }
 
     async fn assert_checkpoint_table_row(
@@ -1945,6 +2075,7 @@ pub(crate) mod tests {
         ];
         let mut mutable =
             MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
+        #[cfg(feature = "profiling")]
         let mut measurement = catalog_measurement(storage);
         let (next_root, blocks_changed) = storage
             .apply_table_ops(
@@ -1955,6 +2086,7 @@ pub(crate) mod tests {
                 &table_ops,
                 cts,
                 engine.inner().core.pools.pool_guards().disk_guard(),
+                #[cfg(feature = "profiling")]
                 &mut measurement,
             )
             .await
@@ -2005,20 +2137,20 @@ pub(crate) mod tests {
         let metadata = &catalog_definition_of_tables().metadata;
         let err = validate_catalog_row(metadata, &[], "catalog test row").unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("catalog test row"), "{report}");
+        let _report = format!("{err:?}");
+        assert!(_report.contains("catalog test row"), "{_report}");
 
         let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u32)]).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("table_id"), "{report}");
-        assert!(report.contains("index 0"), "{report}");
+        let _report = format!("{err:?}");
+        assert!(_report.contains("table_id"), "{_report}");
+        assert!(_report.contains("index 0"), "{_report}");
 
         let err = table_replay_silent_watermark_object_from_vals(&[Val::from(1u64)]).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
-        let report = format!("{err:?}");
-        assert!(report.contains("heap_redo_start_ts"), "{report}");
-        assert!(report.contains("index 1"), "{report}");
+        let _report = format!("{err:?}");
+        assert!(_report.contains("heap_redo_start_ts"), "{_report}");
+        assert!(_report.contains("index 1"), "{_report}");
     }
 
     /// Purpose: Validate catalog root identity even when the root is empty.
@@ -2055,19 +2187,19 @@ pub(crate) mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
-            let report = format!("{err:?}");
+            let _report = format!("{err:?}");
             assert!(
-                report.contains("catalog root table id mismatch"),
-                "{report}"
+                _report.contains("catalog root table id mismatch"),
+                "{_report}"
             );
             assert!(
-                report.contains(&format!("root_table_id={TABLE_ID_COLUMNS}")),
-                "{report}"
+                _report.contains(&format!("root_table_id={TABLE_ID_COLUMNS}")),
+                "{_report}"
             );
-            assert!(report.contains("slot_idx=0"), "{report}");
+            assert!(_report.contains("slot_idx=0"), "{_report}");
             assert!(
-                report.contains("operation=bootstrap_catalog, phase=validate_table_root"),
-                "{report}"
+                _report.contains("operation=bootstrap_catalog, phase=validate_table_root"),
+                "{_report}"
             );
         });
     }
@@ -2093,6 +2225,7 @@ pub(crate) mod tests {
                     table_id: invalid_table_id,
                     kind: RowRedoKind::Insert(PageID::new(0), Vec::new()),
                 }],
+                #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count: 0,
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
@@ -2115,25 +2248,25 @@ pub(crate) mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
-            let report = format!("{err:?}");
+            let _report = format!("{err:?}");
             assert!(
-                report.contains("catalog checkpoint redo table id out of range"),
-                "{report}"
+                _report.contains("catalog checkpoint redo table id out of range"),
+                "{_report}"
             );
             assert!(
-                report.contains(&format!("table_id={invalid_table_id}")),
-                "{report}"
+                _report.contains(&format!("table_id={invalid_table_id}")),
+                "{_report}"
             );
             assert!(
-                report.contains(&format!("slot={}", CATALOG_TABLE_ROOT_DESC_COUNT)),
-                "{report}"
+                _report.contains(&format!("slot={}", CATALOG_TABLE_ROOT_DESC_COUNT)),
+                "{_report}"
             );
             assert!(
-                report.contains(&format!(
+                _report.contains(&format!(
                     "catalog_table_count={}",
                     CATALOG_TABLE_ROOT_DESC_COUNT
                 )),
-                "{report}"
+                "{_report}"
             );
             let current_replay_start_ts = storage.checkpoint_snapshot().catalog_replay_start_ts;
             assert_eq!(current_replay_start_ts, replay_start_ts);
@@ -2173,10 +2306,10 @@ pub(crate) mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidRootInvariant)
             );
-            let report = format!("{err:?}");
-            assert!(report.contains("view=projected"), "{report}");
-            assert!(report.contains("catalog.columns"), "{report}");
-            assert!(report.contains(&format!("table_id={orphan}")), "{report}");
+            let _report = format!("{err:?}");
+            assert!(_report.contains("view=projected"), "{_report}");
+            assert!(_report.contains("catalog.columns"), "{_report}");
+            assert!(_report.contains(&format!("table_id={orphan}")), "{_report}");
 
             let after = storage.checkpoint_snapshot();
             assert_eq!(after.meta_block_id, before.meta_block_id);
@@ -2262,14 +2395,14 @@ pub(crate) mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
-            let report = format!("{err:?}");
+            let _report = format!("{err:?}");
             assert!(
-                report.contains("single catalog row does not fit in LWC block: row_id=0"),
-                "{report}"
+                _report.contains("single catalog row does not fit in LWC block: row_id=0"),
+                "{_report}"
             );
             assert!(
-                report.contains("operation=build_catalog_lwc_blocks, phase=append_row"),
-                "{report}"
+                _report.contains("operation=build_catalog_lwc_blocks, phase=append_row"),
+                "{_report}"
             );
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
 
@@ -2309,9 +2442,9 @@ pub(crate) mod tests {
                 Some(DataIntegrityError::InvalidPayload),
                 "case={case}"
             );
-            let report = format!("{err:?}");
-            assert!(report.contains("catalog checkpoint LWC row"), "{report}");
-            assert!(report.contains("column_no=0"), "{report}");
+            let _report = format!("{err:?}");
+            assert!(_report.contains("catalog checkpoint LWC row"), "{_report}");
+            assert!(_report.contains("column_no=0"), "{_report}");
         }
     }
 
@@ -2341,21 +2474,21 @@ pub(crate) mod tests {
             )
             .await;
 
-            let report = assert_catalog_root_load_error(
+            let _report = assert_catalog_root_load_error(
                 storage,
                 root,
                 DataIntegrityError::InvalidRootInvariant,
             )
             .await;
             assert!(
-                report.contains("catalog root contains delete deltas"),
-                "{report}"
+                _report.contains("catalog root contains delete deltas"),
+                "{_report}"
             );
             assert!(
-                report.contains(&format!("table_id={TABLE_ID_TABLES}")),
-                "{report}"
+                _report.contains(&format!("table_id={TABLE_ID_TABLES}")),
+                "{_report}"
             );
-            assert!(report.contains("delete_count=1"), "{report}");
+            assert!(_report.contains("delete_count=1"), "{_report}");
         });
     }
 
@@ -2391,10 +2524,10 @@ pub(crate) mod tests {
             )
             .await;
 
-            let report =
+            let _report =
                 assert_catalog_root_load_error(storage, root, DataIntegrityError::InvalidPayload)
                     .await;
-            assert!(report.contains("duplicate primary key"), "{report}");
+            assert!(_report.contains("duplicate primary key"), "{_report}");
         });
     }
 
@@ -2464,25 +2597,35 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
+            let outcome = report1.outcome;
+            #[cfg(not(feature = "profiling"))]
+            let outcome = report1;
             assert!(matches!(
-                report1.outcome,
+                outcome,
                 CatalogCheckpointOutcome::Published { .. }
             ));
-            assert_eq!(report1.catalog_ddl_txn_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(report1.report.catalog_ddl_txn_count, 1);
+            #[cfg(feature = "profiling")]
             assert!(
                 report1
+                    .report
                     .table_changes
                     .windows(2)
                     .all(|pair| pair[0].table_id < pair[1].table_id)
             );
+            #[cfg(feature = "profiling")]
             assert!(
                 report1
+                    .report
                     .table_io
                     .windows(2)
                     .all(|pair| pair[0].table_id < pair[1].table_id)
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                report1.metadata_bytes_written,
+                report1.report.metadata_bytes_written,
                 COW_FILE_PAGE_SIZE + SUPER_BLOCK_SIZE
             );
 
@@ -2492,11 +2635,19 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            assert_eq!(noop.outcome, CatalogCheckpointOutcome::Noop);
-            assert_eq!(noop.catalog_ddl_txn_count, 0);
-            assert!(noop.table_changes.is_empty());
-            assert!(noop.table_io.is_empty());
-            assert_eq!(noop.metadata_bytes_written, 0);
+            #[cfg(feature = "profiling")]
+            let outcome = noop.outcome;
+            #[cfg(not(feature = "profiling"))]
+            let outcome = noop;
+            assert_eq!(outcome, CatalogCheckpointOutcome::Noop);
+            #[cfg(feature = "profiling")]
+            assert_eq!(noop.report.catalog_ddl_txn_count, 0);
+            #[cfg(feature = "profiling")]
+            assert!(noop.report.table_changes.is_empty());
+            #[cfg(feature = "profiling")]
+            assert!(noop.report.table_io.is_empty());
+            #[cfg(feature = "profiling")]
+            assert_eq!(noop.report.metadata_bytes_written, 0);
 
             let storage = &engine.inner().core.catalog().storage;
             let before = storage.checkpoint_snapshot();
@@ -2532,42 +2683,58 @@ pub(crate) mod tests {
             let engine = open_catalog_test_engine(main_dir, Some("catalog-meta-fast-path")).await;
 
             let _ = table1(&engine).await;
-            let initial_report = engine
+            let _initial_report = engine
                 .new_session()
                 .unwrap()
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let tables_change = initial_report
+            #[cfg(feature = "profiling")]
+            let _tables_change = _initial_report
+                .report
                 .table_changes
                 .iter()
                 .find(|change| change.table_id == TABLE_ID_TABLES)
                 .unwrap();
-            assert_eq!(tables_change.before_row_count, 0);
-            assert_eq!(tables_change.after_row_count, 1);
-            let tables_io = initial_report
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_change.before_row_count, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_change.after_row_count, 1);
+            #[cfg(feature = "profiling")]
+            let _tables_io = _initial_report
+                .report
                 .table_io
                 .iter()
                 .find(|stats| stats.table_id == TABLE_ID_TABLES)
                 .unwrap();
-            assert!(tables_io.compact_bytes_read >= COW_FILE_PAGE_SIZE);
-            assert!(tables_io.final_compact_bytes >= 2 * COW_FILE_PAGE_SIZE);
-            assert!(tables_io.lwc_bytes_written >= COW_FILE_PAGE_SIZE);
-            assert!(tables_io.index_bytes_written >= COW_FILE_PAGE_SIZE);
-            assert_eq!(tables_io.lwc_bytes_written % COW_FILE_PAGE_SIZE, 0);
-            assert_eq!(tables_io.index_bytes_written % COW_FILE_PAGE_SIZE, 0);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.compact_bytes_read >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.final_compact_bytes >= 2 * COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.lwc_bytes_written >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.index_bytes_written >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_io.lwc_bytes_written % COW_FILE_PAGE_SIZE, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_io.index_bytes_written % COW_FILE_PAGE_SIZE, 0);
 
             let storage = &engine.inner().core.catalog().storage;
+            #[cfg(feature = "profiling")]
             let stats_session = engine.new_session().unwrap();
+            #[cfg(feature = "profiling")]
             let warm_io_before = stats_session.storage_io_stats().unwrap();
-            let warm_report = apply_metadata_only_checkpoint(engine.inner().core.catalog())
+            let _warm_report = apply_metadata_only_checkpoint(engine.inner().core.catalog())
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             let warm_io_after = stats_session.storage_io_stats().unwrap();
             let snap = storage.checkpoint_snapshot();
             let table_roots = snap.meta.table_roots;
             let allocated_before = storage.mtb.active_root_unchecked().alloc_map.allocated();
             let disk_pool_guard = storage.disk_pool.create_base_guard();
+            #[cfg(feature = "profiling")]
             let measurement = CatalogCheckpointMeasurement::new(&table_roots, 0);
             let mut catalog_index_blocks = BTreeSet::new();
             for root in snap.meta.table_roots {
@@ -2579,7 +2746,9 @@ pub(crate) mod tests {
                     .collect_index_entries(
                         &disk_pool_guard,
                         root_block_id,
+                        #[cfg(feature = "profiling")]
                         root.table_id,
+                        #[cfg(feature = "profiling")]
                         &measurement,
                     )
                     .await
@@ -2600,47 +2769,62 @@ pub(crate) mod tests {
             }
             let cached_before = engine.inner().pools.disk.allocated();
 
+            #[cfg(feature = "profiling")]
             let cold_io_before = stats_session.storage_io_stats().unwrap();
             let metadata_only_report =
                 apply_metadata_only_checkpoint(engine.inner().core.catalog())
                     .await
                     .unwrap();
+            #[cfg(feature = "profiling")]
             let cold_io_after = stats_session.storage_io_stats().unwrap();
 
+            #[cfg(feature = "profiling")]
+            let outcome = metadata_only_report.outcome;
+            #[cfg(not(feature = "profiling"))]
+            let outcome = metadata_only_report;
             assert!(matches!(
-                metadata_only_report.outcome,
+                outcome,
                 CatalogCheckpointOutcome::Published { .. }
             ));
-            assert!(metadata_only_report.table_changes.is_empty());
+            #[cfg(feature = "profiling")]
+            assert!(metadata_only_report.report.table_changes.is_empty());
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metadata_only_report
+                    .report
                     .table_io
                     .iter()
                     .map(|stats| stats.compact_bytes_read)
                     .collect::<Vec<_>>(),
-                warm_report
+                _warm_report
+                    .report
                     .table_io
                     .iter()
                     .map(|stats| stats.compact_bytes_read)
                     .collect::<Vec<_>>()
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metadata_only_report
+                    .report
                     .table_io
                     .iter()
                     .map(|stats| stats.final_compact_bytes)
                     .collect::<Vec<_>>(),
-                initial_report
+                _initial_report
+                    .report
                     .table_io
                     .iter()
                     .map(|stats| stats.final_compact_bytes)
                     .collect::<Vec<_>>()
             );
+            #[cfg(feature = "profiling")]
             assert!(
-                metadata_only_report.table_io.iter().all(|stats| {
+                metadata_only_report.report.table_io.iter().all(|stats| {
                     stats.lwc_bytes_written == 0 && stats.index_bytes_written == 0
                 })
             );
+            #[cfg(feature = "profiling")]
             assert!(
                 cold_io_after.table_read_requests - cold_io_before.table_read_requests
                     > warm_io_after.table_read_requests - warm_io_before.table_read_requests
@@ -2680,15 +2864,18 @@ pub(crate) mod tests {
                 .unwrap();
             session.checkpoint_catalog().await.unwrap();
 
-            let report = apply_metadata_only_checkpoint(engine.inner().core.catalog())
+            let _report = apply_metadata_only_checkpoint(engine.inner().core.catalog())
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             for table_id in [
                 TABLE_ID_TABLES,
                 TABLE_ID_COLUMNS,
                 TABLE_ID_TABLE_DESCRIPTORS,
             ] {
-                let stats = report
+                #[cfg(feature = "profiling")]
+                let stats = _report
+                    .report
                     .table_io
                     .iter()
                     .find(|stats| stats.table_id == table_id)
@@ -2696,7 +2883,9 @@ pub(crate) mod tests {
                 // One single-block root costs its root read, LWC read, and one
                 // combined delete-delta/row-ID read. A second projected
                 // validation pass would double this value.
+                #[cfg(feature = "profiling")]
                 assert_eq!(stats.compact_bytes_read, 3 * COW_FILE_PAGE_SIZE);
+                #[cfg(feature = "profiling")]
                 assert_eq!(stats.final_compact_bytes, 2 * COW_FILE_PAGE_SIZE);
             }
         });
@@ -2737,6 +2926,7 @@ pub(crate) mod tests {
                         )),
                     },
                 ],
+                #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count: 0,
                 stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
@@ -2857,10 +3047,10 @@ pub(crate) mod tests {
                 err.downcast_ref::<DataIntegrityError>().copied(),
                 Some(DataIntegrityError::InvalidPayload)
             );
-            let report = format!("{err:?}");
+            let _report = format!("{err:?}");
             assert!(
-                report.contains("catalog checkpoint update cannot change primary key column"),
-                "{report}"
+                _report.contains("catalog checkpoint update cannot change primary key column"),
+                "{_report}"
             );
         });
     }
@@ -2942,11 +3132,13 @@ pub(crate) mod tests {
                 engine.inner().core.catalog().curr_next_table_id(),
                 roots,
             );
+            #[cfg(feature = "profiling")]
             let mut measurement = CatalogCheckpointMeasurement::new(&roots, 0);
             let err = storage
                 .rebuild_catalog_alloc_map(
                     &mut mutable,
                     engine.inner().core.pools.pool_guards().disk_guard(),
+                    #[cfg(feature = "profiling")]
                     &mut measurement,
                 )
                 .await
@@ -3034,6 +3226,7 @@ pub(crate) mod tests {
             let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let tables_root = snap.meta.table_roots[0];
             let root_block_id = tables_root.checkpoint_root_block_id().unwrap();
+            #[cfg(feature = "profiling")]
             let measurement = CatalogCheckpointMeasurement::new(&snap.meta.table_roots, 0);
             let disk_pool_guard = engine
                 .inner()
@@ -3053,7 +3246,9 @@ pub(crate) mod tests {
                 .collect_index_entries(
                     &disk_pool_guard,
                     root_block_id,
+                    #[cfg(feature = "profiling")]
                     TABLE_ID_TABLES,
+                    #[cfg(feature = "profiling")]
                     &measurement,
                 )
                 .await
@@ -3080,7 +3275,9 @@ pub(crate) mod tests {
                 .collect_index_entries(
                     &disk_pool_guard,
                     root_block_id,
+                    #[cfg(feature = "profiling")]
                     TABLE_ID_TABLES,
+                    #[cfg(feature = "profiling")]
                     &measurement,
                 )
                 .await
@@ -3119,28 +3316,38 @@ pub(crate) mod tests {
                 .await;
 
             let table2_id = table2(&engine).await;
-            let report2 = engine
+            let _report2 = engine
                 .new_session()
                 .unwrap()
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            let tables_change = report2
+            #[cfg(feature = "profiling")]
+            let _tables_change = _report2
+                .report
                 .table_changes
                 .iter()
                 .find(|change| change.table_id == TABLE_ID_TABLES)
                 .unwrap();
-            assert_eq!(tables_change.before_row_count, 1);
-            assert_eq!(tables_change.after_row_count, 2);
-            let tables_io = report2
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_change.before_row_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_tables_change.after_row_count, 2);
+            #[cfg(feature = "profiling")]
+            let _tables_io = _report2
+                .report
                 .table_io
                 .iter()
                 .find(|stats| stats.table_id == TABLE_ID_TABLES)
                 .unwrap();
-            assert!(tables_io.compact_bytes_read >= COW_FILE_PAGE_SIZE);
-            assert!(tables_io.final_compact_bytes >= 2 * COW_FILE_PAGE_SIZE);
-            assert!(tables_io.lwc_bytes_written >= COW_FILE_PAGE_SIZE);
-            assert!(tables_io.index_bytes_written >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.compact_bytes_read >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.final_compact_bytes >= 2 * COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.lwc_bytes_written >= COW_FILE_PAGE_SIZE);
+            #[cfg(feature = "profiling")]
+            assert!(_tables_io.index_bytes_written >= COW_FILE_PAGE_SIZE);
 
             let snap2 = engine.inner().core.catalog().storage.checkpoint_snapshot();
             let tables_root2 = snap2.meta.table_roots[0];
@@ -3240,13 +3447,16 @@ pub(crate) mod tests {
             let disk_pool_guard = storage.disk_pool.create_base_guard();
             let snap1 = storage.checkpoint_snapshot();
             let columns_root1 = snap1.meta.table_roots[1];
+            #[cfg(feature = "profiling")]
             let measurement1 = CatalogCheckpointMeasurement::new(&snap1.meta.table_roots, 0);
             assert_eq!(columns_root1.pivot_row_id(), RowID::new(1));
             let entries1 = storage
                 .collect_index_entries(
                     &disk_pool_guard,
                     columns_root1.checkpoint_root_block_id().unwrap(),
+                    #[cfg(feature = "profiling")]
                     TABLE_ID_COLUMNS,
+                    #[cfg(feature = "profiling")]
                     &measurement1,
                 )
                 .await
@@ -3286,6 +3496,7 @@ pub(crate) mod tests {
 
             let snap2 = storage.checkpoint_snapshot();
             let columns_root2 = snap2.meta.table_roots[1];
+            #[cfg(feature = "profiling")]
             let measurement2 = CatalogCheckpointMeasurement::new(&snap2.meta.table_roots, 0);
             let rows = assert_compact_catalog_root(storage, TABLE_ID_COLUMNS).await;
             assert_eq!(rows.len(), row_count);
@@ -3298,7 +3509,9 @@ pub(crate) mod tests {
                 .collect_index_entries(
                     &disk_pool_guard,
                     columns_root2.checkpoint_root_block_id().unwrap(),
+                    #[cfg(feature = "profiling")]
                     TABLE_ID_COLUMNS,
+                    #[cfg(feature = "profiling")]
                     &measurement2,
                 )
                 .await

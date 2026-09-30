@@ -891,7 +891,7 @@ For workflow and timestamp details, see [Checkpoint](checkpoint.md) and
 
 | Method | Result |
 | --- | --- |
-| `checkpoint_catalog` | Publishes eligible catalog state and returns `()`. |
+| `checkpoint_catalog` | Publishes eligible catalog state and reports the outcome, with optional profiling measurements. |
 | `truncate_redo_log` | Returns `RedoTruncationOutcome`, including marker movement, removal counts, failures, and current blockers. |
 | `checkpoint_catalog_and_truncate_redo_log` | Coordinates both operations and returns `CatalogRedoMaintenanceOutcome`. |
 
@@ -906,8 +906,8 @@ reported in the outcome.
 - `wait_for_purge_completion_after(ts)` waits for completed physical purge-cycle
   progress to become newer than `ts`.
 - `cleanup_secondary_mem_indexes(table_id, clean_live_entries)` returns
-  `MemIndexCleanupOutcome`. Its `MemIndexCleanupStats` contains one
-  `SecondaryMemIndexCleanupIndexStats` per active index. Delete-overlay cleanup
+  `MemIndexCleanupOutcome`. With `profiling` enabled, its `MemIndexCleanupStats`
+  contains one `SecondaryMemIndexCleanupIndexStats` per active index. Delete-overlay cleanup
   can succeed while `MemIndexCleanupDelay` in `live_delay` reports that
   live-entry cleanup must be retried later.
 - `total_row_pages(table_id)` returns the current number of hot row pages for a
@@ -919,11 +919,14 @@ cleanup completion matters.
 
 ## Diagnostics and statistics
 
+Diagnostics require the default-enabled `profiling` feature. Disabling it removes
+diagnostic APIs and measurements while preserving storage and maintenance behavior.
+
 `Engine::recovery_report() -> &RecoveryReport` returns immutable diagnostics for
 successful bootstrap, without a session, including after explicit shutdown.
 It reports stage durations and observed work. Failed bootstrap produces no
 report. Field meanings are documented on the
-[report types](../doradb-storage/src/stats.rs).
+[profiling types](../doradb-storage/src/profiling/mod.rs).
 
 Sessions expose point-in-time or cumulative snapshots:
 
@@ -1081,7 +1084,7 @@ The public modules provide the same domains with additional specialized items:
 
 - `doradb_storage::id` contains public identifier newtypes;
 - `doradb_storage::conf` contains configuration types and default constants;
-- `doradb_storage::stats` contains public statistics snapshots; and
+- `doradb_storage::profiling` contains public statistics snapshots; and
 - `doradb_storage::error` contains the public error surface and specialized
   diagnostic/support types.
 

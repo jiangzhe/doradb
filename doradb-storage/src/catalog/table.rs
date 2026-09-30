@@ -2658,42 +2658,67 @@ fn validate_primary_key_contract(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
     use crate::CallbackResult;
+
     use crate::catalog::storage::tests::begin_catalog_test_trx;
+
     use crate::catalog::tests::{
         assert_dropped_table_floor, assert_dropped_table_runtime,
         assert_no_dropped_table_operational_state, wait_for_dropped_table_floor,
         wait_for_no_dropped_table_operational_state,
     };
+
     use crate::catalog::{
         CatalogCheckpointScanStopReason, CurrentTableState, StorageColumnFlags, StorageColumnSpec,
         StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, TableMetadata,
     };
+
     use crate::engine::Engine;
+
     use crate::error::RuntimeResult;
+
     use crate::error::{
         DataIntegrityError, DiscloseError, Error, ErrorKind, FatalError, IoError, LifecycleError,
         OperationError, RuntimeError,
     };
+
     use crate::id::{SessionID, TrxID};
+
     use crate::io::install_storage_backend_test_hook;
+
     use crate::lock::tests::{LockDebugEntryState, TestLockOwner, debug_snapshot};
+
     use crate::lock::{LockMode, LockOwner, LockResource, TableLockMode};
+
     use crate::log::redo::DDLRedo;
+
     use crate::row::ops::ScanRowDecision;
+
     use crate::session::tests::{
         SessionTestExt, active_operation_count, active_operation_snapshot, remove_session_for_test,
     };
+
     use crate::table::TableTerminal;
+
     use crate::table::tests::*;
+
     use crate::trx::MAX_SNAPSHOT_TS;
+
     use crate::trx::purge::PurgeTestEvent;
+
     use crate::trx::tests as trx_tests;
+
     use crate::value::{Val, ValKind};
+
     use std::future::Future;
+
     use std::path::Path;
+
     use std::sync::Arc;
+
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use tempfile::TempDir;
 
     static STORAGE_SCHEMA_FINGERPRINTS: AtomicUsize = AtomicUsize::new(0);
@@ -3123,6 +3148,112 @@ pub(crate) mod tests {
         assert!(engine.inner().poisoner.poison_error().is_none());
         assert!(!session.in_trx().unwrap());
         wait_path_exists(&table_file_path, false).await;
+    }
+
+    async fn assert_create_table_rejected(index_spec: StorageIndexSpec, diagnostic: &str) {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = lightweight_test_engine(&temp_dir, "create_invalid_metadata").await;
+        let mut session = engine.new_session().unwrap();
+        let session_id = session.id();
+        let table_id = engine.inner().core.catalog().curr_next_table_id();
+        let path = engine.inner().table_fs.user_table_file_path(table_id);
+        let error = session
+            .create_table(
+                StorageTableSpec::new(vec![StorageColumnSpec::new(
+                    ValKind::I32,
+                    StorageColumnFlags::empty(),
+                )]),
+                vec![index_spec],
+            )
+            .await
+            .unwrap_err();
+        assert_invalid_metadata(error, diagnostic);
+        assert_eq!(engine.inner().core.catalog().curr_next_table_id(), table_id);
+        assert_no_user_table_publication(&engine, table_id);
+        for resource in [
+            LockResource::TableMetadata(table_id),
+            LockResource::TableData(table_id),
+        ] {
+            assert!(
+                !has_ddl_lock_resource(&engine, session_id, resource),
+                "{resource:?}"
+            );
+        }
+        assert!(engine.inner().poisoner.poison_error().is_none());
+        assert!(!session.in_trx().unwrap());
+        wait_path_exists(&path, false).await;
+    }
+
+    async fn assert_table_lock_cancellation(
+        engine: &Engine,
+        table_id: TableID,
+        owner: LockOwner,
+        lock: impl Future<Output = Result<(), Error>>,
+    ) {
+        let mut lock = Box::pin(lock);
+        assert!(matches!(
+            futures::poll!(lock.as_mut()),
+            std::task::Poll::Pending
+        ));
+        assert!(has_lock_entry(
+            engine,
+            owner,
+            LockResource::TableMetadata(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Granted,
+        ));
+        assert!(has_lock_entry(
+            engine,
+            owner,
+            LockResource::TableData(table_id),
+            LockMode::Shared,
+            LockDebugEntryState::Waiting,
+        ));
+        drop(lock);
+        wait_for_no_lock_resource(engine, owner, LockResource::TableMetadata(table_id)).await;
+        wait_for_no_lock_resource(engine, owner, LockResource::TableData(table_id)).await;
+    }
+
+    fn assert_table_lock_not_found(
+        engine: &Engine,
+        table_id: TableID,
+        owner: LockOwner,
+        error: Error,
+    ) {
+        assert_eq!(
+            error.report().downcast_ref::<OperationError>(),
+            Some(&OperationError::TableNotFound),
+            "{error:?}",
+        );
+        for resource in [
+            LockResource::TableMetadata(table_id),
+            LockResource::TableData(table_id),
+        ] {
+            assert!(
+                !has_lock_resource(engine, owner, resource),
+                "owner={owner:?}, resource={resource:?}"
+            );
+        }
+    }
+
+    fn assert_ddl_metadata_lock(
+        engine: &Engine,
+        table_id: TableID,
+        session_id: SessionID,
+        state: LockDebugEntryState,
+    ) {
+        let owner = ddl_lock_owner(engine, session_id, LockResource::TableMetadata(table_id))
+            .expect("DROP must have requested its metadata lock");
+        assert!(
+            has_lock_entry(
+                engine,
+                owner,
+                LockResource::TableMetadata(table_id),
+                LockMode::Exclusive,
+                state,
+            ),
+            "DROP metadata lock state: table_id={table_id}, state={state:?}"
+        );
     }
 
     /// Purpose: Preserve table metadata through its durable representation.
@@ -4029,112 +4160,6 @@ pub(crate) mod tests {
             assert_eq!(table_id, table.table_id());
             assert_eq!(&*index_ids, [IndexID::new(0), IndexID::new(1)]);
         });
-    }
-
-    async fn assert_create_table_rejected(index_spec: StorageIndexSpec, diagnostic: &str) {
-        let temp_dir = TempDir::new().unwrap();
-        let engine = lightweight_test_engine(&temp_dir, "create_invalid_metadata").await;
-        let mut session = engine.new_session().unwrap();
-        let session_id = session.id();
-        let table_id = engine.inner().core.catalog().curr_next_table_id();
-        let path = engine.inner().table_fs.user_table_file_path(table_id);
-        let error = session
-            .create_table(
-                StorageTableSpec::new(vec![StorageColumnSpec::new(
-                    ValKind::I32,
-                    StorageColumnFlags::empty(),
-                )]),
-                vec![index_spec],
-            )
-            .await
-            .unwrap_err();
-        assert_invalid_metadata(error, diagnostic);
-        assert_eq!(engine.inner().core.catalog().curr_next_table_id(), table_id);
-        assert_no_user_table_publication(&engine, table_id);
-        for resource in [
-            LockResource::TableMetadata(table_id),
-            LockResource::TableData(table_id),
-        ] {
-            assert!(
-                !has_ddl_lock_resource(&engine, session_id, resource),
-                "{resource:?}"
-            );
-        }
-        assert!(engine.inner().poisoner.poison_error().is_none());
-        assert!(!session.in_trx().unwrap());
-        wait_path_exists(&path, false).await;
-    }
-
-    async fn assert_table_lock_cancellation(
-        engine: &Engine,
-        table_id: TableID,
-        owner: LockOwner,
-        lock: impl Future<Output = Result<(), Error>>,
-    ) {
-        let mut lock = Box::pin(lock);
-        assert!(matches!(
-            futures::poll!(lock.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert!(has_lock_entry(
-            engine,
-            owner,
-            LockResource::TableMetadata(table_id),
-            LockMode::Shared,
-            LockDebugEntryState::Granted,
-        ));
-        assert!(has_lock_entry(
-            engine,
-            owner,
-            LockResource::TableData(table_id),
-            LockMode::Shared,
-            LockDebugEntryState::Waiting,
-        ));
-        drop(lock);
-        wait_for_no_lock_resource(engine, owner, LockResource::TableMetadata(table_id)).await;
-        wait_for_no_lock_resource(engine, owner, LockResource::TableData(table_id)).await;
-    }
-
-    fn assert_table_lock_not_found(
-        engine: &Engine,
-        table_id: TableID,
-        owner: LockOwner,
-        error: Error,
-    ) {
-        assert_eq!(
-            error.report().downcast_ref::<OperationError>(),
-            Some(&OperationError::TableNotFound),
-            "{error:?}",
-        );
-        for resource in [
-            LockResource::TableMetadata(table_id),
-            LockResource::TableData(table_id),
-        ] {
-            assert!(
-                !has_lock_resource(engine, owner, resource),
-                "owner={owner:?}, resource={resource:?}"
-            );
-        }
-    }
-
-    fn assert_ddl_metadata_lock(
-        engine: &Engine,
-        table_id: TableID,
-        session_id: SessionID,
-        state: LockDebugEntryState,
-    ) {
-        let owner = ddl_lock_owner(engine, session_id, LockResource::TableMetadata(table_id))
-            .expect("DROP must have requested its metadata lock");
-        assert!(
-            has_lock_entry(
-                engine,
-                owner,
-                LockResource::TableMetadata(table_id),
-                LockMode::Exclusive,
-                state,
-            ),
-            "DROP metadata lock state: table_id={table_id}, state={state:?}"
-        );
     }
 
     /// Purpose: Reject invalid table definitions before resource acquisition.
@@ -5978,6 +6003,7 @@ pub(crate) mod tests {
                 batch.stop_reason,
                 CatalogCheckpointScanStopReason::ReachedDurableUpper
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(batch.catalog_ddl_txn_count, 2);
             assert!(batch.safe_cts >= batch.replay_start_ts);
         });

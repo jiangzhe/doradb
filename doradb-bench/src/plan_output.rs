@@ -201,6 +201,7 @@ pub(crate) fn render_stdout_summary(
                 "catalog checkpoint report has incompatible workload metrics",
             ));
         };
+        let checkpoint = &checkpoint.report;
         let compact_bytes_read = checkpoint
             .table_io
             .iter()

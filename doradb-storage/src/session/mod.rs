@@ -2,10 +2,12 @@ mod managed_table_ops;
 
 pub use managed_table_ops::ManagedTableOps;
 
+#[cfg(feature = "profiling")]
+use crate::buffer::BufferPool;
+use crate::buffer::PoolGuards;
 use crate::buffer::page::VersionedPageID;
-use crate::buffer::{BufferPool, PoolGuards};
 use crate::catalog::{
-    Catalog, CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogCheckpointScope,
+    Catalog, CatalogCheckpointOutcome, CatalogCheckpointResult, CatalogCheckpointScope,
     CreateTableOutcome, DropTablePlan, IndexDdlGateScope, IndexID, PreparedCreateIndex,
     PreparedCreateTable, PreparedDropIndex, PreparedDropTable, StorageIndexSpec, StorageTableSpec,
     ValidatedCreateTable, create_index_catalog_write_targets, create_table_catalog_write_targets,
@@ -28,14 +30,13 @@ use crate::lock::{
 use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
 #[cfg(feature = "profiling")]
-use crate::profiling::HotIndexBuildStats;
-use crate::quiescent::QuiescentGuard;
-use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
-use crate::stats::{
-    BufferPoolStats, LogicalLockStats, MandatoryRuntimeStats, StorageIoStats,
+use crate::profiling::{
+    BufferPoolStats, HotIndexBuildStats, LogicalLockStats, MandatoryRuntimeStats, StorageIoStats,
     TransactionSystemStats, buffer_pool_runtime_stats_snapshot, storage_io_stats_snapshot,
     transaction_system_stats_snapshot,
 };
+use crate::quiescent::QuiescentGuard;
+use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::table::{
     CheckpointDelayReason, CheckpointOutcome, CheckpointRetryObservation, FreezeOutcome,
     MemIndexCleanupOutcome, Table, prepare_checkpoint_table_operation,
@@ -1324,7 +1325,7 @@ impl Session {
     /// refreshes internal catalog-safe redo retention progress for future
     /// truncation planning.
     #[inline]
-    pub async fn checkpoint_catalog(&mut self) -> Result<CatalogCheckpointReport> {
+    pub async fn checkpoint_catalog(&mut self) -> Result<CatalogCheckpointResult> {
         let operation = self
             .pin_operation(SessionOperationKind::Maintenance)
             .attach("operation=checkpoint_catalog")
@@ -1426,6 +1427,7 @@ impl Session {
     /// shutdown, session close, or registry removal. Callers can compare
     /// snapshots to compute deltas.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub fn transaction_system_stats(&self) -> Result<TransactionSystemStats> {
         let session = self
             .pin_inspection()
@@ -1444,6 +1446,7 @@ impl Session {
     /// shutdown, session close, or registry removal. Callers can compare
     /// snapshots to compute deltas.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub fn storage_io_stats(&self) -> Result<StorageIoStats> {
         let session = self
             .pin_inspection()
@@ -1463,6 +1466,7 @@ impl Session {
     /// shutdown, session close, or registry removal. Counters are monotonic
     /// snapshots and callers can compare snapshots to compute deltas.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub fn buffer_pool_stats(&self) -> Result<BufferPoolStats> {
         let session = self
             .pin_inspection()
@@ -1500,6 +1504,7 @@ impl Session {
     /// shutdown, session close, or registry removal. Monotonic fields and
     /// current active counts are independently sampled.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub fn mandatory_runtime_stats(&self) -> Result<MandatoryRuntimeStats> {
         let session = self
             .pin_inspection()
@@ -1532,6 +1537,7 @@ impl Session {
     /// the engine lifecycle is running. Owner-local counters are aggregated
     /// when a session's final family authority closes.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub fn logical_lock_stats(&self) -> Result<LogicalLockStats> {
         let session = self
             .pin_inspection()
@@ -1728,7 +1734,8 @@ impl Session {
 
     /// Full-scan cleanup for an existing user table's secondary MemIndex entries.
     ///
-    /// The outcome always includes completed cleanup accounting. When requested
+    /// With profiling enabled, the outcome includes completed cleanup accounting.
+    /// The measurement field requires the profiling feature. When requested
     /// live-entry removal is unsafe against the active snapshot horizon, delete
     /// overlays are still processed and `live_delay` describes when to retry.
     #[inline]
@@ -3908,7 +3915,8 @@ pub(crate) mod tests {
     use crate::io::install_storage_backend_test_hook;
     use crate::log::LogSync;
     use crate::log::format::REDO_DEFAULT_DATA_START_OFFSET;
-    use crate::stats::{
+    #[cfg(feature = "profiling")]
+    use crate::profiling::{
         BufferPoolCounters, BufferPoolRuntimeStats, MandatoryRuntimeStats, MandatoryTaskStats,
         TransactionSystemStats,
     };
@@ -4388,6 +4396,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn assert_transaction_system_stats_monotonic(
         before: TransactionSystemStats,
         after: TransactionSystemStats,
@@ -4406,6 +4415,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn assert_buffer_pool_stats_monotonic(before: &BufferPoolStats, after: &BufferPoolStats) {
         assert_buffer_pool_runtime_stats_monotonic(before.meta, after.meta);
         assert_buffer_pool_runtime_stats_monotonic(before.mem, after.mem);
@@ -4414,6 +4424,7 @@ pub(crate) mod tests {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn assert_buffer_pool_runtime_stats_monotonic(
         before: BufferPoolRuntimeStats,
         after: BufferPoolRuntimeStats,
@@ -4424,15 +4435,20 @@ pub(crate) mod tests {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn assert_buffer_pool_counters_monotonic(
         before: BufferPoolCounters,
         after: BufferPoolCounters,
     ) {
+        #[cfg(feature = "profiling")]
         assert!(after.cache_hits >= before.cache_hits);
+        #[cfg(feature = "profiling")]
         assert!(after.cache_misses >= before.cache_misses);
         assert!(after.miss_joins >= before.miss_joins);
+        #[cfg(feature = "profiling")]
         assert!(after.queued_reads >= before.queued_reads);
         assert!(after.running_reads >= before.running_reads);
+        #[cfg(feature = "profiling")]
         assert!(after.completed_reads >= before.completed_reads);
         assert!(after.read_errors >= before.read_errors);
         assert!(after.queued_writes >= before.queued_writes);
@@ -4946,10 +4962,15 @@ pub(crate) mod tests {
 
             assert_eq!(session.id(), session_id);
             assert_eq!(session.list_table_ids().unwrap(), table_ids_before);
+            #[cfg(feature = "profiling")]
             assert!(session.transaction_system_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.storage_io_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.buffer_pool_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.mandatory_runtime_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.logical_lock_stats().is_ok());
             #[cfg(feature = "profiling")]
             assert_eq!(
@@ -7269,6 +7290,7 @@ pub(crate) mod tests {
     /// Purpose: Expose cumulative session statistics across catalog work and mandatory task completion.
     /// Expected: Cumulative counters do not decrease and drained mandatory work is fully accounted for.
     #[test]
+    #[cfg(feature = "profiling")]
     fn test_session_stats_snapshots_are_monotonic() {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
@@ -7277,10 +7299,15 @@ pub(crate) mod tests {
                 .unwrap();
             let session = engine.new_session().unwrap();
 
+            #[cfg(feature = "profiling")]
             let trx0 = session.transaction_system_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let storage0 = session.storage_io_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let pools0 = session.buffer_pool_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let mandatory0 = session.mandatory_runtime_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let logical0 = session.logical_lock_stats().unwrap();
             assert_eq!(trx0.commit_count, 0);
             assert_eq!(trx0.trx_count, 0);
@@ -7292,11 +7319,16 @@ pub(crate) mod tests {
             assert_eq!(mandatory0, MandatoryRuntimeStats::default());
 
             let _table_id = table1(&engine).await;
+            #[cfg(feature = "profiling")]
             let trx1 = session.transaction_system_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let storage1 = session.storage_io_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let pools1 = session.buffer_pool_stats().unwrap();
             engine.inner().mandatory_runtime.drain_callers().await;
+            #[cfg(feature = "profiling")]
             let mandatory1 = session.mandatory_runtime_stats().unwrap();
+            #[cfg(feature = "profiling")]
             let logical1 = session.logical_lock_stats().unwrap();
             // Commit waiters can complete before the redo thread publishes
             // aggregate stats, so this test verifies monotonic snapshots
@@ -7307,8 +7339,11 @@ pub(crate) mod tests {
             assert!(storage1.pool_read_requests >= storage0.pool_read_requests);
             assert!(storage1.background_write_requests >= storage0.background_write_requests);
             assert_buffer_pool_stats_monotonic(&pools0, &pools1);
+            #[cfg(feature = "profiling")]
             assert_eq!(mandatory1.operation.submitted_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(mandatory1.operation.started_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(mandatory1.operation.completed_count, 1);
             assert_eq!(mandatory1.operation.error_count, 0);
             assert_eq!(mandatory1.operation.panic_count, 0);
@@ -7326,6 +7361,35 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Keep maintenance operational when profiling APIs and fields are absent.
+    /// Expected: Catalog publication and index cleanup succeed with only their real outcomes.
+    #[cfg(not(feature = "profiling"))]
+    #[test]
+    fn test_maintenance_without_profiling() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+                .await
+                .unwrap();
+            let table_id = table1(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let outcome: CatalogCheckpointOutcome = session.checkpoint_catalog().await.unwrap();
+            assert!(matches!(
+                outcome,
+                crate::CatalogCheckpointOutcome::Published { .. }
+            ));
+            let crate::MemIndexCleanupOutcome { live_delay } = session
+                .cleanup_secondary_mem_indexes(table_id, false)
+                .await
+                .unwrap();
+            assert!(live_delay.is_none());
+            assert!(session.list_table_ids().unwrap().contains(&table_id));
+            session.close().await.unwrap();
+            assert!(session.list_table_ids().is_err());
+            engine.shutdown();
+        });
+    }
+
     /// Purpose: Reject session inspection after its registry entry is removed.
     /// Expected: Catalog and statistics queries report session unavailability as a lifecycle failure.
     #[test]
@@ -7339,21 +7403,24 @@ pub(crate) mod tests {
 
             remove_session_for_test(&engine.inner().session_registry, session.id());
 
-            for err in [
-                session.list_table_ids().unwrap_err(),
-                session.transaction_system_stats().unwrap_err(),
-                session.storage_io_stats().unwrap_err(),
-                session.buffer_pool_stats().unwrap_err(),
-                session.mandatory_runtime_stats().unwrap_err(),
-                session.logical_lock_stats().unwrap_err(),
-                #[cfg(feature = "profiling")]
-                session.hot_index_build_stats().unwrap_err(),
-            ] {
+            let assert_unavailable = |err: Error| {
                 assert_eq!(err.kind(), ErrorKind::Lifecycle);
                 assert_eq!(
                     err.report().downcast_ref::<LifecycleError>().copied(),
                     Some(LifecycleError::SessionUnavailable)
                 );
+            };
+            assert_unavailable(session.list_table_ids().unwrap_err());
+            #[cfg(feature = "profiling")]
+            for err in [
+                session.transaction_system_stats().unwrap_err(),
+                session.storage_io_stats().unwrap_err(),
+                session.buffer_pool_stats().unwrap_err(),
+                session.mandatory_runtime_stats().unwrap_err(),
+                session.logical_lock_stats().unwrap_err(),
+                session.hot_index_build_stats().unwrap_err(),
+            ] {
+                assert_unavailable(err);
             }
         });
     }
@@ -7372,14 +7439,19 @@ pub(crate) mod tests {
             engine.shutdown();
 
             assert_runtime_unavailable_after_shutdown(session.list_table_ids().unwrap_err());
+            #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(
                 session.transaction_system_stats().unwrap_err(),
             );
+            #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(session.storage_io_stats().unwrap_err());
+            #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(session.buffer_pool_stats().unwrap_err());
+            #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(
                 session.mandatory_runtime_stats().unwrap_err(),
             );
+            #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(session.logical_lock_stats().unwrap_err());
             #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(session.hot_index_build_stats().unwrap_err());
@@ -7410,10 +7482,15 @@ pub(crate) mod tests {
             assert_fatal_admission_error(err, FatalError::RedoWrite);
 
             assert_eq!(session.list_table_ids().unwrap(), vec![table_id]);
+            #[cfg(feature = "profiling")]
             assert!(session.transaction_system_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.storage_io_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.buffer_pool_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.mandatory_runtime_stats().is_ok());
+            #[cfg(feature = "profiling")]
             assert!(session.logical_lock_stats().is_ok());
             #[cfg(feature = "profiling")]
             assert_eq!(

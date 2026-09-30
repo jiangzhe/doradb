@@ -6,7 +6,7 @@ use crate::completion::Completion;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::RowID;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotMergeMeasurements, HotMergeWorkerProfile};
+use crate::profiling::{HotMergeMeasurements, HotMergeWorkerProfile, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
 use error_stack::{Report, ResultExt};
@@ -18,8 +18,6 @@ use std::mem::take;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 
 #[cfg(test)]
 pub(super) use tests::{fixture_in as test_runs, prepare_packed as test_prepare_packed};

@@ -3,9 +3,10 @@ use super::{
 };
 use crate::completion::Completion;
 use crate::error::SharedFatalError;
+#[cfg(feature = "profiling")]
+use crate::profiling::clock::Instant;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Writer-assigned identity for one logical redo publication prefix entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +117,9 @@ impl LogPrefixTracker {
                 sync: Some(sync),
                 ready: false,
                 failure: None,
+                #[cfg(feature = "profiling")]
                 started_at: None,
+                #[cfg(feature = "profiling")]
                 sync_nanos: 0,
             },
         });
@@ -237,8 +240,14 @@ impl LogPrefixTracker {
                 ready.failed.push(group);
                 continue;
             }
-            ready.trx_count += group.trx_list.len();
-            ready.commit_count += 1;
+            #[cfg(feature = "profiling")]
+            {
+                ready.trx_count += group.trx_list.len();
+            }
+            #[cfg(feature = "profiling")]
+            {
+                ready.commit_count += 1;
+            }
             ready.log_bytes += group.log_bytes;
             ready.written.push(group);
         }
@@ -323,9 +332,16 @@ impl LogPrefixTracker {
                 debug_assert_eq!(kind, LogRequestKind::Group);
                 group.mark_request_submitted();
             }
-            LogPrefixKind::Sync { started_at, .. } => {
+            LogPrefixKind::Sync {
+                #[cfg(feature = "profiling")]
+                started_at,
+                ..
+            } => {
                 debug_assert_eq!(kind, LogRequestKind::CommitSync);
-                *started_at = Some(Instant::now());
+                #[cfg(feature = "profiling")]
+                {
+                    *started_at = Some(Instant::now());
+                }
             }
             LogPrefixKind::Seal { .. } => {
                 debug_assert!(matches!(
@@ -374,8 +390,10 @@ pub(super) enum LogPrefixKind {
         /// Fatal sync failure reported when the barrier completes.
         failure: Option<SharedFatalError>,
         /// Monotonic timestamp captured when the sync is submitted.
+        #[cfg(feature = "profiling")]
         started_at: Option<Instant>,
         /// Async sync latency measured from submission to completion.
+        #[cfg(feature = "profiling")]
         sync_nanos: usize,
     },
     /// Mandatory rotated-file seal barrier.
@@ -452,7 +470,9 @@ mod tests {
         tracker.push_group(sync_group_for_order_test(TrxID::new(11), true, 0));
 
         let ready = tracker.drain_ready_group_prefix();
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.trx_count, 0);
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.commit_count, 0);
         assert_eq!(ready.log_bytes, 0);
         assert!(ready.failure_reason.is_none());
@@ -466,7 +486,9 @@ mod tests {
         group.outstanding_requests = 0;
 
         let ready = tracker.drain_ready_group_prefix();
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.trx_count, 2);
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.commit_count, 2);
         assert_eq!(ready.log_bytes, 4096);
         assert!(ready.failure_reason.is_none());
@@ -486,7 +508,9 @@ mod tests {
         tracker.push_group(sync_group_for_order_test(TrxID::new(21), false, 4096));
 
         let ready = tracker.drain_ready_group_prefix();
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.trx_count, 1);
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.commit_count, 1);
         assert_eq!(ready.log_bytes, 0);
         assert!(ready.failure_reason.is_none());
@@ -512,7 +536,9 @@ mod tests {
         tracker.push_group(sync_group_for_order_test(TrxID::new(32), true, 4096));
 
         let ready = tracker.drain_ready_group_prefix();
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.trx_count, 1);
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.commit_count, 1);
         assert_eq!(ready.log_bytes, 1024);
         assert!(matches!(
@@ -543,7 +569,9 @@ mod tests {
         tracker.push_group(sync_group_for_order_test(TrxID::new(41), false, 2048));
 
         let ready = tracker.drain_ready_group_prefix();
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.trx_count, 0);
+        #[cfg(feature = "profiling")]
         assert_eq!(ready.commit_count, 0);
         assert_eq!(ready.log_bytes, 0);
         assert!(matches!(

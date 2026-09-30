@@ -12,8 +12,7 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{BufferPage, IOKind, PAGE_SIZE, Page, PageIO, VersionedPageID};
 use crate::buffer::util::{frame_total_bytes, madvise_dontneed};
 use crate::buffer::{
-    BufferPool, BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
-    RowPoolRole, pool_role_name,
+    BufferPool, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, RowPoolRole, pool_role_name,
 };
 use crate::component::Supplier;
 use crate::conf::EvictableBufferPoolConfig;
@@ -28,16 +27,18 @@ use crate::file::block_integrity::{validate_block_checksum, write_block_checksum
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::file::{BlockKey, INDEX_POOL_SWAP_FILE_ID, MEM_POOL_SWAP_FILE_ID, SparseFile};
 use crate::id::{BlockID, PageID};
+#[cfg(feature = "profiling")]
+use crate::io::BackendStats;
 use crate::io::{
-    BackendStats, IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation,
-    StdIoResult,
+    IOKind as StorageIOKind, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult,
 };
 use crate::latch::{GuardState, LatchFallbackMode};
 use crate::map::FastHashMap;
 use crate::notify::EventNotifyOnDrop;
+#[cfg(feature = "profiling")]
+use crate::profiling::{BufferPoolCounters, BufferPoolStatsHandle};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::runtime::yield_now;
-use crate::stats::BufferPoolCounters;
 use crate::{IndexPool, MemPool};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, listener};
@@ -73,6 +74,7 @@ pub(crate) struct EvictableBufferPool {
     // Inflight IO map.
     inflight_io: Arc<InflightIO>,
     // Pool-owned access and IO lifecycle counters.
+    #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
     role: PoolRole,
     arena: QuiescentArena,
@@ -140,6 +142,7 @@ impl EvictableBufferPool {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
+            #[cfg(feature = "profiling")]
             stats: BufferPoolStatsHandle::default(),
             role,
             arena,
@@ -197,6 +200,7 @@ impl EvictableBufferPool {
 
     /// Returns one snapshot of evictable-pool access and IO lifecycle counters.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
@@ -204,6 +208,7 @@ impl EvictableBufferPool {
     /// Returns one snapshot of backend-owned submit/wait activity for this pool.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
+    #[cfg(feature = "profiling")]
     pub(crate) fn io_backend_stats(&self) -> BackendStats {
         self.fs.io_backend_stats()
     }
@@ -229,6 +234,7 @@ impl EvictableBufferPool {
         page_id: PageID,
     ) -> RuntimeOrFatalResult<()> {
         guard.assert_matches(self.identity(), "evictable buffer pool");
+        #[cfg(feature = "profiling")]
         self.stats.record_cache_miss();
         enum DispatchAction {
             RetryYield,
@@ -281,6 +287,7 @@ impl EvictableBufferPool {
                                     let req = EvictReadSubmission::new(
                                         page_id,
                                         Arc::clone(&self.inflight_io),
+                                        #[cfg(feature = "profiling")]
                                         self.stats.clone(),
                                         self.role,
                                         reservation,
@@ -301,6 +308,7 @@ impl EvictableBufferPool {
                                 let req = EvictReadSubmission::new(
                                     page_id,
                                     Arc::clone(&self.inflight_io),
+                                    #[cfg(feature = "profiling")]
                                     self.stats.clone(),
                                     self.role,
                                     reservation,
@@ -311,6 +319,7 @@ impl EvictableBufferPool {
                     }
                 }
                 Entry::Occupied(mut occ) => {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_miss_join();
                     let status = occ.get_mut();
                     let completion = status
@@ -406,13 +415,18 @@ impl EvictableBufferPool {
 
     #[inline]
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
-        let domain_id = match pool.role {
+        let _domain_id = match pool.role {
             PoolRole::Mem => SharedEvictionDomainId::Mem,
             PoolRole::Index => SharedEvictionDomainId::Index,
             other => panic!("unsupported shared-evictor role: {other:?}"),
         };
         let (runtime, policy) = Self::evictor_parts(pool);
-        SharedEvictionDomain::new(domain_id, runtime, policy)
+        SharedEvictionDomain::new(
+            #[cfg(feature = "profiling")]
+            _domain_id,
+            runtime,
+            policy,
+        )
     }
 
     /// Reserves one in-memory page budget slot.
@@ -458,6 +472,7 @@ impl BufferPool for EvictableBufferPool {
     }
 
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     fn allocated(&self) -> usize {
         self.alloc_map.allocated()
     }
@@ -566,6 +581,7 @@ impl BufferPool for EvictableBufferPool {
                 FrameKind::Fixed | FrameKind::Hot => {
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                    #[cfg(feature = "profiling")]
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -579,6 +595,7 @@ impl BufferPool for EvictableBufferPool {
                     }
                     let g = frame.latch.optimistic_fallback_raw(mode).await;
                     let guard = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                    #[cfg(feature = "profiling")]
                     self.stats.record_cache_hit();
                     return Ok(guard);
                 }
@@ -630,6 +647,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    #[cfg(feature = "profiling")]
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -648,6 +666,7 @@ impl BufferPool for EvictableBufferPool {
                         }
                         return Ok(None);
                     }
+                    #[cfg(feature = "profiling")]
                     self.stats.record_cache_hit();
                     return Ok(Some(g));
                 }
@@ -722,6 +741,7 @@ impl BufferPool for EvictableBufferPool {
                     // page is acquired.
                     if p_guard.validate_bool() {
                         let child = FacadePageGuard::new(PageLatchGuard::new(guard.clone(), g), bf);
+                        #[cfg(feature = "profiling")]
                         self.stats.record_cache_hit();
                         return Ok(Valid(child));
                     }
@@ -749,6 +769,7 @@ impl BufferPool for EvictableBufferPool {
                         ))
                     });
                     if matches!(validated, Validation::Valid(_)) {
+                        #[cfg(feature = "profiling")]
                         self.stats.record_cache_hit();
                     }
                     return Ok(validated);
@@ -848,6 +869,7 @@ impl EvictablePoolStateMachine {
             PoolRequest::BatchWrite(page_guards, done_ev) => {
                 for page_guard in page_guards {
                     self.pool.inflight_io.fail_writeback(
+                        #[cfg(feature = "profiling")]
                         &self.pool.stats,
                         page_guard,
                         err.clone().into_completion_bridge(),
@@ -880,6 +902,7 @@ impl EvictablePoolStateMachine {
                 } = sub;
                 let _ = block_key;
                 self.pool.inflight_io.fail_writeback(
+                    #[cfg(feature = "profiling")]
                     &self.pool.stats,
                     page_guard,
                     err.clone().into_completion_bridge(),
@@ -907,6 +930,7 @@ impl EvictablePoolStateMachine {
             EvictSubmission::Write(sub) => {
                 let _ = sub.block_key;
                 self.pool.inflight_io.fail_submitted_writeback(
+                    #[cfg(feature = "profiling")]
                     &self.pool.stats,
                     &mut sub.page_guard,
                     err.clone().into_completion_bridge(),
@@ -1006,6 +1030,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                     "evictable write submission missing inflight entry on submit: page_id={}",
                     sub.page_id()
                 );
+                #[cfg(feature = "profiling")]
                 self.pool.stats.add_running_writes(1);
             }
         }
@@ -1041,6 +1066,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 };
                 if let Some(err) = err {
                     self.pool.inflight_io.fail_writeback(
+                        #[cfg(feature = "profiling")]
                         &self.pool.stats,
                         page_guard,
                         CompletionErrorBridge::capture(err),
@@ -1064,6 +1090,7 @@ impl IOStateMachine for EvictablePoolStateMachine {
                                 "evictable write completion expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
                             );
                             self.pool.in_mem.evict_page(page_guard);
+                            #[cfg(feature = "profiling")]
                             self.pool.stats.add_completed_writes(1);
                             status.completion.take()
                         }
@@ -1094,6 +1121,7 @@ impl EvictableRuntime {
     /// Send one eviction writeback batch to the shared storage worker.
     #[inline]
     fn dispatch_io_writes(&self, page_guards: Vec<PageExclusiveGuard<Page>>) -> EventListener {
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_queued_writes(page_guards.len());
         self.pool.inflight_io.batch_writes(&page_guards);
         let done_ev = Arc::new(EventNotifyOnDrop::new());
@@ -1105,6 +1133,7 @@ impl EvictableRuntime {
         {
             for page_guard in page_guards {
                 self.pool.inflight_io.fail_writeback(
+                    #[cfg(feature = "profiling")]
                     &self.pool.stats,
                     page_guard,
                     CompletionErrorBridge::capture(
@@ -1440,6 +1469,7 @@ pub(crate) struct EvictReadSubmission {
     key: PageID,
     role: PoolRole,
     inflight_io: Arc<InflightIO>,
+    #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
     reservation: Option<Box<PageReservationGuard<EvictPageReservation>>>,
     completed: bool,
@@ -1451,15 +1481,17 @@ impl EvictReadSubmission {
     fn new(
         page_id: PageID,
         inflight_io: Arc<InflightIO>,
-        stats: BufferPoolStatsHandle,
+        #[cfg(feature = "profiling")] stats: BufferPoolStatsHandle,
         role: PoolRole,
         reservation: PageReservationGuard<EvictPageReservation>,
     ) -> Self {
+        #[cfg(feature = "profiling")]
         stats.add_queued_reads(1);
         EvictReadSubmission {
             key: page_id,
             role,
             inflight_io,
+            #[cfg(feature = "profiling")]
             stats,
             reservation: Some(Box::new(reservation)),
             completed: false,
@@ -1524,7 +1556,9 @@ impl EvictReadSubmission {
     #[inline]
     pub(crate) fn fail(mut self, err: CompletionErrorBridge) {
         drop(self.reservation.take());
+        #[cfg(feature = "profiling")]
         self.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(err));
     }
@@ -1532,7 +1566,9 @@ impl EvictReadSubmission {
     /// Fails a submitted reload while retaining its borrowed page memory.
     #[inline]
     fn fail_backend_submitted(&mut self, err: CompletionErrorBridge) {
+        #[cfg(feature = "profiling")]
         self.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(err));
     }
@@ -1540,6 +1576,7 @@ impl EvictReadSubmission {
     /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {
+        #[cfg(feature = "profiling")]
         self.stats.add_running_reads(1);
     }
 
@@ -1587,8 +1624,10 @@ impl EvictReadSubmission {
                 ))
             }
         };
+        #[cfg(feature = "profiling")]
         self.stats.add_completed_reads(1);
         if result.is_err() {
+            #[cfg(feature = "profiling")]
             self.stats.add_read_errors(1);
         }
         self.complete_waiters(result);
@@ -1603,7 +1642,9 @@ impl Drop for EvictReadSubmission {
             return;
         }
         drop(self.reservation.take());
+        #[cfg(feature = "profiling")]
         self.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.stats.add_read_errors(1);
         self.complete_waiters(Err(CompletionErrorBridge::capture(
             Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach(format!(
@@ -1760,7 +1801,7 @@ impl InflightIO {
     #[inline]
     fn fail_writeback(
         &self,
-        stats: &BufferPoolStatsHandle,
+        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
         mut page_guard: PageExclusiveGuard<Page>,
         err: CompletionErrorBridge,
     ) {
@@ -1782,7 +1823,9 @@ impl InflightIO {
                         "evictable write failure expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
                     );
                     page_guard.bf_mut().set_kind(FrameKind::Hot);
+                    #[cfg(feature = "profiling")]
                     stats.add_completed_writes(1);
+                    #[cfg(feature = "profiling")]
                     stats.add_write_errors(1);
                     status.completion.take()
                 }
@@ -1802,7 +1845,7 @@ impl InflightIO {
     #[inline]
     fn fail_submitted_writeback(
         &self,
-        stats: &BufferPoolStatsHandle,
+        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
         page_guard: &mut PageExclusiveGuard<Page>,
         err: CompletionErrorBridge,
     ) {
@@ -1824,7 +1867,9 @@ impl InflightIO {
                         "evictable submitted write failure expected evicting frame: page_id={page_id}, actual_kind={frame_kind:?}"
                     );
                     page_guard.bf_mut().set_kind(FrameKind::Hot);
+                    #[cfg(feature = "profiling")]
                     stats.add_completed_writes(1);
+                    #[cfg(feature = "profiling")]
                     stats.add_write_errors(1);
                     status.completion.take()
                 }
@@ -1893,9 +1938,9 @@ pub(crate) mod tests {
         write_block_checksum as write_block_checksum_for_test,
     };
     use crate::file::fs::FileSystem;
-    use crate::file::fs::tests::{
-        build_test_fs_owner_in, io_backend_stats_handle_identity as fs_stats_handle_identity,
-    };
+    use crate::file::fs::tests::build_test_fs_owner_in;
+    #[cfg(feature = "profiling")]
+    use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::RowID;
     use crate::io::BackendError;
     use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
@@ -2007,6 +2052,7 @@ pub(crate) mod tests {
 
     /// Provides test-only access to `io_backend_stats_handle_identity`.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn io_backend_stats_handle_identity(pool: &EvictableBufferPool) -> usize {
         fs_stats_handle_identity(&pool.fs)
     }
@@ -2106,17 +2152,22 @@ pub(crate) mod tests {
         page
     }
 
-    async fn check_metadata_pool<B: BufferPool>(pool: &B, stats: impl Fn() -> BufferPoolCounters) {
+    async fn check_metadata_pool<B: BufferPool>(
+        pool: &B,
+        #[cfg(feature = "profiling")] stats: impl Fn() -> BufferPoolCounters,
+    ) {
         let root = pool.create_base_guard();
         let page = metadata_test_page(pool, &root).await;
         let id = page.versioned_page_id();
         drop(page);
-        let before = stats();
+        #[cfg(feature = "profiling")]
+        let _before = stats();
         let map = pool.get_row_version_map(&root, id).await.unwrap();
         assert!(map.version_map().try_write_row(RowID::new(103)).is_some());
         assert!(map.version_map().try_write_row(RowID::new(104)).is_none());
         drop(map);
-        assert_eq!(stats(), before);
+        #[cfg(feature = "profiling")]
+        assert_eq!(stats(), _before);
         let page = pool
             .get_page::<RowPage>(&root, id.page_id, LatchFallbackMode::Exclusive)
             .await
@@ -2188,6 +2239,7 @@ pub(crate) mod tests {
         let req = EvictReadSubmission::new(
             page_id,
             Arc::clone(&owner.inflight_io),
+            #[cfg(feature = "profiling")]
             owner.stats.clone(),
             owner.role,
             reservation,
@@ -3011,7 +3063,8 @@ pub(crate) mod tests {
                 assert!(futures::poll!(metadata.as_mut()).is_pending());
                 request.complete(Ok(if succeeds { PAGE_SIZE } else { 0 }));
                 assert_eq!(completion.wait_result().await.is_ok(), succeeds);
-                let before = owner.stats();
+                #[cfg(feature = "profiling")]
+                let _before = owner.stats();
                 let map = metadata.await.unwrap();
                 assert!(
                     map.version_map()
@@ -3020,7 +3073,8 @@ pub(crate) mod tests {
                         .is_none()
                 );
                 drop(map);
-                assert_eq!(owner.stats(), before);
+                #[cfg(feature = "profiling")]
+                assert_eq!(owner.stats(), _before);
                 assert_eq!(
                     frame_kind(&owner, id.page_id),
                     if succeeds {
@@ -3109,6 +3163,7 @@ pub(crate) mod tests {
             page_guard.page_mut()[block_checksum_offset(PAGE_SIZE)..].fill(0);
             page_guard.bf_mut().set_dirty(false);
             page_guard.bf_mut().set_kind(FrameKind::Evicting);
+            #[cfg(feature = "profiling")]
             let baseline = owner.stats();
             let runtime = EvictableRuntime {
                 arena: owner.arena.arena_guard(owner.create_base_guard()),
@@ -3117,8 +3172,10 @@ pub(crate) mod tests {
 
             assert!(runtime.execute(vec![page_guard]).is_none());
             assert_eq!(owner.arena.frame(page_id).kind(), FrameKind::Evicted);
-            let delta = owner.stats().delta_since(baseline);
-            assert_eq!(delta.queued_writes, 0);
+            #[cfg(feature = "profiling")]
+            let _delta = owner.stats().delta_since(baseline);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.queued_writes, 0);
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
         });
     }
@@ -3256,11 +3313,16 @@ pub(crate) mod tests {
             assert_eq!(owner.inflight_io.writes.load(Ordering::Relaxed), 0);
             assert!(!owner.inflight_io.map.lock().contains_key(&page_id));
 
-            let stats = owner.stats();
-            assert_eq!(stats.queued_writes, 1);
-            assert_eq!(stats.running_writes, 0);
-            assert_eq!(stats.completed_writes, 1);
-            assert_eq!(stats.write_errors, 1);
+            #[cfg(feature = "profiling")]
+            let _stats = owner.stats();
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.queued_writes, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.running_writes, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.completed_writes, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.write_errors, 1);
 
             drop(runtime);
             drop(pool_guard);
@@ -3790,8 +3852,18 @@ pub(crate) mod tests {
                     .max_file_size(128usize * 1024 * 1024),
             );
             let fixed = FixedBufferPool::with_capacity(PoolRole::Meta, 1024 * 1024).unwrap();
-            check_metadata_pool(&fixed, || fixed.stats()).await;
-            check_metadata_pool(&*pool, || pool.stats()).await;
+            check_metadata_pool(
+                &fixed,
+                #[cfg(feature = "profiling")]
+                || fixed.stats(),
+            )
+            .await;
+            check_metadata_pool(
+                &*pool,
+                #[cfg(feature = "profiling")]
+                || pool.stats(),
+            )
+            .await;
         });
     }
 
@@ -3812,10 +3884,12 @@ pub(crate) mod tests {
             let id = page.versioned_page_id();
             page.bf().set_kind(FrameKind::Cool);
             drop(page);
-            let before = pool.stats();
+            #[cfg(feature = "profiling")]
+            let _before = pool.stats();
             let resident = pool.in_mem.count.load(Ordering::Acquire);
             drop(pool.get_row_version_map(&root, id).await.unwrap());
-            assert_eq!(pool.stats(), before);
+            #[cfg(feature = "profiling")]
+            assert_eq!(pool.stats(), _before);
             assert_eq!(frame_kind(&pool, id.page_id), FrameKind::Cool);
             assert_eq!(pool.in_mem.count.load(Ordering::Acquire), resident);
 
@@ -3836,7 +3910,8 @@ pub(crate) mod tests {
                 pool: pool.owner_guard().into_sync(),
             };
             runtime.dispatch_io_writes(vec![page]).await;
-            let before = pool.stats();
+            #[cfg(feature = "profiling")]
+            let _before = pool.stats();
             let resident = pool.in_mem.count.load(Ordering::Acquire);
             let dirty = pool.arena.frame(id.page_id).is_dirty();
             let map = pending.await.unwrap();
@@ -3846,7 +3921,8 @@ pub(crate) mod tests {
                 .purge_undo_chain(MAX_SNAPSHOT_TS);
             drop(map);
             drop(pool.get_row_version_map(&root, id).await.unwrap());
-            assert_eq!(pool.stats(), before);
+            #[cfg(feature = "profiling")]
+            assert_eq!(pool.stats(), _before);
             assert_eq!(frame_kind(&pool, id.page_id), FrameKind::Evicted);
             assert_eq!(pool.in_mem.count.load(Ordering::Acquire), resident);
             assert_eq!(pool.arena.frame(id.page_id).is_dirty(), dirty);

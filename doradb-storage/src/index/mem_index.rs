@@ -90,8 +90,10 @@ pub(crate) struct MemIndexCleanupBatch {
     /// Cleanup candidates copied out of one MemIndex leaf.
     pub(crate) entries: Vec<MemIndexEntry>,
     /// Live entries skipped before encoded-key allocation.
+    #[cfg(feature = "profiling")]
     pub(crate) skipped_live: usize,
     /// Hot delete overlays skipped before encoded-key allocation.
+    #[cfg(feature = "profiling")]
     pub(crate) skipped_hot_deleted: usize,
 }
 
@@ -190,6 +192,7 @@ where
         for idx in 0..node.count() {
             let slot = S::slot_state(node, idx);
             if slot.row_id >= self.pivot_row_id {
+                #[cfg(feature = "profiling")]
                 if slot.deleted {
                     batch.skipped_hot_deleted += 1;
                 } else {
@@ -198,7 +201,10 @@ where
                 continue;
             }
             if !slot.deleted && !self.clean_live_entries {
-                batch.skipped_live += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    batch.skipped_live += 1;
+                }
                 continue;
             }
             // The cleanup cursor only yields occupied leaf slots, whose key

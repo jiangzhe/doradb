@@ -1,7 +1,4 @@
 use super::decode::DecodedGroup;
-use crate::stats::RecoveryRedoMetrics;
-use std::time::Instant;
-
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, IoError, IoResult, RuntimeError, RuntimeResult,
 };
@@ -18,6 +15,8 @@ use crate::log::format::{
 };
 use crate::log::{RedoLogFileDescriptor, next_redo_file_seq};
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::{RecoveryRedoMetrics, clock::Instant};
 use crate::serde::Deser;
 use crate::thread as doradb_thread;
 use error_stack::{Report, ResultExt};
@@ -309,11 +308,14 @@ impl RedoReplayPlanner {
         let suffix = self.load_replay_suffix(floor)?;
         let planned = self.plan_replay_segments(&suffix, floor)?;
 
+        #[cfg(feature = "profiling")]
         let segments_selected = planned.stream_segments.len() as u64;
         let stream = RecoveryLogStream::from_planned_segments(planned.stream_segments, read_depth)
             .attach("phase=plan_recovery_redo_read_ahead")?;
         Ok(PlannedRedoRecovery {
+            #[cfg(feature = "profiling")]
             segments_discovered: self.discovered.len() as u64,
+            #[cfg(feature = "profiling")]
             segments_selected,
             skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
             stream,
@@ -483,8 +485,10 @@ struct PlannedReplaySegments {
 /// Complete redo startup plan: stream plus post-replay repair policy.
 pub(crate) struct PlannedRedoRecovery {
     /// Segment filenames discovered, including excluded segments.
+    #[cfg(feature = "profiling")]
     pub(crate) segments_discovered: u64,
     /// Segments selected for body replay.
+    #[cfg(feature = "profiling")]
     pub(crate) segments_selected: u64,
     /// Highest CTS from sealed skipped segments below the replay floor.
     pub(crate) skipped_max_recovered_cts: Option<TrxID>,
@@ -548,8 +552,10 @@ impl RedoLogStream {
     /// Refill the in-memory queue from the direct-IO stream.
     #[inline]
     async fn fill_buffer(&mut self) -> RuntimeResult<()> {
+        #[cfg(feature = "profiling")]
         let started = self.groups.metrics.as_ref().map(|_| Instant::now());
         let result = self.fill_buffer_inner().await;
+        #[cfg(feature = "profiling")]
         if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
             metrics.stream_refill_elapsed += started.elapsed();
         }
@@ -559,8 +565,11 @@ impl RedoLogStream {
     async fn fill_buffer_inner(&mut self) -> RuntimeResult<()> {
         while self.groups.state == RedoLogStreamState::Active {
             if let Some(mut iter) = self.groups.read_next_group().await? {
+                #[cfg(feature = "profiling")]
                 let started = self.groups.metrics.as_ref().map(|_| Instant::now());
+                #[cfg(feature = "profiling")]
                 let payload_bytes = iter.data.len() as u64;
+                #[cfg(feature = "profiling")]
                 let before = self.buffer.len();
                 loop {
                     match iter.try_next() {
@@ -575,6 +584,7 @@ impl RedoLogStream {
                         }
                     }
                 }
+                #[cfg(feature = "profiling")]
                 if let (Some(started), Some(metrics)) = (started, &mut self.groups.metrics) {
                     metrics.group_decode_elapsed += started.elapsed();
                     metrics.groups_decoded += 1;
@@ -618,15 +628,22 @@ impl RecoveryLogStream {
         segments: Vec<RedoLogSegment>,
         read_depth: usize,
     ) -> RuntimeResult<Self> {
-        let mut groups = RedoGroupReader::from_planned_segments(segments, read_depth)?;
-        groups.metrics = Some(RecoveryRedoMetrics::default());
+        let groups = RedoGroupReader::from_planned_segments(segments, read_depth)?;
+        #[cfg(feature = "profiling")]
+        let groups = {
+            let mut groups = groups;
+            groups.metrics = Some(RecoveryRedoMetrics::default());
+            groups
+        };
         Ok(Self { groups })
     }
 
     /// Read and validate one whole group before exposing any transaction from it.
     pub(super) async fn try_next(&mut self) -> RuntimeResult<Option<DecodedGroup>> {
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         let result = self.read_group().await;
+        #[cfg(feature = "profiling")]
         if let Some(metrics) = &mut self.groups.metrics {
             metrics.stream_refill_elapsed += started.elapsed();
         }
@@ -637,7 +654,9 @@ impl RecoveryLogStream {
         let Some(iter) = self.groups.read_next_group().await? else {
             return Ok(None);
         };
+        #[cfg(feature = "profiling")]
         let payload_bytes = iter.data.len() as u64;
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         let group = DecodedGroup::decode(iter.data, iter.min_cts, iter.max_cts).map_err(|err| {
             self.groups.fail_stream(
@@ -645,6 +664,7 @@ impl RecoveryLogStream {
                     .attach("operation=decode_redo_group"),
             )
         })?;
+        #[cfg(feature = "profiling")]
         if let Some(metrics) = &mut self.groups.metrics {
             metrics.group_decode_elapsed += started.elapsed();
             metrics.groups_decoded += 1;
@@ -656,6 +676,7 @@ impl RecoveryLogStream {
 
     /// Returns startup measurements after stream termination.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn recovery_metrics(&self) -> RecoveryRedoMetrics {
         self.groups.recovery_metrics()
     }
@@ -669,6 +690,7 @@ impl RecoveryLogStream {
 
 /// Buffered stream of transaction redo records across a sequence of redo files.
 struct RedoGroupReader {
+    #[cfg(feature = "profiling")]
     metrics: Option<RecoveryRedoMetrics>,
     /// Direct-IO read-ahead worker for the planned logical stream.
     reader: Option<RedoReadAheadHandle>,
@@ -702,6 +724,7 @@ impl RedoGroupReader {
             current_segment: None,
             state,
             unsealed_terminals: Vec::new(),
+            #[cfg(feature = "profiling")]
             metrics: None,
         })
     }
@@ -930,12 +953,14 @@ impl RedoGroupReader {
         let reader = self.reader.as_ref().unwrap_or_else(|| {
             panic!("redo read-protocol invariant violated: receive before worker start")
         });
+        #[cfg(feature = "profiling")]
         let started = self.metrics.as_ref().map(|_| Instant::now());
         let item = reader.items.recv_async().await.unwrap_or_else(|_| {
             panic!(
                 "redo read-protocol invariant violated: worker channel closed without terminal item"
             )
         });
+        #[cfg(feature = "profiling")]
         if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
             metrics.receive_wait_elapsed += started.elapsed();
             if let RedoReadItem::Block { buf, .. } = &item {
@@ -955,11 +980,13 @@ impl RedoGroupReader {
 
     #[inline]
     fn stop_reader(&mut self) {
+        #[cfg(feature = "profiling")]
         let started = self.metrics.as_ref().map(|_| Instant::now());
         if let Some(reader) = &self.reader {
             reader.stop();
         }
         self.reader.take();
+        #[cfg(feature = "profiling")]
         if let (Some(started), Some(metrics)) = (started, &mut self.metrics) {
             metrics.reader_shutdown_elapsed += started.elapsed();
         }
@@ -981,6 +1008,7 @@ impl RedoGroupReader {
     }
 
     /// Returns startup-only consumer measurements after stream termination.
+    #[cfg(feature = "profiling")]
     pub(crate) fn recovery_metrics(&self) -> RecoveryRedoMetrics {
         self.metrics.unwrap_or_default()
     }
@@ -2435,6 +2463,7 @@ mod tests {
                 current_segment: None,
                 state: RedoLogStreamState::Active,
                 unsealed_terminals: Vec::new(),
+                #[cfg(feature = "profiling")]
                 metrics: None,
             },
         }
@@ -2868,6 +2897,7 @@ mod tests {
 
         let planned = planner.plan_catalog_scan(TrxID::new(5), 1).unwrap();
 
+        #[cfg(feature = "profiling")]
         assert!(planned.stream.groups.metrics.is_none());
         assert_eq!(
             planned.sealed_segments,
@@ -2922,7 +2952,9 @@ mod tests {
                     newest_file_seq: 1
                 }
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(planned.segments_discovered, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(planned.segments_selected, 1);
             let mut stream = planned.stream;
 
@@ -2935,12 +2967,18 @@ mod tests {
                 Some((TrxID::new(5), TrxID::new(5))),
             )
             .await;
+            #[cfg(feature = "profiling")]
             let metrics = stream.recovery_metrics();
 
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.groups_decoded, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.transactions_decoded, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.data_blocks_consumed, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.consumed_bytes, 2 * STORAGE_SECTOR_SIZE as u64);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metrics.validated_payload_bytes,
                 simple_trx_log(TrxID::new(5)).ser_len() as u64
@@ -3186,7 +3224,7 @@ mod tests {
                 },
                 redo,
             );
-            let payload_bytes = log.ser_len() as u64;
+            let _payload_bytes = log.ser_len() as u64;
             let group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log).unwrap();
             let blocks = group
                 .finish_with(|count| {
@@ -3206,16 +3244,23 @@ mod tests {
             );
             assert!(stream.try_next().await.unwrap().is_some());
             assert!(stream.try_next().await.unwrap().is_none());
+            #[cfg(feature = "profiling")]
             let metrics = stream.recovery_metrics();
 
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.groups_decoded, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.transactions_decoded, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.data_blocks_consumed, blocks.len() as u64 + 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metrics.consumed_bytes,
                 (blocks.len() as u64 + 1) * STORAGE_SECTOR_SIZE as u64
             );
-            assert_eq!(metrics.validated_payload_bytes, payload_bytes);
+            #[cfg(feature = "profiling")]
+            assert_eq!(metrics.validated_payload_bytes, _payload_bytes);
+            #[cfg(feature = "profiling")]
             assert!(
                 metrics.stream_refill_elapsed
                     >= metrics.receive_wait_elapsed
@@ -3245,7 +3290,7 @@ mod tests {
                     dml: BTreeMap::new(),
                 },
             );
-            let mut payload_bytes = log1.ser_len() as u64;
+            let mut _payload_bytes = log1.ser_len() as u64;
             let mut group = LogBlockGroup::new(STORAGE_SECTOR_SIZE, log1).unwrap();
 
             let mut rows = BTreeMap::new();
@@ -3266,7 +3311,7 @@ mod tests {
                 },
                 RedoLogs { ddl: None, dml },
             );
-            payload_bytes += log2.ser_len() as u64;
+            _payload_bytes += log2.ser_len() as u64;
             assert!(group.append_trx_log(log2).is_none());
             let blocks = group
                 .finish_with(|count| {
@@ -3319,11 +3364,15 @@ mod tests {
                 matches!(row.kind, DecodedRowKind::Delete(Some(page)) if page == test_page_id(5))
             );
             assert!(stream.try_next().await.unwrap().is_none());
+            #[cfg(feature = "profiling")]
             let metrics = stream.recovery_metrics();
 
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.transactions_decoded, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.groups_decoded, 1);
-            assert_eq!(metrics.validated_payload_bytes, payload_bytes);
+            #[cfg(feature = "profiling")]
+            assert_eq!(metrics.validated_payload_bytes, _payload_bytes);
         });
     }
 
@@ -3381,15 +3430,21 @@ mod tests {
             assert_eq!(first.transactions[0].header.cts, TrxID::new(1));
             assert_eq!(second.transactions[0].header.cts, TrxID::new(2));
             assert!(stream.try_next().await.unwrap().is_none());
+            #[cfg(feature = "profiling")]
             let metrics = stream.recovery_metrics();
 
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.transactions_decoded, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.groups_decoded, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(metrics.data_blocks_consumed, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metrics.consumed_bytes,
                 (STORAGE_SECTOR_SIZE + second_block_size) as u64
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 metrics.validated_payload_bytes,
                 (simple_trx_log(TrxID::new(1)).ser_len() + simple_trx_log(TrxID::new(2)).ser_len())

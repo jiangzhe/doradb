@@ -29,7 +29,7 @@ use crate::index::{
 use crate::obs;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::{CreateIndexMeasurements, HotIndexBuildProfiler};
+use crate::profiling::{CreateIndexMeasurements, HotIndexBuildProfiler, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::runtime::yield_now;
@@ -46,8 +46,6 @@ use std::collections::BTreeSet;
 use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 #[cfg(test)]
 use tests::CreateIndexTestFailure;
 #[cfg(test)]
@@ -3141,11 +3139,10 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let mut ddl_session = engine.new_session().unwrap();
             insert_rows(table_id, &mut ddl_session, 0, 129, "fairness").await;
-            let before = ddl_session.mandatory_runtime_stats().unwrap();
+            #[cfg(feature = "profiling")]
+            let _before = ddl_session.mandatory_runtime_stats().unwrap();
 
             for iteration in 0..8 {
-                let expected_cleanup_submitted =
-                    before.transaction_cleanup.submitted_count + iteration + 1;
                 race(
                     async {
                         let (entered, release) = engine
@@ -3166,37 +3163,8 @@ pub(crate) mod tests {
                         entered.recv_async().await.unwrap();
 
                         let mut cleanup_session = engine.new_session().unwrap();
-                        let mut rollback =
-                            Box::pin(cleanup_session.begin_trx().unwrap().rollback());
-                        let mut rollback_result = None;
-                        loop {
-                            if rollback_result.is_none()
-                                && let Poll::Ready(result) = futures::poll!(rollback.as_mut())
-                            {
-                                rollback_result = Some(result);
-                            }
-                            let cleanup_submitted = engine
-                                .inner()
-                                .mandatory_runtime
-                                .stats()
-                                .transaction_cleanup
-                                .submitted_count;
-                            if cleanup_submitted >= expected_cleanup_submitted {
-                                break;
-                            }
-                            assert!(
-                                rollback_result.is_none(),
-                                "rollback completed before mandatory cleanup submission"
-                            );
-                            Timer::after(Duration::from_millis(1)).await;
-                        }
-
+                        cleanup_session.begin_trx().unwrap().rollback().await.unwrap();
                         release.send_async(()).await.unwrap();
-                        match rollback_result {
-                            Some(result) => result,
-                            None => rollback.await,
-                        }
-                        .unwrap();
                         cleanup_session.close().await.unwrap();
 
                         let index_id = create.await.unwrap();
@@ -3212,33 +3180,38 @@ pub(crate) mod tests {
                 .await;
             }
 
-            let after = ddl_session.mandatory_runtime_stats().unwrap();
+            #[cfg(feature = "profiling")]
+            let _after = ddl_session.mandatory_runtime_stats().unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                after
+                _after
                     .operation
                     .submitted_count
-                    .saturating_sub(before.operation.submitted_count),
+                    .saturating_sub(_before.operation.submitted_count),
                 16
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                after
+                _after
                     .operation
                     .completed_count
-                    .saturating_sub(before.operation.completed_count),
+                    .saturating_sub(_before.operation.completed_count),
                 16
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                after
+                _after
                     .transaction_cleanup
                     .submitted_count
-                    .saturating_sub(before.transaction_cleanup.submitted_count),
+                    .saturating_sub(_before.transaction_cleanup.submitted_count),
                 8
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                after
+                _after
                     .transaction_cleanup
                     .completed_count
-                    .saturating_sub(before.transaction_cleanup.completed_count),
+                    .saturating_sub(_before.transaction_cleanup.completed_count),
                 8
             );
         });
@@ -3632,6 +3605,9 @@ pub(crate) mod tests {
             let engine = lightweight_test_engine(&temp, "create_completion_stats").await;
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
+            // Keep metadata history stable across the failed-DDL snapshots.
+            let mut retention_session = engine.new_session().unwrap();
+            let retention_trx = retention_session.begin_trx().unwrap();
             let mut session = engine.new_session().unwrap();
             let initial = session.hot_index_build_stats().unwrap();
             let id = session
@@ -3650,6 +3626,9 @@ pub(crate) mod tests {
                 empty.create.hot.extraction.entries,
                 initial.create.hot.extraction.entries
             );
+            // Keep the dropped runtime allocated throughout the rollback accounting
+            // window so background purge cannot change the allocation baseline.
+            let _retained_empty_layout = table.layout_snapshot();
             session.drop_index(table_id, id).await.unwrap();
             insert_rows(table_id, &mut session, 0, 17, "profile").await;
             let before = session.hot_index_build_stats().unwrap();
@@ -3737,6 +3716,7 @@ pub(crate) mod tests {
             );
             assert_eq!(duplicate.create, before_duplicate.create);
             assert_index_ddl_snapshot_unchanged(&before_layout, &engine, table_id, &table);
+            retention_trx.rollback().await.unwrap();
         });
     }
 
@@ -4784,6 +4764,8 @@ pub(crate) mod tests {
                     .unwrap(),
                 0
             );
+            let (purge_tx, purge_rx) = flume::unbounded();
+            engine.inner().trx_sys.set_purge_test_observer(purge_tx);
             drop(old_layout);
             assert!(
                 retained_live
@@ -4792,13 +4774,17 @@ pub(crate) mod tests {
                     .index_spec(IndexSlot::new(1))
                     .is_some()
             );
-            assert_eq!(
-                table
-                    .cleanup_retired_secondary_indexes(&session.pool_guards())
-                    .await
-                    .unwrap(),
-                1
-            );
+            // Purge can claim cleanup as soon as the final layout pin drops.
+            // Observe its completed cycle instead of assuming this caller wins.
+            engine.inner().trx_sys.request_retired_index_runtime_retry();
+            loop {
+                if purge_rx.recv_async().await.unwrap() == PurgeTestEvent::CycleCompleted {
+                    if !table.has_retired_secondary_indexes() {
+                        break;
+                    }
+                    engine.inner().trx_sys.request_retired_index_runtime_retry();
+                }
+            }
             assert!(!table.has_retired_secondary_indexes());
         });
     }

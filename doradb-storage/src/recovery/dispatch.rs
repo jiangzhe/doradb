@@ -16,9 +16,10 @@ use crate::error::{
 };
 use crate::id::{PageID, TableID};
 use crate::map::FastHashMap;
+#[cfg(feature = "profiling")]
+use crate::profiling::{RecoveryReport, RowReplayCounts};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
-use crate::stats::RecoveryReport;
 use crate::table::Table;
 use error_stack::Report;
 use futures::future::{BoxFuture, Either, select};
@@ -26,6 +27,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, FutureExt, StreamExt};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
+#[cfg(feature = "profiling")]
 use std::mem;
 use std::sync::Arc;
 #[cfg(test)]
@@ -45,24 +47,6 @@ struct BatchCompletion {
     result: CompletionResult<RuntimeOrFatalResult<BatchOutput>>,
 }
 
-/// Successful hot-row mutations in a replay batch or collected recovery work.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct RowReplayCounts {
-    /// Successfully applied inserts.
-    pub(crate) inserts: u64,
-    /// Successfully applied updates.
-    pub(crate) updates: u64,
-    /// Successfully applied deletes.
-    pub(crate) deletes: u64,
-}
-
-impl RowReplayCounts {
-    /// Returns whether no successful mutations have been recorded.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inserts == 0 && self.updates == 0 && self.deletes == 0
-    }
-}
-
 struct ActivePage {
     table: Arc<Table>,
     // None while the outstanding job/completion owns the bitmap.
@@ -79,6 +63,7 @@ struct TableWork {
 
 struct BatchOutput {
     state: RowReplayState,
+    #[cfg(feature = "profiling")]
     counts: RowReplayCounts,
     batch: PackedPageBatch,
 }
@@ -119,6 +104,7 @@ pub(super) struct ReplayDispatcher {
     pool: QuiescentGuard<ThreadPool>,
     guards: PoolGuards,
     disable_validation: bool,
+    #[cfg(feature = "profiling")]
     counts: RowReplayCounts,
     #[cfg(test)]
     test_hook: Option<tests::BatchHook>,
@@ -148,6 +134,7 @@ impl ReplayDispatcher {
             pool,
             guards,
             disable_validation: config.disable_dml_validation,
+            #[cfg(feature = "profiling")]
             counts: RowReplayCounts::default(),
             #[cfg(test)]
             test_hook: tests::installed_hook(),
@@ -298,9 +285,12 @@ impl ReplayDispatcher {
                     )
                 })
         })??;
-        self.counts.inserts += output.counts.inserts;
-        self.counts.updates += output.counts.updates;
-        self.counts.deletes += output.counts.deletes;
+        #[cfg(feature = "profiling")]
+        {
+            self.counts.inserts += output.counts.inserts;
+            self.counts.updates += output.counts.updates;
+            self.counts.deletes += output.counts.deletes;
+        }
         let page = self
             .active_pages
             .get_mut(&key)
@@ -430,6 +420,7 @@ impl ReplayDispatcher {
     }
 
     /// Merge successfully collected hot work once.
+    #[cfg(feature = "profiling")]
     pub(super) fn merge_counts(&mut self, report: &mut RecoveryReport) {
         let counts = mem::take(&mut self.counts);
         report.work.hot_inserts += counts.inserts;
@@ -456,15 +447,20 @@ async fn replay_page_batch(
     if let Some(hook) = &test_hook {
         hook.before(key).await;
     }
-    let counts = table
+    let result = table
         .recover_row_batch(&guards, &mut state, &batch, disable_validation)
-        .await?;
+        .await;
+    #[cfg(feature = "profiling")]
+    let counts = result?;
+    #[cfg(not(feature = "profiling"))]
+    result?;
     #[cfg(test)]
     if let Some(hook) = &test_hook {
         hook.finished.send(key).unwrap();
     }
     Ok(BatchOutput {
         state,
+        #[cfg(feature = "profiling")]
         counts,
         batch,
     })
@@ -767,7 +763,27 @@ mod tests {
 
     async fn verify_replay_after_cancellation(config: EngineConfig) {
         let engine = Engine::bootstrap(config).await.unwrap();
+        verify_committed_replay_row(&engine).await;
+        #[cfg(feature = "profiling")]
         assert_eq!(engine.recovery_report().work.hot_inserts, 1);
+    }
+
+    async fn verify_committed_replay_row(engine: &Engine) {
+        let tables = engine.inner().core.catalog().snapshot_live_user_tables();
+        assert_eq!(tables.len(), 1);
+        let mut session = engine.new_session().unwrap();
+        let mut trx = session.begin_trx().unwrap();
+        let row = trx
+            .table_lookup_unique_mvcc(
+                crate::TableIndex(tables[0].table_id(), crate::IndexID::new(0)),
+                &[Val::from(7i32)],
+                &[0, 1],
+            )
+            .await
+            .unwrap()
+            .unwrap_found();
+        assert_eq!(row, vec![Val::from(7i32), Val::from("committed")]);
+        trx.rollback().await.unwrap();
     }
 
     fn insert(page: PageID, row_id: RowID, value: &str) -> OwnedReplayOp {
@@ -832,7 +848,10 @@ mod tests {
                         );
                 prepare_cancelled_replay(&config).await;
                 let engine = Engine::bootstrap(config).await.unwrap();
+                verify_committed_replay_row(&engine).await;
+                #[cfg(feature = "profiling")]
                 assert_eq!(engine.recovery_report().work.hot_inserts, 1);
+                #[cfg(feature = "profiling")]
                 assert!(engine.recovery_report().work.catalog_row_ops_applied > 0);
             }
         });
@@ -887,6 +906,7 @@ mod tests {
             f.insert(0, 1).await;
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 f.dispatch.counts,
                 RowReplayCounts {
@@ -1092,6 +1112,7 @@ mod tests {
             assert!(f.dispatch.active_pages[&key].state.is_none());
             drop(held1);
             f.dispatch.wait_one().await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(f.dispatch.counts.inserts, 2);
             assert_eq!(f.dispatch.in_flight.len(), 1);
             let page = f.lock(1).await;
@@ -1109,6 +1130,7 @@ mod tests {
             drop(held0);
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
+            #[cfg(feature = "profiling")]
             assert_eq!(f.dispatch.counts.inserts, 3);
         });
     }
@@ -1129,6 +1151,7 @@ mod tests {
             let error = settlement.await;
             assert!(format!("{error:?}").contains("injected parser/DDL failure"));
             f.assert_idle();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 f.dispatch.counts,
                 RowReplayCounts {
@@ -1327,6 +1350,7 @@ mod tests {
             }
             // Admission pressure made progress long before EOF, despite every
             // page containing fewer rows than its batch target.
+            #[cfg(feature = "profiling")]
             assert!(f.dispatch.counts.inserts >= 62);
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
@@ -1342,6 +1366,7 @@ mod tests {
             }
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 f.dispatch.counts,
                 RowReplayCounts {
@@ -1401,6 +1426,7 @@ mod tests {
             gate.release.send(()).unwrap();
             f.dispatch.drain_all().await.unwrap();
             f.assert_idle();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 f.dispatch.counts,
                 RowReplayCounts {
@@ -1438,6 +1464,7 @@ mod tests {
             gate.release.send(()).unwrap();
             gate.release.send(()).unwrap();
             f.dispatch.drain_all().await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(f.dispatch.counts.inserts, 2);
             assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));
         });
@@ -1468,6 +1495,7 @@ mod tests {
                 );
                 gate.release.send(()).unwrap();
                 f.dispatch.drain_all().await.unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(f.dispatch.counts.inserts, 1);
             }
         });

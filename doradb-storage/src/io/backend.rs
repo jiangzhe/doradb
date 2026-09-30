@@ -1,5 +1,7 @@
 use super::BACKEND_NAME;
 use crate::error::{IoError, IoResult};
+#[cfg(feature = "profiling")]
+pub(crate) use crate::profiling::BackendStats;
 use error_stack::Report;
 use libc::{EAGAIN, EBUSY};
 use std::fmt;
@@ -7,7 +9,6 @@ use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -367,6 +368,7 @@ impl BackendError {
 
     /// Syscall attempt count observed before the failure.
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn call_count(&self) -> usize {
         self.call_count
     }
@@ -470,117 +472,6 @@ impl BackendToken {
     #[inline]
     pub(crate) const fn slot_index(self) -> u32 {
         self.0 as u32
-    }
-}
-
-/// Snapshot of backend-owned submit/wait activity.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct BackendStats {
-    /// Number of backend kernel-entry calls spent submitting work or waiting.
-    ///
-    /// On `libaio`, one logical IO commonly contributes one submit call and
-    /// one wait call, so this count can be roughly doubled compared with
-    /// `io_uring` for serialized workloads.
-    pub(crate) submit_and_wait_calls: usize,
-    /// Number of operations accepted by the backend submit path.
-    pub(crate) submitted_ops: usize,
-    /// Total nanoseconds spent in backend submit-or-wait calls.
-    ///
-    /// This is a non-overlapping total. `libaio` contributes separate submit
-    /// and wait syscall time, while `io_uring` contributes fused
-    /// `submit_and_wait()` time once.
-    pub(crate) submit_and_wait_nanos: usize,
-    /// Number of completions observed by the backend wait path.
-    pub(crate) wait_completions: usize,
-}
-
-impl BackendStats {
-    /// Returns the saturating delta from one earlier snapshot.
-    #[inline]
-    #[cfg_attr(
-        any(not(test), feature = "iouring"),
-        expect(dead_code, reason = "internal io backend stats")
-    )]
-    pub(crate) fn delta_since(self, earlier: BackendStats) -> BackendStats {
-        BackendStats {
-            submit_and_wait_calls: self
-                .submit_and_wait_calls
-                .saturating_sub(earlier.submit_and_wait_calls),
-            submitted_ops: self.submitted_ops.saturating_sub(earlier.submitted_ops),
-            submit_and_wait_nanos: self
-                .submit_and_wait_nanos
-                .saturating_sub(earlier.submit_and_wait_nanos),
-            wait_completions: self
-                .wait_completions
-                .saturating_sub(earlier.wait_completions),
-        }
-    }
-}
-
-#[derive(Default)]
-struct BackendStatsCounters {
-    submit_and_wait_calls: AtomicUsize,
-    submitted_ops: AtomicUsize,
-    submit_and_wait_nanos: AtomicUsize,
-    wait_completions: AtomicUsize,
-}
-
-/// Shared handle used to collect backend submit and wait statistics.
-#[derive(Clone, Default)]
-pub(crate) struct BackendStatsHandle(Arc<BackendStatsCounters>);
-
-impl BackendStatsHandle {
-    /// Returns a point-in-time snapshot of backend activity counters.
-    #[inline]
-    pub(crate) fn snapshot(&self) -> BackendStats {
-        BackendStats {
-            submit_and_wait_calls: self.0.submit_and_wait_calls.load(Ordering::Relaxed),
-            submitted_ops: self.0.submitted_ops.load(Ordering::Relaxed),
-            submit_and_wait_nanos: self.0.submit_and_wait_nanos.load(Ordering::Relaxed),
-            wait_completions: self.0.wait_completions.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Records submit-or-wait calls and their elapsed time in nanoseconds.
-    #[inline]
-    pub(crate) fn record_submit_and_wait(&self, submit_and_wait_calls: usize, nanos: usize) {
-        if submit_and_wait_calls != 0 {
-            self.0
-                .submit_and_wait_calls
-                .fetch_add(submit_and_wait_calls, Ordering::Relaxed);
-        }
-        if nanos != 0 {
-            self.0
-                .submit_and_wait_nanos
-                .fetch_add(nanos, Ordering::Relaxed);
-        }
-    }
-
-    /// Records operations accepted by the backend submit path.
-    #[inline]
-    pub(crate) fn record_submitted_ops(&self, submitted_ops: usize) {
-        if submitted_ops != 0 {
-            self.0
-                .submitted_ops
-                .fetch_add(submitted_ops, Ordering::Relaxed);
-        }
-    }
-
-    /// Records completions returned by the backend wait path.
-    #[inline]
-    pub(crate) fn record_wait_completions(&self, wait_completions: usize) {
-        if wait_completions != 0 {
-            self.0
-                .wait_completions
-                .fetch_add(wait_completions, Ordering::Relaxed);
-        }
-    }
-
-    /// Returns the allocation identity of the shared stats counters.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn identity(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
     }
 }
 

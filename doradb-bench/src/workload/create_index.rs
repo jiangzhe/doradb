@@ -8,7 +8,7 @@ use crate::fixture::{
 };
 use crate::measurement::{
     CreateIndexReport, CreateIndexVerification, LatencyDistribution, LatencyUnit, MeasurementClock,
-    ProcessRssSampler, WorkloadCounters, WorkloadMetrics, process_cpu_delta, process_cpu_nanos,
+    ProcessRssSampler, WorkloadCounters, WorkloadMetrics, process_cpu_nanos,
 };
 use crate::plan::{CreateIndexConfig, CreateIndexKey};
 use crate::plan_executor::{
@@ -111,7 +111,7 @@ impl SessionExecutor for CreateIndexExecutor {
                 .map_err(BenchError::from)
         })
         .await;
-        // Always join, even when CREATE or either clock conversion failed. The operation
+        // Always join, even when CREATE or wall-clock measurement failed. The operation
         // result owns the primary failure; cleanup cannot replace it.
         let rss_result = sampler.map(ProcessRssSampler::stop).transpose();
         let (index_id, create_elapsed_nanos, process_cpu_nanos) = result?;
@@ -312,17 +312,17 @@ pub(crate) async fn complete_create_index(
 
 async fn measure_create<T>(
     clock: &MeasurementClock,
-    mut cpu_time: impl FnMut() -> Result<u64>,
+    mut cpu_time: impl FnMut() -> u64,
     operation: impl Future<Output = Result<T>>,
 ) -> Result<(T, u64, u64)> {
-    let cpu_started = cpu_time()?;
+    let cpu_started = cpu_time();
     let started = clock.now();
     let result = operation.await;
     let stopped = clock.now();
     let cpu_stopped = cpu_time();
     let value = result?;
     let elapsed = clock.wall_delta_nanos(started, stopped)?;
-    let cpu = process_cpu_delta(cpu_started, cpu_stopped?)?;
+    let cpu = cpu_stopped - cpu_started;
     Ok((value, elapsed, cpu))
 }
 
@@ -405,19 +405,12 @@ mod tests {
     }
 
     /// Purpose: Isolate index-creation timing while preserving failure precedence.
-    /// Expected: Measurements exclude surrounding work, clock initialization gates execution,
-    /// and creation errors retain priority.
+    /// Expected: Measurements exclude surrounding work, and creation errors retain priority
+    /// over wall-clock errors.
     #[test]
     fn create_clocks_exclude_setup_cleanup_and_verification_and_preserve_errors() {
         smol::block_on(async {
-            for failure in [
-                "none",
-                "cpu-start",
-                "cpu-end",
-                "backwards",
-                "duration",
-                "create",
-            ] {
+            for failure in ["none", "duration", "create"] {
                 let (clock, mock) = MeasurementClock::mock();
                 // Preparation, profiler attachment, and sampler readiness.
                 mock.increment(Duration::from_secs(1));
@@ -428,23 +421,11 @@ mod tests {
                     || {
                         let read = reads.get();
                         reads.set(read + 1);
-                        if (failure == "cpu-start" && read == 0)
-                            || (matches!(failure, "cpu-end" | "create") && read == 1)
-                        {
-                            Err(BenchError::message("CPU sentinel"))
-                        } else {
-                            Ok(if read == 0 {
-                                100
-                            } else if failure == "backwards" {
-                                99
-                            } else {
-                                123
-                            })
-                        }
+                        if read == 0 { 100 } else { 123 }
                     },
                     async {
                         called.set(true);
-                        if failure == "duration" {
+                        if matches!(failure, "duration" | "create") {
                             mock.decrement(Duration::from_millis(1));
                         } else {
                             mock.increment(Duration::from_nanos(37));
@@ -463,12 +444,15 @@ mod tests {
                     assert_eq!(result.unwrap(), (17, 37, 23));
                 } else {
                     let error = result.unwrap_err();
-                    if failure == "create" {
-                        assert_eq!(error.to_string(), "CREATE sentinel");
-                    }
+                    let expected = if failure == "create" {
+                        "CREATE sentinel"
+                    } else {
+                        "measurement wall clock moved backwards"
+                    };
+                    assert_eq!(error.to_string(), expected);
                 }
-                assert_eq!(called.get(), failure != "cpu-start");
-                assert_eq!(reads.get(), if failure == "cpu-start" { 1 } else { 2 });
+                assert!(called.get());
+                assert_eq!(reads.get(), 2);
             }
         });
     }

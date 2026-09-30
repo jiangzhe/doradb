@@ -30,13 +30,14 @@ use crate::id::{BlockID, FileID, RowID, TableID, TrxID};
 use crate::index::{ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::clock::Instant;
 use crate::quiescent::QuiescentGuard;
 use crate::serde::{Deser, Ser};
 use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Magic bytes stored at the beginning of every user table-file super block.
 pub(crate) const TABLE_FILE_MAGIC_WORD: [u8; 8] = [b'D', b'O', b'R', b'A', 0, 0, 0, 0];
@@ -535,6 +536,7 @@ impl MutableTableFile {
         disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
         disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<()> {
+        #[cfg(feature = "profiling")]
         let started_at = Instant::now();
         let table_file = Arc::clone(&self.file);
         let root = self.root();
@@ -563,11 +565,18 @@ impl MutableTableFile {
         root.column_block_index_root = new_root;
         root.pivot_row_id = max_row_id;
         root.heap_redo_start_ts = heap_redo_start_ts;
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=checkpoint_lwc_pipeline component=table_file action=rebuild_column_index result=ok file_id={} block_count={} duration_nanos={}",
             self.file.sparse_file().file_id(),
             new_entries.len(),
             started_at.elapsed().as_nanos(),
+        );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=checkpoint_lwc_pipeline component=table_file action=rebuild_column_index result=ok file_id={} block_count={}",
+            self.file.sparse_file().file_id(),
+            new_entries.len(),
         );
         Ok(())
     }

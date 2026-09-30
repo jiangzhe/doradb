@@ -13,10 +13,7 @@ use crate::error::{
     RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 pub(crate) use checkpoint::*;
-pub use checkpoint::{
-    CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogTableCheckpointChange,
-    CatalogTableCheckpointIoStats,
-};
+pub use checkpoint::{CatalogCheckpointOutcome, CatalogCheckpointResult};
 pub(crate) use definition::*;
 pub use definition::{
     BindingNamespaceID, DescriptorUpdate, MAX_TABLE_BINDING_KEY_BYTES, MAX_TABLE_DESCRIPTOR_BYTES,
@@ -284,7 +281,7 @@ impl Catalog {
         &self,
         batch: CatalogCheckpointBatch,
         disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
         let prepared = self.prepare_checkpoint_batch(batch, disk_guard).await?;
         self.commit_prepared_checkpoint(prepared).await
     }
@@ -305,13 +302,17 @@ impl Catalog {
     pub(crate) async fn commit_prepared_checkpoint(
         &self,
         prepared: PreparedCatalogCheckpoint,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
-        let report = prepared.commit(&self.storage).await?;
+    ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
+        let result = prepared.commit(&self.storage).await?;
+        #[cfg(feature = "profiling")]
+        let outcome = result.outcome;
+        #[cfg(not(feature = "profiling"))]
+        let outcome = result;
         let CatalogCheckpointOutcome::Published {
             catalog_replay_start_ts,
-        } = report.outcome
+        } = outcome
         else {
-            return Ok(report);
+            return Ok(result);
         };
         for table in self.snapshot_live_user_tables() {
             if let Err(err) = table.apply_index_lifecycle_checkpoint(catalog_replay_start_ts) {
@@ -326,7 +327,7 @@ impl Catalog {
                 ));
             }
         }
-        Ok(report)
+        Ok(result)
     }
 
     /// Reload one user table runtime from catalog metadata and table file.
@@ -2539,6 +2540,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(batch1.catalog_ddl_txn_count, 2);
             assert_eq!(
                 batch1.stop_reason,
@@ -2568,6 +2570,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(batch2.catalog_ddl_txn_count, 0);
             assert_eq!(batch2.safe_cts, safe_cts_1);
             engine

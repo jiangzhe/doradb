@@ -7,6 +7,8 @@ use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::id::PageID;
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::SharedPoolEvictorStatsHandle;
 use crate::quiescent::{QuiescentBox, SyncQuiescentGuard};
 use crate::thread;
 use crate::{DiskPool, IndexPool, MemPool};
@@ -17,93 +19,10 @@ use std::collections::BTreeSet;
 use std::ops::{Range, RangeFrom, RangeTo};
 use std::panic::resume_unwind;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 const DEFAULT_TARGET_FREE_RATIO: f64 = 0.10;
 const DEFAULT_HYSTERESIS_RATIO: f64 = 0.30;
-
-/// Snapshot of shared-evictor wake and domain-execution activity.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SharedPoolEvictorStats {
-    /// Number of wakeups observed after the evictor blocked for work.
-    pub(crate) wake_count: usize,
-    /// Number of times the evictor blocked waiting for work.
-    pub(crate) wait_count: usize,
-    /// Number of readonly-domain runs completed by the shared evictor.
-    pub(crate) readonly_runs: usize,
-    /// Number of mem-pool-domain runs completed by the shared evictor.
-    pub(crate) mem_runs: usize,
-    /// Number of index-pool-domain runs completed by the shared evictor.
-    pub(crate) index_runs: usize,
-}
-
-impl SharedPoolEvictorStats {
-    /// Returns the saturating delta from one earlier snapshot.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
-    pub(crate) fn delta_since(self, earlier: SharedPoolEvictorStats) -> SharedPoolEvictorStats {
-        SharedPoolEvictorStats {
-            wake_count: self.wake_count.saturating_sub(earlier.wake_count),
-            wait_count: self.wait_count.saturating_sub(earlier.wait_count),
-            readonly_runs: self.readonly_runs.saturating_sub(earlier.readonly_runs),
-            mem_runs: self.mem_runs.saturating_sub(earlier.mem_runs),
-            index_runs: self.index_runs.saturating_sub(earlier.index_runs),
-        }
-    }
-}
-
-#[derive(Default)]
-struct SharedPoolEvictorStatsCounters {
-    wake_count: AtomicUsize,
-    wait_count: AtomicUsize,
-    readonly_runs: AtomicUsize,
-    mem_runs: AtomicUsize,
-    index_runs: AtomicUsize,
-}
-
-/// Cloneable writer handle for shared-evictor stats counters.
-#[derive(Clone, Default)]
-pub(crate) struct SharedPoolEvictorStatsHandle(Arc<SharedPoolEvictorStatsCounters>);
-
-impl SharedPoolEvictorStatsHandle {
-    /// Returns one point-in-time snapshot of all counters.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "internal buffer pool stats"))]
-    pub(crate) fn snapshot(&self) -> SharedPoolEvictorStats {
-        SharedPoolEvictorStats {
-            wake_count: self.0.wake_count.load(Ordering::Relaxed),
-            wait_count: self.0.wait_count.load(Ordering::Relaxed),
-            readonly_runs: self.0.readonly_runs.load(Ordering::Relaxed),
-            mem_runs: self.0.mem_runs.load(Ordering::Relaxed),
-            index_runs: self.0.index_runs.load(Ordering::Relaxed),
-        }
-    }
-
-    #[inline]
-    fn record_wait(&self) {
-        self.0.wait_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn record_wake(&self) {
-        self.0.wake_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn record_domain_run(&self, id: SharedEvictionDomainId) {
-        match id {
-            SharedEvictionDomainId::Readonly => {
-                self.0.readonly_runs.fetch_add(1, Ordering::Relaxed);
-            }
-            SharedEvictionDomainId::Mem => {
-                self.0.mem_runs.fetch_add(1, Ordering::Relaxed);
-            }
-            SharedEvictionDomainId::Index => {
-                self.0.index_runs.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
 
 /// Shared clock hand state for clock-sweep eviction.
 #[derive(Debug, Clone)]
@@ -640,6 +559,7 @@ impl PressureDeltaClockPolicy {
 }
 
 pub(super) struct SharedEvictionDomain {
+    #[cfg(feature = "profiling")]
     id: SharedEvictionDomainId,
     runtime: Box<dyn EvictionRuntime + Send>,
     policy: PressureDeltaClockPolicy,
@@ -648,7 +568,7 @@ pub(super) struct SharedEvictionDomain {
 impl SharedEvictionDomain {
     #[inline]
     pub(super) fn new<T>(
-        id: SharedEvictionDomainId,
+        #[cfg(feature = "profiling")] id: SharedEvictionDomainId,
         runtime: T,
         policy: PressureDeltaClockPolicy,
     ) -> Self
@@ -656,6 +576,7 @@ impl SharedEvictionDomain {
         T: EvictionRuntime + Send + 'static,
     {
         SharedEvictionDomain {
+            #[cfg(feature = "profiling")]
             id,
             runtime: Box::new(runtime),
             policy,
@@ -663,6 +584,7 @@ impl SharedEvictionDomain {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn id(&self) -> SharedEvictionDomainId {
         self.id
     }
@@ -693,8 +615,10 @@ impl SharedEvictionDomain {
     }
 }
 
+/// Diagnostic identity of a shared eviction domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SharedEvictionDomainId {
+pub(crate) enum SharedEvictionDomainId {
+    #[cfg(any(test, feature = "profiling"))]
     Readonly,
     Mem,
     Index,
@@ -705,6 +629,7 @@ struct SharedEvictor {
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
     next_domain: usize,
+    #[cfg(feature = "profiling")]
     stats: SharedPoolEvictorStatsHandle,
 }
 
@@ -714,13 +639,14 @@ impl SharedEvictor {
         domains: Vec<SharedEvictionDomain>,
         shutdown_flag: Arc<AtomicBool>,
         wake_event: Arc<Event>,
-        stats: SharedPoolEvictorStatsHandle,
+        #[cfg(feature = "profiling")] stats: SharedPoolEvictorStatsHandle,
     ) -> Self {
         SharedEvictor {
             domains,
             shutdown_flag,
             wake_event,
             next_domain: 0,
+            #[cfg(feature = "profiling")]
             stats,
         }
     }
@@ -756,6 +682,7 @@ impl SharedEvictor {
                 return false;
             };
             if self.domains[idx].try_run_once() {
+                #[cfg(feature = "profiling")]
                 self.stats.record_domain_run(self.domains[idx].id());
                 return true;
             }
@@ -772,11 +699,13 @@ impl SharedEvictor {
         if self.any_domain_ready() {
             return true;
         }
+        #[cfg(feature = "profiling")]
         self.stats.record_wait();
         listener.wait();
         if self.shutdown_flag.load(Ordering::Acquire) {
             return false;
         }
+        #[cfg(feature = "profiling")]
         self.stats.record_wake();
         true
     }
@@ -803,7 +732,10 @@ pub(crate) struct SharedPoolEvictorWorkers;
 impl Component for SharedPoolEvictorWorkers {
     type Config = ();
     type Owned = SharedPoolEvictorWorkersOwned;
+    #[cfg(feature = "profiling")]
     type Access = SharedPoolEvictorStatsHandle;
+    #[cfg(not(feature = "profiling"))]
+    type Access = ();
     type Error = Report<RuntimeError>;
 
     const NAME: &'static str = "shared_pool_evictor_workers";
@@ -823,6 +755,7 @@ impl Component for SharedPoolEvictorWorkers {
         let mem_pool = mem_pool.clone_inner().into_sync();
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let wake_event = Arc::new(Event::new());
+        #[cfg(feature = "profiling")]
         let stats = SharedPoolEvictorStatsHandle::default();
 
         disk_pool.install_shared_evictor_wake(Arc::clone(&wake_event));
@@ -837,6 +770,7 @@ impl Component for SharedPoolEvictorWorkers {
             ],
             Arc::clone(&shutdown_flag),
             Arc::clone(&wake_event),
+            #[cfg(feature = "profiling")]
             stats.clone(),
         )
         .start_thread()
@@ -848,6 +782,7 @@ impl Component for SharedPoolEvictorWorkers {
             mem_pool,
             shutdown_flag,
             wake_event,
+            #[cfg(feature = "profiling")]
             stats,
             evict_thread: Mutex::new(Some(handle)),
         });
@@ -856,7 +791,12 @@ impl Component for SharedPoolEvictorWorkers {
 
     #[inline]
     fn access(owner: &QuiescentBox<Self::Owned>) -> Self::Access {
-        owner.stats.clone()
+        #[cfg(feature = "profiling")]
+        {
+            owner.stats.clone()
+        }
+        #[cfg(not(feature = "profiling"))]
+        let _ = owner;
     }
 
     #[inline]
@@ -894,6 +834,7 @@ pub(crate) struct SharedPoolEvictorWorkersOwned {
     mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
+    #[cfg(feature = "profiling")]
     stats: SharedPoolEvictorStatsHandle,
     evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1040,6 +981,8 @@ mod tests {
     use crate::id::{BlockID, TableID, TrxID};
     use crate::io::{DirectBuf, IOBuf};
     use crate::poison::EnginePoisoner;
+    #[cfg(feature = "profiling")]
+    use crate::profiling::SharedPoolEvictorStats;
     use crate::quiescent::QuiescentGuard;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
@@ -1048,13 +991,17 @@ mod tests {
     use std::mem;
     use std::path::Path;
     use std::sync::Arc;
+    #[cfg(feature = "profiling")]
     use std::thread;
+    #[cfg(feature = "profiling")]
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     const TEST_POOL_BYTES: usize = 64 * 1024 * 130;
     const TEST_POOL_MAX_FILE_BYTES: usize = 128 * 1024 * 260;
+    #[cfg(feature = "profiling")]
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+    #[cfg(feature = "profiling")]
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 
     struct MockRuntime {
@@ -1125,6 +1072,7 @@ mod tests {
         disk_pool: DiskPool,
         mem_pool: MemPool,
         index_pool: IndexPool,
+        #[cfg(feature = "profiling")]
         stats: SharedPoolEvictorStatsHandle,
         registry: ComponentRegistry,
     }
@@ -1169,22 +1117,26 @@ mod tests {
                 let disk_pool = registry.dependency::<DiskPool>();
                 let mem_pool = registry.dependency::<MemPool>();
                 let index_pool = registry.dependency::<IndexPool>();
+                #[cfg(feature = "profiling")]
                 let stats = registry.dependency::<SharedPoolEvictorWorkers>();
                 Self {
                     fs,
                     disk_pool,
                     mem_pool,
                     index_pool,
+                    #[cfg(feature = "profiling")]
                     stats,
                     registry,
                 }
             })
         }
 
+        #[cfg(feature = "profiling")]
         fn stats(&self) -> SharedPoolEvictorStats {
             self.stats.snapshot()
         }
 
+        #[cfg(feature = "profiling")]
         fn wait_until_idle(&self) -> SharedPoolEvictorStats {
             // Startup synchronization only needs evidence that the shared
             // evictor has parked at least once. Requiring a fresh
@@ -1222,12 +1174,20 @@ mod tests {
         ]
         .into_iter()
         .zip(resident)
-        .map(|(id, count)| SharedEvictionDomain::new(id, MockRuntime::new(count, 8), test_policy()))
+        .map(|(_id, count)| {
+            SharedEvictionDomain::new(
+                #[cfg(feature = "profiling")]
+                _id,
+                MockRuntime::new(count, 8),
+                test_policy(),
+            )
+        })
         .collect();
         SharedEvictor::new(
             domains,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Event::new()),
+            #[cfg(feature = "profiling")]
             SharedPoolEvictorStatsHandle::default(),
         )
     }
@@ -1236,6 +1196,7 @@ mod tests {
         capacity * (mem::size_of::<BufferFrame>() + mem::size_of::<Page>())
     }
 
+    #[cfg(feature = "profiling")]
     fn wait_for(mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
         loop {
@@ -1475,6 +1436,7 @@ mod tests {
 
     /// Purpose: Attribute shared-evictor activity to the domain under pressure.
     /// Expected: Only the pressured domain records eviction runs.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_shared_evictor_stats_track_isolated_domain_pressure() {
         smol::block_on(async {
@@ -1488,10 +1450,13 @@ mod tests {
                     prepare_read_pressure(&runtime.fs, &runtime.disk_pool, test_user_table_id(201))
                         .await;
 
+                #[cfg(feature = "profiling")]
                 let start = runtime.stats();
                 drive_read_pressure(&readonly_fixture).await;
                 wait_for(|| runtime.stats().delta_since(start).readonly_runs > 0);
+                #[cfg(feature = "profiling")]
                 let delta = runtime.stats().delta_since(start);
+                #[cfg(feature = "profiling")]
                 assert!(delta.readonly_runs > 0);
                 assert_eq!(delta.mem_runs, 0);
                 assert_eq!(delta.index_runs, 0);
@@ -1501,13 +1466,17 @@ mod tests {
             {
                 let root = TempDir::new().unwrap();
                 let runtime = StartedSharedEvictorRuntime::new(root.path());
+                #[cfg(feature = "profiling")]
                 runtime.wait_until_idle();
 
+                #[cfg(feature = "profiling")]
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.mem_pool, 192).await;
                 wait_for(|| runtime.stats().delta_since(start).mem_runs > 0);
+                #[cfg(feature = "profiling")]
                 let delta = runtime.stats().delta_since(start);
                 assert_eq!(delta.readonly_runs, 0);
+                #[cfg(feature = "profiling")]
                 assert!(delta.mem_runs > 0);
                 assert_eq!(delta.index_runs, 0);
             }
@@ -1515,14 +1484,18 @@ mod tests {
             {
                 let root = TempDir::new().unwrap();
                 let runtime = StartedSharedEvictorRuntime::new(root.path());
+                #[cfg(feature = "profiling")]
                 runtime.wait_until_idle();
 
+                #[cfg(feature = "profiling")]
                 let start = runtime.stats();
                 allocate_with_pressure(&runtime.index_pool, 192).await;
                 wait_for(|| runtime.stats().delta_since(start).index_runs > 0);
+                #[cfg(feature = "profiling")]
                 let delta = runtime.stats().delta_since(start);
                 assert_eq!(delta.readonly_runs, 0);
                 assert_eq!(delta.mem_runs, 0);
+                #[cfg(feature = "profiling")]
                 assert!(delta.index_runs > 0);
             }
         });
@@ -1535,12 +1508,14 @@ mod tests {
         smol::block_on(async {
             let root = TempDir::new().unwrap();
             let runtime = StartedSharedEvictorRuntime::new(root.path());
+            #[cfg(feature = "profiling")]
             runtime.wait_until_idle();
 
             let table_id = test_user_table_id(202);
             let readonly_fixture =
                 prepare_read_pressure(&runtime.fs, &runtime.disk_pool, table_id).await;
 
+            #[cfg(feature = "profiling")]
             let start = runtime.stats();
             let readonly_task = {
                 let readonly_fixture = readonly_fixture.clone();
@@ -1561,13 +1536,19 @@ mod tests {
                 })
             };
 
+            #[cfg(feature = "profiling")]
             wait_for(|| {
+                #[cfg(feature = "profiling")]
                 let delta = runtime.stats().delta_since(start);
                 delta.readonly_runs > 0 && delta.mem_runs > 0 && delta.index_runs > 0
             });
+            #[cfg(feature = "profiling")]
             let delta = runtime.stats().delta_since(start);
+            #[cfg(feature = "profiling")]
             assert!(delta.readonly_runs > 0);
+            #[cfg(feature = "profiling")]
             assert!(delta.mem_runs > 0);
+            #[cfg(feature = "profiling")]
             assert!(delta.index_runs > 0);
 
             readonly_task.await;

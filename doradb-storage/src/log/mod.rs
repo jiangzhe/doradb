@@ -17,9 +17,8 @@ use crate::file::{SparseFile, UNTRACKED_FILE_ID};
 use crate::free_list::FreeList;
 use crate::id::TrxID;
 use crate::io::{
-    Backend, BackendError, BackendResult, BackendStats, BackendStatsHandle, CompletedSubmission,
-    DirectBuf, IOBuf, IOKind, IOSubmission, Operation, StorageBackend, SubmissionDriver,
-    SubmitAttempt, SubmitRetry,
+    Backend, BackendError, BackendResult, CompletedSubmission, DirectBuf, IOBuf, IOKind,
+    IOSubmission, Operation, StorageBackend, SubmissionDriver, SubmitAttempt, SubmitRetry,
 };
 use crate::log::block_group::{LogBlockGroup, TrxLog};
 use crate::log::format::{
@@ -29,6 +28,8 @@ use crate::log::format::{
 use crate::map::FastHashMap;
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::{BackendStats, BackendStatsHandle, RedoLogStats};
 use crate::trx::MIN_SNAPSHOT_TS;
 use crate::trx::group::{
     Commit, CommitGroup, CommitGroupLog, CommitJoin, GroupCommit, MutexGroupCommit,
@@ -49,7 +50,7 @@ use std::path::PathBuf;
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Redo-local owner for a sparse log file and its selected super-block metadata.
@@ -371,14 +372,17 @@ impl RedoLogFinalizer {
             closed: None,
             log_file: Some(log_file),
         };
+        #[cfg(feature = "profiling")]
         let io_backend_stats = ctx.stats_handle();
         Ok((
             RedoLog {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
+                #[cfg(feature = "profiling")]
                 stats: Arc::new(CachePadded::new(RedoLogStats::default())),
                 purge_tx,
                 log_write_backend: CachePadded::new(Mutex::new(Some(ctx))),
+                #[cfg(feature = "profiling")]
                 io_backend_stats,
                 log_block_size: self.log_block_size,
                 file_prefix: self.file_prefix,
@@ -641,12 +645,14 @@ pub(crate) struct RedoLog {
     /// redo headers.
     pub(crate) persisted_cts: CachePadded<AtomicU64>,
     /// Stats of transaction system.
+    #[cfg(feature = "profiling")]
     pub(crate) stats: Arc<CachePadded<RedoLogStats>>,
     /// Purge coordinator channel used for committed transaction GC handoff.
     pub(crate) purge_tx: Sender<Purge>,
     /// Backend for redo writes, taken exactly once by the log thread.
     log_write_backend: CachePadded<Mutex<Option<StorageBackend>>>,
     /// Backend-owned submit/wait statistics for redo writes.
+    #[cfg(feature = "profiling")]
     io_backend_stats: BackendStatsHandle,
     /// Fixed byte size of every redo data-block write.
     pub(crate) log_block_size: usize,
@@ -838,28 +844,6 @@ impl RedoLog {
         Ok(waiter)
     }
 
-    #[inline]
-    fn update_stats(
-        &self,
-        trx_count: usize,
-        commit_count: usize,
-        log_bytes: usize,
-        sync_count: usize,
-        sync_nanos: usize,
-    ) {
-        self.stats.trx_count.fetch_add(trx_count, Ordering::Relaxed);
-        self.stats
-            .commit_count
-            .fetch_add(commit_count, Ordering::Relaxed);
-        self.stats.log_bytes.fetch_add(log_bytes, Ordering::Relaxed);
-        self.stats
-            .sync_count
-            .fetch_add(sync_count, Ordering::Relaxed);
-        self.stats
-            .sync_nanos
-            .fetch_add(sync_nanos, Ordering::Relaxed);
-    }
-
     /// Take ownership of the redo write driver backend for the log thread.
     #[inline]
     pub(crate) fn take_log_write_driver(&self) -> LogWriteDriver {
@@ -873,8 +857,14 @@ impl RedoLog {
 
     /// Return a snapshot of redo write backend statistics.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn io_backend_stats(&self) -> BackendStats {
-        self.io_backend_stats.snapshot()
+        #[cfg(feature = "profiling")]
+        {
+            self.io_backend_stats.snapshot()
+        }
+        #[cfg(not(feature = "profiling"))]
+        Default::default()
     }
 }
 
@@ -973,29 +963,6 @@ impl SyncGroup {
     }
 }
 
-/// Atomic counters maintained by the redo log writer.
-#[derive(Default)]
-pub(crate) struct RedoLogStats {
-    /// Number of commit groups completed.
-    pub(crate) commit_count: AtomicUsize,
-    /// Number of transactions completed through redo.
-    pub(crate) trx_count: AtomicUsize,
-    /// Total redo bytes written.
-    pub(crate) log_bytes: AtomicUsize,
-    /// Number of redo file sync calls.
-    pub(crate) sync_count: AtomicUsize,
-    /// Total nanoseconds spent in redo file sync calls.
-    pub(crate) sync_nanos: AtomicUsize,
-    /// Number of best-effort redo file seal failures.
-    pub(crate) seal_failure_count: AtomicUsize,
-    /// Number of transactions handed to purge.
-    pub(crate) purge_trx_count: AtomicUsize,
-    /// Number of row versions purged.
-    pub(crate) purge_row_count: AtomicUsize,
-    /// Number of index entries purged.
-    pub(crate) purge_index_count: AtomicUsize,
-}
-
 #[derive(Default)]
 struct ReadyGroupPrefix {
     /// Groups whose redo bytes form one durable publication prefix.
@@ -1005,7 +972,9 @@ struct ReadyGroupPrefix {
     /// Last prefix entry id drained into this batch. A front sync barrier
     /// reuses this id to keep live prefix ids contiguous for O(1) lookup.
     sync_barrier_id: Option<LogPrefixId>,
+    #[cfg(feature = "profiling")]
     trx_count: usize,
+    #[cfg(feature = "profiling")]
     commit_count: usize,
     log_bytes: usize,
     /// Redo fd for `written`. A publish batch cannot span log files.
@@ -1506,7 +1475,12 @@ where
         }
 
         if ready.log_bytes == 0 || self.log_sync == LogSync::None {
-            self.publish_ready_group_prefix(sealer, ready, 0);
+            self.publish_ready_group_prefix(
+                sealer,
+                ready,
+                #[cfg(feature = "profiling")]
+                0,
+            );
             return;
         }
 
@@ -1524,6 +1498,7 @@ where
             sync,
             ready,
             failure,
+            #[cfg(feature = "profiling")]
             sync_nanos,
             ..
         } = entry.kind
@@ -1537,7 +1512,12 @@ where
             self.fail_ready_prefix_waiters(&mut ready_prefix, failed_reason);
             return;
         }
-        self.publish_ready_group_prefix(sealer, ready_prefix, sync_nanos);
+        self.publish_ready_group_prefix(
+            sealer,
+            ready_prefix,
+            #[cfg(feature = "profiling")]
+            sync_nanos,
+        );
     }
 
     #[inline]
@@ -1545,7 +1525,7 @@ where
         &self,
         sealer: &mut LogFileSealer,
         ready: ReadyGroupPrefix,
-        sync_nanos: usize,
+        #[cfg(feature = "profiling")] sync_nanos: usize,
     ) {
         let max_cts = ready.written.last().unwrap().max_cts;
         for sync_group in &ready.written {
@@ -1591,11 +1571,13 @@ where
         #[cfg(test)]
         self.trx_sys.publish_purge_handoff(max_cts);
 
-        self.trx_sys.redo_log.update_stats(
+        #[cfg(feature = "profiling")]
+        self.trx_sys.redo_log.stats.record(
             ready.trx_count,
             ready.commit_count,
             ready.log_bytes,
             usize::from(ready.log_bytes > 0 && self.log_sync != LogSync::None),
+            #[cfg(feature = "profiling")]
             sync_nanos,
         );
     }
@@ -1935,7 +1917,9 @@ where
         let LogPrefixKind::Sync {
             ready,
             failure,
+            #[cfg(feature = "profiling")]
             started_at,
+            #[cfg(feature = "profiling")]
             sync_nanos,
             ..
         } = &mut entry.kind
@@ -1945,9 +1929,12 @@ where
         if failure.is_none() {
             *failure = fatal_error;
         }
-        *sync_nanos = started_at
-            .take()
-            .map_or(0, |started_at| started_at.elapsed().as_nanos() as usize);
+        #[cfg(feature = "profiling")]
+        {
+            *sync_nanos = started_at
+                .take()
+                .map_or(0, |started_at| started_at.elapsed().as_nanos() as usize);
+        }
         *ready = true;
     }
 
@@ -3929,6 +3916,7 @@ mod tests {
                     .load(Ordering::SeqCst),
                 91
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 harness
                     .trx_sys
@@ -3938,6 +3926,7 @@ mod tests {
                     .load(Ordering::Relaxed),
                 2
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 harness
                     .trx_sys
@@ -4539,6 +4528,7 @@ mod tests {
             sealer.seal_active_file_best_effort(&harness.trx_sys, &mut write_driver);
 
             assert!(harness.poisoner.poison_error().is_none());
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 harness
                     .trx_sys

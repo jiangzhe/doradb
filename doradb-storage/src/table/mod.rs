@@ -34,10 +34,7 @@ use checkpoint_workflow::{FrozenPage, TableCheckpointWorkflow};
 pub(crate) use deletion_buffer::*;
 pub(crate) use dml_validator::*;
 pub(crate) use gc::prepare_mem_index_cleanup_operation;
-pub use gc::{
-    MemIndexCleanupDelay, MemIndexCleanupOutcome, MemIndexCleanupStats,
-    SecondaryMemIndexCleanupIndexStats,
-};
+pub use gc::{MemIndexCleanupDelay, MemIndexCleanupOutcome};
 pub(crate) use index_ddl_plan::{CreateIndexPlan, DropIndexPlan};
 pub(crate) use index_lifecycle::{
     CurrentDefinitionAllocatorView, IndexPlacement, TableIndexLifecycleState,

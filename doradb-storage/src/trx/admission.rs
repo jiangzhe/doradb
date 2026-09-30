@@ -596,10 +596,13 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = LockOwner::transaction(session_id, trx.trx_id());
 
+            #[cfg(feature = "profiling")]
             let before = session.logical_lock_stats().unwrap();
             let first = touch_table_read(&mut trx, table_id).await.unwrap_err();
             assert_eq!(operation_error(&first), Some(OperationError::TableNotFound));
+            #[cfg(feature = "profiling")]
             let after_first = session.logical_lock_stats().unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 after_first.immediate_physical_acquisitions
                     - before.immediate_physical_acquisitions,
@@ -619,11 +622,14 @@ mod tests {
 
             let retry = touch_table_read(&mut trx, table_id).await.unwrap_err();
             assert_eq!(operation_error(&retry), Some(OperationError::TableNotFound));
+            #[cfg(feature = "profiling")]
             let after_retry = session.logical_lock_stats().unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 after_retry.immediate_physical_acquisitions,
                 after_first.immediate_physical_acquisitions
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 after_retry.resource_transitions,
                 after_first.resource_transitions
@@ -763,17 +769,21 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
+                #[cfg(feature = "profiling")]
                 let after_first = old_session.logical_lock_stats().unwrap();
                 let retry = old_trx
                     .table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from(&b"retry"[..])])
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&retry), Some(OperationError::SchemaChanged));
+                #[cfg(feature = "profiling")]
                 let after_retry = old_session.logical_lock_stats().unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(
                     after_retry.immediate_physical_acquisitions,
                     after_first.immediate_physical_acquisitions
                 );
+                #[cfg(feature = "profiling")]
                 assert_eq!(
                     after_retry.resource_transitions,
                     after_first.resource_transitions

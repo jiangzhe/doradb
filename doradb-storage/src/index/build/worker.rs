@@ -8,7 +8,7 @@ use crate::error::{
 };
 use crate::memcmp::MEM_CMP_KEY_INLINE;
 #[cfg(feature = "profiling")]
-use crate::profiling::HotBuildWorkerProfile;
+use crate::profiling::{HotBuildWorkerProfile, clock::Instant};
 use crate::row::RowRead;
 use crate::runtime::thread_pool::ThreadPool;
 use crate::runtime::yield_now;
@@ -17,8 +17,6 @@ use error_stack::ResultExt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 
 /// Submit one finite extraction job with move-once completion.
 pub(super) fn submit(

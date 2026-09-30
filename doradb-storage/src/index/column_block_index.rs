@@ -25,6 +25,7 @@ use std::mem;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
+#[cfg(feature = "profiling")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zerocopy::byteorder::little_endian::{U32 as LeU32, U64 as LeU64};
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -1513,6 +1514,7 @@ pub(crate) struct ColumnBlockIndex<'a> {
     disk_pool_guard: &'a PoolGuard,
     root_block_id: BlockID,
     end_row_id: RowID,
+    #[cfg(feature = "profiling")]
     logical_read_counter: Option<&'a AtomicUsize>,
 }
 
@@ -1534,12 +1536,14 @@ impl<'a> ColumnBlockIndex<'a> {
             disk_pool_guard,
             root_block_id,
             end_row_id,
+            #[cfg(feature = "profiling")]
             logical_read_counter: None,
         }
     }
 
     /// Attaches a cache-independent counter for successful logical node reads.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn with_logical_read_counter(mut self, counter: &'a AtomicUsize) -> Self {
         self.logical_read_counter = Some(counter);
         self
@@ -1570,6 +1574,7 @@ impl<'a> ColumnBlockIndex<'a> {
                     self.file_kind
                 )
             })?;
+        #[cfg(feature = "profiling")]
         if let Some(counter) = self.logical_read_counter {
             counter.fetch_add(1, Ordering::Relaxed);
         }

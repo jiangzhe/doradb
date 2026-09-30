@@ -777,16 +777,21 @@ mod tests {
     fn test_collect_referenced_blocks_skips_single_block_read() {
         let blob = vec![9u8; 513];
         smol::block_on(with_persisted_blobs(&[&blob], async |reader, refs| {
+            #[cfg(feature = "profiling")]
             let before = reader.disk_pool.stats();
             let mut blocks = Vec::new();
             reader
                 .collect_referenced_blocks_with(refs[0], |block_id| blocks.push(block_id))
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             let delta = reader.disk_pool.stats().delta_since(before);
             assert_eq!(blocks, vec![refs[0].start_block_id]);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.queued_reads, 0);
         }));
     }

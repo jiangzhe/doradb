@@ -17,17 +17,18 @@ workspace = true
 blake3 = { workspace = true }
 byte-unit = { workspace = true }
 clap = { workspace = true }
-doradb-storage = { path = "../doradb-storage" }
+doradb-storage = { path = "../doradb-storage", features = ["profiling"] }
 easy-parallel = { workspace = true }
 event-listener = { workspace = true }
 hdrhistogram = { workspace = true }
 quanta = { workspace = true }
 parking_lot = { workspace = true }
-rustix = { workspace = true, features = ["param", "time"] }
+rustix = { workspace = true }
 serde = { workspace = true }
 smol = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+quanta = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }

@@ -1,8 +1,9 @@
 use crate::buffer::arena::{ArenaGuard, QuiescentArena};
+#[cfg(feature = "profiling")]
+use crate::buffer::evictor::SharedEvictionDomainId;
 use crate::buffer::evictor::{
     ClockHand, EvictionArbiter, EvictionArbiterBuilder, EvictionRuntime, FailureRateTracker,
-    PressureDeltaClockPolicy, SharedEvictionDomain, SharedEvictionDomainId, clock_collect_batch,
-    clock_sweep_candidate,
+    PressureDeltaClockPolicy, SharedEvictionDomain, clock_collect_batch, clock_sweep_candidate,
 };
 use crate::buffer::frame::{BufferFrame, FrameKind};
 use crate::buffer::guard::{
@@ -12,8 +13,7 @@ use crate::buffer::load::{PageReservation, PageReservationGuard};
 use crate::buffer::page::{PAGE_SIZE, Page, VersionedPageID};
 use crate::buffer::util::madvise_dontneed;
 use crate::buffer::{
-    BufferPoolStatsHandle, PageIOCompletion, PoolGuard, PoolIdentity, PoolRole,
-    ReadonlyBlockValidator, pool_role_name,
+    PageIOCompletion, PoolGuard, PoolIdentity, PoolRole, ReadonlyBlockValidator, pool_role_name,
 };
 use crate::error::{
     CompletionErrorBridge, CompletionResult, InternalError, InternalResult, IoError,
@@ -26,9 +26,10 @@ use crate::id::{BlockID, FileID, PageID};
 use crate::io::{IOKind, IOSubmission, Operation, StdIoResult};
 use crate::latch::LatchFallbackMode;
 use crate::map::FastDashMap;
+#[cfg(feature = "profiling")]
+use crate::profiling::{BufferPoolCounters, BufferPoolStatsHandle};
 use crate::quiescent::{QuiescentGuard, SyncQuiescentGuard};
 use crate::runtime::yield_now;
-use crate::stats::BufferPoolCounters;
 use dashmap::mapref::entry::Entry;
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, EventListener, listener};
@@ -109,6 +110,8 @@ impl Drop for ReadonlyWriteLease {
 ///
 /// Reverse lookup is stored inline in `BufferFrame` as persisted-block metadata.
 pub(crate) struct ReadonlyBufferPool {
+    #[cfg(test)]
+    test_progress: tests::ReadTestProgress,
     size: usize,
     mappings: FastDashMap<BlockKey, VersionedPageID>,
     inflights: FastDashMap<BlockKey, InflightBlockState>,
@@ -117,6 +120,7 @@ pub(crate) struct ReadonlyBufferPool {
     fs: QuiescentGuard<FileSystem>,
     shutdown_flag: Arc<AtomicBool>,
     role: PoolRole,
+    #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
     arena: QuiescentArena,
 }
@@ -166,7 +170,10 @@ impl ReadonlyBufferPool {
             fs,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             role,
+            #[cfg(feature = "profiling")]
             stats: BufferPoolStatsHandle::default(),
+            #[cfg(test)]
+            test_progress: tests::ReadTestProgress::default(),
             arena,
         };
         Ok(pool)
@@ -182,18 +189,21 @@ impl ReadonlyBufferPool {
 
     /// Returns total number of frame slots in this pool.
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn capacity(&self) -> usize {
         self.size
     }
 
     /// Returns number of currently mapped cache entries.
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn allocated(&self) -> usize {
         self.mappings.len()
     }
 
     /// Returns one snapshot of shared readonly-pool access and load counters.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
@@ -356,7 +366,12 @@ impl ReadonlyBufferPool {
     #[inline]
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
         let (runtime, policy) = Self::evictor_parts(pool);
-        SharedEvictionDomain::new(SharedEvictionDomainId::Readonly, runtime, policy)
+        SharedEvictionDomain::new(
+            #[cfg(feature = "profiling")]
+            SharedEvictionDomainId::Readonly,
+            runtime,
+            policy,
+        )
     }
 
     #[inline]
@@ -549,6 +564,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
         key: BlockKey,
         validation: Option<InflightLoadValidation>,
     ) -> InternalResult<Arc<PageIOCompletion>> {
+        #[cfg(feature = "profiling")]
         self.stats.record_cache_miss();
         let requested_class = if validation.is_some() {
             ReadonlyLoadClass::Validated
@@ -576,7 +592,10 @@ impl QuiescentGuard<ReadonlyBufferPool> {
                     // Joiners do not repair inflight state. A completed Loading
                     // can be observed during the completer's publish/remove
                     // window; the completer remains responsible for cleanup.
+                    #[cfg(feature = "profiling")]
                     self.stats.record_miss_join();
+                    #[cfg(test)]
+                    self.test_progress.record_miss_join();
                     return Ok(Arc::clone(inflight));
                 }
                 InflightBlockState::WriteBlocked => {
@@ -739,6 +758,7 @@ impl QuiescentGuard<ReadonlyBufferPool> {
             if let Some(shared) = page_guard.lock_shared_async().await {
                 let block = ReadonlyBlockGuard::new(shared);
                 if resident_hit {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_cache_hit();
                 }
                 return Ok(block);
@@ -909,6 +929,7 @@ impl ReadSubmission {
         // live until IO completion, and offsets are page-aligned by construction.
         let operation =
             unsafe { Operation::pread_borrowed(file.as_raw_fd(), offset, ptr, PAGE_SIZE) };
+        #[cfg(feature = "profiling")]
         pool.stats.add_queued_reads(1);
         ReadSubmission {
             key,
@@ -941,7 +962,9 @@ impl ReadSubmission {
     #[inline]
     pub(crate) fn fail(mut self, err: CompletionErrorBridge) {
         drop(self.reservation.take());
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(err));
     }
@@ -949,7 +972,9 @@ impl ReadSubmission {
     /// Fails a submitted miss load while retaining its borrowed page memory.
     #[inline]
     pub(crate) fn fail_backend_submitted(&mut self, err: CompletionErrorBridge) {
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(err));
     }
@@ -957,6 +982,7 @@ impl ReadSubmission {
     /// Records that the backend accepted this read submission into running state.
     #[inline]
     pub(crate) fn record_running(&self) {
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_running_reads(1);
     }
 
@@ -978,7 +1004,9 @@ impl ReadSubmission {
                         self.key.block_id,
                     ) {
                         drop(self.reservation.take());
+                        #[cfg(feature = "profiling")]
                         self.pool.stats.add_completed_reads(1);
+                        #[cfg(feature = "profiling")]
                         self.pool.stats.add_read_errors(1);
                         self.complete_inflight_once(Err(CompletionErrorBridge::capture(
                             err.attach(format!(
@@ -1014,8 +1042,10 @@ impl ReadSubmission {
                 ))
             }
         };
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_completed_reads(1);
         if result.is_err() {
+            #[cfg(feature = "profiling")]
             self.pool.stats.add_read_errors(1);
         }
         self.complete_inflight_once(result);
@@ -1037,7 +1067,9 @@ impl Drop for ReadSubmission {
             return;
         }
         drop(self.reservation.take());
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_completed_reads(1);
+        #[cfg(feature = "profiling")]
         self.pool.stats.add_read_errors(1);
         self.complete_inflight_once(Err(CompletionErrorBridge::capture(
             Report::new(IoError::from(IoErrorKind::BrokenPipe)).attach(format!(
@@ -1339,61 +1371,111 @@ pub(crate) fn begin_write_barrier(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
     use crate::buffer::page::Page;
+
     use crate::buffer::{test_outstanding_base_guard_count, test_page_id};
+
     use crate::catalog::{
         StorageColumnFlags, StorageColumnSpec, TableMetadata, USER_TABLE_ID_START,
     };
+
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
+
     use crate::engine::Engine;
+
     use crate::error::RuntimeOrFatalError;
+
     use crate::error::{
         DataIntegrityError, DataIntegrityResult, LifecycleError, ResourceError, RuntimeError,
     };
+
     use crate::file::block_integrity::{
         BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
         COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
         write_block_header,
     };
+
     use crate::file::build_test_fs;
+
     use crate::file::build_test_fs_in;
-    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
+
+    #[cfg(feature = "profiling")]
+    use crate::file::cow_file::SUPER_BLOCK_ID;
+
+    use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
+
     use crate::file::fs::FileSystem;
+
     use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
+
     use crate::file::table_file::{MutableTableFile, TableFile};
+
     use crate::file::{CATALOG_MTB_FILE_ID, FileKind, test_block_id, test_file_id};
+
     use crate::id::{RowID, TableID, TrxID};
+
     use crate::index::{
         COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
         COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
         validate_persisted_column_block_index_page,
     };
+
     use crate::io::{
         DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
+
     use crate::layout;
+
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
+
     use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
+
     use crate::table::test_user_table_id;
+
     use crate::value::ValKind;
+
     use smol::Timer;
+
     use std::io::Error as StdIoError;
+
     use std::ops::Deref;
+
     use std::os::fd::{AsRawFd, RawFd};
+
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use std::sync::Arc;
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use std::sync::mpsc::{self, RecvTimeoutError};
+
     use std::thread;
+
     use std::time::Duration;
+
     use tempfile::TempDir;
 
     const TEST_WAIT_RETRIES: usize = 100;
+
     const TEST_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+
     static VALIDATED_RESIDENCY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    pub(super) struct ReadTestProgress {
+        miss_joins: AtomicUsize,
+    }
+
+    impl ReadTestProgress {
+        pub(super) fn record_miss_join(&self) {
+            self.miss_joins.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     /// Test-only owner wrapper for one shared readonly pool.
     pub(crate) struct GlobalReadOnlyPoolScope {
@@ -1461,6 +1543,7 @@ pub(crate) mod tests {
 
         /// Provides test-only access to `global_stats`.
         #[inline]
+        #[cfg(feature = "profiling")]
         pub(crate) fn global_stats(&self) -> BufferPoolCounters {
             self.global.stats()
         }
@@ -1740,8 +1823,11 @@ pub(crate) mod tests {
     async fn wait_for_miss_joins(pool: &ReadonlyBufferPool, expected: usize) {
         // The controlled read remains blocked, so every follower must attach
         // to its live completion instead of racing with publication or failure.
-        wait_for(|| pool.stats().miss_joins >= expected).await;
-        assert_eq!(pool.stats().miss_joins, expected);
+        wait_for(|| pool.test_progress.miss_joins.load(Ordering::Relaxed) >= expected).await;
+        assert_eq!(
+            pool.test_progress.miss_joins.load(Ordering::Relaxed),
+            expected
+        );
     }
 
     #[inline]
@@ -1991,6 +2077,7 @@ pub(crate) mod tests {
 
     /// Purpose: Distinguish cold loads from warm read-only cache accesses.
     /// Expected: A cold read records storage I/O while a warm hit returns the same payload without another read.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_readonly_pool_global_stats_track_single_miss_then_warm_hit() {
         smol::block_on(async {
@@ -2005,6 +2092,7 @@ pub(crate) mod tests {
             let pool = table_readonly_pool(&scope, test_user_table_id(120), &table_file);
             let pool_guard = pool.create_base_guard();
 
+            #[cfg(feature = "profiling")]
             let cold_start = pool.global_stats();
             let cold_guard = pool
                 .read_raw_block(&pool_guard, SUPER_BLOCK_ID)
@@ -2013,15 +2101,24 @@ pub(crate) mod tests {
             assert_eq!(&cold_guard.page()[..14], b"readonly-stats");
             drop(cold_guard);
 
+            #[cfg(feature = "profiling")]
             let cold_delta = pool.global_stats().delta_since(cold_start);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.miss_joins, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.running_reads, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.completed_reads, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(cold_delta.read_errors, 0);
 
+            #[cfg(feature = "profiling")]
             let warm_start = pool.global_stats();
             let warm_guard = pool
                 .read_raw_block(&pool_guard, SUPER_BLOCK_ID)
@@ -2030,17 +2127,24 @@ pub(crate) mod tests {
             assert_eq!(&warm_guard.page()[..14], b"readonly-stats");
             drop(warm_guard);
 
+            #[cfg(feature = "profiling")]
             let warm_delta = pool.global_stats().delta_since(warm_start);
+            #[cfg(feature = "profiling")]
             assert_eq!(warm_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(warm_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(warm_delta.queued_reads, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(warm_delta.running_reads, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(warm_delta.completed_reads, 0);
         });
     }
 
     /// Purpose: Share read-only pool counters across file-specific wrappers.
     /// Expected: A load through one wrapper is visible through every wrapper of the same pool.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_readonly_pool_global_stats_are_shared_across_file_wrappers() {
         smol::block_on(async {
@@ -2062,7 +2166,9 @@ pub(crate) mod tests {
             let pool_b = table_readonly_pool(&scope, test_user_table_id(122), &table_file_b);
             let pool_a_guard = pool_a.create_base_guard();
 
+            #[cfg(feature = "profiling")]
             let start_a = pool_a.global_stats();
+            #[cfg(feature = "profiling")]
             let start_b = pool_b.global_stats();
             assert_eq!(start_a, start_b);
 
@@ -2073,7 +2179,9 @@ pub(crate) mod tests {
             assert_eq!(&guard_a.page()[..17], b"readonly-shared-a");
             drop(guard_a);
 
+            #[cfg(feature = "profiling")]
             let delta_a = pool_a.global_stats().delta_since(start_a);
+            #[cfg(feature = "profiling")]
             let delta_b = pool_b.global_stats().delta_since(start_b);
             assert_eq!(delta_a, delta_b);
             assert_eq!(delta_a.cache_hits, 0);
@@ -2406,6 +2514,7 @@ pub(crate) mod tests {
                 err.downcast_ref::<InternalError>().copied(),
                 Some(InternalError::ReadonlyWriteBlocked)
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(global.stats().queued_reads, 0);
 
             drop(lease);
@@ -2678,6 +2787,7 @@ pub(crate) mod tests {
                 &global,
             );
             let pool_guard = pool.create_base_guard();
+            #[cfg(feature = "profiling")]
             let reload_start = pool.global_stats();
             let page = pool
                 .read_raw_block(&pool_guard, test_block_id(9))
@@ -2686,14 +2796,22 @@ pub(crate) mod tests {
             assert_eq!(&page.page()[..6], b"reload");
             drop(page);
 
-            let reload_delta = pool.global_stats().delta_since(reload_start);
-            assert_eq!(reload_delta.cache_hits, 0);
-            assert_eq!(reload_delta.cache_misses, 1);
-            assert_eq!(reload_delta.miss_joins, 0);
-            assert_eq!(reload_delta.queued_reads, 1);
-            assert_eq!(reload_delta.running_reads, 1);
-            assert_eq!(reload_delta.completed_reads, 1);
-            assert_eq!(reload_delta.read_errors, 0);
+            #[cfg(feature = "profiling")]
+            let _reload_delta = pool.global_stats().delta_since(reload_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.miss_joins, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.running_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.completed_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.read_errors, 0);
 
             let reloaded_frame_id = global.try_get_frame_id(&key).unwrap();
             assert_ne!(reloaded_frame_id, stale_frame_id);
@@ -2739,6 +2857,7 @@ pub(crate) mod tests {
             );
             let pool_guard = pool.create_base_guard();
 
+            #[cfg(feature = "profiling")]
             let reload_start = pool.global_stats();
             let page = pool
                 .read_validated_block(&pool_guard, test_block_id(12), count_and_validate_lwc_block)
@@ -2752,15 +2871,24 @@ pub(crate) mod tests {
                 admitted_residency.generation
             );
 
-            let reload_delta = pool.global_stats().delta_since(reload_start);
-            assert_eq!(reload_delta.cache_hits, 0);
-            assert_eq!(reload_delta.cache_misses, 1);
-            assert_eq!(reload_delta.miss_joins, 0);
-            assert_eq!(reload_delta.queued_reads, 1);
-            assert_eq!(reload_delta.running_reads, 1);
-            assert_eq!(reload_delta.completed_reads, 1);
-            assert_eq!(reload_delta.read_errors, 0);
+            #[cfg(feature = "profiling")]
+            let _reload_delta = pool.global_stats().delta_since(reload_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.miss_joins, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.running_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.completed_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_reload_delta.read_errors, 0);
 
+            #[cfg(feature = "profiling")]
             let warm_start = pool.global_stats();
             let page = pool
                 .read_validated_block(&pool_guard, test_block_id(12), count_and_validate_lwc_block)
@@ -2769,14 +2897,22 @@ pub(crate) mod tests {
             drop(page);
             assert_eq!(VALIDATED_RESIDENCY_CALLS.load(Ordering::SeqCst), 1);
 
-            let warm_delta = pool.global_stats().delta_since(warm_start);
-            assert_eq!(warm_delta.cache_hits, 1);
-            assert_eq!(warm_delta.cache_misses, 0);
-            assert_eq!(warm_delta.miss_joins, 0);
-            assert_eq!(warm_delta.queued_reads, 0);
-            assert_eq!(warm_delta.running_reads, 0);
-            assert_eq!(warm_delta.completed_reads, 0);
-            assert_eq!(warm_delta.read_errors, 0);
+            #[cfg(feature = "profiling")]
+            let _warm_delta = pool.global_stats().delta_since(warm_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.miss_joins, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.queued_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.running_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.completed_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_warm_delta.read_errors, 0);
 
             let mut resident = global
                 .try_lock_page_exclusive(&pool_guard, admitted_residency.page_id)
@@ -2884,6 +3020,7 @@ pub(crate) mod tests {
                 .try_get_frame_id(&key)
                 .expect("first read must publish resident mapping");
             let free_before = global.residency.free.lock().len();
+            #[cfg(feature = "profiling")]
             let stats_before = global.stats();
 
             let global_guard = global.guard();
@@ -2903,12 +3040,18 @@ pub(crate) mod tests {
             assert_eq!(global.allocated(), 1);
             assert_eq!(global.residency.free.lock().len(), free_before);
 
-            let stats_delta = global.stats().delta_since(stats_before);
-            assert_eq!(stats_delta.cache_misses, 1);
-            assert_eq!(stats_delta.queued_reads, 0);
-            assert_eq!(stats_delta.running_reads, 0);
-            assert_eq!(stats_delta.completed_reads, 0);
-            assert_eq!(stats_delta.read_errors, 0);
+            #[cfg(feature = "profiling")]
+            let _stats_delta = global.stats().delta_since(stats_before);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.queued_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.running_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.completed_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.read_errors, 0);
 
             drop(table_file);
             drop(fs);
@@ -3415,6 +3558,7 @@ pub(crate) mod tests {
             );
             let pool_guard = pool.create_base_guard();
             let key = BlockKey::new(test_user_file_id(TableID::new(115)), test_block_id(8));
+            #[cfg(feature = "profiling")]
             let stats_start = pool.global_stats();
 
             let pool_1 = (*pool).clone();
@@ -3458,9 +3602,12 @@ pub(crate) mod tests {
             assert_eq!(global.allocated(), 0);
             assert_eq!(global.try_get_frame_id(&key), None);
             wait_for(|| !global.inflights.contains_key(&key)).await;
-            let stats_delta = pool.global_stats().delta_since(stats_start);
-            assert_eq!(stats_delta.completed_reads, 1);
-            assert_eq!(stats_delta.read_errors, 1);
+            #[cfg(feature = "profiling")]
+            let _stats_delta = pool.global_stats().delta_since(stats_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.completed_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats_delta.read_errors, 1);
             drop(table_file);
             drop(fs);
         });
@@ -3650,6 +3797,7 @@ pub(crate) mod tests {
                     pool.try_get_frame_id(&key).is_none()
                 })
                 .expect("cache pressure must evict a loaded block");
+            #[cfg(feature = "profiling")]
             let reload_start = pool.stats();
             let g = pool
                 .read_raw_block(
@@ -3662,9 +3810,13 @@ pub(crate) mod tests {
                 .expect("buffer-pool read failed in test");
             let expected = format!("page-{evicted}");
             assert_eq!(&g.page()[..expected.len()], expected.as_bytes());
-            let delta = pool.stats().delta_since(reload_start);
-            assert_eq!(delta.cache_misses, 1);
-            assert_eq!(delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
+            let _delta = pool.stats().delta_since(reload_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(pool.stats().queued_writes, 0);
             drop(g);
             drop(pool_guard);

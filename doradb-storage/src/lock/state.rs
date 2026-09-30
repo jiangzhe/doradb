@@ -8,6 +8,8 @@ use crate::error::{OperationOrFatalResult, OperationResult};
 use crate::id::{ClaimNo, SessionID, TableID, TrxID};
 use crate::map::FastHashMap;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::FamilyLockStats;
 use std::array::from_fn;
 
 /// Authoritative cleanup index for one exact logical lock scope.
@@ -104,33 +106,6 @@ impl LockScopeState {
     }
 }
 
-/// Owner-local logical-lock path counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct FamilyLockStats {
-    /// Acquisitions covered by the same exact logical claim.
-    pub(crate) repeated_exact_covered: u64,
-    /// Fresh exact claims published under an existing physical family holder.
-    pub(crate) family_covered_publications: u64,
-    /// Owner-local conversions that preserve the physical family mode.
-    pub(crate) physical_mode_preserving_conversions: u64,
-    /// Physical manager acquisition or conversion transitions.
-    pub(crate) manager_acquires: u64,
-    /// Physical family removals from the manager.
-    pub(crate) physical_family_removals: u64,
-    /// Fresh accepted logical claim identities.
-    pub(crate) accepted_fresh_claims: u64,
-    /// Exact logical claims converted to a covering mode.
-    pub(crate) conversions: u64,
-    /// Exact logical scopes closed through their cleanup indexes.
-    pub(crate) scopes_closed: u64,
-    /// Claims visited while closing exact logical scopes.
-    pub(crate) close_claims_visited: u64,
-    /// Scope-close claims that changed physical family state.
-    pub(crate) scope_close_physical_changes: u64,
-    /// Releases that left the family/resource physical mode unchanged.
-    pub(crate) physical_mode_preserving_releases: u64,
-}
-
 /// Authoritative owner-side family/resource index for one session family.
 ///
 /// For every resource, `resources` aggregates the exact claims retained by
@@ -154,6 +129,7 @@ pub(crate) struct FamilyLockState {
     family: LockFamily,
     next_claim_no: u64,
     resources: FastHashMap<LockResource, LocalFamilyResourceState>,
+    #[cfg(feature = "profiling")]
     stats: FamilyLockStats,
 }
 
@@ -164,6 +140,7 @@ impl FamilyLockState {
             family,
             next_claim_no: 1,
             resources: FastHashMap::default(),
+            #[cfg(feature = "profiling")]
             stats: FamilyLockStats::default(),
         }
     }
@@ -204,7 +181,10 @@ impl FamilyLockState {
         if let Some(existing) = curr_scope.claims.get(&resource).copied() {
             // A directionally covered request is entirely owner-local.
             if existing.mode.covers(resource, mode) {
-                self.stats.repeated_exact_covered += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.repeated_exact_covered += 1;
+                }
                 return Ok(LockGrant::Existing);
             }
 
@@ -236,7 +216,10 @@ impl FamilyLockState {
                 mode,
             );
             if candidate_covering != old_covering {
-                self.stats.manager_acquires += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.manager_acquires += 1;
+                }
                 lock_manager.convert_family(
                     resource,
                     self.family,
@@ -244,7 +227,10 @@ impl FamilyLockState {
                     candidate_covering,
                 )?;
             } else {
-                self.stats.physical_mode_preserving_conversions += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.physical_mode_preserving_conversions += 1;
+                }
             }
 
             // The manager now represents `candidate_covering`, or no manager
@@ -265,7 +251,10 @@ impl FamilyLockState {
                     )
                 })
                 .mode = mode;
-            self.stats.conversions += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.stats.conversions += 1;
+            }
             return Ok(LockGrant::Existing);
         }
 
@@ -283,7 +272,10 @@ impl FamilyLockState {
             claim_no,
         };
         if !family_covered {
-            self.stats.manager_acquires += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.stats.manager_acquires += 1;
+            }
         }
         let guard = PendingClaimGuard::new(
             lock_manager,
@@ -329,15 +321,26 @@ impl FamilyLockState {
             let token = curr_scope
                 .claim_token(resource)
                 .expect("scope key must retain its claim");
+            #[cfg(feature = "profiling")]
             let physical_changes = self.stats.physical_family_removals;
             self.release_token(curr_scope, lock_manager, &token);
+            #[cfg(feature = "profiling")]
             if self.stats.physical_family_removals != physical_changes {
-                self.stats.scope_close_physical_changes += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.scope_close_physical_changes += 1;
+                }
             }
             released += 1;
-            self.stats.close_claims_visited += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.stats.close_claims_visited += 1;
+            }
         }
-        self.stats.scopes_closed += 1;
+        #[cfg(feature = "profiling")]
+        {
+            self.stats.scopes_closed += 1;
+        }
         curr_scope.assert_cleared();
         released
     }
@@ -528,9 +531,15 @@ impl FamilyLockState {
             token.claim_no,
             family_claim.claim_no
         );
-        self.stats.accepted_fresh_claims += 1;
+        #[cfg(feature = "profiling")]
+        {
+            self.stats.accepted_fresh_claims += 1;
+        }
         if family_covered {
-            self.stats.family_covered_publications += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.stats.family_covered_publications += 1;
+            }
         }
     }
 
@@ -673,14 +682,20 @@ impl FamilyLockState {
             Some(mode) if mode == old_covering_mode => {
                 // No external compatibility changes, so manager access and
                 // waiter promotion are unnecessary.
-                self.stats.physical_mode_preserving_releases += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.physical_mode_preserving_releases += 1;
+                }
             }
             None => {
                 // Remove the physical family before deleting the exact
                 // owner-side records. Exclusive family authority prevents
                 // another family operation from observing this staging interval.
                 lock_manager.remove_family(token.resource, self.family, old_covering_mode);
-                self.stats.physical_family_removals += 1;
+                #[cfg(feature = "profiling")]
+                {
+                    self.stats.physical_family_removals += 1;
+                }
             }
             Some(candidate_mode) => {
                 panic!(
@@ -783,8 +798,12 @@ impl FamilyLockAuthority {
             .family
             .close_scope(&mut self.session_scope, lock_manager);
         self.family.assert_empty();
+        #[cfg(feature = "profiling")]
         lock_manager.record_family_stats(self.family.stats);
-        self.family.stats = FamilyLockStats::default();
+        #[cfg(feature = "profiling")]
+        {
+            self.family.stats = FamilyLockStats::default();
+        }
         released
     }
 
@@ -1372,6 +1391,7 @@ mod tests {
         authority.session_scope.assert_cleared();
         assert_eq!(authority.family.next_claim_no, 1);
         assert!(authority.family.resources.is_empty());
+        #[cfg(feature = "profiling")]
         assert_eq!(authority.family.stats, FamilyLockStats::default());
     }
 
@@ -1412,6 +1432,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(authority.family.stats.family_covered_publications, 1);
             authority.family.close_scope(&mut trx, &manager);
             assert_eq!(
@@ -1459,6 +1480,7 @@ mod tests {
 
             family.close_scope(&mut transaction, &manager);
             assert!(operation.covers(resource, LockMode::Exclusive));
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.physical_mode_preserving_releases, 1);
             assert_manager_agreement(&family, &manager);
 
@@ -1504,6 +1526,7 @@ mod tests {
             family.close_scope(&mut transaction, &manager);
             assert!(session_scope.covers(parent_resource, LockMode::Exclusive));
             assert_eq!(owner_count(&manager, session_scope.owner()), 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.physical_family_removals, 1);
             assert_manager_agreement(family, &manager);
 
@@ -1560,6 +1583,7 @@ mod tests {
                 first.claim_no,
                 session_scope.claim_token(resource).unwrap().claim_no
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.repeated_exact_covered, 1);
             family.close_scope(session_scope, &manager);
         });
@@ -1613,17 +1637,28 @@ mod tests {
             authority.family.close_scope(&mut trx_scope, &manager);
             authority.close_session(&manager);
 
-            let stats = manager.stats();
-            assert_eq!(stats.owner_local_exact_covered_hits, 1);
-            assert_eq!(stats.owner_local_covered_publications, 1);
-            assert_eq!(stats.owner_local_mode_preserving_releases, 1);
-            assert_eq!(stats.scope_close_claims_visited, 2);
-            assert_eq!(stats.scope_close_physical_changes, 1);
-            assert_eq!(stats.immediate_physical_acquisitions, 1);
-            assert_eq!(stats.current_physical_resources, 0);
-            assert_eq!(stats.current_physical_families, 0);
-            assert_eq!(stats.peak_physical_resources, 1);
-            assert_eq!(stats.peak_physical_families, 1);
+            #[cfg(feature = "profiling")]
+            let _stats = manager.stats();
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.owner_local_exact_covered_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.owner_local_covered_publications, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.owner_local_mode_preserving_releases, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.scope_close_claims_visited, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.scope_close_physical_changes, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.immediate_physical_acquisitions, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.current_physical_resources, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.current_physical_families, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.peak_physical_resources, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.peak_physical_families, 1);
         });
     }
 
@@ -1731,8 +1766,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.family_covered_publications, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.manager_acquires, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.accepted_fresh_claims, 3);
             assert_eq!(family_snapshot(family).len(), 3);
             assert_manager_agreement(family, &manager);
@@ -1742,9 +1780,13 @@ mod tests {
             family.close_scope(session_scope, &manager);
             family.assert_empty();
             assert_manager_agreement(family, &manager);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.physical_family_removals, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.scopes_closed, 3);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.close_claims_visited, 3);
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.physical_mode_preserving_releases, 2);
         });
     }
@@ -1805,6 +1847,7 @@ mod tests {
             );
             assert!(session_scope.covers(resource, LockMode::IntentExclusive));
             assert!(!session_scope.covers(resource, LockMode::Shared));
+            #[cfg(feature = "profiling")]
             assert_eq!(family.stats.conversions, 1);
             family.close_scope(session_scope, &manager);
         });

@@ -31,6 +31,8 @@ use crate::index::{
 use crate::io::DirectBuf;
 use crate::lwc::LwcBuilder;
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::{CheckpointLwcProfile, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::row::RowPage;
 use crate::runtime::mandatory::PreparedExecution;
@@ -54,7 +56,6 @@ use std::collections::BTreeSet;
 use std::mem::replace;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::time::Instant;
 
 #[cfg(test)]
 pub(crate) use tests::test_hooks;
@@ -169,11 +170,8 @@ struct CheckpointLwcPipeline<'a> {
     encode_limit: usize,
     last_accepted_end_row_id: RowID,
     first_error: Option<RuntimeOrFatalError>,
-    started_at: Instant,
-    final_cpu_completion_at: Option<Instant>,
-    final_write_acceptance_at: Option<Instant>,
-    produced_blocks: usize,
-    peak_cpu_occupancy: usize,
+    #[cfg(feature = "profiling")]
+    profile: CheckpointLwcProfile,
 }
 
 impl<'a> CheckpointLwcPipeline<'a> {
@@ -197,11 +195,8 @@ impl<'a> CheckpointLwcPipeline<'a> {
             next_to_write: 0,
             encode_limit,
             first_error: None,
-            started_at: Instant::now(),
-            final_cpu_completion_at: None,
-            final_write_acceptance_at: None,
-            produced_blocks: 0,
-            peak_cpu_occupancy: 0,
+            #[cfg(feature = "profiling")]
+            profile: CheckpointLwcProfile::new(),
         }
     }
 
@@ -228,8 +223,15 @@ impl<'a> CheckpointLwcPipeline<'a> {
             .submit(move || builder.build(row_shape_fingerprint));
         self.blocks
             .push(Some(LwcBlockState::Encoding { shape, completion }));
-        self.produced_blocks += 1;
-        self.peak_cpu_occupancy = self.peak_cpu_occupancy.max(self.cpu_occupancy());
+        #[cfg(feature = "profiling")]
+        {
+            self.profile.produced_blocks += 1;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.profile.peak_cpu_occupancy =
+                self.profile.peak_cpu_occupancy.max(self.cpu_occupancy());
+        }
         assert!(
             self.cpu_occupancy() <= self.encode_limit,
             "checkpoint CPU-stage occupancy exceeded ThreadPool worker bound"
@@ -269,7 +271,10 @@ impl<'a> CheckpointLwcPipeline<'a> {
                 }
             }
         };
-        self.final_cpu_completion_at = Some(Instant::now());
+        #[cfg(feature = "profiling")]
+        {
+            self.profile.final_cpu_completion_at = Some(Instant::now());
+        }
         // Take the owned Encoding state only after its completion is ready.
         // The temporary empty slot lets the encoded buffer cross the async
         // ingress boundary without duplicating the block in another queue.
@@ -303,7 +308,10 @@ impl<'a> CheckpointLwcPipeline<'a> {
         self.last_accepted_end_row_id = entry.end_row_id();
         self.blocks[self.next_to_write] = Some(LwcBlockState::Writing { entry, completion });
         self.next_to_write += 1;
-        self.final_write_acceptance_at = Some(Instant::now());
+        #[cfg(feature = "profiling")]
+        {
+            self.profile.final_write_acceptance_at = Some(Instant::now());
+        }
         Ok(true)
     }
 
@@ -366,7 +374,10 @@ impl<'a> CheckpointLwcPipeline<'a> {
             let start_row_id = shape.start_row_id();
             let end_row_id = shape.end_row_id();
             let result = completion.wait_take_result().await;
-            self.final_cpu_completion_at = Some(Instant::now());
+            #[cfg(feature = "profiling")]
+            {
+                self.profile.final_cpu_completion_at = Some(Instant::now());
+            }
             if let Err(error) = self.resolve_encode(start_row_id, end_row_id, result) {
                 self.record_error(error);
             }
@@ -455,12 +466,15 @@ impl<'a> CheckpointLwcPipeline<'a> {
         // Both paths must observe every write accepted before the error or end
         // of production. Only an all-success Written list becomes index input.
         self.drain_writes().await;
+        #[cfg(feature = "profiling")]
         let result = if self.first_error.is_some() {
             "error"
         } else {
             "ok"
         };
-        self.log_diagnostics(result);
+        #[cfg(feature = "profiling")]
+        self.profile
+            .log_diagnostics(result, self.table_id, self.encode_limit);
         if let Some(error) = self.first_error {
             return Err(error);
         }
@@ -472,31 +486,6 @@ impl<'a> CheckpointLwcPipeline<'a> {
                 _ => panic!("successful checkpoint pipeline has a non-Written terminal state"),
             })
             .collect())
-    }
-
-    fn log_diagnostics(&self, result: &str) {
-        let production_nanos = self.final_cpu_completion_at.map_or(0, |finished| {
-            finished.duration_since(self.started_at).as_nanos()
-        });
-        let cpu_to_accept_nanos = self
-            .final_cpu_completion_at
-            .zip(self.final_write_acceptance_at)
-            .and_then(|(cpu, accepted)| accepted.checked_duration_since(cpu))
-            .map_or(0, |duration| duration.as_nanos());
-        let write_drain_nanos = self
-            .final_write_acceptance_at
-            .map_or(0, |accepted| accepted.elapsed().as_nanos());
-        obs::debug!(
-            "event=checkpoint_lwc_pipeline component=table action=finish result={} table_id={} block_count={} cpu_stage_capacity={} peak_cpu_occupancy={} production_nanos={} final_cpu_to_final_write_acceptance_nanos={} data_write_drain_nanos={}",
-            result,
-            self.table_id,
-            self.produced_blocks,
-            self.encode_limit,
-            self.peak_cpu_occupancy,
-            production_nanos,
-            cpu_to_accept_nanos,
-            write_drain_nanos,
-        );
     }
 }
 

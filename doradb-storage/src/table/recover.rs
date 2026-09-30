@@ -5,10 +5,28 @@ use crate::error::{
     DataIntegrityError, DataIntegrityResult, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::{RowID, TrxID};
-use crate::recovery::{PackedPageBatch, ReplayKind, ReplayOp, RowReplayCounts, RowReplayState};
+#[cfg(feature = "profiling")]
+use crate::profiling::RowReplayCounts;
+use crate::recovery::{PackedPageBatch, ReplayKind, ReplayOp, RowReplayState};
 use crate::row::RowPage;
 use crate::table::{DeletionError, DmlValidator, Table};
 use error_stack::{Report, ResultExt};
+
+/// Feature-selected replay diagnostics; the disabled result has no payload.
+#[cfg(feature = "profiling")]
+pub(crate) type RowReplayResult = RowReplayCounts;
+
+/// Feature-selected replay diagnostics; the disabled result has no payload.
+#[cfg(not(feature = "profiling"))]
+pub(crate) type RowReplayResult = ();
+
+/// Independent mutation evidence retained across a partially failed replay batch.
+#[derive(Default)]
+struct RowReplayProgress {
+    mutated: bool,
+    #[cfg(feature = "profiling")]
+    counts: RowReplayCounts,
+}
 
 impl Table {
     /// Apply one ordered hot-page batch through one exclusive page acquisition.
@@ -19,7 +37,7 @@ impl Table {
         replay: &mut RowReplayState,
         ops: &PackedPageBatch,
         disable_dml_validation: bool,
-    ) -> RuntimeOrFatalResult<RowReplayCounts> {
+    ) -> RuntimeOrFatalResult<RowReplayResult> {
         let page_id = replay.page_id();
         let layout = self.layout_snapshot();
         let metadata = layout.metadata();
@@ -27,7 +45,7 @@ impl Table {
             .row_store
             .must_get_row_page_exclusive(guards, page_id)
             .await?;
-        let mut counts = RowReplayCounts::default();
+        let mut progress = RowReplayProgress::default();
         // The job exclusively owns the bitmap. No scheduler wait occurs while
         // the latch is held, and every successful mutation is marked dirty even
         // if validation or mutation of a later operation fails.
@@ -37,16 +55,23 @@ impl Table {
             replay,
             ops,
             disable_dml_validation,
-            &mut counts,
+            &mut progress,
         );
-        if !counts.is_empty() {
+        if progress.mutated {
             page_guard.set_dirty();
         }
         result?;
-        Ok(counts)
+        #[cfg(feature = "profiling")]
+        {
+            Ok(progress.counts)
+        }
+        #[cfg(not(feature = "profiling"))]
+        {
+            Ok(())
+        }
     }
 
-    /// Apply ordered operations to the latched page, retaining counts on failure.
+    /// Apply ordered operations to the latched page, retaining the mutation marker on failure.
     fn recover_row_batch_to_page(
         &self,
         metadata: &TableMetadata,
@@ -54,7 +79,7 @@ impl Table {
         replay: &mut RowReplayState,
         ops: &PackedPageBatch,
         disable_dml_validation: bool,
-        counts: &mut RowReplayCounts,
+        progress: &mut RowReplayProgress,
     ) -> RuntimeResult<()> {
         let page_id = replay.page_id();
         for op in ops.operations() {
@@ -64,7 +89,7 @@ impl Table {
                 replay,
                 &op,
                 disable_dml_validation,
-                counts,
+                progress,
             )
             .change_context(RuntimeError::TableAccess)
             .attach_with(|| {
@@ -77,7 +102,7 @@ impl Table {
         Ok(())
     }
 
-    /// Validate and apply one operation, counting only its successful mutation.
+    /// Validate and apply one operation, marking every successful mutation before continuing.
     fn recover_row_op_to_page(
         &self,
         metadata: &TableMetadata,
@@ -85,7 +110,7 @@ impl Table {
         replay: &mut RowReplayState,
         op: &ReplayOp<'_>,
         disable_dml_validation: bool,
-        counts: &mut RowReplayCounts,
+        progress: &mut RowReplayProgress,
     ) -> DataIntegrityResult<()> {
         let row_id = op.row_id;
         let cts = op.cts;
@@ -97,7 +122,11 @@ impl Table {
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
                 self.recover_row_insert_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
-                counts.inserts += 1;
+                progress.mutated = true;
+                #[cfg(feature = "profiling")]
+                {
+                    progress.counts.inserts += 1;
+                }
             }
             ReplayKind::Update(cols) => {
                 if !disable_dml_validation {
@@ -106,11 +135,19 @@ impl Table {
                         .change_context(DataIntegrityError::InvalidPayload)?;
                 }
                 self.recover_row_update_to_page(metadata, page_guard, replay, row_id, cols, cts)?;
-                counts.updates += 1;
+                progress.mutated = true;
+                #[cfg(feature = "profiling")]
+                {
+                    progress.counts.updates += 1;
+                }
             }
             ReplayKind::Delete => {
                 self.recover_row_delete_to_page(page_guard, replay, row_id, cts)?;
-                counts.deletes += 1;
+                progress.mutated = true;
+                #[cfg(feature = "profiling")]
+                {
+                    progress.counts.deletes += 1;
+                }
             }
         }
         Ok(())
@@ -398,6 +435,7 @@ mod tests {
             let page_id = page.page_id();
             let row_id = page.page().header.start_row_id;
             let mut replay = replay_state(&page);
+            page.bf().set_dirty(false);
             drop(page);
             for kind in [
                 RowRedoKind::Insert(page_id, vec![Val::from(1i32)]),
@@ -442,6 +480,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(page.page().header.row_count(), 0);
                 assert!(page.page().is_deleted(0));
+                assert!(!page.is_dirty());
             }
             for (slot, disable_validation) in [false, true].into_iter().enumerate() {
                 let current_row = row_id + slot as u64;
@@ -466,17 +505,22 @@ mod tests {
                         },
                     })
                     .collect();
-                let counts = table
+                let result = table
                     .recover_row_batch(
                         &guards,
                         &mut replay,
                         &pack_test_ops(ops),
                         disable_validation,
                     )
-                    .await
-                    .unwrap();
-                assert_eq!(counts.inserts, 1);
-                assert_eq!(counts.updates, 1);
+                    .await;
+                #[cfg(feature = "profiling")]
+                let _counts = result.unwrap();
+                #[cfg(not(feature = "profiling"))]
+                result.unwrap();
+                #[cfg(feature = "profiling")]
+                assert_eq!(_counts.inserts, 1);
+                #[cfg(feature = "profiling")]
+                assert_eq!(_counts.updates, 1);
                 assert!(replay.is_inserted(slot));
                 let page = table
                     .row_store
@@ -487,6 +531,98 @@ mod tests {
                     page.page().row(slot).clone_vals(&table.metadata().col),
                     vec![Val::I32(1), Val::from("replacement bytes")]
                 );
+            }
+        });
+    }
+
+    /// Purpose: Preserve dirty-page tracking independently of optional replay counters.
+    /// Expected: An insert, update, or delete followed by invalid replay still marks the
+    /// page dirty and retains the successful mutation despite returning an error.
+    #[test]
+    fn test_partial_replay_failure_marks_successful_mutations_dirty() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine =
+                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "partial_replay").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let session = engine.new_session().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let guards = session.pool_guards();
+            let page = table
+                .row_store
+                .get_insert_page_exclusive(&guards, 2)
+                .await
+                .unwrap();
+            let page_id = page.page_id();
+            let row_id = page.page().header.start_row_id;
+            let mut replay = replay_state(&page);
+            page.bf().set_dirty(false);
+            drop(page);
+            let kinds = [
+                RowRedoKind::Insert(page_id, vec![Val::I32(1), Val::from("initial")]),
+                RowRedoKind::Update(
+                    page_id,
+                    vec![UpdateCol {
+                        idx: 1,
+                        val: Val::from("updated"),
+                    }],
+                ),
+                RowRedoKind::Delete(Some(page_id)),
+            ];
+            for (step, kind) in kinds.into_iter().enumerate() {
+                let cts = TrxID::new(10 + 2 * step as u64);
+                let ops = pack_test_ops([
+                    OwnedReplayOp {
+                        cts,
+                        row: RowRedo { row_id, kind },
+                    },
+                    OwnedReplayOp {
+                        cts: cts + 1,
+                        row: RowRedo {
+                            row_id,
+                            kind: RowRedoKind::Update(
+                                page_id,
+                                vec![UpdateCol {
+                                    idx: 2,
+                                    val: Val::from("invalid column"),
+                                }],
+                            ),
+                        },
+                    },
+                ]);
+                let err = table
+                    .recover_row_batch(&guards, &mut replay, &ops, false)
+                    .await
+                    .unwrap_err();
+                let RuntimeOrFatalError::Runtime(err) = err else {
+                    panic!("expected invalid payload, got {err:?}");
+                };
+                assert_eq!(
+                    err.downcast_ref::<DataIntegrityError>(),
+                    Some(&DataIntegrityError::InvalidPayload)
+                );
+                let page = table
+                    .row_store
+                    .must_get_row_page_exclusive(&guards, page_id)
+                    .await
+                    .unwrap();
+                assert!(
+                    page.is_dirty(),
+                    "mutation {step} must survive batch failure"
+                );
+                assert!(replay.is_inserted(0));
+                assert_eq!(page.page().is_deleted(0), step == 2);
+                if step < 2 {
+                    assert_eq!(
+                        page.page().row(0).clone_vals(&table.metadata().col),
+                        vec![
+                            Val::I32(1),
+                            Val::from(if step == 0 { "initial" } else { "updated" })
+                        ]
+                    );
+                }
+                // Isolate the next operation's dirty transition from this mutation.
+                page.bf().set_dirty(false);
             }
         });
     }
@@ -831,13 +967,19 @@ mod tests {
                         kind,
                     },
                 }]);
-                let counts = table
+                let result = table
                     .recover_row_batch(&guards, &mut replay, &batch, false)
-                    .await
-                    .unwrap();
-                assert_eq!(counts.inserts, u64::from(phase == "insert"), "{phase}");
-                assert_eq!(counts.updates, u64::from(phase == "update"), "{phase}");
-                assert_eq!(counts.deletes, 0, "{phase}");
+                    .await;
+                #[cfg(feature = "profiling")]
+                let _counts = result.unwrap();
+                #[cfg(not(feature = "profiling"))]
+                result.unwrap();
+                #[cfg(feature = "profiling")]
+                assert_eq!(_counts.inserts, u64::from(phase == "insert"), "{phase}");
+                #[cfg(feature = "profiling")]
+                assert_eq!(_counts.updates, u64::from(phase == "update"), "{phase}");
+                #[cfg(feature = "profiling")]
+                assert_eq!(_counts.deletes, 0, "{phase}");
                 assert!(replay.is_inserted(1), "{phase}");
                 drop(batch);
                 let page = table

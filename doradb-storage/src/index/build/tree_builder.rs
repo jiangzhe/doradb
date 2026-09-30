@@ -28,10 +28,17 @@ use crate::index::mem_index::MemIndex;
 use crate::index::util::Maskable;
 use crate::latch::LatchFallbackMode;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::{
+    ColdHotMeasurements, HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements,
+    PageMeasurement, ParentPlanningProfile, clock::Instant,
+};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{thread_pool::ThreadPool, yield_now};
 use error_stack::{Report, ResultExt};
 use futures::FutureExt;
+#[cfg(feature = "profiling")]
+use std::mem::take;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -46,60 +53,8 @@ pub(crate) use tests::{
     assert_recovery_root, gate_recovery_allocation, panic_install_transfer, panic_recovery_cleanup,
 };
 
-#[cfg(feature = "profiling")]
-use super::cold_validation::ColdHotMeasurements;
-#[cfg(feature = "profiling")]
-use crate::profiling::{HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements};
-#[cfg(feature = "profiling")]
-use std::{mem::take, time::Instant};
-
 const INITIAL_CANDIDATES: usize = 64;
 const PARENT_WINDOW: usize = max_node_slots::<BTreeU64>() + 2;
-
-#[cfg(feature = "profiling")]
-#[derive(Clone, Copy, Debug, Default)]
-struct PageMeasurement {
-    planning: u64,
-    allocation: u64,
-    packing: u64,
-    occupied: usize,
-}
-
-// One restartable parent-planning attempt. The interval continues across helper
-// returns and is restarted only after an actual cooperative yield resumes.
-#[cfg(feature = "profiling")]
-struct ParentPlanningProfile {
-    started: Instant,
-    interval_started: Instant,
-    max_sync_nanos: u64,
-}
-
-#[cfg(feature = "profiling")]
-impl ParentPlanningProfile {
-    fn new(started: Instant) -> Self {
-        Self {
-            started,
-            interval_started: started,
-            max_sync_nanos: 0,
-        }
-    }
-
-    fn record(&mut self, now: Instant) {
-        self.max_sync_nanos = self
-            .max_sync_nanos
-            .max(now.duration_since(self.interval_started).as_nanos() as u64);
-    }
-
-    fn resume(&mut self, now: Instant) {
-        self.interval_started = now;
-    }
-
-    fn finish(mut self, now: Instant, measurements: &mut HotPackedMeasurements) {
-        self.record(now);
-        measurements.parent_planning_nanos += now.duration_since(self.started).as_nanos() as u64;
-        measurements.max_sync_nanos = measurements.max_sync_nanos.max(self.max_sync_nanos);
-    }
-}
 
 /// Page identity and borrowed fence coordinates; ownership lives only in the page tracker.
 #[derive(Clone, Copy, Debug)]
@@ -661,6 +616,7 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
 
     /// Return exhaustive consumed entries after construction completes.
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     pub(crate) fn entries(&self) -> usize {
         self.assembly.completion.entries()
     }

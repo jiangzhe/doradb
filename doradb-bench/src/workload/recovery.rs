@@ -3,10 +3,10 @@ use super::index_fixture::prepare_index_fixture;
 use crate::error::{BenchError, Result};
 use crate::fixture::{IndexMode, RecoverableTable};
 use crate::measurement::{InternalMetric, MeasurementClock, RecoveryReport, RecoveryVerification};
-use crate::output::{capture_internal_stats, cumulative_internal_metrics};
 use crate::plan::RecoveryFixture;
 use crate::workload::verification::{Fingerprint, scan_content};
 use doradb_storage::id::TableID;
+use doradb_storage::profiling::InternalStatsSnapshot;
 use doradb_storage::{Engine, EngineConfig, IndexID};
 
 /// Successful reopen measurement before shared aggregation.
@@ -80,11 +80,10 @@ pub(crate) async fn run_recovery(
     let engine = owner
         .as_ref()
         .ok_or_else(|| BenchError::message("recovery lost the reopened owner"))?;
-    let report = RecoveryReport::from_storage(engine.recovery_report())?;
+    let report = RecoveryReport::try_from(engine.recovery_report())?;
     let internal_metrics = if include_stats {
         let mut session = engine.new_session()?;
-        let result =
-            capture_internal_stats(&session).map(|snapshot| cumulative_internal_metrics(&snapshot));
+        let result = InternalStatsSnapshot::capture(&session).map(|snapshot| snapshot.cumulative());
         let close = session.close().await;
         let metrics = result?;
         close?;

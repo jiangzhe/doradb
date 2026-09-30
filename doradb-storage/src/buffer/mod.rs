@@ -13,11 +13,12 @@ mod util;
 
 #[cfg(test)]
 pub(crate) use self::arena::outstanding_base_guard_count as test_outstanding_base_guard_count;
+#[cfg(all(test, feature = "profiling"))]
+pub(crate) use self::evict::tests::io_backend_stats_handle_identity as test_io_backend_stats_handle_identity;
 #[cfg(test)]
 pub(crate) use self::evict::tests::{
     dispatch_dirty_pages_for_test as test_dispatch_dirty_pages,
     evict_existing_page_for_test as test_evict_existing_page, frame_kind as test_frame_kind,
-    io_backend_stats_handle_identity as test_io_backend_stats_handle_identity,
     persist_and_evict_page_for_test as test_persist_and_evict_page,
 };
 #[cfg(test)]
@@ -30,6 +31,8 @@ pub(crate) use evict::EvictableBufferPool;
 pub(crate) use evict::{
     EvictReadSubmission, EvictSubmission, EvictablePoolStateMachine, PoolRequest,
 };
+#[cfg(feature = "profiling")]
+pub(crate) use evictor::SharedEvictionDomainId;
 pub(crate) use evictor::SharedPoolEvictorWorkers;
 pub(crate) use evictor::{EvictionArbiter, EvictionArbiterBuilder};
 pub(crate) use fixed::FixedBufferPool;
@@ -58,14 +61,11 @@ use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::{BlockID, PageID};
 use crate::latch::LatchFallbackMode;
 use crate::quiescent::QuiescentBox;
-use crate::stats::BufferPoolCounters;
 use error_stack::{Report, ResultExt};
 use std::fmt::Debug;
 use std::future::Future;
 use std::mem::size_of;
 use std::result::Result as StdResult;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Sentinel page id used when no real page id is available.
 pub(crate) const INVALID_PAGE_ID: PageID = PageID::new(u64::MAX);
@@ -80,127 +80,6 @@ pub(crate) type PageIOCompletion = Completion<PageID>;
 /// Validation callback for one persisted readonly-cache block image.
 pub(crate) type ReadonlyBlockValidator = fn(&[u8], FileKind, BlockID) -> DataIntegrityResult<()>;
 
-#[derive(Default)]
-struct BufferPoolStatsCounters {
-    cache_hits: AtomicUsize,
-    cache_misses: AtomicUsize,
-    miss_joins: AtomicUsize,
-    queued_reads: AtomicUsize,
-    running_reads: AtomicUsize,
-    completed_reads: AtomicUsize,
-    read_errors: AtomicUsize,
-    queued_writes: AtomicUsize,
-    running_writes: AtomicUsize,
-    completed_writes: AtomicUsize,
-    write_errors: AtomicUsize,
-}
-
-/// Cloneable writer handle for buffer-pool stats counters.
-#[derive(Clone, Default)]
-pub(crate) struct BufferPoolStatsHandle(Arc<BufferPoolStatsCounters>);
-
-impl BufferPoolStatsHandle {
-    /// Returns one point-in-time snapshot of all counters.
-    #[inline]
-    pub(crate) fn snapshot(&self) -> BufferPoolCounters {
-        BufferPoolCounters {
-            cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
-            cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
-            miss_joins: self.0.miss_joins.load(Ordering::Relaxed),
-            queued_reads: self.0.queued_reads.load(Ordering::Relaxed),
-            running_reads: self.0.running_reads.load(Ordering::Relaxed),
-            completed_reads: self.0.completed_reads.load(Ordering::Relaxed),
-            read_errors: self.0.read_errors.load(Ordering::Relaxed),
-            queued_writes: self.0.queued_writes.load(Ordering::Relaxed),
-            running_writes: self.0.running_writes.load(Ordering::Relaxed),
-            completed_writes: self.0.completed_writes.load(Ordering::Relaxed),
-            write_errors: self.0.write_errors.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Records one cache hit.
-    #[inline]
-    pub(crate) fn record_cache_hit(&self) {
-        self.0.cache_hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one cache miss.
-    #[inline]
-    pub(crate) fn record_cache_miss(&self) {
-        self.0.cache_misses.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one miss that joined an existing inflight load.
-    #[inline]
-    pub(crate) fn record_miss_join(&self) {
-        self.0.miss_joins.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Adds queued read operations to the counter set.
-    #[inline]
-    pub(crate) fn add_queued_reads(&self, count: usize) {
-        if count != 0 {
-            self.0.queued_reads.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds running read operations to the counter set.
-    #[inline]
-    pub(crate) fn add_running_reads(&self, count: usize) {
-        if count != 0 {
-            self.0.running_reads.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds completed read operations to the counter set.
-    #[inline]
-    pub(crate) fn add_completed_reads(&self, count: usize) {
-        if count != 0 {
-            self.0.completed_reads.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds failed read operations to the counter set.
-    #[inline]
-    pub(crate) fn add_read_errors(&self, count: usize) {
-        if count != 0 {
-            self.0.read_errors.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds queued write operations to the counter set.
-    #[inline]
-    pub(crate) fn add_queued_writes(&self, count: usize) {
-        if count != 0 {
-            self.0.queued_writes.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds running write operations to the counter set.
-    #[inline]
-    pub(crate) fn add_running_writes(&self, count: usize) {
-        if count != 0 {
-            self.0.running_writes.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds completed write operations to the counter set.
-    #[inline]
-    pub(crate) fn add_completed_writes(&self, count: usize) {
-        if count != 0 {
-            self.0.completed_writes.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-
-    /// Adds failed write operations to the counter set.
-    #[inline]
-    pub(crate) fn add_write_errors(&self, count: usize) {
-        if count != 0 {
-            self.0.write_errors.fetch_add(count, Ordering::Relaxed);
-        }
-    }
-}
-
 /// Abstraction of buffer pool.
 pub(crate) trait BufferPool: Send + Sync {
     /// Native access failures; pools that perform I/O also preserve Fatal.
@@ -210,6 +89,7 @@ pub(crate) trait BufferPool: Send + Sync {
     fn capacity(&self) -> usize;
 
     /// Returns the number of allocated pages.
+    #[cfg(any(test, feature = "profiling"))]
     fn allocated(&self) -> usize;
 
     /// Test allocation membership under a caller-owned page-stability contract.

@@ -1222,6 +1222,7 @@ mod tests {
                             .await
                             .unwrap();
                         assert_eq!(cleanup.live_delay, None);
+                        #[cfg(feature = "profiling")]
                         assert!(cleanup.stats.indexes.iter().all(|stats| stats.removed > 0));
                     }
                     let mut writer_session = engine.new_session().unwrap();

@@ -14,7 +14,7 @@ workspace = true
 
 [features]
 default = ["iouring", "profiling"]
-profiling = []
+profiling = ["dep:quanta", "dep:rustix"]
 libaio = []
 iouring = ["dep:io-uring"]
 
@@ -44,6 +44,9 @@ crc32fast = { workspace = true }
 ordered-float = { workspace = true }
 dashmap = { workspace = true }
 io-uring = { workspace = true, optional = true }
+
+quanta = { workspace = true, optional = true }
+rustix = { workspace = true, features = ["param", "time"], optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

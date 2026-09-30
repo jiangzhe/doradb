@@ -5,17 +5,15 @@ use crate::buffer::guard::{
     FacadePageGuard, PageExclusiveGuard, PageLatchGuard, RowVersionMapGuard,
 };
 use crate::buffer::page::{BufferPage, Page, VersionedPageID};
-use crate::buffer::{
-    BufferPool, BufferPoolStatsHandle, PoolGuard, PoolIdentity, PoolRole, RowPoolRole,
-    pool_role_name,
-};
+use crate::buffer::{BufferPool, PoolGuard, PoolIdentity, PoolRole, RowPoolRole, pool_role_name};
 use crate::error::Validation::Valid;
 use crate::error::{
     InternalError, ResourceError, ResourceResult, RuntimeError, RuntimeResult, Validation,
 };
 use crate::id::PageID;
 use crate::latch::LatchFallbackMode;
-use crate::stats::BufferPoolCounters;
+#[cfg(feature = "profiling")]
+use crate::profiling::{BufferPoolCounters, BufferPoolStatsHandle};
 use error_stack::Report;
 use std::mem;
 
@@ -26,6 +24,7 @@ pub(crate) struct FixedBufferPool {
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
     role: PoolRole,
+    #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
     arena: QuiescentArena,
 }
@@ -46,6 +45,7 @@ impl FixedBufferPool {
             size,
             alloc_map: AllocMap::new(size),
             role,
+            #[cfg(feature = "profiling")]
             stats: BufferPoolStatsHandle::default(),
             arena,
         })
@@ -65,6 +65,7 @@ impl FixedBufferPool {
 
     /// Returns one snapshot of fixed-pool access counters.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats(&self) -> BufferPoolCounters {
         self.stats.snapshot()
     }
@@ -109,6 +110,7 @@ impl FixedBufferPool {
             pool_role_name(self.role)
         );
         let page = self.get_page_internal(guard, page_id, mode).await;
+        #[cfg(feature = "profiling")]
         self.stats.record_cache_hit();
         page
     }
@@ -135,6 +137,7 @@ impl FixedBufferPool {
         );
         let child = self.get_page_internal::<T>(guard, page_id, mode).await;
         if parent.validate_bool() {
+            #[cfg(feature = "profiling")]
             self.stats.record_cache_hit();
             return Validation::Valid(child);
         }
@@ -154,6 +157,7 @@ impl BufferPool for FixedBufferPool {
     }
 
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     fn allocated(&self) -> usize {
         self.alloc_map.allocated()
     }
@@ -224,6 +228,7 @@ impl BufferPool for FixedBufferPool {
             "page not allocated"
         );
         let guard = self.get_page_internal(guard, page_id, mode).await;
+        #[cfg(feature = "profiling")]
         self.stats.record_cache_hit();
         Ok(guard)
     }
@@ -246,6 +251,7 @@ impl BufferPool for FixedBufferPool {
             }
             return Ok(None);
         }
+        #[cfg(feature = "profiling")]
         self.stats.record_cache_hit();
         Ok(Some(g))
     }
@@ -292,6 +298,7 @@ impl BufferPool for FixedBufferPool {
         // the validation make sure parent page does not change until child
         // page is acquired.
         if p_guard.validate_bool() {
+            #[cfg(feature = "profiling")]
             self.stats.record_cache_hit();
             return Ok(Valid(g));
         }
@@ -629,6 +636,7 @@ mod tests {
 
     /// Purpose: Classify fixed-pool reads as resident cache accesses.
     /// Expected: A resident read records a hit without a miss or storage read.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_fixed_buffer_pool_stats_track_resident_hits_only() {
         smol::block_on(async {
@@ -641,6 +649,7 @@ mod tests {
             let page_id = page.page_id();
             drop(page);
 
+            #[cfg(feature = "profiling")]
             let baseline = pool.stats();
             let guard = pool
                 .get_page::<RowPageIndexNode>(&pool_guard, page_id, LatchFallbackMode::Shared)
@@ -648,11 +657,17 @@ mod tests {
                 .expect("fixed-pool read failed in test");
             drop(guard);
 
+            #[cfg(feature = "profiling")]
             let delta = pool.stats().delta_since(baseline);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.queued_reads, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.running_reads, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(delta.completed_reads, 0);
         });
     }

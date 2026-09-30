@@ -150,6 +150,7 @@ impl HotBuildTableSource {
 
     /// Count final hot pages once, independently of the number of active indexes.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn page_count(&self) -> usize {
         self.pages.len()
     }
