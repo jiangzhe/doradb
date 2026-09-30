@@ -526,12 +526,6 @@ impl MandatoryInternalTask for TerminalRollbackCleanupJob {
 /// As undo logs are maintained purely in memory, we can use shared pointer with atomic variable
 /// to perform very fast CTS backfill.
 pub(crate) struct TransactionSystem {
-    /// Value-only completed recovery measurements for engine assembly.
-    #[cfg(feature = "profiling")]
-    pub(crate) recovery_report: RecoveryReport,
-    /// Recorder retained from bootstrap for public hot-build snapshots.
-    #[cfg(feature = "profiling")]
-    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
     /// A sequence to generate snapshot timestamp(abbr. sts) and commit timestamp(abbr. cts).
     /// They share the same sequence and start from 1.
     /// The two timestamps are used to identify which version of data a transaction should see.
@@ -604,6 +598,12 @@ pub(crate) struct TransactionSystem {
     /// This is separate from the catalog checkpoint gate: it protects redo
     /// marker/suffix/progress consistency, not catalog metadata DDL ordering.
     redo_retention_gate: CachePadded<ExclusiveGate>,
+    /// Value-only completed recovery measurements for engine assembly.
+    #[cfg(feature = "profiling")]
+    pub(crate) recovery_report: RecoveryReport,
+    /// Recorder retained from bootstrap for public hot-build snapshots.
+    #[cfg(feature = "profiling")]
+    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
 }
 
 impl TransactionSystem {
@@ -730,10 +730,6 @@ impl TransactionSystem {
             catalog.snapshot_dropped_table_file_cleanups(),
         );
         TransactionSystem {
-            #[cfg(feature = "profiling")]
-            recovery_report: RecoveryReport::default(),
-            #[cfg(feature = "profiling")]
-            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
             ts: CachePadded::new(AtomicU64::new(initial_ts.as_u64())),
             global_visible_sts: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
             published_gc_horizon: CachePadded::new(MonotonicU64::new(initial_ts.as_u64())),
@@ -756,6 +752,10 @@ impl TransactionSystem {
             fatal_rollback_retention: CachePadded::new(Mutex::new(Vec::new())),
             catalog_redo_retention: CachePadded::new(Mutex::new(None)),
             redo_retention_gate: CachePadded::new(ExclusiveGate::new()),
+            #[cfg(feature = "profiling")]
+            recovery_report: RecoveryReport::default(),
+            #[cfg(feature = "profiling")]
+            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
         }
     }
 

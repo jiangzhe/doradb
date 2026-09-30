@@ -313,13 +313,13 @@ impl RedoReplayPlanner {
         let stream = RecoveryLogStream::from_planned_segments(planned.stream_segments, read_depth)
             .attach("phase=plan_recovery_redo_read_ahead")?;
         Ok(PlannedRedoRecovery {
+            skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
+            stream,
+            repair_policy: planned.repair_policy,
             #[cfg(feature = "profiling")]
             segments_discovered: self.discovered.len() as u64,
             #[cfg(feature = "profiling")]
             segments_selected,
-            skipped_max_recovered_cts: planned.skipped_max_recovered_cts,
-            stream,
-            repair_policy: planned.repair_policy,
         })
     }
 
@@ -484,18 +484,18 @@ struct PlannedReplaySegments {
 
 /// Complete redo startup plan: stream plus post-replay repair policy.
 pub(crate) struct PlannedRedoRecovery {
-    /// Segment filenames discovered, including excluded segments.
-    #[cfg(feature = "profiling")]
-    pub(crate) segments_discovered: u64,
-    /// Segments selected for body replay.
-    #[cfg(feature = "profiling")]
-    pub(crate) segments_selected: u64,
     /// Highest CTS from sealed skipped segments below the replay floor.
     pub(crate) skipped_max_recovered_cts: Option<TrxID>,
     /// Stream over the planned durable redo prefix.
     pub(crate) stream: RecoveryLogStream,
     /// Repair and writable-file policy to apply after stream replay.
     pub(crate) repair_policy: RedoRecoveryRepairPolicy,
+    /// Segment filenames discovered, including excluded segments.
+    #[cfg(feature = "profiling")]
+    pub(crate) segments_discovered: u64,
+    /// Segments selected for body replay.
+    #[cfg(feature = "profiling")]
+    pub(crate) segments_selected: u64,
 }
 
 /// Catalog checkpoint scan plan with sealed redo segment summaries.
@@ -690,8 +690,6 @@ impl RecoveryLogStream {
 
 /// Buffered stream of transaction redo records across a sequence of redo files.
 struct RedoGroupReader {
-    #[cfg(feature = "profiling")]
-    metrics: Option<RecoveryRedoMetrics>,
     /// Direct-IO read-ahead worker for the planned logical stream.
     reader: Option<RedoReadAheadHandle>,
     /// Parser state for the current redo segment.
@@ -700,6 +698,8 @@ struct RedoGroupReader {
     state: RedoLogStreamState,
     /// Accepted-prefix metadata for scanned unsealed segments.
     unsealed_terminals: Vec<UnsealedSegmentTerminal>,
+    #[cfg(feature = "profiling")]
+    metrics: Option<RecoveryRedoMetrics>,
 }
 
 impl RedoGroupReader {

@@ -378,12 +378,8 @@ impl RedoLogFinalizer {
             RedoLog {
                 group_commit: CachePadded::new(MutexGroupCommit::new(group_commit)),
                 persisted_cts: CachePadded::new(AtomicU64::new(MIN_SNAPSHOT_TS.as_u64())),
-                #[cfg(feature = "profiling")]
-                stats: Arc::new(CachePadded::new(RedoLogStats::default())),
                 purge_tx,
                 log_write_backend: CachePadded::new(Mutex::new(Some(ctx))),
-                #[cfg(feature = "profiling")]
-                io_backend_stats,
                 log_block_size: self.log_block_size,
                 file_prefix: self.file_prefix,
                 file_seq: AtomicU32::new(file_seq),
@@ -393,6 +389,10 @@ impl RedoLogFinalizer {
                     self.log_write_io_depth * 2,
                     move || DirectBuf::zeroed(self.log_block_size),
                 ),
+                #[cfg(feature = "profiling")]
+                stats: Arc::new(CachePadded::new(RedoLogStats::default())),
+                #[cfg(feature = "profiling")]
+                io_backend_stats,
             },
             header_completion,
         ))
@@ -644,16 +644,10 @@ pub(crate) struct RedoLog {
     /// still seeds timestamps only from checkpoint metadata, table roots, and
     /// redo headers.
     pub(crate) persisted_cts: CachePadded<AtomicU64>,
-    /// Stats of transaction system.
-    #[cfg(feature = "profiling")]
-    pub(crate) stats: Arc<CachePadded<RedoLogStats>>,
     /// Purge coordinator channel used for committed transaction GC handoff.
     pub(crate) purge_tx: Sender<Purge>,
     /// Backend for redo writes, taken exactly once by the log thread.
     log_write_backend: CachePadded<Mutex<Option<StorageBackend>>>,
-    /// Backend-owned submit/wait statistics for redo writes.
-    #[cfg(feature = "profiling")]
-    io_backend_stats: BackendStatsHandle,
     /// Fixed byte size of every redo data-block write.
     pub(crate) log_block_size: usize,
     /// Log file prefix for the single redo file family.
@@ -664,6 +658,12 @@ pub(crate) struct RedoLog {
     pub(crate) file_max_size: usize,
     /// Free list of reusable fixed-block write buffers returned by completed I/O.
     pub(crate) buf_free_list: FreeList<DirectBuf>,
+    /// Stats of transaction system.
+    #[cfg(feature = "profiling")]
+    pub(crate) stats: Arc<CachePadded<RedoLogStats>>,
+    /// Backend-owned submit/wait statistics for redo writes.
+    #[cfg(feature = "profiling")]
+    io_backend_stats: BackendStatsHandle,
 }
 
 impl RedoLog {
@@ -972,14 +972,14 @@ struct ReadyGroupPrefix {
     /// Last prefix entry id drained into this batch. A front sync barrier
     /// reuses this id to keep live prefix ids contiguous for O(1) lookup.
     sync_barrier_id: Option<LogPrefixId>,
-    #[cfg(feature = "profiling")]
-    trx_count: usize,
-    #[cfg(feature = "profiling")]
-    commit_count: usize,
     log_bytes: usize,
     /// Redo fd for `written`. A publish batch cannot span log files.
     log_fd: Option<RawFd>,
     failure_reason: Option<FailedPrecommitReason>,
+    #[cfg(feature = "profiling")]
+    trx_count: usize,
+    #[cfg(feature = "profiling")]
+    commit_count: usize,
 }
 
 /// Durability mode for syncing redo log writes.

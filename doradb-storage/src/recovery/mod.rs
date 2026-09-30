@@ -79,8 +79,6 @@ pub(crate) struct RecoveryOutcome {
 
 /// Recovery coordinator for checkpoint bootstrap, redo replay, final repair, and redo startup.
 pub(crate) struct RecoveryCoordinator<'a> {
-    #[cfg(feature = "profiling")]
-    report: RecoveryReport,
     /// Catalog, table files, and buffer-pool resources used by recovery.
     resources: RecoveryResources<'a>,
     /// Planner for the ordered redo-log stream.
@@ -97,6 +95,8 @@ pub(crate) struct RecoveryCoordinator<'a> {
     pending_index_ddl_reconciliations: FastHashSet<TableID>,
     /// Bounded page replay and retained insertion history.
     dispatcher: ReplayDispatcher,
+    #[cfg(feature = "profiling")]
+    report: RecoveryReport,
 }
 
 impl<'a> RecoveryCoordinator<'a> {
@@ -114,8 +114,6 @@ impl<'a> RecoveryCoordinator<'a> {
             config,
         );
         RecoveryCoordinator {
-            #[cfg(feature = "profiling")]
-            report: RecoveryReport::default(),
             resources,
             redo_planner,
             redo_read_depth: config.io_depth,
@@ -124,6 +122,8 @@ impl<'a> RecoveryCoordinator<'a> {
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             dispatcher,
+            #[cfg(feature = "profiling")]
+            report: RecoveryReport::default(),
         }
     }
 

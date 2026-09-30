@@ -120,9 +120,9 @@ pub(crate) struct ReadonlyBufferPool {
     fs: QuiescentGuard<FileSystem>,
     shutdown_flag: Arc<AtomicBool>,
     role: PoolRole,
+    arena: QuiescentArena,
     #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
-    arena: QuiescentArena,
 }
 
 impl ReadonlyBufferPool {
@@ -170,11 +170,11 @@ impl ReadonlyBufferPool {
             fs,
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             role,
-            #[cfg(feature = "profiling")]
-            stats: BufferPoolStatsHandle::default(),
             #[cfg(test)]
             test_progress: tests::ReadTestProgress::default(),
             arena,
+            #[cfg(feature = "profiling")]
+            stats: BufferPoolStatsHandle::default(),
         };
         Ok(pool)
     }
@@ -367,10 +367,10 @@ impl ReadonlyBufferPool {
     pub(super) fn shared_evictor_domain(pool: SyncQuiescentGuard<Self>) -> SharedEvictionDomain {
         let (runtime, policy) = Self::evictor_parts(pool);
         SharedEvictionDomain::new(
-            #[cfg(feature = "profiling")]
-            SharedEvictionDomainId::Readonly,
             runtime,
             policy,
+            #[cfg(feature = "profiling")]
+            SharedEvictionDomainId::Readonly,
         )
     }
 

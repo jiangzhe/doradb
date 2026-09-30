@@ -19,9 +19,9 @@ use std::ptr::null_mut;
 pub(crate) const BACKEND_NAME: &str = "libaio";
 
 struct LibaioWaitResult {
+    completed: Vec<(BackendToken, StdIoResult<usize>)>,
     #[cfg(feature = "profiling")]
     calls: usize,
-    completed: Vec<(BackendToken, StdIoResult<usize>)>,
 }
 
 /// Concrete libaio context used by the current storage-engine backend.
@@ -133,9 +133,9 @@ impl LibaioBackend {
             completed.push((BackendToken::from_raw(ev.data), res));
         }
         Ok(LibaioWaitResult {
+            completed,
             #[cfg(feature = "profiling")]
             calls: wait_calls,
-            completed,
         })
     }
 }

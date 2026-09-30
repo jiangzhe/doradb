@@ -60,11 +60,11 @@ const PARENT_WINDOW: usize = max_node_slots::<BTreeU64>() + 2;
 #[derive(Clone, Copy, Debug)]
 struct ChildDescriptor {
     page_id: PageID,
-    #[cfg(feature = "profiling")]
-    measurement: PageMeasurement,
     height: u16,
     lower: Option<HotEntryRef>,
     upper: Option<HotEntryRef>,
+    #[cfg(feature = "profiling")]
+    measurement: PageMeasurement,
 }
 
 /// Completed construction or settled duplicate evidence for caller-owned classification.
@@ -476,12 +476,12 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
                 .completion
                 .take()
                 .unwrap_or_else(|| unreachable!("finished build owns merge completion")),
-            #[cfg(feature = "profiling")]
-            measurements: take(&mut self.measurements),
             cold_completion: self
                 .cold_completion
                 .take()
                 .unwrap_or_else(|| unreachable!("finished build owns cold completion")),
+            #[cfg(feature = "profiling")]
+            measurements: take(&mut self.measurements),
             #[cfg(feature = "profiling")]
             merge: self.merge,
         }

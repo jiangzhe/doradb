@@ -204,13 +204,13 @@ impl CatalogStorage {
                 table_id,
                 spec.parent_column,
                 disk_guard,
-                #[cfg(feature = "profiling")]
-                measurement,
                 |val| {
                     let table_id = decode_table_id(val, spec.name, "projected")?;
                     require_parent(&parents, spec, table_id, "projected")?;
                     track_or_require_managed(&mut managed_tables, spec, table_id, "projected")
                 },
+                #[cfg(feature = "profiling")]
+                measurement,
             )
             .await?;
         }

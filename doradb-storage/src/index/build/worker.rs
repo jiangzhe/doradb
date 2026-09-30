@@ -81,9 +81,9 @@ async fn extract_group(
         group_id: group,
         entries: BudgetedVec::new(budget),
         duplicates: LocalDuplicates::Unchecked,
+        payload: MemoryReservation::new(budget),
         #[cfg(feature = "profiling")]
         profile: HotBuildWorkerProfile::default(),
-        payload: MemoryReservation::new(budget),
     };
     if !extract_rows(source, stop, pages, &mut run).await? {
         return Ok(None);

@@ -64,17 +64,17 @@ pub(crate) struct HotBuildSource {
     pub(crate) budget: MemoryBudget,
     /// Captured cold/hot boundary.
     pub(crate) pivot: RowID,
+    // DDL admission cannot retire while any accepted worker holds this source.
+    _ddl: Option<Arc<IndexDdlGateScope>>,
+    /// Component-only scheduling and failure controls.
+    #[cfg(test)]
+    pub(super) test: WorkerHooks,
     /// Wall duration of source and descriptor capture, in nanoseconds.
     #[cfg(feature = "profiling")]
     pub(crate) capture_elapsed_nanos: u64,
     /// Shared publication target for completed extraction samples.
     #[cfg(feature = "profiling")]
     pub(crate) profiler: Arc<HotIndexBuildProfiler>,
-    // DDL admission cannot retire while any accepted worker holds this source.
-    _ddl: Option<Arc<IndexDdlGateScope>>,
-    /// Component-only scheduling and failure controls.
-    #[cfg(test)]
-    pub(super) test: WorkerHooks,
 }
 
 impl HotBuildSource {
@@ -183,13 +183,13 @@ impl HotBuildTableSource {
             },
             budget: self.budget.clone(),
             pivot: capture.pivot,
+            _ddl: capture.ddl.clone(),
+            #[cfg(test)]
+            test: WorkerHooks::default(),
             #[cfg(feature = "profiling")]
             capture_elapsed_nanos: 0,
             #[cfg(feature = "profiling")]
             profiler: capture.profiler.clone(),
-            _ddl: capture.ddl.clone(),
-            #[cfg(test)]
-            test: WorkerHooks::default(),
         }
     }
 }

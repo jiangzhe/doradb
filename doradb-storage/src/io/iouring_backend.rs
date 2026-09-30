@@ -285,19 +285,19 @@ impl Backend for IouringBackend {
                     .inspect(|outcome| {
                         #[cfg(feature = "profiling")]
                         record_blocking_wait_stats(
-                            &self.stats,
                             Some(outcome),
-                            outcome.call_count,
                             start.elapsed().as_nanos() as usize,
+                            &self.stats,
+                            outcome.call_count,
                         );
                     })
                     .inspect_err(|err| {
                         #[cfg(feature = "profiling")]
                         record_blocking_wait_stats(
-                            &self.stats,
                             None,
-                            err.call_count(),
                             start.elapsed().as_nanos() as usize,
+                            &self.stats,
+                            err.call_count(),
                         );
                     });
                 result?;
@@ -389,10 +389,10 @@ fn retry_submit(reason: SubmitRetryReason, call_count: usize) -> SubmitOutcome {
 #[inline]
 #[cfg(feature = "profiling")]
 fn record_blocking_wait_stats(
-    #[cfg(feature = "profiling")] stats: &BackendStatsHandle,
     outcome: Option<&BlockingWaitOutcome>,
-    #[cfg(feature = "profiling")] call_count: usize,
     elapsed_nanos: usize,
+    #[cfg(feature = "profiling")] stats: &BackendStatsHandle,
+    #[cfg(feature = "profiling")] call_count: usize,
 ) {
     #[cfg(feature = "profiling")]
     stats.record_submit_and_wait(call_count, elapsed_nanos);
@@ -546,7 +546,7 @@ mod tests {
             #[cfg(feature = "profiling")]
             call_count: 2,
         };
-        record_blocking_wait_stats(&stats, Some(&outcome), outcome.call_count, 17);
+        record_blocking_wait_stats(Some(&outcome), 17, &stats, outcome.call_count);
         stats.record_wait_completions(3);
 
         let snapshot = stats.snapshot();

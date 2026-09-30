@@ -63,9 +63,9 @@ struct TableWork {
 
 struct BatchOutput {
     state: RowReplayState,
+    batch: PackedPageBatch,
     #[cfg(feature = "profiling")]
     counts: RowReplayCounts,
-    batch: PackedPageBatch,
 }
 
 struct ReplayLimits {
@@ -104,10 +104,10 @@ pub(super) struct ReplayDispatcher {
     pool: QuiescentGuard<ThreadPool>,
     guards: PoolGuards,
     disable_validation: bool,
-    #[cfg(feature = "profiling")]
-    counts: RowReplayCounts,
     #[cfg(test)]
     test_hook: Option<tests::BatchHook>,
+    #[cfg(feature = "profiling")]
+    counts: RowReplayCounts,
 }
 
 impl ReplayDispatcher {
@@ -134,10 +134,10 @@ impl ReplayDispatcher {
             pool,
             guards,
             disable_validation: config.disable_dml_validation,
-            #[cfg(feature = "profiling")]
-            counts: RowReplayCounts::default(),
             #[cfg(test)]
             test_hook: tests::installed_hook(),
+            #[cfg(feature = "profiling")]
+            counts: RowReplayCounts::default(),
         }
     }
 
@@ -456,9 +456,9 @@ async fn replay_page_batch(
     }
     Ok(BatchOutput {
         state,
+        batch,
         #[cfg(feature = "profiling")]
         counts: _result.counts,
-        batch,
     })
 }
 

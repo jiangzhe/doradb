@@ -26,13 +26,13 @@ use std::sync::Arc;
 /// Result of a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemIndexCleanupOutcome {
-    /// Cleanup accounting for all active secondary indexes scanned by the pass.
-    #[cfg(feature = "profiling")]
-    pub stats: MemIndexCleanupStats,
     /// Reason requested live-entry cleanup could not run against the captured root.
     ///
     /// Delete-overlay cleanup still completes even when live-entry cleanup is delayed.
     pub live_delay: Option<MemIndexCleanupDelay>,
+    /// Cleanup accounting for all active secondary indexes scanned by the pass.
+    #[cfg(feature = "profiling")]
+    pub stats: MemIndexCleanupStats,
 }
 
 /// Diagnostic payload for a retryable live-entry cleanup delay.
@@ -369,9 +369,9 @@ impl Table {
         }
 
         Ok(MemIndexCleanupOutcome {
+            live_delay,
             #[cfg(feature = "profiling")]
             stats,
-            live_delay,
         })
     }
 

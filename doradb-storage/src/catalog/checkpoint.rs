@@ -63,11 +63,11 @@ pub(crate) struct CatalogCheckpointBatch {
     pub(crate) sealed_redo_segments: Vec<CatalogSafeRedoSegment>,
     /// Catalog table row redo operations folded into the checkpoint.
     pub(crate) catalog_ops: Vec<CatalogRedoEntry>,
+    /// Reason the scan stopped.
+    pub(crate) stop_reason: CatalogCheckpointScanStopReason,
     /// Number of catalog DDL transactions included in the batch.
     #[cfg(feature = "profiling")]
     pub(crate) catalog_ddl_txn_count: usize,
-    /// Reason the scan stopped.
-    pub(crate) stop_reason: CatalogCheckpointScanStopReason,
 }
 
 impl CatalogCheckpointBatch {
@@ -539,9 +539,9 @@ impl Catalog {
             first_retained_file_seq,
             sealed_redo_segments: vec![],
             catalog_ops: vec![],
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
         if durable_upper_cts < replay_start_ts {
             // Nothing durable has reached the catalog replay cursor yet, so
@@ -1072,9 +1072,9 @@ mod tests {
                 },
             ],
             catalog_ops: Vec::new(),
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
         let progress = batch.redo_retention_progress().unwrap();
@@ -1116,9 +1116,9 @@ mod tests {
                 redo_range: None,
             }],
             catalog_ops: Vec::new(),
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
         assert!(batch.redo_retention_progress().is_none());

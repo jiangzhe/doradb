@@ -2353,15 +2353,6 @@ pub(crate) mod tests {
         };
         let layout = table.layout_snapshot();
         IndexDdlSnapshot {
-            #[cfg(feature = "profiling")]
-            published_creates: engine
-                .inner()
-                .trx_sys
-                .hot_build_profiler
-                .snapshot()
-                .create
-                .hot
-                .completed_builds,
             current_effective_cts: effective_cts,
             current_metadata: metadata,
             history_count: engine
@@ -2376,6 +2367,15 @@ pub(crate) mod tests {
                 .map(Option::is_some)
                 .collect(),
             root: table.file().active_root_unchecked().clone(),
+            #[cfg(feature = "profiling")]
+            published_creates: engine
+                .inner()
+                .trx_sys
+                .hot_build_profiler
+                .snapshot()
+                .create
+                .hot
+                .completed_builds,
         }
     }
 

@@ -559,27 +559,27 @@ impl PressureDeltaClockPolicy {
 }
 
 pub(super) struct SharedEvictionDomain {
-    #[cfg(feature = "profiling")]
-    id: SharedEvictionDomainId,
     runtime: Box<dyn EvictionRuntime + Send>,
     policy: PressureDeltaClockPolicy,
+    #[cfg(feature = "profiling")]
+    id: SharedEvictionDomainId,
 }
 
 impl SharedEvictionDomain {
     #[inline]
     pub(super) fn new<T>(
-        #[cfg(feature = "profiling")] id: SharedEvictionDomainId,
         runtime: T,
         policy: PressureDeltaClockPolicy,
+        #[cfg(feature = "profiling")] id: SharedEvictionDomainId,
     ) -> Self
     where
         T: EvictionRuntime + Send + 'static,
     {
         SharedEvictionDomain {
-            #[cfg(feature = "profiling")]
-            id,
             runtime: Box::new(runtime),
             policy,
+            #[cfg(feature = "profiling")]
+            id,
         }
     }
 
@@ -782,9 +782,9 @@ impl Component for SharedPoolEvictorWorkers {
             mem_pool,
             shutdown_flag,
             wake_event,
+            evict_thread: Mutex::new(Some(handle)),
             #[cfg(feature = "profiling")]
             stats,
-            evict_thread: Mutex::new(Some(handle)),
         });
         Ok(())
     }
@@ -834,9 +834,9 @@ pub(crate) struct SharedPoolEvictorWorkersOwned {
     mem_pool: SyncQuiescentGuard<EvictableBufferPool>,
     shutdown_flag: Arc<AtomicBool>,
     wake_event: Arc<Event>,
+    evict_thread: Mutex<Option<JoinHandle<()>>>,
     #[cfg(feature = "profiling")]
     stats: SharedPoolEvictorStatsHandle,
-    evict_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Iterates the ordered resident-set according to clock-hand position.
@@ -1072,9 +1072,9 @@ mod tests {
         disk_pool: DiskPool,
         mem_pool: MemPool,
         index_pool: IndexPool,
+        registry: ComponentRegistry,
         #[cfg(feature = "profiling")]
         stats: SharedPoolEvictorStatsHandle,
-        registry: ComponentRegistry,
     }
 
     impl StartedSharedEvictorRuntime {
@@ -1124,9 +1124,9 @@ mod tests {
                     disk_pool,
                     mem_pool,
                     index_pool,
+                    registry,
                     #[cfg(feature = "profiling")]
                     stats,
-                    registry,
                 }
             })
         }
@@ -1176,10 +1176,10 @@ mod tests {
         .zip(resident)
         .map(|(_id, count)| {
             SharedEvictionDomain::new(
-                #[cfg(feature = "profiling")]
-                _id,
                 MockRuntime::new(count, 8),
                 test_policy(),
+                #[cfg(feature = "profiling")]
+                _id,
             )
         })
         .collect();

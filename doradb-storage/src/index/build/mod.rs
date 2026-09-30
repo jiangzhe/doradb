@@ -124,10 +124,10 @@ pub(crate) struct HotSortedRun {
     entries: BudgetedVec<IndexBuildEntry>,
     /// Local evidence selected by the invocation duplicate policy.
     pub(crate) duplicates: LocalDuplicates,
-    #[cfg(feature = "profiling")]
-    profile: HotBuildWorkerProfile,
     // Entries (including keys) are destroyed before their payload admission.
     payload: MemoryReservation,
+    #[cfg(feature = "profiling")]
+    profile: HotBuildWorkerProfile,
 }
 
 impl HotSortedRun {
@@ -143,11 +143,11 @@ pub(crate) struct SortedHotRuns {
     runs: Vec<Arc<HotSortedRun>>,
     // Source-selected policy survives even an empty extraction.
     duplicates: DuplicateCheck,
+    /// Shared admission retained for run ownership and downstream phases.
+    pub(crate) budget: MemoryBudget,
     /// Completed build counts, durations, and scratch high-water.
     #[cfg(feature = "profiling")]
     pub(crate) measurements: HotBuildMeasurements,
-    /// Shared admission retained for run ownership and downstream phases.
-    pub(crate) budget: MemoryBudget,
 }
 
 impl SortedHotRuns {
@@ -206,9 +206,9 @@ pub(crate) struct HotLocalSort {
     submitted: usize,
     collected: usize,
     failure: Option<RuntimeOrFatalError>,
+    finished: bool,
     #[cfg(feature = "profiling")]
     profile: HotBuildProfile,
-    finished: bool,
 }
 
 impl HotLocalSort {
@@ -247,9 +247,9 @@ impl HotLocalSort {
             submitted: 0,
             collected: 0,
             failure: None,
+            finished: false,
             #[cfg(feature = "profiling")]
             profile,
-            finished: false,
         }
     }
 
@@ -296,9 +296,9 @@ impl HotLocalSort {
         Ok(SortedHotRuns {
             runs,
             duplicates: self.source.key.duplicates,
+            budget: self.source.budget.clone(),
             #[cfg(feature = "profiling")]
             measurements,
-            budget: self.source.budget.clone(),
         })
     }
 

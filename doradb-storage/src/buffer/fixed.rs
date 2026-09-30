@@ -24,9 +24,9 @@ pub(crate) struct FixedBufferPool {
     // free_list: Mutex<PageID>,
     alloc_map: AllocMap,
     role: PoolRole,
+    arena: QuiescentArena,
     #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
-    arena: QuiescentArena,
 }
 
 impl FixedBufferPool {
@@ -45,9 +45,9 @@ impl FixedBufferPool {
             size,
             alloc_map: AllocMap::new(size),
             role,
+            arena,
             #[cfg(feature = "profiling")]
             stats: BufferPoolStatsHandle::default(),
-            arena,
         })
     }
 

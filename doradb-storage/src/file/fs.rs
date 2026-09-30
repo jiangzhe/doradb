@@ -1636,15 +1636,15 @@ pub(crate) struct FileSystem {
     table_reads: IOClient<ReadSubmission>,
     pool_reads: IOClient<PoolReadRequest>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    #[cfg(feature = "profiling")]
-    io_backend_stats: BackendStatsHandle,
-    #[cfg(feature = "profiling")]
-    storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
     cow_file_max_pages: usize,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
+    #[cfg(feature = "profiling")]
+    io_backend_stats: BackendStatsHandle,
+    #[cfg(feature = "profiling")]
+    storage_service_stats: StorageServiceStatsHandle,
 }
 
 impl FileSystem {
@@ -2023,14 +2023,14 @@ pub(crate) fn build_file_system(
             table_reads,
             pool_reads,
             background_writes,
-            #[cfg(feature = "profiling")]
-            io_backend_stats: stats,
-            #[cfg(feature = "profiling")]
-            storage_service_stats: builder.stats.clone(),
             configured_io_depth: io_depth,
             cow_file_max_pages,
             data_dir,
             catalog_file_name,
+            #[cfg(feature = "profiling")]
+            io_backend_stats: stats,
+            #[cfg(feature = "profiling")]
+            storage_service_stats: builder.stats.clone(),
         },
         builder,
     ))

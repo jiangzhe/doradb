@@ -55,12 +55,12 @@ pub(crate) struct HotIndexBuild<P: BufferPool + 'static> {
     preparation: Option<HotMergePreparation>,
     packing: Option<HotPackedBuild<P>>,
     cleanup: Option<StagedPageCleanup<P>>,
+    #[cfg(test)]
+    hooks: tests::Hooks<P>,
     #[cfg(feature = "profiling")]
     extraction: Option<HotBuildMeasurements>,
     #[cfg(feature = "profiling")]
     cleanup_elapsed_nanos: u64,
-    #[cfg(test)]
-    hooks: tests::Hooks<P>,
 }
 
 impl<P: BufferPool + 'static> HotIndexBuild<P> {
@@ -97,12 +97,12 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             preparation: None,
             packing: None,
             cleanup: None,
+            #[cfg(test)]
+            hooks: tests::Hooks::default(),
             #[cfg(feature = "profiling")]
             extraction: None,
             #[cfg(feature = "profiling")]
             cleanup_elapsed_nanos: 0,
-            #[cfg(test)]
-            hooks: tests::Hooks::default(),
         }
     }
 

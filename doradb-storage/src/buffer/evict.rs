@@ -73,11 +73,11 @@ pub(crate) struct EvictableBufferPool {
     in_mem: Arc<InMemPageSet>,
     // Inflight IO map.
     inflight_io: Arc<InflightIO>,
+    role: PoolRole,
+    arena: QuiescentArena,
     // Pool-owned access and IO lifecycle counters.
     #[cfg(feature = "profiling")]
     stats: BufferPoolStatsHandle,
-    role: PoolRole,
-    arena: QuiescentArena,
 }
 
 impl EvictableBufferPool {
@@ -142,10 +142,10 @@ impl EvictableBufferPool {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             in_mem: Arc::new(InMemPageSet::new(max_nbr_in_mem, eviction_arbiter)),
             inflight_io: Arc::new(InflightIO::default()),
-            #[cfg(feature = "profiling")]
-            stats: BufferPoolStatsHandle::default(),
             role,
             arena,
+            #[cfg(feature = "profiling")]
+            stats: BufferPoolStatsHandle::default(),
         };
         Ok((pool, file))
     }
@@ -287,10 +287,10 @@ impl EvictableBufferPool {
                                     let req = EvictReadSubmission::new(
                                         page_id,
                                         Arc::clone(&self.inflight_io),
-                                        #[cfg(feature = "profiling")]
-                                        self.stats.clone(),
                                         self.role,
                                         reservation,
+                                        #[cfg(feature = "profiling")]
+                                        self.stats.clone(),
                                     );
                                     DispatchAction::SendRead { req, completion }
                                 }
@@ -308,10 +308,10 @@ impl EvictableBufferPool {
                                 let req = EvictReadSubmission::new(
                                     page_id,
                                     Arc::clone(&self.inflight_io),
-                                    #[cfg(feature = "profiling")]
-                                    self.stats.clone(),
                                     self.role,
                                     reservation,
+                                    #[cfg(feature = "profiling")]
+                                    self.stats.clone(),
                                 );
                                 DispatchAction::SendRead { req, completion }
                             }
@@ -422,10 +422,10 @@ impl EvictableBufferPool {
         };
         let (runtime, policy) = Self::evictor_parts(pool);
         SharedEvictionDomain::new(
-            #[cfg(feature = "profiling")]
-            _domain_id,
             runtime,
             policy,
+            #[cfg(feature = "profiling")]
+            _domain_id,
         )
     }
 
@@ -869,10 +869,10 @@ impl EvictablePoolStateMachine {
             PoolRequest::BatchWrite(page_guards, done_ev) => {
                 for page_guard in page_guards {
                     self.pool.inflight_io.fail_writeback(
-                        #[cfg(feature = "profiling")]
-                        &self.pool.stats,
                         page_guard,
                         err.clone().into_completion_bridge(),
+                        #[cfg(feature = "profiling")]
+                        &self.pool.stats,
                     );
                 }
                 drop(done_ev);
@@ -902,10 +902,10 @@ impl EvictablePoolStateMachine {
                 } = sub;
                 let _ = block_key;
                 self.pool.inflight_io.fail_writeback(
-                    #[cfg(feature = "profiling")]
-                    &self.pool.stats,
                     page_guard,
                     err.clone().into_completion_bridge(),
+                    #[cfg(feature = "profiling")]
+                    &self.pool.stats,
                 );
                 drop(batch_done);
                 StorageIOKind::Write
@@ -930,10 +930,10 @@ impl EvictablePoolStateMachine {
             EvictSubmission::Write(sub) => {
                 let _ = sub.block_key;
                 self.pool.inflight_io.fail_submitted_writeback(
-                    #[cfg(feature = "profiling")]
-                    &self.pool.stats,
                     &mut sub.page_guard,
                     err.clone().into_completion_bridge(),
+                    #[cfg(feature = "profiling")]
+                    &self.pool.stats,
                 );
                 drop(sub.batch_done.take());
                 StorageIOKind::Write
@@ -1066,10 +1066,10 @@ impl IOStateMachine for EvictablePoolStateMachine {
                 };
                 if let Some(err) = err {
                     self.pool.inflight_io.fail_writeback(
-                        #[cfg(feature = "profiling")]
-                        &self.pool.stats,
                         page_guard,
                         CompletionErrorBridge::capture(err),
+                        #[cfg(feature = "profiling")]
+                        &self.pool.stats,
                     );
                     drop(batch_done);
                     return StorageIOKind::Write;
@@ -1133,13 +1133,13 @@ impl EvictableRuntime {
         {
             for page_guard in page_guards {
                 self.pool.inflight_io.fail_writeback(
-                    #[cfg(feature = "profiling")]
-                    &self.pool.stats,
                     page_guard,
                     CompletionErrorBridge::capture(
                         Report::new(IoError::from(IoErrorKind::BrokenPipe))
                             .attach("send evict pool batch write request"),
                     ),
+                    #[cfg(feature = "profiling")]
+                    &self.pool.stats,
                 );
             }
             drop(done_ev);
@@ -1469,10 +1469,10 @@ pub(crate) struct EvictReadSubmission {
     key: PageID,
     role: PoolRole,
     inflight_io: Arc<InflightIO>,
-    #[cfg(feature = "profiling")]
-    stats: BufferPoolStatsHandle,
     reservation: Option<Box<PageReservationGuard<EvictPageReservation>>>,
     completed: bool,
+    #[cfg(feature = "profiling")]
+    stats: BufferPoolStatsHandle,
 }
 
 impl EvictReadSubmission {
@@ -1481,9 +1481,9 @@ impl EvictReadSubmission {
     fn new(
         page_id: PageID,
         inflight_io: Arc<InflightIO>,
-        #[cfg(feature = "profiling")] stats: BufferPoolStatsHandle,
         role: PoolRole,
         reservation: PageReservationGuard<EvictPageReservation>,
+        #[cfg(feature = "profiling")] stats: BufferPoolStatsHandle,
     ) -> Self {
         #[cfg(feature = "profiling")]
         stats.add_queued_reads(1);
@@ -1491,10 +1491,10 @@ impl EvictReadSubmission {
             key: page_id,
             role,
             inflight_io,
-            #[cfg(feature = "profiling")]
-            stats,
             reservation: Some(Box::new(reservation)),
             completed: false,
+            #[cfg(feature = "profiling")]
+            stats,
         }
     }
 
@@ -1801,9 +1801,9 @@ impl InflightIO {
     #[inline]
     fn fail_writeback(
         &self,
-        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
         mut page_guard: PageExclusiveGuard<Page>,
         err: CompletionErrorBridge,
+        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
     ) {
         let page_id = page_guard.page_id();
         let completion = {
@@ -1845,9 +1845,9 @@ impl InflightIO {
     #[inline]
     fn fail_submitted_writeback(
         &self,
-        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
         page_guard: &mut PageExclusiveGuard<Page>,
         err: CompletionErrorBridge,
+        #[cfg(feature = "profiling")] stats: &BufferPoolStatsHandle,
     ) {
         let page_id = page_guard.page_id();
         let completion = {
@@ -2239,10 +2239,10 @@ pub(crate) mod tests {
         let req = EvictReadSubmission::new(
             page_id,
             Arc::clone(&owner.inflight_io),
-            #[cfg(feature = "profiling")]
-            owner.stats.clone(),
             owner.role,
             reservation,
+            #[cfg(feature = "profiling")]
+            owner.stats.clone(),
         );
         (req, completion)
     }

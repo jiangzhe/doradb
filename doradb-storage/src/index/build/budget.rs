@@ -13,10 +13,10 @@ pub(crate) use tests::fail_at;
 struct BudgetState {
     limit: usize,
     used: AtomicUsize,
-    #[cfg(feature = "profiling")]
-    peak: AtomicUsize,
     #[cfg(test)]
     test: BudgetFailure,
+    #[cfg(feature = "profiling")]
+    peak: AtomicUsize,
 }
 
 /// Concurrent bulk scratch admission within each of a table's serial index builds.
@@ -30,10 +30,10 @@ impl MemoryBudget {
         Self(Arc::new(BudgetState {
             limit,
             used: AtomicUsize::new(0),
-            #[cfg(feature = "profiling")]
-            peak: AtomicUsize::new(0),
             #[cfg(test)]
             test: BudgetFailure::default(),
+            #[cfg(feature = "profiling")]
+            peak: AtomicUsize::new(0),
         }))
     }
 

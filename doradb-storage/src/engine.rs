@@ -276,12 +276,12 @@ impl Drop for EngineAdmission<'_> {
 /// operations acquire strong runtime access internally only for the duration of
 /// the operation. Runtime internals are not exposed through the public facade.
 pub struct Engine {
-    #[cfg(feature = "profiling")]
-    recovery_report: RecoveryReport,
     // Field order is part of owner teardown: shared runtime reachability is
     // released before component owners are dropped.
     inner: Arc<EngineInner>,
     components: Option<ComponentRegistry>,
+    #[cfg(feature = "profiling")]
+    recovery_report: RecoveryReport,
 }
 
 impl Engine {
@@ -853,10 +853,10 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     #[cfg(feature = "profiling")]
     report.finish_transaction(runtime_started - transaction_started);
     let engine = Engine {
-        #[cfg(feature = "profiling")]
-        recovery_report: report,
         inner: Arc::new(engine_inner),
         components: Some(registry),
+        #[cfg(feature = "profiling")]
+        recovery_report: report,
     };
     #[cfg(feature = "profiling")]
     let mut engine = engine;

@@ -603,18 +603,18 @@ pub(crate) struct MandatoryRuntime {
     /// while redo can produce final cleanup, then closes and drains before the
     /// executor runners stop.
     internal_admission: MandatoryInternalAdmission,
-    /// Monotonic diagnostics for accepted caller operations.
-    #[cfg(feature = "profiling")]
-    operation_counters: Arc<MandatoryTaskCounters>,
-    /// Monotonic diagnostics for internal transaction cleanup.
-    #[cfg(feature = "profiling")]
-    transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
     /// One-way stop state shared by all executor runners.
     stopping: AtomicBool,
     /// Wakeup used to stop the runner after both admissions drain.
     stop_event: Event,
     /// Engine-level fatal state used by mandatory panic supervision.
     poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Monotonic diagnostics for accepted caller operations.
+    #[cfg(feature = "profiling")]
+    operation_counters: Arc<MandatoryTaskCounters>,
+    /// Monotonic diagnostics for internal transaction cleanup.
+    #[cfg(feature = "profiling")]
+    transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
 }
 
 impl MandatoryRuntime {
@@ -624,13 +624,13 @@ impl MandatoryRuntime {
             executor: async_executor::Executor::new(),
             admission: MandatoryAdmission::new(config.concurrency_limit),
             internal_admission: MandatoryInternalAdmission::new(),
+            stopping: AtomicBool::new(false),
+            stop_event: Event::new(),
+            poisoner,
             #[cfg(feature = "profiling")]
             operation_counters: Arc::new(MandatoryTaskCounters::default()),
             #[cfg(feature = "profiling")]
             transaction_cleanup_counters: Arc::new(MandatoryTaskCounters::default()),
-            stopping: AtomicBool::new(false),
-            stop_event: Event::new(),
-            poisoner,
         }
     }
 

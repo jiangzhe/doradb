@@ -138,10 +138,10 @@ pub(crate) struct HotMergePreparation {
     collected: usize,
     failure: Option<RuntimeOrFatalError>,
     finished: bool,
-    #[cfg(feature = "profiling")]
-    started: Option<Instant>,
     #[cfg(test)]
     hook: tests::CutHook,
+    #[cfg(feature = "profiling")]
+    started: Option<Instant>,
 }
 
 impl HotMergePreparation {
@@ -209,10 +209,10 @@ impl HotMergePreparation {
             collected: 0,
             failure: None,
             finished: false,
-            #[cfg(feature = "profiling")]
-            started: None,
             #[cfg(test)]
             hook: tests::CutHook::default(),
+            #[cfg(feature = "profiling")]
+            started: None,
         })
     }
 
@@ -1248,9 +1248,9 @@ mod tests {
                 group_id: group * 3 + 1,
                 entries,
                 duplicates,
+                payload,
                 #[cfg(feature = "profiling")]
                 profile: HotBuildWorkerProfile::default(),
-                payload,
             }));
         }
         Arc::new(SortedHotRuns {

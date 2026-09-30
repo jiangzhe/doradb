@@ -917,9 +917,9 @@ impl CatalogStorage {
                     disk_pool_guard,
                     &column_index,
                     &entry,
+                    root.table_id,
                     #[cfg(feature = "profiling")]
                     measurement,
-                    root.table_id,
                 )
                 .await?;
             for row in page_rows {
@@ -996,8 +996,8 @@ impl CatalogStorage {
         disk_pool_guard: &PoolGuard,
         column_index: &ColumnBlockIndex<'_>,
         entry: &CatalogIndexEntry,
-        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
         table_id: TableID,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<Vec<RowRecord>> {
         let file_kind = self.mtb.file_kind();
         let block_id = entry.block_id();
@@ -1074,8 +1074,8 @@ impl CatalogStorage {
         expected_table_id: TableID,
         column_no: usize,
         disk_pool_guard: &PoolGuard,
-        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
         mut visitor: F,
+        #[cfg(feature = "profiling")] measurement: &CatalogCheckpointMeasurement,
     ) -> RuntimeOrFatalResult<()>
     where
         F: FnMut(Val) -> DataIntegrityResult<()>,
@@ -1726,9 +1726,9 @@ pub(crate) mod tests {
             first_retained_file_seq: 0,
             sealed_redo_segments: Vec::new(),
             catalog_ops: Vec::new(),
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
     }
 
@@ -1753,9 +1753,9 @@ pub(crate) mod tests {
             first_retained_file_seq: 0,
             sealed_redo_segments: Vec::new(),
             catalog_ops,
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         }
     }
 
@@ -1974,9 +1974,9 @@ pub(crate) mod tests {
                 table_id: TABLE_ID_TABLES,
                 kind: RowRedoKind::DeleteByPrimaryKey(key),
             }],
+            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             #[cfg(feature = "profiling")]
             catalog_ddl_txn_count: 0,
-            stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
         };
 
         let err = expect_runtime_report(
@@ -2210,9 +2210,9 @@ pub(crate) mod tests {
                     table_id: invalid_table_id,
                     kind: RowRedoKind::Insert(PageID::new(0), Vec::new()),
                 }],
+                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
                 #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count: 0,
-                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
 
             let err = expect_runtime_report(
@@ -2899,9 +2899,9 @@ pub(crate) mod tests {
                         )),
                     },
                 ],
+                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
                 #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count: 0,
-                stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
             };
 
             engine

@@ -91,15 +91,15 @@ impl RecoveryHotIndexWorker {
             poisoner: resources.poisoner.clone(),
             policy: resources.hot_build_policy,
             duplicates,
-            #[cfg(feature = "profiling")]
-            profiler: resources.hot_build_profiler.clone(),
             active: None,
-            #[cfg(feature = "profiling")]
-            report: RecoveryHotIndexResult::default(),
             phase: "source_capture",
             current_table: None,
             #[cfg(test)]
             hooks: tests::Hooks::capture(),
+            #[cfg(feature = "profiling")]
+            profiler: resources.hot_build_profiler.clone(),
+            #[cfg(feature = "profiling")]
+            report: RecoveryHotIndexResult::default(),
         };
         let (sender, terminal) = flume::bounded(1);
         let thread = spawn_named("Recovery-Index", move || {
@@ -178,16 +178,16 @@ struct RecoveryHotIndexTask {
     poisoner: QuiescentGuard<EnginePoisoner>,
     policy: HotBuildPolicy,
     duplicates: DuplicateCheck,
-    #[cfg(feature = "profiling")]
-    profiler: Arc<HotIndexBuildProfiler>,
     // Stage coordinators and cleanup survive an unwind of the borrowed root future.
     active: Option<HotIndexBuild<EvictableBufferPool>>,
-    #[cfg(feature = "profiling")]
-    report: RecoveryHotIndexReport,
     phase: &'static str,
     current_table: Option<TableID>,
     #[cfg(test)]
     hooks: tests::Hooks,
+    #[cfg(feature = "profiling")]
+    profiler: Arc<HotIndexBuildProfiler>,
+    #[cfg(feature = "profiling")]
+    report: RecoveryHotIndexReport,
 }
 
 impl RecoveryHotIndexTask {
