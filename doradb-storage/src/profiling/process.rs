@@ -25,11 +25,15 @@ pub struct SampledProcessRss {
 }
 
 /// Running one-millisecond Linux process-RSS sampler.
+///
+/// Dropping the sampler stops and joins its worker, waiting for any current read
+/// or sampling sleep to finish. Use [`Self::stop`] to obtain measurements and
+/// report worker errors; implicit cleanup discards them.
 pub struct ProcessRssSampler {
     baseline_bytes: usize,
     peak_bytes: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
-    thread: JoinHandle<Result<()>>,
+    thread: Option<JoinHandle<Result<()>>>,
 }
 
 impl ProcessRssSampler {
@@ -71,7 +75,7 @@ impl ProcessRssSampler {
                     baseline_bytes,
                     peak_bytes,
                     stop,
-                    thread,
+                    thread: Some(thread),
                 }),
                 Ok(Err(error)) => {
                     let _ = thread.join();
@@ -89,17 +93,13 @@ impl ProcessRssSampler {
     }
 
     /// Take the terminal sample, stop and join the sampler, and return its peak.
-    pub fn stop(self) -> crate::Result<SampledProcessRss> {
+    pub fn stop(mut self) -> crate::Result<SampledProcessRss> {
         (|| -> Result<_> {
             let final_sample = current_process_rss();
             if let Ok(bytes) = &final_sample {
                 self.peak_bytes.fetch_max(*bytes, Ordering::Relaxed);
             }
-            self.stop.store(true, Ordering::Release);
-            let thread_result = self.thread.join().map_err(|_| {
-                measurement_error("process RSS sampler thread panicked before joining")
-            })?;
-            thread_result?;
+            self.stop_and_join()?;
             final_sample?;
             let peak_bytes = self.peak_bytes.load(Ordering::Relaxed);
             Ok(SampledProcessRss {
@@ -109,6 +109,26 @@ impl ProcessRssSampler {
             })
         })()
         .map_err(DiscloseError::disclose)
+    }
+
+    fn stop_and_join(&mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        // The caller owns this worker independently of engine poison or shutdown.
+        // It finishes its current read/sleep before observing the stop flag;
+        // joining is authoritative completion, including on caller cancellation.
+        // Taking the handle gives stop() or Drop sole cleanup ownership.
+        thread
+            .join()
+            .map_err(|_| measurement_error("process RSS sampler thread panicked before joining"))?
+    }
+}
+
+impl Drop for ProcessRssSampler {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
     }
 }
 
@@ -146,7 +166,44 @@ fn parse_statm_rss(contents: &str, page_size: usize) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use tempfile::TempDir;
+
+    fn assert_sampler_cleanup(
+        sampler: ProcessRssSampler,
+        case: &str,
+        cleanup: impl FnOnce(ProcessRssSampler),
+    ) {
+        let stop = Arc::clone(&sampler.stop);
+        let peak = Arc::downgrade(&sampler.peak_bytes);
+        cleanup(sampler);
+        assert!(stop.load(Ordering::Acquire), "stop not signaled: {case}");
+        assert_eq!(Arc::strong_count(&stop), 1, "worker retained stop: {case}");
+        assert!(peak.upgrade().is_none(), "worker retained peak: {case}");
+    }
+
+    fn abandon_sampler(sampler: ProcessRssSampler, exit: &str) {
+        match exit {
+            "drop" => drop(sampler),
+            "early error" => {
+                let result = (|| {
+                    let _sampler = sampler;
+                    Err::<(), _>("caller error")?;
+                    Ok::<(), &str>(())
+                })();
+                assert_eq!(result, Err("caller error"));
+            }
+            "unwind" => {
+                let panic = catch_unwind(AssertUnwindSafe(|| {
+                    let _sampler = sampler;
+                    panic!("caller panic");
+                }))
+                .unwrap_err();
+                assert_eq!(panic.downcast_ref::<&str>(), Some(&"caller panic"));
+            }
+            _ => unreachable!("unknown sampler exit: {exit}"),
+        }
+    }
 
     /// Purpose: Read accumulated CPU time across all process threads.
     /// Expected: Successive samples remain nondecreasing.
@@ -167,16 +224,72 @@ mod tests {
     }
 
     /// Purpose: Keep sampled memory peaks consistent with the baseline.
-    /// Expected: Peak memory cannot fall below the baseline and additional usage reflects their
-    /// difference.
+    /// Expected: Explicit stop joins the worker and reports a peak above or equal to its baseline.
     #[test]
     fn process_rss_sampler_synchronizes_and_returns_a_nondecreasing_peak() {
-        let sample = ProcessRssSampler::start().unwrap().stop().unwrap();
-        assert!(sample.peak_bytes >= sample.baseline_bytes);
-        assert_eq!(
-            sample.peak_above_baseline_bytes,
-            sample.peak_bytes.saturating_sub(sample.baseline_bytes)
-        );
+        assert_sampler_cleanup(ProcessRssSampler::start().unwrap(), "stop", |sampler| {
+            let sample = sampler.stop().unwrap();
+            assert!(sample.peak_bytes >= sample.baseline_bytes);
+            assert_eq!(
+                sample.peak_above_baseline_bytes,
+                sample.peak_bytes.saturating_sub(sample.baseline_bytes)
+            );
+        });
+    }
+
+    /// Purpose: Reclaim abandoned sampler workers on ordinary scope exit, errors, and unwinding.
+    /// Expected: Cleanup signals stop and releases all worker references before returning.
+    #[test]
+    fn process_rss_sampler_drop_joins_abandoned_workers() {
+        for exit in ["drop", "early error", "unwind"] {
+            assert_sampler_cleanup(ProcessRssSampler::start().unwrap(), exit, |sampler| {
+                abandon_sampler(sampler, exit);
+            });
+        }
+    }
+
+    /// Purpose: Preserve explicit worker failure reporting while making implicit cleanup infallible.
+    /// Expected: Stop reports worker errors and panics; Drop joins without replacing caller failures.
+    #[test]
+    fn process_rss_sampler_worker_failures_respect_cleanup_mode() {
+        for worker_panics in [false, true] {
+            for exit in ["stop", "drop", "unwind"] {
+                let peak_bytes = Arc::new(AtomicUsize::new(0));
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker_peak = Arc::clone(&peak_bytes);
+                let worker_stop = Arc::clone(&stop);
+                let thread = thread::spawn(move || {
+                    let _worker_state = (worker_peak, worker_stop);
+                    assert!(!worker_panics, "worker panic");
+                    Err(measurement_error("worker error"))
+                });
+                let sampler = ProcessRssSampler {
+                    baseline_bytes: 0,
+                    peak_bytes,
+                    stop,
+                    thread: Some(thread),
+                };
+                let case = format!("worker_panics={worker_panics}, exit={exit}");
+                assert_sampler_cleanup(sampler, &case, |sampler| {
+                    if exit == "stop" {
+                        let error = sampler.stop().unwrap_err();
+                        assert_eq!(
+                            error.report().downcast_ref::<RuntimeError>(),
+                            Some(&RuntimeError::ProfilingMeasurement),
+                            "{case}"
+                        );
+                        let expected = if worker_panics {
+                            "process RSS sampler thread panicked before joining"
+                        } else {
+                            "worker error"
+                        };
+                        assert!(format!("{error:?}").contains(expected), "{case}: {error:?}");
+                    } else {
+                        abandon_sampler(sampler, exit);
+                    }
+                });
+            }
+        }
     }
 
     /// Purpose: Expose unavailable process-memory statistics as a measurement failure.

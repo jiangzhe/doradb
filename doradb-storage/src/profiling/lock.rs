@@ -234,12 +234,38 @@ pub(crate) fn increment_current(current: &AtomicU64, peak: &AtomicU64) {
 }
 
 /// Decrease a diagnostic current count.
+/// Each decrement must balance a prior increment in the logical-lock lifecycle.
 #[inline]
 pub(crate) fn decrement_current(current: &AtomicU64) {
-    current.fetch_sub(1, Ordering::Relaxed);
+    let previous = current.fetch_sub(1, Ordering::Relaxed);
+    assert!(previous > 0, "logical-lock current statistic underflowed");
 }
 
 #[inline]
 fn load(counter: &AtomicU64) -> u64 {
     counter.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Purpose: Protect balanced logical-lock count decrements through the final release.
+    /// Expected: Each decrement removes one count, and the final release reaches zero.
+    #[test]
+    fn test_decrement_current_balanced() {
+        let current = AtomicU64::new(2);
+        decrement_current(&current);
+        assert_eq!(current.load(Ordering::Relaxed), 1);
+        decrement_current(&current);
+        assert_eq!(current.load(Ordering::Relaxed), 0);
+    }
+
+    /// Purpose: Detect an unbalanced logical-lock count decrement.
+    /// Expected: Decrementing zero panics with the logical-lock underflow diagnostic.
+    #[test]
+    #[should_panic(expected = "logical-lock current statistic underflowed")]
+    fn test_decrement_current_underflow() {
+        decrement_current(&AtomicU64::new(0));
+    }
 }

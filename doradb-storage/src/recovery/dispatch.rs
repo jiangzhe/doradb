@@ -447,13 +447,9 @@ async fn replay_page_batch(
     if let Some(hook) = &test_hook {
         hook.before(key).await;
     }
-    let result = table
+    let _result = table
         .recover_row_batch(&guards, &mut state, &batch, disable_validation)
-        .await;
-    #[cfg(feature = "profiling")]
-    let counts = result?;
-    #[cfg(not(feature = "profiling"))]
-    result?;
+        .await?;
     #[cfg(test)]
     if let Some(hook) = &test_hook {
         hook.finished.send(key).unwrap();
@@ -461,7 +457,7 @@ async fn replay_page_batch(
     Ok(BatchOutput {
         state,
         #[cfg(feature = "profiling")]
-        counts,
+        counts: _result.counts,
         batch,
     })
 }

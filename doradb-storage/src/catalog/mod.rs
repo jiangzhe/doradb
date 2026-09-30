@@ -304,13 +304,9 @@ impl Catalog {
         prepared: PreparedCatalogCheckpoint,
     ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
         let result = prepared.commit(&self.storage).await?;
-        #[cfg(feature = "profiling")]
-        let outcome = result.outcome;
-        #[cfg(not(feature = "profiling"))]
-        let outcome = result;
         let CatalogCheckpointOutcome::Published {
             catalog_replay_start_ts,
-        } = outcome
+        } = result.outcome
         else {
             return Ok(result);
         };

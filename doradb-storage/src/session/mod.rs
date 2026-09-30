@@ -7373,7 +7373,8 @@ pub(crate) mod tests {
                 .unwrap();
             let table_id = table1(&engine).await;
             let mut session = engine.new_session().unwrap();
-            let outcome: CatalogCheckpointOutcome = session.checkpoint_catalog().await.unwrap();
+            let crate::CatalogCheckpointResult { outcome } =
+                session.checkpoint_catalog().await.unwrap();
             assert!(matches!(
                 outcome,
                 crate::CatalogCheckpointOutcome::Published { .. }

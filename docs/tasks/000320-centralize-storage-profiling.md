@@ -114,10 +114,11 @@ contain buffer, I/O, transaction, lock, runtime, recovery, checkpoint, cleanup,
 and hot-index measurement code. Feature gates cover the complete construction,
 recording, snapshot, and transport paths. Components retain recorder ownership.
 Maintenance operations remain available independently of profiling.
-`CatalogCheckpointResult` belongs to the catalog checkpoint module: an enabled
-named struct contains `outcome` and a metrics-only `CatalogCheckpointReport`,
-while the disabled definition aliases `CatalogCheckpointOutcome`. Row replay and
-hot-index recovery result aliases also live in their operational owner modules.
+`CatalogCheckpointResult` belongs to the catalog checkpoint module: the named
+struct always contains `outcome`, with a metrics-only `CatalogCheckpointReport`
+field when profiling is enabled. Row replay likewise returns a named struct with
+feature-gated counts. Its result and the hot-index recovery result alias also live
+in their operational owner modules.
 This leaves the entire profiling module feature-gated with no disabled stubs.
 
 The disabled API follows these contracts:
@@ -127,7 +128,7 @@ The disabled API follows these contracts:
 | Session stats getters and their diagnostic types | Absent |
 | `Engine::recovery_report()` and recovery report types | Absent |
 | Internal stats producers | Absent; no synthetic snapshots or static report |
-| Catalog checkpoint | `CatalogCheckpointResult` aliases the actual `CatalogCheckpointOutcome` |
+| Catalog checkpoint | `CatalogCheckpointResult` retains `outcome`; `report` field absent |
 | MemIndex cleanup | Actual `live_delay`; `stats` field absent |
 | Capacity, allocation, admission, and drain bookkeeping | Remains operational |
 
@@ -216,21 +217,21 @@ at their existing boundaries. All 146 benchmark tests passed after this change.
 Review made the profiling module and all pure stats APIs feature-gated and
 removed disabled zero/empty fallback producers. The six session stats getters,
 engine recovery report, and diagnostic type exports require profiling. Catalog
-checkpoint returns a named outcome/report struct when enabled and directly
-returns its operational outcome through a type alias when disabled. The report
-contains only metrics. Result definitions stay in their operational modules,
-including the row-replay and hot-index recovery aliases. Redundant inner feature
-gates were removed from profiling modules.
+checkpoint returns the same named struct in both builds, with an unconditional
+outcome and a feature-gated report containing only metrics. Result definitions
+stay in their operational modules, including the row-replay result with feature-gated
+counts and the hot-index recovery alias. Redundant inner feature gates were removed
+from profiling modules.
 
-External callers verify both checkpoint result definitions, the metrics-only
+External callers verify the checkpoint result in both builds, the metrics-only
 report, and the absence of the disabled profiling module; previous API checks
 also verified that diagnostic methods are unavailable without the feature.
 Checkpoint serialization retains its flat benchmark schema and rejects unknown
-fields at the result, outcome, table-change, and table-I/O levels. Disabled
-maintenance tests consume the checkpoint outcome directly and destructure cleanup
-results with only operational fields. Runtime lifecycle tests use authoritative
-blocker counts in both builds; metric-only checks require profiling. The two
-dedicated snapshot/report tests run only when those APIs exist, explaining the
+fields at the result, published outcome, table-change, and table-I/O levels. Disabled
+maintenance tests destructure checkpoint and cleanup results with only operational
+fields. Runtime lifecycle tests use authoritative blocker counts in both builds;
+metric-only checks require profiling. The two dedicated snapshot/report tests
+run only when those APIs exist, explaining the
 reduced disabled test counts.
 
 Formatting, workspace Clippy, and all three explicit storage feature/backend
@@ -262,9 +263,8 @@ items, source backlogs to close, or parent RFC phases to synchronize.
 - Buffer, storage I/O, redo/purge, locks, runtime, recovery, checkpoint, cleanup,
   and index-build instrumentation is optional across its complete lifetime.
 - Enabled native duration reports and benchmark schemas retain their contracts.
-  Disabled catalog checkpoints return their outcome directly; cleanup results
-  omit measurement fields. Configuration and
-  persisted storage formats are unchanged.
+  Disabled catalog checkpoint and cleanup results omit measurement fields.
+  Configuration and persisted storage formats are unchanged.
 - Optional process probes are reusable outside the benchmark; RSS failures return
   storage errors. Benchmark callers retain workload-specific conversion and validation.
 - Profiling clock setup occurs outside internal reported startup time; the

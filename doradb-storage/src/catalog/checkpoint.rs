@@ -125,21 +125,17 @@ pub enum CatalogCheckpointOutcome {
     Noop,
 }
 
-/// Catalog checkpoint publication outcome and profiling measurements.
-#[cfg(feature = "profiling")]
+/// Catalog checkpoint publication outcome with feature-gated profiling measurements.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogCheckpointResult {
     /// Publication classification and durable replay boundary.
     pub outcome: CatalogCheckpointOutcome,
     /// Measurements collected by this checkpoint.
+    #[cfg(feature = "profiling")]
     #[serde(flatten)]
     pub report: CatalogCheckpointReport,
 }
-
-/// Catalog checkpoint publication outcome when profiling is disabled.
-#[cfg(not(feature = "profiling"))]
-pub type CatalogCheckpointResult = CatalogCheckpointOutcome;
 
 /// Configuration for scanning catalog checkpoint redo logs.
 #[derive(Clone)]
@@ -443,11 +439,7 @@ impl Catalog {
         obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
         let result = self.checkpoint_prepared_inner(trx_sys, disk_guard).await;
         result.inspect(|result| {
-            #[cfg(feature = "profiling")]
-            let outcome = result.outcome;
-            #[cfg(not(feature = "profiling"))]
-            let outcome = *result;
-            match outcome {
+            match result.outcome {
                 CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
                 } => obs::info!(
@@ -483,13 +475,9 @@ impl Catalog {
         let publishable_progress = batch.redo_retention_progress();
         match self.apply_checkpoint_batch(batch, disk_guard).await {
             Ok(result) => {
-                #[cfg(feature = "profiling")]
-                let outcome = result.outcome;
-                #[cfg(not(feature = "profiling"))]
-                let outcome = result;
                 if let CatalogCheckpointOutcome::Published {
                     catalog_replay_start_ts,
-                } = outcome
+                } = result.outcome
                 {
                     if let Some(progress) = publishable_progress {
                         debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
@@ -820,6 +808,45 @@ mod tests {
         let mut dml = BTreeMap::new();
         dml.insert(TABLE_ID_TABLES, TableDML { rows });
         dml
+    }
+
+    /// Purpose: Preserve the catalog checkpoint result schema without profiling.
+    /// Expected: Both outcomes round-trip inside an outcome field, without metrics, and
+    /// unknown result fields are rejected.
+    #[cfg(not(feature = "profiling"))]
+    #[test]
+    fn test_catalog_checkpoint_result_serialization_without_profiling() {
+        use toml::Value;
+
+        for (case, outcome, expected) in [
+            (
+                "published",
+                CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts: TrxID::new(42),
+                },
+                "[outcome]\ntype = \"published\"\ncatalog_replay_start_ts = 42\n",
+            ),
+            (
+                "noop",
+                CatalogCheckpointOutcome::Noop,
+                "[outcome]\ntype = \"noop\"\n",
+            ),
+        ] {
+            let result = CatalogCheckpointResult { outcome };
+            let encoded = toml::to_string(&result).unwrap();
+            let value: Value = toml::from_str(&encoded).unwrap();
+            assert_eq!(value, toml::from_str::<Value>(expected).unwrap(), "{case}");
+            assert_eq!(
+                toml::from_str::<CatalogCheckpointResult>(&encoded).unwrap(),
+                result,
+                "{case}"
+            );
+            let invalid = format!("unknown = 1\n{encoded}");
+            assert!(
+                toml::from_str::<CatalogCheckpointResult>(&invalid).is_err(),
+                "{case}: unknown field accepted in result"
+            );
+        }
     }
 
     /// Purpose: Identify catalog deletion redo belonging to the dropped table.

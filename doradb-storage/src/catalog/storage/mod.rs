@@ -1320,43 +1320,28 @@ impl PreparedCatalogCheckpoint {
                     .attach("operation=commit_catalog_checkpoint")?;
                 drop(old_root);
                 storage.install_checkpointed_silent_watermarks(checkpointed_silent_watermarks);
-                let outcome = CatalogCheckpointOutcome::Published {
-                    catalog_replay_start_ts,
-                };
-                #[cfg(feature = "profiling")]
-                {
-                    Ok(CatalogCheckpointResult {
-                        outcome,
-                        report: measurement.finish(),
-                    })
-                }
-                #[cfg(not(feature = "profiling"))]
-                {
-                    Ok(outcome)
-                }
+                Ok(CatalogCheckpointResult {
+                    outcome: CatalogCheckpointOutcome::Published {
+                        catalog_replay_start_ts,
+                    },
+                    #[cfg(feature = "profiling")]
+                    report: measurement.finish(),
+                })
             }
             PreparedCatalogCheckpoint::Noop {
                 #[cfg(feature = "profiling")]
                 catalog_ddl_txn_count,
                 ..
-            } => {
+            } => Ok(CatalogCheckpointResult {
+                outcome: CatalogCheckpointOutcome::Noop,
                 #[cfg(feature = "profiling")]
-                {
-                    Ok(CatalogCheckpointResult {
-                        outcome: CatalogCheckpointOutcome::Noop,
-                        report: CatalogCheckpointReport {
-                            catalog_ddl_txn_count,
-                            table_changes: Box::new([]),
-                            table_io: Box::new([]),
-                            metadata_bytes_written: 0,
-                        },
-                    })
-                }
-                #[cfg(not(feature = "profiling"))]
-                {
-                    Ok(CatalogCheckpointOutcome::Noop)
-                }
-            }
+                report: CatalogCheckpointReport {
+                    catalog_ddl_txn_count,
+                    table_changes: Box::new([]),
+                    table_io: Box::new([]),
+                    metadata_bytes_written: 0,
+                },
+            }),
         }
     }
 }
@@ -2597,12 +2582,8 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            #[cfg(feature = "profiling")]
-            let outcome = report1.outcome;
-            #[cfg(not(feature = "profiling"))]
-            let outcome = report1;
             assert!(matches!(
-                outcome,
+                report1.outcome,
                 CatalogCheckpointOutcome::Published { .. }
             ));
             #[cfg(feature = "profiling")]
@@ -2635,11 +2616,7 @@ pub(crate) mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
-            #[cfg(feature = "profiling")]
-            let outcome = noop.outcome;
-            #[cfg(not(feature = "profiling"))]
-            let outcome = noop;
-            assert_eq!(outcome, CatalogCheckpointOutcome::Noop);
+            assert_eq!(noop.outcome, CatalogCheckpointOutcome::Noop);
             #[cfg(feature = "profiling")]
             assert_eq!(noop.report.catalog_ddl_txn_count, 0);
             #[cfg(feature = "profiling")]
@@ -2778,12 +2755,8 @@ pub(crate) mod tests {
             #[cfg(feature = "profiling")]
             let cold_io_after = stats_session.storage_io_stats().unwrap();
 
-            #[cfg(feature = "profiling")]
-            let outcome = metadata_only_report.outcome;
-            #[cfg(not(feature = "profiling"))]
-            let outcome = metadata_only_report;
             assert!(matches!(
-                outcome,
+                metadata_only_report.outcome,
                 CatalogCheckpointOutcome::Published { .. }
             ));
             #[cfg(feature = "profiling")]

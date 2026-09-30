@@ -475,16 +475,7 @@ impl TransactionSystem {
                 new_first_retained_file_seq = target_marker;
             }
             match self.catalog.commit_prepared_checkpoint(prepared).await {
-                Ok(result) => {
-                    #[cfg(feature = "profiling")]
-                    {
-                        result.outcome
-                    }
-                    #[cfg(not(feature = "profiling"))]
-                    {
-                        result
-                    }
-                }
+                Ok(result) => result.outcome,
                 Err(RuntimeOrFatalError::Runtime(err))
                     if err.downcast_ref::<IoError>().is_some() =>
                 {

@@ -12,13 +12,13 @@ use crate::row::RowPage;
 use crate::table::{DeletionError, DmlValidator, Table};
 use error_stack::{Report, ResultExt};
 
-/// Feature-selected replay diagnostics; the disabled result has no payload.
-#[cfg(feature = "profiling")]
-pub(crate) type RowReplayResult = RowReplayCounts;
-
-/// Feature-selected replay diagnostics; the disabled result has no payload.
-#[cfg(not(feature = "profiling"))]
-pub(crate) type RowReplayResult = ();
+/// Successful row replay completion with feature-gated mutation counts.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RowReplayResult {
+    /// Successfully applied row mutations.
+    #[cfg(feature = "profiling")]
+    pub(crate) counts: RowReplayCounts,
+}
 
 /// Independent mutation evidence retained across a partially failed replay batch.
 #[derive(Default)]
@@ -61,14 +61,10 @@ impl Table {
             page_guard.set_dirty();
         }
         result?;
-        #[cfg(feature = "profiling")]
-        {
-            Ok(progress.counts)
-        }
-        #[cfg(not(feature = "profiling"))]
-        {
-            Ok(())
-        }
+        Ok(RowReplayResult {
+            #[cfg(feature = "profiling")]
+            counts: progress.counts,
+        })
     }
 
     /// Apply ordered operations to the latched page, retaining the mutation marker on failure.
@@ -181,6 +177,7 @@ impl Table {
 
 #[cfg(test)]
 mod tests {
+    use super::RowReplayResult;
     use crate::buffer::guard::{PageExclusiveGuard, PageGuard};
     use crate::buffer::page::PAGE_SIZE;
     use crate::catalog::tests::{
@@ -505,22 +502,22 @@ mod tests {
                         },
                     })
                     .collect();
-                let result = table
+                let RowReplayResult {
+                    #[cfg(feature = "profiling")]
+                    counts,
+                } = table
                     .recover_row_batch(
                         &guards,
                         &mut replay,
                         &pack_test_ops(ops),
                         disable_validation,
                     )
-                    .await;
+                    .await
+                    .unwrap();
                 #[cfg(feature = "profiling")]
-                let _counts = result.unwrap();
-                #[cfg(not(feature = "profiling"))]
-                result.unwrap();
+                assert_eq!(counts.inserts, 1);
                 #[cfg(feature = "profiling")]
-                assert_eq!(_counts.inserts, 1);
-                #[cfg(feature = "profiling")]
-                assert_eq!(_counts.updates, 1);
+                assert_eq!(counts.updates, 1);
                 assert!(replay.is_inserted(slot));
                 let page = table
                     .row_store
@@ -967,19 +964,19 @@ mod tests {
                         kind,
                     },
                 }]);
-                let result = table
+                let RowReplayResult {
+                    #[cfg(feature = "profiling")]
+                    counts,
+                } = table
                     .recover_row_batch(&guards, &mut replay, &batch, false)
-                    .await;
+                    .await
+                    .unwrap();
                 #[cfg(feature = "profiling")]
-                let _counts = result.unwrap();
-                #[cfg(not(feature = "profiling"))]
-                result.unwrap();
+                assert_eq!(counts.inserts, u64::from(phase == "insert"), "{phase}");
                 #[cfg(feature = "profiling")]
-                assert_eq!(_counts.inserts, u64::from(phase == "insert"), "{phase}");
+                assert_eq!(counts.updates, u64::from(phase == "update"), "{phase}");
                 #[cfg(feature = "profiling")]
-                assert_eq!(_counts.updates, u64::from(phase == "update"), "{phase}");
-                #[cfg(feature = "profiling")]
-                assert_eq!(_counts.deletes, 0, "{phase}");
+                assert_eq!(counts.deletes, 0, "{phase}");
                 assert!(replay.is_inserted(1), "{phase}");
                 drop(batch);
                 let page = table
