@@ -1,24 +1,19 @@
 use crate::error::{BenchError, Result};
 use crate::fixture::{CatalogCardinalities, IndexMode, KeyRange, PlacementKind, RowPlacement};
 use crate::plan::{CatalogCheckpointCase, CatalogCheckpointProfile};
-pub use doradb_storage::profiling::RecoveryHotIndexMeasurements;
-use doradb_storage::{
-    CatalogCheckpointReport, RecoveryPhaseTimings as StorageRecoveryPhaseTimings,
-    RecoveryRedoMetrics as StorageRecoveryRedoMetrics, RecoveryReport as StorageRecoveryReport,
-    RecoveryWorkCounts as StorageRecoveryWorkCounts,
+use doradb_storage::CatalogCheckpointResult;
+pub use doradb_storage::profiling::{
+    InternalMetric, InternalMetricKind, InternalMetricUnit, ProcessRssSampler,
+    RecoveryHotIndexMeasurements, RecoveryMeasurements as RecoveryReport,
+    RecoveryPhaseMeasurements as RecoveryPhaseTimings,
+    RecoveryRedoMeasurements as RecoveryRedoMetrics, RecoveryWorkCounts, SampledProcessRss,
+    process_cpu_nanos,
 };
 use hdrhistogram::Histogram;
 use quanta::{Clock, Instant};
-use rustix::param::page_size;
-use rustix::time::{ClockId, Timespec, clock_gettime};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const LOWEST_LATENCY_NANOS: u64 = 1;
@@ -229,238 +224,8 @@ pub enum WorkloadMetrics {
         /// Sampled process-RSS measurements around the checkpoint.
         sampled_process_rss: SampledProcessRss,
         /// Checkpoint-owned logical image and successful-write measurement.
-        checkpoint: CatalogCheckpointReport,
+        checkpoint: CatalogCheckpointResult,
     },
-}
-
-/// Strict benchmark representation of storage `RecoveryReport`; durations are u64 nanoseconds.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryReport {
-    /// Internal startup envelope through ready owner assembly.
-    pub bootstrap_elapsed_nanos: u64,
-    /// Configuration, root setup, and components preceding the catalog.
-    pub engine_setup_elapsed_nanos: u64,
-    /// Complete catalog construction, including checkpoint loading.
-    pub catalog_bootstrap_elapsed_nanos: u64,
-    /// Complete transaction-system component construction.
-    pub transaction_bootstrap_elapsed_nanos: u64,
-    /// Remaining workers, header durability, layout handling, and owner assembly.
-    pub runtime_startup_elapsed_nanos: u64,
-    /// Intervals nested within transaction-system construction.
-    pub phases: RecoveryPhaseTimings,
-    /// Observed replay and reconstruction work.
-    pub work: RecoveryWorkCounts,
-    /// Consumer-side redo stream attribution.
-    pub redo: RecoveryRedoMetrics,
-    /// Completed-index attribution; absent in older reports recorded without profiling.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hot_indexes: Option<RecoveryHotIndexMeasurements>,
-}
-
-impl RecoveryReport {
-    /// Validate and copy one immutable successful storage report.
-    pub(crate) fn from_storage(report: &StorageRecoveryReport) -> Result<Self> {
-        let [
-            bootstrap_elapsed_nanos,
-            engine_setup_elapsed_nanos,
-            catalog_bootstrap_elapsed_nanos,
-            transaction_bootstrap_elapsed_nanos,
-            runtime_startup_elapsed_nanos,
-        ] = durations_nanos([
-            report.bootstrap_elapsed,
-            report.engine_setup_elapsed,
-            report.catalog_bootstrap_elapsed,
-            report.transaction_bootstrap_elapsed,
-            report.runtime_startup_elapsed,
-        ])?;
-        let report = Self {
-            bootstrap_elapsed_nanos,
-            engine_setup_elapsed_nanos,
-            catalog_bootstrap_elapsed_nanos,
-            transaction_bootstrap_elapsed_nanos,
-            runtime_startup_elapsed_nanos,
-            phases: RecoveryPhaseTimings::from_storage(&report.phases)?,
-            work: RecoveryWorkCounts::from_storage(&report.work),
-            redo: RecoveryRedoMetrics::from_storage(&report.redo)?,
-            hot_indexes: Some(report.hot_indexes),
-        };
-        validate_recovery_report(&report)?;
-        Ok(report)
-    }
-}
-
-/// Strict benchmark representation of storage `RecoveryPhaseTimings`; durations are u64 nanoseconds.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryPhaseTimings {
-    /// Recovery resources, redo discovery, and coordinator construction.
-    pub preparation_elapsed_nanos: u64,
-    /// Checkpointed user tables, cleanup, and replay-bound seeding.
-    pub user_table_bootstrap_elapsed_nanos: u64,
-    /// Replay-suffix planning and read-ahead launch.
-    pub redo_planning_elapsed_nanos: u64,
-    /// Redo stream consumption, application, and termination.
-    pub redo_replay_elapsed_nanos: u64,
-    /// Catalog, descriptor, table-root, and index lifecycle validation.
-    pub validation_elapsed_nanos: u64,
-    /// Post-replay provisional-file cleanup.
-    pub absent_file_cleanup_elapsed_nanos: u64,
-    /// Replay-sidecar consumption and final hot-index reconstruction.
-    pub hot_index_rebuild_elapsed_nanos: u64,
-    /// Accepted-prefix repair and startup-file policy selection; excludes later repair IO.
-    pub redo_repair_planning_elapsed_nanos: u64,
-    /// Construction of writable redo startup resources.
-    pub redo_finalize_elapsed_nanos: u64,
-    /// Remaining transaction-component construction time.
-    pub other_elapsed_nanos: u64,
-}
-
-impl RecoveryPhaseTimings {
-    fn from_storage(report: &StorageRecoveryPhaseTimings) -> Result<Self> {
-        let [
-            preparation_elapsed_nanos,
-            user_table_bootstrap_elapsed_nanos,
-            redo_planning_elapsed_nanos,
-            redo_replay_elapsed_nanos,
-            validation_elapsed_nanos,
-            absent_file_cleanup_elapsed_nanos,
-            hot_index_rebuild_elapsed_nanos,
-            redo_repair_planning_elapsed_nanos,
-            redo_finalize_elapsed_nanos,
-            other_elapsed_nanos,
-        ] = durations_nanos([
-            report.preparation_elapsed,
-            report.user_table_bootstrap_elapsed,
-            report.redo_planning_elapsed,
-            report.redo_replay_elapsed,
-            report.validation_elapsed,
-            report.absent_file_cleanup_elapsed,
-            report.hot_index_rebuild_elapsed,
-            report.redo_repair_planning_elapsed,
-            report.redo_finalize_elapsed,
-            report.other_elapsed,
-        ])?;
-        Ok(Self {
-            preparation_elapsed_nanos,
-            user_table_bootstrap_elapsed_nanos,
-            redo_planning_elapsed_nanos,
-            redo_replay_elapsed_nanos,
-            validation_elapsed_nanos,
-            absent_file_cleanup_elapsed_nanos,
-            hot_index_rebuild_elapsed_nanos,
-            redo_repair_planning_elapsed_nanos,
-            redo_finalize_elapsed_nanos,
-            other_elapsed_nanos,
-        })
-    }
-}
-
-/// Strict benchmark representation of storage `RecoveryWorkCounts`.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryWorkCounts {
-    /// Redo segment filenames discovered at startup.
-    pub redo_segments_discovered: u64,
-    /// Segments selected for body replay.
-    pub redo_segments_selected: u64,
-    /// Decoded catalog RowRedo entries, before filtering.
-    pub catalog_row_ops_seen: u64,
-    /// Successfully applied catalog RowRedo entries, including DDL payloads.
-    pub catalog_row_ops_applied: u64,
-    /// Decoded catalog RowRedo entries excluded by replay boundaries.
-    pub catalog_row_ops_skipped: u64,
-    /// Decoded user RowRedo entries, before filtering.
-    pub user_row_ops_seen: u64,
-    /// Successfully applied user RowRedo entries.
-    pub user_row_ops_applied: u64,
-    /// Decoded user RowRedo entries excluded by replay boundaries.
-    pub user_row_ops_skipped: u64,
-    /// Successfully replayed hot inserts.
-    pub hot_inserts: u64,
-    /// Successfully replayed hot updates.
-    pub hot_updates: u64,
-    /// Successfully replayed hot deletes.
-    pub hot_deletes: u64,
-    /// Successfully replayed cold deletes.
-    pub cold_deletes: u64,
-    /// User tables loaded from the catalog checkpoint.
-    pub checkpoint_user_tables: u64,
-    /// Successfully allocated replay pages, including pages later dropped.
-    pub hot_pages_reconstructed: u64,
-    /// Final hot pages visited by index reconstruction.
-    pub index_rebuild_pages: u64,
-    /// Successful insertions across all active hot indexes.
-    pub index_entries_inserted: u64,
-}
-
-impl RecoveryWorkCounts {
-    fn from_storage(report: &StorageRecoveryWorkCounts) -> Self {
-        Self {
-            redo_segments_discovered: report.redo_segments_discovered,
-            redo_segments_selected: report.redo_segments_selected,
-            catalog_row_ops_seen: report.catalog_row_ops_seen,
-            catalog_row_ops_applied: report.catalog_row_ops_applied,
-            catalog_row_ops_skipped: report.catalog_row_ops_skipped,
-            user_row_ops_seen: report.user_row_ops_seen,
-            user_row_ops_applied: report.user_row_ops_applied,
-            user_row_ops_skipped: report.user_row_ops_skipped,
-            hot_inserts: report.hot_inserts,
-            hot_updates: report.hot_updates,
-            hot_deletes: report.hot_deletes,
-            cold_deletes: report.cold_deletes,
-            checkpoint_user_tables: report.checkpoint_user_tables,
-            hot_pages_reconstructed: report.hot_pages_reconstructed,
-            index_rebuild_pages: report.index_rebuild_pages,
-            index_entries_inserted: report.index_entries_inserted,
-        }
-    }
-}
-
-/// Strict benchmark representation of storage `RecoveryRedoMetrics`; durations are u64 nanoseconds.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecoveryRedoMetrics {
-    /// Complete consumer refill calls, including waits, decoding, and reader termination.
-    pub stream_refill_elapsed_nanos: u64,
-    /// Channel receive time, including scheduling and immediate receive overhead.
-    pub receive_wait_elapsed_nanos: u64,
-    /// Transaction-frame deserialization, timed once per validated group.
-    pub group_decode_elapsed_nanos: u64,
-    /// Reader stop and join time inside stream termination.
-    pub reader_shutdown_elapsed_nanos: u64,
-    /// Refill time excluding receives, decoding, and reader shutdown.
-    pub stream_other_elapsed_nanos: u64,
-    /// Replay time excluding refill; includes application, dispatch, and filtering.
-    pub apply_and_dispatch_elapsed_nanos: u64,
-    /// Complete validated groups decoded.
-    pub groups_decoded: u64,
-    /// Decoded transactions, including those later filtered.
-    pub transactions_decoded: u64,
-    /// Data blocks received by the consumer, including terminal/tail blocks.
-    pub data_blocks_consumed: u64,
-    /// Full buffer bytes consumed, excluding metadata and unused read-ahead.
-    pub consumed_bytes: u64,
-    /// Logical payload bytes in complete validated groups.
-    pub validated_payload_bytes: u64,
-}
-
-impl RecoveryRedoMetrics {
-    fn from_storage(report: &StorageRecoveryRedoMetrics) -> Result<Self> {
-        Ok(Self {
-            stream_refill_elapsed_nanos: duration_nanos(report.stream_refill_elapsed)?,
-            receive_wait_elapsed_nanos: duration_nanos(report.receive_wait_elapsed)?,
-            group_decode_elapsed_nanos: duration_nanos(report.group_decode_elapsed)?,
-            reader_shutdown_elapsed_nanos: duration_nanos(report.reader_shutdown_elapsed)?,
-            stream_other_elapsed_nanos: duration_nanos(report.stream_other_elapsed)?,
-            apply_and_dispatch_elapsed_nanos: duration_nanos(report.apply_and_dispatch_elapsed)?,
-            groups_decoded: report.groups_decoded,
-            transactions_decoded: report.transactions_decoded,
-            data_blocks_consumed: report.data_blocks_consumed,
-            consumed_bytes: report.consumed_bytes,
-            validated_payload_bytes: report.validated_payload_bytes,
-        })
-    }
 }
 
 /// Content proof for a clean reopen in the same process with uncontrolled cache state.
@@ -481,103 +246,6 @@ pub struct RecoveryVerification {
     pub fingerprint: String,
     /// Whether the complete unbounded index stream matched the table scan.
     pub index_verified: bool,
-}
-
-/// Benchmark-local sampled process resident-set measurements.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SampledProcessRss {
-    /// Synchronous RSS sample immediately before starting the sampler.
-    pub baseline_bytes: usize,
-    /// Greatest one-millisecond or terminal synchronous RSS sample.
-    pub peak_bytes: usize,
-    /// Saturating sampled peak above the pre-operation baseline.
-    pub peak_above_baseline_bytes: usize,
-}
-
-/// Running one-millisecond Linux process-RSS sampler.
-pub(crate) struct ProcessRssSampler {
-    baseline_bytes: usize,
-    peak_bytes: Arc<AtomicUsize>,
-    stop: Arc<AtomicBool>,
-    thread: JoinHandle<Result<()>>,
-}
-
-impl ProcessRssSampler {
-    /// Capture the baseline, start sampling, and wait for sampler readiness.
-    pub(crate) fn start() -> Result<Self> {
-        let baseline_bytes = current_process_rss()?;
-        let peak_bytes = Arc::new(AtomicUsize::new(baseline_bytes));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let thread_peak = Arc::clone(&peak_bytes);
-        let thread_stop = Arc::clone(&stop);
-        let thread = thread::Builder::new()
-            .name("doradb-bench-rss".to_owned())
-            .spawn(move || {
-                let first = current_process_rss();
-                match first {
-                    Ok(bytes) => {
-                        thread_peak.fetch_max(bytes, Ordering::Relaxed);
-                        let _ = ready_tx.send(Ok(()));
-                    }
-                    Err(error) => {
-                        let message = error.to_string();
-                        let _ = ready_tx.send(Err(message));
-                        return Err(error);
-                    }
-                }
-                while !thread_stop.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(1));
-                    let bytes = current_process_rss()?;
-                    thread_peak.fetch_max(bytes, Ordering::Relaxed);
-                }
-                Ok(())
-            })
-            .map_err(|error| {
-                BenchError::message(format!("failed to start process RSS sampler: {error}"))
-            })?;
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                baseline_bytes,
-                peak_bytes,
-                stop,
-                thread,
-            }),
-            Ok(Err(message)) => {
-                let _ = thread.join();
-                Err(BenchError::message(format!(
-                    "process RSS sampler could not read Linux procfs: {message}"
-                )))
-            }
-            Err(error) => {
-                let _ = thread.join();
-                Err(BenchError::message(format!(
-                    "process RSS sampler readiness channel closed: {error}"
-                )))
-            }
-        }
-    }
-
-    /// Take the terminal sample, stop and join the sampler, and return its peak.
-    pub(crate) fn stop(self) -> Result<SampledProcessRss> {
-        let final_sample = current_process_rss();
-        if let Ok(bytes) = &final_sample {
-            self.peak_bytes.fetch_max(*bytes, Ordering::Relaxed);
-        }
-        self.stop.store(true, Ordering::Release);
-        let thread_result = self.thread.join().map_err(|_| {
-            BenchError::message("process RSS sampler thread panicked before joining")
-        })?;
-        thread_result?;
-        final_sample?;
-        let peak_bytes = self.peak_bytes.load(Ordering::Relaxed);
-        Ok(SampledProcessRss {
-            baseline_bytes: self.baseline_bytes,
-            peak_bytes,
-            peak_above_baseline_bytes: peak_bytes.saturating_sub(self.baseline_bytes),
-        })
-    }
 }
 
 /// Complete CREATE measurements; verification is filled after the runner ends.
@@ -807,41 +475,6 @@ pub struct SessionRunResult {
     pub latency: LatencyDistribution,
 }
 
-/// Classification that controls interpretation of an engine diagnostic.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum InternalMetricKind {
-    /// Counter observed since the fresh engine startup, including background activity.
-    CumulativeCounter,
-    CounterDelta,
-    EndGauge,
-    LifetimePeak,
-}
-
-/// Physical unit of an engine diagnostic.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum InternalMetricUnit {
-    Count,
-    Bytes,
-    Nanoseconds,
-    Frames,
-}
-
-/// Typed optional storage-engine diagnostic.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct InternalMetric {
-    /// Stable diagnostic name.
-    pub name: String,
-    /// Exact diagnostic value.
-    pub value: u64,
-    /// Interpretation of the metric value.
-    pub kind: InternalMetricKind,
-    /// Physical unit of the metric value.
-    pub unit: InternalMetricUnit,
-}
-
 /// Latency summary calculated from an exact merged distribution.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -961,130 +594,10 @@ pub fn operations_per_second(operations: u64, elapsed_nanos: u64) -> f64 {
     }
 }
 
-/// Read all process threads' accumulated CPU time using the safe Linux clock API.
-pub(crate) fn process_cpu_nanos() -> Result<u64> {
-    timespec_nanos(clock_gettime(ClockId::ProcessCPUTime))
-}
-
-/// Validate a nonnegative process CPU delta.
-pub(crate) fn process_cpu_delta(start: u64, end: u64) -> Result<u64> {
-    end.checked_sub(start)
-        .ok_or_else(|| BenchError::message("process CPU clock moved backwards"))
-}
-
 /// Convert a duration to exact nanoseconds, rejecting values outside the metric range.
 fn duration_nanos(duration: Duration) -> Result<u64> {
     u64::try_from(duration.as_nanos())
         .map_err(|_| BenchError::message("measurement duration exceeds u64 nanoseconds"))
-}
-
-/// Convert a fixed-size group of durations to exact nanoseconds.
-fn durations_nanos<const N: usize>(durations: [Duration; N]) -> Result<[u64; N]> {
-    let mut nanos = [0; N];
-    for (target, duration) in nanos.iter_mut().zip(durations) {
-        *target = duration_nanos(duration)?;
-    }
-    Ok(nanos)
-}
-
-fn timespec_nanos(value: Timespec) -> Result<u64> {
-    let seconds = u64::try_from(value.tv_sec)
-        .map_err(|_| BenchError::message("negative process CPU seconds"))?;
-    let nanos = u64::try_from(value.tv_nsec)
-        .ok()
-        .filter(|nanos| *nanos < 1_000_000_000)
-        .ok_or_else(|| BenchError::message("invalid process CPU nanoseconds"))?;
-    seconds
-        .checked_mul(1_000_000_000)
-        .and_then(|seconds| seconds.checked_add(nanos))
-        .ok_or_else(|| BenchError::message("process CPU duration exceeds u64 nanoseconds"))
-}
-
-fn check_recovery_sum(actual: u64, components: &[u64]) -> Result<()> {
-    let expected = components.iter().try_fold(0u64, |total, value| {
-        total
-            .checked_add(*value)
-            .ok_or_else(|| BenchError::message("recovery metric sum overflow"))
-    })?;
-    if actual != expected {
-        return Err(BenchError::message("recovery metric accounting mismatch"));
-    }
-    Ok(())
-}
-
-fn validate_recovery_report(report: &RecoveryReport) -> Result<()> {
-    check_recovery_sum(
-        report.bootstrap_elapsed_nanos,
-        &[
-            report.engine_setup_elapsed_nanos,
-            report.catalog_bootstrap_elapsed_nanos,
-            report.transaction_bootstrap_elapsed_nanos,
-            report.runtime_startup_elapsed_nanos,
-        ],
-    )?;
-    let phases = &report.phases;
-    check_recovery_sum(
-        report.transaction_bootstrap_elapsed_nanos,
-        &[
-            phases.preparation_elapsed_nanos,
-            phases.user_table_bootstrap_elapsed_nanos,
-            phases.redo_planning_elapsed_nanos,
-            phases.redo_replay_elapsed_nanos,
-            phases.validation_elapsed_nanos,
-            phases.absent_file_cleanup_elapsed_nanos,
-            phases.hot_index_rebuild_elapsed_nanos,
-            phases.redo_repair_planning_elapsed_nanos,
-            phases.redo_finalize_elapsed_nanos,
-            phases.other_elapsed_nanos,
-        ],
-    )?;
-    validate_recovery_redo(phases.redo_replay_elapsed_nanos, &report.redo)?;
-    validate_recovery_work(&report.work)
-}
-
-fn validate_recovery_redo(replay_elapsed_nanos: u64, redo: &RecoveryRedoMetrics) -> Result<()> {
-    check_recovery_sum(
-        replay_elapsed_nanos,
-        &[
-            redo.stream_refill_elapsed_nanos,
-            redo.apply_and_dispatch_elapsed_nanos,
-        ],
-    )?;
-    check_recovery_sum(
-        redo.stream_refill_elapsed_nanos,
-        &[
-            redo.receive_wait_elapsed_nanos,
-            redo.group_decode_elapsed_nanos,
-            redo.reader_shutdown_elapsed_nanos,
-            redo.stream_other_elapsed_nanos,
-        ],
-    )?;
-    if redo.consumed_bytes < redo.validated_payload_bytes {
-        return Err(BenchError::message(
-            "recovery validated payload bytes exceed consumed bytes",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_recovery_work(work: &RecoveryWorkCounts) -> Result<()> {
-    check_recovery_sum(
-        work.catalog_row_ops_seen,
-        &[work.catalog_row_ops_applied, work.catalog_row_ops_skipped],
-    )?;
-    check_recovery_sum(
-        work.user_row_ops_seen,
-        &[work.user_row_ops_applied, work.user_row_ops_skipped],
-    )?;
-    check_recovery_sum(
-        work.user_row_ops_applied,
-        &[
-            work.hot_inserts,
-            work.hot_updates,
-            work.hot_deletes,
-            work.cold_deletes,
-        ],
-    )
 }
 
 fn checked_counter(left: u64, right: u64, name: &str) -> Result<u64> {
@@ -1092,95 +605,14 @@ fn checked_counter(left: u64, right: u64, name: &str) -> Result<u64> {
         .ok_or_else(|| BenchError::message(format!("workload counter overflow: {name}")))
 }
 
-fn current_process_rss() -> Result<usize> {
-    read_process_rss(Path::new("/proc/self/statm"), page_size())
-}
-
-fn read_process_rss(path: &Path, page_size: usize) -> Result<usize> {
-    let contents = fs::read_to_string(path).map_err(|error| {
-        BenchError::message(format!(
-            "failed to read process RSS from {}: {error}",
-            path.display()
-        ))
-    })?;
-    parse_statm_rss(&contents, page_size)
-}
-
-fn parse_statm_rss(contents: &str, page_size: usize) -> Result<usize> {
-    let resident_pages = contents
-        .split_ascii_whitespace()
-        .nth(1)
-        .ok_or_else(|| BenchError::message("/proc/self/statm has no resident-page field"))?
-        .parse::<usize>()
-        .map_err(|error| {
-            BenchError::message(format!(
-                "/proc/self/statm resident-page field is malformed: {error}"
-            ))
-        })?;
-    resident_pages.checked_mul(page_size).ok_or_else(|| {
-        BenchError::message(format!(
-            "process RSS byte count overflow: resident_pages={resident_pages}, page_size={page_size}"
-        ))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use doradb_storage::id::{TableID, TrxID};
-    use doradb_storage::profiling::{HotBuildMeasurements, HotMergeMeasurements};
     use doradb_storage::{
-        CatalogCheckpointOutcome, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
+        CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogTableCheckpointChange,
+        CatalogTableCheckpointIoStats,
     };
-    use tempfile::TempDir;
-
-    /// Purpose: Maintain valid, monotonic process CPU accounting.
-    /// Expected: Valid times convert precisely while malformed, overflowing, or decreasing
-    /// readings are rejected.
-    #[test]
-    fn process_cpu_conversion_and_deltas_are_checked() {
-        assert_eq!(
-            timespec_nanos(Timespec {
-                tv_sec: 1,
-                tv_nsec: 2
-            })
-            .unwrap(),
-            1_000_000_002
-        );
-        assert_eq!(
-            timespec_nanos(Timespec {
-                tv_sec: 0,
-                tv_nsec: 0
-            })
-            .unwrap(),
-            0
-        );
-        for value in [
-            Timespec {
-                tv_sec: -1,
-                tv_nsec: 0,
-            },
-            Timespec {
-                tv_sec: 0,
-                tv_nsec: -1,
-            },
-            Timespec {
-                tv_sec: 0,
-                tv_nsec: 1_000_000_000,
-            },
-            Timespec {
-                tv_sec: i64::MAX,
-                tv_nsec: 0,
-            },
-        ] {
-            assert!(timespec_nanos(value).is_err());
-        }
-        assert_eq!(process_cpu_delta(10, 15).unwrap(), 5);
-        assert_eq!(process_cpu_delta(10, 10).unwrap(), 0);
-        assert!(process_cpu_delta(10, 9).is_err());
-        let first = process_cpu_nanos().unwrap();
-        assert!(process_cpu_delta(first, process_cpu_nanos().unwrap()).is_ok());
-    }
 
     /// Purpose: Enforce monotonic ordering for raw measurement timestamps.
     /// Expected: Equal timestamps represent no elapsed time and reversed timestamps are
@@ -1416,26 +848,28 @@ mod tests {
                     peak_bytes: 20,
                     peak_above_baseline_bytes: 10,
                 },
-                checkpoint: CatalogCheckpointReport {
+                checkpoint: CatalogCheckpointResult {
                     outcome: CatalogCheckpointOutcome::Published {
                         catalog_replay_start_ts: TrxID::new(42),
                     },
-                    catalog_ddl_txn_count: 1,
-                    table_changes: vec![CatalogTableCheckpointChange {
-                        table_id: TableID::new(9),
-                        before_row_count: 1,
-                        after_row_count: 2,
-                    }]
-                    .into_boxed_slice(),
-                    table_io: vec![CatalogTableCheckpointIoStats {
-                        table_id: TableID::new(9),
-                        compact_bytes_read: 16_384,
-                        final_compact_bytes: 32_768,
-                        lwc_bytes_written: 16_384,
-                        index_bytes_written: 16_384,
-                    }]
-                    .into_boxed_slice(),
-                    metadata_bytes_written: 24_576,
+                    report: CatalogCheckpointReport {
+                        catalog_ddl_txn_count: 1,
+                        table_changes: vec![CatalogTableCheckpointChange {
+                            table_id: TableID::new(9),
+                            before_row_count: 1,
+                            after_row_count: 2,
+                        }]
+                        .into_boxed_slice(),
+                        table_io: vec![CatalogTableCheckpointIoStats {
+                            table_id: TableID::new(9),
+                            compact_bytes_read: 16_384,
+                            final_compact_bytes: 32_768,
+                            lwc_bytes_written: 16_384,
+                            index_bytes_written: 16_384,
+                        }]
+                        .into_boxed_slice(),
+                        metadata_bytes_written: 24_576,
+                    },
                 },
             },
         ];
@@ -1443,6 +877,38 @@ mod tests {
             let encoded = toml::to_string(&metrics).unwrap();
             if matches!(&metrics, WorkloadMetrics::CatalogCheckpoint { .. }) {
                 assert!(encoded.contains("type = \"catalog-checkpoint\""));
+                let value: toml::Value = toml::from_str(&encoded).unwrap();
+                let checkpoint = value["checkpoint"].as_table().unwrap();
+                let mut fields = checkpoint.keys().map(String::as_str).collect::<Vec<_>>();
+                fields.sort_unstable();
+                assert_eq!(
+                    fields,
+                    [
+                        "catalog_ddl_txn_count",
+                        "metadata_bytes_written",
+                        "outcome",
+                        "table_changes",
+                        "table_io",
+                    ]
+                );
+                for level in ["checkpoint", "outcome", "table_changes", "table_io"] {
+                    let mut invalid = value.clone();
+                    let checkpoint = &mut invalid["checkpoint"];
+                    let target = match level {
+                        "checkpoint" => checkpoint,
+                        "outcome" => &mut checkpoint["outcome"],
+                        _ => &mut checkpoint[level][0],
+                    };
+                    target
+                        .as_table_mut()
+                        .unwrap()
+                        .insert("unknown".to_owned(), toml::Value::Integer(1));
+                    assert!(
+                        toml::from_str::<WorkloadMetrics>(&toml::to_string(&invalid).unwrap())
+                            .is_err(),
+                        "unknown field accepted in {level}"
+                    );
+                }
                 let obsolete = encoded.replacen(
                     "type = \"catalog-checkpoint\"",
                     "type = \"catalog-checkpoint-scale\"",
@@ -1461,255 +927,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    /// Purpose: Validate resident-memory accounting from process statistics.
-    /// Expected: Resident pages convert accurately to bytes while malformed or overflowing
-    /// input is rejected.
-    #[test]
-    fn process_rss_parser_checks_shape_and_overflow() {
-        assert_eq!(parse_statm_rss("100 7 2 1\n", 4_096).unwrap(), 28_672);
-        assert!(parse_statm_rss("100\n", 4_096).is_err());
-        assert!(parse_statm_rss("100 nope\n", 4_096).is_err());
-        assert!(parse_statm_rss("1 2\n", usize::MAX).is_err());
-    }
-
-    /// Purpose: Keep sampled memory peaks consistent with the baseline.
-    /// Expected: Peak memory cannot fall below the baseline and additional usage reflects their
-    /// difference.
-    #[test]
-    fn process_rss_sampler_synchronizes_and_returns_a_nondecreasing_peak() {
-        let sample = ProcessRssSampler::start().unwrap().stop().unwrap();
-        assert!(sample.peak_bytes >= sample.baseline_bytes);
-        assert_eq!(
-            sample.peak_above_baseline_bytes,
-            sample.peak_bytes.saturating_sub(sample.baseline_bytes)
-        );
-    }
-
-    /// Purpose: Expose unavailable process-memory statistics as a measurement failure.
-    /// Expected: The diagnostic identifies the failed RSS read.
-    #[test]
-    fn process_rss_reader_rejects_unavailable_input() {
-        let temp = TempDir::new().unwrap();
-        let error = read_process_rss(&temp.path().join("missing-statm"), 4_096).unwrap_err();
-        assert!(error.to_string().contains("failed to read process RSS"));
-    }
-
-    /// Purpose: Preserve the recovery report schema while reusing storage measurement types.
-    /// Expected: Measurements round-trip losslessly and unknown fields at every nested level are rejected.
-    #[test]
-    fn recovery_measurements_round_trip_with_strict_fields() {
-        let storage = StorageRecoveryReport {
-            hot_indexes: RecoveryHotIndexMeasurements {
-                extraction: HotBuildMeasurements {
-                    entries: u64::MAX,
-                    source_pages: 7,
-                    ..HotBuildMeasurements::default()
-                },
-                merge: HotMergeMeasurements {
-                    checked: true,
-                    partitions: 3,
-                    ..HotMergeMeasurements::default()
-                },
-                completed_builds: 2,
-                scratch_peak_bytes: 4096,
-                ..RecoveryHotIndexMeasurements::default()
-            },
-            ..StorageRecoveryReport::default()
-        };
-        let report = RecoveryReport::from_storage(&storage).unwrap();
-        assert_eq!(report.hot_indexes, Some(storage.hot_indexes));
-        let encoded = toml::to_string(&report).unwrap();
-        assert_eq!(toml::from_str::<RecoveryReport>(&encoded).unwrap(), report);
-        for path in ["hot_indexes", "hot_indexes.extraction", "hot_indexes.merge"] {
-            let header = format!("[{path}]\n");
-            let invalid =
-                encoded.replacen(&header, &format!("{header}unknown_measurement = 1\n"), 1);
-            let error = toml::from_str::<RecoveryReport>(&invalid).unwrap_err();
-            assert!(
-                error.to_string().contains("unknown_measurement"),
-                "{path}: {error}"
-            );
-        }
-    }
-
-    /// Purpose: Preserve recovery timing precision across conversion and serialization.
-    /// Expected: Representable durations remain lossless and out-of-range timings are rejected.
-    #[test]
-    fn recovery_duration_conversion_and_numeric_round_trip_check_bounds() {
-        let duration = Duration::from_nanos(u64::MAX);
-        let mut storage = StorageRecoveryReport {
-            bootstrap_elapsed: duration,
-            transaction_bootstrap_elapsed: duration,
-            phases: StorageRecoveryPhaseTimings {
-                redo_replay_elapsed: duration,
-                ..StorageRecoveryPhaseTimings::default()
-            },
-            redo: StorageRecoveryRedoMetrics {
-                stream_refill_elapsed: duration,
-                receive_wait_elapsed: duration,
-                ..StorageRecoveryRedoMetrics::default()
-            },
-            ..StorageRecoveryReport::default()
-        };
-        let report = RecoveryReport::from_storage(&storage).unwrap();
-        assert_eq!(report.bootstrap_elapsed_nanos, u64::MAX);
-        assert_eq!(report.phases.redo_replay_elapsed_nanos, u64::MAX);
-        assert_eq!(report.redo.receive_wait_elapsed_nanos, u64::MAX);
-        let encoded = toml::to_string(&report).unwrap();
-        assert!(encoded.contains(&format!("bootstrap_elapsed_nanos = {}\n", u64::MAX)));
-        assert_eq!(toml::from_str::<RecoveryReport>(&encoded).unwrap(), report);
-
-        let oversized = duration + Duration::from_nanos(1);
-        storage.bootstrap_elapsed = oversized;
-        assert!(RecoveryReport::from_storage(&storage).is_err());
-        storage.bootstrap_elapsed = duration;
-        storage.phases.redo_replay_elapsed = oversized;
-        assert!(RecoveryReport::from_storage(&storage).is_err());
-        storage.phases.redo_replay_elapsed = duration;
-        storage.redo.receive_wait_elapsed = oversized;
-        assert!(RecoveryReport::from_storage(&storage).is_err());
-    }
-
-    /// Purpose: Keep top-level recovery timings associated with their original components.
-    /// Expected: Conversion preserves each component's duration without exchanging fields.
-    #[test]
-    fn recovery_report_duration_conversion_preserves_field_mapping() {
-        let storage = StorageRecoveryReport {
-            bootstrap_elapsed: Duration::from_nanos(110),
-            engine_setup_elapsed: Duration::from_nanos(11),
-            catalog_bootstrap_elapsed: Duration::from_nanos(22),
-            transaction_bootstrap_elapsed: Duration::from_nanos(33),
-            runtime_startup_elapsed: Duration::from_nanos(44),
-            phases: StorageRecoveryPhaseTimings {
-                other_elapsed: Duration::from_nanos(33),
-                ..StorageRecoveryPhaseTimings::default()
-            },
-            ..StorageRecoveryReport::default()
-        };
-        let report = RecoveryReport::from_storage(&storage).unwrap();
-        assert_eq!(report.bootstrap_elapsed_nanos, 110);
-        assert_eq!(report.engine_setup_elapsed_nanos, 11);
-        assert_eq!(report.catalog_bootstrap_elapsed_nanos, 22);
-        assert_eq!(report.transaction_bootstrap_elapsed_nanos, 33);
-        assert_eq!(report.runtime_startup_elapsed_nanos, 44);
-    }
-
-    /// Purpose: Keep recovery phase timings associated with their original phases.
-    /// Expected: Conversion preserves each phase's duration without exchanging fields.
-    #[test]
-    fn recovery_phase_duration_conversion_preserves_field_mapping() {
-        let storage = StorageRecoveryPhaseTimings {
-            preparation_elapsed: Duration::from_nanos(1),
-            user_table_bootstrap_elapsed: Duration::from_nanos(2),
-            redo_planning_elapsed: Duration::from_nanos(3),
-            redo_replay_elapsed: Duration::from_nanos(4),
-            validation_elapsed: Duration::from_nanos(5),
-            absent_file_cleanup_elapsed: Duration::from_nanos(6),
-            hot_index_rebuild_elapsed: Duration::from_nanos(7),
-            redo_repair_planning_elapsed: Duration::from_nanos(8),
-            redo_finalize_elapsed: Duration::from_nanos(9),
-            other_elapsed: Duration::from_nanos(10),
-        };
-        let phases = RecoveryPhaseTimings::from_storage(&storage).unwrap();
-        assert_eq!(phases.preparation_elapsed_nanos, 1);
-        assert_eq!(phases.user_table_bootstrap_elapsed_nanos, 2);
-        assert_eq!(phases.redo_planning_elapsed_nanos, 3);
-        assert_eq!(phases.redo_replay_elapsed_nanos, 4);
-        assert_eq!(phases.validation_elapsed_nanos, 5);
-        assert_eq!(phases.absent_file_cleanup_elapsed_nanos, 6);
-        assert_eq!(phases.hot_index_rebuild_elapsed_nanos, 7);
-        assert_eq!(phases.redo_repair_planning_elapsed_nanos, 8);
-        assert_eq!(phases.redo_finalize_elapsed_nanos, 9);
-        assert_eq!(phases.other_elapsed_nanos, 10);
-    }
-
-    /// Purpose: Keep validated redo payload within consumed input.
-    /// Expected: Accounting accepts covered payloads and rejects payload sizes exceeding
-    /// consumed bytes.
-    #[test]
-    fn recovery_redo_payload_cannot_exceed_consumed_bytes() {
-        for (consumed_bytes, validated_payload_bytes, valid) in [
-            (0, 0, true),
-            (64, 64, true),
-            (4096, 128, true),
-            (u64::MAX, u64::MAX, true),
-            (u64::MAX, 0, true),
-            (0, 1, false),
-            (127, 128, false),
-            (u64::MAX - 1, u64::MAX, false),
-        ] {
-            let storage = StorageRecoveryReport {
-                redo: StorageRecoveryRedoMetrics {
-                    consumed_bytes,
-                    validated_payload_bytes,
-                    ..StorageRecoveryRedoMetrics::default()
-                },
-                ..StorageRecoveryReport::default()
-            };
-            let result = RecoveryReport::from_storage(&storage);
-            assert_eq!(
-                result.is_ok(),
-                valid,
-                "consumed_bytes={consumed_bytes}, validated_payload_bytes={validated_payload_bytes}"
-            );
-            if !valid {
-                assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "recovery validated payload bytes exceed consumed bytes"
-                );
-            }
-        }
-    }
-
-    /// Purpose: Prevent overflow throughout recovery accounting totals.
-    /// Expected: Unrepresentable timing and work sums are rejected with an accounting
-    /// diagnostic.
-    #[test]
-    fn recovery_accounting_sums_reject_overflow() {
-        let empty = RecoveryReport::from_storage(&StorageRecoveryReport::default()).unwrap();
-        for case in ["bootstrap", "phases", "replay", "refill", "rows"] {
-            let mut report = empty.clone();
-            match case {
-                "bootstrap" => {
-                    report.engine_setup_elapsed_nanos = u64::MAX;
-                    report.catalog_bootstrap_elapsed_nanos = 1;
-                }
-                "phases" => {
-                    report.phases.preparation_elapsed_nanos = u64::MAX;
-                    report.phases.other_elapsed_nanos = 1;
-                }
-                "replay" => {
-                    report.redo.stream_refill_elapsed_nanos = u64::MAX;
-                    report.redo.apply_and_dispatch_elapsed_nanos = 1;
-                }
-                "refill" => {
-                    report.redo.receive_wait_elapsed_nanos = u64::MAX;
-                    report.redo.stream_other_elapsed_nanos = 1;
-                }
-                "rows" => {
-                    report.work.user_row_ops_applied = u64::MAX;
-                    report.work.user_row_ops_skipped = 1;
-                }
-                _ => unreachable!(),
-            }
-            let error = validate_recovery_report(&report).unwrap_err();
-            assert_eq!(error.to_string(), "recovery metric sum overflow", "{case}");
-        }
-    }
-
-    /// Purpose: Require complete and internally consistent recovery metrics.
-    /// Expected: Balanced reports are accepted while inconsistent work or timing totals are rejected.
-    #[test]
-    fn recovery_conversion_rejects_inconsistent_accounting() {
-        let mut report = StorageRecoveryReport::default();
-        assert!(RecoveryReport::from_storage(&report).is_ok());
-        report.work.user_row_ops_seen = 1;
-        assert!(RecoveryReport::from_storage(&report).is_err());
-        report.work.user_row_ops_skipped = 1;
-        assert!(RecoveryReport::from_storage(&report).is_ok());
-        report.redo.receive_wait_elapsed = Duration::from_nanos(1);
-        assert!(RecoveryReport::from_storage(&report).is_err());
     }
 }

@@ -1,32 +1,46 @@
-#[cfg(all(feature = "libaio", feature = "iouring"))]
-compile_error!("Enable exactly one storage IO backend feature: `libaio` or `iouring`.");
-#[cfg(not(any(feature = "libaio", feature = "iouring")))]
-compile_error!("One storage IO backend feature must be enabled: `libaio` or `iouring`.");
-
 mod backend;
+
 mod buf;
+
 #[cfg(feature = "iouring")]
 mod iouring_backend;
+
 #[cfg(feature = "libaio")]
 mod libaio_abi;
+
 #[cfg(feature = "libaio")]
 mod libaio_backend;
 
+#[cfg(feature = "profiling")]
+use crate::error::{IoError, IoResult};
 use crate::obs;
+#[cfg(feature = "profiling")]
+use error_stack::Report;
+#[cfg(feature = "profiling")]
+use std::{fs, path::Path};
+
 use flume::{Receiver, SendError, Sender};
+
 use std::collections::VecDeque;
+
 use std::mem::{forget, replace, take};
+
 use std::os::unix::io::RawFd;
+
 use std::ptr::null_mut;
+
 use std::result::Result as StdResult;
+
 use std::time::Duration;
 
 pub(crate) use backend::*;
+
 pub(crate) use buf::*;
 
 /// Canonical storage backend selected by cargo features.
 #[cfg(feature = "iouring")]
 pub(crate) use iouring_backend::{BACKEND_NAME, IouringBackend as StorageBackend};
+
 /// Canonical storage backend selected by cargo features.
 #[cfg(feature = "libaio")]
 pub(crate) use libaio_backend::{BACKEND_NAME, LibaioBackend as StorageBackend};
@@ -41,6 +55,12 @@ pub(crate) use self::tests::{
 pub(crate) const STORAGE_SECTOR_SIZE: usize = 4096;
 
 const INVALID_SLOT: u32 = u32::MAX;
+
+#[cfg(all(feature = "libaio", feature = "iouring"))]
+compile_error!("Enable exactly one storage IO backend feature: `libaio` or `iouring`.");
+
+#[cfg(not(any(feature = "libaio", feature = "iouring")))]
+compile_error!("One storage IO backend feature must be enabled: `libaio` or `iouring`.");
 
 /// Buffer ownership model for one backend-agnostic IO operation.
 ///
@@ -899,6 +919,12 @@ impl<T> Clone for IOClient<T> {
     fn clone(&self) -> Self {
         IOClient(self.0.clone())
     }
+}
+
+/// Read explicit caller-requested process diagnostics through the I/O boundary.
+#[cfg(feature = "profiling")]
+pub(crate) fn read_profiling_procfs(path: &Path) -> IoResult<String> {
+    fs::read_to_string(path).map_err(|error| Report::new(IoError::from(error.kind())).attach(error))
 }
 
 /// Align given input length to storage sector size.

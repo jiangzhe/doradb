@@ -23,9 +23,9 @@ use crate::file::{
 };
 use crate::id::{TableID, TrxID};
 use crate::io::{
-    Backend, BackendError, BackendStats, BackendStatsHandle, BackendToken, IOClient, IOKind,
-    IOMessage, IOQueue, IOStateMachine, IOSubmission, Operation, StdIoResult, StorageBackend,
-    SubmitAttempt, SubmitRetryBackoff, SubmittedIoCleanup,
+    Backend, BackendError, BackendToken, IOClient, IOKind, IOMessage, IOQueue, IOStateMachine,
+    IOSubmission, Operation, StdIoResult, StorageBackend, SubmitAttempt, SubmitRetryBackoff,
+    SubmittedIoCleanup,
 };
 #[cfg(test)]
 use crate::io::{StorageBackendOp, current_storage_backend_test_hook};
@@ -33,6 +33,10 @@ use crate::map::FastHashSet;
 use crate::notify::EventNotifyOnDrop;
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+pub(crate) use crate::profiling::StorageServiceStats;
+#[cfg(feature = "profiling")]
+use crate::profiling::{BackendStats, BackendStatsHandle, StorageServiceStatsHandle};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::thread;
 use crate::{IndexPool, MemPool};
@@ -48,116 +52,11 @@ use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 const STORAGE_SERVICE_BACKLOG: usize = 10;
 const STORAGE_BACKGROUND_WRITE_BURST_LIMIT: usize = 1;
 const INVALID_SLOT: u32 = u32::MAX;
-
-/// Snapshot of shared-storage service ingress and scheduler activity.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct StorageServiceStats {
-    /// Number of admitted table-file or readonly-cache read requests.
-    pub(crate) table_read_requests: usize,
-    /// Number of admitted evictable-pool page-in read requests.
-    pub(crate) pool_read_requests: usize,
-    /// Number of admitted shared background-write requests.
-    pub(crate) background_write_requests: usize,
-    /// Number of scheduler turns consumed by the table-read lane.
-    pub(crate) table_read_turns: usize,
-    /// Number of scheduler turns consumed by the pool-read lane.
-    pub(crate) pool_read_turns: usize,
-    /// Number of scheduler turns consumed by the background-write lane.
-    pub(crate) background_write_turns: usize,
-}
-
-impl StorageServiceStats {
-    /// Returns the saturating delta from one earlier snapshot.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
-    pub(crate) fn delta_since(self, earlier: StorageServiceStats) -> StorageServiceStats {
-        StorageServiceStats {
-            table_read_requests: self
-                .table_read_requests
-                .saturating_sub(earlier.table_read_requests),
-            pool_read_requests: self
-                .pool_read_requests
-                .saturating_sub(earlier.pool_read_requests),
-            background_write_requests: self
-                .background_write_requests
-                .saturating_sub(earlier.background_write_requests),
-            table_read_turns: self
-                .table_read_turns
-                .saturating_sub(earlier.table_read_turns),
-            pool_read_turns: self.pool_read_turns.saturating_sub(earlier.pool_read_turns),
-            background_write_turns: self
-                .background_write_turns
-                .saturating_sub(earlier.background_write_turns),
-        }
-    }
-}
-
-#[derive(Default)]
-struct StorageServiceStatsCounters {
-    table_read_requests: AtomicUsize,
-    pool_read_requests: AtomicUsize,
-    background_write_requests: AtomicUsize,
-    table_read_turns: AtomicUsize,
-    pool_read_turns: AtomicUsize,
-    background_write_turns: AtomicUsize,
-}
-
-#[derive(Clone, Default)]
-struct StorageServiceStatsHandle(Arc<StorageServiceStatsCounters>);
-
-impl StorageServiceStatsHandle {
-    #[inline]
-    fn snapshot(&self) -> StorageServiceStats {
-        StorageServiceStats {
-            table_read_requests: self.0.table_read_requests.load(Ordering::Relaxed),
-            pool_read_requests: self.0.pool_read_requests.load(Ordering::Relaxed),
-            background_write_requests: self.0.background_write_requests.load(Ordering::Relaxed),
-            table_read_turns: self.0.table_read_turns.load(Ordering::Relaxed),
-            pool_read_turns: self.0.pool_read_turns.load(Ordering::Relaxed),
-            background_write_turns: self.0.background_write_turns.load(Ordering::Relaxed),
-        }
-    }
-
-    #[inline]
-    fn record_request(&self, lane_id: StorageLaneId) {
-        match lane_id {
-            StorageLaneId::TableReads => {
-                self.0.table_read_requests.fetch_add(1, Ordering::Relaxed);
-            }
-            StorageLaneId::PoolReads => {
-                self.0.pool_read_requests.fetch_add(1, Ordering::Relaxed);
-            }
-            StorageLaneId::BackgroundWrites => {
-                self.0
-                    .background_write_requests
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[inline]
-    fn record_turn(&self, lane_id: StorageLaneId) {
-        match lane_id {
-            StorageLaneId::TableReads => {
-                self.0.table_read_turns.fetch_add(1, Ordering::Relaxed);
-            }
-            StorageLaneId::PoolReads => {
-                self.0.pool_read_turns.fetch_add(1, Ordering::Relaxed);
-            }
-            StorageLaneId::BackgroundWrites => {
-                self.0
-                    .background_write_turns
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
 
 /// Pool-read lane payload for one evictable-pool page-in request.
 pub(crate) enum PoolReadRequest {
@@ -539,7 +438,7 @@ struct BackgroundWriteLane {
 
 /// Round-robin lane identity used by the shared storage scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageLaneId {
+pub(crate) enum StorageLaneId {
     TableReads,
     PoolReads,
     BackgroundWrites,
@@ -619,6 +518,7 @@ struct StorageRequestScheduler {
     pool_reads: PoolReadLane,
     background_writes: BackgroundWriteLane,
     cursor: StorageLaneId,
+    #[cfg(feature = "profiling")]
     stats: StorageServiceStatsHandle,
 }
 
@@ -807,6 +707,7 @@ impl StorageRequestScheduler {
         io_depth: usize,
     ) {
         let lane_id = turn_start.lane_id();
+        #[cfg(feature = "profiling")]
         self.stats.record_turn(lane_id);
         let headroom = io_depth - self.local_depth(queue, staged_slots_len, submitted);
         debug_assert!(headroom != 0);
@@ -892,6 +793,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 IOMessage::Req(req) => {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_request(StorageLaneId::TableReads);
                     let queue_len = queue.len();
                     self.table_reads.deferred_req =
@@ -951,6 +853,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 IOMessage::Req(req) => {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_request(StorageLaneId::PoolReads);
                     let queue_len = queue.len();
                     self.pool_reads.deferred_req =
@@ -1010,6 +913,7 @@ impl StorageRequestScheduler {
                     break;
                 }
                 IOMessage::Req(req) => {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_request(StorageLaneId::BackgroundWrites);
                     let queue_len = queue.len();
                     self.background_writes.deferred_req =
@@ -1245,6 +1149,7 @@ pub(crate) struct StorageIOWorkerBuilder<B = StorageBackend> {
     table_reads_rx: Receiver<IOMessage<ReadSubmission>>,
     pool_reads_rx: Receiver<IOMessage<PoolReadRequest>>,
     background_writes_rx: Receiver<IOMessage<BackgroundWriteRequest>>,
+    #[cfg(feature = "profiling")]
     stats: StorageServiceStatsHandle,
 }
 
@@ -1265,6 +1170,7 @@ where
         let (table_reads_rx, table_reads) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
         let (pool_reads_rx, pool_reads) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
         let (background_writes_rx, background_writes) = IOClient::bounded(STORAGE_SERVICE_BACKLOG);
+        #[cfg(feature = "profiling")]
         let stats = StorageServiceStatsHandle::default();
         (
             Self {
@@ -1272,6 +1178,7 @@ where
                 table_reads_rx,
                 pool_reads_rx,
                 background_writes_rx,
+                #[cfg(feature = "profiling")]
                 stats,
             },
             table_reads,
@@ -1309,6 +1216,7 @@ where
                     shutdown: false,
                 },
                 cursor: StorageLaneId::TableReads,
+                #[cfg(feature = "profiling")]
                 stats: self.stats,
             },
             submitted: 0,
@@ -1728,13 +1636,15 @@ pub(crate) struct FileSystem {
     table_reads: IOClient<ReadSubmission>,
     pool_reads: IOClient<PoolReadRequest>,
     background_writes: IOClient<BackgroundWriteRequest>,
-    io_backend_stats: BackendStatsHandle,
-    storage_service_stats: StorageServiceStatsHandle,
     configured_io_depth: usize,
     cow_file_max_pages: usize,
     data_dir: PathBuf,
     // Catalog multi-table file name.
     catalog_file_name: String,
+    #[cfg(feature = "profiling")]
+    io_backend_stats: BackendStatsHandle,
+    #[cfg(feature = "profiling")]
+    storage_service_stats: StorageServiceStatsHandle,
 }
 
 impl FileSystem {
@@ -1982,12 +1892,14 @@ impl FileSystem {
 
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn io_backend_stats(&self) -> BackendStats {
         self.io_backend_stats.snapshot()
     }
 
     /// Returns one snapshot of shared-storage ingress and scheduler activity.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn storage_service_stats(&self) -> StorageServiceStats {
         self.storage_service_stats.snapshot()
     }
@@ -2102,6 +2014,7 @@ pub(crate) fn build_file_system(
     cow_file_max_pages: usize,
 ) -> IoResult<(FileSystem, StorageIOWorkerBuilder)> {
     let backend = StorageBackend::setup(io_depth)?;
+    #[cfg(feature = "profiling")]
     let stats = backend.stats_handle();
     let (builder, table_reads, pool_reads, background_writes) =
         StorageIOWorkerBuilder::new(backend);
@@ -2110,12 +2023,14 @@ pub(crate) fn build_file_system(
             table_reads,
             pool_reads,
             background_writes,
-            io_backend_stats: stats,
-            storage_service_stats: builder.stats.clone(),
             configured_io_depth: io_depth,
             cow_file_max_pages,
             data_dir,
             catalog_file_name,
+            #[cfg(feature = "profiling")]
+            io_backend_stats: stats,
+            #[cfg(feature = "profiling")]
+            storage_service_stats: builder.stats.clone(),
         },
         builder,
     ))
@@ -2581,6 +2496,7 @@ pub(crate) mod tests {
 
     /// Provides test-only access to `io_backend_stats_handle_identity`.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn io_backend_stats_handle_identity(fs: &FileSystem) -> usize {
         fs.io_backend_stats.identity()
     }
@@ -3414,6 +3330,7 @@ pub(crate) mod tests {
             let table_file_identity =
                 StorageBackendFileIdentity::from_path(fs.user_table_file_path(table_id)).unwrap();
             let read_fd = reopened.sparse_file().as_raw_fd();
+            #[cfg(feature = "profiling")]
             let stats_start = fs.storage_service_stats();
             let hook = Arc::new(ControlledStorageOpHook::new(
                 IOKind::Write,
@@ -3425,8 +3342,9 @@ pub(crate) mod tests {
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
             hook.wait_for_blocked_submits(1).await;
 
-            let read_stats_start = readonly_pool.stats();
-            let readonly_probe = readonly_pool.clone();
+            #[cfg(feature = "profiling")]
+            let _read_stats_start = readonly_pool.stats();
+            let _readonly_probe = readonly_pool.clone();
             let mut readonly_task = pin!(async move {
                 let g = readonly_pool
                     .read_raw_block(
@@ -3443,10 +3361,11 @@ pub(crate) mod tests {
             // dispatch on this task so the counter cannot be observed between
             // submission construction and enqueueing the request.
             assert!(futures::poll!(readonly_task.as_mut()).is_pending());
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                readonly_probe
+                _readonly_probe
                     .stats()
-                    .delta_since(read_stats_start)
+                    .delta_since(_read_stats_start)
                     .queued_reads,
                 1
             );
@@ -3462,13 +3381,20 @@ pub(crate) mod tests {
             assert_eq!(readonly_task.await, b"table-read");
             writes_done.await;
 
-            let delta = fs.storage_service_stats().delta_since(stats_start);
-            assert_eq!(delta.table_read_requests, 1);
-            assert_eq!(delta.pool_read_requests, 0);
-            assert_eq!(delta.background_write_requests, 1);
-            assert_eq!(delta.table_read_turns, 1);
-            assert_eq!(delta.pool_read_turns, 0);
-            assert_eq!(delta.background_write_turns, 2);
+            #[cfg(feature = "profiling")]
+            let _delta = fs.storage_service_stats().delta_since(stats_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.table_read_requests, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.pool_read_requests, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.background_write_requests, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.table_read_turns, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.pool_read_turns, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.background_write_turns, 2);
         });
     }
 
@@ -3491,6 +3417,7 @@ pub(crate) mod tests {
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp")).unwrap();
             let mem_pool_file =
                 StorageBackendFileIdentity::from_path(temp_dir.path().join("data.swp")).unwrap();
+            #[cfg(feature = "profiling")]
             let stats_start = fs.storage_service_stats();
             let hook = Arc::new(ControlledStorageOpHook::new(
                 IOKind::Write,
@@ -3502,8 +3429,9 @@ pub(crate) mod tests {
             let writes_done = test_dispatch_dirty_pages(index_pool, 2).await;
             hook.wait_for_blocked_submits(1).await;
 
-            let read_stats_start = mem_pool.stats();
-            let mem_pool_probe = mem_pool.clone();
+            #[cfg(feature = "profiling")]
+            let _read_stats_start = mem_pool.stats();
+            let _mem_pool_probe = mem_pool.clone();
             let pool_guard = mem_pool.create_base_guard();
             let mut reload_task = pin!(async move {
                 let g = mem_pool
@@ -3517,10 +3445,11 @@ pub(crate) mod tests {
             // polling its dispatch before releasing the blocked write, since
             // the queued-read counter advances before the channel send.
             assert!(futures::poll!(reload_task.as_mut()).is_pending());
+            #[cfg(feature = "profiling")]
             assert_eq!(
-                mem_pool_probe
+                _mem_pool_probe
                     .stats()
-                    .delta_since(read_stats_start)
+                    .delta_since(_read_stats_start)
                     .queued_reads,
                 1
             );
@@ -3536,13 +3465,20 @@ pub(crate) mod tests {
             assert_eq!(reload_task.await, b"pool-read");
             writes_done.await;
 
-            let delta = fs.storage_service_stats().delta_since(stats_start);
-            assert_eq!(delta.table_read_requests, 0);
-            assert_eq!(delta.pool_read_requests, 1);
-            assert_eq!(delta.background_write_requests, 1);
-            assert_eq!(delta.table_read_turns, 0);
-            assert_eq!(delta.pool_read_turns, 1);
-            assert_eq!(delta.background_write_turns, 2);
+            #[cfg(feature = "profiling")]
+            let _delta = fs.storage_service_stats().delta_since(stats_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.table_read_requests, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.pool_read_requests, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.background_write_requests, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.table_read_turns, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.pool_read_turns, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.background_write_turns, 2);
         });
     }
 

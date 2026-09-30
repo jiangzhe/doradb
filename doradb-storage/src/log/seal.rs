@@ -15,6 +15,7 @@ use error_stack::Report;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
 use std::result::Result as StdResult;
+#[cfg(feature = "profiling")]
 use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +154,7 @@ impl LogFileSealer {
             .seal_file_target_best_effort(target, write_driver)
             .is_err()
         {
+            #[cfg(feature = "profiling")]
             trx_sys
                 .redo_log
                 .stats

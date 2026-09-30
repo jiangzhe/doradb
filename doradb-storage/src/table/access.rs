@@ -5613,7 +5613,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(outcome.live_delay.is_none());
+            #[cfg(feature = "profiling")]
             assert_eq!(outcome.stats.indexes.len(), 2);
+            #[cfg(feature = "profiling")]
             assert!(outcome.stats.indexes.iter().all(|stats| stats.removed >= 1));
 
             assert_secondary_mem_entries_absent(
@@ -8388,19 +8390,24 @@ mod tests {
 
             let table = table_for_internal_assertion(&engine, table_id);
             let cdb_before = table.deletion_buffer().scan_diagnostics();
+            #[cfg(feature = "profiling")]
             let before = session.buffer_pool_stats().unwrap().disk.counters;
             let mut measured = session.begin_trx().unwrap();
             assert_eq!(scan_table_i32s(&mut measured, table_id).await.len(), 5);
             measured.commit().await.unwrap();
-            let delta = session
+            #[cfg(feature = "profiling")]
+            let _delta = session
                 .buffer_pool_stats()
                 .unwrap()
                 .disk
                 .counters
                 .delta_since(before);
-            assert_eq!(delta.cache_hits, 2, "one index leaf plus one LWC block");
-            assert_eq!(delta.cache_misses, 0);
-            assert_eq!(delta.completed_reads, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.cache_hits, 2, "one index leaf plus one LWC block");
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.completed_reads, 0);
             let cdb_after = table.deletion_buffer().scan_diagnostics();
             assert_eq!(cdb_after.0 - cdb_before.0, 1, "one bounded CDB pass");
             assert_eq!(cdb_after.1 - cdb_before.1, 0, "no per-row CDB gets");
@@ -9859,6 +9866,33 @@ mod tests {
                 .table_id();
             drop(ddl_session);
 
+            use crate::io::{
+                IOKind, StdIoResult, StorageBackendFileIdentity, StorageBackendOp,
+                StorageBackendTestHook, install_storage_backend_test_hook,
+            };
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct IndexWrites {
+                file: StorageBackendFileIdentity,
+                completed: AtomicUsize,
+                errors: AtomicUsize,
+            }
+            impl StorageBackendTestHook for IndexWrites {
+                fn on_complete(&self, op: StorageBackendOp, result: &mut StdIoResult<usize>) {
+                    if op.kind() == IOKind::Write && op.matches_file_identity(self.file) {
+                        if result.is_err() {
+                            self.errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.completed.fetch_add(1, Ordering::Release);
+                    }
+                }
+            }
+            let writes = Arc::new(IndexWrites {
+                file: StorageBackendFileIdentity::from_path(temp_dir.path().join("index.swp"))
+                    .unwrap(),
+                completed: AtomicUsize::new(0),
+                errors: AtomicUsize::new(0),
+            });
+            let _hook = install_storage_backend_test_hook(writes.clone());
             let mut session = engine.new_session().unwrap();
             let mut inserted = Vec::new();
 
@@ -9875,24 +9909,22 @@ mod tests {
                     inserted.push((row_id, key));
                 }
                 trx.commit().await.unwrap();
-                let stats = engine.inner().pools.index.stats();
-                if stats.completed_writes > 0 && stats.write_errors == 0 {
+                if writes.completed.load(Ordering::Acquire) > 0 {
                     break;
                 }
             }
 
             // Timer audit: index-pool eviction/I/O test coordination.
             for _ in 0..20 {
-                let stats = engine.inner().pools.index.stats();
-                if stats.completed_writes > 0 && stats.write_errors == 0 {
+                if writes.completed.load(Ordering::Acquire) > 0 {
                     break;
                 }
                 Timer::after(Duration::from_millis(50)).await;
             }
 
-            let stats = engine.inner().pools.index.stats();
             assert!(
-                stats.completed_writes > 0 && stats.write_errors == 0,
+                writes.completed.load(Ordering::Acquire) > 0
+                    && writes.errors.load(Ordering::Relaxed) == 0,
                 "user secondary-index pool should evict with a small index buffer"
             );
 

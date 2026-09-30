@@ -3,7 +3,6 @@
 //! This module is the standalone core for RFC-0016 logical locks. It tracks
 //! table metadata and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
-
 mod claim;
 mod state;
 mod wait;
@@ -16,8 +15,11 @@ use crate::component::{Component, ComponentRegistry, ShelfScope};
 use crate::error::{OperationError, OperationResult};
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::map::{FastDashMap, FastHashMap};
+#[cfg(feature = "profiling")]
+use crate::profiling::{
+    FamilyLockStats, LockManagerStats, LogicalLockStats, add, decrement_current, increment_current,
+};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crate::stats::LogicalLockStats;
 use crossbeam_utils::CachePadded;
 use dashmap::mapref::entry::Entry;
 use error_stack::Report;
@@ -28,7 +30,6 @@ use std::fmt;
 use std::mem::take;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use state::{
     FamilyLockAuthority, FamilyLockState, FreshClaimsGuard, LockScopeState, TransactionLockState,
@@ -291,6 +292,7 @@ pub(crate) struct LockManager {
     catalog: [CatalogTableLockSlot; BUILTIN_CATALOG_TABLE_COUNT],
     /// Dynamic fallback for user tables and every unknown reserved catalog ID.
     user: FastDashMap<LockResource, ResourceState>,
+    #[cfg(feature = "profiling")]
     stats: LockManagerStats,
 }
 
@@ -301,18 +303,21 @@ impl LockManager {
         LockManager {
             catalog: from_fn(|_| CatalogTableLockSlot::default()),
             user: FastDashMap::default(),
+            #[cfg(feature = "profiling")]
             stats: LockManagerStats::default(),
         }
     }
 
     /// Returns a poison-tolerant logical-lock statistics snapshot.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats(&self) -> LogicalLockStats {
         self.stats.snapshot()
     }
 
     #[inline]
-    fn record_family_stats(&self, stats: state::FamilyLockStats) {
+    #[cfg(feature = "profiling")]
+    fn record_family_stats(&self, stats: FamilyLockStats) {
         self.stats.record_family(stats);
     }
 
@@ -323,39 +328,52 @@ impl LockManager {
         mode: LockMode,
     ) -> OperationResult<PendingStart> {
         mode.assert_valid_for(token.resource);
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
+        #[cfg(feature = "profiling")]
         add(&self.stats.mode_slots_examined, MODE_COUNT as u64);
         self.with_resource(
             token.resource,
             ResourceAccess::Create,
             "start_pending",
             |resource_state| {
+                #[cfg(feature = "profiling")]
                 let old_slots = resource_state.wait_queue.allocated_slots();
                 let result = resource_state.start_pending(token.resource, token, mode);
+                #[cfg(feature = "profiling")]
                 if let Ok(start) = &result {
+                    #[cfg(feature = "profiling")]
                     increment_current(
                         &self.stats.current_physical_families,
                         &self.stats.peak_physical_families,
                     );
                     match start {
                         PendingStart::Immediate => {
+                            #[cfg(feature = "profiling")]
                             add(&self.stats.immediate_physical_acquisitions, 1);
                         }
                         PendingStart::Waiting { .. } => {
+                            #[cfg(feature = "profiling")]
                             add(&self.stats.enqueued_waiters, 1);
+                            #[cfg(feature = "profiling")]
                             add(&self.stats.completion_allocations, 1);
+                            #[cfg(feature = "profiling")]
                             add(&self.stats.queue_link_mutations, 1);
+                            #[cfg(feature = "profiling")]
                             increment_current(
                                 &self.stats.current_linked_waiters,
                                 &self.stats.peak_linked_waiters,
                             );
+                            #[cfg(feature = "profiling")]
                             increment_current(
                                 &self.stats.current_live_waiter_nodes,
                                 &self.stats.peak_live_waiter_nodes,
                             );
                             if resource_state.wait_queue.allocated_slots() > old_slots {
+                                #[cfg(feature = "profiling")]
                                 add(&self.stats.waiter_slab_growths, 1);
                             } else {
+                                #[cfg(feature = "profiling")]
                                 add(&self.stats.waiter_slab_reuses, 1);
                             }
                         }
@@ -368,6 +386,7 @@ impl LockManager {
 
     #[inline]
     fn observe_pending(&self, token: &PendingClaimToken, mode: LockMode, node_id: WaitNodeID) {
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
         self.with_resource(
             token.resource,
@@ -377,15 +396,15 @@ impl LockManager {
                 resource_state.observe_pending(token, mode, node_id);
             },
         );
-        decrement_current(
-            &self.stats.current_live_waiter_nodes,
-            "current_live_waiter_nodes",
-        );
+        #[cfg(feature = "profiling")]
+        decrement_current(&self.stats.current_live_waiter_nodes);
+        #[cfg(feature = "profiling")]
         add(&self.stats.provisional_observations, 1);
     }
 
     #[inline]
     fn cancel_waiting(&self, token: PendingClaimToken, mode: LockMode, node_id: WaitNodeID) {
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
         let mut notify = DeferredNotifications::default();
         self.with_resource(
@@ -397,8 +416,12 @@ impl LockManager {
                     .wait_queue
                     .assert_identity(node_id, &token, mode);
                 match resource_state.wait_queue.node(node_id).phase {
-                    WaitNodePhase::Queued { prev, next } => {
-                        match (prev, next) {
+                    WaitNodePhase::Queued {
+                        prev: _prev,
+                        next: _next,
+                    } => {
+                        #[cfg(feature = "profiling")]
+                        match (_prev, _next) {
                             (None, _) => add(&self.stats.cancelled_head_waiters, 1),
                             (Some(_), None) => add(&self.stats.cancelled_tail_waiters, 1),
                             (Some(_), Some(_)) => add(&self.stats.cancelled_middle_waiters, 1),
@@ -413,35 +436,27 @@ impl LockManager {
                             token.resource,
                             token.owner.family()
                         );
+                        #[cfg(feature = "profiling")]
                         add(&self.stats.queue_link_mutations, 1);
-                        decrement_current(
-                            &self.stats.current_linked_waiters,
-                            "current_linked_waiters",
-                        );
-                        decrement_current(
-                            &self.stats.current_live_waiter_nodes,
-                            "current_live_waiter_nodes",
-                        );
-                        decrement_current(
-                            &self.stats.current_physical_families,
-                            "current_physical_families",
-                        );
+                        #[cfg(feature = "profiling")]
+                        decrement_current(&self.stats.current_linked_waiters);
+                        #[cfg(feature = "profiling")]
+                        decrement_current(&self.stats.current_live_waiter_nodes);
+                        #[cfg(feature = "profiling")]
+                        decrement_current(&self.stats.current_physical_families);
                         resource_state.grant_waiters(token.resource, &mut notify);
                     }
                     WaitNodePhase::Provisional => {
                         resource_state.remove_provisional(&token, mode, node_id);
                         let _ = resource_state.wait_queue.consume_provisional(node_id);
-                        decrement_current(
-                            &self.stats.current_live_waiter_nodes,
-                            "current_live_waiter_nodes",
-                        );
-                        decrement_current(
-                            &self.stats.current_physical_families,
-                            "current_physical_families",
-                        );
+                        #[cfg(feature = "profiling")]
+                        decrement_current(&self.stats.current_live_waiter_nodes);
+                        #[cfg(feature = "profiling")]
+                        decrement_current(&self.stats.current_physical_families);
                         resource_state.grant_waiters(token.resource, &mut notify);
                     }
                 }
+                #[cfg(feature = "profiling")]
                 self.record_promotions(&notify);
             },
         );
@@ -450,6 +465,7 @@ impl LockManager {
 
     #[inline]
     fn cancel_fresh_grant(&self, token: PendingClaimToken, mode: LockMode) {
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
         let mut notify = DeferredNotifications::default();
         self.with_resource(
@@ -459,10 +475,9 @@ impl LockManager {
             |resource_state| {
                 resource_state.remove_fresh_grant(&token, mode);
                 resource_state.grant_waiters(token.resource, &mut notify);
-                decrement_current(
-                    &self.stats.current_physical_families,
-                    "current_physical_families",
-                );
+                #[cfg(feature = "profiling")]
+                decrement_current(&self.stats.current_physical_families);
+                #[cfg(feature = "profiling")]
                 self.record_promotions(&notify);
             },
         );
@@ -478,7 +493,9 @@ impl LockManager {
         new_mode: LockMode,
     ) -> OperationResult<()> {
         new_mode.assert_valid_for(resource);
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
+        #[cfg(feature = "profiling")]
         add(&self.stats.mode_slots_examined, MODE_COUNT as u64);
         self.with_resource(
             resource,
@@ -486,7 +503,9 @@ impl LockManager {
             "convert_family",
             |resource_state| {
                 let result = resource_state.convert_family(resource, family, old_mode, new_mode);
+                #[cfg(feature = "profiling")]
                 if result.is_ok() {
+                    #[cfg(feature = "profiling")]
                     add(&self.stats.physical_upgrades, 1);
                 }
                 result
@@ -496,6 +515,7 @@ impl LockManager {
 
     #[inline]
     fn remove_family(&self, resource: LockResource, family: LockFamily, old_mode: LockMode) {
+        #[cfg(feature = "profiling")]
         add(&self.stats.resource_transitions, 1);
         let mut notify = DeferredNotifications::default();
         self.with_resource(
@@ -505,10 +525,9 @@ impl LockManager {
             |resource_state| {
                 resource_state.remove_family(resource, family, old_mode);
                 resource_state.grant_waiters(resource, &mut notify);
-                decrement_current(
-                    &self.stats.current_physical_families,
-                    "current_physical_families",
-                );
+                #[cfg(feature = "profiling")]
+                decrement_current(&self.stats.current_physical_families);
+                #[cfg(feature = "profiling")]
                 self.record_promotions(&notify);
             },
         );
@@ -532,6 +551,7 @@ impl LockManager {
                     matches!(access, ResourceAccess::Create),
                     "lock manager requires active catalog state: resource={resource}, transition={transition}"
                 );
+                #[cfg(feature = "profiling")]
                 increment_current(
                     &self.stats.current_physical_resources,
                     &self.stats.peak_physical_resources,
@@ -541,10 +561,8 @@ impl LockManager {
             // Activation and complete drain linearize under this same cell mutex.
             // Queued and provisional nodes pin the state until their exact cleanup.
             let discarded = if state.is_empty() {
-                decrement_current(
-                    &self.stats.current_physical_resources,
-                    "current_physical_resources",
-                );
+                #[cfg(feature = "profiling")]
+                decrement_current(&self.stats.current_physical_resources);
                 // Retain ordinary working capacity and detach oversized containers
                 // independently. A retained slab keeps its free list and generations.
                 let families = (state.families.capacity() > CATALOG_STATE_RETAIN_CAPACITY)
@@ -565,6 +583,7 @@ impl LockManager {
                     ResourceAccess::Create => match self.user.entry(resource) {
                         Entry::Occupied(entry) => entry.into_ref(),
                         Entry::Vacant(entry) => {
+                            #[cfg(feature = "profiling")]
                             increment_current(&self.stats.current_physical_resources, &self.stats.peak_physical_resources);
                             entry.insert(ResourceState::default())
                         }
@@ -583,10 +602,8 @@ impl LockManager {
                     .remove_if(&resource, |_, state| state.is_empty())
                     .is_some()
             {
-                decrement_current(
-                    &self.stats.current_physical_resources,
-                    "current_physical_resources",
-                );
+                #[cfg(feature = "profiling")]
+                decrement_current(&self.stats.current_physical_resources);
             }
             result
         }
@@ -605,19 +622,24 @@ impl LockManager {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn record_promotions(&self, notifications: &DeferredNotifications) {
         let promoted = notifications.len();
         if promoted == 0 {
             return;
         }
+        #[cfg(feature = "profiling")]
         add(&self.stats.promoted_waiters, promoted);
+        #[cfg(feature = "profiling")]
         add(&self.stats.queue_link_mutations, promoted);
+        #[cfg(feature = "profiling")]
         add(
             &self.stats.mode_slots_examined,
             promoted * MODE_COUNT as u64,
         );
         for _ in 0..promoted {
-            decrement_current(&self.stats.current_linked_waiters, "current_linked_waiters");
+            #[cfg(feature = "profiling")]
+            decrement_current(&self.stats.current_linked_waiters);
         }
     }
 }
@@ -656,104 +678,6 @@ impl Component for LockManager {
     fn shutdown(_component: &Self::Owned) {
         // Panic safety: the engine session/operation drain removes every lock
         // manager user before this passive hook is dispatched.
-    }
-}
-
-#[derive(Default)]
-struct LockManagerStats {
-    owner_local_exact_covered_hits: AtomicU64,
-    owner_local_covered_publications: AtomicU64,
-    owner_local_mode_preserving_conversions: AtomicU64,
-    owner_local_mode_preserving_releases: AtomicU64,
-    resource_transitions: AtomicU64,
-    mode_slots_examined: AtomicU64,
-    immediate_physical_acquisitions: AtomicU64,
-    physical_upgrades: AtomicU64,
-    enqueued_waiters: AtomicU64,
-    queue_link_mutations: AtomicU64,
-    cancelled_head_waiters: AtomicU64,
-    cancelled_middle_waiters: AtomicU64,
-    cancelled_tail_waiters: AtomicU64,
-    provisional_observations: AtomicU64,
-    promoted_waiters: AtomicU64,
-    scope_close_claims_visited: AtomicU64,
-    scope_close_physical_changes: AtomicU64,
-    completion_allocations: AtomicU64,
-    waiter_slab_growths: AtomicU64,
-    waiter_slab_reuses: AtomicU64,
-    current_physical_resources: AtomicU64,
-    peak_physical_resources: AtomicU64,
-    current_physical_families: AtomicU64,
-    peak_physical_families: AtomicU64,
-    current_linked_waiters: AtomicU64,
-    peak_linked_waiters: AtomicU64,
-    current_live_waiter_nodes: AtomicU64,
-    peak_live_waiter_nodes: AtomicU64,
-}
-
-impl LockManagerStats {
-    #[inline]
-    fn snapshot(&self) -> LogicalLockStats {
-        LogicalLockStats {
-            owner_local_exact_covered_hits: load(&self.owner_local_exact_covered_hits),
-            owner_local_covered_publications: load(&self.owner_local_covered_publications),
-            owner_local_mode_preserving_conversions: load(
-                &self.owner_local_mode_preserving_conversions,
-            ),
-            owner_local_mode_preserving_releases: load(&self.owner_local_mode_preserving_releases),
-            resource_transitions: load(&self.resource_transitions),
-            mode_slots_examined: load(&self.mode_slots_examined),
-            immediate_physical_acquisitions: load(&self.immediate_physical_acquisitions),
-            physical_upgrades: load(&self.physical_upgrades),
-            enqueued_waiters: load(&self.enqueued_waiters),
-            queue_link_mutations: load(&self.queue_link_mutations),
-            cancelled_head_waiters: load(&self.cancelled_head_waiters),
-            cancelled_middle_waiters: load(&self.cancelled_middle_waiters),
-            cancelled_tail_waiters: load(&self.cancelled_tail_waiters),
-            provisional_observations: load(&self.provisional_observations),
-            promoted_waiters: load(&self.promoted_waiters),
-            scope_close_claims_visited: load(&self.scope_close_claims_visited),
-            scope_close_physical_changes: load(&self.scope_close_physical_changes),
-            completion_allocations: load(&self.completion_allocations),
-            waiter_slab_growths: load(&self.waiter_slab_growths),
-            waiter_slab_reuses: load(&self.waiter_slab_reuses),
-            current_physical_resources: load(&self.current_physical_resources),
-            peak_physical_resources: load(&self.peak_physical_resources),
-            current_physical_families: load(&self.current_physical_families),
-            peak_physical_families: load(&self.peak_physical_families),
-            current_linked_waiters: load(&self.current_linked_waiters),
-            peak_linked_waiters: load(&self.peak_linked_waiters),
-            current_live_waiter_nodes: load(&self.current_live_waiter_nodes),
-            peak_live_waiter_nodes: load(&self.peak_live_waiter_nodes),
-        }
-    }
-
-    #[inline]
-    fn record_family(&self, family: state::FamilyLockStats) {
-        add(
-            &self.owner_local_exact_covered_hits,
-            family.repeated_exact_covered,
-        );
-        add(
-            &self.owner_local_covered_publications,
-            family.family_covered_publications,
-        );
-        add(
-            &self.owner_local_mode_preserving_conversions,
-            family.physical_mode_preserving_conversions,
-        );
-        add(
-            &self.owner_local_mode_preserving_releases,
-            family.physical_mode_preserving_releases,
-        );
-        add(
-            &self.scope_close_claims_visited,
-            family.close_claims_visited,
-        );
-        add(
-            &self.scope_close_physical_changes,
-            family.scope_close_physical_changes,
-        );
     }
 }
 
@@ -1167,6 +1091,7 @@ struct DeferredNotifications {
 
 impl DeferredNotifications {
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     fn len(&self) -> u64 {
         match &self.notifications {
             NotificationSet::None => 0,
@@ -1212,31 +1137,6 @@ impl Drop for DeferredNotifications {
     fn drop(&mut self) {
         self.publish_inner();
     }
-}
-
-#[inline]
-fn load(counter: &AtomicU64) -> u64 {
-    counter.load(Ordering::Relaxed)
-}
-
-#[inline]
-fn add(counter: &AtomicU64, value: u64) {
-    counter.fetch_add(value, Ordering::Relaxed);
-}
-
-#[inline]
-fn increment_current(current: &AtomicU64, peak: &AtomicU64) {
-    let value = current.fetch_add(1, Ordering::Relaxed) + 1;
-    peak.fetch_max(value, Ordering::Relaxed);
-}
-
-#[inline]
-fn decrement_current(current: &AtomicU64, label: &'static str) {
-    let previous = current.fetch_sub(1, Ordering::Relaxed);
-    assert!(
-        previous > 0,
-        "logical-lock current statistic underflowed: counter={label}"
-    );
 }
 
 #[inline]
@@ -1405,6 +1305,7 @@ pub(crate) mod tests {
     use futures::FutureExt;
     use futures::future::LocalBoxFuture;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::Wake;
 
     /// Debug snapshot of all physical families and queued waiters.
@@ -1427,7 +1328,7 @@ pub(crate) mod tests {
         pub(crate) waiter_capacity: usize,
         /// Number of occupied waiter nodes in any phase.
         pub(crate) live_waiters: usize,
-        /// Direct-index free-list order.
+        /// Direct-_index free-list order.
         pub(crate) free_slots: Vec<usize>,
         /// Generation of every allocated slot.
         pub(crate) generations: Vec<u64>,
@@ -1670,11 +1571,16 @@ pub(crate) mod tests {
     }
 
     fn assert_drained(manager: &LockManager) {
-        let stats = manager.stats();
-        assert_eq!(stats.current_physical_resources, 0);
-        assert_eq!(stats.current_physical_families, 0);
-        assert_eq!(stats.current_linked_waiters, 0);
-        assert_eq!(stats.current_live_waiter_nodes, 0);
+        #[cfg(feature = "profiling")]
+        let _stats = manager.stats();
+        #[cfg(feature = "profiling")]
+        assert_eq!(_stats.current_physical_resources, 0);
+        #[cfg(feature = "profiling")]
+        assert_eq!(_stats.current_physical_families, 0);
+        #[cfg(feature = "profiling")]
+        assert_eq!(_stats.current_linked_waiters, 0);
+        #[cfg(feature = "profiling")]
+        assert_eq!(_stats.current_live_waiter_nodes, 0);
         assert!(debug_snapshot(manager).resources.is_empty());
         assert!(manager.user.is_empty());
     }
@@ -2594,6 +2500,7 @@ pub(crate) mod tests {
             }
         }
         assert!(manager.user.is_empty());
+        #[cfg(feature = "profiling")]
         assert_eq!(manager.stats().current_physical_resources, 12);
         for id in [
             0,
@@ -2621,11 +2528,14 @@ pub(crate) mod tests {
         );
         for (index, token) in tokens.into_iter().enumerate() {
             manager.cancel_fresh_grant(token, LockMode::Shared);
+            assert_eq!(debug_snapshot(&manager).resources.len(), 19 - index);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 manager.stats().current_physical_resources,
                 19 - index as u64
             );
         }
+        #[cfg(feature = "profiling")]
         assert_eq!(manager.stats().peak_physical_resources, 20);
         assert_drained(&manager);
     }
@@ -2668,7 +2578,8 @@ pub(crate) mod tests {
         let resource = table_data(TABLE_ID_TABLE_BINDINGS);
         let mut previous_generations = Vec::new();
         for cycle in 0..2 {
-            let before_stats = manager.stats();
+            #[cfg(feature = "profiling")]
+            let _before_stats = manager.stats();
             let blocker = pending_token(resource, 1);
             start_immediate(&manager, &blocker, LockMode::Exclusive);
             let mut waiters = (2..66)
@@ -2703,8 +2614,8 @@ pub(crate) mod tests {
                 }
                 previous_generations = generations;
             }
-            for (index, (token, node)) in waiters.into_iter().enumerate() {
-                if index % 2 == 0 {
+            for (_index, (token, node)) in waiters.into_iter().enumerate() {
+                if _index % 2 == 0 {
                     manager.observe_pending(&token, LockMode::Shared, node);
                     manager.cancel_fresh_grant(token, LockMode::Shared);
                 } else {
@@ -2725,16 +2636,19 @@ pub(crate) mod tests {
             drop(state);
             assert_drained(&manager);
             if cycle != 0 {
+                #[cfg(feature = "profiling")]
                 assert_eq!(
                     manager.stats().waiter_slab_growths,
-                    before_stats.waiter_slab_growths
+                    _before_stats.waiter_slab_growths
                 );
+                #[cfg(feature = "profiling")]
                 assert_eq!(
-                    manager.stats().waiter_slab_reuses - before_stats.waiter_slab_reuses,
+                    manager.stats().waiter_slab_reuses - _before_stats.waiter_slab_reuses,
                     65
                 );
             }
         }
+        #[cfg(feature = "profiling")]
         assert_eq!(manager.stats().waiter_slab_reuses, 66);
     }
 
@@ -2799,7 +2713,8 @@ pub(crate) mod tests {
                 }
                 assert_drained(&manager);
 
-                let before_stats = manager.stats();
+                #[cfg(feature = "profiling")]
+                let _before_stats = manager.stats();
                 let blocker = pending_token(resource, 3);
                 start_immediate(&manager, &blocker, LockMode::Exclusive);
                 let waiter = pending_token(resource, 4);
@@ -2810,13 +2725,16 @@ pub(crate) mod tests {
                 }
                 manager.cancel_waiting(waiter, LockMode::Shared, next_node);
                 manager.cancel_fresh_grant(blocker, LockMode::Exclusive);
-                let after_stats = manager.stats();
+                #[cfg(feature = "profiling")]
+                let _after_stats = manager.stats();
+                #[cfg(feature = "profiling")]
                 assert_eq!(
-                    after_stats.waiter_slab_growths - before_stats.waiter_slab_growths,
+                    _after_stats.waiter_slab_growths - _before_stats.waiter_slab_growths,
                     u64::from(drop_waiters)
                 );
+                #[cfg(feature = "profiling")]
                 assert_eq!(
-                    after_stats.waiter_slab_reuses - before_stats.waiter_slab_reuses,
+                    _after_stats.waiter_slab_reuses - _before_stats.waiter_slab_reuses,
                     u64::from(!drop_waiters)
                 );
                 assert_drained(&manager);
@@ -2856,12 +2774,14 @@ pub(crate) mod tests {
                     }
                 })
                 .unwrap();
-                let stats = manager.stats();
+                #[cfg(feature = "profiling")]
+                let _stats = manager.stats();
+                #[cfg(feature = "profiling")]
                 assert_eq!(
                     [
-                        stats.cancelled_head_waiters,
-                        stats.cancelled_middle_waiters,
-                        stats.cancelled_tail_waiters
+                        _stats.cancelled_head_waiters,
+                        _stats.cancelled_middle_waiters,
+                        _stats.cancelled_tail_waiters
                     ][cancelled_index],
                     1
                 );
@@ -2939,11 +2859,10 @@ pub(crate) mod tests {
                             "test_deferred_release",
                             |state| {
                                 state.remove_fresh_grant(&blocker, LockMode::Exclusive);
-                                decrement_current(
-                                    &manager.stats.current_physical_families,
-                                    "current_physical_families",
-                                );
+                                #[cfg(feature = "profiling")]
+                                decrement_current(&manager.stats.current_physical_families);
                                 state.grant_waiters(resource, &mut notify);
+                                #[cfg(feature = "profiling")]
                                 manager.record_promotions(&notify);
                                 if publication == 2 {
                                     panic!("exercise committed promotion unwind");

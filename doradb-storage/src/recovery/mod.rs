@@ -22,7 +22,6 @@ pub(crate) mod stream;
 mod timeline;
 
 use self::dispatch::ReplayDispatcher;
-pub(crate) use self::dispatch::RowReplayCounts;
 use crate::buffer::guard::PageGuard;
 use crate::catalog::{
     CatalogTable, IndexDdlKind, IndexDdlRootProof, IndexRef, ReplayVisibleIndexDdl,
@@ -38,8 +37,9 @@ use crate::log::redo::{DDLRedo, RowRedo, RowRedoKind, TableDML};
 use crate::log::{RedoLogCreateMode, RedoLogFinalizer, next_redo_file_seq};
 use crate::map::FastHashSet;
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::{RecoveryReport, clock::Instant};
 use crate::recovery::stream::{PlannedRedoRecovery, RecoveryLogStream};
-use crate::stats::RecoveryReport;
 use crate::table::RowPageDescriptor;
 use crate::table::{Table, TableRedoReplayFloor};
 use crate::trx::MIN_SNAPSHOT_TS;
@@ -47,7 +47,6 @@ use decode::{DecodedGroup, DecodedRow, DecodedRowKind, DecodedTable, DecodedTrx,
 #[cfg(test)]
 pub(crate) use packed::{OwnedReplayOp, pack_test_ops};
 pub(crate) use packed::{PackedPageBatch, ReplayKind, ReplayOp};
-use std::time::Instant;
 use stream::{RedoRecoveryRepairPolicy, RedoReplayPlanner, UnsealedSegmentTerminal};
 
 use error_stack::{Report, ResultExt};
@@ -74,12 +73,12 @@ pub(crate) struct RecoveryOutcome {
     /// Value-only writable redo startup policy.
     pub(crate) finalizer: RedoLogFinalizer,
     /// Completed coordinator measurements.
+    #[cfg(feature = "profiling")]
     pub(crate) report: RecoveryReport,
 }
 
 /// Recovery coordinator for checkpoint bootstrap, redo replay, final repair, and redo startup.
 pub(crate) struct RecoveryCoordinator<'a> {
-    report: RecoveryReport,
     /// Catalog, table files, and buffer-pool resources used by recovery.
     resources: RecoveryResources<'a>,
     /// Planner for the ordered redo-log stream.
@@ -96,6 +95,8 @@ pub(crate) struct RecoveryCoordinator<'a> {
     pending_index_ddl_reconciliations: FastHashSet<TableID>,
     /// Bounded page replay and retained insertion history.
     dispatcher: ReplayDispatcher,
+    #[cfg(feature = "profiling")]
+    report: RecoveryReport,
 }
 
 impl<'a> RecoveryCoordinator<'a> {
@@ -113,7 +114,6 @@ impl<'a> RecoveryCoordinator<'a> {
             config,
         );
         RecoveryCoordinator {
-            report: RecoveryReport::default(),
             resources,
             redo_planner,
             redo_read_depth: config.io_depth,
@@ -122,6 +122,8 @@ impl<'a> RecoveryCoordinator<'a> {
             timeline: RecoveryTimeline::new(MIN_SNAPSHOT_TS),
             pending_index_ddl_reconciliations: FastHashSet::default(),
             dispatcher,
+            #[cfg(feature = "profiling")]
+            report: RecoveryReport::default(),
         }
     }
 
@@ -146,6 +148,7 @@ impl<'a> RecoveryCoordinator<'a> {
     }
 
     async fn recover_all_inner(mut self) -> RuntimeOrFatalResult<RecoveryOutcome> {
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=checkpoint_bootstrap action=start result=ok"
@@ -162,7 +165,11 @@ impl<'a> RecoveryCoordinator<'a> {
                 );
             })?;
 
-        self.report.phases.user_table_bootstrap_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.user_table_bootstrap_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_planning action=start result=ok"
@@ -171,7 +178,9 @@ impl<'a> RecoveryCoordinator<'a> {
             skipped_max_recovered_cts,
             mut stream,
             repair_policy,
+            #[cfg(feature = "profiling")]
             segments_discovered,
+            #[cfg(feature = "profiling")]
             segments_selected,
         } = self
             .redo_planner
@@ -187,14 +196,24 @@ impl<'a> RecoveryCoordinator<'a> {
                     err
                 );
             })?;
-        self.report.work.redo_segments_discovered = segments_discovered;
-        self.report.work.redo_segments_selected = segments_selected;
+        #[cfg(feature = "profiling")]
+        {
+            self.report.work.redo_segments_discovered = segments_discovered;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.report.work.redo_segments_selected = segments_selected;
+        }
         if let Some(skipped_max_cts) = skipped_max_recovered_cts {
             self.timeline.max_recovered_cts = self.timeline.max_recovered_cts.max(skipped_max_cts);
         }
         // 1. replay DDL and DML into catalog metadata, hot RowStore pages, and
         //    cold delete markers.
-        self.report.phases.redo_planning_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.redo_planning_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_replay action=start result=ok"
@@ -213,14 +232,22 @@ impl<'a> RecoveryCoordinator<'a> {
             );
             return Err(error);
         }
+        #[cfg(feature = "profiling")]
         self.dispatcher.merge_counts(&mut self.report);
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_replay action=finish result=ok replayed_logs={}",
             replayed_logs
         );
-        self.report.phases.redo_replay_elapsed = started.elapsed();
-        self.report.redo = stream.recovery_metrics();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.redo_replay_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.report.redo = stream.recovery_metrics();
+        }
 
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         let unsealed_terminals = stream.take_unsealed_terminals();
         // 2. Validate every final catalog satellite against catalog.tables.
@@ -273,7 +300,11 @@ impl<'a> RecoveryCoordinator<'a> {
             .attach("operation=recovery, phase=hydrate_managed_definitions")?;
         // 4. Remove create-table provisional files whose catalog redo never
         //    became durable.
-        self.report.phases.validation_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.validation_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=absent_file_cleanup action=start result=ok"
@@ -290,7 +321,11 @@ impl<'a> RecoveryCoordinator<'a> {
             })
             .change_context(RuntimeError::Recovery)?;
         // 5. Rebuild hot secondary-index state from recovered RowStore pages.
-        self.report.phases.absent_file_cleanup_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.absent_file_cleanup_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=index_rebuild action=start result=ok"
@@ -308,7 +343,11 @@ impl<'a> RecoveryCoordinator<'a> {
             })?;
         // 5. Repair accepted unsealed redo prefixes and select the runtime
         //    active file only after replay has succeeded.
-        self.report.phases.hot_index_rebuild_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.hot_index_rebuild_elapsed = started.elapsed();
+        }
+        #[cfg(feature = "profiling")]
         let started = Instant::now();
         obs::info!(
             "event=recovery_phase component=recovery phase=redo_repair_startup action=start result=ok"
@@ -325,10 +364,14 @@ impl<'a> RecoveryCoordinator<'a> {
             })
             .change_context(RuntimeError::Recovery)?;
 
-        self.report.phases.redo_repair_planning_elapsed = started.elapsed();
+        #[cfg(feature = "profiling")]
+        {
+            self.report.phases.redo_repair_planning_elapsed = started.elapsed();
+        }
         Ok(RecoveryOutcome {
             max_recovered_cts: self.timeline.max_recovered_cts,
             finalizer: self.finalizer,
+            #[cfg(feature = "profiling")]
             report: self.report,
         })
     }
@@ -442,7 +485,10 @@ impl<'a> RecoveryCoordinator<'a> {
                     .insert(table.table_id);
             }
             self.timeline.seed_table_bounds(state);
-            self.report.work.checkpoint_user_tables += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.report.work.checkpoint_user_tables += 1;
+            }
         }
         Ok(())
     }
@@ -595,6 +641,7 @@ impl<'a> RecoveryCoordinator<'a> {
         group: &DecodedGroup,
     ) -> RuntimeOrFatalResult<()> {
         let DecodedTrx { header, kind } = trx;
+        #[cfg(feature = "profiling")]
         match &kind {
             DecodedTrxKind::Ddl(_, dml) => {
                 for (id, table) in dml {
@@ -617,6 +664,7 @@ impl<'a> RecoveryCoordinator<'a> {
         }
     }
 
+    #[cfg(feature = "profiling")]
     fn count_seen(&mut self, table_id: TableID, rows: usize) {
         let count = if table_id.is_catalog() {
             &mut self.report.work.catalog_row_ops_seen
@@ -634,12 +682,15 @@ impl<'a> RecoveryCoordinator<'a> {
         else {
             return Ok(());
         };
-        let report = worker.wait().await?;
-        self.report.work.index_rebuild_pages += report.pages;
-        self.report.work.index_entries_inserted += report.entries;
-
+        let result = worker.wait().await;
+        #[cfg(feature = "profiling")]
+        let report = result?;
+        #[cfg(not(feature = "profiling"))]
+        result?;
         #[cfg(feature = "profiling")]
         {
+            self.report.work.index_rebuild_pages += report.pages;
+            self.report.work.index_entries_inserted += report.entries;
             self.report.hot_indexes = report.measurements;
         }
         Ok(())
@@ -1042,7 +1093,10 @@ impl<'a> RecoveryCoordinator<'a> {
                 ))
                 .change_context(RuntimeError::Recovery).into());
         }
-        self.report.work.hot_pages_reconstructed += 1;
+        #[cfg(feature = "profiling")]
+        {
+            self.report.work.hot_pages_reconstructed += 1;
+        }
         page_guard.unwrap_vmap().set_create_cts(cts);
         self.dispatcher
             .page_history
@@ -1258,7 +1312,10 @@ impl<'a> RecoveryCoordinator<'a> {
                     unreachable!()
                 }
             }
-            self.report.work.catalog_row_ops_applied += 1;
+            #[cfg(feature = "profiling")]
+            {
+                self.report.work.catalog_row_ops_applied += 1;
+            }
         }
         Ok(())
     }
@@ -1295,7 +1352,10 @@ impl<'a> RecoveryCoordinator<'a> {
                         table.recover_cold_row_delete(row.row_id, cts)
                             .change_context(RuntimeError::Recovery)
                             .attach_with(|| format!("operation=recover_cold_row_delete, table_id={table_id}, row_id={}, cts={cts}", row.row_id))?;
-                        self.report.work.cold_deletes += 1;
+                        #[cfg(feature = "profiling")]
+                        {
+                            self.report.work.cold_deletes += 1;
+                        }
                         continue;
                     }
                     if cts < heap_redo_start_ts {
@@ -1420,6 +1480,7 @@ mod tests {
     use crate::index::build::{HotBuildPolicy, HotBuildSource};
     use crate::table::RowPageDescriptor;
 
+    use crate::CallbackResult;
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
     use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, RowLocation};
@@ -1432,6 +1493,8 @@ mod tests {
     };
     use crate::log::redo::TableDML;
     use crate::log::redo::{DDLRedo, RedoHeader, RedoLogs, RedoTrxKind, RowRedo, RowRedoKind};
+    #[cfg(feature = "profiling")]
+    use crate::profiling::{RecoveryReport, RecoveryWorkCounts};
     use crate::recovery::RowReplayState;
     use crate::recovery::{RecoveryResources, TableReplayBounds};
     use crate::row::RowRead;
@@ -1449,7 +1512,7 @@ mod tests {
     use crate::trx::ver_map::RowPageState;
     use crate::value::Val;
     use crate::value::ValKind;
-    use crate::{CallbackResult, RecoveryReport, RecoveryWorkCounts};
+    #[cfg(feature = "profiling")]
     use std::time::Duration;
 
     use std::collections::BTreeMap;
@@ -1480,9 +1543,9 @@ mod tests {
             spec: &TableIndexMetadata,
         ) -> RuntimeOrFatalResult<HotBuildSource> {
             use crate::index::build::{DuplicateCheck, HotBuildCapture};
-            use error_stack::ResultExt;
             #[cfg(feature = "profiling")]
-            use std::time::Instant;
+            use crate::profiling::clock::Instant;
+            use error_stack::ResultExt;
             self.dispatcher.drain_all().await?;
             let policy = self.resources.hot_build_policy;
             #[cfg(feature = "profiling")]
@@ -1583,7 +1646,9 @@ mod tests {
         assert!(report.contains(&format!("block_id={block_id}")), "{report}");
     }
 
+    #[cfg(feature = "profiling")]
     fn assert_report_accounting(report: &RecoveryReport) {
+        #[cfg(feature = "profiling")]
         assert_eq!(
             report.bootstrap_elapsed,
             report.engine_setup_elapsed
@@ -1592,6 +1657,7 @@ mod tests {
                 + report.runtime_startup_elapsed
         );
         let phases = &report.phases;
+        #[cfg(feature = "profiling")]
         assert_eq!(
             report.transaction_bootstrap_elapsed,
             phases.preparation_elapsed
@@ -2481,6 +2547,7 @@ mod tests {
         redo.insert_dml(table_id, RowRedo { row_id, kind });
         replay_test_dml(recovery, redo.dml, cts).await?;
         recovery.dispatcher.drain_all().await?;
+        #[cfg(feature = "profiling")]
         recovery.dispatcher.merge_counts(&mut recovery.report);
         Ok(())
     }
@@ -2890,6 +2957,7 @@ mod tests {
                 assert_eq!(history.len(), 1, "{case}");
                 assert!(history.contains_key(&original_page), "{case}");
                 assert!(!history.contains_key(&invalid_page), "{case}");
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.hot_pages_reconstructed, 1, "{case}");
             }
         });
@@ -3008,10 +3076,15 @@ mod tests {
                     )
                     .await;
                 }
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.hot_pages_reconstructed, 3);
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.index_rebuild_pages, 3);
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.index_entries_inserted, 4);
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.hot_inserts, 3);
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.hot_deletes, 1);
                 for (page_id, address, create_cts) in maps {
                     let page = table
@@ -3128,8 +3201,11 @@ mod tests {
             .unwrap();
             recovery.rebuild_hot_indexes().await.unwrap();
             assert!(recovery.dispatcher.page_history.is_empty());
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.hot_pages_reconstructed, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.index_rebuild_pages, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.index_entries_inserted, 0);
         });
     }
@@ -3234,11 +3310,16 @@ mod tests {
             .await
             .unwrap();
             recovery.dispatcher.drain_all().await.unwrap();
+            #[cfg(feature = "profiling")]
             recovery.dispatcher.merge_counts(&mut recovery.report);
             recovery.rebuild_hot_indexes().await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.hot_inserts, 3);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.hot_updates, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.hot_deletes, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.index_entries_inserted, 4);
             for (id, row) in [(first, RowID::new(75)), (other, RowID::new(0))] {
                 let table = engine.inner().core.catalog().get_table(id).unwrap();
@@ -3407,10 +3488,14 @@ mod tests {
             assert!(!recovery.dispatcher.page_history[&other][&PageID::new(30)].is_inserted(0));
             drop(other_held);
             recovery.dispatcher.drain_all().await.unwrap();
+            #[cfg(feature = "profiling")]
             recovery.dispatcher.merge_counts(&mut recovery.report);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.hot_inserts, 3);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.user_row_ops_seen, 3);
             recovery.rebuild_hot_indexes().await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.index_rebuild_pages, 2);
         });
     }
@@ -3543,6 +3628,7 @@ mod tests {
             .await
             .unwrap();
 
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.user_row_ops_seen, 1);
             // The coarse floor still counts decoded row maps, including DML carried by DDL.
             recovery.timeline.replay_floor = TrxID::new(10);
@@ -3562,11 +3648,16 @@ mod tests {
             replay_test_log(&mut recovery, TrxLog::new(redo_header(TrxID::new(9)), redo))
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             recovery.report.finish_transaction(Duration::ZERO);
 
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.catalog_row_ops_seen, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.catalog_row_ops_skipped, 2);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.user_row_ops_seen, 4);
+            #[cfg(feature = "profiling")]
             assert_eq!(recovery.report.work.user_row_ops_skipped, 4);
             drop(recovery);
             drop(engine);
@@ -3918,11 +4009,17 @@ mod tests {
                 Engine::bootstrap(corruption_recovery_engine_config(main_dir, log_file_stem))
                     .await
                     .unwrap();
+            #[cfg(feature = "profiling")]
             let report = recovered.recovery_report();
+            #[cfg(feature = "profiling")]
             assert_report_accounting(report);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.redo_segments_discovered, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.redo_segments_selected, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.redo.transactions_decoded, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.user_row_ops_seen, 0);
             let mut session = recovered.new_session().unwrap();
             let trx = session.begin_trx().unwrap();
@@ -4082,6 +4179,7 @@ mod tests {
 
     /// Purpose: Report recovery work when bootstrapping an empty storage root.
     /// Expected: Recovery records no replay work and its report remains unchanged after shutdown.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_log_recover_empty() {
         smol::block_on(async {
@@ -4091,11 +4189,15 @@ mod tests {
                 .await
                 .unwrap();
 
+            #[cfg(feature = "profiling")]
             let report = *engine.recovery_report();
+            #[cfg(feature = "profiling")]
             assert_report_accounting(&report);
             assert_eq!(report.work, RecoveryWorkCounts::default());
+            #[cfg(feature = "profiling")]
             assert_eq!(report.redo.transactions_decoded, 0);
             engine.shutdown();
+            #[cfg(feature = "profiling")]
             assert_eq!(engine.recovery_report(), &report);
             drop(engine);
         })
@@ -4234,17 +4336,26 @@ mod tests {
                 .await
                 .unwrap();
 
+            #[cfg(feature = "profiling")]
             let report = engine.recovery_report();
+            #[cfg(feature = "profiling")]
             assert_report_accounting(report);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.hot_inserts, DML_SIZE as u64);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.hot_updates, DML_SIZE.div_ceil(UPD_STEP) as u64);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.hot_deletes, DML_SIZE.div_ceil(DEL_STEP) as u64);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.user_row_ops_skipped, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 report.work.index_entries_inserted,
                 (DML_SIZE - DML_SIZE.div_ceil(DEL_STEP)) as u64
             );
+            #[cfg(feature = "profiling")]
             assert!(report.work.catalog_row_ops_applied > 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 report.work.catalog_row_ops_seen,
                 report.work.catalog_row_ops_applied
@@ -4307,6 +4418,7 @@ mod tests {
                 .await
                 .unwrap();
 
+            #[cfg(feature = "profiling")]
             let initial_report = *engine.recovery_report();
             let mut session = engine.new_session().unwrap();
             let table_id = session
@@ -4329,6 +4441,7 @@ mod tests {
                 .checkpoint_catalog()
                 .await
                 .unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(engine.recovery_report(), &initial_report);
             let snap = engine.inner().core.catalog().storage.checkpoint_snapshot();
             assert!(snap.catalog_replay_start_ts > MIN_SNAPSHOT_TS);
@@ -4340,8 +4453,11 @@ mod tests {
                 .await
                 .unwrap();
 
+            #[cfg(feature = "profiling")]
             assert_report_accounting(engine.recovery_report());
+            #[cfg(feature = "profiling")]
             assert_eq!(engine.recovery_report().work.checkpoint_user_tables, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(engine.recovery_report().work.catalog_row_ops_applied, 0);
             assert!(engine.inner().core.catalog().get_table(table_id).is_some());
             drop(engine);
@@ -5297,10 +5413,15 @@ mod tests {
                 .unwrap();
 
             let table = engine.inner().core.catalog().get_table(table_id).unwrap();
+            #[cfg(feature = "profiling")]
             let report = engine.recovery_report();
+            #[cfg(feature = "profiling")]
             assert_report_accounting(report);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.cold_deletes, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(report.work.hot_inserts, 1);
+            #[cfg(feature = "profiling")]
             assert!(report.work.user_row_ops_skipped >= 11);
             assert_eq!(
                 table.file().active_root_unchecked().deletion_cutoff_ts,
@@ -5882,6 +6003,7 @@ mod tests {
                         }
                     }
                 }
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovery.report.work.user_row_ops_seen, 4);
                 assert_eq!(recovery.timeline.max_recovered_cts, TrxID::new(10));
             }

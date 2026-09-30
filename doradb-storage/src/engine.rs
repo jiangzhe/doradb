@@ -25,13 +25,17 @@ use crate::index::build::HotBuildPolicy;
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::{
+    RecoveryReport,
+    clock::{self, Instant},
+};
 use crate::quiescent::QuiescentGuard;
 use crate::root::{StorageRootLease, StorageRootLeaseAttempt};
 use crate::runtime::block_on;
 use crate::runtime::mandatory::{MandatoryRuntime, MandatoryRuntimeWorkers};
 use crate::runtime::thread_pool::{ThreadPool, ThreadPoolWorkers};
 use crate::session::{Session, SessionAdmission, SessionCleanupRequest, SessionRegistry};
-use crate::stats::RecoveryReport;
 #[cfg(test)]
 use crate::table::tests::MaintenanceTestController;
 #[cfg(test)]
@@ -46,7 +50,6 @@ use std::ops::Deref;
 use std::result;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
 const FIRST_SESSION_ID: SessionID = SessionID::new(1);
 // Engine lifecycle admission uses one packed atomic word so admission and
@@ -273,11 +276,12 @@ impl Drop for EngineAdmission<'_> {
 /// operations acquire strong runtime access internally only for the duration of
 /// the operation. Runtime internals are not exposed through the public facade.
 pub struct Engine {
-    recovery_report: RecoveryReport,
     // Field order is part of owner teardown: shared runtime reachability is
     // released before component owners are dropped.
     inner: Arc<EngineInner>,
     components: Option<ComponentRegistry>,
+    #[cfg(feature = "profiling")]
+    recovery_report: RecoveryReport,
 }
 
 impl Engine {
@@ -300,6 +304,7 @@ impl Engine {
     }
 
     /// Returns immutable startup diagnostics, also readable after explicit shutdown.
+    #[cfg(feature = "profiling")]
     pub fn recovery_report(&self) -> &RecoveryReport {
         &self.recovery_report
     }
@@ -650,7 +655,11 @@ impl Deref for EngineInner {
 }
 
 async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
-    let started = Instant::now();
+    #[cfg(feature = "profiling")]
+    let started = {
+        clock::initialize();
+        Instant::now()
+    };
     let config = config.validate_inner().disclose()?;
     let table_scan_config = config.table_scan;
     let resolved = config
@@ -753,13 +762,16 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     // guards for row/index/readonly access. Register catalog after the pools it
     // can pin so reverse shutdown/drop order releases table guards before pool
     // owners are torn down.
+    #[cfg(feature = "profiling")]
     let catalog_started = Instant::now();
     builder.build::<Catalog>(catalog_cfg).await.disclose()?;
+    #[cfg(feature = "profiling")]
     let transaction_started = Instant::now();
     builder
         .build::<TransactionSystem>((trx_cfg, config.recovery, config.hot_index_build))
         .await
         .disclose()?;
+    #[cfg(feature = "profiling")]
     let runtime_started = Instant::now();
     builder
         .build::<TransactionPurgeWorkers>(())
@@ -836,24 +848,43 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         lifecycle,
         next_session_id: AtomicU64::new(FIRST_SESSION_ID.as_u64()),
     };
+    #[cfg(feature = "profiling")]
     let mut report = engine_inner.core.trx_sys.recovery_report;
+    #[cfg(feature = "profiling")]
     report.finish_transaction(runtime_started - transaction_started);
-    let mut engine = Engine {
-        recovery_report: report,
+    let engine = Engine {
         inner: Arc::new(engine_inner),
         components: Some(registry),
+        #[cfg(feature = "profiling")]
+        recovery_report: report,
     };
+    #[cfg(feature = "profiling")]
+    let mut engine = engine;
+    #[cfg(feature = "profiling")]
     let completed = Instant::now();
-    engine.recovery_report.bootstrap_elapsed = completed - started;
-    engine.recovery_report.engine_setup_elapsed = catalog_started - started;
-    engine.recovery_report.catalog_bootstrap_elapsed = transaction_started - catalog_started;
-    engine.recovery_report.runtime_startup_elapsed = completed - runtime_started;
+    #[cfg(feature = "profiling")]
+    {
+        engine.recovery_report.bootstrap_elapsed = completed - started;
+    }
+    #[cfg(feature = "profiling")]
+    {
+        engine.recovery_report.engine_setup_elapsed = catalog_started - started;
+    }
+    #[cfg(feature = "profiling")]
+    {
+        engine.recovery_report.catalog_bootstrap_elapsed = transaction_started - catalog_started;
+    }
+    #[cfg(feature = "profiling")]
+    {
+        engine.recovery_report.runtime_startup_elapsed = completed - runtime_started;
+    }
     Ok(engine)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "profiling")]
     use crate::buffer::test_io_backend_stats_handle_identity as pool_stats_handle_identity;
     use crate::catalog::tests::table1;
     use crate::conf::HotIndexBuildConfig;
@@ -864,6 +895,7 @@ mod tests {
         ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
         RuntimeOrFatalError,
     };
+    #[cfg(feature = "profiling")]
     use crate::file::fs::tests::io_backend_stats_handle_identity as fs_stats_handle_identity;
     use crate::id::{BlockID, TableID, TrxID};
     use crate::io::{
@@ -1449,6 +1481,7 @@ mod tests {
 
     /// Purpose: Protect shared storage statistics ownership across pools and table files.
     /// Expected: All storage consumers reference the same backend statistics handle.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_engine_shared_storage_runtime_reuses_one_backend_stats_handle() {
         smol::block_on(async {
@@ -1469,11 +1502,16 @@ mod tests {
             .await
             .unwrap();
 
+            #[cfg(feature = "profiling")]
             let table_stats = fs_stats_handle_identity(&engine.inner().table_fs);
+            #[cfg(feature = "profiling")]
             let mem_stats = pool_stats_handle_identity(&engine.inner().pools.mem);
+            #[cfg(feature = "profiling")]
             let index_stats = pool_stats_handle_identity(&engine.inner().pools.index);
 
+            #[cfg(feature = "profiling")]
             assert_eq!(table_stats, mem_stats);
+            #[cfg(feature = "profiling")]
             assert_eq!(table_stats, index_stats);
         });
     }
@@ -1501,10 +1539,12 @@ mod tests {
             .unwrap();
 
             assert_eq!(engine.inner().table_fs.configured_io_depth(), 7);
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 engine.inner().pools.mem.io_backend_stats(),
                 engine.inner().table_fs.io_backend_stats()
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 engine.inner().pools.index.io_backend_stats(),
                 engine.inner().table_fs.io_backend_stats()

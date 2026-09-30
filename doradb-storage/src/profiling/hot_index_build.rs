@@ -1,6 +1,6 @@
+use crate::profiling::clock::Instant;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 
 /// Stage measurements; worker durations are sums, not stage wall durations.
 ///
@@ -542,12 +542,76 @@ impl HotIndexMeasurements {
 /// Recovery's completed hot indexes, with table capture charged once per table.
 pub type RecoveryHotIndexMeasurements = HotIndexMeasurements;
 
+/// Per-page planning, allocation, packing, and occupancy measurements.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PageMeasurement {
+    /// Nanoseconds spent planning this page.
+    pub(crate) planning: u64,
+    /// Nanoseconds spent allocating this page.
+    pub(crate) allocation: u64,
+    /// Nanoseconds spent packing this page.
+    pub(crate) packing: u64,
+    /// Bytes occupied by packed entries.
+    pub(crate) occupied: usize,
+}
+
+// One restartable parent-planning attempt. The interval continues across helper
+// returns and is restarted only after an actual cooperative yield resumes.
+/// Restartable parent planning intervals across cooperative yields.
+pub(crate) struct ParentPlanningProfile {
+    started: Instant,
+    interval_started: Instant,
+    max_sync_nanos: u64,
+}
+
+impl ParentPlanningProfile {
+    /// Start one parent-planning attempt.
+    pub(crate) fn new(started: Instant) -> Self {
+        Self {
+            started,
+            interval_started: started,
+            max_sync_nanos: 0,
+        }
+    }
+
+    /// Record the current uninterrupted planning interval.
+    pub(crate) fn record(&mut self, now: Instant) {
+        self.max_sync_nanos = self
+            .max_sync_nanos
+            .max(now.duration_since(self.interval_started).as_nanos() as u64);
+    }
+
+    /// Restart interval tracking after a cooperative yield.
+    pub(crate) fn resume(&mut self, now: Instant) {
+        self.interval_started = now;
+    }
+
+    /// Publish the completed attempt and maximum synchronous interval.
+    pub(crate) fn finish(mut self, now: Instant, measurements: &mut HotPackedMeasurements) {
+        self.record(now);
+        measurements.parent_planning_nanos += now.duration_since(self.started).as_nanos() as u64;
+        measurements.max_sync_nanos = measurements.max_sync_nanos.max(self.max_sync_nanos);
+    }
+}
+
+/// Cross-tier worker sums and longest uninterrupted work interval.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ColdHotMeasurements {
+    /// Key comparisons, including partition-boundary searches.
+    pub(crate) comparisons: u64,
+    /// Sum of partition-boundary search and batch validation time.
+    pub(crate) worker_nanos: u64,
+    /// Longest partition-boundary search or full batch validation interval.
+    pub(crate) max_sync_nanos: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         HotBuildMeasurements, HotBuildProfile, HotBuildWorkerProfile, HotIndexBuildProfiler,
     };
-    use std::time::{Duration, Instant};
+    use crate::profiling::clock::Instant;
+    use std::time::Duration;
 
     /// Purpose: Distinguish accumulated recovery installation work from per-build maxima.
     /// Expected: Counts and stage work add, peaks take maxima, and temporary-root occupancy is counted by height.

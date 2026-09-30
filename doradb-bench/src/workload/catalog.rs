@@ -16,9 +16,9 @@ use crate::workload::util::{
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{
-    BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport, CreateIndexDefinition,
-    CreateTableDefinition, DescriptorUpdate, DropIndexDefinition, Engine, IndexID,
-    MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedTableInterpreter,
+    BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogCheckpointResult,
+    CreateIndexDefinition, CreateTableDefinition, DescriptorUpdate, DropIndexDefinition, Engine,
+    IndexID, MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedTableInterpreter,
     ManagedTableOps, Session, StorageIndexFlags, StorageIndexKeyByColumnId, StorageTableDefinition,
     TableBinding,
 };
@@ -684,9 +684,10 @@ async fn verify_probe_bindings(
 
 fn verify_baseline_report(
     before: CatalogCardinalities,
-    report: &CatalogCheckpointReport,
+    result: &CatalogCheckpointResult,
 ) -> Result<()> {
-    if !matches!(report.outcome, CatalogCheckpointOutcome::Published { .. })
+    let report = &result.report;
+    if !matches!(result.outcome, CatalogCheckpointOutcome::Published { .. })
         || report.catalog_ddl_txn_count != before.user_tables
         || report.metadata_bytes_written == 0
     {
@@ -726,14 +727,15 @@ fn verify_table_changes(
 
 fn verify_checkpoint_report(
     summary: &CatalogCheckpointFixtureSummary,
-    report: &CatalogCheckpointReport,
+    result: &CatalogCheckpointResult,
 ) -> Result<()> {
+    let report = &result.report;
     if summary.drop_probe_id == summary.index_probe_id {
         return Err(BenchError::message(
             "catalog-checkpoint retained probe identities unexpectedly coincide",
         ));
     }
-    if !matches!(report.outcome, CatalogCheckpointOutcome::Published { .. })
+    if !matches!(result.outcome, CatalogCheckpointOutcome::Published { .. })
         || report.catalog_ddl_txn_count != 1
         || report.metadata_bytes_written == 0
     {
@@ -876,7 +878,7 @@ mod tests {
     fn checkpoint_report(
         ddl_count: usize,
         changes: &[(u64, usize, usize)],
-    ) -> CatalogCheckpointReport {
+    ) -> CatalogCheckpointResult {
         let table_changes = changes
             .iter()
             .map(
@@ -898,25 +900,27 @@ mod tests {
                 index_bytes_written: 16_384,
             })
             .collect();
-        CatalogCheckpointReport {
+        CatalogCheckpointResult {
             outcome: CatalogCheckpointOutcome::Published {
                 catalog_replay_start_ts: TrxID::new(42),
             },
-            catalog_ddl_txn_count: ddl_count,
-            table_changes,
-            table_io,
-            metadata_bytes_written: 24_576,
+            report: CatalogCheckpointReport {
+                catalog_ddl_txn_count: ddl_count,
+                table_changes,
+                table_io,
+                metadata_bytes_written: 24_576,
+            },
         }
     }
 
-    fn baseline_report() -> CatalogCheckpointReport {
+    fn baseline_report() -> CatalogCheckpointResult {
         checkpoint_report(
             1_000,
             &[(0, 0, 1_000), (1, 0, 2_000), (3, 0, 1_000), (5, 0, 10_000)],
         )
     }
 
-    fn case_report(case: CatalogCheckpointCase) -> CatalogCheckpointReport {
+    fn case_report(case: CatalogCheckpointCase) -> CatalogCheckpointResult {
         let changes: &[_] = match case {
             CatalogCheckpointCase::ManagedCreate => &[
                 (0, 1_000, 1_001),
@@ -1202,8 +1206,8 @@ mod tests {
                 checkpoint.outcome,
                 CatalogCheckpointOutcome::Published { .. }
             ));
-            assert_eq!(checkpoint.catalog_ddl_txn_count, 1);
-            assert!(checkpoint.metadata_bytes_written > 0);
+            assert_eq!(checkpoint.report.catalog_ddl_txn_count, 1);
+            assert!(checkpoint.report.metadata_bytes_written > 0);
             let expected = if case == CatalogCheckpointCase::ManagedIndexCreate {
                 checkpoint_report(1, &[(0, 4, 4), (2, 0, 1), (3, 4, 4)])
             } else {
@@ -1217,19 +1221,24 @@ mod tests {
                     ],
                 )
             };
-            assert_eq!(checkpoint.table_changes, expected.table_changes);
+            assert_eq!(
+                checkpoint.report.table_changes,
+                expected.report.table_changes
+            );
             assert!(
                 checkpoint
+                    .report
                     .table_io
                     .windows(2)
                     .all(|pair| pair[0].table_id < pair[1].table_id)
             );
-            assert!(checkpoint.table_io.iter().all(|io| {
+            assert!(checkpoint.report.table_io.iter().all(|io| {
                 io.compact_bytes_read > 0 || io.lwc_bytes_written > 0 || io.index_bytes_written > 0
             }));
-            for change in &checkpoint.table_changes {
+            for change in &checkpoint.report.table_changes {
                 assert!(
                     checkpoint
+                        .report
                         .table_io
                         .iter()
                         .any(|io| io.table_id == change.table_id)
@@ -1249,10 +1258,10 @@ mod tests {
             assert_recovered_catalog(&mut session, case, before).await;
             let noop = session.checkpoint_catalog().await.unwrap();
             assert_eq!(noop.outcome, CatalogCheckpointOutcome::Noop);
-            assert_eq!(noop.catalog_ddl_txn_count, 0);
-            assert!(noop.table_changes.is_empty());
-            assert!(noop.table_io.is_empty());
-            assert_eq!(noop.metadata_bytes_written, 0);
+            assert_eq!(noop.report.catalog_ddl_txn_count, 0);
+            assert!(noop.report.table_changes.is_empty());
+            assert!(noop.report.table_io.is_empty());
+            assert_eq!(noop.report.metadata_bytes_written, 0);
             session.close().await.unwrap();
             engine.shutdown();
         });
@@ -1391,13 +1400,13 @@ mod tests {
             let mut report = case_report(case);
             verify_checkpoint_report(&fixture_summary(case), &report).unwrap();
             // Validation may read an unchanged table, so I/O and change lists need not coincide.
-            let mut read_only = report.table_io[0].clone();
+            let mut read_only = report.report.table_io[0].clone();
             read_only.table_id = TableID::new((1_u64 << 63) + 6);
             read_only.lwc_bytes_written = 0;
             read_only.index_bytes_written = 0;
-            let mut io = report.table_io.into_vec();
+            let mut io = report.report.table_io.into_vec();
             io.push(read_only);
-            report.table_io = io.into_boxed_slice();
+            report.report.table_io = io.into_boxed_slice();
             verify_checkpoint_report(&fixture_summary(case), &report).unwrap();
         }
     }
@@ -1407,39 +1416,39 @@ mod tests {
     /// identifying the inconsistency.
     #[test]
     fn report_validators_reject_invalid_publication_and_table_shapes() {
-        let cases: &[InvalidCase<CatalogCheckpointReport>] = &[
+        let cases: &[InvalidCase<CatalogCheckpointResult>] = &[
             ("unexpected shape", |report| {
                 report.outcome = CatalogCheckpointOutcome::Noop
             }),
             ("unexpected shape", |report| {
-                report.catalog_ddl_txn_count += 1
+                report.report.catalog_ddl_txn_count += 1
             }),
             ("unexpected shape", |report| {
-                report.metadata_bytes_written = 0
+                report.report.metadata_bytes_written = 0
             }),
             ("table changes differ", |report| {
-                report.table_changes[0].before_row_count += 1
+                report.report.table_changes[0].before_row_count += 1
             }),
             ("table changes differ", |report| {
-                report.table_changes[0].after_row_count += 1
+                report.report.table_changes[0].after_row_count += 1
             }),
             ("table changes differ", |report| {
-                report.table_changes = report.table_changes[1..].into();
+                report.report.table_changes = report.report.table_changes[1..].into();
             }),
             ("changes are not in increasing", |report| {
-                report.table_changes.swap(0, 1)
+                report.report.table_changes.swap(0, 1)
             }),
             ("changes are not in increasing", |report| {
-                report.table_changes[1].table_id = report.table_changes[0].table_id;
+                report.report.table_changes[1].table_id = report.report.table_changes[0].table_id;
             }),
             ("I/O is not in increasing", |report| {
-                report.table_io.swap(0, 1)
+                report.report.table_io.swap(0, 1)
             }),
             ("I/O is not in increasing", |report| {
-                report.table_io[1].table_id = report.table_io[0].table_id;
+                report.report.table_io[1].table_id = report.report.table_io[0].table_id;
             }),
             ("inactive table", |report| {
-                let io = &mut report.table_io[0];
+                let io = &mut report.report.table_io[0];
                 io.compact_bytes_read = 0;
                 io.lwc_bytes_written = 0;
                 io.index_bytes_written = 0;
@@ -1447,7 +1456,7 @@ mod tests {
                 assert!(io.final_compact_bytes > 0);
             }),
             ("changed table has no measured I/O", |report| {
-                report.table_io = report.table_io[1..].into();
+                report.report.table_io = report.report.table_io[1..].into();
             }),
         ];
         for &(error, alter) in cases {

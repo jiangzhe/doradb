@@ -126,6 +126,7 @@ pub(super) enum DecodedTable {
 impl DecodedTable {
     /// Count selected entries after duplicate-key replacement, as in owning replay.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Catalog(dml) => dml.rows.len(),

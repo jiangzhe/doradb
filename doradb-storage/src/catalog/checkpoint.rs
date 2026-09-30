@@ -12,6 +12,8 @@ use crate::id::{TableID, TrxID};
 use crate::log::discover_redo_log_files;
 use crate::log::redo::{DDLRedo, RowRedoKind, TableDML};
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::CatalogCheckpointReport;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::stream::{CatalogSafeRedoSegment, RedoReplayPlanner};
 use crate::runtime::mandatory::PreparedExecution;
@@ -23,6 +25,7 @@ use crate::trx::sys::{CatalogRedoRetentionProgress, TransactionSystem};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
 use parking_lot::Mutex;
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
 /// One catalog-row redo operation extracted from persisted logs.
@@ -61,10 +64,11 @@ pub(crate) struct CatalogCheckpointBatch {
     pub(crate) sealed_redo_segments: Vec<CatalogSafeRedoSegment>,
     /// Catalog table row redo operations folded into the checkpoint.
     pub(crate) catalog_ops: Vec<CatalogRedoEntry>,
-    /// Number of catalog DDL transactions included in the batch.
-    pub(crate) catalog_ddl_txn_count: usize,
     /// Reason the scan stopped.
     pub(crate) stop_reason: CatalogCheckpointScanStopReason,
+    /// Number of catalog DDL transactions included in the batch.
+    #[cfg(feature = "profiling")]
+    pub(crate) catalog_ddl_txn_count: usize,
 }
 
 impl CatalogCheckpointBatch {
@@ -119,51 +123,20 @@ pub enum CatalogCheckpointOutcome {
         catalog_replay_start_ts: TrxID,
     },
     /// The batch had no publishable work or was already superseded.
+    #[serde(deserialize_with = "deserialize_checkpoint_noop")]
     Noop,
 }
 
-/// Successful catalog checkpoint measurement returned by the public operation.
+/// Catalog checkpoint publication outcome with feature-gated profiling measurements.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct CatalogCheckpointReport {
+pub struct CatalogCheckpointResult {
     /// Publication classification and durable replay boundary.
     pub outcome: CatalogCheckpointOutcome,
-    /// Number of catalog DDL transactions folded by this checkpoint.
-    pub catalog_ddl_txn_count: usize,
-    /// Changed logical catalog tables in increasing table-ID order.
-    pub table_changes: Box<[CatalogTableCheckpointChange]>,
-    /// Logical catalog tables with measured I/O in increasing table-ID order.
-    pub table_io: Box<[CatalogTableCheckpointIoStats]>,
-    /// Successfully written catalog metadata-page and super-root-slot bytes.
-    pub metadata_bytes_written: usize,
-}
-
-/// Row-count change for one built-in logical catalog table.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogTableCheckpointChange {
-    /// Built-in logical catalog table identity.
-    pub table_id: TableID,
-    /// Rows in the durable table image before the change.
-    pub before_row_count: usize,
-    /// Rows in the durable table image after the change.
-    pub after_row_count: usize,
-}
-
-/// Checkpoint I/O for one built-in logical catalog table with measured activity.
-#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogTableCheckpointIoStats {
-    /// Built-in logical catalog table identity.
-    pub table_id: TableID,
-    /// Cache-independent bytes requested from compact table blocks.
-    pub compact_bytes_read: usize,
-    /// Bytes occupied by all compact blocks reachable from the final root.
-    pub final_compact_bytes: usize,
-    /// Successfully written replacement LWC block bytes.
-    pub lwc_bytes_written: usize,
-    /// Successfully written replacement column-index block bytes.
-    pub index_bytes_written: usize,
+    /// Measurements collected by this checkpoint.
+    #[cfg(feature = "profiling")]
+    #[serde(flatten)]
+    pub report: CatalogCheckpointReport,
 }
 
 /// Configuration for scanning catalog checkpoint redo logs.
@@ -420,7 +393,7 @@ struct CatalogCheckpointExecution {
 }
 
 impl MaintenanceExecution for CatalogCheckpointExecution {
-    type Output = CatalogCheckpointReport;
+    type Output = CatalogCheckpointResult;
 
     const LABEL: &'static str = "checkpoint_catalog";
 
@@ -444,7 +417,7 @@ pub(crate) fn prepare_catalog_checkpoint_operation(
     catalog_scope: CatalogCheckpointScope,
     redo_scope: RedoRetentionScope,
     scope: PreparedMaintenanceScope,
-) -> impl PreparedExecution<Output = CatalogCheckpointReport> {
+) -> impl PreparedExecution<Output = CatalogCheckpointResult> {
     PreparedMaintenanceExecution::<CatalogCheckpointExecution>::global(
         scope,
         CatalogCheckpointExecution {
@@ -464,20 +437,21 @@ impl Catalog {
         &self,
         trx_sys: &TransactionSystem,
         disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
         obs::info!("event=checkpoint_publish component=catalog action=start result=ok");
-        self.checkpoint_prepared_inner(trx_sys, disk_guard)
-            .await
-        .inspect(|report| match report.outcome {
-            CatalogCheckpointOutcome::Published {
-                catalog_replay_start_ts,
-            } => obs::info!(
-                "event=checkpoint_publish component=catalog action=publish result=ok catalog_replay_start_ts={}",
-                catalog_replay_start_ts
-            ),
-            CatalogCheckpointOutcome::Noop => obs::debug!(
-                "event=checkpoint_publish component=catalog action=publish result=skipped reason=noop"
-            ),
+        let result = self.checkpoint_prepared_inner(trx_sys, disk_guard).await;
+        result.inspect(|result| {
+            match result.outcome {
+                CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts,
+                } => obs::info!(
+                    "event=checkpoint_publish component=catalog action=publish result=ok catalog_replay_start_ts={}",
+                    catalog_replay_start_ts
+                ),
+                CatalogCheckpointOutcome::Noop => obs::debug!(
+                    "event=checkpoint_publish component=catalog action=publish result=skipped reason=noop"
+                ),
+            }
         })
         .inspect_err(|err| match err {
             RuntimeOrFatalError::Fatal(report) => obs::error!(
@@ -495,36 +469,27 @@ impl Catalog {
         &self,
         trx_sys: &TransactionSystem,
         disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<CatalogCheckpointReport> {
+    ) -> RuntimeOrFatalResult<CatalogCheckpointResult> {
         let scan_cfg = trx_sys.catalog_checkpoint_scan_config()?;
         let batch = self
             .scan_checkpoint_batch(trx_sys.persisted_watermark_cts(), scan_cfg)
             .await?;
         let publishable_progress = batch.redo_retention_progress();
         match self.apply_checkpoint_batch(batch, disk_guard).await {
-            Ok(
-                report @ CatalogCheckpointReport {
-                    outcome:
-                        CatalogCheckpointOutcome::Published {
-                            catalog_replay_start_ts,
-                        },
-                    ..
-                },
-            ) => {
-                if let Some(progress) = publishable_progress {
-                    debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
-                    trx_sys.record_catalog_redo_retention_progress(progress);
+            Ok(result) => {
+                if let CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts,
+                } = result.outcome
+                {
+                    if let Some(progress) = publishable_progress {
+                        debug_assert_eq!(progress.catalog_replay_start_ts, catalog_replay_start_ts);
+                        trx_sys.record_catalog_redo_retention_progress(progress);
+                    }
+                    trx_sys.request_dropped_table_purge();
+                    trx_sys.request_retired_index_runtime_retry();
                 }
-                trx_sys.request_dropped_table_purge();
-                trx_sys.request_retired_index_runtime_retry();
-                Ok(report)
+                Ok(result)
             }
-            Ok(
-                report @ CatalogCheckpointReport {
-                    outcome: CatalogCheckpointOutcome::Noop,
-                    ..
-                },
-            ) => Ok(report),
             Err(err) => {
                 let has_io_source = match &err {
                     RuntimeOrFatalError::Runtime(report) => {
@@ -576,8 +541,9 @@ impl Catalog {
             first_retained_file_seq,
             sealed_redo_segments: vec![],
             catalog_ops: vec![],
-            catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            #[cfg(feature = "profiling")]
+            catalog_ddl_txn_count: 0,
         };
         if durable_upper_cts < replay_start_ts {
             // Nothing durable has reached the catalog replay cursor yet, so
@@ -654,7 +620,8 @@ impl Catalog {
                     // Reaching here means this transaction will never need to be
                     // replayed as catalog history before the next checkpoint cursor.
                     batch.safe_cts = header.cts;
-                    batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1);
+                    #[cfg(feature = "profiling")]
+                    { batch.catalog_ddl_txn_count = batch.catalog_ddl_txn_count.saturating_add(1); }
 
                     // Only catalog-table row redo is materialized into the catalog
                     // checkpoint; user-table row data remains owned by table
@@ -777,6 +744,16 @@ impl Catalog {
     }
 }
 
+fn deserialize_checkpoint_noop<'de, D: Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    // Serde's internally tagged unit variant accepts leftover fields. An empty
+    // struct enforces the enum's strict field policy while preserving Noop.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoopFields {}
+
+    NoopFields::deserialize(deserializer).map(|_| ())
+}
+
 fn drop_table_has_catalog_table_delete(
     table_id: TableID,
     dml: &BTreeMap<TableID, TableDML>,
@@ -843,6 +820,90 @@ mod tests {
         let mut dml = BTreeMap::new();
         dml.insert(TABLE_ID_TABLES, TableDML { rows });
         dml
+    }
+
+    /// Purpose: Preserve strict checkpoint serialization across profiling configurations.
+    /// Expected: Both outcomes and their result wrappers retain their wire shapes and
+    /// round-trip without accepting unknown result or outcome fields.
+    #[test]
+    fn test_catalog_checkpoint_serialization_strictly() {
+        use toml::Value;
+
+        for (case, outcome, expected) in [
+            (
+                "published",
+                CatalogCheckpointOutcome::Published {
+                    catalog_replay_start_ts: TrxID::new(42),
+                },
+                "[outcome]\ntype = \"published\"\ncatalog_replay_start_ts = 42\n",
+            ),
+            (
+                "noop",
+                CatalogCheckpointOutcome::Noop,
+                "[outcome]\ntype = \"noop\"\n",
+            ),
+        ] {
+            let expected_outcome = toml::from_str::<Value>(expected).unwrap()["outcome"].clone();
+            let encoded_outcome = toml::to_string(&outcome).unwrap();
+            assert_eq!(
+                toml::from_str::<Value>(&encoded_outcome).unwrap(),
+                expected_outcome,
+                "{case}: outcome schema"
+            );
+            assert_eq!(
+                toml::from_str::<CatalogCheckpointOutcome>(&encoded_outcome).unwrap(),
+                outcome,
+                "{case}: outcome round trip"
+            );
+            let invalid = format!("unknown = 1\n{encoded_outcome}");
+            assert!(
+                toml::from_str::<CatalogCheckpointOutcome>(&invalid).is_err(),
+                "{case}: unknown field accepted in outcome"
+            );
+
+            let result = CatalogCheckpointResult {
+                outcome,
+                #[cfg(feature = "profiling")]
+                report: CatalogCheckpointReport {
+                    catalog_ddl_txn_count: 0,
+                    table_changes: Box::new([]),
+                    table_io: Box::new([]),
+                    metadata_bytes_written: 0,
+                },
+            };
+            let expected = if cfg!(feature = "profiling") {
+                format!(
+                    "catalog_ddl_txn_count = 0\ntable_changes = []\ntable_io = []\nmetadata_bytes_written = 0\n{expected}"
+                )
+            } else {
+                expected.to_owned()
+            };
+            let encoded = toml::to_string(&result).unwrap();
+            let value: Value = toml::from_str(&encoded).unwrap();
+            assert_eq!(value, toml::from_str::<Value>(&expected).unwrap(), "{case}");
+            assert_eq!(
+                toml::from_str::<CatalogCheckpointResult>(&encoded).unwrap(),
+                result,
+                "{case}"
+            );
+            for level in ["result", "outcome"] {
+                let mut invalid = value.clone();
+                let target = if level == "result" {
+                    &mut invalid
+                } else {
+                    &mut invalid["outcome"]
+                };
+                target
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("unknown".to_owned(), Value::Integer(1));
+                assert!(
+                    toml::from_str::<CatalogCheckpointResult>(&toml::to_string(&invalid).unwrap())
+                        .is_err(),
+                    "{case}: unknown field accepted in {level}"
+                );
+            }
+        }
     }
 
     /// Purpose: Identify catalog deletion redo belonging to the dropped table.
@@ -1068,8 +1129,9 @@ mod tests {
                 },
             ],
             catalog_ops: Vec::new(),
-            catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            #[cfg(feature = "profiling")]
+            catalog_ddl_txn_count: 0,
         };
 
         let progress = batch.redo_retention_progress().unwrap();
@@ -1111,8 +1173,9 @@ mod tests {
                 redo_range: None,
             }],
             catalog_ops: Vec::new(),
-            catalog_ddl_txn_count: 0,
             stop_reason: CatalogCheckpointScanStopReason::ReachedDurableUpper,
+            #[cfg(feature = "profiling")]
+            catalog_ddl_txn_count: 0,
         };
 
         assert!(batch.redo_retention_progress().is_none());

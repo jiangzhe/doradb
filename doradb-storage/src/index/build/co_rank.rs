@@ -1,11 +1,11 @@
 use super::merge::{HotEntryRef, execution_error, observe_stop};
 use super::{BudgetedVec, SortedHotRuns};
 use crate::error::{RuntimeError, RuntimeOrFatalResult};
+#[cfg(feature = "profiling")]
+use crate::profiling::clock::Instant;
 use error_stack::ResultExt;
 use std::cmp::Ordering;
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 
 /// A rank's exact prefixes and immediate total-order neighbors.
 pub(super) struct HotMergeCut {

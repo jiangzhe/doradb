@@ -3226,16 +3226,19 @@ mod tests {
 
             let tree = runtime.open(root, &guard);
             let key = [Val::from(7u32)];
+            #[cfg(feature = "profiling")]
             let stats_before = disk_pool.global_stats();
             assert_eq!(
                 non_unique_prefix_scan_rows(&tree, &key).await,
                 test_row_ids([1007])
             );
-            let delta = disk_pool.global_stats().delta_since(stats_before);
+            #[cfg(feature = "profiling")]
+            let _delta = disk_pool.global_stats().delta_since(stats_before);
+            #[cfg(feature = "profiling")]
             assert!(
-                delta.cache_misses < tree_blocks / 2,
+                _delta.cache_misses < tree_blocks / 2,
                 "prefix scan loaded {} readonly blocks out of {} DiskTree blocks",
-                delta.cache_misses,
+                _delta.cache_misses,
                 tree_blocks
             );
         });
@@ -3733,17 +3736,22 @@ mod tests {
             let collect_guard = collect_disk_pool.create_base_guard();
             let collect_runtime = unique_runtime!(metadata, collect_disk_pool);
             let collect_tree = collect_runtime.open(root, &collect_guard);
+            #[cfg(feature = "profiling")]
             let start_stats = collect_disk_pool.global_stats();
             let mut reachable = BTreeSet::new();
             collect_tree
                 .collect_reachable_blocks(&mut reachable)
                 .await
                 .unwrap();
-            let delta = collect_disk_pool.global_stats().delta_since(start_stats);
+            #[cfg(feature = "profiling")]
+            let _delta = collect_disk_pool.global_stats().delta_since(start_stats);
 
-            assert_eq!(delta.cache_misses, 1);
-            assert_eq!(delta.queued_reads, 1);
-            assert_eq!(delta.completed_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.cache_misses, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.queued_reads, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_delta.completed_reads, 1);
             assert_eq!(reachable.len(), leaf_entries.len() + 1);
             assert!(reachable.contains(&root_block_id));
             for entry in leaf_entries {

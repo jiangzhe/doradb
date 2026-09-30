@@ -2,22 +2,27 @@ use super::libaio_abi::{
     io_context_t, io_destroy, io_event, io_getevents, io_iocb_cmd, io_setup, io_submit, iocb,
 };
 use super::{
-    Backend, BackendError, BackendResult, BackendStatsHandle, BackendToken, IOKind, Operation,
-    StdIoResult, SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
+    Backend, BackendError, BackendResult, BackendToken, IOKind, Operation, StdIoResult,
+    SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
 };
 use crate::error::{IoError, IoResult};
+#[cfg(feature = "profiling")]
+use crate::profiling::{BackendStatsHandle, clock::Instant};
 use error_stack::Report;
 use libc::{EAGAIN, EINTR, EINVAL, c_long};
 use std::collections::VecDeque;
 use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
 use std::ptr::null_mut;
-use std::time::Instant;
 
 /// Canonical name used in libaio backend diagnostics.
 pub(crate) const BACKEND_NAME: &str = "libaio";
 
-type LibaioWaitResult = (usize, Vec<(BackendToken, StdIoResult<usize>)>);
+struct LibaioWaitResult {
+    completed: Vec<(BackendToken, StdIoResult<usize>)>,
+    #[cfg(feature = "profiling")]
+    calls: usize,
+}
 
 /// Concrete libaio context used by the current storage-engine backend.
 ///
@@ -26,12 +31,14 @@ type LibaioWaitResult = (usize, Vec<(BackendToken, StdIoResult<usize>)>);
 pub(crate) struct LibaioBackend {
     ctx: io_context_t,
     io_depth: usize,
+    #[cfg(feature = "profiling")]
     stats: BackendStatsHandle,
 }
 
 impl LibaioBackend {
     /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats_handle(&self) -> BackendStatsHandle {
         self.stats.clone()
     }
@@ -125,7 +132,11 @@ impl LibaioBackend {
             };
             completed.push((BackendToken::from_raw(ev.data), res));
         }
-        Ok((wait_calls, completed))
+        Ok(LibaioWaitResult {
+            completed,
+            #[cfg(feature = "profiling")]
+            calls: wait_calls,
+        })
     }
 }
 
@@ -177,6 +188,7 @@ impl Backend for LibaioBackend {
                 0 => Ok(Self {
                     ctx,
                     io_depth,
+                    #[cfg(feature = "profiling")]
                     stats: BackendStatsHandle::default(),
                 }),
                 ret => {
@@ -250,19 +262,24 @@ impl Backend for LibaioBackend {
         if batch.staged.is_empty() || limit == 0 {
             return Ok(SubmitAttempt::Noop);
         }
+        #[cfg(feature = "profiling")]
         let start = Instant::now();
         batch.prefix.clear();
         batch
             .prefix
             .extend(batch.staged.iter().take(limit).copied());
         let submit_result = self.submit_limit(&batch.prefix, limit);
+        #[cfg(feature = "profiling")]
         self.stats
             .record_submit_and_wait(1, start.elapsed().as_nanos() as usize);
+        #[cfg(feature = "profiling")]
         let submit_result = submit_result.inspect(|attempt| {
             if let SubmitAttempt::Submitted(submit_count) = attempt {
+                #[cfg(feature = "profiling")]
                 self.stats.record_submitted_ops(submit_count.get());
             }
-        })?;
+        });
+        let submit_result = submit_result?;
         if let SubmitAttempt::Submitted(submit_count) = submit_result {
             batch.staged.drain(0..submit_count.get());
         }
@@ -275,19 +292,24 @@ impl Backend for LibaioBackend {
         events: &mut Self::Events,
         min_nr: usize,
     ) -> BackendResult<Vec<(BackendToken, StdIoResult<usize>)>> {
+        #[cfg(feature = "profiling")]
         let start = Instant::now();
-        let (_wait_calls, completed) = self
-            .wait_at_least_with_attempts(events, min_nr)
-            .inspect(|(wait_calls, completed)| {
+        let result = self.wait_at_least_with_attempts(events, min_nr);
+        #[cfg(feature = "profiling")]
+        let result = result
+            .inspect(|outcome| {
+                #[cfg(feature = "profiling")]
                 self.stats
-                    .record_submit_and_wait(*wait_calls, start.elapsed().as_nanos() as usize);
-                self.stats.record_wait_completions(completed.len());
+                    .record_submit_and_wait(outcome.calls, start.elapsed().as_nanos() as usize);
+                #[cfg(feature = "profiling")]
+                self.stats.record_wait_completions(outcome.completed.len());
             })
             .inspect_err(|err| {
+                #[cfg(feature = "profiling")]
                 self.stats
                     .record_submit_and_wait(err.call_count(), start.elapsed().as_nanos() as usize);
-            })?;
-        Ok(completed)
+            });
+        Ok(result?.completed)
     }
 
     #[inline]
@@ -597,6 +619,7 @@ pub(crate) mod tests {
 
         IO_GETEVENTS_CALLS.store(0, Ordering::SeqCst);
         let previous = set_io_getevents_hook(Some(eintr_then_one_completion));
+        #[cfg(feature = "profiling")]
         let baseline = backend.stats_handle().snapshot();
         let completions =
             <LibaioBackend as Backend>::wait_at_least(&mut backend, &mut events, 1).unwrap();
@@ -610,8 +633,11 @@ pub(crate) mod tests {
             Err(err) => panic!("expected successful completion, got error: {err}"),
         }
 
+        #[cfg(feature = "profiling")]
         let delta = backend.stats_handle().snapshot().delta_since(baseline);
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.submit_and_wait_calls, 2);
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.wait_completions, 1);
     }
 }

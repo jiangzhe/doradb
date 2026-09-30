@@ -893,7 +893,9 @@ mod tests {
 
                 let mut scan = index.cleanup_scan(pool_guard, RowID::new(100), true);
                 let batch = scan.next_batch().await.unwrap().unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(batch.skipped_live, 1);
+                #[cfg(feature = "profiling")]
                 assert_eq!(batch.skipped_hot_deleted, 1);
                 assert_eq!(
                     batch
@@ -907,7 +909,9 @@ mod tests {
 
                 let mut scan = index.cleanup_scan(pool_guard, RowID::new(100), false);
                 let batch = scan.next_batch().await.unwrap().unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(batch.skipped_live, 2);
+                #[cfg(feature = "profiling")]
                 assert_eq!(batch.skipped_hot_deleted, 1);
                 assert_eq!(
                     batch

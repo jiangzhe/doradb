@@ -431,13 +431,19 @@ impl TransactionSystem {
         min_active_sts: TrxID,
     ) -> RuntimeOrFatalResult<Vec<RetiredRowPageBatch>> {
         let mut table_cache = TableCache::new(catalog);
+        #[cfg(feature = "profiling")]
         let purge_trx_count = trx_list.len();
+        #[cfg(feature = "profiling")]
         let mut purge_row_count = 0;
+        #[cfg(feature = "profiling")]
         let mut purge_index_count = 0;
         // First, purge row undo logs by versioned page identity.
         for trx in &trx_list {
             if let Some(row_undo) = trx.row_undo() {
-                purge_row_count += row_undo.len();
+                #[cfg(feature = "profiling")]
+                {
+                    purge_row_count += row_undo.len();
+                }
                 for undo in &**row_undo {
                     if undo.table_id.is_catalog() {
                         let Some(table) = table_cache.get_catalog_table(undo.table_id) else {
@@ -511,7 +517,10 @@ impl TransactionSystem {
                             .await?
                     };
                     if deleted {
-                        purge_index_count += 1;
+                        #[cfg(feature = "profiling")]
+                        {
+                            purge_index_count += 1;
+                        }
                     }
                 }
             }
@@ -521,14 +530,17 @@ impl TransactionSystem {
             .filter_map(CommittedTrx::into_retired_row_pages)
             .collect();
 
+        #[cfg(feature = "profiling")]
         self.redo_log
             .stats
             .purge_trx_count
             .fetch_add(purge_trx_count, Ordering::Relaxed);
+        #[cfg(feature = "profiling")]
         self.redo_log
             .stats
             .purge_row_count
             .fetch_add(purge_row_count, Ordering::Relaxed);
+        #[cfg(feature = "profiling")]
         self.redo_log
             .stats
             .purge_index_count
@@ -1683,7 +1695,8 @@ mod tests {
             .wait_for_purge_completion_after(engine.inner().trx_sys.purge_handoff_cts())
             .await
             .unwrap();
-        let initial = engine.inner().trx_sys.trx_sys_stats();
+        #[cfg(feature = "profiling")]
+        let _initial = engine.inner().trx_sys.trx_sys_stats();
         let mut reader = engine.new_session().unwrap();
         let snapshot = reader.begin_trx().unwrap();
         let row_count = if evicted { 192 } else { 4 };
@@ -1728,7 +1741,7 @@ mod tests {
                 }
             }
         }
-        let sys = &engine.inner().trx_sys;
+        let _sys = &engine.inner().trx_sys;
         report_phase("handoff");
         wait_for_purge_handoff(&writer, target).await.unwrap();
         for &(row_id, id) in &rows {
@@ -1739,7 +1752,11 @@ mod tests {
                 .unwrap();
             assert!(map.version_map().try_write_row(row_id).unwrap().is_some());
         }
-        assert_eq!(sys.trx_sys_stats().purge_row_count, initial.purge_row_count);
+        #[cfg(feature = "profiling")]
+        assert_eq!(
+            _sys.trx_sys_stats().purge_row_count,
+            _initial.purge_row_count
+        );
         // Unrelated resident pages expose cache displacement caused by
         // any accidental row-undo reload. Setup and spill IO precede baseline.
         report_phase("pressure");
@@ -1760,6 +1777,7 @@ mod tests {
             .filter(|&&id| test_frame_kind(pool, id) == FrameKind::Evicted)
             .count();
         report_phase("purge");
+        #[cfg(feature = "profiling")]
         let before = pool.stats();
         let started = Instant::now();
         snapshot.commit().await.unwrap();
@@ -1777,6 +1795,7 @@ mod tests {
                 .unwrap();
             assert!(map.version_map().try_write_row(row_id).unwrap().is_none());
         }
+        #[cfg(feature = "profiling")]
         let delta = pool.stats().delta_since(before);
         let evicted_rows = rows
             .iter()
@@ -1787,22 +1806,30 @@ mod tests {
             .filter(|&&id| test_frame_kind(pool, id) == FrameKind::Evicted)
             .count();
         eprintln!(
-            "row-purge workers={workers} evicted={evicted} rows={row_count} frame_capacity={} pressure_pages={} elapsed={elapsed:?} delta={delta:?} evicted_rows={evicted_rows} pressure_evicted_before={pressure_evicted_before} pressure_evicted_after={displaced}",
+            "row-purge workers={workers} evicted={evicted} rows={row_count} frame_capacity={} pressure_pages={} elapsed={elapsed:?} evicted_rows={evicted_rows} pressure_evicted_before={pressure_evicted_before} pressure_evicted_after={displaced}",
             pool.capacity(),
             pressure.len()
         );
+        #[cfg(feature = "profiling")]
+        eprintln!("row-purge delta={delta:?}");
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.queued_reads, 0);
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.completed_reads, 0);
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.cache_misses, 0);
+        #[cfg(feature = "profiling")]
         assert_eq!(delta.cache_hits, 0);
         assert_eq!(evicted_rows, if evicted { row_count } else { 0 });
+        #[cfg(feature = "profiling")]
         assert_eq!(
-            sys.trx_sys_stats().purge_row_count,
-            initial.purge_row_count + row_count
+            _sys.trx_sys_stats().purge_row_count,
+            _initial.purge_row_count + row_count
         );
+        #[cfg(feature = "profiling")]
         assert_eq!(
-            sys.trx_sys_stats().purge_index_count,
-            initial.purge_index_count
+            _sys.trx_sys_stats().purge_index_count,
+            _initial.purge_index_count
         );
         report_phase("shutdown");
         drop((reader, writer, guards, table));
@@ -2096,7 +2123,8 @@ mod tests {
             .wait_for_purge_completion_after(initial_target)
             .await
             .unwrap();
-        let initial = engine.inner().trx_sys.trx_sys_stats();
+        #[cfg(feature = "profiling")]
+        let _initial = engine.inner().trx_sys.trx_sys_stats();
         let mut target = initial_target;
         for i in 0..PURGE_SIZE {
             let mut trx = session.begin_trx().unwrap();
@@ -2117,20 +2145,24 @@ mod tests {
             .wait_for_purge_completion_after(target)
             .await
             .unwrap();
-        let stats = engine.inner().trx_sys.trx_sys_stats();
+        #[cfg(feature = "profiling")]
+        let _stats = engine.inner().trx_sys.trx_sys_stats();
+        #[cfg(feature = "profiling")]
         assert_eq!(
-            stats.purge_trx_count,
-            initial.purge_trx_count + PURGE_SIZE * 2,
+            _stats.purge_trx_count,
+            _initial.purge_trx_count + PURGE_SIZE * 2,
             "workers={workers}"
         );
+        #[cfg(feature = "profiling")]
         assert_eq!(
-            stats.purge_row_count,
-            initial.purge_row_count + PURGE_SIZE * 2,
+            _stats.purge_row_count,
+            _initial.purge_row_count + PURGE_SIZE * 2,
             "workers={workers}"
         );
+        #[cfg(feature = "profiling")]
         assert_eq!(
-            stats.purge_index_count,
-            initial.purge_index_count + PURGE_SIZE,
+            _stats.purge_index_count,
+            _initial.purge_index_count + PURGE_SIZE,
             "workers={workers}"
         );
     }

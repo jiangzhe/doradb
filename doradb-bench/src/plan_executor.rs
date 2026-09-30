@@ -6,7 +6,6 @@ use crate::measurement::{
     BenchmarkAccumulator, BenchmarkAggregate, InternalMetric, LatencyDistribution,
     MeasuredRunResult, MeasurementClock, WorkloadCounters, WorkloadMetrics, operations_per_second,
 };
-use crate::output::{capture_internal_stats, plan_internal_metrics};
 use crate::plan::{Phase, Plan, ResolvedWorkload, load_plan};
 use crate::plan_output::{
     InvocationReport, PreparePhaseResult, absolute_result_path, render_stdout_summary,
@@ -22,6 +21,7 @@ use crate::workload::{
     TrxNoopExecutor, UpdateRandExecutor, complete_create_index, prepare_create_fixture,
     run_recovery,
 };
+use doradb_storage::profiling::InternalStatsSnapshot;
 use doradb_storage::{Engine, EngineConfig, Session};
 use easy_parallel::Parallel;
 use rustix::process::{Signal, getpid, kill_process};
@@ -801,9 +801,9 @@ where
     };
     let stats_state = if workload.include_stats() {
         let session = engine.new_session()?;
-        match capture_internal_stats(&session) {
+        match InternalStatsSnapshot::capture(&session) {
             Ok(before) => Some((session, before)),
-            Err(error) => return close_stats_session(session, Err(error)).await,
+            Err(error) => return close_stats_session(session, Err(error.into())).await,
         }
     } else {
         None
@@ -840,8 +840,9 @@ where
     };
 
     let internal_metrics = if let Some((mut session, before)) = stats_state {
-        let metrics_result =
-            capture_internal_stats(&session).map(|after| plan_internal_metrics(&before, &after));
+        let metrics_result = InternalStatsSnapshot::capture(&session)
+            .map(|after| after.delta_since(&before))
+            .map_err(BenchError::from);
         let close_result = session.close().await.map_err(BenchError::from);
         match (metrics_result, close_result) {
             (Ok(metrics), Ok(())) => metrics,

@@ -16,7 +16,7 @@ use crate::index::build::{
 use crate::map::FastHashMap;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotIndexBuildProfiler, RecoveryHotIndexMeasurements};
+use crate::profiling::{HotIndexBuildProfiler, RecoveryHotIndexReport, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{block_on, thread_pool::ThreadPool};
 use crate::table::Table;
@@ -27,30 +27,24 @@ use std::mem;
 use std::panic::resume_unwind;
 use std::sync::Arc;
 use std::thread::{JoinHandle, panicking};
-#[cfg(feature = "profiling")]
-use std::time::Instant;
 
 #[cfg(test)]
 pub(super) use tests::checked_rebuild;
 
 type Histories = FastHashMap<TableID, FastHashMap<PageID, RowReplayState>>;
 
-/// Value-only terminal report; no table or pool guard crosses the channel.
-#[derive(Default)]
-pub(super) struct RecoveryHotIndexReport {
-    /// Validated hot source pages, counted once per table.
-    pub(super) pages: u64,
-    /// Entries installed and cleaned across all selected indexes.
-    pub(super) entries: u64,
-    /// Completed index stage measurements without resource owners.
-    #[cfg(feature = "profiling")]
-    pub(super) measurements: RecoveryHotIndexMeasurements,
-}
+/// Feature-selected index reconstruction diagnostics; disabled completion has no payload.
+#[cfg(feature = "profiling")]
+pub(super) type RecoveryHotIndexResult = RecoveryHotIndexReport;
+
+/// Feature-selected index reconstruction diagnostics; disabled completion has no payload.
+#[cfg(not(feature = "profiling"))]
+pub(super) type RecoveryHotIndexResult = ();
 
 /// Recovery-local join ownership, never transferred into the component registry.
 pub(super) struct RecoveryHotIndexWorker {
     thread: Option<JoinHandle<()>>,
-    terminal: flume::Receiver<CompletionResult<RecoveryHotIndexReport>>,
+    terminal: flume::Receiver<CompletionResult<RecoveryHotIndexResult>>,
     poisoner: QuiescentGuard<EnginePoisoner>,
 }
 
@@ -97,14 +91,15 @@ impl RecoveryHotIndexWorker {
             poisoner: resources.poisoner.clone(),
             policy: resources.hot_build_policy,
             duplicates,
-            #[cfg(feature = "profiling")]
-            profiler: resources.hot_build_profiler.clone(),
             active: None,
-            report: RecoveryHotIndexReport::default(),
             phase: "source_capture",
             current_table: None,
             #[cfg(test)]
             hooks: tests::Hooks::capture(),
+            #[cfg(feature = "profiling")]
+            profiler: resources.hot_build_profiler.clone(),
+            #[cfg(feature = "profiling")]
+            report: RecoveryHotIndexResult::default(),
         };
         let (sender, terminal) = flume::bounded(1);
         let thread = spawn_named("Recovery-Index", move || {
@@ -126,7 +121,7 @@ impl RecoveryHotIndexWorker {
     /// The task produces progress, the channel result/disconnection is authoritative,
     /// and poison never bypasses this obligation. Drop owns cancellation by joining;
     /// component shutdown cannot start before this recovery-local handle is destroyed.
-    pub(super) async fn wait(mut self) -> RuntimeOrFatalResult<RecoveryHotIndexReport> {
+    pub(super) async fn wait(mut self) -> RuntimeOrFatalResult<RecoveryHotIndexResult> {
         let result = self.terminal.recv_async().await;
         self.join();
         match result {
@@ -183,19 +178,20 @@ struct RecoveryHotIndexTask {
     poisoner: QuiescentGuard<EnginePoisoner>,
     policy: HotBuildPolicy,
     duplicates: DuplicateCheck,
-    #[cfg(feature = "profiling")]
-    profiler: Arc<HotIndexBuildProfiler>,
     // Stage coordinators and cleanup survive an unwind of the borrowed root future.
     active: Option<HotIndexBuild<EvictableBufferPool>>,
-    report: RecoveryHotIndexReport,
     phase: &'static str,
     current_table: Option<TableID>,
     #[cfg(test)]
     hooks: tests::Hooks,
+    #[cfg(feature = "profiling")]
+    profiler: Arc<HotIndexBuildProfiler>,
+    #[cfg(feature = "profiling")]
+    report: RecoveryHotIndexReport,
 }
 
 impl RecoveryHotIndexTask {
-    fn run(mut self) -> RuntimeOrFatalResult<RecoveryHotIndexReport> {
+    fn run(mut self) -> RuntimeOrFatalResult<RecoveryHotIndexResult> {
         let result = block_on(self.execute()).attach_with(|| self.diagnostic());
         self.phase = "settlement";
         // Cleanup invariant panics must unwind to the joined owner. They are
@@ -204,7 +200,14 @@ impl RecoveryHotIndexTask {
         merge_build_result(result, cleanup)?;
         #[cfg(test)]
         self.hooks.at(tests::Point::Completed);
-        Ok(self.report)
+        #[cfg(feature = "profiling")]
+        {
+            Ok(self.report)
+        }
+        #[cfg(not(feature = "profiling"))]
+        {
+            Ok(())
+        }
     }
 
     fn diagnostic(&self) -> String {
@@ -260,11 +263,17 @@ impl RecoveryHotIndexTask {
                     table.table_id()
                 )
             })?;
-            self.report.pages += source.page_count() as u64;
             #[cfg(feature = "profiling")]
             {
-                self.report.measurements.capture_elapsed_nanos +=
-                    started.elapsed().as_nanos() as u64;
+                self.report.pages += source.page_count() as u64;
+            }
+            #[cfg(feature = "profiling")]
+            {
+                #[cfg(feature = "profiling")]
+                {
+                    self.report.measurements.capture_elapsed_nanos +=
+                        started.elapsed().as_nanos() as u64;
+                }
             }
             let retained = source.budget.used();
             for (_, spec) in layout.metadata().idx.active_indexes() {
@@ -322,7 +331,10 @@ impl RecoveryHotIndexTask {
                 ready.install(destination).await?;
                 self.phase = "cleanup";
                 active.settle().await?;
-                self.report.entries += ready.entries() as u64;
+                #[cfg(feature = "profiling")]
+                {
+                    self.report.entries += ready.entries() as u64;
+                }
                 #[cfg(feature = "profiling")]
                 {
                     let (extraction, merge, packed, cleanup) = active.measurements(&ready);
@@ -559,8 +571,10 @@ mod tests {
             let observed = events.clone();
             let _hook = install(move |point| observed.lock().push(point));
             let engine = Engine::bootstrap(config).await.unwrap();
-            let report = engine.recovery_report();
-            assert_eq!(report.work.index_entries_inserted, 1600);
+            #[cfg(feature = "profiling")]
+            let _report = engine.recovery_report();
+            #[cfg(feature = "profiling")]
+            assert_eq!(_report.work.index_entries_inserted, 1600);
             let starts: Vec<_> = events
                 .lock()
                 .iter()
@@ -585,16 +599,23 @@ mod tests {
             );
             #[cfg(feature = "profiling")]
             {
-                assert_eq!(report.hot_indexes.completed_builds, 4);
-                assert_eq!(report.hot_indexes.extraction.entries, 1600);
+                #[cfg(feature = "profiling")]
+                assert_eq!(_report.hot_indexes.completed_builds, 4);
+                #[cfg(feature = "profiling")]
+                assert_eq!(_report.hot_indexes.extraction.entries, 1600);
+                #[cfg(feature = "profiling")]
                 assert_eq!(
-                    report.hot_indexes.extraction.source_pages,
-                    2 * report.work.index_rebuild_pages
+                    _report.hot_indexes.extraction.source_pages,
+                    2 * _report.work.index_rebuild_pages
                 );
-                assert_eq!(report.hot_indexes.merge.duplicate_comparisons, 0);
-                assert!(!report.hot_indexes.merge.checked);
-                assert!(report.hot_indexes.leaf_pages > 4);
-                assert!(report.hot_indexes.scratch_peak_bytes > 0);
+                #[cfg(feature = "profiling")]
+                assert_eq!(_report.hot_indexes.merge.duplicate_comparisons, 0);
+                #[cfg(feature = "profiling")]
+                assert!(!_report.hot_indexes.merge.checked);
+                #[cfg(feature = "profiling")]
+                assert!(_report.hot_indexes.leaf_pages > 4);
+                #[cfg(feature = "profiling")]
+                assert!(_report.hot_indexes.scratch_peak_bytes > 0);
             }
             engine.shutdown();
         });
@@ -676,6 +697,7 @@ mod tests {
                 drop(exits);
                 drop(observer);
                 let recovered = Engine::bootstrap(config).await.unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
                 recovered.shutdown();
             });
@@ -718,6 +740,7 @@ mod tests {
                     release.send(()).unwrap();
                 });
                 let recovered = Engine::bootstrap(config).await.unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
                 recovered.shutdown();
             });
@@ -771,6 +794,7 @@ mod tests {
                 drop(hook);
                 drop(spawn);
                 let recovered = Engine::bootstrap(config).await.unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
                 recovered.shutdown();
             });
@@ -794,6 +818,7 @@ mod tests {
                 "{error:?}"
             );
             let recovered = Engine::bootstrap(config).await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
             recovered.shutdown();
         });
@@ -826,6 +851,7 @@ mod tests {
                 );
                 drop(hook);
                 let recovered = Engine::bootstrap(config).await.unwrap();
+                #[cfg(feature = "profiling")]
                 assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
                 recovered.shutdown();
             });
@@ -858,6 +884,7 @@ mod tests {
             );
             drop(hook);
             let recovered = Engine::bootstrap(config).await.unwrap();
+            #[cfg(feature = "profiling")]
             assert_eq!(recovered.recovery_report().work.index_entries_inserted, 800);
             recovered.shutdown();
         });
@@ -928,7 +955,12 @@ mod tests {
             let thread = spawn_named("Recovery-Index-test", move || {
                 assert!(
                     sender
-                        .try_send(Ok(RecoveryHotIndexReport::default()))
+                        .try_send(Ok(
+                            #[cfg(feature = "profiling")]
+                            RecoveryHotIndexResult::default(),
+                            #[cfg(not(feature = "profiling"))]
+                            ()
+                        ))
                         .is_ok()
                 );
                 published_tx.send(()).unwrap();

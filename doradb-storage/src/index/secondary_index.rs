@@ -1573,7 +1573,9 @@ mod tests {
             };
             assert_eq!(observation.owner_row_id(), RowID::new(20));
             assert!(!observation.deleted());
+            #[cfg(feature = "profiling")]
             let mem_claim_start = (*index_pool).stats();
+            #[cfg(feature = "profiling")]
             let disk_claim_start = disk_pool.global_stats();
             assert_eq!(
                 observation
@@ -1582,12 +1584,18 @@ mod tests {
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
-            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
-            assert_eq!(mem_claim_delta.cache_hits, 1);
-            assert_eq!(mem_claim_delta.cache_misses, 0);
-            let disk_claim_delta = disk_pool.global_stats().delta_since(disk_claim_start);
-            assert_eq!(disk_claim_delta.cache_hits, 0);
-            assert_eq!(disk_claim_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _disk_claim_delta = disk_pool.global_stats().delta_since(disk_claim_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_disk_claim_delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_disk_claim_delta.cache_misses, 0);
 
             assert!(
                 mem_bound
@@ -1612,6 +1620,7 @@ mod tests {
                     .unwrap()
                     .is_ok()
             );
+            #[cfg(feature = "profiling")]
             let mem_claim_start = (*index_pool).stats();
             assert_eq!(
                 observation
@@ -1620,9 +1629,12 @@ mod tests {
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
-            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
-            assert_eq!(mem_claim_delta.cache_hits, 1);
-            assert_eq!(mem_claim_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_misses, 0);
 
             assert!(
                 mem_bound
@@ -1647,6 +1659,7 @@ mod tests {
                     .unwrap()
                     .is_ok()
             );
+            #[cfg(feature = "profiling")]
             let mem_claim_start = (*index_pool).stats();
             assert_eq!(
                 observation
@@ -1655,9 +1668,12 @@ mod tests {
                     .unwrap(),
                 IndexCompareExchange::Mismatch
             );
-            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
-            assert_eq!(mem_claim_delta.cache_hits, 1);
-            assert_eq!(mem_claim_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_misses, 0);
             assert_eq!(
                 mem_bound.lookup(&key2, TrxID::new(8)).await.unwrap(),
                 Some((RowID::new(999), false))
@@ -1692,6 +1708,7 @@ mod tests {
                     .await
                     .unwrap()
             );
+            #[cfg(feature = "profiling")]
             let mem_claim_start = (*index_pool).stats();
             assert_eq!(
                 observation
@@ -1700,9 +1717,12 @@ mod tests {
                     .unwrap(),
                 IndexCompareExchange::Mismatch
             );
-            let mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
-            assert_eq!(mem_claim_delta.cache_hits, 1);
-            assert_eq!(mem_claim_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _mem_claim_delta = (*index_pool).stats().delta_since(mem_claim_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_hits, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_mem_claim_delta.cache_misses, 0);
             assert_eq!(
                 mem_bound.lookup(&key2, TrxID::new(9)).await.unwrap(),
                 Some((RowID::new(20), true))
@@ -1944,6 +1964,7 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+            #[cfg(feature = "profiling")]
             let hot_insert_start = disk_pool.global_stats();
             assert_eq!(
                 non_unique_mem_bound
@@ -1952,9 +1973,12 @@ mod tests {
                     .unwrap(),
                 IndexInsert::Ok(false)
             );
-            let hot_insert_delta = disk_pool.global_stats().delta_since(hot_insert_start);
-            assert_eq!(hot_insert_delta.cache_hits, 0);
-            assert_eq!(hot_insert_delta.cache_misses, 0);
+            #[cfg(feature = "profiling")]
+            let _hot_insert_delta = disk_pool.global_stats().delta_since(hot_insert_start);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_hot_insert_delta.cache_hits, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_hot_insert_delta.cache_misses, 0);
             assert!(
                 bound
                     .compare_delete_mem(&key1, RowID::new(100), true, TrxID::new(4))

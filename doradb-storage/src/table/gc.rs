@@ -1,6 +1,6 @@
 use super::{Table, TableRootSnapshot, TableRuntimeLayout};
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuard, PoolGuards};
-use crate::catalog::{IndexID, IndexRef, IndexSlot, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, TableMetadata};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
@@ -11,6 +11,8 @@ use crate::index::{
     ColumnBlockIndex, MemIndexEntry, NonUniqueMemIndex, ResolvedColumnRow, SecondaryIndex,
     UniqueMemIndex,
 };
+#[cfg(feature = "profiling")]
+use crate::profiling::{MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats};
 use crate::runtime::mandatory::PreparedExecution;
 use crate::runtime::yield_now;
 use crate::session::{
@@ -21,22 +23,16 @@ use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use std::sync::Arc;
 
-/// Aggregate result for a full-scan user-table secondary MemIndex cleanup pass.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct MemIndexCleanupStats {
-    /// One row per secondary index scanned by this pass.
-    pub indexes: Vec<SecondaryMemIndexCleanupIndexStats>,
-}
-
 /// Result of a full-scan user-table secondary MemIndex cleanup pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemIndexCleanupOutcome {
-    /// Cleanup accounting for all active secondary indexes scanned by the pass.
-    pub stats: MemIndexCleanupStats,
     /// Reason requested live-entry cleanup could not run against the captured root.
     ///
-    /// Delete-overlay cleanup still completes and is represented in [`Self::stats`].
+    /// Delete-overlay cleanup still completes even when live-entry cleanup is delayed.
     pub live_delay: Option<MemIndexCleanupDelay>,
+    /// Cleanup accounting for all active secondary indexes scanned by the pass.
+    #[cfg(feature = "profiling")]
+    pub stats: MemIndexCleanupStats,
 }
 
 /// Diagnostic payload for a retryable live-entry cleanup delay.
@@ -48,59 +44,6 @@ pub struct MemIndexCleanupDelay {
     pub effective_ts: TrxID,
     /// Global minimum active snapshot timestamp observed by cleanup.
     pub min_active_sts: TrxID,
-}
-
-/// Cleanup result for one secondary MemIndex.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecondaryMemIndexCleanupIndexStats {
-    /// Stable table-local secondary-index identity.
-    pub index_id: IndexID,
-    /// Whether the scanned index is unique.
-    pub unique: bool,
-    /// Number of MemIndex entries processed as cleanup candidates.
-    pub scanned: usize,
-    /// Number of MemIndex entries physically removed.
-    pub removed: usize,
-    /// Number of MemIndex entries intentionally retained.
-    pub retained: usize,
-    /// Number of live MemIndex entries skipped before key materialization.
-    pub skipped_live: usize,
-    /// Number of hot delete overlays skipped before key materialization.
-    pub skipped_hot_deleted: usize,
-}
-
-impl SecondaryMemIndexCleanupIndexStats {
-    #[inline]
-    fn new(index_id: IndexID, unique: bool) -> Self {
-        Self {
-            index_id,
-            unique,
-            scanned: 0,
-            removed: 0,
-            retained: 0,
-            skipped_live: 0,
-            skipped_hot_deleted: 0,
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, decision: CleanupDecision) {
-        self.scanned += 1;
-        match decision {
-            CleanupDecision::Remove => self.removed += 1,
-            CleanupDecision::Retain => self.retained += 1,
-        }
-    }
-
-    #[inline]
-    fn record_skipped_live(&mut self, count: usize) {
-        self.skipped_live += count;
-    }
-
-    #[inline]
-    fn record_skipped_hot_deleted(&mut self, count: usize) {
-        self.skipped_hot_deleted += count;
-    }
 }
 
 struct MemIndexCleanupSnapshot<'ctx> {
@@ -383,6 +326,7 @@ impl Table {
             index_pool_guard,
             disk_pool_guard,
         };
+        #[cfg(feature = "profiling")]
         let mut stats = MemIndexCleanupStats {
             indexes: Vec::with_capacity(metadata.idx.active_index_count()),
         };
@@ -393,6 +337,7 @@ impl Table {
                 continue;
             }
             let secondary_root = snapshot.secondary_index_root(index_slot);
+            #[cfg(feature = "profiling")]
             let mut index_stats =
                 SecondaryMemIndexCleanupIndexStats::new(index_ref.id(), index.is_unique());
             match index {
@@ -402,6 +347,7 @@ impl Table {
                         index_ref,
                         index,
                         secondary_root,
+                        #[cfg(feature = "profiling")]
                         &mut index_stats,
                     )
                     .await?;
@@ -412,15 +358,21 @@ impl Table {
                         index_ref,
                         index,
                         secondary_root,
+                        #[cfg(feature = "profiling")]
                         &mut index_stats,
                     )
                     .await?;
                 }
             }
+            #[cfg(feature = "profiling")]
             stats.indexes.push(index_stats);
         }
 
-        Ok(MemIndexCleanupOutcome { stats, live_delay })
+        Ok(MemIndexCleanupOutcome {
+            live_delay,
+            #[cfg(feature = "profiling")]
+            stats,
+        })
     }
 
     #[inline]
@@ -430,7 +382,7 @@ impl Table {
         index_ref: IndexRef,
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: Option<BlockID>,
-        stats: &mut SecondaryMemIndexCleanupIndexStats,
+        #[cfg(feature = "profiling")] stats: &mut SecondaryMemIndexCleanupIndexStats,
     ) -> RuntimeOrFatalResult<()> {
         let disk = secondary_root
             .map(|root| {
@@ -446,10 +398,12 @@ impl Table {
             cleanup_context.clean_live_entries,
         );
         while let Some(batch) = scan.next_batch().await? {
+            #[cfg(feature = "profiling")]
             stats.record_skipped_live(batch.skipped_live);
+            #[cfg(feature = "profiling")]
             stats.record_skipped_hot_deleted(batch.skipped_hot_deleted);
             for entry in batch.entries {
-                let decision = if entry.deleted {
+                let _decision = if entry.deleted {
                     // Delete-shadows are removable only after we prove the overlay
                     // is obsolete. Whole-row deletion is one proof; for cold rows,
                     // an immutable LWC row whose current unique key encodes
@@ -497,7 +451,8 @@ impl Table {
                         None => CleanupDecision::Retain,
                     }
                 };
-                stats.record(decision);
+                #[cfg(feature = "profiling")]
+                stats.record(matches!(_decision, CleanupDecision::Remove));
             }
         }
         Ok(())
@@ -510,7 +465,7 @@ impl Table {
         index_ref: IndexRef,
         index: &SecondaryIndex<EvictableBufferPool>,
         secondary_root: Option<BlockID>,
-        stats: &mut SecondaryMemIndexCleanupIndexStats,
+        #[cfg(feature = "profiling")] stats: &mut SecondaryMemIndexCleanupIndexStats,
     ) -> RuntimeOrFatalResult<()> {
         let disk = secondary_root
             .map(|root| {
@@ -526,10 +481,12 @@ impl Table {
             cleanup_context.clean_live_entries,
         );
         while let Some(batch) = scan.next_batch().await? {
+            #[cfg(feature = "profiling")]
             stats.record_skipped_live(batch.skipped_live);
+            #[cfg(feature = "profiling")]
             stats.record_skipped_hot_deleted(batch.skipped_hot_deleted);
             for entry in batch.entries {
-                let decision = if entry.deleted {
+                let _decision = if entry.deleted {
                     // Non-unique delete marks use the same cold-row-only proof as
                     // unique shadows. If the persisted row exists but its current
                     // exact key no longer matches this encoded key+row-id pair,
@@ -576,7 +533,8 @@ impl Table {
                         None => CleanupDecision::Retain,
                     }
                 };
-                stats.record(decision);
+                #[cfg(feature = "profiling")]
+                stats.record(matches!(_decision, CleanupDecision::Remove));
             }
         }
         Ok(())
@@ -788,6 +746,7 @@ async fn compare_delete_non_unique_cleanup_entry<P: BufferPool>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "profiling")]
     use super::SecondaryMemIndexCleanupIndexStats;
     use crate::buffer::PoolGuards;
     use crate::catalog::tests::wait_for_dropped_table_floor;
@@ -820,6 +779,7 @@ mod tests {
     }
 
     impl CleanupIndexKind {
+        #[cfg(feature = "profiling")]
         fn slot(self) -> IndexSlot {
             IndexSlot::new(match self {
                 Self::Unique => 0,
@@ -975,6 +935,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(outcome.live_delay, None, "{kind:?}, purgeable={purgeable}");
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 outcome.stats.indexes[usize::from(kind.slot().get())],
                 SecondaryMemIndexCleanupIndexStats {
@@ -1032,6 +993,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.live_delay, None, "{kind:?}");
+        #[cfg(feature = "profiling")]
         assert_eq!(
             outcome.stats.indexes[usize::from(kind.slot().get())],
             SecondaryMemIndexCleanupIndexStats {
@@ -1134,8 +1096,11 @@ mod tests {
                 .unwrap();
             assert!(!cleanup_session.in_trx().unwrap());
             assert_eq!(outcome.live_delay, None);
+            #[cfg(feature = "profiling")]
             assert_eq!(outcome.stats.indexes.len(), 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(outcome.stats.indexes[0].removed, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(outcome.stats.indexes[0].skipped_live, 0);
         });
     }
@@ -1281,12 +1246,19 @@ mod tests {
             assert_eq!(delay.table_id, table_id);
             assert_eq!(delay.effective_ts, effective_ts);
             assert!(delay.min_active_sts <= *reader_sts.lock());
+            #[cfg(feature = "profiling")]
             assert_eq!(delayed.stats.indexes.len(), 2);
+            #[cfg(feature = "profiling")]
             for index_stats in &delayed.stats.indexes {
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.scanned, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.removed, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.retained, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.skipped_live, 1);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.skipped_hot_deleted, 0);
             }
 
@@ -1319,7 +1291,9 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(completed.live_delay, None);
+            #[cfg(feature = "profiling")]
             assert_eq!(completed.stats.indexes[0].removed, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(completed.stats.indexes[1].removed, 1);
 
             let current_unique = bound_unique_index(&table, &pool_guards, IndexSlot::new(0));
@@ -1360,20 +1334,29 @@ mod tests {
                 &pool_guards,
                 IndexSlot::new(0),
             );
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
             assert!(!session.in_trx().unwrap());
-            assert_eq!(stats.indexes.len(), 1);
-            assert_eq!(stats.indexes[0].index_id, IndexID::new(0));
-            assert!(stats.indexes[0].unique);
-            assert_eq!(stats.indexes[0].scanned, row_count as usize);
-            assert_eq!(stats.indexes[0].removed, row_count as usize);
-            assert_eq!(stats.indexes[0].retained, 0);
-            assert_eq!(stats.indexes[0].skipped_live, 0);
-            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes.len(), 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].index_id, IndexID::new(0));
+            #[cfg(feature = "profiling")]
+            assert!(_stats.indexes[0].unique);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].scanned, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].removed, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_live, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_hot_deleted, 0);
 
             for key_value in 0..row_count {
                 let key = single_key(key_value);
@@ -1435,19 +1418,28 @@ mod tests {
                 &pool_guards,
                 IndexSlot::new(1),
             );
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
-            assert_eq!(stats.indexes.len(), 2);
-            assert_eq!(stats.indexes[1].index_id, IndexID::new(1));
-            assert!(!stats.indexes[1].unique);
-            assert_eq!(stats.indexes[1].scanned, row_count as usize);
-            assert_eq!(stats.indexes[1].removed, row_count as usize);
-            assert_eq!(stats.indexes[1].retained, 0);
-            assert_eq!(stats.indexes[1].skipped_live, 0);
-            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes.len(), 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].index_id, IndexID::new(1));
+            #[cfg(feature = "profiling")]
+            assert!(!_stats.indexes[1].unique);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].scanned, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].removed, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_live, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_hot_deleted, 0);
 
             let key = name_key("same-name");
             let disk_rows = non_unique_disk_tree_prefix_scan(
@@ -1479,16 +1471,22 @@ mod tests {
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             assert_checkpoint_published(&mut session, table_id).await;
 
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
-            assert_eq!(stats.indexes[1].scanned, row_count as usize);
-            assert_eq!(stats.indexes[1].removed, row_count as usize);
-            assert_eq!(stats.indexes[1].retained, 0);
-            assert_eq!(stats.indexes[1].skipped_live, 0);
-            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].scanned, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].removed, row_count as usize);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_live, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_hot_deleted, 0);
         });
     }
 
@@ -1520,13 +1518,21 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(outcome.live_delay, None);
-            let stats = outcome.stats;
-            assert_eq!(stats.indexes.len(), 2);
-            for index_stats in &stats.indexes {
+            #[cfg(feature = "profiling")]
+            let _stats = outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes.len(), 2);
+            #[cfg(feature = "profiling")]
+            for index_stats in &_stats.indexes {
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.scanned, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.removed, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.retained, 0);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.skipped_live, row_count as usize);
+                #[cfg(feature = "profiling")]
                 assert_eq!(index_stats.skipped_hot_deleted, 0);
             }
 
@@ -1599,16 +1605,22 @@ mod tests {
                     .unwrap()
             );
 
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
-            assert_eq!(stats.indexes[0].scanned, 0);
-            assert_eq!(stats.indexes[0].removed, 0);
-            assert_eq!(stats.indexes[0].retained, 0);
-            assert_eq!(stats.indexes[0].skipped_live, 1);
-            assert_eq!(stats.indexes[0].skipped_hot_deleted, 1);
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].scanned, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].removed, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_live, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_hot_deleted, 1);
             assert_eq!(
                 index
                     .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
@@ -1682,12 +1694,18 @@ mod tests {
                 .expect("old reader must delay live-entry cleanup");
             assert_eq!(delay.table_id, table_id);
             assert!(delay.effective_ts >= delay.min_active_sts);
-            let stats = outcome.stats;
-            assert_eq!(stats.indexes[0].scanned, 1);
-            assert_eq!(stats.indexes[0].removed, 1);
-            assert_eq!(stats.indexes[0].retained, 0);
-            assert_eq!(stats.indexes[0].skipped_live, 1);
-            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            #[cfg(feature = "profiling")]
+            let _stats = outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].scanned, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].removed, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_live, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
                     .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
@@ -1748,12 +1766,18 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(outcome.live_delay, None);
-            let stats = outcome.stats;
-            assert_eq!(stats.indexes[0].scanned, 1);
-            assert_eq!(stats.indexes[0].removed, 1);
-            assert_eq!(stats.indexes[0].retained, 0);
-            assert_eq!(stats.indexes[0].skipped_live, 1);
-            assert_eq!(stats.indexes[0].skipped_hot_deleted, 0);
+            #[cfg(feature = "profiling")]
+            let _stats = outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].scanned, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].removed, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_live, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[0].skipped_hot_deleted, 0);
             assert_eq!(
                 index
                     .lookup(&stale_key.vals, MAX_SNAPSHOT_TS,)
@@ -1906,16 +1930,22 @@ mod tests {
                 IndexMask::Masked
             );
 
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
-            assert_eq!(stats.indexes[1].scanned, 0);
-            assert_eq!(stats.indexes[1].removed, 0);
-            assert_eq!(stats.indexes[1].retained, 0);
-            assert_eq!(stats.indexes[1].skipped_live, 1);
-            assert_eq!(stats.indexes[1].skipped_hot_deleted, 1);
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].scanned, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].removed, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_live, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_hot_deleted, 1);
             assert_eq!(
                 index
                     .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
@@ -1971,16 +2001,22 @@ mod tests {
                 .put_committed(row_id, TrxID::new(1))
                 .unwrap();
 
-            let stats = session
+            let _outcome = session
                 .cleanup_secondary_mem_indexes(table_id, true)
                 .await
-                .unwrap()
-                .stats;
-            assert_eq!(stats.indexes[1].scanned, 2);
-            assert_eq!(stats.indexes[1].removed, 2);
-            assert_eq!(stats.indexes[1].retained, 0);
-            assert_eq!(stats.indexes[1].skipped_live, 0);
-            assert_eq!(stats.indexes[1].skipped_hot_deleted, 0);
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            let _stats = _outcome.stats;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].scanned, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].removed, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].retained, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_live, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.indexes[1].skipped_hot_deleted, 0);
             assert_eq!(
                 index
                     .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)

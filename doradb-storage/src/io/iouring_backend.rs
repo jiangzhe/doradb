@@ -1,8 +1,10 @@
 use super::{
-    Backend, BackendError, BackendResult, BackendStats, BackendStatsHandle, BackendToken, IOKind,
-    Operation, StdIoResult, SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
+    Backend, BackendError, BackendResult, BackendToken, IOKind, Operation, StdIoResult,
+    SubmitAttempt, SubmitRetry, SubmitRetryReason, SubmittedIoCleanup,
 };
 use crate::error::{IoError, IoResult};
+#[cfg(feature = "profiling")]
+use crate::profiling::{BackendStats, BackendStatsHandle, clock::Instant};
 use error_stack::Report;
 use io_uring::opcode::{Fsync, Read, Write};
 use io_uring::types::{CancelBuilder, FsyncFlags, Timespec};
@@ -11,7 +13,7 @@ use libc::{EAGAIN, EBUSY, EINTR};
 use std::collections::VecDeque;
 use std::io::{Error as StdIoError, ErrorKind as StdIoErrorKind};
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Canonical name used in io_uring backend diagnostics.
 pub(crate) const BACKEND_NAME: &str = "io_uring";
@@ -22,6 +24,7 @@ const IOURING_SYNC_CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) struct IouringBackend {
     ring: IoUring,
     io_depth: usize,
+    #[cfg(feature = "profiling")]
     stats: BackendStatsHandle,
 }
 
@@ -29,12 +32,14 @@ impl IouringBackend {
     /// Returns one snapshot of backend-owned submit/wait activity.
     #[inline]
     #[expect(dead_code, reason = "internal io backend stats")]
+    #[cfg(feature = "profiling")]
     fn stats(&self) -> BackendStats {
         self.stats.snapshot()
     }
 
     /// Returns a cloneable handle to backend-owned submit/wait statistics.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats_handle(&self) -> BackendStatsHandle {
         self.stats.clone()
     }
@@ -77,6 +82,7 @@ impl IouringBackend {
             };
             completed.push((BackendToken::from_raw(cqe.user_data()), res));
         }
+        #[cfg(feature = "profiling")]
         self.stats.record_wait_completions(completed.len());
         completed
     }
@@ -119,7 +125,7 @@ impl IouringBackend {
 
     fn blocking_submit_and_wait(&mut self, min_nr: usize) -> BackendResult<BlockingWaitOutcome> {
         let mut call_count = 0usize;
-        let submitted = loop {
+        let _submitted = loop {
             call_count += 1;
             match self.ring.submit_and_wait(min_nr) {
                 Ok(submitted) => break submitted,
@@ -130,7 +136,9 @@ impl IouringBackend {
             }
         };
         Ok(BlockingWaitOutcome {
-            submitted,
+            #[cfg(feature = "profiling")]
+            submitted: _submitted,
+            #[cfg(feature = "profiling")]
             call_count,
         })
     }
@@ -166,6 +174,7 @@ impl Backend for IouringBackend {
         Ok(Self {
             ring,
             io_depth,
+            #[cfg(feature = "profiling")]
             stats: BackendStatsHandle::default(),
         })
     }
@@ -219,6 +228,7 @@ impl Backend for IouringBackend {
         batch: &mut Self::SubmitBatch,
         limit: usize,
     ) -> BackendResult<SubmitAttempt> {
+        #[cfg(feature = "profiling")]
         let start = Instant::now();
         let sq_full = self.stage_pending_sqes(batch, limit);
 
@@ -235,21 +245,26 @@ impl Backend for IouringBackend {
             return Ok(SubmitAttempt::Noop);
         }
 
-        self.submit_pending_sqes(batch)
+        let result = self.submit_pending_sqes(batch);
+        #[cfg(feature = "profiling")]
+        let result = result
             .inspect(|outcome| {
+                #[cfg(feature = "profiling")]
                 self.stats.record_submit_and_wait(
                     outcome.call_count,
                     start.elapsed().as_nanos() as usize,
                 );
                 if let SubmitAttempt::Submitted(submitted) = outcome.result {
+                    #[cfg(feature = "profiling")]
                     self.stats.record_submitted_ops(submitted.get());
                 }
             })
             .inspect_err(|err| {
+                #[cfg(feature = "profiling")]
                 self.stats
                     .record_submit_and_wait(err.call_count(), start.elapsed().as_nanos() as usize);
-            })
-            .map(|outcome| outcome.result)
+            });
+        result.map(|outcome| outcome.result)
     }
 
     #[inline]
@@ -262,24 +277,30 @@ impl Backend for IouringBackend {
             let cq = self.ring.completion();
             if cq.len() < min_nr {
                 drop(cq);
+                #[cfg(feature = "profiling")]
                 let start = Instant::now();
-                self.blocking_submit_and_wait(min_nr)
+                let result = self.blocking_submit_and_wait(min_nr);
+                #[cfg(feature = "profiling")]
+                let result = result
                     .inspect(|outcome| {
+                        #[cfg(feature = "profiling")]
                         record_blocking_wait_stats(
-                            &self.stats,
                             Some(outcome),
-                            outcome.call_count,
                             start.elapsed().as_nanos() as usize,
+                            &self.stats,
+                            outcome.call_count,
                         );
                     })
                     .inspect_err(|err| {
+                        #[cfg(feature = "profiling")]
                         record_blocking_wait_stats(
-                            &self.stats,
                             None,
-                            err.call_count(),
                             start.elapsed().as_nanos() as usize,
+                            &self.stats,
+                            err.call_count(),
                         );
-                    })?;
+                    });
+                result?;
             }
         }
         Ok(self.take_completions())
@@ -335,17 +356,24 @@ impl IouringSubmitBatch {
                 SubmitAttempt::Retry(SubmitRetry::new(SubmitRetryReason::NoProgress, call_count))
             }
         };
-        SubmitOutcome { result, call_count }
+        SubmitOutcome {
+            result,
+            #[cfg(feature = "profiling")]
+            call_count,
+        }
     }
 }
 
 struct SubmitOutcome {
     result: SubmitAttempt,
+    #[cfg(feature = "profiling")]
     call_count: usize,
 }
 
 struct BlockingWaitOutcome {
+    #[cfg(feature = "profiling")]
     submitted: usize,
+    #[cfg(feature = "profiling")]
     call_count: usize,
 }
 
@@ -353,19 +381,23 @@ struct BlockingWaitOutcome {
 fn retry_submit(reason: SubmitRetryReason, call_count: usize) -> SubmitOutcome {
     SubmitOutcome {
         result: SubmitAttempt::Retry(SubmitRetry::new(reason, call_count)),
+        #[cfg(feature = "profiling")]
         call_count,
     }
 }
 
 #[inline]
+#[cfg(feature = "profiling")]
 fn record_blocking_wait_stats(
-    stats: &BackendStatsHandle,
     outcome: Option<&BlockingWaitOutcome>,
-    call_count: usize,
     elapsed_nanos: usize,
+    #[cfg(feature = "profiling")] stats: &BackendStatsHandle,
+    #[cfg(feature = "profiling")] call_count: usize,
 ) {
+    #[cfg(feature = "profiling")]
     stats.record_submit_and_wait(call_count, elapsed_nanos);
     if let Some(outcome) = outcome {
+        #[cfg(feature = "profiling")]
         stats.record_submitted_ops(outcome.submitted);
     }
 }
@@ -413,6 +445,7 @@ mod tests {
             outcome.result,
             SubmitAttempt::Submitted(NonZeroUsize::new(2).unwrap())
         );
+        #[cfg(feature = "profiling")]
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 1);
         assert_eq!(batch.staged.len(), 1);
@@ -431,6 +464,7 @@ mod tests {
         assert_eq!(retry.reason(), SubmitRetryReason::NoProgress);
         assert_eq!(retry.raw_errno(), None);
         assert_eq!(retry.call_count(), 1);
+        #[cfg(feature = "profiling")]
         assert_eq!(outcome.call_count, 1);
         assert_eq!(batch.pending_sqes, 2);
         assert_eq!(batch.staged.len(), 2);
@@ -465,6 +499,7 @@ mod tests {
         assert_eq!(retry.reason(), SubmitRetryReason::Ebusy);
         assert_eq!(retry.raw_errno(), Some(EBUSY));
         assert_eq!(retry.call_count(), 3);
+        #[cfg(feature = "profiling")]
         assert_eq!(outcome.call_count, 3);
     }
 
@@ -502,14 +537,16 @@ mod tests {
 
     /// Purpose: Account for submission and completion activity during a blocking io_uring wait.
     /// Expected: Statistics retain syscall attempts, elapsed time, accepted operations, and completions.
+    #[cfg(feature = "profiling")]
     #[test]
     fn test_record_blocking_wait_stats_counts_combined_fields() {
         let stats = BackendStatsHandle::default();
         let outcome = BlockingWaitOutcome {
             submitted: 5,
+            #[cfg(feature = "profiling")]
             call_count: 2,
         };
-        record_blocking_wait_stats(&stats, Some(&outcome), outcome.call_count, 17);
+        record_blocking_wait_stats(Some(&outcome), 17, &stats, outcome.call_count);
         stats.record_wait_completions(3);
 
         let snapshot = stats.snapshot();

@@ -11,8 +11,9 @@ use crate::error::{
 use crate::id::{SessionOperationKey, TableID};
 use crate::obs;
 use crate::poison::EnginePoisoner;
+#[cfg(feature = "profiling")]
+use crate::profiling::{MandatoryRuntimeStats, MandatoryTaskCounters, clock::Instant};
 use crate::quiescent::{QuiescentBox, QuiescentGuard};
-use crate::stats::{MandatoryRuntimeStats, MandatoryTaskStats};
 use crate::{runtime, thread};
 use error_stack::{Report, ResultExt};
 use event_listener::{Event, listener};
@@ -26,9 +27,10 @@ use std::mem::take;
 use std::panic::AssertUnwindSafe;
 use std::result::Result as StdResult;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+#[cfg(feature = "profiling")]
+use std::time::Duration;
 
 /// Immutable classification of one mandatory task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,74 +153,9 @@ where
     }
 }
 
-#[derive(Default)]
-struct MandatoryTaskCounters {
-    submitted_count: AtomicUsize,
-    started_count: AtomicUsize,
-    completed_count: AtomicUsize,
-    error_count: AtomicUsize,
-    panic_count: AtomicUsize,
-    detached_observer_count: AtomicUsize,
-    admission_wait_nanos: AtomicUsize,
-    queue_wait_nanos: AtomicUsize,
-    execution_nanos: AtomicUsize,
-}
-
-impl MandatoryTaskCounters {
-    #[inline]
-    fn record_submitted(&self, admission_wait_nanos: usize) {
-        self.submitted_count.fetch_add(1, Ordering::Relaxed);
-        self.admission_wait_nanos
-            .fetch_add(admission_wait_nanos, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn record_started(&self, queue_wait_nanos: usize) {
-        self.started_count.fetch_add(1, Ordering::Relaxed);
-        self.queue_wait_nanos
-            .fetch_add(queue_wait_nanos, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn record_completed(&self, result: MandatoryTaskResult, execution_nanos: usize) {
-        match result {
-            MandatoryTaskResult::Ok => {}
-            MandatoryTaskResult::Error => {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-            }
-            MandatoryTaskResult::Panic => {
-                self.panic_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.execution_nanos
-            .fetch_add(execution_nanos, Ordering::Relaxed);
-        self.completed_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn record_observer_detached(&self) {
-        self.detached_observer_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn snapshot(&self, active_count: usize) -> MandatoryTaskStats {
-        MandatoryTaskStats {
-            submitted_count: self.submitted_count.load(Ordering::Relaxed),
-            started_count: self.started_count.load(Ordering::Relaxed),
-            completed_count: self.completed_count.load(Ordering::Relaxed),
-            error_count: self.error_count.load(Ordering::Relaxed),
-            panic_count: self.panic_count.load(Ordering::Relaxed),
-            detached_observer_count: self.detached_observer_count.load(Ordering::Relaxed),
-            active_count,
-            admission_wait_nanos: self.admission_wait_nanos.load(Ordering::Relaxed),
-            queue_wait_nanos: self.queue_wait_nanos.load(Ordering::Relaxed),
-            execution_nanos: self.execution_nanos.load(Ordering::Relaxed),
-        }
-    }
-}
-
+/// Terminal execution classification used by runtime events and profiling.
 #[derive(Clone, Copy)]
-enum MandatoryTaskResult {
+pub(crate) enum MandatoryTaskResult {
     Ok,
     Error,
     Panic,
@@ -511,6 +448,7 @@ struct MandatoryCompletion<T> {
     completion: Completion<T>,
     observation: Mutex<ObservationState>,
     metadata: MandatoryTaskMetadata,
+    #[cfg(feature = "profiling")]
     counters: Arc<MandatoryTaskCounters>,
 }
 
@@ -518,12 +456,13 @@ impl<T> MandatoryCompletion<T> {
     #[inline]
     fn endpoints(
         metadata: MandatoryTaskMetadata,
-        counters: Arc<MandatoryTaskCounters>,
+        #[cfg(feature = "profiling")] counters: Arc<MandatoryTaskCounters>,
     ) -> (CompletionProducer<T>, CompletionObserver<T>) {
         let inner = Arc::new(Self {
             completion: Completion::new(),
             observation: Mutex::new(ObservationState::Attached),
             metadata,
+            #[cfg(feature = "profiling")]
             counters,
         });
         (
@@ -562,6 +501,7 @@ impl<T> CompletionProducer<T> {
     }
 
     #[inline]
+    #[cfg(feature = "profiling")]
     fn counters(&self) -> &Arc<MandatoryTaskCounters> {
         &self.inner.counters
     }
@@ -623,6 +563,7 @@ impl<T> Drop for CompletionObserver<T> {
             return;
         }
         self.armed = false;
+        #[cfg(feature = "profiling")]
         self.inner.counters.record_observer_detached();
         let mut observation = self.inner.observation.lock();
         assert!(
@@ -662,16 +603,18 @@ pub(crate) struct MandatoryRuntime {
     /// while redo can produce final cleanup, then closes and drains before the
     /// executor runners stop.
     internal_admission: MandatoryInternalAdmission,
-    /// Monotonic diagnostics for accepted caller operations.
-    operation_counters: Arc<MandatoryTaskCounters>,
-    /// Monotonic diagnostics for internal transaction cleanup.
-    transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
     /// One-way stop state shared by all executor runners.
     stopping: AtomicBool,
     /// Wakeup used to stop the runner after both admissions drain.
     stop_event: Event,
     /// Engine-level fatal state used by mandatory panic supervision.
     poisoner: QuiescentGuard<EnginePoisoner>,
+    /// Monotonic diagnostics for accepted caller operations.
+    #[cfg(feature = "profiling")]
+    operation_counters: Arc<MandatoryTaskCounters>,
+    /// Monotonic diagnostics for internal transaction cleanup.
+    #[cfg(feature = "profiling")]
+    transaction_cleanup_counters: Arc<MandatoryTaskCounters>,
 }
 
 impl MandatoryRuntime {
@@ -681,11 +624,13 @@ impl MandatoryRuntime {
             executor: async_executor::Executor::new(),
             admission: MandatoryAdmission::new(config.concurrency_limit),
             internal_admission: MandatoryInternalAdmission::new(),
-            operation_counters: Arc::new(MandatoryTaskCounters::default()),
-            transaction_cleanup_counters: Arc::new(MandatoryTaskCounters::default()),
             stopping: AtomicBool::new(false),
             stop_event: Event::new(),
             poisoner,
+            #[cfg(feature = "profiling")]
+            operation_counters: Arc::new(MandatoryTaskCounters::default()),
+            #[cfg(feature = "profiling")]
+            transaction_cleanup_counters: Arc::new(MandatoryTaskCounters::default()),
         }
     }
 
@@ -721,6 +666,7 @@ impl MandatoryRuntime {
 
     /// Return an independently sampled fixed-class statistics snapshot.
     #[inline]
+    #[cfg(feature = "profiling")]
     pub(crate) fn stats(&self) -> MandatoryRuntimeStats {
         let (_, operation_active) = self.admission.inspect();
         let (_, cleanup_active) = self.internal_admission.inspect();
@@ -982,6 +928,7 @@ impl QuiescentGuard<MandatoryRuntime> {
                 error.attach("phase=mandatory_admission_health_check"),
             ));
         }
+        #[cfg(feature = "profiling")]
         let admission_started_at = Instant::now();
         let acquire = self.admission.acquire(self.clone());
         futures::pin_mut!(acquire);
@@ -1000,13 +947,19 @@ impl QuiescentGuard<MandatoryRuntime> {
         };
         // Winning admission is the poison-race linearization point. A later
         // poison does not cancel work that is already admitted and accounted.
+        #[cfg(feature = "profiling")]
         let admission_wait_nanos = elapsed_nanos(admission_started_at);
         let metadata = prepared.metadata();
-        let (producer, observer) =
-            MandatoryCompletion::endpoints(metadata, Arc::clone(&self.operation_counters));
+        let (producer, observer) = MandatoryCompletion::endpoints(
+            metadata,
+            #[cfg(feature = "profiling")]
+            Arc::clone(&self.operation_counters),
+        );
 
         // No await or expected rejection exists below this ownership edge.
+        #[cfg(feature = "profiling")]
         let queued_at = Instant::now();
+        #[cfg(feature = "profiling")]
         self.operation_counters
             .record_submitted(admission_wait_nanos);
         let accepted = prepared.accept();
@@ -1016,7 +969,9 @@ impl QuiescentGuard<MandatoryRuntime> {
                 accepted,
                 producer,
                 permit,
+                #[cfg(feature = "profiling")]
                 queued_at,
+                #[cfg(feature = "profiling")]
                 admission_wait_nanos,
             ))
             .detach();
@@ -1033,11 +988,19 @@ impl QuiescentGuard<MandatoryRuntime> {
             return Err(job);
         };
         let metadata = job.metadata();
+        #[cfg(feature = "profiling")]
         let queued_at = Instant::now();
         let task_runtime = self.clone();
+        #[cfg(feature = "profiling")]
         self.transaction_cleanup_counters.record_submitted(0);
         self.executor
-            .spawn(task_runtime.supervise_internal(job, metadata, permit, queued_at))
+            .spawn(task_runtime.supervise_internal(
+                job,
+                metadata,
+                permit,
+                #[cfg(feature = "profiling")]
+                queued_at,
+            ))
             .detach();
         Ok(())
     }
@@ -1052,16 +1015,21 @@ impl QuiescentGuard<MandatoryRuntime> {
         mut accepted: A,
         producer: CompletionProducer<A::Output>,
         permit: MandatoryPermit,
-        queued_at: Instant,
-        admission_wait_nanos: usize,
+        #[cfg(feature = "profiling")] queued_at: Instant,
+        #[cfg(feature = "profiling")] admission_wait_nanos: usize,
     ) where
         A: AcceptedExecution,
     {
+        #[cfg(feature = "profiling")]
         let started_at = Instant::now();
+        #[cfg(feature = "profiling")]
         let queue_wait_nanos = duration_nanos(started_at.duration_since(queued_at));
         let metadata = producer.metadata().clone();
+        #[cfg(feature = "profiling")]
         let counters = Arc::clone(producer.counters());
+        #[cfg(feature = "profiling")]
         counters.record_started(queue_wait_nanos);
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={} admission_wait_nanos={} queue_wait_nanos={}",
             metadata.task_class(),
@@ -1070,6 +1038,14 @@ impl QuiescentGuard<MandatoryRuntime> {
             OptionalValue(metadata.table_id()),
             admission_wait_nanos,
             queue_wait_nanos,
+        );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={}",
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
         );
         let outcome = AssertUnwindSafe(async { accepted.execute().await })
             .catch_unwind()
@@ -1090,11 +1066,14 @@ impl QuiescentGuard<MandatoryRuntime> {
                 (MandatoryTaskResult::Panic, Err::<A::Output, _>(error))
             }
         };
+        #[cfg(feature = "profiling")]
         let execution_nanos = elapsed_nanos(started_at);
+        #[cfg(feature = "profiling")]
         counters.record_completed(result, execution_nanos);
         // Publish terminal metrics before waking the observer so an immediate
         // statistics snapshot includes the completion that it just consumed.
         let observer = producer.complete(completion_result);
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} execution_nanos={} observer={}",
             result.label(),
@@ -1103,6 +1082,16 @@ impl QuiescentGuard<MandatoryRuntime> {
             OptionalValue(metadata.session_operation()),
             OptionalValue(metadata.table_id()),
             execution_nanos,
+            observer.label(),
+        );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} observer={}",
+            result.label(),
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
             observer.label(),
         );
         drop(accepted);
@@ -1119,14 +1108,18 @@ impl QuiescentGuard<MandatoryRuntime> {
         mut job: J,
         metadata: MandatoryTaskMetadata,
         permit: MandatoryInternalPermit,
-        queued_at: Instant,
+        #[cfg(feature = "profiling")] queued_at: Instant,
     ) where
         J: MandatoryInternalTask,
     {
+        #[cfg(feature = "profiling")]
         let started_at = Instant::now();
+        #[cfg(feature = "profiling")]
         let queue_wait_nanos = duration_nanos(started_at.duration_since(queued_at));
+        #[cfg(feature = "profiling")]
         self.transaction_cleanup_counters
             .record_started(queue_wait_nanos);
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={} admission_wait_nanos=0 queue_wait_nanos={}",
             metadata.task_class(),
@@ -1134,6 +1127,14 @@ impl QuiescentGuard<MandatoryRuntime> {
             OptionalValue(metadata.session_operation()),
             OptionalValue(metadata.table_id()),
             queue_wait_nanos,
+        );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=start result=ok task_class={} task_label={} session_operation={} table_id={}",
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
         );
         let result = if AssertUnwindSafe(async { job.run().await })
             .catch_unwind()
@@ -1147,9 +1148,12 @@ impl QuiescentGuard<MandatoryRuntime> {
         } else {
             MandatoryTaskResult::Ok
         };
+        #[cfg(feature = "profiling")]
         let execution_nanos = elapsed_nanos(started_at);
+        #[cfg(feature = "profiling")]
         self.transaction_cleanup_counters
             .record_completed(result, execution_nanos);
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} execution_nanos={} observer=none",
             result.label(),
@@ -1159,17 +1163,28 @@ impl QuiescentGuard<MandatoryRuntime> {
             OptionalValue(metadata.table_id()),
             execution_nanos,
         );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=mandatory_task component=mandatory_runtime action=finish result={} task_class={} task_label={} session_operation={} table_id={} observer=none",
+            result.label(),
+            metadata.task_class(),
+            metadata.task_label(),
+            OptionalValue(metadata.session_operation()),
+            OptionalValue(metadata.table_id()),
+        );
         drop(job);
         drop(permit);
     }
 }
 
 #[inline]
+#[cfg(feature = "profiling")]
 fn elapsed_nanos(started_at: Instant) -> usize {
     duration_nanos(started_at.elapsed())
 }
 
 #[inline]
+#[cfg(feature = "profiling")]
 fn duration_nanos(duration: Duration) -> usize {
     duration.as_nanos() as usize
 }
@@ -1180,6 +1195,8 @@ mod tests {
     use crate::component::RegistryBuilder;
     use crate::conf::MandatoryRuntimeConfig;
     use crate::error::{FatalError, OperationError};
+    #[cfg(feature = "profiling")]
+    use crate::profiling::MandatoryTaskStats;
     use crate::thread::{SpawnTestEvent, fail_spawn_named, observe_spawn_named};
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::Arc;
@@ -1548,6 +1565,7 @@ mod tests {
     fn test_completion<T>() -> (CompletionProducer<T>, CompletionObserver<T>) {
         MandatoryCompletion::endpoints(
             MandatoryTaskMetadata::operation("test", None),
+            #[cfg(feature = "profiling")]
             Arc::new(MandatoryTaskCounters::default()),
         )
     }
@@ -1561,6 +1579,7 @@ mod tests {
             *completion.observation.lock(),
             ObservationState::Consumed
         ));
+        #[cfg(feature = "profiling")]
         assert_eq!(
             completion
                 .counters
@@ -1656,6 +1675,7 @@ mod tests {
         ] {
             let drops = Arc::new(AtomicUsize::new(0));
             let (producer, observer) = test_completion::<DropCount>();
+            #[cfg(feature = "profiling")]
             let counters = Arc::clone(&observer.inner.counters);
             let mut observer = Some(observer);
             if detach_first {
@@ -1672,6 +1692,7 @@ mod tests {
                 usize::from(detach_first),
                 "{case}"
             );
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 counters.detached_observer_count.load(Ordering::Relaxed),
                 usize::from(detach_first),
@@ -1679,6 +1700,7 @@ mod tests {
             );
             drop(observer);
             assert_eq!(drops.load(Ordering::Relaxed), 1, "{case}");
+            #[cfg(feature = "profiling")]
             assert_eq!(
                 counters.detached_observer_count.load(Ordering::Relaxed),
                 1,
@@ -1695,6 +1717,7 @@ mod tests {
             let (registry, mandatory) = test_runtime(1).await;
             let moves = Arc::new(AtomicUsize::new(0));
             let finishes = Arc::new(AtomicUsize::new(0));
+            #[cfg(feature = "profiling")]
             assert_eq!(mandatory.stats(), MandatoryRuntimeStats::default());
 
             let observer = mandatory
@@ -1708,16 +1731,24 @@ mod tests {
             assert_eq!(observer.wait().await.unwrap().0, 1);
             assert_eq!(moves.load(Ordering::Relaxed), 1);
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
-            let stats = mandatory.stats();
-            assert_eq!(stats.operation.submitted_count, 1);
-            assert_eq!(stats.operation.started_count, 1);
-            assert_eq!(stats.operation.completed_count, 1);
-            assert_eq!(stats.operation.error_count, 0);
-            assert_eq!(stats.operation.panic_count, 0);
-            assert_eq!(stats.operation.detached_observer_count, 0);
-            assert_eq!(stats.transaction_cleanup, MandatoryTaskStats::default());
+            #[cfg(feature = "profiling")]
+            let _stats = mandatory.stats();
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.submitted_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.started_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.completed_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.error_count, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.panic_count, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.operation.detached_observer_count, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.transaction_cleanup, MandatoryTaskStats::default());
             mandatory.drain_callers().await;
-            assert_eq!(mandatory.stats().operation.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().0, 0);
 
             (registry, mandatory)
         });
@@ -1822,12 +1853,18 @@ mod tests {
                 error.downcast_ref::<OperationError>().copied(),
                 Some(OperationError::TableNotFound)
             );
-            let stats = mandatory.stats().operation;
-            assert_eq!(stats.submitted_count, 1);
-            assert_eq!(stats.started_count, 1);
-            assert_eq!(stats.completed_count, 1);
-            assert_eq!(stats.error_count, 1);
-            assert_eq!(stats.panic_count, 0);
+            #[cfg(feature = "profiling")]
+            let _stats = mandatory.stats().operation;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.submitted_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.started_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.completed_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.error_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.panic_count, 0);
             assert_eq!(moves.load(Ordering::Relaxed), 1);
             assert_eq!(finishes.load(Ordering::Relaxed), 1);
             mandatory.poisoner.ensure_healthy().unwrap();
@@ -1844,21 +1881,31 @@ mod tests {
                 .unwrap();
             started.wait_result().await.unwrap();
             drop(observer);
-            let stats = mandatory.stats().operation;
-            assert_eq!(stats.active_count, 1);
-            assert_eq!(stats.completed_count, 1);
-            assert_eq!(stats.detached_observer_count, 1);
+            #[cfg(feature = "profiling")]
+            let _stats = mandatory.stats().operation;
+            assert_eq!(mandatory.blocker_counts().0, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.completed_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.detached_observer_count, 1);
             release.complete(Ok(()));
             mandatory.drain_callers().await;
 
-            let stats = mandatory.stats().operation;
-            assert_eq!(stats.submitted_count, 2);
-            assert_eq!(stats.started_count, 2);
-            assert_eq!(stats.completed_count, 2);
-            assert_eq!(stats.error_count, 1);
-            assert_eq!(stats.panic_count, 0);
-            assert_eq!(stats.detached_observer_count, 1);
-            assert_eq!(stats.active_count, 0);
+            #[cfg(feature = "profiling")]
+            let _stats = mandatory.stats().operation;
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.submitted_count, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.started_count, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.completed_count, 2);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.error_count, 1);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.panic_count, 0);
+            #[cfg(feature = "profiling")]
+            assert_eq!(_stats.detached_observer_count, 1);
+            assert_eq!(mandatory.blocker_counts().0, 0);
             (registry, mandatory)
         });
         assert_shutdown(&registry, &mandatory);
@@ -1919,13 +1966,18 @@ mod tests {
                 mandatory.drain_callers().await;
             }
 
+            #[cfg(feature = "profiling")]
             let stats = mandatory.stats();
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.operation.submitted_count, 64);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.operation.completed_count, 64);
-            assert_eq!(stats.operation.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().0, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.submitted_count, 32);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.completed_count, 32);
-            assert_eq!(stats.transaction_cleanup.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().1, 0);
             (registry, mandatory)
         });
         assert_shutdown(&registry, &mandatory);
@@ -1957,11 +2009,15 @@ mod tests {
                 assert_eq!(rendezvous.registrations.load(Ordering::Acquire), 2);
                 mandatory.drain_callers().await;
             }
+            #[cfg(feature = "profiling")]
             let stats = mandatory.stats().operation;
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.submitted_count, 64);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.started_count, 64);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.completed_count, 64);
-            assert_eq!(stats.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().0, 0);
             (registry, mandatory)
         });
         assert_shutdown(&registry, &mandatory);
@@ -2021,15 +2077,23 @@ mod tests {
                 ],
                 "panic phase, poison visibility, and held internal permits"
             );
+            #[cfg(feature = "profiling")]
             let stats = mandatory.stats();
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.operation, MandatoryTaskStats::default());
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.submitted_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.started_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.completed_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.error_count, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.panic_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.transaction_cleanup.detached_observer_count, 0);
-            assert_eq!(stats.transaction_cleanup.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().1, 0);
 
             (registry, mandatory)
         });
@@ -2090,14 +2154,21 @@ mod tests {
             assert_eq!(rejected_moves.load(Ordering::Relaxed), 0);
             assert_eq!(rejected_finishes.load(Ordering::Relaxed), 0);
             assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            #[cfg(feature = "profiling")]
             let stats = mandatory.stats().operation;
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.submitted_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.started_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.completed_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.error_count, 0);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.panic_count, 1);
+            #[cfg(feature = "profiling")]
             assert_eq!(stats.detached_observer_count, 0);
-            assert_eq!(stats.active_count, 0);
+            assert_eq!(mandatory.blocker_counts().0, 0);
 
             (registry, mandatory)
         });

@@ -17,6 +17,8 @@ use crate::file::{
 use crate::id::{BlockID, FileID, TrxID};
 use crate::io::{DirectBuf, IOClient};
 use crate::obs;
+#[cfg(feature = "profiling")]
+use crate::profiling::clock::Instant;
 use crate::quiescent::QuiescentGuard;
 use crate::trx::MAX_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
@@ -29,7 +31,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::{NonNull, null_mut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::time::Instant;
 
 /// Shared page size of CoW table files and multi-table files.
 pub(crate) const COW_FILE_PAGE_SIZE: usize = PAGE_SIZE;
@@ -916,6 +917,7 @@ impl<M> CowFile<M> {
                 ))
             })?;
 
+        #[cfg(feature = "profiling")]
         let fsync_started_at = Instant::now();
         fsync_direct(Arc::clone(&self.file), background_writes)
             .await
@@ -926,10 +928,16 @@ impl<M> CowFile<M> {
                         format!("operation=publish_file_root, file_id={file_id}, phase=fsync")
                     })
             })?;
+        #[cfg(feature = "profiling")]
         obs::debug!(
             "event=cow_root_publish component=cow_file action=fsync result=ok file_id={} duration_nanos={}",
             file_id,
             fsync_started_at.elapsed().as_nanos(),
+        );
+        #[cfg(not(feature = "profiling"))]
+        obs::debug!(
+            "event=cow_root_publish component=cow_file action=fsync result=ok file_id={}",
+            file_id,
         );
         Ok(self.swap_active_root(new_root.root))
     }

@@ -313,6 +313,10 @@ pub(crate) enum LifecycleError {
 /// Recoverable failures of engine-owned internal operations and runtime infrastructure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum RuntimeError {
+    /// Optional profiling validation or process measurement failed.
+    #[error("profiling measurement failed")]
+    #[cfg(feature = "profiling")]
+    ProfilingMeasurement,
     /// The operating system rejected creation of a required background thread.
     #[error("background thread spawn failed")]
     BackgroundSpawn,

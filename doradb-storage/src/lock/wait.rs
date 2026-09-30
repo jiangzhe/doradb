@@ -428,6 +428,7 @@ impl WaitQueue {
     }
 
     #[inline]
+    #[cfg(any(test, feature = "profiling"))]
     pub(super) fn allocated_slots(&self) -> usize {
         self.nodes.slots.len()
     }

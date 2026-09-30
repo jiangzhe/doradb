@@ -34,7 +34,6 @@ mod runtime;
 mod sealed;
 mod serde;
 mod session;
-pub mod stats;
 mod table;
 mod thread;
 mod trx;
@@ -43,8 +42,7 @@ mod value;
 pub(crate) use component::{DiskPool, IndexPool, MemPool, MetaPool};
 
 pub use catalog::{
-    BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointReport,
-    CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, ColumnID, ColumnOrdinal,
+    BindingNamespaceID, CatalogCheckpointOutcome, CatalogCheckpointResult, ColumnID, ColumnOrdinal,
     CreateIndexDefinition, CreateTableDefinition, CreateTableOutcome, DescriptorUpdate,
     DropIndexDefinition, ID_DOMAIN_END, IndexID, IndexOrder, MAX_TABLE_BINDING_KEY_BYTES,
     MAX_TABLE_DESCRIPTOR_BYTES, ManagedCreateTableDefinition, ManagedTableDefinitionSnapshot,
@@ -63,6 +61,14 @@ pub use conf::{
 pub use engine::Engine;
 pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};
 pub use lock::TableLockMode;
+#[cfg(feature = "profiling")]
+pub use profiling::{
+    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, CatalogCheckpointReport,
+    CatalogTableCheckpointChange, CatalogTableCheckpointIoStats, IoBackendStats, LogicalLockStats,
+    MandatoryRuntimeStats, MandatoryTaskStats, MemIndexCleanupStats, RecoveryPhaseTimings,
+    RecoveryRedoMetrics, RecoveryReport, RecoveryWorkCounts, SecondaryMemIndexCleanupIndexStats,
+    StorageIoStats, TransactionSystemStats,
+};
 pub use row::ops::{
     RowMutation, ScanMvcc, ScanRowDecision, SelectMvcc, TableMutationOutcome, UniqueMutation,
     UniqueMutationOutcome, UpdateCol,
@@ -71,15 +77,9 @@ pub use session::{
     CatalogRedoMaintenanceOutcome, ManagedTableOps, RedoTruncationBlockerInfo,
     RedoTruncationOutcome, Session,
 };
-pub use stats::{
-    BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats, IoBackendStats, LogicalLockStats,
-    MandatoryRuntimeStats, MandatoryTaskStats, RecoveryPhaseTimings, RecoveryRedoMetrics,
-    RecoveryReport, RecoveryWorkCounts, StorageIoStats, TransactionSystemStats,
-};
 pub use table::{
     CheckpointCancelReason, CheckpointDelayReason, CheckpointOutcome, FreezeOutcome,
     FrozenPageBatchInfo, LazyRow, MemIndexCleanupDelay, MemIndexCleanupOutcome,
-    MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats,
 };
 pub use trx::{
     IndexScanMvccStream, ReadSnapshot, ReadSnapshotBuilder, TableScanMvccStream, TableScanOptions,
