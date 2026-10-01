@@ -6,9 +6,10 @@ pub(crate) mod build;
 mod column_block_index;
 #[cfg(test)]
 pub(crate) use column_block_index::tests::adaptive_leaf_fixture;
-mod column_deletion_blob;
-pub(crate) mod column_row_set;
+mod ordinal_deletion_set;
+pub(crate) use ordinal_deletion_set::OrdinalDeletionSet;
 pub(crate) mod disk_tree;
+pub(crate) mod identity_set;
 mod index_stream;
 mod mem_index;
 mod non_unique_index;
@@ -33,8 +34,8 @@ pub(crate) use borrowed_stream::BorrowedIndexMutationStream;
 pub(crate) use btree::{BTREE_NODE_USABLE_SIZE, BTreeKey, BTreeKeyEncoder, KeyRange};
 #[cfg(test)]
 pub(crate) use column_block_index::tests::{
-    corrupt_leaf_block_id, corrupt_leaf_delete_codec, corrupt_leaf_row_codec,
-    corrupt_leaf_short_delete_section_header,
+    corrupt_leaf_block_id, corrupt_leaf_delete_codec, corrupt_leaf_reserved,
+    corrupt_leaf_row_codec, corrupt_leaf_short_delete_section_header, inline_deletion_leaf_fixture,
 };
 #[cfg(test)]
 pub(crate) use column_block_index::{
@@ -43,12 +44,7 @@ pub(crate) use column_block_index::{
 };
 pub(crate) use column_block_index::{
     ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnBlockScanEntry,
-    ColumnDeleteDeltaPatch, ColumnLeafEntry, ColumnScanDeletePlan, DeferredColumnScanDeletes,
-    ResolvedColumnRow,
-};
-#[cfg(test)]
-pub(crate) use column_deletion_blob::{
-    COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, validate_persisted_blob_page,
+    ColumnDeletionPatch, ColumnLeafEntry, ResolvedColumnRow,
 };
 pub(crate) use index_stream::{IndexBatchStream, IndexLookupCandidate};
 pub(crate) use mem_index::MemIndexEntry;

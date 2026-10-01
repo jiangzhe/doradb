@@ -45,7 +45,7 @@ doradb-storage/src/session/mod.rs,Session::wait_for_checkpoint_retry,2
 doradb-storage/src/session/mod.rs,Session::wait_for_gc_horizon_after,2
 doradb-storage/src/session/mod.rs,Session::wait_for_purge_completion_after,2
 doradb-storage/src/table/access.rs,LazyRow::val,2
-doradb-storage/src/table/access.rs,UserTableAccessor::mutate_cold_rows_mvcc,12
+doradb-storage/src/table/access.rs,UserTableAccessor::mutate_cold_rows_mvcc,11
 doradb-storage/src/table/access.rs,UserTableAccessor::mutate_hot_rows_mvcc,7
 doradb-storage/src/table/access.rs,UserTableAccessor::table_index_mutate_mvcc,2
 doradb-storage/src/table/access.rs,UserTableAccessor::table_mutate_mvcc,1

@@ -178,6 +178,11 @@ bitmap. Deleted or otherwise cutoff-invisible rows are omitted while explicit
 RowIDs preserve the sparse logical range. If an output block must split, the
 same prepared bitmap is reused rather than walking undo state again.
 
+User and catalog checkpoints share a per-block row limit that guarantees room
+for identity and any future deletion state. Splitting across blocks preserves
+prepared visibility, RowID order, and exactly-once inclusion of each accepted
+row and its secondary-index entries.
+
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
 complete block input, checkpoint submits only LWC serialization, compression,
@@ -203,10 +208,10 @@ row-identity representation and creates matching binding metadata for the index
 entry and LWC block. Their membership, row order, and binding remain fixed
 through publication. Catalog checkpoints follow the same identity rules.
 
-Row identity must fit within its index entry alongside deletion metadata. If it
-cannot fit, checkpoint stops production, drains accepted writes, and publishes
-no partial root. Failures after the irreversible transition retain the existing
-fatal checkpoint policy.
+The row limit does not remove limits on value size or RowID coverage. If output
+cannot be represented, checkpoint stops production, drains accepted writes, and
+publishes no partial root. Failures after the irreversible transition retain the
+existing fatal checkpoint policy.
 
 For every row accepted into an LWC block, checkpoint sends the identical
 visible value and RowID to the secondary-index sidecar. This produces companion

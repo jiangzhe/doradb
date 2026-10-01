@@ -5,12 +5,13 @@
 //! Actual table scan must take MVCC into consideration,
 //! but that's not included in this module.
 
-use crate::bitmap::{Bitmap, BitmapRangeFilter};
+use crate::bitmap::Bitmap;
 use crate::catalog::TableColumnLayout;
 use crate::error::{InternalError, InternalResult};
 use crate::row::{RowPage, RowPageNullBitmap};
 use crate::value::{PageVar, Val, ValBuffer, ValType};
 use error_stack::Report;
+use std::ops::Range;
 use zerocopy::byteorder::little_endian::{
     F32 as LeF32, F64 as LeF64, I16 as LeI16, I32 as LeI32, I64 as LeI64, U16 as LeU16,
     U32 as LeU32, U64 as LeU64,
@@ -364,6 +365,7 @@ pub(crate) struct PageVectorView<'p, 'm> {
     // row count should be freezed when creating this view.
     // to allow concurrent insert when query this page.
     row_count: usize,
+    source_range: Range<usize>,
     // delete bitmap is a copy of the one on current page.
     // it can be modified to represent an old view when
     // MVCC is enabled.
@@ -381,6 +383,7 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
             page,
             col_layout,
             row_count,
+            source_range: 0..row_count,
             del_bitmap,
         }
     }
@@ -388,16 +391,32 @@ impl<'p, 'm> PageVectorView<'p, 'm> {
     /// Count rows not deleted.
     #[inline]
     pub(crate) fn rows_non_deleted(&self) -> usize {
-        self.del_bitmap
-            .bitmap_range_iter(self.row_count)
-            .map(|(f, n)| if f { 0 } else { n })
+        self.range_non_deleted()
+            .map(|(start, end)| end - start)
             .sum()
     }
 
-    /// Returns range of non-deleted rows.
+    /// Restricts source coordinates while retaining full column and null arrays.
+    pub(crate) fn with_source_range(mut self, range: Range<usize>) -> InternalResult<Self> {
+        if range.start > range.end || range.end > self.row_count {
+            return Err(Report::new(InternalError::LwcBuilderMisuse).attach(format!(
+                "invalid vector view range {range:?}, rows={}",
+                self.row_count
+            )));
+        }
+        self.source_range = range;
+        Ok(self)
+    }
+
+    /// Returns non-deleted ranges in original source coordinates.
     #[inline]
-    pub(crate) fn range_non_deleted(&self) -> BitmapRangeFilter<'_> {
-        self.del_bitmap.bitmap_range_filter(self.row_count, false)
+    pub(crate) fn range_non_deleted(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.del_bitmap[..self.source_range.end.div_ceil(64)]
+            .bitmap_range_filter(self.source_range.end, false)
+            .filter_map(|(start, end)| {
+                let start = start.max(self.source_range.start);
+                (start < end).then_some((start, end))
+            })
     }
 
     /// Returns null bitmap and value data of given column.
@@ -426,6 +445,7 @@ impl RowPage {
             page: self,
             col_layout,
             row_count,
+            source_range: 0..row_count,
             del_bitmap,
         })
     }
@@ -922,6 +942,89 @@ mod tests {
             assert_scan_rows(case, &scanner, &metadata.col, &expected);
             assert!(!page.is_deleted(0), "{case}");
             assert!(page.is_deleted(1), "{case}");
+        }
+    }
+
+    /// Purpose: Restrict prepared visibility while retaining source coordinates for nullable and variable-width columns.
+    /// Expected: Ranged scans preserve exact source values and nulls, ignore live deletes, and reject invalid endpoints.
+    #[test]
+    fn bounded_views_preserve_source_coordinates() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let rows = vec![
+            vec![Val::U16(10), Val::from("first".as_bytes())],
+            vec![Val::Null, Val::Null],
+            vec![
+                Val::U16(12),
+                Val::from("long source value at two".as_bytes()),
+            ],
+            vec![Val::Null, Val::from("three".as_bytes())],
+            vec![Val::U16(14), Val::Null],
+            vec![Val::U16(15), Val::Null],
+        ];
+        let mut page = create_row_page();
+        page.init(RowID::new(100), rows.len(), &metadata.col);
+        for row in &rows {
+            assert!(page.insert(&metadata.col, row).is_ok());
+        }
+        assert!(matches!(page.delete(RowID::new(102)), Delete::Ok));
+        let view = page
+            .vector_view_with_del_bitmap(&metadata.col, vec![0b010010])
+            .unwrap()
+            .with_source_range(2..6)
+            .unwrap();
+        assert_eq!(
+            view.range_non_deleted().collect::<Vec<_>>(),
+            vec![(2, 4), (5, 6)]
+        );
+        assert_eq!(view.rows_non_deleted(), 3);
+        let mut scanner = ScanBuffer::new(&metadata.col, &[0, 1]);
+        scanner.scan(view);
+        assert_scan_rows(
+            "bounded prepared view",
+            &scanner,
+            &metadata.col,
+            &[rows[2].clone(), rows[3].clone(), rows[5].clone()],
+        );
+        for (start, end) in [(4, 3), (0, 7), (7, 7)] {
+            let range = start..end;
+            let result = page
+                .vector_view_with_del_bitmap(&metadata.col, vec![0])
+                .unwrap()
+                .with_source_range(range);
+            assert!(result.is_err());
+        }
+        let empty = page
+            .vector_view(&metadata.col)
+            .with_source_range(6..6)
+            .unwrap();
+        assert_eq!(empty.rows_non_deleted(), 0);
+    }
+
+    /// Purpose: Clip bounded visibility before the source bitmap's final word.
+    /// Expected: Exact and partial word ranges include only their source positions even when later words are visible.
+    #[test]
+    fn bounded_views_clip_bitmap_words() {
+        let (metadata, page) = prepared_visibility_page(100);
+        for (start, end) in [(0, 64), (17, 63), (63, 65), (64, 64), (64, 99)] {
+            let view = page
+                .vector_view_with_del_bitmap(&metadata.col, vec![0, 0])
+                .unwrap()
+                .with_source_range(start..end)
+                .unwrap();
+            assert_eq!(view.rows_non_deleted(), end - start);
+            let mut scanner = ScanBuffer::new(&metadata.col, &[0]);
+            scanner.scan(view);
+            let expected: Vec<_> = (start..end)
+                .map(|row| vec![Val::I8(row as i8 + 1)])
+                .collect();
+            assert_scan_rows("bitmap word clip", &scanner, &metadata.col, &expected);
         }
     }
 

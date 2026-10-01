@@ -20,16 +20,19 @@ use crate::error::{
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
+use crate::index::OrdinalDeletionSet;
 use crate::index::disk_tree::{
     NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
 };
+use crate::index::identity_set::EncodedRowSet;
 use crate::index::{BTreeKeyEncoder, secondary_index_encoder};
 use crate::index::{
-    ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeleteDeltaPatch,
+    ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeletionPatch,
     ColumnLeafEntry,
 };
 use crate::io::DirectBuf;
 use crate::lwc::LwcBuilder;
+use crate::lwc::MAX_LWC_ROWS;
 use crate::obs;
 #[cfg(feature = "profiling")]
 use crate::profiling::{CheckpointLwcProfile, clock::Instant};
@@ -1561,11 +1564,7 @@ impl Table {
                 .into());
         }
 
-        // Step 3: resolve each row-id to its persisted block payload.
-        // Future improvement:
-        // 1) resolve disjoint row-id ranges in parallel for higher throughput;
-        // 2) when roaring bitmap encoding is introduced, also fetch the target LWC block
-        //    row-id array to map each input row-id to the correct offset-based bit index.
+        // Step 3: group selected logical RowIDs by their persisted block.
         let column_index = ColumnBlockIndex::new(
             column_block_index_root,
             pivot_row_id,
@@ -1658,35 +1657,54 @@ impl Table {
             self.table_id()
         );
 
-        // Step 4: load authoritative persisted deltas and merge pending row-id deltas.
-        let mut patch_storage: Vec<(RowID, Vec<u32>)> = Vec::new();
+        // Step 4: translate markers once and merge compact physical ordinals.
+        let mut patch_storage: Vec<(RowID, OrdinalDeletionSet)> = Vec::new();
         for group in groups {
             let pending = &pending_deltas[group.pending_start..group.pending_end];
-            let (base_deltas, row_ids) = column_index
-                .load_delete_deltas_and_row_ids(&group.entry)
+            let (identity, base) = column_index
+                .load_entry_identity_and_deletions(&group.entry)
                 .await?;
-            let mut base = base_deltas.into_iter().collect::<BTreeSet<_>>();
-            let new_deltas = pending
-                .iter()
-                .copied()
-                .filter(|delta| !base.contains(delta))
-                .collect::<Vec<_>>();
-            if new_deltas.is_empty() {
+            let mut new_ordinals = Vec::with_capacity(pending.len());
+            for delta in pending {
+                let ordinal = identity.as_ref().ordinal_for_delta(*delta).ok_or_else(|| {
+                    Report::new(DataIntegrityError::InvalidPayload)
+                        .attach(format!("delete marker is absent from physical identity: start_row_id={}, delta={delta}", group.entry.start_row_id))
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach(format!("operation=apply_deletion_checkpoint, table_id={}", self.table_id()))
+                })?;
+                if !base.contains(ordinal) {
+                    new_ordinals.push(ordinal);
+                }
+            }
+            if new_ordinals.is_empty() {
                 continue;
             }
-
             self.collect_deleted_secondary_sidecar(
                 &group.entry,
-                &row_ids,
-                &new_deltas,
+                &identity,
+                &new_ordinals,
                 metadata,
                 secondary_sidecar,
                 disk_guard,
             )
             .await?;
-
-            base.extend(new_deltas);
-            patch_storage.push((group.entry.start_row_id, base.into_iter().collect()));
+            let mut merged = Vec::with_capacity(base.len() + new_ordinals.len());
+            let mut previous = base.iter().peekable();
+            for ordinal in new_ordinals {
+                while previous.peek().is_some_and(|old| *old < ordinal) {
+                    merged.extend(previous.next());
+                }
+                merged.push(ordinal);
+            }
+            merged.extend(previous);
+            let deletions = OrdinalDeletionSet::from_ordinals(group.entry.row_count(), &merged)
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach(format!(
+                    "operation=encode_checkpoint_deletions, table_id={}, start_row_id={}",
+                    self.table_id(),
+                    group.entry.start_row_id
+                ))?;
+            patch_storage.push((group.entry.start_row_id, deletions));
         }
         if patch_storage.is_empty() {
             if cutoff_advanced {
@@ -1697,15 +1715,15 @@ impl Table {
         }
 
         // Step 5: apply typed delete rewrites and advance the index root in the mutable file.
-        let patches: Vec<ColumnDeleteDeltaPatch<'_>> = patch_storage
+        let patches: Vec<ColumnDeletionPatch<'_>> = patch_storage
             .iter()
-            .map(|(start_row_id, delete_deltas)| ColumnDeleteDeltaPatch {
+            .map(|(start_row_id, deletions)| ColumnDeletionPatch {
                 start_row_id: *start_row_id,
-                delete_deltas,
+                deletions,
             })
             .collect();
         let new_root = column_index
-            .batch_replace_delete_deltas(mutable_file, &patches, checkpoint_ts)
+            .batch_replace_deletions(mutable_file, &patches, checkpoint_ts)
             .await?;
         mutable_file.set_column_block_index_root(new_root);
         mutable_file.advance_deletion_cutoff_ts(cutoff_ts);
@@ -1818,28 +1836,19 @@ impl Table {
     async fn collect_deleted_secondary_sidecar(
         &self,
         entry: &ColumnLeafEntry,
-        row_ids: &[RowID],
-        delete_deltas: &[u32],
+        identity: &EncodedRowSet,
+        ordinals: &[u16],
         metadata: &TableMetadata,
         secondary_sidecar: &mut SecondaryCheckpointSidecar,
         disk_guard: &PoolGuard,
     ) -> RuntimeOrFatalResult<()> {
-        if secondary_sidecar.indexes.is_empty() || delete_deltas.is_empty() {
+        if secondary_sidecar.indexes.is_empty() || ordinals.is_empty() {
             return Ok(());
         }
 
-        // ColumnBlockIndex supplies the authoritative row-id ordering for this
-        // persisted block, which maps deletion deltas back to row indexes.
-        if row_ids.len() != entry.row_count() as usize
-            || row_ids.windows(2).any(|window| window[0] >= window[1])
-        {
+        if identity.row_count() != usize::from(entry.row_count()) {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "invalid persisted row id set: block_id={}, row_count={}, row_id_count={}",
-                    entry.block_id(),
-                    entry.row_count(),
-                    row_ids.len()
-                ))
+                .attach("deletion identity physical count mismatch")
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach(format!(
                     "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={}",
@@ -1848,11 +1857,6 @@ impl Table {
                 ))
                 .into());
         }
-        let dense_row_ids = row_ids.len() == entry.row_id_span() as usize
-            && row_ids
-                .iter()
-                .enumerate()
-                .all(|(idx, row_id)| *row_id == entry.start_row_id + idx as u64);
 
         // Decode the persisted LWC block once for this block group, then derive
         // all secondary delete keys from the selected row indexes.
@@ -1860,7 +1864,7 @@ impl Table {
         let block_id = entry.block_id();
         let persisted = self.storage.load_lwc_block(disk_guard, block_id).await?;
         let block = persisted.block();
-        if block.row_count() != row_ids.len()
+        if block.row_count() != identity.row_count()
             || block.block_binding_value() != entry.block_binding_value()
         {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
@@ -1868,7 +1872,7 @@ impl Table {
                     "LWC block metadata mismatch: block_id={}, block_row_count={}, expected_row_count={}, block_binding_value={}, expected_binding_value={}",
                     entry.block_id(),
                     block.row_count(),
-                    row_ids.len(),
+                    identity.row_count(),
                     block.block_binding_value(),
                     entry.block_binding_value()
                 ))
@@ -1879,68 +1883,16 @@ impl Table {
                 )).into());
         }
 
-        let mut sparse_row_idx = 0usize;
-        for delta in delete_deltas {
-            let row_id = entry
-                .start_row_id
-                .checked_add(u64::from(*delta))
-                .ok_or_else(|| Report::new(DataIntegrityError::InvalidPayload))
-                .attach_with(|| {
-                    format!(
-                        "delete delta overflows row id: start_row_id={}, delta={delta}",
-                        entry.start_row_id
-                    )
-                })
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
-                        self.table_id()
-                    )
-                })?;
-            let row_idx = if dense_row_ids {
-                usize::try_from(*delta)
-                    .change_context(DataIntegrityError::InvalidPayload)
-                    .attach_with(|| format!("delete delta does not fit usize: delta={delta}"))
+        for ordinal in ordinals {
+            let delta = identity.as_ref().delta_for_ordinal(*ordinal).ok_or_else(|| {
+                Report::new(DataIntegrityError::InvalidPayload)
+                    .attach(format!("deletion ordinal {ordinal} exceeds physical identity"))
                     .change_context(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
-                            self.table_id()
-                        )
-                    })?
-            } else {
-                while row_ids
-                    .get(sparse_row_idx)
-                    .is_some_and(|current| *current < row_id)
-                {
-                    sparse_row_idx += 1;
-                }
-                if row_ids.get(sparse_row_idx) != Some(&row_id) {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "delete delta does not map to row id: row_id={row_id}, delta={delta}"
-                        ))
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!(
-                            "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
-                            self.table_id()
-                        )).into());
-                }
-                sparse_row_idx
-            };
-            if row_idx >= row_ids.len() {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "delete delta row index out of bounds: row_idx={row_idx}, row_count={}",
-                        row_ids.len()
-                    ))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach(format!(
-                        "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
-                        self.table_id()
-                    )).into());
-            }
+                    .attach(format!("operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}", self.table_id()))
+            })?;
+            // Validated identity coverage cannot overflow its original RowID bounds.
+            let row_id = entry.start_row_id + u64::from(delta);
+            let row_idx = usize::from(*ordinal);
             for sidecar_pos in 0..secondary_sidecar.indexes.len() {
                 let (index, key) = {
                     let active = &secondary_sidecar.indexes[sidecar_pos];
@@ -2327,120 +2279,74 @@ impl Table {
                             )),
                     ));
                 };
-                let appended = {
-                    let page_guard = self
-                        .row_store
-                        .must_get_row_page_shared(guards, prepared.page_id)
-                        .await?;
-                    let page = page_guard.page();
-                    assert_eq!(page.header.start_row_id, prepared.start_row_id);
-                    let view = page
-                        .vector_view_with_del_bitmap(
-                            metadata.col.as_ref(),
-                            prepared.del_bitmap.clone(),
-                        )
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach_with(|| {
-                            format!(
-                                "operation=build_and_write_lwc_blocks, phase=build_vector_view, table_id={}, page_id={}",
-                                self.table_id(), prepared.page_id
-                            )
-                        })?;
-                    if view.rows_non_deleted() == 0 {
-                        None
-                    } else {
-                        if let Some(collect_visible_row) = collect_visible_row.as_mut() {
-                            for (start_idx, end_idx) in view.range_non_deleted() {
-                                for row_idx in start_idx..end_idx {
-                                    collect_visible_row(page, row_idx, page.row_id(row_idx));
-                                }
-                            }
-                        }
-                        if builder.is_empty() {
-                            current_start = prepared.start_row_id;
-                            current_end = prepared.end_row_id;
-                        }
-                        Some(builder.append_view(view, prepared.start_row_id))
-                    }
-                };
-                // Page guards and borrowed vector views are gone before any
-                // CPU-completion or shared-ingress await.
-                pipeline.advance_ready().await?;
-                let Some(appended) = appended else {
-                    continue;
-                };
-                if !appended {
-                    if builder.is_empty() {
-                        return Err(RuntimeOrFatalError::from(
-                            Report::new(InternalError::LwcBuilderMisuse)
-                                .attach(format!(
-                                    "single row page does not fit in LWC block: page_id={}",
-                                    prepared.page_id
-                                ))
-                                .change_context(RuntimeError::CheckpointExecution)
-                                .attach(format!(
-                                    "operation=build_and_write_lwc_blocks, phase=append_page, table_id={}",
-                                    self.table_id()
-                                )),
-                        ));
-                    }
-                    let shape = ColumnBlockEntryShape::new(self.table_id(),
-                        current_start,
-                        current_end,
-                        builder.row_ids(),
-                        builder.row_set_seeds(),
-                        Vec::new(),
-                    )
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach("operation=plan_cold_row_identity")?;
-                    let completed_builder = replace(
-                        &mut builder,
-                        LwcBuilder::new(Arc::clone(&metadata.col)),
-                    );
-                    // No page guard or borrowed vector view survives this
-                    // capacity wait and accepted-task submission boundary.
-                    pipeline.submit(completed_builder, shape).await?;
-                    current_start = prepared.start_row_id;
-                    current_end = prepared.end_row_id;
-                    let rebuilt_appended = {
-                        let page_guard = self
-                            .row_store
-                            .must_get_row_page_shared(guards, prepared.page_id)
-                            .await?;
+                let mut cursor = 0usize;
+                let mut retry_end = None;
+                loop {
+                    let selection = {
+                        let page_guard = self.row_store.must_get_row_page_shared(guards, prepared.page_id).await?;
                         let page = page_guard.page();
                         assert_eq!(page.header.start_row_id, prepared.start_row_id);
-                        let view = page
-                            .vector_view_with_del_bitmap(
-                                metadata.col.as_ref(),
-                                prepared.del_bitmap.clone(),
-                            )
+                        let source_count = page.header.row_count();
+                        let view = page.vector_view_with_del_bitmap(metadata.col.as_ref(), prepared.del_bitmap.clone())
+                            .and_then(|view| view.with_source_range(cursor..source_count))
                             .change_context(RuntimeError::CheckpointExecution)
-                            .attach_with(|| {
-                                format!(
-                                    "operation=build_and_write_lwc_blocks, phase=rebuild_vector_view, table_id={}, page_id={}",
-                                    self.table_id(), prepared.page_id
-                                )
-                            })?;
-                        builder.append_view(view, prepared.start_row_id)
-                    };
-                    if !rebuilt_appended {
-                        return Err(RuntimeOrFatalError::from(
-                            Report::new(InternalError::LwcBuilderMisuse)
-                                .attach(format!(
-                                    "single row page does not fit in LWC block: page_id={}",
-                                    prepared.page_id
-                                ))
+                            .attach(format!("operation=build_checkpoint_selection, table_id={}, page_id={}", self.table_id(), prepared.page_id))?;
+                        let visible = view.rows_non_deleted();
+                        if visible == 0 { None } else if builder.row_count() == MAX_LWC_ROWS {
+                            // Keep a full builder pending until another visible selection
+                            // or the batch end fixes its final coverage and binding.
+                            Some((false, cursor))
+                        } else {
+                            let remaining = MAX_LWC_ROWS - builder.row_count();
+                            let end = retry_end.unwrap_or_else(|| {
+                                if visible <= remaining { return source_count; }
+                                let mut needed = remaining;
+                                for (start, end) in view.range_non_deleted() {
+                                    if end - start >= needed { return start + needed; }
+                                    needed -= end - start;
+                                }
+                                unreachable!("visible checkpoint ranges must satisfy remaining capacity")
+                            });
+                            let view = view.with_source_range(cursor..end)
                                 .change_context(RuntimeError::CheckpointExecution)
-                                .attach(format!(
-                                    "operation=build_and_write_lwc_blocks, phase=append_page, table_id={}",
-                                    self.table_id()
-                                )),
-                        ));
+                                .attach("operation=bound_checkpoint_selection")?;
+                            let ranges: Vec<_> = if collect_visible_row.is_some() { view.range_non_deleted().collect() } else { Vec::new() };
+                            let was_empty = builder.is_empty();
+                            let appended = builder.append_view(view, prepared.start_row_id);
+                            if appended {
+                                if was_empty { current_start = prepared.start_row_id + cursor as u64; }
+                                current_end = if end == source_count { prepared.end_row_id } else { prepared.start_row_id + end as u64 };
+                                if let Some(collect) = collect_visible_row.as_mut() {
+                                    for (start, end) in ranges {
+                                        for row_idx in start..end { collect(page, row_idx, page.row_id(row_idx)); }
+                                    }
+                                }
+                            }
+                            Some((appended, end))
+                        }
+                    };
+                    // Page guards and borrowed views never cross pipeline waits.
+                    pipeline.advance_ready().await?;
+                    let Some((appended, end)) = selection else { break; };
+                    if appended {
+                        cursor = end;
+                        retry_end = None;
+                        continue;
                     }
-                } else {
-                    current_end = prepared.end_row_id;
+                    if builder.is_empty() {
+                        return Err(Report::new(InternalError::LwcBuilderMisuse)
+                            .attach(format!("source row selection does not fit in LWC block: page_id={}, range={cursor}..{end}", prepared.page_id))
+                            .change_context(RuntimeError::CheckpointExecution)
+                            .attach(format!("operation=build_and_write_lwc_blocks, phase=append_page, table_id={}", self.table_id())).into());
+                    }
+                    if end > cursor { retry_end = Some(end); }
+                    let shape = ColumnBlockEntryShape::new(self.table_id(), current_start, current_end,
+                        builder.row_ids(), builder.row_set_seeds())
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach("operation=plan_cold_row_identity")?;
+                    let completed = replace(&mut builder, LwcBuilder::new(Arc::clone(&metadata.col)));
+                    pipeline.submit(completed, shape).await?;
                 }
-                pipeline.advance_ready().await?;
             }
             if !builder.is_empty() {
                 let shape = ColumnBlockEntryShape::new(self.table_id(),
@@ -2448,7 +2354,7 @@ impl Table {
                     new_pivot_row_id,
                     builder.row_ids(),
                     builder.row_set_seeds(),
-                    Vec::new(),
+
                 )
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach("operation=plan_cold_row_identity")?;
@@ -2582,7 +2488,7 @@ mod tests {
     use crate::file::cow_file::COW_FILE_PAGE_SIZE;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::index::RowLocation;
-    use crate::index::{corrupt_leaf_delete_codec, corrupt_leaf_short_delete_section_header};
+    use crate::index::{corrupt_leaf_reserved, corrupt_leaf_short_delete_section_header};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol};
@@ -3262,7 +3168,6 @@ mod tests {
                 start_row_id + 10,
                 &[start_row_id],
                 &[],
-                Vec::new(),
             )
             .unwrap(),
             completion,
@@ -3277,7 +3182,6 @@ mod tests {
             start_row_id + 10,
             &[start_row_id],
             &[],
-            Vec::new(),
         )
         .unwrap()
         .with_block_id(BlockID::new(block_id))
@@ -3663,11 +3567,17 @@ mod tests {
             assert!(active_root.deletion_cutoff_ts > marker_ts);
             assert_eq!(entry.block_id(), entry_before.block_id());
             assert_eq!(entry.end_row_id(), entry_before.end_row_id());
-            assert_eq!(entry.row_id_span(), entry_before.row_id_span());
+            assert_eq!(
+                entry.end_row_id() - entry.start_row_id,
+                entry_before.end_row_id() - entry_before.start_row_id
+            );
             assert_eq!(entry.row_count(), entry_before.row_count());
-            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            let (identity, deltas) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
             let expected_delta = (row_id - entry.start_row_id) as u32;
-            assert!(deltas.contains(&expected_delta));
+            assert!(deltas.contains(identity.as_ref().ordinal_for_delta(expected_delta).unwrap()));
         });
     }
 
@@ -3839,7 +3749,7 @@ mod tests {
             );
             let report = format!("{err:?}");
             assert!(
-                report.contains("single row page does not fit in LWC block"),
+                report.contains("source row selection does not fit in LWC block"),
                 "{report}"
             );
             assert!(report.contains(&format!("page_id={page_id}")), "{report}");
@@ -3976,6 +3886,181 @@ mod tests {
         });
     }
 
+    /// Purpose: Split a prepared source page larger than the row cap and finalize a full tail across invisible pages.
+    /// Expected: Every visible RowID/value and sidecar row appears once, every block obeys the cap, and final bindings include the pivot.
+    #[test]
+    fn checkpoint_splits_large_source_page_with_prepared_visibility() {
+        smol::block_on(async {
+            for (case, nullable, holes) in [("dense", false, false), ("nullable holes", true, true)]
+            {
+                let temp_dir = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp_dir, "bounded-lwc-page").await;
+                let mut session = engine.new_session().unwrap();
+                let flags = if nullable {
+                    StorageColumnFlags::NULLABLE
+                } else {
+                    StorageColumnFlags::empty()
+                };
+                let table_id = session
+                    .create_table(
+                        StorageTableSpec::new(vec![StorageColumnSpec::new(ValKind::U8, flags)]),
+                        vec![],
+                    )
+                    .await
+                    .unwrap()
+                    .table_id();
+                let table = table_for_internal_assertion(&engine, table_id);
+                let metadata = table.metadata();
+                let guards = session.pool_guards();
+                let mut expected = Vec::new();
+                let visible_target = 2 * MAX_LWC_ROWS + if holes { 0 } else { 137 };
+                let first = {
+                    let guard = table
+                        .row_store
+                        .try_get_insert_page(&guards, 3 * MAX_LWC_ROWS)
+                        .await
+                        .unwrap();
+                    let page = guard.page();
+                    let count = usize::from(page.header.max_row_count);
+                    assert!(
+                        count > visible_target,
+                        "{case}: narrow source page must exceed the block cap"
+                    );
+                    let mut bitmap = vec![0u64; count.div_ceil(64)];
+                    for ordinal in 0..count {
+                        let value = if nullable && ordinal % 3 == 0 {
+                            Val::Null
+                        } else {
+                            Val::U8((ordinal % 251) as u8)
+                        };
+                        assert!(
+                            page.insert(&metadata.col, std::slice::from_ref(&value))
+                                .is_ok()
+                        );
+                        if expected.len() == visible_target || (holes && ordinal % 17 == 0) {
+                            bitmap.bitmap_set(ordinal);
+                        } else {
+                            expected.push((page.row_id(ordinal), value));
+                        }
+                    }
+                    // Live visibility changes after preparation must not affect any retry.
+                    assert!(matches!(
+                        page.delete(expected[100].0),
+                        crate::row::ops::Delete::Ok
+                    ));
+                    PreparedTransitionPage {
+                        page_id: guard.page_id(),
+                        start_row_id: page.header.start_row_id,
+                        end_row_id: page.header.start_row_id + count as u64,
+                        cutoff_ts: TrxID::new(1),
+                        observed_version: 0,
+                        required_cutoff_ts: None,
+                        del_bitmap: bitmap,
+                        overlay_markers: Vec::new(),
+                    }
+                };
+                let tail = {
+                    let guard = table
+                        .row_store
+                        .try_get_insert_page(&guards, 1)
+                        .await
+                        .unwrap();
+                    let page = guard.page();
+                    assert!(page.insert(&metadata.col, &[Val::U8(255)]).is_ok());
+                    PreparedTransitionPage {
+                        page_id: guard.page_id(),
+                        start_row_id: page.header.start_row_id,
+                        end_row_id: page.header.start_row_id + u64::from(page.header.max_row_count),
+                        cutoff_ts: TrxID::new(1),
+                        observed_version: 0,
+                        required_cutoff_ts: None,
+                        del_bitmap: vec![1],
+                        overlay_markers: Vec::new(),
+                    }
+                };
+                let pivot = tail.end_row_id;
+                let mut mutable = test_mutable_table_file(&engine, &table, &guards);
+                let mut sidecar = Vec::new();
+                let entries = table
+                    .build_and_write_lwc_blocks(
+                        &metadata,
+                        &guards,
+                        CheckpointLwcProduction {
+                            mutable_file: &mut mutable,
+                            thread_pool: engine.inner().thread_pool.clone(),
+                            new_pivot_row_id: pivot,
+                            prepared_pages: &[Some(first), Some(tail)],
+                        },
+                        Some(|_: &RowPage, _: usize, row_id| sidecar.push(row_id)),
+                        &engine.inner().maintenance_test,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    entries.len(),
+                    visible_target.div_ceil(MAX_LWC_ROWS),
+                    "{case}"
+                );
+                assert_eq!(entries.last().unwrap().end_row_id(), pivot, "{case}");
+                assert_eq!(
+                    sidecar,
+                    expected.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+                    "{case}"
+                );
+                mutable
+                    .finish_lwc_blocks(
+                        entries,
+                        TrxID::new(2),
+                        TrxID::new(2),
+                        table.disk_pool(),
+                        guards.disk_guard(),
+                    )
+                    .await
+                    .unwrap();
+                let root = mutable.root();
+                let index = ColumnBlockIndex::new(
+                    root.column_block_index_root,
+                    root.pivot_row_id,
+                    table.file().file_kind(),
+                    table.file().sparse_file(),
+                    table.disk_pool(),
+                    guards.disk_guard(),
+                );
+                let mut actual = Vec::new();
+                for entry in index.collect_leaf_entries().await.unwrap() {
+                    assert_eq!(
+                        usize::from(entry.row_count()),
+                        (visible_target - actual.len()).min(MAX_LWC_ROWS),
+                        "{case}"
+                    );
+                    let (identity, deletions) = index
+                        .load_entry_identity_and_deletions(&entry)
+                        .await
+                        .unwrap();
+                    assert!(deletions.is_empty());
+                    let persisted = table
+                        .storage
+                        .load_lwc_block(guards.disk_guard(), entry.block_id())
+                        .await
+                        .unwrap();
+                    let block = persisted.block();
+                    assert_eq!(
+                        block.block_binding_value(),
+                        entry.block_binding_value(),
+                        "{case}"
+                    );
+                    for (ordinal, delta) in identity.as_ref().iter_deltas().enumerate() {
+                        let values = block
+                            .decode_full_row_values(&metadata.col, ordinal)
+                            .unwrap();
+                        actual.push((entry.start_row_id + u64::from(delta), values[0].clone()));
+                    }
+                }
+                assert_eq!(actual, expected, "{case}");
+            }
+        });
+    }
+
     /// Purpose: Protect checkpoint pipeline ordering across encoded tasks.
     /// Expected: Output follows logical row order and consumes every accepted completion.
     #[test]
@@ -3998,7 +4083,6 @@ mod tests {
                     RowID::new(20),
                     &[RowID::new(10)],
                     &[],
-                    Vec::new(),
                 )
                 .unwrap(),
                 completion: Arc::clone(&first),
@@ -4010,7 +4094,6 @@ mod tests {
                     RowID::new(30),
                     &[RowID::new(20)],
                     &[],
-                    Vec::new(),
                 )
                 .unwrap(),
                 completion: Arc::clone(&second),
@@ -4669,8 +4752,8 @@ mod tests {
                 .unwrap()
                 .expect("transition snapshot should persist the row into LWC");
             assert!(root_after_first.deletion_cutoff_ts <= delete_cts);
-            let (deltas, _) = index_after_first
-                .load_delete_deltas_and_row_ids(&entry_after_first)
+            let (_, deltas) = index_after_first
+                .load_entry_identity_and_deletions(&entry_after_first)
                 .await
                 .unwrap();
             assert!(deltas.is_empty());
@@ -4691,13 +4774,13 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("persisted entry should still exist");
-            let (deltas, _) = index_after_second
-                .load_delete_deltas_and_row_ids(&entry_after_second)
+            let (identity, deltas) = index_after_second
+                .load_entry_identity_and_deletions(&entry_after_second)
                 .await
                 .unwrap();
             let expected_delta = (row_id - entry_after_second.start_row_id) as u32;
             assert!(root_after_second.deletion_cutoff_ts > delete_cts);
-            assert!(deltas.contains(&expected_delta));
+            assert!(deltas.contains(identity.as_ref().ordinal_for_delta(expected_delta).unwrap()));
         });
     }
 
@@ -4925,7 +5008,10 @@ mod tests {
                 .unwrap()
                 .expect("persisted entry should exist");
             assert!(active_root.deletion_cutoff_ts <= delete_cts);
-            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            let (_, deltas) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
             assert!(deltas.is_empty());
 
             hold_trx.rollback().await.unwrap();
@@ -4938,7 +5024,7 @@ mod tests {
     #[test]
     fn test_checkpoint_fails_on_invalid_v2_delete_metadata() {
         smol::block_on(assert_checkpoint_delete_metadata_corruption(
-            corrupt_leaf_delete_codec,
+            corrupt_leaf_reserved,
         ));
     }
 

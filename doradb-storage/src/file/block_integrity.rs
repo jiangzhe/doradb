@@ -13,10 +13,7 @@ pub(crate) const BLOCK_INTEGRITY_TRAILER_SIZE: usize = mem::size_of::<BlockInteg
 pub(crate) const LWC_BLOCK_SPEC: BlockIntegritySpec = BlockIntegritySpec::new(*b"LWCPAGE\0", 2);
 /// Block-integrity markers for persisted column block-index nodes.
 pub(crate) const COLUMN_BLOCK_INDEX_BLOCK_SPEC: BlockIntegritySpec =
-    BlockIntegritySpec::new(*b"CBINDEX\0", 3);
-/// Block-integrity markers for persisted column auxiliary-blob blocks.
-pub(crate) const COLUMN_DELETION_BLOB_BLOCK_SPEC: BlockIntegritySpec =
-    BlockIntegritySpec::new(*b"CDBLOB\0\0", 2);
+    BlockIntegritySpec::new(*b"CBINDEX\0", 4);
 /// Expected block-envelope markers for one persisted CoW block kind.
 ///
 /// The shared integrity helpers use this to validate that a block belongs to

@@ -17,6 +17,10 @@ cold-row deletes.
 published. This document owns restart ordering and the rules for consuming
 them.
 
+Persistent cold-row deletions are part of the column index and are validated
+with it. [Table File](./table-file.md#63-inline-ordinal-deletion-sections)
+describes storage compatibility.
+
 ## Recovery-Visible Durability
 
 A foreground effect is recoverable only when it is represented by a durable

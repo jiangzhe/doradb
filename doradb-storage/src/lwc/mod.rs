@@ -2,7 +2,7 @@
 
 pub(crate) mod block;
 
-use crate::index::column_row_set::RowSetSeed;
+use crate::index::identity_set::IdentitySetSeed;
 pub(crate) use block::*;
 
 use crate::bitmap::Bitmap;
@@ -23,6 +23,9 @@ use std::mem;
 use std::slice::Iter;
 use std::sync::Arc;
 use zerocopy::{Immutable, IntoBytes};
+
+/// Physical row cap that guarantees inline identity and every deletion subset fit.
+pub(crate) const MAX_LWC_ROWS: usize = 15_360;
 
 const LWC_BLOCK_HEADER_SIZE: usize = mem::size_of::<LwcBlockHeader>();
 
@@ -1037,7 +1040,7 @@ struct LwcSnapshot {
     row_count: usize,
     row_ids_len: usize,
     seeds_len: usize,
-    last_seed: Option<RowSetSeed>,
+    last_seed: Option<IdentitySetSeed>,
     stats: Vec<LwcColumnSnapshot>,
 }
 
@@ -1046,7 +1049,7 @@ pub(crate) struct LwcBuilder {
     col_layout: Arc<TableColumnLayout>,
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
-    row_set_seeds: Vec<RowSetSeed>,
+    row_set_seeds: Vec<IdentitySetSeed>,
     stats: Vec<LwcColumnStats>,
 }
 
@@ -1075,7 +1078,6 @@ impl LwcBuilder {
 
     /// Returns the number of rows currently buffered.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved row_count"))]
     pub(crate) fn row_count(&self) -> usize {
         self.buffer.len()
     }
@@ -1087,7 +1089,7 @@ impl LwcBuilder {
     }
 
     /// Returns accepted logical range statistics used for identity planning.
-    pub(crate) fn row_set_seeds(&self) -> &[RowSetSeed] {
+    pub(crate) fn row_set_seeds(&self) -> &[IdentitySetSeed] {
         &self.row_set_seeds
     }
 
@@ -1101,6 +1103,9 @@ impl LwcBuilder {
     /// Panics when the row was not validated against the layout supplied to
     /// [`Self::new`].
     pub(crate) fn append_row_values(&mut self, row_id: RowID, vals: &[Val]) -> bool {
+        if self.row_count() == MAX_LWC_ROWS {
+            return false;
+        }
         let snapshot = self.snapshot_state();
         if self.append_row_values_inner(row_id, vals) {
             true
@@ -1124,6 +1129,9 @@ impl LwcBuilder {
         view: PageVectorView<'_, '_>,
         start_row_id: RowID,
     ) -> bool {
+        if view.rows_non_deleted() > MAX_LWC_ROWS - self.row_count() {
+            return false;
+        }
         let snapshot = self.snapshot_state();
         if self.append_view_inner(view, start_row_id) {
             true
@@ -1142,7 +1150,7 @@ impl LwcBuilder {
         }
         self.scan_page_stats(&view, &new_row_ids);
         self.buffer.scan(view);
-        RowSetSeed::append_page(&mut self.row_set_seeds, &new_row_ids, self.row_ids.len());
+        IdentitySetSeed::append_page(&mut self.row_set_seeds, &new_row_ids, self.row_ids.len());
         self.row_ids.extend(new_row_ids);
         self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
@@ -1151,7 +1159,7 @@ impl LwcBuilder {
         self.scan_row_value_stats(vals);
         self.buffer
             .append_row_values(self.col_layout.as_ref(), vals);
-        RowSetSeed::append_window(&mut self.row_set_seeds, row_id, self.row_ids.len());
+        IdentitySetSeed::append_window(&mut self.row_set_seeds, row_id, self.row_ids.len());
         self.row_ids.push(row_id);
         self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
@@ -1163,10 +1171,9 @@ impl LwcBuilder {
                 .attach("cannot build an empty LWC block"));
         }
         let row_count = self.buffer.len();
-        if row_count > u16::MAX as usize {
+        if row_count > MAX_LWC_ROWS {
             return Err(lwc_block_encoding_contract().attach(format!(
-                "field=row_count, actual={row_count}, maximum={}",
-                u16::MAX
+                "field=row_count, actual={row_count}, maximum={MAX_LWC_ROWS}"
             )));
         }
         let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
@@ -3021,7 +3028,49 @@ mod tests {
         assert_built_rows(builder, &expected_rows);
     }
 
-    /// Purpose: Report a builder row count that exceeds the persisted field's range.
+    /// Purpose: Reject cap-plus-one direct and vector appends without changing accepted builder state.
+    /// Expected: RowIDs, seeds, nullable values, and extrema remain exact after rejection and a final successful append.
+    #[test]
+    fn row_cap_rejection_preserves_builder_state() {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U8,
+                StorageColumnFlags::NULLABLE,
+            )],
+            vec![],
+        )
+        .unwrap();
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+        let expected: Vec<_> = (0..MAX_LWC_ROWS)
+            .map(|i| vec![if i % 3 == 0 { Val::Null } else { Val::U8(7) }])
+            .collect();
+        for (i, row) in expected[..MAX_LWC_ROWS - 1].iter().enumerate() {
+            assert!(builder.append_row_values(RowID::new(i as u64), row));
+        }
+        let rows = builder.row_ids().to_vec();
+        let seeds = builder.row_set_seeds().to_vec();
+        let stats = integer_stats(&builder);
+        let mut page = RowPage::new_test_page();
+        page.init(RowID::new(MAX_LWC_ROWS as u64 - 1), 2, &metadata.col);
+        assert!(page.insert(&metadata.col, &[Val::U8(255)]).is_ok());
+        assert!(page.insert(&metadata.col, &[Val::U8(0)]).is_ok());
+        assert!(!builder.append_view(page.vector_view(&metadata.col), page.header.start_row_id));
+        assert_eq!(builder.row_ids(), rows);
+        assert_eq!(builder.row_set_seeds(), seeds);
+        assert_eq!(integer_stats(&builder), stats);
+        assert!(builder.append_row_values(
+            RowID::new(MAX_LWC_ROWS as u64 - 1),
+            &expected[MAX_LWC_ROWS - 1]
+        ));
+        let seeds = builder.row_set_seeds().to_vec();
+        assert!(!builder.append_row_values(RowID::new(MAX_LWC_ROWS as u64), &[Val::U8(255)]));
+        assert_eq!(builder.row_count(), MAX_LWC_ROWS);
+        assert_eq!(builder.row_set_seeds(), seeds);
+        assert_eq!(integer_stats(&builder), stats);
+        assert_built_rows(builder, &expected);
+    }
+
+    /// Purpose: Defend final serialization against internal state bypassing row-cap admission.
     /// Expected: Building fails with an encoding-contract error identifying the field limit.
     #[test]
     fn test_lwc_builder_reports_reachable_row_count_encoding_contract() {
@@ -3035,13 +3084,13 @@ mod tests {
         .expect("valid table metadata");
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
 
-        for row_no in 0..=u16::MAX {
-            assert!(builder.append_row_values(RowID::new(u64::from(row_no)), &[Val::U8(0)]));
+        for row_no in 0..=MAX_LWC_ROWS {
+            assert!(builder.append_row_values_inner(RowID::new(row_no as u64), &[Val::U8(0)]));
         }
-        assert_eq!(builder.row_count(), u16::MAX as usize + 1);
+        assert_eq!(builder.row_count(), MAX_LWC_ROWS + 1);
 
         let err = match builder.build(0) {
-            Ok(_) => panic!("row count above u16::MAX must fail encoding"),
+            Ok(_) => panic!("row count above the cap must fail encoding"),
             Err(err) => err,
         };
         assert_eq!(
@@ -3050,7 +3099,7 @@ mod tests {
         );
         let report = format!("{err:?}");
         assert!(report.contains("field=row_count"), "{report}");
-        assert!(report.contains("maximum=65535"), "{report}");
+        assert!(report.contains("maximum=15360"), "{report}");
     }
 
     /// Purpose: Collect nullable integer statistics from live non-null row values.

@@ -984,7 +984,6 @@ mod tests {
                 RowID::new(end),
                 &(start..end).map(RowID::new).collect::<Vec<_>>(),
                 &[],
-                Vec::new(),
             )
             .unwrap(),
             buf: page_buf(payload),

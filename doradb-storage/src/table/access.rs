@@ -23,14 +23,13 @@ use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BorrowedIndexMutationStream, ColumnBlockIndex, ColumnBlockScanEntry, ColumnLeafEntry,
-    ColumnScanDeletePlan, CurrentIndexReadHandle, DeferredColumnScanDeletes, IndexBatchStream,
-    IndexCompareExchange, IndexLookupCandidate, IndexMask, KeyRange, LwcRowLocation,
-    NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle, OwnedIndexCandidateStream, RowLocation,
-    SecondaryIndex, UniqueSecondaryIndex,
+    CurrentIndexReadHandle, IndexBatchStream, IndexCompareExchange, IndexLookupCandidate,
+    IndexMask, KeyRange, LwcRowLocation, NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle,
+    OwnedIndexCandidateStream, RowLocation, SecondaryIndex, UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::{LwcBlock, PersistedLwcBlock, PreparedLwcBlock};
-use crate::map::{FastHashMap, FastHashSet};
+use crate::map::FastHashMap;
 use crate::poison::PoisonAwareListener;
 #[cfg(test)]
 use crate::row::Row;
@@ -396,15 +395,16 @@ pub(crate) enum ColdDeleteMask {
 impl ColdDeleteMask {
     fn compile(
         row_count: u16,
-        deleted_ordinals: &[u32],
+        deleted_ordinals: impl IntoIterator<Item = u16>,
         overrides: &[OrdinalVisibilityOverride],
     ) -> DataIntegrityResult<Self> {
-        if deleted_ordinals.is_empty() && overrides.iter().all(|entry| entry.force_visible) {
+        let mut deleted_ordinals = deleted_ordinals.into_iter().peekable();
+        if deleted_ordinals.peek().is_none() && overrides.iter().all(|entry| entry.force_visible) {
             return Ok(ColdDeleteMask::AllVisible);
         }
         let row_count = usize::from(row_count);
         let mut words = vec![0u64; row_count.div_ceil(u64::BITS as usize)];
-        for &ordinal in deleted_ordinals {
+        for ordinal in deleted_ordinals {
             let ordinal = ordinal as usize;
             if ordinal >= row_count {
                 return Err(
@@ -450,15 +450,6 @@ impl ColdDeleteMask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ColdDescriptorDeletes {
-    Ready(ColdDeleteMask),
-    Deferred {
-        deletes: DeferredColumnScanDeletes,
-        overrides: Box<[OrdinalVisibilityOverride]>,
-    },
-}
-
 /// Immutable scan execution metadata for one persisted LWC block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdBlockScanDescriptor {
@@ -468,7 +459,7 @@ pub(crate) struct ColdBlockScanDescriptor {
     row_count: u16,
     row_id_span: u32,
     block_binding_value: u64,
-    deletes: ColdDescriptorDeletes,
+    deletes: ColdDeleteMask,
 }
 
 impl ColdBlockScanDescriptor {
@@ -2015,33 +2006,7 @@ impl<'op> UserTableAccessor<'op> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
         let disk_guard = runtime.pool_guards().disk_guard();
-        let delete_mask = match &descriptor.deletes {
-            ColdDescriptorDeletes::Ready(mask) => mask.clone(),
-            ColdDescriptorDeletes::Deferred { deletes, overrides } => {
-                let ordinals = deletes
-                    .load_ordinals(
-                        file_kind,
-                        storage.file().sparse_file(),
-                        storage.disk_pool(),
-                        disk_guard,
-                    )
-                    .await
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_table_scan_cold_page, phase=load_delete_blob, block_id={}",
-                            descriptor.block_id
-                        )
-                    })?;
-                ColdDeleteMask::compile(descriptor.row_count, &ordinals, overrides)
-                    .change_context(RuntimeError::TableAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_table_scan_cold_page, phase=finalize_delete_mask, block_id={}",
-                            descriptor.block_id
-                        )
-                    })?
-            }
-        };
+        let delete_mask = descriptor.deletes.clone();
         let persisted = storage
             .load_lwc_block(disk_guard, descriptor.block_id)
             .await
@@ -2277,7 +2242,7 @@ impl<'op> UserTableAccessor<'op> {
             column_index.collect_leaf_entries().await.disclose()?
         };
         for entry in entries {
-            let (delete_deltas, row_ids) = {
+            let (identity, durable_deleted) = {
                 let column_index = ColumnBlockIndex::new(
                     column_root,
                     pivot_row_id,
@@ -2287,13 +2252,15 @@ impl<'op> UserTableAccessor<'op> {
                     disk_guard,
                 );
                 column_index
-                    .load_delete_deltas_and_row_ids(&entry)
+                    .load_entry_identity_and_deletions(&entry)
                     .await
                     .disclose()?
             };
-            let durable_deleted =
-                persisted_delete_set_for_scan(file_kind, &entry, delete_deltas).disclose()?;
-            let has_durable_deletes = !durable_deleted.is_empty();
+            let row_ids: Vec<_> = identity
+                .as_ref()
+                .iter_deltas()
+                .map(|delta| entry.start_row_id + u64::from(delta))
+                .collect();
             // A wait before callback selection leaves the cursor on this row so
             // the persisted image and current marker are reloaded. Staged
             // callback output is drained exactly once before any wait.
@@ -2313,7 +2280,7 @@ impl<'op> UserTableAccessor<'op> {
                         deletion_buffer,
                         reader_status.as_ref(),
                         row_id,
-                        has_durable_deletes && durable_deleted.contains(&row_id),
+                        durable_deleted.contains(row_idx as u16),
                     ) {
                         ColdLatestRow::Readable => (),
                         ColdLatestRow::NotFound => {
@@ -3353,36 +3320,6 @@ impl<'op> UserTableAccessor<'op> {
     }
 }
 
-fn persisted_delete_set_for_scan(
-    file_kind: FileKind,
-    entry: &ColumnLeafEntry,
-    delete_deltas: Vec<u32>,
-) -> DataIntegrityResult<FastHashSet<RowID>> {
-    let mut deleted = FastHashSet::default();
-    for delta in delete_deltas {
-        let row_id = entry
-            .start_row_id
-            .checked_add(u64::from(delta))
-            .ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={}, delete delta overflows row id: start_row_id={}, delta={delta}",
-                    entry.block_id(),
-                    entry.start_row_id
-                ))
-            })?;
-        if row_id >= entry.end_row_id() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "file={file_kind}, block=lwc_block, block_id={}, delete delta outside entry range: row_id={row_id}, start_row_id={}, end_row_id={}",
-                entry.block_id(),
-                entry.start_row_id,
-                entry.end_row_id()
-            )));
-        }
-        deleted.insert(row_id);
-    }
-    Ok(deleted)
-}
-
 fn compile_cold_scan_descriptors(
     entries: Vec<ColumnBlockScanEntry>,
     visibility_overrides: &[ColdVisibilityOverride],
@@ -3418,15 +3355,8 @@ fn compile_cold_scan_descriptors(
             }
             next_override += 1;
         }
-        let deletes = match entry.deletes {
-            ColumnScanDeletePlan::InlineOrdinals(ordinals) => ColdDescriptorDeletes::Ready(
-                ColdDeleteMask::compile(entry.row_count, &ordinals, &ordinal_overrides)?,
-            ),
-            ColumnScanDeletePlan::External(deletes) => ColdDescriptorDeletes::Deferred {
-                deletes,
-                overrides: ordinal_overrides.into_boxed_slice(),
-            },
-        };
+        let deletes =
+            ColdDeleteMask::compile(entry.row_count, entry.deletes.iter(), &ordinal_overrides)?;
         descriptors.push(Arc::new(ColdBlockScanDescriptor {
             block_id: entry.block_id,
             start_row_id: entry.start_row_id,
@@ -6669,7 +6599,7 @@ mod tests {
     fn test_cold_delete_mask_applies_cdb_overrides_after_persisted_deletes() {
         let mask = ColdDeleteMask::compile(
             5,
-            &[1, 3],
+            [1, 3],
             &[
                 OrdinalVisibilityOverride {
                     ordinal: 1,
@@ -6691,7 +6621,7 @@ mod tests {
         assert_eq!(
             ColdDeleteMask::compile(
                 2,
-                &[],
+                [],
                 &[OrdinalVisibilityOverride {
                     ordinal: 1,
                     force_visible: true,
@@ -9147,8 +9077,18 @@ mod tests {
             let pool_guards = session.pool_guards();
             let index = snapshot.index(pool_guards.disk_guard());
             let entry = index.locate_block(row_id).await.unwrap().unwrap();
-            let (deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
-            assert!(deltas.contains(&((row_id - entry.start_row_id) as u32)));
+            let (identity, deltas) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
+            assert!(
+                deltas.contains(
+                    identity
+                        .as_ref()
+                        .ordinal_for_delta((row_id - entry.start_row_id) as u32)
+                        .unwrap()
+                )
+            );
 
             let mut trx = session.begin_trx().unwrap();
             assert_eq!(

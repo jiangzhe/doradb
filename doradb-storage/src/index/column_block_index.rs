@@ -4,19 +4,19 @@ use crate::error::{
     RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
 };
 use crate::file::block_integrity::{
-    BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, max_payload_len, validate_block,
-    write_block_checksum, write_block_header,
+    BLOCK_INTEGRITY_HEADER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
+    max_payload_len, validate_block, write_block_checksum, write_block_header,
 };
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::index::column_deletion_blob::{
-    BlobRef, COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST, COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
-    ColumnDeletionBlobReader, ColumnDeletionBlobWriter,
+use crate::index::identity_set::{EncodedRowSet, IdentitySetSeed, RowSetRef};
+use crate::index::ordinal_deletion_set::{
+    OrdinalDeletionSet, OrdinalDeletionSetRef, deletion_body_bound,
 };
-use crate::index::column_row_set::{EncodedRowSet, RowSetRef, RowSetSeed};
 use crate::io::DirectBuf;
 use crate::layout;
+use crate::lwc::MAX_LWC_ROWS;
 use crate::quiescent::QuiescentGuard;
 use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
@@ -42,7 +42,6 @@ pub(crate) const COLUMN_BLOCK_DATA_SIZE: usize =
 /// Serialized byte width of one [`ColumnBlockBranchEntry`].
 pub(crate) const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBranchEntry>();
 /// Bytes occupied by the shared node header plus the leaf-only header extension.
-#[cfg_attr(not(test), expect(dead_code, reason = "pending dead-code audit"))]
 pub(crate) const COLUMN_BLOCK_LEAF_HEADER_SIZE: usize =
     COLUMN_BLOCK_HEADER_SIZE + mem::size_of::<ColumnBlockLeafHeaderExt>();
 
@@ -61,30 +60,18 @@ const COLUMN_BLOCK_LEAF_SEARCH_TYPE_PLAIN: u8 = 1;
 const COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U32: u8 = 2;
 const COLUMN_BLOCK_LEAF_SEARCH_TYPE_DELTA_U16: u8 = 3;
 const COLUMN_ROW_SECTION_VERSION: u8 = 1;
-const COLUMN_DELETE_SECTION_VERSION: u8 = 1;
-const COLUMN_DELETE_DOMAIN_ROW_ID_DELTA: u8 = 1;
-const COLUMN_DELETE_DOMAIN_ORDINAL: u8 = 2;
-const COLUMN_DELETE_CODEC_NONE: u8 = 0;
-const COLUMN_DELETE_CODEC_INLINE_DELTA_LIST: u8 = 1;
-const COLUMN_DELETE_CODEC_EXTERNAL_BLOB: u8 = 2;
-const COLUMN_BLOB_REF_SIZE: usize =
-    mem::size_of::<BlockID>() + mem::size_of::<u16>() + mem::size_of::<u32>();
-const LEGACY_INLINE_DELETE_FIELD_SIZE: usize = 120;
-const LEGACY_INLINE_DELETE_U16_OFFSET: usize = 4;
-const LEGACY_INLINE_DELETE_U32_OFFSET: usize = 4;
-const LEGACY_INLINE_DELETE_U16_CAPACITY: usize =
-    (LEGACY_INLINE_DELETE_FIELD_SIZE - LEGACY_INLINE_DELETE_U16_OFFSET) / 2;
-const LEGACY_INLINE_DELETE_U32_CAPACITY: usize =
-    (LEGACY_INLINE_DELETE_FIELD_SIZE - LEGACY_INLINE_DELETE_U32_OFFSET) / 4;
-// Reserve the largest inline deletion payload, even for an initially live entry.
-const COLUMN_DELETE_RESERVE: usize =
-    COLUMN_DELETE_SECTION_HEADER_SIZE + LEGACY_INLINE_DELETE_U16_CAPACITY * mem::size_of::<u32>();
-const COLUMN_ROW_BODY_LIMIT: usize = COLUMN_BLOCK_LEAF_DATA_SIZE
-    - COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE
-    - COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE
-    - COLUMN_DELETE_RESERVE
-    - mem::size_of::<SectionHeader>();
-const _: () = assert!(COLUMN_DELETE_RESERVE == 240 && COLUMN_ROW_BODY_LIMIT == 65_184);
+const COLUMN_DELETE_SECTION_VERSION: u8 = 2;
+const COLUMN_STANDALONE_FIXED_SIZE: usize = BLOCK_INTEGRITY_HEADER_SIZE
+    + BLOCK_INTEGRITY_TRAILER_SIZE
+    + COLUMN_BLOCK_LEAF_HEADER_SIZE
+    + COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE
+    + COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE
+    + mem::size_of::<SectionHeader>()
+    + COLUMN_DELETE_SECTION_HEADER_SIZE;
+const _: () = assert!(
+    COLUMN_STANDALONE_FIXED_SIZE + 4 * MAX_LWC_ROWS + deletion_body_bound(MAX_LWC_ROWS)
+        <= COLUMN_BLOCK_PAGE_SIZE
+);
 const BLOCK_BINDING_FORMAT_TAG: &[u8; 8] = b"LWCBIND1";
 
 /// Maximum number of logical entries that can fit in one leaf node.
@@ -222,35 +209,6 @@ impl ColumnBlockLeafSearchType {
     }
 }
 
-/// Persisted delete-domain tag stored in v2 leaf prefixes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ColumnDeleteDomain {
-    /// Delete payload units are `start_row_id`-relative row-id deltas.
-    RowIdDelta,
-    /// Delete payload units are row ordinals inside the authoritative row set.
-    Ordinal,
-}
-
-impl ColumnDeleteDomain {
-    #[inline]
-    fn encode(self) -> u8 {
-        match self {
-            ColumnDeleteDomain::RowIdDelta => COLUMN_DELETE_DOMAIN_ROW_ID_DELTA,
-            ColumnDeleteDomain::Ordinal => COLUMN_DELETE_DOMAIN_ORDINAL,
-        }
-    }
-
-    #[inline]
-    fn decode(raw: u8) -> DataIntegrityResult<Self> {
-        match raw {
-            COLUMN_DELETE_DOMAIN_ROW_ID_DELTA => Ok(ColumnDeleteDomain::RowIdDelta),
-            COLUMN_DELETE_DOMAIN_ORDINAL => Ok(ColumnDeleteDomain::Ordinal),
-            _ => Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("invalid column delete domain {raw}"))),
-        }
-    }
-}
-
 #[repr(C)]
 #[derive(
     Clone, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -258,20 +216,18 @@ impl ColumnDeleteDomain {
 struct DeleteSectionHeader {
     kind: u8,
     version: u8,
-    domain: u8,
-    aux: u8,
+    flags: [u8; 2],
     del_count: [u8; 2],
     reserved: [u8; 2],
 }
 
 impl DeleteSectionHeader {
     #[inline]
-    fn new(kind: u8, domain: ColumnDeleteDomain, del_count: u16, aux: u8) -> Self {
-        DeleteSectionHeader {
+    fn new(kind: u8, del_count: u16) -> Self {
+        Self {
             kind,
             version: COLUMN_DELETE_SECTION_VERSION,
-            domain: domain.encode(),
-            aux,
+            flags: [0; 2],
             del_count: del_count.to_le_bytes(),
             reserved: [0; 2],
         }
@@ -280,11 +236,6 @@ impl DeleteSectionHeader {
     #[inline]
     fn del_count(&self) -> u16 {
         u16::from_le_bytes(self.del_count)
-    }
-
-    #[inline]
-    fn domain(&self) -> DataIntegrityResult<ColumnDeleteDomain> {
-        ColumnDeleteDomain::decode(self.domain)
     }
 }
 
@@ -454,8 +405,7 @@ pub(crate) struct ColumnBlockEntryShape {
     start_row_id: RowID,
     end_row_id: RowID,
     row_set: EncodedRowSet,
-    delete_deltas: Vec<u32>,
-    delete_domain: ColumnDeleteDomain,
+    deletions: OrdinalDeletionSet,
     block_binding_value: u64,
 }
 
@@ -466,18 +416,19 @@ impl ColumnBlockEntryShape {
         start_row_id: RowID,
         end_row_id: RowID,
         row_ids: &[RowID],
-        seeds: &[RowSetSeed],
-        mut delete_deltas: Vec<u32>,
+        seeds: &[IdentitySetSeed],
     ) -> ResourceResult<Self> {
-        let row_set = EncodedRowSet::plan(
-            start_row_id,
-            end_row_id,
-            row_ids,
-            seeds,
-            COLUMN_ROW_BODY_LIMIT,
-        )?;
-        delete_deltas.sort_unstable();
-        delete_deltas.dedup();
+        if row_ids.len() > MAX_LWC_ROWS {
+            return Err(
+                Report::new(ResourceError::ColumnBlockEntryCapacityExceeded).attach(format!(
+                    "physical row count {} exceeds {MAX_LWC_ROWS}",
+                    row_ids.len()
+                )),
+            );
+        }
+        let row_set =
+            EncodedRowSet::plan(start_row_id, end_row_id, row_ids, seeds, 4 * row_ids.len())?;
+        let deletions = OrdinalDeletionSet::empty(row_set.row_count() as u16);
         let block_binding_value = calculate_block_binding_value(
             table_id,
             start_row_id,
@@ -488,8 +439,7 @@ impl ColumnBlockEntryShape {
             start_row_id,
             end_row_id,
             row_set,
-            delete_deltas,
-            delete_domain: ColumnDeleteDomain::RowIdDelta,
+            deletions,
             block_binding_value,
         })
     }
@@ -520,14 +470,13 @@ impl ColumnBlockEntryShape {
             end_row_id: self.end_row_id,
             block_id: block_id.into(),
             row_set: self.row_set,
-            delete_deltas: self.delete_deltas,
-            delete_domain: self.delete_domain,
+            deletions: self.deletions,
             block_binding_value: self.block_binding_value,
         }
     }
 }
 
-/// Fully materialized logical leaf entry used by v2 builders and rewrite flows
+/// Fully materialized logical leaf entry used by builders and rewrite flows
 /// after the backing LWC block id is known.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColumnBlockEntryInput {
@@ -535,8 +484,7 @@ pub(crate) struct ColumnBlockEntryInput {
     end_row_id: RowID,
     block_id: BlockID,
     row_set: EncodedRowSet,
-    delete_deltas: Vec<u32>,
-    delete_domain: ColumnDeleteDomain,
+    deletions: OrdinalDeletionSet,
     block_binding_value: u64,
 }
 
@@ -567,8 +515,6 @@ pub(crate) struct ColumnLeafEntry {
     del_count: u16,
     row_id_span: u32,
     first_present_delta: u32,
-    delete_domain: ColumnDeleteDomain,
-    delete_blob_ref: Option<BlobRef>,
     block_binding_value: u64,
 }
 
@@ -598,128 +544,12 @@ impl ColumnLeafEntry {
         self.del_count
     }
 
-    /// Returns the persisted row-id coverage span.
-    #[inline]
-    pub(crate) fn row_id_span(&self) -> u32 {
-        self.row_id_span
-    }
-
-    /// Returns the persisted delete domain used for this leaf entry.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved deletion info"))]
-    pub(crate) fn delete_domain(&self) -> ColumnDeleteDomain {
-        self.delete_domain
-    }
-
-    /// Returns the referenced delete blob when this entry uses external delete
-    /// storage.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved deletion info"))]
-    pub(crate) fn deletion_blob_ref(&self) -> Option<BlobRef> {
-        self.delete_blob_ref
-    }
-
     /// Returns the block binding value bound to this persisted
     /// block-index leaf entry.
     #[inline]
     pub(crate) fn block_binding_value(&self) -> u64 {
         self.block_binding_value
     }
-}
-
-/// Lazy external persisted-delete payload retained by a cold scan descriptor.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DeferredColumnScanDeletes {
-    domain: ColumnDeleteDomain,
-    del_count: u16,
-    blob_ref: BlobRef,
-    codec_version: u8,
-    row_count: u16,
-    identity: Option<EncodedRowSet>,
-}
-
-impl DeferredColumnScanDeletes {
-    /// Load, validate, and normalize the external payload to LWC ordinals.
-    pub(crate) async fn load_ordinals(
-        &self,
-        file_kind: FileKind,
-        file: &Arc<SparseFile>,
-        disk_pool: &QuiescentGuard<ReadonlyBufferPool>,
-        disk_pool_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<Vec<u32>> {
-        let reader = ColumnDeletionBlobReader::new(file_kind, file, disk_pool, disk_pool_guard);
-        let (header, payload) = reader.read_framed_blob(self.blob_ref).await?;
-        if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
-            || header.codec_version() != self.codec_version
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={file_kind}, block=column_deletion_blob, block_id={}, deletion metadata does not match scan descriptor",
-                    self.blob_ref.start_block_id
-                ))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=load_column_scan_delete_ordinals").into());
-        }
-        let values = decode_u32_bytes_strict(&payload, self.del_count)
-            .attach_with(|| {
-                format!(
-                    "file={file_kind}, block=column_deletion_blob, block_id={}",
-                    self.blob_ref.start_block_id
-                )
-            })
-            .change_context(RuntimeError::IndexAccess)
-            .attach("operation=load_column_scan_delete_ordinals")?;
-        match self.domain {
-            ColumnDeleteDomain::Ordinal => {
-                if values
-                    .iter()
-                    .any(|ordinal| *ordinal >= u32::from(self.row_count))
-                {
-                    return Err(invalid_node_payload()
-                        .attach(format!(
-                            "file={file_kind}, block=column_deletion_blob, block_id={}",
-                            self.blob_ref.start_block_id
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=load_column_scan_delete_ordinals")
-                        .into());
-                }
-                Ok(values)
-            }
-            ColumnDeleteDomain::RowIdDelta => {
-                let identity = self.identity.as_ref().ok_or_else(|| {
-                    invalid_node_payload()
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=load_column_scan_delete_ordinals")
-                })?;
-                values
-                    .into_iter()
-                    .map(|delta| {
-                        identity.ordinal_for_delta(delta).ok_or_else(|| {
-                            invalid_node_payload()
-                                .attach(format!(
-                                    "file={file_kind}, block=column_deletion_blob, block_id={}",
-                                    self.blob_ref.start_block_id
-                                ))
-                                .change_context(RuntimeError::IndexAccess)
-                                .attach("operation=load_column_scan_delete_ordinals")
-                        })
-                    })
-                    .collect::<RuntimeResult<Vec<_>>>()
-                    .map_err(Into::into)
-            }
-        }
-    }
-}
-
-/// Persisted delete state already compiled as ordinals or deferred to a blob read.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ColumnScanDeletePlan {
-    /// Inline delete ordinals, empty when the block has no persisted deletes.
-    InlineOrdinals(Vec<u32>),
-    /// External delete metadata that remains lazy until the block is reached.
-    External(DeferredColumnScanDeletes),
 }
 
 /// Scan-ready metadata decoded while its owning column-index leaf is resident.
@@ -740,7 +570,7 @@ pub(crate) struct ColumnBlockScanEntry {
     /// Minimal resolver used only while row-id based metadata needs ordinals.
     pub(crate) identity: EncodedRowSet,
     /// Persisted visibility base for the block.
-    pub(crate) deletes: ColumnScanDeletePlan,
+    pub(crate) deletes: OrdinalDeletionSet,
 }
 
 /// Runtime row resolution result for one persisted columnar row lookup.
@@ -791,74 +621,23 @@ impl ResolvedColumnRow {
     }
 }
 
-/// One authoritative delete-delta rewrite keyed by leaf `start_row_id`.
+/// One complete ordinal deletion replacement keyed by leaf `start_row_id`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ColumnDeleteDeltaPatch<'a> {
+pub(crate) struct ColumnDeletionPatch<'a> {
     /// Existing leaf-entry key to rewrite.
     pub(crate) start_row_id: RowID,
-    /// Replacement delete deltas in ascending row-id-delta order.
-    pub(crate) delete_deltas: &'a [u32],
+    /// Replacement set with the entry's physical row count.
+    pub(crate) deletions: &'a OrdinalDeletionSet,
 }
 
 type LogicalRowSet = EncodedRowSet;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum LogicalDeleteSet {
-    None {
-        domain: ColumnDeleteDomain,
-    },
-    Inline {
-        domain: ColumnDeleteDomain,
-        row_id_deltas: Vec<u32>,
-    },
-    External {
-        domain: ColumnDeleteDomain,
-        del_count: u16,
-        blob_ref: BlobRef,
-        row_id_deltas: Option<Vec<u32>>,
-    },
-}
-
-impl LogicalDeleteSet {
-    #[inline]
-    fn domain(&self) -> ColumnDeleteDomain {
-        match self {
-            LogicalDeleteSet::None { domain }
-            | LogicalDeleteSet::Inline { domain, .. }
-            | LogicalDeleteSet::External { domain, .. } => *domain,
-        }
-    }
-
-    #[inline]
-    fn del_count(&self) -> u16 {
-        match self {
-            LogicalDeleteSet::None { .. } => 0,
-            LogicalDeleteSet::Inline { row_id_deltas, .. } => {
-                storage_count_u16(row_id_deltas.len())
-            }
-            LogicalDeleteSet::External { del_count, .. } => *del_count,
-        }
-    }
-
-    #[inline]
-    fn contains_delta(&self, delta: u32) -> bool {
-        let row_id_deltas = match self {
-            LogicalDeleteSet::None { .. } => return false,
-            LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
-            LogicalDeleteSet::External { row_id_deltas, .. } => row_id_deltas
-                .as_ref()
-                .expect("resolved external delete set must contain decoded row-id deltas"),
-        };
-        row_id_deltas.binary_search(&delta).is_ok()
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogicalLeafEntry {
     start_row_id: RowID,
     block_id: BlockID,
     row_set: LogicalRowSet,
-    delete_set: LogicalDeleteSet,
+    delete_set: OrdinalDeletionSet,
     block_binding_value: u64,
 }
 
@@ -867,7 +646,7 @@ impl LogicalLeafEntry {
         start_row_id: RowID,
         block_id: BlockID,
         row_set: LogicalRowSet,
-        delete_set: LogicalDeleteSet,
+        delete_set: OrdinalDeletionSet,
         block_binding_value: u64,
     ) -> Self {
         LogicalLeafEntry {
@@ -883,7 +662,7 @@ impl LogicalLeafEntry {
 #[derive(Clone, Debug)]
 struct ResolvedLeafPatch {
     start_row_id: RowID,
-    delete_set: LogicalDeleteSet,
+    delete_set: OrdinalDeletionSet,
 }
 
 impl ResolvedLeafPatch {
@@ -909,8 +688,8 @@ struct EncodedLeafEntry {
 
 impl EncodedLeafEntry {
     fn from_logical(entry: &LogicalLeafEntry) -> Self {
-        let row_section = encode_row_section(&entry.row_set, entry.delete_set.domain());
-        let delete_section = encode_delete_section(&entry.row_set, &entry.delete_set);
+        let row_section = encode_row_section(&entry.row_set);
+        let delete_section = encode_delete_section(&entry.delete_set);
         EncodedLeafEntry {
             start_row_id: entry.start_row_id,
             block_id: entry.block_id,
@@ -1334,14 +1113,6 @@ struct DecodedRowSectionMetadata {
     first_present_delta: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DecodedDeleteSectionMetadata {
-    delete_codec: u8,
-    delete_domain: ColumnDeleteDomain,
-    del_count: u16,
-    blob_ref: Option<BlobRef>,
-}
-
 /// Snapshot reader and copy-on-write rewrite façade for one persisted column
 /// block-index tree root.
 pub(crate) struct ColumnBlockIndex<'a> {
@@ -1564,11 +1335,8 @@ impl<'a> ColumnBlockIndex<'a> {
                 else {
                     return Ok(None);
                 };
-                // todo: query deletion flag without full decoding.
-                let delete_set = self
-                    .decode_logical_delete_set(&view, row_set, block_id)
-                    .await?;
-                let durable_deleted = delete_set.contains_delta(delta);
+                let durable_deleted =
+                    deletions_in_view(&view, row_set.row_count()).contains(row_idx as u16);
                 return Ok(Some(build_resolved_row(
                     block_id,
                     &view,
@@ -1585,137 +1353,22 @@ impl<'a> ColumnBlockIndex<'a> {
         }
     }
 
-    /// Loads validated delete deltas and authoritative row ids for one
-    /// persisted entry from one leaf-node read.
-    pub(crate) async fn load_delete_deltas_and_row_ids(
+    /// Loads compact identity and durable ordinal deletions from one admitted leaf.
+    pub(crate) async fn load_entry_identity_and_deletions(
         &self,
         entry: &ColumnLeafEntry,
-    ) -> RuntimeOrFatalResult<(Vec<u32>, Vec<RowID>)> {
+    ) -> RuntimeOrFatalResult<(EncodedRowSet, OrdinalDeletionSet)> {
         let node = self.read_node(entry.leaf_block_id).await?;
         let view = self.read_entry_view(&node, entry)?;
-        let row_set = self
-            .node_result(entry.leaf_block_id, decode_logical_row_set(&view))
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=load_column_delete_deltas_and_row_ids, start_row_id={}",
-                    entry.start_row_id
-                )
-            })?;
-        let delete_set = self
-            .decode_logical_delete_set(&view, row_set.as_ref(), entry.leaf_block_id)
-            .await?;
-        let delete_deltas = match delete_set {
-            LogicalDeleteSet::None { .. } => Vec::new(),
-            LogicalDeleteSet::Inline { row_id_deltas, .. } => row_id_deltas,
-            LogicalDeleteSet::External { row_id_deltas, .. } => row_id_deltas.ok_or_else(|| {
-                invalid_node_payload()
-                    .attach(format!(
-                        "file={}, block=column_block_index, block_id={}",
-                        self.file_kind(),
-                        entry.leaf_block_id
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=load_column_delete_deltas_and_row_ids")
-            })?,
-        };
-        let row_ids = self
-            .node_result(
-                entry.leaf_block_id,
-                decode_row_ids_from_row_set(view.start_row_id, &row_set),
-            )
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=load_column_delete_deltas_and_row_ids, start_row_id={}",
-                    entry.start_row_id
-                )
-            })?;
-        Ok((delete_deltas, row_ids))
-    }
-
-    async fn decode_logical_delete_set(
-        &self,
-        view: &LeafEntryView<'_>,
-        row_set: RowSetRef<'_>,
-        block_id: BlockID,
-    ) -> RuntimeOrFatalResult<LogicalDeleteSet> {
-        let delete_set = self
-            .node_result(block_id, decode_logical_delete_set_base(view, row_set))
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| format!("operation=decode_column_delete_set, block_id={block_id}"))?;
-        let LogicalDeleteSet::External {
-            domain,
-            del_count,
-            blob_ref,
-            ..
-        } = delete_set
-        else {
-            return Ok(delete_set);
-        };
-
-        let reader = ColumnDeletionBlobReader::new(
-            self.file_kind,
-            self.file,
-            self.disk_pool,
-            self.disk_pool_guard,
-        );
-        let (header, payload) = reader.read_framed_blob(blob_ref).await.map_err(|err| {
-            err.attach_with(|| {
-                format!(
-                    "decode column deletion blob: file={}, start_block_id={}",
-                    self.file_kind(),
-                    blob_ref.start_block_id
-                )
-            })
-        })?;
-        if header.blob_kind() != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-            || header.codec_kind() != COLUMN_AUX_BLOB_CODEC_U32_DELTA_LIST
-            || header.codec_version()
-                != view
-                    .delete_header
-                    .ok_or_else(|| {
-                        invalid_node_payload()
-                            .attach(format!(
-                                "file={}, block=column_block_index, block_id={block_id}",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=decode_column_delete_set")
-                    })?
-                    .version
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=column_deletion_blob, block_id={}, deletion metadata does not match column index block {block_id}",
-                    self.file_kind(),
-                    blob_ref.start_block_id
-                ))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=decode_column_delete_set").into());
-        }
-        let row_id_deltas = decode_delete_rows(&payload, del_count, domain, row_set)
-            .attach_with(|| {
-                format!(
-                    "file={}, block=column_deletion_blob, block_id={}",
-                    self.file_kind(),
-                    blob_ref.start_block_id
-                )
-            })
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| format!("operation=decode_column_delete_set, block_id={block_id}"))?;
-        Ok(LogicalDeleteSet::External {
-            domain,
-            del_count,
-            blob_ref,
-            row_id_deltas: Some(row_id_deltas),
-        })
+        let identity = row_set_in_view(&view);
+        let deletions = deletions_in_view(&view, identity.row_count());
+        Ok((identity.to_owned(), deletions.to_owned()))
     }
 
     async fn load_rewrite_context(
         &self,
         start_row_id: RowID,
-    ) -> RuntimeOrFatalResult<(LogicalRowSet, ColumnDeleteDomain)> {
+    ) -> RuntimeOrFatalResult<LogicalRowSet> {
         assert_ne!(
             self.root_block_id, SUPER_BLOCK_ID,
             "column block-index invariant violated: rewrite context requested from empty root, start_row_id={start_row_id}"
@@ -1756,18 +1409,7 @@ impl<'a> ColumnBlockIndex<'a> {
                             "operation=load_column_rewrite_context, start_row_id={start_row_id}"
                         )
                     })?;
-                let delete_domain = self
-                    .node_result(
-                        block_id,
-                        decode_default_delete_domain_from_row_header(view.row_header),
-                    )
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                        )
-                    })?;
-                return Ok((row_set, delete_domain));
+                return Ok(row_set);
             }
             let entries = node.branch_entries();
             let idx = search_branch_entry(entries, start_row_id).unwrap_or_else(|| {
@@ -1842,8 +1484,7 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Collects scan-ready cold-block metadata in ascending row-id order.
     ///
     /// Each leaf prefix plane and entry payload is decoded while its owning
-    /// node is already resident. External delete blobs intentionally remain
-    /// unread until execution reaches their block.
+    /// node is already resident. Compact ordinal deletes travel with the identity.
     pub(crate) async fn collect_scan_entries(
         &self,
     ) -> RuntimeOrFatalResult<Vec<ColumnBlockScanEntry>> {
@@ -1907,7 +1548,7 @@ impl<'a> ColumnBlockIndex<'a> {
     /// Collect all blocks reachable from this column block-index root.
     ///
     /// The traversal validates every visited index node, leaf payload metadata,
-    /// LWC block reference, and external delete blob page chain before adding
+    /// and LWC block reference before adding
     /// the block ids to `out`.
     pub(crate) async fn collect_reachable_blocks(
         &self,
@@ -1917,12 +1558,6 @@ impl<'a> ColumnBlockIndex<'a> {
             return Ok(());
         }
         let mut stack = vec![self.root_block_id];
-        let blob_reader = ColumnDeletionBlobReader::new(
-            self.file_kind,
-            self.file,
-            self.disk_pool,
-            self.disk_pool_guard,
-        );
         while let Some(block_id) = stack.pop() {
             out.insert(block_id);
             let node = self.read_node(block_id).await?;
@@ -1937,26 +1572,6 @@ impl<'a> ColumnBlockIndex<'a> {
                         .change_context(RuntimeError::IndexAccess)
                         .attach("operation=collect_column_reachable_blocks")?;
                     out.insert(view.entry_header.block_id());
-                    let delete_meta = self
-                        .node_result(block_id, decode_delete_section_metadata_from_view(&view))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_reachable_blocks")?;
-                    if delete_meta.delete_codec == COLUMN_DELETE_CODEC_EXTERNAL_BLOB {
-                        let blob_ref = delete_meta.blob_ref.ok_or_else(|| {
-                            invalid_node_payload()
-                                .attach(format!(
-                                    "file={}, block=column_block_index, block_id={block_id}",
-                                    self.file_kind()
-                                ))
-                                .change_context(RuntimeError::IndexAccess)
-                                .attach("operation=collect_column_reachable_blocks")
-                        })?;
-                        blob_reader
-                            .collect_referenced_blocks_with(blob_ref, |blob_block_id| {
-                                out.insert(blob_block_id);
-                            })
-                            .await?;
-                    }
                 }
                 continue;
             }
@@ -1979,44 +1594,37 @@ impl<'a> ColumnBlockIndex<'a> {
         Ok(())
     }
 
-    /// Replaces sorted delete-delta sets keyed by `start_row_id`.
-    pub(crate) async fn batch_replace_delete_deltas<M: MutableCowFile>(
+    /// Replaces complete ordinal deletion sets keyed by `start_row_id`.
+    pub(crate) async fn batch_replace_deletions<M: MutableCowFile>(
         &self,
         mutable_file: &mut M,
-        patches: &[ColumnDeleteDeltaPatch<'_>],
+        patches: &[ColumnDeletionPatch<'_>],
         create_ts: TrxID,
     ) -> RuntimeOrFatalResult<BlockID> {
         if patches.is_empty() {
             return Ok(self.root_block_id);
         }
         assert!(
-            self.root_block_id != SUPER_BLOCK_ID && delete_delta_patches_sorted_unique(patches),
+            self.root_block_id != SUPER_BLOCK_ID && deletion_patches_sorted_unique(patches),
             "column block-index invariant violated: invalid delete-delta batch, root_block_id={}, patch_count={}",
             self.root_block_id,
             patches.len()
         );
 
-        let resolved = {
-            let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
-            let mut resolved = Vec::with_capacity(patches.len());
-            for patch in patches {
-                let (row_set, delete_domain) =
-                    self.load_rewrite_context(patch.start_row_id).await?;
-                let delete_set = build_rewrite_delete_set(
-                    &mut writer,
-                    &row_set,
-                    patch.delete_deltas,
-                    delete_domain,
-                )
-                .await?;
-                resolved.push(ResolvedLeafPatch {
-                    start_row_id: patch.start_row_id,
-                    delete_set,
-                });
-            }
-            writer.finish().await?;
-            resolved
-        };
+        let mut resolved = Vec::with_capacity(patches.len());
+        for patch in patches {
+            let row_set = self.load_rewrite_context(patch.start_row_id).await?;
+            assert_eq!(
+                usize::from(patch.deletions.row_count()),
+                row_set.row_count(),
+                "column deletion replacement physical count: start_row_id={}",
+                patch.start_row_id
+            );
+            resolved.push(ResolvedLeafPatch {
+                start_row_id: patch.start_row_id,
+                delete_set: patch.deletions.clone(),
+            });
+        }
 
         let root_height = self
             .read_node(self.root_block_id)
@@ -2061,15 +1669,7 @@ impl<'a> ColumnBlockIndex<'a> {
             self.end_row_id
         );
 
-        let logical_entries = {
-            let mut writer = ColumnDeletionBlobWriter::new(mutable_file);
-            let mut logical_entries = Vec::with_capacity(entries.len());
-            for entry in entries {
-                logical_entries.push(build_logical_entry_from_input(&mut writer, entry).await?);
-            }
-            writer.finish().await?;
-            logical_entries
-        };
+        let logical_entries: Vec<_> = entries.iter().map(build_logical_entry_from_input).collect();
         if self.root_block_id == SUPER_BLOCK_ID {
             return self
                 .build_tree_from_logical_entries(mutable_file, &logical_entries, create_ts)
@@ -2704,7 +2304,9 @@ fn validate_leaf_prefixes(prefixes: &LeafPrefixPlane<'_>, data: &[u8]) -> DataIn
         if row_header.version != COLUMN_ROW_SECTION_VERSION {
             return Err(invalid_node_payload());
         }
-        decode_default_delete_domain_from_row_header(row_header)?;
+        if row_header.flags != 0 || row_header.aux != 0 {
+            return Err(invalid_node_payload());
+        }
         let rows = RowSetRef::validate(
             row_header.kind,
             &row_section[4..],
@@ -2714,7 +2316,11 @@ fn validate_leaf_prefixes(prefixes: &LeafPrefixPlane<'_>, data: &[u8]) -> DataIn
             row_count: rows.row_count(),
             first_present_delta: rows.delta_for_ordinal(0).ok_or_else(invalid_node_payload)?,
         };
-        if u32::from(row_meta.row_count) > entry_header.row_id_span() {
+        if usize::from(row_meta.row_count) > MAX_LWC_ROWS
+            || row_section.len() - mem::size_of::<SectionHeader>()
+                > 4 * usize::from(row_meta.row_count)
+            || u32::from(row_meta.row_count) > entry_header.row_id_span()
+        {
             return Err(invalid_node_payload());
         }
 
@@ -2723,19 +2329,7 @@ fn validate_leaf_prefixes(prefixes: &LeafPrefixPlane<'_>, data: &[u8]) -> DataIn
         } else {
             Some(&entry_bytes[row_section_end..])
         };
-        let delete_meta = decode_delete_section_metadata(delete_section, row_header)?;
-        if delete_meta.del_count > row_meta.row_count {
-            return Err(invalid_node_payload());
-        }
-        if delete_meta.delete_codec == COLUMN_DELETE_CODEC_INLINE_DELTA_LIST {
-            decode_delete_rows(
-                &delete_section.ok_or_else(invalid_node_payload)?
-                    [COLUMN_DELETE_SECTION_HEADER_SIZE..],
-                delete_meta.del_count,
-                delete_meta.delete_domain,
-                rows,
-            )?;
-        }
+        validate_delete_section(delete_section, row_meta.row_count)?;
         last_end = Some(end_row_id);
         ranges.push((
             prefix.entry_offset as usize,
@@ -2790,51 +2384,20 @@ fn decode_logical_row_set(view: &LeafEntryView<'_>) -> DataIntegrityResult<Logic
     Ok(row_set_in_view(view).to_owned())
 }
 
-fn decode_row_ids_from_row_set(
-    start_row_id: RowID,
-    row_set: &LogicalRowSet,
-) -> DataIntegrityResult<Vec<RowID>> {
-    row_set
-        .as_ref()
-        .iter_deltas()
-        .map(|delta| {
-            start_row_id
-                .checked_add(u64::from(delta))
-                .ok_or_else(invalid_node_payload)
-        })
-        .collect()
+#[inline]
+fn deletions_in_view<'a>(view: &LeafEntryView<'a>, row_count: u16) -> OrdinalDeletionSetRef<'a> {
+    let section = view
+        .delete_header
+        .zip(view.delete_section)
+        .map(|(header, bytes)| (header.kind, &bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..]));
+    OrdinalDeletionSetRef::from_admitted(row_count, section)
 }
 
 fn decode_logical_delete_set_base(
     view: &LeafEntryView<'_>,
     row_set: RowSetRef<'_>,
-) -> DataIntegrityResult<LogicalDeleteSet> {
-    let delete_meta = decode_delete_section_metadata_from_view(view)?;
-    match delete_meta.delete_codec {
-        COLUMN_DELETE_CODEC_NONE => Ok(LogicalDeleteSet::None {
-            domain: delete_meta.delete_domain,
-        }),
-        COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
-            let bytes = view.delete_section.ok_or_else(invalid_node_payload)?;
-            let row_id_deltas = decode_delete_rows(
-                &bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..],
-                delete_meta.del_count,
-                delete_meta.delete_domain,
-                row_set,
-            )?;
-            Ok(LogicalDeleteSet::Inline {
-                domain: delete_meta.delete_domain,
-                row_id_deltas,
-            })
-        }
-        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => Ok(LogicalDeleteSet::External {
-            domain: delete_meta.delete_domain,
-            del_count: delete_meta.del_count,
-            blob_ref: delete_meta.blob_ref.ok_or_else(invalid_node_payload)?,
-            row_id_deltas: None,
-        }),
-        _ => Err(invalid_node_payload()),
-    }
+) -> DataIntegrityResult<OrdinalDeletionSet> {
+    Ok(deletions_in_view(view, row_set.row_count()).to_owned())
 }
 
 fn build_leaf_entry(
@@ -2846,7 +2409,7 @@ fn build_leaf_entry(
         view.row_header,
         view.entry_header.row_id_span(),
     )?;
-    let delete_meta = decode_delete_section_metadata_from_view(view)?;
+    let deletions = deletions_in_view(view, row_meta.row_count);
     Ok(ColumnLeafEntry {
         leaf_block_id,
         start_row_id: view.start_row_id,
@@ -2856,11 +2419,9 @@ fn build_leaf_entry(
             .end_row_id(view.start_row_id)
             .map_err(|_| invalid_node_payload())?,
         row_count: row_meta.row_count,
-        del_count: delete_meta.del_count,
+        del_count: deletions.len() as u16,
         row_id_span: view.entry_header.row_id_span(),
         first_present_delta: row_meta.first_present_delta,
-        delete_domain: delete_meta.delete_domain,
-        delete_blob_ref: delete_meta.blob_ref,
         block_binding_value: view.entry_header.block_binding_value(),
     })
 }
@@ -2868,38 +2429,7 @@ fn build_leaf_entry(
 fn build_scan_entry(view: &LeafEntryView<'_>) -> DataIntegrityResult<ColumnBlockScanEntry> {
     let row_set = decode_logical_row_set(view)?;
     let row_count = u16::try_from(row_set.row_count()).map_err(|_| invalid_node_payload())?;
-    let delete_set = decode_logical_delete_set_base(view, row_set.as_ref())?;
-    let deletes = match delete_set {
-        LogicalDeleteSet::None { .. } => ColumnScanDeletePlan::InlineOrdinals(Vec::new()),
-        LogicalDeleteSet::Inline { row_id_deltas, .. } => {
-            let ordinals = row_id_deltas
-                .into_iter()
-                .map(|delta| {
-                    row_set
-                        .ordinal_for_delta(delta)
-                        .ok_or_else(invalid_node_payload)
-                })
-                .collect::<DataIntegrityResult<Vec<_>>>()?;
-            ColumnScanDeletePlan::InlineOrdinals(ordinals)
-        }
-        LogicalDeleteSet::External {
-            domain,
-            del_count,
-            blob_ref,
-            ..
-        } => {
-            let codec_version = view.delete_header.ok_or_else(invalid_node_payload)?.version;
-            let identity = (domain == ColumnDeleteDomain::RowIdDelta).then(|| row_set.clone());
-            ColumnScanDeletePlan::External(DeferredColumnScanDeletes {
-                domain,
-                del_count,
-                blob_ref,
-                codec_version,
-                row_count,
-                identity,
-            })
-        }
-    };
+    let deletes = deletions_in_view(view, row_count).to_owned();
     Ok(ColumnBlockScanEntry {
         start_row_id: view.start_row_id,
         end_row_id: view
@@ -2930,15 +2460,6 @@ fn build_resolved_row(
     }
 }
 
-fn decode_default_delete_domain_from_row_header(
-    row_header: SectionHeader,
-) -> DataIntegrityResult<ColumnDeleteDomain> {
-    if row_header.flags != 0 {
-        return Err(invalid_node_payload());
-    }
-    decode_delete_domain_or_invalid_node(row_header.aux)
-}
-
 fn decode_row_section_metadata(
     row_section: &[u8],
     row_header: SectionHeader,
@@ -2957,18 +2478,9 @@ fn decode_row_section_metadata(
     })
 }
 
-fn decode_delete_section_metadata(
-    delete_section: Option<&[u8]>,
-    row_header: SectionHeader,
-) -> DataIntegrityResult<DecodedDeleteSectionMetadata> {
-    let default_domain = decode_default_delete_domain_from_row_header(row_header)?;
-    let Some(bytes) = delete_section else {
-        return Ok(DecodedDeleteSectionMetadata {
-            delete_codec: COLUMN_DELETE_CODEC_NONE,
-            delete_domain: default_domain,
-            del_count: 0,
-            blob_ref: None,
-        });
+fn validate_delete_section(bytes: Option<&[u8]>, row_count: u16) -> DataIntegrityResult<()> {
+    let Some(bytes) = bytes else {
+        return Ok(());
     };
     if bytes.len() < COLUMN_DELETE_SECTION_HEADER_SIZE {
         return Err(invalid_node_payload());
@@ -2979,88 +2491,29 @@ fn decode_delete_section_metadata(
         ),
         "delete_section_header",
     )?;
-    decode_delete_section_metadata_with_header(bytes, header, default_domain)
-}
-
-fn decode_delete_section_metadata_from_view(
-    view: &LeafEntryView<'_>,
-) -> DataIntegrityResult<DecodedDeleteSectionMetadata> {
-    let default_domain = decode_default_delete_domain_from_row_header(view.row_header)?;
-    let Some(bytes) = view.delete_section else {
-        return Ok(DecodedDeleteSectionMetadata {
-            delete_codec: COLUMN_DELETE_CODEC_NONE,
-            delete_domain: default_domain,
-            del_count: 0,
-            blob_ref: None,
-        });
-    };
-    let header = view.delete_header.ok_or_else(invalid_node_payload)?;
-    decode_delete_section_metadata_with_header(bytes, header, default_domain)
-}
-
-fn decode_delete_section_metadata_with_header(
-    bytes: &[u8],
-    header: &DeleteSectionHeader,
-    default_domain: ColumnDeleteDomain,
-) -> DataIntegrityResult<DecodedDeleteSectionMetadata> {
-    if header.version != COLUMN_DELETE_SECTION_VERSION || header.reserved != [0; 2] {
+    if header.version != COLUMN_DELETE_SECTION_VERSION
+        || header.flags != [0; 2]
+        || header.reserved != [0; 2]
+    {
         return Err(invalid_node_payload());
     }
-    let delete_domain = header.domain().map_err(|_| invalid_node_payload())?;
-    if delete_domain != default_domain {
-        return Err(invalid_node_payload());
-    }
-    let del_count = header.del_count();
-    if del_count == 0 {
-        return Err(invalid_node_payload());
-    }
-    match header.kind {
-        COLUMN_DELETE_CODEC_INLINE_DELTA_LIST => {
-            let expected_len =
-                COLUMN_DELETE_SECTION_HEADER_SIZE + del_count as usize * mem::size_of::<u32>();
-            if header.aux != 0 || bytes.len() != expected_len {
-                return Err(invalid_node_payload());
-            }
-            Ok(DecodedDeleteSectionMetadata {
-                delete_codec: COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
-                delete_domain,
-                del_count,
-                blob_ref: None,
-            })
-        }
-        COLUMN_DELETE_CODEC_EXTERNAL_BLOB => {
-            if header.aux != COLUMN_AUX_BLOB_KIND_DELETE_DELTAS
-                || bytes.len() != COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE
-            {
-                return Err(invalid_node_payload());
-            }
-            Ok(DecodedDeleteSectionMetadata {
-                delete_codec: COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
-                delete_domain,
-                del_count,
-                blob_ref: Some(
-                    decode_blob_ref(&bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..])
-                        .map_err(|_| invalid_node_payload())?,
-                ),
-            })
-        }
-        _ => Err(invalid_node_payload()),
-    }
+    OrdinalDeletionSetRef::validate(
+        row_count,
+        header.del_count(),
+        header.kind,
+        &bytes[COLUMN_DELETE_SECTION_HEADER_SIZE..],
+    )?;
+    Ok(())
 }
 
-#[inline]
-fn decode_delete_domain_or_invalid_node(raw: u8) -> DataIntegrityResult<ColumnDeleteDomain> {
-    ColumnDeleteDomain::decode(raw).map_err(|_| invalid_node_payload())
-}
-
-fn encode_row_section(row_set: &LogicalRowSet, delete_domain: ColumnDeleteDomain) -> Vec<u8> {
+fn encode_row_section(row_set: &LogicalRowSet) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + row_set.body().len());
     bytes.extend_from_slice(
         &SectionHeader {
             kind: row_set.codec(),
             version: COLUMN_ROW_SECTION_VERSION,
             flags: 0,
-            aux: delete_domain.encode(),
+            aux: 0,
         }
         .encode(),
     );
@@ -3068,49 +2521,15 @@ fn encode_row_section(row_set: &LogicalRowSet, delete_domain: ColumnDeleteDomain
     bytes
 }
 
-fn encode_delete_section(row_set: &LogicalRowSet, delete_set: &LogicalDeleteSet) -> Vec<u8> {
-    match delete_set {
-        LogicalDeleteSet::None { .. } => Vec::new(),
-        LogicalDeleteSet::Inline {
-            domain,
-            row_id_deltas,
-        } => {
-            let delete_values = encode_delete_values(row_id_deltas, row_set, *domain);
-            assert!(
-                inline_delete_values_fit(&delete_values),
-                "column block-index invariant violated: inline delete values exceed capacity"
-            );
-            let header = DeleteSectionHeader::new(
-                COLUMN_DELETE_CODEC_INLINE_DELTA_LIST,
-                *domain,
-                storage_count_u16(delete_values.len()),
-                0,
-            );
-            let mut bytes = Vec::with_capacity(
-                COLUMN_DELETE_SECTION_HEADER_SIZE + mem::size_of_val(delete_values.as_slice()),
-            );
-            bytes.extend_from_slice(layout::bytes_of(&header));
-            for value in delete_values {
-                bytes.extend_from_slice(&value.to_le_bytes());
-            }
-            bytes
-        }
-        LogicalDeleteSet::External {
-            domain, blob_ref, ..
-        } => {
-            let header = DeleteSectionHeader::new(
-                COLUMN_DELETE_CODEC_EXTERNAL_BLOB,
-                *domain,
-                delete_set.del_count(),
-                COLUMN_AUX_BLOB_KIND_DELETE_DELTAS,
-            );
-            let mut bytes =
-                Vec::with_capacity(COLUMN_DELETE_SECTION_HEADER_SIZE + COLUMN_BLOB_REF_SIZE);
-            bytes.extend_from_slice(layout::bytes_of(&header));
-            encode_blob_ref(blob_ref, &mut bytes);
-            bytes
-        }
-    }
+fn encode_delete_section(delete_set: &OrdinalDeletionSet) -> Vec<u8> {
+    let Some(codec) = delete_set.codec() else {
+        return Vec::new();
+    };
+    let header = DeleteSectionHeader::new(codec, storage_count_u16(delete_set.len()));
+    let mut bytes = Vec::with_capacity(COLUMN_DELETE_SECTION_HEADER_SIZE + delete_set.body().len());
+    bytes.extend_from_slice(layout::bytes_of(&header));
+    bytes.extend_from_slice(delete_set.body());
+    bytes
 }
 
 fn encode_leaf_chunk(
@@ -3268,209 +2687,19 @@ fn reserve_tail(arena_end: &mut usize, len: usize, total_len: usize) -> (usize, 
     (start, end)
 }
 
-fn decode_blob_ref(bytes: &[u8]) -> DataIntegrityResult<BlobRef> {
-    if bytes.len() != COLUMN_BLOB_REF_SIZE {
-        return Err(invalid_node_payload().attach(format!(
-            "column deletion blob reference has invalid length {}, expected {COLUMN_BLOB_REF_SIZE}",
-            bytes.len()
-        )));
-    }
-    let start_block_id = BlockID::from(u64::from_le_bytes(
-        bytes[0..8].try_into().map_err(|_| invalid_node_payload())?,
-    ));
-    let start_offset = u16::from_le_bytes(
-        bytes[8..10]
-            .try_into()
-            .map_err(|_| invalid_node_payload())?,
-    );
-    let byte_len = u32::from_le_bytes(
-        bytes[10..14]
-            .try_into()
-            .map_err(|_| invalid_node_payload())?,
-    );
-    if start_block_id == SUPER_BLOCK_ID || byte_len == 0 {
-        return Err(invalid_node_payload().attach(format!(
-            "invalid column deletion blob reference: start_block_id={start_block_id}, byte_len={byte_len}"
-        )));
-    }
-    Ok(BlobRef {
-        start_block_id,
-        start_offset,
-        byte_len,
-    })
-}
-
-fn encode_blob_ref(blob_ref: &BlobRef, out: &mut Vec<u8>) {
-    out.extend_from_slice(&blob_ref.start_block_id.to_le_bytes());
-    out.extend_from_slice(&blob_ref.start_offset.to_le_bytes());
-    out.extend_from_slice(&blob_ref.byte_len.to_le_bytes());
-}
-
-fn decode_delete_rows(
-    bytes: &[u8],
-    expected_count: u16,
-    delete_domain: ColumnDeleteDomain,
-    row_set: RowSetRef<'_>,
-) -> DataIntegrityResult<Vec<u32>> {
-    let delete_values = decode_u32_bytes_strict(bytes, expected_count)?;
-    match delete_domain {
-        ColumnDeleteDomain::RowIdDelta => {
-            if delete_values
-                .iter()
-                .any(|delta| row_set.ordinal_for_delta(*delta).is_none())
-            {
-                return Err(invalid_node_payload());
-            }
-            Ok(delete_values)
-        }
-        ColumnDeleteDomain::Ordinal => {
-            if delete_values
-                .iter()
-                .any(|ordinal| *ordinal >= u32::from(row_set.row_count()))
-            {
-                return Err(invalid_node_payload());
-            }
-            let mut row_id_deltas = Vec::with_capacity(delete_values.len());
-            for ordinal in delete_values {
-                row_id_deltas.push(
-                    row_set
-                        .delta_for_ordinal(
-                            u16::try_from(ordinal).map_err(|_| invalid_node_payload())?,
-                        )
-                        .ok_or_else(invalid_node_payload)?,
-                );
-            }
-            Ok(row_id_deltas)
-        }
-    }
-}
-
-fn decode_u32_bytes_strict(bytes: &[u8], expected_count: u16) -> DataIntegrityResult<Vec<u32>> {
-    if bytes.len() != expected_count as usize * mem::size_of::<u32>() {
-        return Err(invalid_node_payload().attach(format!(
-            "u32 delta payload length {} does not match expected count {expected_count}",
-            bytes.len()
-        )));
-    }
-    let mut res = Vec::with_capacity(expected_count as usize);
-    let mut prev = None;
-    for chunk in bytes.as_chunks::<{ mem::size_of::<u32>() }>().0 {
-        let value = u32::from_le_bytes(*chunk);
-        if let Some(prev_value) = prev
-            && value <= prev_value
-        {
-            return Err(invalid_node_payload().attach(format!(
-                "u32 delta payload is not strictly increasing: previous={prev_value}, current={value}"
-            )));
-        }
-        prev = Some(value);
-        res.push(value);
-    }
-    Ok(res)
-}
-
-fn encode_u32_values_bytes(values: &[u32]) -> Vec<u8> {
-    storage_count_u16(values.len());
-    assert!(
-        delete_deltas_sorted_unique(values),
-        "column block-index invariant violated: u32 values are not strictly sorted and unique"
-    );
-    let mut out = Vec::with_capacity(mem::size_of_val(values));
-    for value in values {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
-}
-
-fn encode_delete_values(
-    row_id_deltas: &[u32],
-    row_set: &LogicalRowSet,
-    delete_domain: ColumnDeleteDomain,
-) -> Vec<u32> {
-    assert!(
-        delete_deltas_sorted_unique(row_id_deltas),
-        "column block-index invariant violated: delete deltas are not strictly sorted and unique"
-    );
-    match delete_domain {
-        ColumnDeleteDomain::RowIdDelta => {
-            assert!(
-                row_id_deltas
-                    .iter()
-                    .all(|delta| row_set.contains_delta(*delta)),
-                "column block-index invariant violated: delete delta is absent from row set"
-            );
-            row_id_deltas.to_vec()
-        }
-        ColumnDeleteDomain::Ordinal => {
-            let mut ordinals = Vec::with_capacity(row_id_deltas.len());
-            for delta in row_id_deltas {
-                ordinals.push(row_set.ordinal_for_delta(*delta).unwrap_or_else(|| {
-                    panic!("column block-index invariant violated: delete delta has no ordinal")
-                }));
-            }
-            ordinals
-        }
-    }
-}
-
-async fn build_rewrite_delete_set<M: MutableCowFile>(
-    writer: &mut ColumnDeletionBlobWriter<'_, M>,
-    row_set: &LogicalRowSet,
-    delete_deltas: &[u32],
-    delete_domain: ColumnDeleteDomain,
-) -> RuntimeResult<LogicalDeleteSet> {
-    if delete_deltas.is_empty() {
-        return Ok(LogicalDeleteSet::None {
-            domain: delete_domain,
-        });
-    }
-    let delete_values = encode_delete_values(delete_deltas, row_set, delete_domain);
-    if inline_delete_values_fit(&delete_values) {
-        return Ok(LogicalDeleteSet::Inline {
-            domain: delete_domain,
-            row_id_deltas: delete_deltas.to_vec(),
-        });
-    }
-    let bytes = encode_u32_values_bytes(&delete_values);
-    let blob_ref = writer.append_delete_payload(&bytes).await?;
-    Ok(LogicalDeleteSet::External {
-        domain: delete_domain,
-        del_count: storage_count_u16(delete_deltas.len()),
-        blob_ref,
-        row_id_deltas: Some(delete_deltas.to_vec()),
-    })
-}
-
-async fn build_logical_entry_from_input<M: MutableCowFile>(
-    writer: &mut ColumnDeletionBlobWriter<'_, M>,
-    input: &ColumnBlockEntryInput,
-) -> RuntimeResult<LogicalLeafEntry> {
+fn build_logical_entry_from_input(input: &ColumnBlockEntryInput) -> LogicalLeafEntry {
     assert_ne!(
         input.block_id, SUPER_BLOCK_ID,
-        "column block-index invariant violated: entry points to empty-root sentinel, start_row_id={}, end_row_id={}",
-        input.start_row_id, input.end_row_id
+        "column entry points to empty-root sentinel: start_row_id={}",
+        input.start_row_id
     );
-    let row_set = input.row_set.clone();
-    let delete_set =
-        build_rewrite_delete_set(writer, &row_set, &input.delete_deltas, input.delete_domain)
-            .await?;
-    Ok(LogicalLeafEntry::new(
+    LogicalLeafEntry::new(
         input.start_row_id,
         input.block_id,
-        row_set,
-        delete_set,
+        input.row_set.clone(),
+        input.deletions.clone(),
         input.block_binding_value,
-    ))
-}
-
-fn inline_delete_values_fit(values: &[u32]) -> bool {
-    storage_count_u16(values.len());
-    let fits_u16 = values.iter().all(|value| *value <= u16::MAX as u32);
-    if fits_u16 {
-        values.len() <= LEGACY_INLINE_DELETE_U16_CAPACITY
-    } else {
-        values.len() <= LEGACY_INLINE_DELETE_U32_CAPACITY
-    }
+    )
 }
 
 #[inline]
@@ -3493,15 +2722,8 @@ fn entry_inputs_sorted(entries: &[ColumnBlockEntryInput]) -> bool {
         .all(|pair| pair[0].start_row_id() < pair[1].start_row_id())
 }
 
-fn delete_deltas_sorted_unique(deltas: &[u32]) -> bool {
-    deltas.windows(2).all(|pair| pair[0] < pair[1])
-}
-
-fn delete_delta_patches_sorted_unique(patches: &[ColumnDeleteDeltaPatch<'_>]) -> bool {
+fn deletion_patches_sorted_unique(patches: &[ColumnDeletionPatch<'_>]) -> bool {
     patches_sorted_unique_by_start_row_id(patches, |patch| patch.start_row_id)
-        && patches
-            .iter()
-            .all(|patch| delete_deltas_sorted_unique(patch.delete_deltas))
 }
 
 fn patches_sorted_unique_by_start_row_id<P, F>(patches: &[P], mut key: F) -> bool
@@ -3556,6 +2778,7 @@ pub(super) mod tests {
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::path::Path;
+    use std::slice;
     use std::sync::Arc;
 
     const COLUMN_ROW_CODEC_DENSE: u8 = 1;
@@ -3570,27 +2793,37 @@ pub(super) mod tests {
             RowID::new(0),
             test_block_id(10),
             row_set,
-            LogicalDeleteSet::None {
-                domain: ColumnDeleteDomain::RowIdDelta,
-            },
+            OrdinalDeletionSet::empty(5),
             0,
         );
         let encoded = EncodedLeafEntry::from_logical(&entry);
-        let mut page = vec![0; COLUMN_BLOCK_PAGE_SIZE];
-        let start = write_block_header(&mut page, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
-        let header = ColumnBlockNodeHeader::new(0, 1, RowID::new(0), TrxID::new(1));
-        page[start..start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(layout::bytes_of(&header));
-        encode_leaf_chunk(
-            &mut page[start + COLUMN_BLOCK_HEADER_SIZE..start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE],
-            &[encoded],
-            ColumnBlockLeafSearchType::DeltaU16,
-        );
-        write_block_checksum(&mut page);
-        page
+        encoded_leaf_page(&[encoded])
     }
 
-    /// Corrupts leaf delete codec for an integrity test.
+    /// Builds an admitted leaf with inline deletion bytes for cache-corruption tests.
+    pub(crate) fn inline_deletion_leaf_fixture() -> Vec<u8> {
+        let input =
+            dense_entry_with_deletions(RowID::new(0), RowID::new(8), &[1, 4], test_block_id(10));
+        let encoded = EncodedLeafEntry::from_logical(&build_logical_entry_from_input(&input));
+        encoded_leaf_page(&[encoded])
+    }
+
+    /// Corrupts the codec of an existing nonempty inline deletion section.
     pub(crate) fn corrupt_leaf_delete_codec(
+        path: impl AsRef<Path>,
+        page_id: impl Into<u64>,
+        prefix_idx: usize,
+    ) {
+        rewrite_page_with_checksum(path, page_id, |page| {
+            let offset = leaf_entry_payload_offset(page, prefix_idx);
+            let row_len =
+                u16::from_le_bytes(page[offset + 22..offset + 24].try_into().unwrap()) as usize;
+            page[offset + COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + row_len] = 0xff;
+        });
+    }
+
+    /// Corrupts the reserved row-header byte for an integrity test.
+    pub(crate) fn corrupt_leaf_reserved(
         path: impl AsRef<Path>,
         page_id: impl Into<u64>,
         prefix_idx: usize,
@@ -3655,6 +2888,42 @@ pub(super) mod tests {
         });
     }
 
+    fn encoded_leaf_page(entries: &[EncodedLeafEntry]) -> Vec<u8> {
+        let mut page = vec![0; COLUMN_BLOCK_PAGE_SIZE];
+        let start = write_block_header(&mut page, COLUMN_BLOCK_INDEX_BLOCK_SPEC);
+        let header = ColumnBlockNodeHeader::new(
+            0,
+            entries.len() as u32,
+            entries[0].start_row_id,
+            TrxID::new(1),
+        );
+        page[start..start + COLUMN_BLOCK_HEADER_SIZE].copy_from_slice(layout::bytes_of(&header));
+        encode_leaf_chunk(
+            &mut page[start + COLUMN_BLOCK_HEADER_SIZE..start + COLUMN_BLOCK_NODE_PAYLOAD_SIZE],
+            entries,
+            select_leaf_search_type(entries),
+        );
+        write_block_checksum(&mut page);
+        page
+    }
+
+    fn dense_logical(start: u64, count: u16) -> LogicalLeafEntry {
+        LogicalLeafEntry::new(
+            RowID::new(start),
+            BlockID::new(1_000_000 + start),
+            RowSetRef::validate(1, &[], u32::from(count))
+                .unwrap()
+                .to_owned(),
+            OrdinalDeletionSet::empty(count),
+            calculate_block_binding_value(
+                test_user_table_id(1),
+                RowID::new(start),
+                RowID::new(start + u64::from(count)),
+                u32::from(count),
+            ),
+        )
+    }
+
     fn leaf_entry_payload_offset(page: &[u8], prefix_idx: usize) -> usize {
         const SEARCH_TYPE_PLAIN: u8 = 1;
         const SEARCH_TYPE_DELTA_U32: u8 = 2;
@@ -3708,7 +2977,7 @@ pub(super) mod tests {
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
         let row_ids = test_row_id_range(start.as_u64(), end.as_u64());
-        ColumnBlockEntryShape::new(test_user_table_id(1), start, end, &row_ids, &[], Vec::new())
+        ColumnBlockEntryShape::new(test_user_table_id(1), start, end, &row_ids, &[])
             .unwrap()
             .with_block_id(block_id)
     }
@@ -3730,30 +2999,21 @@ pub(super) mod tests {
         row_ids: Vec<RowID>,
         block_id: impl Into<BlockID>,
     ) -> ColumnBlockEntryInput {
-        ColumnBlockEntryShape::new(test_user_table_id(1), start, end, &row_ids, &[], Vec::new())
+        ColumnBlockEntryShape::new(test_user_table_id(1), start, end, &row_ids, &[])
             .unwrap()
             .with_block_id(block_id)
     }
 
-    fn dense_entry_with_delete_domain(
+    fn dense_entry_with_deletions(
         start: RowID,
         end: RowID,
-        delete_deltas: Vec<u32>,
-        delete_domain: ColumnDeleteDomain,
-        block_id: impl Into<BlockID>,
+        ordinals: &[u16],
+        block_id: BlockID,
     ) -> ColumnBlockEntryInput {
-        let row_ids = test_row_id_range(start.as_u64(), end.as_u64());
-        let mut shape = ColumnBlockEntryShape::new(
-            test_user_table_id(1),
-            start,
-            end,
-            &row_ids,
-            &[],
-            delete_deltas,
-        )
-        .unwrap();
-        shape.delete_domain = delete_domain;
-        shape.with_block_id(block_id)
+        let mut input = dense_entry(start, end, block_id);
+        input.deletions =
+            OrdinalDeletionSet::from_ordinals(input.row_set.row_count() as u16, ordinals).unwrap();
+        input
     }
 
     async fn assert_search_type_lookup(
@@ -3817,6 +3077,397 @@ pub(super) mod tests {
         );
     }
 
+    /// Purpose: Repack growing middle entries, propagate leaf splits through a full branch, and retain old-root visibility.
+    /// Expected: Root height grows, untouched children stay referenced, and later all-deleted shrinkage preserves identity and neighboring lookups.
+    #[test]
+    fn deletion_growth_splits_full_branch_and_preserves_old_root() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata(), false)
+                .unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+            let guard = pool.create_base_guard();
+            let make_index = |root, end| {
+                ColumnBlockIndex::new(
+                    root,
+                    RowID::new(end),
+                    pool.file_kind(),
+                    pool.sparse_file(),
+                    pool.global_pool(),
+                    &guard,
+                )
+            };
+            let empty = make_index(SUPER_BLOCK_ID, 0);
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                pool.global_pool().clone(),
+                guard.clone(),
+            );
+            // Compact dense identities fill one leaf; a later bitmap expands its middle entry.
+            let count = MAX_LWC_ROWS as u16;
+            let entries: Vec<_> = (0..1920)
+                .map(|i| dense_logical(i * u64::from(count), count))
+                .collect();
+            let mut children = empty
+                .write_leaf_pages_from_logical_entries(&mut mutable, &entries, TrxID::new(2))
+                .await
+                .unwrap();
+            assert_eq!(children.len(), 1);
+            let mut next = 1920 * u64::from(count);
+            for _ in 1..COLUMN_BLOCK_MAX_BRANCH_ENTRIES {
+                children.extend(
+                    empty
+                        .write_leaf_pages_from_logical_entries(
+                            &mut mutable,
+                            &[dense_logical(next, 1)],
+                            TrxID::new(2),
+                        )
+                        .await
+                        .unwrap(),
+                );
+                next += 1;
+            }
+            let branches = empty
+                .write_branch_pages(&mut mutable, &children, 1, TrxID::new(2))
+                .await
+                .unwrap();
+            assert_eq!(branches.len(), 1);
+            let original = make_index(branches[0].block_id(), next);
+            let target = entries[960].start_row_id;
+            let single = OrdinalDeletionSet::from_ordinals(count, &[1]).unwrap();
+            let small_root = original
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: target,
+                        deletions: &single,
+                    }],
+                    TrxID::new(3),
+                )
+                .await
+                .unwrap();
+            let small = make_index(small_root, next);
+            assert_eq!(
+                small
+                    .read_node(small_root)
+                    .await
+                    .unwrap()
+                    .header_ref()
+                    .height(),
+                1
+            );
+            let ordinals: Vec<_> = (0..count).step_by(2).collect();
+            let bitmap = OrdinalDeletionSet::from_ordinals(count, &ordinals).unwrap();
+            let grown_root = small
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: target,
+                        deletions: &bitmap,
+                    }],
+                    TrxID::new(4),
+                )
+                .await
+                .unwrap();
+            let grown = make_index(grown_root, next);
+            assert_eq!(
+                grown
+                    .read_node(grown_root)
+                    .await
+                    .unwrap()
+                    .header_ref()
+                    .height(),
+                2
+            );
+            let all =
+                OrdinalDeletionSet::from_ordinals(count, &(0..count).collect::<Vec<_>>()).unwrap();
+            let shrunk_root = grown
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: target,
+                        deletions: &all,
+                    }],
+                    TrxID::new(5),
+                )
+                .await
+                .unwrap();
+            let shrunk = make_index(shrunk_root, next);
+            for (index, expected_deletes) in [
+                (&original, 0),
+                (&small, 1),
+                (&grown, ordinals.len()),
+                (&shrunk, usize::from(count)),
+            ] {
+                let mut refs = Vec::new();
+                let mut stack = vec![index.root_block_id];
+                while let Some(block_id) = stack.pop() {
+                    let node = index.read_node(block_id).await.unwrap();
+                    if node.header_ref().height() == 1 {
+                        refs.extend_from_slice(node.branch_entries());
+                    } else {
+                        stack.extend(
+                            node.branch_entries()
+                                .iter()
+                                .rev()
+                                .map(ColumnBlockBranchEntry::block_id),
+                        );
+                    }
+                }
+                let split = usize::from(expected_deletes > 1);
+                assert_eq!(refs.len(), children.len() + split);
+                assert_eq!(
+                    &refs[1 + split..],
+                    &children[1..],
+                    "untouched child references"
+                );
+                for expected in &entries {
+                    let entry = index
+                        .locate_block(expected.start_row_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let (identity, deletions) = index
+                        .load_entry_identity_and_deletions(&entry)
+                        .await
+                        .unwrap();
+                    assert_eq!(identity, expected.row_set);
+                    assert_eq!(entry.block_binding_value(), expected.block_binding_value);
+                    assert_eq!(entry.block_id(), expected.block_id);
+                    assert_eq!(
+                        deletions.len(),
+                        if entry.start_row_id == target {
+                            expected_deletes
+                        } else {
+                            0
+                        }
+                    );
+                }
+                for ordinal in [0, 1, 2, count - 1] {
+                    let resolved = index
+                        .locate_and_resolve_row(target + u64::from(ordinal))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(resolved.row_idx(), usize::from(ordinal));
+                    let deleted = match expected_deletes {
+                        0 => false,
+                        1 => ordinal == 1,
+                        n if n == usize::from(count) => true,
+                        _ => ordinal % 2 == 0,
+                    };
+                    assert_eq!(resolved.durable_deleted(), deleted);
+                }
+            }
+        });
+    }
+
+    /// Purpose: Recalculate compact prefix widths when a deletion splits an exactly packed leaf.
+    /// Expected: A u32-prefix leaf splits into a u32-prefix leaf and a single-entry u16-prefix leaf with intact offsets.
+    #[test]
+    fn deletion_split_reselects_prefix_width() {
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table = fs
+                .create_table_file(test_user_table_id(1), metadata(), false)
+                .unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let global = global_readonly_pool_scope(64 * 1024 * 1024);
+            let pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+            let guard = pool.create_base_guard();
+            let index = ColumnBlockIndex::new(
+                SUPER_BLOCK_ID,
+                RowID::new(0),
+                pool.file_kind(),
+                pool.sparse_file(),
+                pool.global_pool(),
+                &guard,
+            );
+            let mut mutable = MutableTableFile::fork(
+                &table,
+                fs.background_writes(),
+                pool.global_pool().clone(),
+                guard.clone(),
+            );
+            let entries: Vec<_> = (0..1925).map(|i| dense_logical(i * 64, 8)).collect();
+            let root = index
+                .build_tree_from_logical_entries(&mut mutable, &entries, TrxID::new(2))
+                .await
+                .unwrap();
+            let index = ColumnBlockIndex::new(
+                root,
+                RowID::new(1925 * 64),
+                pool.file_kind(),
+                pool.sparse_file(),
+                pool.global_pool(),
+                &guard,
+            );
+            let deletes = OrdinalDeletionSet::from_ordinals(8, &[1]).unwrap();
+            let updated = index
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: entries[900].start_row_id,
+                        deletions: &deletes,
+                    }],
+                    TrxID::new(3),
+                )
+                .await
+                .unwrap();
+            let branch = index.read_node(updated).await.unwrap();
+            assert_eq!(branch.header_ref().height(), 1);
+            assert_eq!(branch.branch_entries().len(), 2);
+            for (child, search) in branch.branch_entries().iter().zip([
+                ColumnBlockLeafSearchType::DeltaU32,
+                ColumnBlockLeafSearchType::DeltaU16,
+            ]) {
+                let leaf = index.read_node(child.block_id()).await.unwrap();
+                assert_eq!(leaf.leaf_prefix_plane().unwrap().search_type(), search);
+            }
+            let current = ColumnBlockIndex::new(
+                updated,
+                RowID::new(1925 * 64),
+                pool.file_kind(),
+                pool.sparse_file(),
+                pool.global_pool(),
+                &guard,
+            );
+            for entry in entries {
+                let row = current
+                    .locate_and_resolve_row(entry.start_row_id + 1)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.row_idx(), 1);
+                assert_eq!(row.block_binding_value(), entry.block_binding_value);
+                assert_eq!(
+                    row.durable_deleted(),
+                    entry.start_row_id == RowID::new(900 * 64)
+                );
+            }
+        });
+    }
+
+    /// Purpose: Independently account for the worst supported identity and deletion bodies in a complete leaf.
+    /// Expected: The cap serializes in 63,604 bytes including framing, while 16,384 rows cannot meet the bound.
+    #[test]
+    fn standalone_capacity_bound_matches_serialization() {
+        assert_eq!(COLUMN_STANDALONE_FIXED_SIZE, 120);
+        assert_eq!(120 + 4 * 16_384 + deletion_body_bound(16_384), 67_836);
+        for count in [1, 63, 64, 65, 4096, MAX_LWC_ROWS] {
+            let rows: Vec<_> = (0..count).map(|i| RowID::new(i as u64 * 100003)).collect();
+            let mut input = sparse_entry(
+                RowID::new(0),
+                RowID::new(count as u64 * 100003),
+                rows,
+                test_block_id(1001),
+            );
+            input.deletions = OrdinalDeletionSet::from_ordinals(
+                count as u16,
+                &(0..count as u16).step_by(2).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let encoded = EncodedLeafEntry::from_logical(&build_logical_entry_from_input(&input));
+            let actual = 48
+                + 32
+                + leaf_chunk_encoded_len(
+                    slice::from_ref(&encoded),
+                    ColumnBlockLeafSearchType::DeltaU16,
+                );
+            assert!(actual <= 120 + 4 * count + deletion_body_bound(count));
+            if count == MAX_LWC_ROWS {
+                assert_eq!(input.row_set.body().len(), 61_440);
+                assert_eq!(input.deletions.body().len(), 2_044);
+                assert_eq!(actual, 63_604);
+            }
+            let page = encoded_leaf_page(&[encoded]);
+            validate_persisted_column_block_index_page(
+                &page,
+                FileKind::TableFile,
+                test_block_id(1),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Purpose: Enforce new-format count and representation bounds even for structurally valid integer sets.
+    /// Expected: Oversized dense identity, inefficient identity bitmap, and oversized deletion list all fail admission.
+    #[test]
+    fn rejects_valid_codecs_outside_capacity_contract() {
+        let input = dense_entry(RowID::new(0), RowID::new(8), test_block_id(1001));
+        let base = EncodedLeafEntry::from_logical(&build_logical_entry_from_input(&input));
+        let mut dense = base.clone();
+        dense.row_id_span = MAX_LWC_ROWS as u32 + 1;
+        let mut bitmap = base.clone();
+        bitmap.row_id_span = 64;
+        bitmap.row_section = vec![6, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let mut deletion = base;
+        deletion.row_id_span = MAX_LWC_ROWS as u32;
+        deletion.delete_section = vec![3, 2, 0, 0, 0x4c, 4, 0, 0]; // 1,100 sorted ordinals.
+        deletion
+            .delete_section
+            .extend((0..1100u16).flat_map(u16::to_le_bytes));
+        for (case, encoded) in [
+            ("physical count", dense),
+            ("identity body", bitmap),
+            ("deletion body", deletion),
+        ] {
+            let page = encoded_leaf_page(&[encoded]);
+            let err = validate_persisted_column_block_index_page(
+                &page,
+                FileKind::TableFile,
+                test_block_id(1),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "{case}"
+            );
+        }
+    }
+
+    /// Purpose: Validate deletion framing and redundant cardinality before a leaf enters the cache.
+    /// Expected: Unknown codecs, versions, flags, reserved bytes, and mismatched counts return typed payload errors.
+    #[test]
+    fn rejects_corrupt_inline_deletion_headers() {
+        let original = inline_deletion_leaf_fixture();
+        let offset =
+            leaf_entry_payload_offset(&original, 0) + COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE + 4;
+        for (field, value) in [
+            (0, 0xff),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 0),
+            (4, 3),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+        ] {
+            let mut page = original.clone();
+            page[offset + field] = value;
+            write_block_checksum(&mut page);
+            let err = validate_persisted_column_block_index_page(
+                &page,
+                FileKind::TableFile,
+                test_block_id(1),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "field={field}"
+            );
+        }
+    }
+
     /// Purpose: Protect translation from row-id deltas to dense and sparse scan ordinals.
     /// Expected: Present deltas map to their physical positions and gaps or out-of-range deltas are absent.
     #[test]
@@ -3826,7 +3477,7 @@ pub(super) mod tests {
             RowID::new(4),
             &test_row_id_range(0, 4),
             &[],
-            COLUMN_ROW_BODY_LIMIT,
+            4 * MAX_LWC_ROWS,
         )
         .unwrap();
         assert!(dense.body().is_empty());
@@ -3840,7 +3491,7 @@ pub(super) mod tests {
             RowID::new(10),
             &test_row_ids([1, 4, 9]),
             &[],
-            COLUMN_ROW_BODY_LIMIT,
+            4 * MAX_LWC_ROWS,
         )
         .unwrap();
         assert_eq!(sparse.ordinal_for_delta(1), Some(0));
@@ -3892,12 +3543,12 @@ pub(super) mod tests {
         }
     }
 
-    /// Purpose: Reject the former fingerprint leaf header before parsing its offsets.
+    /// Purpose: Reject the previous index envelope before parsing any legacy deletion metadata.
     /// Expected: A checksummed old-version node fails with InvalidVersion.
     #[test]
     fn column_index_rejects_previous_binding_format() {
         let mut page = adaptive_leaf_fixture();
-        page[8..16].copy_from_slice(&2u64.to_le_bytes());
+        page[8..16].copy_from_slice(&3u64.to_le_bytes());
         write_block_checksum(&mut page);
         let err = validate_persisted_column_block_index_page(
             &page,
@@ -3979,16 +3630,18 @@ pub(super) mod tests {
     /// Expected: Every bound field affects the value; equal summaries and index-only changes preserve it.
     #[test]
     fn block_binding_value_tracks_only_table_bounds_and_count() {
-        let make_shape = |table, start, end, rows: &[RowID], deletes| {
-            ColumnBlockEntryShape::new(
+        let make_shape = |table, start, end, rows: &[RowID], deletes: Vec<u16>| {
+            let mut shape = ColumnBlockEntryShape::new(
                 TableID::new(table),
                 RowID::new(start),
                 RowID::new(end),
                 rows,
                 &[],
-                deletes,
             )
-            .unwrap()
+            .unwrap();
+            shape.deletions =
+                OrdinalDeletionSet::from_ordinals(rows.len() as u16, &deletes).unwrap();
+            shape
         };
         let rows = test_row_ids([12, 15, 18]);
         let base = make_shape(1, 10, 20, &rows, Vec::new());
@@ -4003,7 +3656,7 @@ pub(super) mod tests {
         }
         assert_eq!(
             binding,
-            make_shape(1, 10, 20, &test_row_ids([12, 16, 18]), vec![6]).block_binding_value()
+            make_shape(1, 10, 20, &test_row_ids([12, 16, 18]), vec![1]).block_binding_value()
         );
         assert_eq!(
             binding,
@@ -4021,17 +3674,8 @@ pub(super) mod tests {
     /// Expected: Decoding reports invalid payload with column-index corruption context.
     #[test]
     fn test_decode_delete_section_metadata_rejects_short_header() {
-        let row_header = SectionHeader {
-            kind: COLUMN_ROW_CODEC_DENSE,
-            version: COLUMN_ROW_SECTION_VERSION,
-            flags: 0,
-            aux: ColumnDeleteDomain::Ordinal.encode(),
-        };
-        let err = decode_delete_section_metadata(
-            Some(&[0u8; COLUMN_DELETE_SECTION_HEADER_SIZE - 1]),
-            row_header,
-        )
-        .unwrap_err();
+        let err = validate_delete_section(Some(&[0u8; COLUMN_DELETE_SECTION_HEADER_SIZE - 1]), 8)
+            .unwrap_err();
         assert_column_index_corruption(
             err.attach(format!(
                 "file={}, block=column_block_index, block_id={}",
@@ -4044,37 +3688,25 @@ pub(super) mod tests {
         );
     }
 
-    /// Purpose: Enforce the persisted identity cardinality limit before submission.
-    /// Expected: Oversized identity returns the typed capacity error without truncation.
+    /// Purpose: Enforce the common physical row cap before allocating index bytes.
+    /// Expected: Cap-plus-one identity returns the typed capacity error even for dense rows.
     #[test]
-    fn test_encode_row_section_rejects_row_count_above_u16() {
-        let err = ColumnBlockEntryShape::new(
-            test_user_table_id(1),
-            RowID::new(0),
-            RowID::new(65536),
-            &test_row_id_range(0, 65536),
-            &[],
-            Vec::new(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.current_context(),
-            &ResourceError::ColumnBlockEntryCapacityExceeded
-        );
-    }
-
-    /// Purpose: Enforce the persisted deletion-count limit for inline delete sets.
-    /// Expected: An oversized delete set is rejected without truncating its count.
-    #[test]
-    #[should_panic(
-        expected = "column block-index invariant violated: count 65536 exceeds u16 storage"
-    )]
-    fn test_logical_delete_set_rejects_delete_count_above_u16() {
-        let delete_set = LogicalDeleteSet::Inline {
-            domain: ColumnDeleteDomain::RowIdDelta,
-            row_id_deltas: (0..=u16::MAX as u32).collect(),
-        };
-        delete_set.del_count();
+    fn test_encode_row_section_rejects_row_count_above_cap() {
+        for count in [MAX_LWC_ROWS as u64 + 1, 65_536] {
+            let err = ColumnBlockEntryShape::new(
+                test_user_table_id(1),
+                RowID::new(0),
+                RowID::new(count),
+                &test_row_id_range(0, count),
+                &[],
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.current_context(),
+                &ResourceError::ColumnBlockEntryCapacityExceeded,
+                "count={count}"
+            );
+        }
     }
 
     /// Purpose: Protect block lookup for adjacent sparse and dense row entries.
@@ -4270,7 +3902,16 @@ pub(super) mod tests {
             let dense = index.locate_block(RowID::new(2)).await.unwrap().unwrap();
             let sparse = index.locate_block(RowID::new(15)).await.unwrap().unwrap();
 
-            let (_, dense_row_ids) = index.load_delete_deltas_and_row_ids(&dense).await.unwrap();
+            let (identity, deletes) = index
+                .load_entry_identity_and_deletions(&dense)
+                .await
+                .unwrap();
+            assert!(deletes.is_empty());
+            let dense_row_ids: Vec<_> = identity
+                .as_ref()
+                .iter_deltas()
+                .map(|delta| dense.start_row_id + u64::from(delta))
+                .collect();
             assert_eq!(dense_row_ids, test_row_ids([0, 1, 2, 3]));
             assert_eq!(
                 dense.block_binding_value(),
@@ -4281,7 +3922,16 @@ pub(super) mod tests {
                     4
                 )
             );
-            let (_, sparse_row_ids) = index.load_delete_deltas_and_row_ids(&sparse).await.unwrap();
+            let (identity, deletes) = index
+                .load_entry_identity_and_deletions(&sparse)
+                .await
+                .unwrap();
+            assert!(deletes.is_empty());
+            let sparse_row_ids: Vec<_> = identity
+                .as_ref()
+                .iter_deltas()
+                .map(|delta| sparse.start_row_id + u64::from(delta))
+                .collect();
             assert_eq!(sparse_row_ids, test_row_ids([12, 15, 18]));
             assert_eq!(
                 sparse.block_binding_value(),
@@ -4304,14 +3954,11 @@ pub(super) mod tests {
                     RowID::new(10),
                     &test_row_ids([2, 5, 8]),
                     &[],
-                    COLUMN_ROW_BODY_LIMIT
+                    4 * MAX_LWC_ROWS
                 )
                 .unwrap()
             );
-            assert!(matches!(
-                &scan_entries[0].deletes,
-                ColumnScanDeletePlan::InlineOrdinals(ordinals) if ordinals.is_empty()
-            ));
+            assert!(scan_entries[0].deletes.is_empty());
         });
     }
 
@@ -4421,7 +4068,7 @@ pub(super) mod tests {
     /// Purpose: Protect persisted replacement of an inline row-id deletion set.
     /// Expected: The new deletion set remains inline and determines durable deletion without changing row membership.
     #[test]
-    fn test_batch_replace_delete_deltas_roundtrip_inline() {
+    fn test_batch_replace_deletions_roundtrip_inline() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
@@ -4476,11 +4123,11 @@ pub(super) mod tests {
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             )
-            .batch_replace_delete_deltas(
+            .batch_replace_deletions(
                 &mut mutable,
-                &[ColumnDeleteDeltaPatch {
+                &[ColumnDeletionPatch {
                     start_row_id: RowID::new(0),
-                    delete_deltas: &[1, 3, 6],
+                    deletions: &OrdinalDeletionSet::from_ordinals(8, &[1, 3, 6]).unwrap(),
                 }],
                 TrxID::new(3),
             )
@@ -4500,10 +4147,12 @@ pub(super) mod tests {
             assert_eq!(entry.block_id(), 1001);
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
-            assert!(entry.deletion_blob_ref().is_none());
-            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
-            let loaded: BTreeSet<_> = delete_deltas.into_iter().collect();
-            assert_eq!(loaded, BTreeSet::from([1u32, 3, 6]));
+            let (_, deletions) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
+            let loaded: BTreeSet<_> = deletions.iter().collect();
+            assert_eq!(loaded, BTreeSet::from([1u16, 3, 6]));
             assert!(
                 index
                     .locate_and_resolve_row(RowID::new(1))
@@ -4523,10 +4172,10 @@ pub(super) mod tests {
         });
     }
 
-    /// Purpose: Protect reachability and deferred scan loading for externally stored deletion sets.
-    /// Expected: Reachable blocks include deletion storage and loaded ordinals preserve durable deletion state.
+    /// Purpose: Protect reachability and ready scan membership for large inline deletion sets.
+    /// Expected: Only index and value blocks are reachable and scan ordinals preserve durable deletions.
     #[test]
-    fn test_collect_reachable_blocks_includes_external_delete_blob_blocks() {
+    fn test_collect_reachable_blocks_with_inline_deletions() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
@@ -4540,18 +4189,12 @@ pub(super) mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.create_base_guard();
 
-            let row_ids = test_row_id_range(0, 96);
-            let delete_deltas: Vec<u32> = (0..80).collect();
-            let entry = ColumnBlockEntryShape::new(
-                test_user_table_id(1),
+            let entry = dense_entry_with_deletions(
                 RowID::new(0),
                 RowID::new(96),
-                &row_ids,
-                &[],
-                delete_deltas,
-            )
-            .unwrap()
-            .with_block_id(test_block_id(1001));
+                &(0..80).collect::<Vec<_>>(),
+                test_block_id(1001),
+            );
             let mut mutable = MutableTableFile::fork(
                 &table,
                 background_writes,
@@ -4580,9 +4223,6 @@ pub(super) mod tests {
                 &disk_pool_guard,
             );
             let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
-            let blob_ref = entry
-                .deletion_blob_ref()
-                .expect("large delete set should be stored in external blob blocks");
             assert!(
                 index
                     .locate_and_resolve_row(RowID::new(40))
@@ -4606,31 +4246,20 @@ pub(super) mod tests {
                 .unwrap();
             assert!(reachable.contains(&root));
             assert!(reachable.contains(&entry.block_id()));
-            assert!(reachable.contains(&blob_ref.start_block_id));
+            assert_eq!(reachable.len(), 2);
 
             let scan_entries = index.collect_scan_entries().await.unwrap();
-            let ColumnScanDeletePlan::External(deferred) = &scan_entries[0].deletes else {
-                panic!("large scan delete set should remain deferred")
-            };
             assert_eq!(
-                deferred
-                    .load_ordinals(
-                        disk_pool.file_kind(),
-                        disk_pool.sparse_file(),
-                        disk_pool.global_pool(),
-                        &disk_pool_guard,
-                    )
-                    .await
-                    .unwrap(),
-                (0..80).collect::<Vec<u32>>()
+                scan_entries[0].deletes.iter().collect::<Vec<_>>(),
+                (0..80).collect::<Vec<u16>>()
             );
         });
     }
 
-    /// Purpose: Protect the deletion domain when replacing an ordinal-based delete set.
-    /// Expected: Replacement preserves the ordinal domain and the requested deleted positions.
+    /// Purpose: Replace an existing durable ordinal set with a complete new set.
+    /// Expected: Replacement retains physical identity and the requested deleted positions.
     #[test]
-    fn test_batch_replace_delete_deltas_preserves_ordinal_domain() {
+    fn test_batch_replace_deletions_replaces_existing_set() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let background_writes = fs.background_writes();
@@ -4644,11 +4273,10 @@ pub(super) mod tests {
             let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
             let disk_pool_guard = disk_pool.create_base_guard();
 
-            let seed = dense_entry_with_delete_domain(
+            let seed = dense_entry_with_deletions(
                 RowID::new(0),
                 RowID::new(8),
-                vec![1, 3],
-                ColumnDeleteDomain::Ordinal,
+                &[1, 3],
                 test_block_id(1001),
             );
             let mut mutable = MutableTableFile::fork(
@@ -4684,11 +4312,11 @@ pub(super) mod tests {
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             )
-            .batch_replace_delete_deltas(
+            .batch_replace_deletions(
                 &mut mutable,
-                &[ColumnDeleteDeltaPatch {
+                &[ColumnDeletionPatch {
                     start_row_id: RowID::new(0),
-                    delete_deltas: &[1, 3, 6],
+                    deletions: &OrdinalDeletionSet::from_ordinals(8, &[6]).unwrap(),
                 }],
                 TrxID::new(3),
             )
@@ -4705,11 +4333,22 @@ pub(super) mod tests {
                 &disk_pool_guard,
             );
             let entry = index.locate_block(RowID::new(0)).await.unwrap().unwrap();
-            assert_eq!(entry.delete_domain(), ColumnDeleteDomain::Ordinal);
-            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            assert_eq!(entry.del_count(), 1);
+            assert!(
+                !index
+                    .locate_and_resolve_row(RowID::new(1))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .durable_deleted()
+            );
+            let (_, deletions) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
             assert_eq!(
-                delete_deltas.into_iter().collect::<BTreeSet<_>>(),
-                BTreeSet::from([1u32, 3, 6])
+                deletions.iter().collect::<BTreeSet<_>>(),
+                BTreeSet::from([6u16])
             );
         });
     }
@@ -4793,7 +4432,7 @@ pub(super) mod tests {
         });
     }
 
-    /// Purpose: Preserve legacy and adaptive identity through persisted delete-only rewrites in both domains.
+    /// Purpose: Preserve list and adaptive identity bytes through ordinal deletion rewrites.
     /// Expected: Reopened entries retain codec bytes, binding values, ordinals, and physical membership while deletion state changes.
     #[test]
     fn mixed_identity_delete_rewrite_preserves_compact_bytes() {
@@ -4823,7 +4462,6 @@ pub(super) mod tests {
                     RowID::new(*end),
                     rows,
                     &[],
-                    Vec::new(),
                 )
                 .unwrap();
                 if idx == 0 {
@@ -4832,8 +4470,6 @@ pub(super) mod tests {
                         RowSetRef::validate(2, &[0, 0, 0, 0, 2, 0, 0, 0, 7, 0, 0, 0], 10)
                             .unwrap()
                             .to_owned();
-                } else {
-                    shape.delete_domain = ColumnDeleteDomain::Ordinal;
                 }
                 inputs.push(shape.with_block_id(test_block_id(1001 + idx as i32)));
             }
@@ -4870,17 +4506,24 @@ pub(super) mod tests {
                 disk_pool.global_pool().clone(),
                 guard.clone(),
             );
-            let deleted = [vec![0, 7], vec![0, 999]];
-            let patches: Vec<_> = bounds
+            let deleted = [vec![0u16, 2], vec![0, values[1].len() as u16 - 1]];
+            let replacements: Vec<_> = values
                 .iter()
                 .zip(&deleted)
-                .map(|((start, _), deltas)| ColumnDeleteDeltaPatch {
+                .map(|(rows, ordinals)| {
+                    OrdinalDeletionSet::from_ordinals(rows.len() as u16, ordinals).unwrap()
+                })
+                .collect();
+            let patches: Vec<_> = bounds
+                .iter()
+                .zip(&replacements)
+                .map(|((start, _), deletions)| ColumnDeletionPatch {
                     start_row_id: RowID::new(*start),
-                    delete_deltas: deltas,
+                    deletions,
                 })
                 .collect();
             let updated = index
-                .batch_replace_delete_deltas(&mut mutable, &patches, TrxID::new(3))
+                .batch_replace_deletions(&mut mutable, &patches, TrxID::new(3))
                 .await
                 .unwrap();
             assert_ne!(updated, root);
@@ -4901,14 +4544,25 @@ pub(super) mod tests {
                 let identity = row_set_in_view(&view).to_owned();
                 assert_eq!(identity, inputs[idx].row_set);
                 assert_eq!(entry.block_binding_value(), inputs[idx].block_binding_value);
-                let (deletes, loaded) = index.load_delete_deltas_and_row_ids(entry).await.unwrap();
-                assert_eq!(deletes, deleted[idx]);
+                let (identity, deletes) = index
+                    .load_entry_identity_and_deletions(entry)
+                    .await
+                    .unwrap();
+                let loaded: Vec<_> = identity
+                    .as_ref()
+                    .iter_deltas()
+                    .map(|delta| entry.start_row_id + u64::from(delta))
+                    .collect();
+                assert_eq!(deletes.iter().collect::<Vec<_>>(), deleted[idx]);
                 assert_eq!(loaded, values[idx]);
                 for (ordinal, row) in loaded.iter().enumerate() {
                     let resolved = index.locate_and_resolve_row(*row).await.unwrap().unwrap();
                     let delta = row.checked_sub(entry.start_row_id).unwrap() as u32;
                     assert_eq!(resolved.row_idx(), ordinal);
-                    assert_eq!(resolved.durable_deleted(), deleted[idx].contains(&delta));
+                    assert_eq!(
+                        resolved.durable_deleted(),
+                        deleted[idx].contains(&(ordinal as u16))
+                    );
                     assert_eq!(
                         scans[idx].identity.ordinal_for_delta(delta),
                         Some(ordinal as u32)
@@ -4922,10 +4576,10 @@ pub(super) mod tests {
         });
     }
 
-    /// Purpose: Preserve logical rows across legacy and adaptive codecs with different partitions.
+    /// Purpose: Preserve logical rows across whole lists and adaptive codecs with different partitions.
     /// Expected: Every encoding yields the source deltas and the same membership and ordinal mapping.
     #[test]
-    fn compact_rows_match_legacy_across_partitions() {
+    fn compact_rows_match_whole_lists_across_partitions() {
         for deltas in [
             (0..1000).collect::<Vec<u32>>(),
             (0..1000).filter(|i| i % 11 != 0).collect(),
@@ -4945,7 +4599,7 @@ pub(super) mod tests {
                 .to_owned();
             let mut seeds = Vec::new();
             for (idx, chunk) in values.chunks(31).enumerate() {
-                RowSetSeed::append_page(&mut seeds, chunk, idx * 31);
+                IdentitySetSeed::append_page(&mut seeds, chunk, idx * 31);
             }
             for hints in [&[][..], seeds.as_slice()] {
                 let adaptive = EncodedRowSet::plan(
@@ -4953,7 +4607,7 @@ pub(super) mod tests {
                     RowID::new(end),
                     &values,
                     hints,
-                    COLUMN_ROW_BODY_LIMIT,
+                    4 * MAX_LWC_ROWS,
                 )
                 .unwrap();
                 for rows in [&legacy, &adaptive] {
@@ -4965,85 +4619,5 @@ pub(super) mod tests {
                 }
             }
         }
-    }
-
-    /// Purpose: Retain readable legacy entries without imposing the new delete reserve retroactively.
-    /// Expected: A full legacy leaf writes successfully, while its oversized deletion rewrite returns a capacity error before allocation.
-    #[test]
-    fn legacy_entry_actual_rewrite_capacity() {
-        smol::block_on(async {
-            let (_temp_dir, fs) = build_test_fs();
-            let table = fs
-                .create_table_file(test_user_table_id(1), metadata(), false)
-                .unwrap();
-            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
-            drop(old_root);
-            let global = global_readonly_pool_scope(64 * 1024 * 1024);
-            let disk_pool = table_readonly_pool(&global, test_user_table_id(1), &table);
-            let guard = disk_pool.create_base_guard();
-            let index = ColumnBlockIndex::new(
-                SUPER_BLOCK_ID,
-                RowID::new(0),
-                disk_pool.file_kind(),
-                disk_pool.sparse_file(),
-                disk_pool.global_pool(),
-                &guard,
-            );
-            let count = (COLUMN_BLOCK_LEAF_DATA_SIZE
-                - COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE
-                - COLUMN_BLOCK_LEAF_ENTRY_HEADER_SIZE
-                - 4)
-                / 4;
-            let bytes: Vec<_> = (0..count as u32)
-                .flat_map(|i| (i * 2).to_le_bytes())
-                .collect();
-            assert!(bytes.len() > COLUMN_ROW_BODY_LIMIT);
-            let row_set = RowSetRef::validate(2, &bytes, count as u32 * 2)
-                .unwrap()
-                .to_owned();
-            let mut entry = LogicalLeafEntry::new(
-                RowID::new(0),
-                test_block_id(1001),
-                row_set,
-                LogicalDeleteSet::None {
-                    domain: ColumnDeleteDomain::RowIdDelta,
-                },
-                0,
-            );
-            let mut mutable = MutableTableFile::fork(
-                &table,
-                fs.background_writes(),
-                disk_pool.global_pool().clone(),
-                guard.clone(),
-            );
-            let leaves = index
-                .write_leaf_pages_from_logical_entries(
-                    &mut mutable,
-                    &[entry.clone()],
-                    TrxID::new(2),
-                )
-                .await
-                .unwrap();
-            assert_eq!(leaves.len(), 1);
-            entry.delete_set = LogicalDeleteSet::Inline {
-                domain: ColumnDeleteDomain::RowIdDelta,
-                row_id_deltas: vec![0],
-            };
-            let alloc_map_before = mutable.root().alloc_map.clone();
-            let err = index
-                .write_leaf_pages_from_logical_entries(&mut mutable, &[entry], TrxID::new(3))
-                .await
-                .unwrap_err();
-            let err = err.disclose();
-            assert_eq!(
-                err.report().downcast_ref::<ResourceError>(),
-                Some(&ResourceError::ColumnBlockEntryCapacityExceeded)
-            );
-            assert_eq!(
-                mutable.root().alloc_map,
-                alloc_map_before,
-                "rejected deletion rewrite must preserve allocation state"
-            );
-        });
     }
 }

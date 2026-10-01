@@ -1112,11 +1112,18 @@ mod tests {
             let snapshot = column_block_index_snapshot(&engine, table_id);
             let column_index = snapshot.index(pool_guards.disk_guard());
             let entry = column_index.locate_block(row_id).await.unwrap().unwrap();
-            let (delete_deltas, _) = column_index
-                .load_delete_deltas_and_row_ids(&entry)
+            let (identity, delete_deltas) = column_index
+                .load_entry_identity_and_deletions(&entry)
                 .await
                 .unwrap();
-            assert!(delete_deltas.contains(&((row_id - entry.start_row_id) as u32)));
+            assert!(
+                delete_deltas.contains(
+                    identity
+                        .as_ref()
+                        .ordinal_for_delta((row_id - entry.start_row_id) as u32)
+                        .unwrap()
+                )
+            );
 
             table.deletion_buffer().remove(row_id);
             let inserted = bound_unique_index(&table, &pool_guards, key.index_slot)

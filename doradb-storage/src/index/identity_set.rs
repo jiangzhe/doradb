@@ -1,5 +1,5 @@
-//! Adaptive, directly searchable cold row identity. All integers are packed LE.
-//! The index owns the four-byte common header (including the delete domain).
+//! Adaptive, directly searchable identity sets for cold rows and ordinal deletions.
+//! All integers are packed LE; index sections own their headers.
 
 use crate::error::{DataIntegrityError, DataIntegrityResult, ResourceError, ResourceResult};
 use crate::id::RowID;
@@ -23,14 +23,14 @@ const WINDOW: u64 = 4096;
 
 /// Statistics that can be combined without revisiting source rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RowSetStats {
+pub(crate) struct IdentitySetStats {
     first: u64,
     last: u64,
     count: usize,
     runs: usize,
 }
 
-impl RowSetStats {
+impl IdentitySetStats {
     #[inline]
     fn from_rows(rows: &[RowID]) -> Self {
         let mut stats = Self {
@@ -70,13 +70,13 @@ impl RowSetStats {
 
 /// A transient packing hint; ordinals refer to the builder's retained RowIDs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RowSetSeed {
+pub(crate) struct IdentitySetSeed {
     start: usize,
     end: usize,
-    stats: RowSetStats,
+    stats: IdentitySetStats,
 }
 
-impl RowSetSeed {
+impl IdentitySetSeed {
     /// Records accepted rows from a page, splitting oversized ranges into windows.
     #[inline]
     pub(crate) fn append_page(seeds: &mut Vec<Self>, rows: &[RowID], ordinal: usize) {
@@ -87,7 +87,7 @@ impl RowSetSeed {
             seeds.push(Self {
                 start: ordinal,
                 end: ordinal + rows.len(),
-                stats: RowSetStats::from_rows(rows),
+                stats: IdentitySetStats::from_rows(rows),
             });
         } else {
             for (idx, row) in rows.iter().enumerate() {
@@ -110,7 +110,7 @@ impl RowSetSeed {
         seeds.push(Self {
             start: ordinal,
             end: ordinal + 1,
-            stats: RowSetStats::from_rows(&[row]),
+            stats: IdentitySetStats::from_rows(&[row]),
         });
     }
 }
@@ -139,7 +139,7 @@ impl Candidate {
 
 #[derive(Clone, Debug)]
 struct Segment {
-    seed: RowSetSeed,
+    seed: IdentitySetSeed,
     candidate: Candidate,
     prev: Option<usize>,
     next: Option<usize>,
@@ -148,25 +148,25 @@ struct Segment {
 }
 
 /// A deterministic exact-size selection, retaining only O(seed count) metadata.
-struct RowSetPlan {
+struct IdentitySetPlan {
     whole: Candidate,
     segments: Vec<Segment>,
     segmented: bool,
     len: usize,
 }
 
-impl RowSetPlan {
-    fn new(rows: &[RowID], base: u64, span: u32, seeds: &[RowSetSeed]) -> Self {
+impl IdentitySetPlan {
+    fn new(rows: &[RowID], base: u64, span: u32, seeds: &[IdentitySetSeed]) -> Self {
         // Keep the cheapest whole-entry codec as a fallback. Counts, endpoints,
         // and run counts give exact byte costs without encoding each candidate.
-        let stats = RowSetStats::from_rows(rows);
+        let stats = IdentitySetStats::from_rows(rows);
         let whole = whole_candidate(stats, base, span);
         let mut generated = Vec::new();
         // Prefer the builder's source-page/window seeds. Without supplied seeds,
         // group present rows into 4,096-position windows, skipping empty windows.
         let seeds = if seeds.is_empty() {
             for (idx, row) in rows.iter().enumerate() {
-                RowSetSeed::append_window(&mut generated, *row, idx);
+                IdentitySetSeed::append_window(&mut generated, *row, idx);
             }
             &generated
         } else {
@@ -304,7 +304,7 @@ impl RowSetPlan {
             }
         } else {
             let c = self.whole;
-            let stats = RowSetStats::from_rows(rows);
+            let stats = IdentitySetStats::from_rows(rows);
             let local_base = if c.trimmed { stats.first } else { base };
             let local_span = if c.trimmed { stats.span() as u32 } else { span };
             match c.codec {
@@ -344,21 +344,25 @@ impl RowSetPlan {
 
 type MergeHeap = BinaryHeap<(usize, Reverse<usize>, usize, usize)>;
 
-/// Immutable encoded identity. Dense sets do not allocate a body.
+/// Immutable encoded identity set shared by row identity and ordinal deletions.
+/// Dense sets do not allocate a body.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedRowSet {
+pub(crate) struct EncodedIdentitySet {
     codec: u8,
     span: u32,
     body: Option<Arc<[u8]>>,
 }
 
-impl EncodedRowSet {
+/// Encoded identity set interpreted as cold row membership.
+pub(crate) type EncodedRowSet = EncodedIdentitySet;
+
+impl EncodedIdentitySet {
     /// Plans and encodes exactly once, checking capacity before allocating bytes.
     pub(crate) fn plan(
         start: RowID,
         end: RowID,
         rows: &[RowID],
-        seeds: &[RowSetSeed],
+        seeds: &[IdentitySetSeed],
         body_limit: usize,
     ) -> ResourceResult<Self> {
         let span = end
@@ -374,7 +378,7 @@ impl EncodedRowSet {
             rows[0] >= start && rows[rows.len() - 1] < end && rows.windows(2).all(|p| p[0] < p[1]),
             "column row-set input must be ordered within coverage"
         );
-        let plan = RowSetPlan::new(rows, start.as_u64(), span, seeds);
+        let plan = IdentitySetPlan::new(rows, start.as_u64(), span, seeds);
         if plan.len > body_limit || plan.len > u16::MAX as usize {
             return Err(Report::new(ResourceError::ColumnBlockEntryCapacityExceeded));
         }
@@ -389,8 +393,8 @@ impl EncodedRowSet {
 
     /// Borrows the invariant established by encoding or cache admission.
     #[inline]
-    pub(crate) fn as_ref(&self) -> RowSetRef<'_> {
-        RowSetRef::from_admitted(self.codec, self.body(), self.span)
+    pub(crate) fn as_ref(&self) -> IdentitySetRef<'_> {
+        IdentitySetRef::from_admitted(self.codec, self.body(), self.span)
     }
 
     /// Returns the persisted codec tag.
@@ -417,12 +421,6 @@ impl EncodedRowSet {
         usize::from(self.as_ref().count)
     }
 
-    /// Tests membership without expanding the set.
-    #[inline]
-    pub(crate) fn contains_delta(&self, delta: u32) -> bool {
-        self.ordinal_for_delta(delta).is_some()
-    }
-
     /// Translates a present delta into its ordinal.
     #[inline]
     pub(crate) fn ordinal_for_delta(&self, delta: u32) -> Option<u32> {
@@ -433,16 +431,20 @@ impl EncodedRowSet {
     }
 }
 
-/// Borrowed compact identity, usable only after validation or trusted encoding.
+/// Borrowed identity set for row identity or ordinal deletions.
+/// Usable only after validation or trusted encoding.
 #[derive(Clone, Copy)]
-pub(crate) struct RowSetRef<'a> {
+pub(crate) struct IdentitySetRef<'a> {
     codec: u8,
     body: &'a [u8],
     span: u32,
     count: u16,
 }
 
-impl<'a> RowSetRef<'a> {
+/// Borrowed identity set interpreted as cold row membership.
+pub(crate) type RowSetRef<'a> = IdentitySetRef<'a>;
+
+impl<'a> IdentitySetRef<'a> {
     /// Validates disk bytes completely before establishing a searchable view.
     pub(super) fn validate(codec: u8, body: &'a [u8], span: u32) -> DataIntegrityResult<Self> {
         let invalid = || {
@@ -570,8 +572,8 @@ impl<'a> RowSetRef<'a> {
 
     /// Copies compact bytes once for a shared scan descriptor or CoW rewrite.
     #[inline]
-    pub(crate) fn to_owned(self) -> EncodedRowSet {
-        EncodedRowSet {
+    pub(crate) fn to_owned(self) -> EncodedIdentitySet {
+        EncodedIdentitySet {
             codec: self.codec,
             span: self.span,
             body: (!self.body.is_empty()).then(|| Arc::from(self.body)),
@@ -623,14 +625,14 @@ impl<'a> RowSetRef<'a> {
 
     /// Iterates in LWC ordinal order with a sequential codec cursor.
     #[inline]
-    pub(crate) fn iter_deltas(self) -> RowSetIter<'a> {
+    pub(crate) fn iter_deltas(self) -> IdentitySetIter<'a> {
         let (base, local) = if self.codec == SEGMENTED {
             let (base, _, local) = self.segment(0);
             (base, local)
         } else {
             self.local()
         };
-        RowSetIter {
+        IdentitySetIter {
             view: self,
             segment: 0,
             base,
@@ -904,14 +906,14 @@ impl LocalRef<'_> {
 }
 
 /// Sequential cursor over validated compact bytes, including segment boundaries.
-pub(crate) struct RowSetIter<'a> {
-    view: RowSetRef<'a>,
+pub(crate) struct IdentitySetIter<'a> {
+    view: IdentitySetRef<'a>,
     segment: usize,
     base: u32,
     cursor: LocalIter<'a>,
 }
 
-impl Iterator for RowSetIter<'_> {
+impl Iterator for IdentitySetIter<'_> {
     type Item = u32;
 
     #[inline]
@@ -1023,7 +1025,7 @@ fn bitmap_len(span: u64) -> usize {
     words * 8 + words.div_ceil(4) * 2
 }
 
-fn local_candidate(stats: RowSetStats) -> Candidate {
+fn local_candidate(stats: IdentitySetStats) -> Candidate {
     let span = stats.span() as usize;
     let holes = span - stats.count;
     let mut best = Candidate {
@@ -1074,7 +1076,7 @@ fn local_candidate(stats: RowSetStats) -> Candidate {
     best
 }
 
-fn whole_candidate(stats: RowSetStats, base: u64, span: u32) -> Candidate {
+fn whole_candidate(stats: IdentitySetStats, base: u64, span: u32) -> Candidate {
     let mut best = Candidate {
         codec: LIST32,
         trimmed: false,
@@ -1288,7 +1290,7 @@ mod tests {
     }
 
     fn whole(codec: u8, span: u32, rows: &[RowID], trimmed: bool) -> Vec<u8> {
-        let stats = RowSetStats::from_rows(rows);
+        let stats = IdentitySetStats::from_rows(rows);
         let base = if trimmed { stats.first } else { 0 };
         let local_span = if trimmed { stats.span() as u32 } else { span };
         let mut body = Vec::new();
@@ -1320,7 +1322,7 @@ mod tests {
         body
     }
 
-    fn check(view: RowSetRef<'_>, expected: &[RowID]) {
+    fn check(view: IdentitySetRef<'_>, expected: &[RowID]) {
         let deltas: Vec<_> = expected.iter().map(|r| r.as_u64() as u32).collect();
         assert_eq!(usize::from(view.row_count()), deltas.len());
         assert_eq!(
@@ -1411,7 +1413,7 @@ mod tests {
                         continue;
                     }
                     let body = whole(codec, span, &values, trimmed);
-                    let view = RowSetRef::validate(codec, &body, span).unwrap();
+                    let view = IdentitySetRef::validate(codec, &body, span).unwrap();
                     check(view, &values);
                 }
             }
@@ -1427,7 +1429,10 @@ mod tests {
                 let values = rows((0..span).filter(|i| mask & (1 << i) != 0));
                 for codec in [MISSING, TRIMMED_MISSING] {
                     let body = whole(codec, span, &values, codec == TRIMMED_MISSING);
-                    check(RowSetRef::validate(codec, &body, span).unwrap(), &values);
+                    check(
+                        IdentitySetRef::validate(codec, &body, span).unwrap(),
+                        &values,
+                    );
                 }
             }
         }
@@ -1451,10 +1456,10 @@ mod tests {
                 RUNS16 => rows((base..base + 100).filter(|i| i % 50 < 20)),
                 _ => rows([base, base + 1, base + 1024, base + 2048]),
             };
-            let seed = RowSetSeed {
+            let seed = IdentitySetSeed {
                 start: values.len(),
                 end: values.len() + local.len(),
-                stats: RowSetStats::from_rows(&local),
+                stats: IdentitySetStats::from_rows(&local),
             };
             let mut payload = Vec::new();
             emit_local(
@@ -1483,23 +1488,23 @@ mod tests {
         let len = 4
             + segments.len() * DIRECTORY_SIZE
             + segments.iter().map(|s| s.candidate.len).sum::<usize>();
-        let plan = RowSetPlan {
-            whole: whole_candidate(RowSetStats::from_rows(&values), 0, 400000),
+        let plan = IdentitySetPlan {
+            whole: whole_candidate(IdentitySetStats::from_rows(&values), 0, 400000),
             segments,
             segmented: true,
             len,
         };
         let body = plan.encode(&values, 0, 400000);
         check(
-            RowSetRef::validate(SEGMENTED, &body, 400000).unwrap(),
+            IdentitySetRef::validate(SEGMENTED, &body, 400000).unwrap(),
             &values,
         );
         for len in 0..body.len() {
-            assert!(RowSetRef::validate(SEGMENTED, &body[..len], 400000).is_err());
+            assert!(IdentitySetRef::validate(SEGMENTED, &body[..len], 400000).is_err());
         }
         let mut overlapping = body.clone();
         overlapping[20..24].fill(0);
-        assert!(RowSetRef::validate(SEGMENTED, &overlapping, 400000).is_err());
+        assert!(IdentitySetRef::validate(SEGMENTED, &overlapping, 400000).is_err());
         for (offset, value) in [
             (2, 0),
             (4 + 15, 1),
@@ -1510,7 +1515,7 @@ mod tests {
             let mut corrupt = body.clone();
             corrupt[offset] = value;
             assert!(
-                RowSetRef::validate(SEGMENTED, &corrupt, 400000).is_err(),
+                IdentitySetRef::validate(SEGMENTED, &corrupt, 400000).is_err(),
                 "offset={offset}"
             );
         }
@@ -1530,10 +1535,10 @@ mod tests {
             }
             let mut seeds = Vec::new();
             for (idx, chunk) in values.chunks(23).enumerate() {
-                RowSetSeed::append_page(&mut seeds, chunk, idx * 23);
+                IdentitySetSeed::append_page(&mut seeds, chunk, idx * 23);
             }
-            let plan = RowSetPlan::new(&values, 0, span, &seeds);
-            let encoded = EncodedRowSet::plan(
+            let plan = IdentitySetPlan::new(&values, 0, span, &seeds);
+            let encoded = EncodedIdentitySet::plan(
                 RowID::new(0),
                 RowID::new(u64::from(span)),
                 &values,
@@ -1545,7 +1550,7 @@ mod tests {
             assert!(plan.len <= plan.whole.len);
             assert_eq!(
                 encoded,
-                EncodedRowSet::plan(
+                EncodedIdentitySet::plan(
                     RowID::new(0),
                     RowID::new(u64::from(span)),
                     &values,
@@ -1555,14 +1560,14 @@ mod tests {
                 .unwrap()
             );
             check(
-                RowSetRef::validate(encoded.codec(), encoded.body(), span).unwrap(),
+                IdentitySetRef::validate(encoded.codec(), encoded.body(), span).unwrap(),
                 &values,
             );
         }
         let values = rows([0, 1, 2, 1000000000, 1000000001, u32::MAX - 1]);
-        let plan = RowSetPlan::new(&values, 0, u32::MAX, &[]);
+        let plan = IdentitySetPlan::new(&values, 0, u32::MAX, &[]);
         assert!(plan.segments.len() <= values.len());
-        let encoded = EncodedRowSet::plan(
+        let encoded = EncodedIdentitySet::plan(
             RowID::new(0),
             RowID::new(u64::from(u32::MAX)),
             &values,
@@ -1594,7 +1599,7 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    RowSetRef::validate(codec, &body[..len], 1050).is_err(),
+                    IdentitySetRef::validate(codec, &body[..len], 1050).is_err(),
                     "codec={codec} len={len}"
                 );
             }
@@ -1602,7 +1607,7 @@ mod tests {
                 let mut corrupt = body.clone();
                 let idx = hash(seed) as usize % corrupt.len();
                 corrupt[idx] ^= (hash(seed + 1) as u8) | 1;
-                if let Ok(view) = RowSetRef::validate(codec, &corrupt, 1050) {
+                if let Ok(view) = IdentitySetRef::validate(codec, &corrupt, 1050) {
                     let decoded = rows(view.iter_deltas());
                     assert!(decoded.windows(2).all(|p| p[0] < p[1]));
                     check(view, &decoded);
@@ -1611,18 +1616,18 @@ mod tests {
         }
         let mut body = whole(BITMAP, 1050, &values, false);
         body[3] = 1;
-        assert!(RowSetRef::validate(BITMAP, &body, 1050).is_err());
+        assert!(IdentitySetRef::validate(BITMAP, &body, 1050).is_err());
         body[3] = 0;
         *body.last_mut().unwrap() |= 128;
-        assert!(RowSetRef::validate(BITMAP, &body, 1050).is_err());
+        assert!(IdentitySetRef::validate(BITMAP, &body, 1050).is_err());
         let mut body = whole(RUNS16, 1050, &values, false);
         body[8] = 1;
-        assert!(RowSetRef::validate(RUNS16, &body, 1050).is_err());
-        assert!(RowSetRef::validate(255, &[], 1).is_err());
-        assert!(RowSetRef::validate(DENSE, &[0], 1).is_err());
-        assert!(RowSetRef::validate(DENSE, &[], 0).is_err());
-        assert!(RowSetRef::validate(LIST16, &[1, 0, 1, 0], 10).is_err());
-        assert!(RowSetRef::validate(LIST32, &[0; 3], 10).is_err());
+        assert!(IdentitySetRef::validate(RUNS16, &body, 1050).is_err());
+        assert!(IdentitySetRef::validate(255, &[], 1).is_err());
+        assert!(IdentitySetRef::validate(DENSE, &[0], 1).is_err());
+        assert!(IdentitySetRef::validate(DENSE, &[], 0).is_err());
+        assert!(IdentitySetRef::validate(LIST16, &[1, 0, 1, 0], 10).is_err());
+        assert!(IdentitySetRef::validate(LIST32, &[0; 3], 10).is_err());
     }
 
     /// Purpose: Enforce cardinality, coverage, and exact body budgets before encoding.
@@ -1631,7 +1636,7 @@ mod tests {
     fn capacity_and_row_id_boundaries() {
         let values = rows(0..65535);
         assert!(
-            EncodedRowSet::plan(RowID::new(0), RowID::new(65535), &values, &[], 0)
+            EncodedIdentitySet::plan(RowID::new(0), RowID::new(65535), &values, &[], 0)
                 .unwrap()
                 .body()
                 .is_empty()
@@ -1641,7 +1646,7 @@ mod tests {
             (u64::from(u32::MAX) + 1, rows([0])),
         ] {
             assert_eq!(
-                EncodedRowSet::plan(RowID::new(0), RowID::new(end), &values, &[], 65184)
+                EncodedIdentitySet::plan(RowID::new(0), RowID::new(end), &values, &[], 65184)
                     .unwrap_err()
                     .current_context(),
                 &ResourceError::ColumnBlockEntryCapacityExceeded
@@ -1649,19 +1654,22 @@ mod tests {
         }
         let values = rows((0..20000).map(|i| i * 100003));
         assert_eq!(
-            EncodedRowSet::plan(RowID::new(0), RowID::new(2000000000), &values, &[], 65184)
+            EncodedIdentitySet::plan(RowID::new(0), RowID::new(2000000000), &values, &[], 65184)
                 .unwrap_err()
                 .current_context(),
             &ResourceError::ColumnBlockEntryCapacityExceeded
         );
         let values = rows([0, 100, 10000]);
-        let exact = RowSetPlan::new(&values, 0, 10001, &[]).len;
-        assert!(EncodedRowSet::plan(RowID::new(0), RowID::new(10001), &values, &[], exact).is_ok());
+        let exact = IdentitySetPlan::new(&values, 0, 10001, &[]).len;
         assert!(
-            EncodedRowSet::plan(RowID::new(0), RowID::new(10001), &values, &[], exact - 1).is_err()
+            EncodedIdentitySet::plan(RowID::new(0), RowID::new(10001), &values, &[], exact).is_ok()
+        );
+        assert!(
+            EncodedIdentitySet::plan(RowID::new(0), RowID::new(10001), &values, &[], exact - 1)
+                .is_err()
         );
         let values = [RowID::new(u64::MAX - 3), RowID::new(u64::MAX - 1)];
-        let encoded = EncodedRowSet::plan(
+        let encoded = EncodedIdentitySet::plan(
             RowID::new(u64::MAX - 4),
             RowID::new(u64::MAX),
             &values,
