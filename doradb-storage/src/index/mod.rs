@@ -4,7 +4,10 @@ mod borrowed_stream;
 mod btree;
 pub(crate) mod build;
 mod column_block_index;
+#[cfg(test)]
+pub(crate) use column_block_index::tests::adaptive_leaf_fixture;
 mod column_deletion_blob;
+pub(crate) mod column_row_set;
 pub(crate) mod disk_tree;
 mod index_stream;
 mod mem_index;

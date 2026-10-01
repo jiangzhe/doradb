@@ -358,6 +358,8 @@ pub(crate) enum RuntimeError {
 /// Fieldless resource-domain errors carried underneath `ErrorKind::Resource`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub(crate) enum ResourceError {
+    #[error("column block entry capacity exceeded")]
+    ColumnBlockEntryCapacityExceeded,
     #[error("storage file capacity exceeded")]
     StorageFileCapacityExceeded,
     #[error("insufficient memory")]

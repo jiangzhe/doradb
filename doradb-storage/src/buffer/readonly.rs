@@ -3926,4 +3926,66 @@ pub(crate) mod tests {
         let decision = arbiter.decide(8, global.capacity(), 0, 0.02, 1).unwrap();
         assert_eq!(decision.batch_size, 5);
     }
+
+    /// Purpose: Enforce adaptive identity validation once per admitted immutable generation.
+    /// Expected: Warm reads reuse admission, invalidation revalidates, and malformed rank metadata is never cached.
+    #[test]
+    fn adaptive_identity_cache_admission_and_invalidation() {
+        use crate::index::adaptive_leaf_fixture;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn validate(page: &[u8], kind: FileKind, block: BlockID) -> DataIntegrityResult<()> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            validate_persisted_column_block_index_page(page, kind, block)
+        }
+        smol::block_on(async {
+            let (_temp_dir, fs) = build_test_fs();
+            let table_id = test_user_table_id(123);
+            let file = fs
+                .create_table_file(table_id, make_metadata(), false)
+                .unwrap();
+            let file = commit_table_file(&fs, file).await;
+            let page = adaptive_leaf_fixture();
+            let block = test_block_id(12);
+            write_page_bytes(&fs, &file, block, &page).await;
+            let global = owned_global_pool(frame_page_bytes(2));
+            let pool = owned_readonly_pool(
+                FileID::from(table_id),
+                FileKind::TableFile,
+                Arc::clone(file.sparse_file()),
+                &global,
+            );
+            let guard = pool.create_base_guard();
+            for _ in 0..3 {
+                drop(
+                    pool.read_validated_block(&guard, block, validate)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+            global.invalidate_block(&guard, FileID::from(table_id), block);
+            drop(
+                pool.read_validated_block(&guard, block, validate)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+            assert_invalid_page_not_cached(
+                "adaptive bitmap rank",
+                table_id,
+                block,
+                page,
+                validate_persisted_column_block_index_page,
+                |page| {
+                    // This standalone entry is packed at the page tail: 24-byte
+                    // entry header, common header, count/variant, prefix, word.
+                    let prefix = BLOCK_INTEGRITY_HEADER_SIZE + COLUMN_BLOCK_NODE_PAYLOAD_SIZE - 10;
+                    page[prefix] = 1;
+                    write_block_checksum(page);
+                },
+                DataIntegrityError::InvalidPayload,
+            )
+            .await;
+        });
+    }
 }

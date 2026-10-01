@@ -467,7 +467,7 @@ pub(crate) struct ColdBlockScanDescriptor {
     end_row_id: RowID,
     row_count: u16,
     row_id_span: u32,
-    row_shape_fingerprint: u128,
+    block_binding_value: u64,
     deletes: ColdDescriptorDeletes,
 }
 
@@ -1116,7 +1116,7 @@ impl<'op> UserTableAccessor<'op> {
                     guards,
                     resolved.block_id(),
                     resolved.row_idx(),
-                    resolved.row_shape_fingerprint(),
+                    resolved.block_binding_value(),
                 )
                 .await?;
             assert_eq!(
@@ -1249,7 +1249,7 @@ impl<'op> UserTableAccessor<'op> {
                 RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
-                    row_shape_fingerprint,
+                    block_binding_value,
                     durable_deleted,
                 }) => {
                     if !cold_row_visible_mvcc(
@@ -1274,10 +1274,10 @@ impl<'op> UserTableAccessor<'op> {
                             )
                         })?;
                     let block = persisted.block();
-                    if block.row_shape_fingerprint() != row_shape_fingerprint {
+                    if block.block_binding_value() != block_binding_value {
                         return Err(Report::new(DataIntegrityError::InvalidPayload)
                             .attach(format!(
-                                "file={file_kind}, block=lwc_block, block_id={block_id}, row shape fingerprint mismatch"
+                                "file={file_kind}, block=lwc_block, block_id={block_id}, block binding value mismatch"
                             ))
                             .change_context(RuntimeError::TableAccess)
                             .attach(format!(
@@ -1366,7 +1366,7 @@ impl<'op> UserTableAccessor<'op> {
         guards: &PoolGuards,
         block_id: BlockID,
         row_idx: usize,
-        row_shape_fingerprint: u128,
+        block_binding_value: u64,
         read_set: &[usize],
     ) -> RuntimeOrFatalResult<Vec<Val>> {
         let storage = self.column_storage();
@@ -1382,10 +1382,10 @@ impl<'op> UserTableAccessor<'op> {
                 )
             })?;
         let block = persisted.block();
-        if block.row_shape_fingerprint() != row_shape_fingerprint {
+        if block.block_binding_value() != block_binding_value {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, row shape fingerprint mismatch"
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, block binding value mismatch"
                 ))
                 .change_context(RuntimeError::TableAccess)
                 .attach(format!(
@@ -1410,7 +1410,7 @@ impl<'op> UserTableAccessor<'op> {
         guards: &PoolGuards,
         block_id: BlockID,
         row_idx: usize,
-        row_shape_fingerprint: u128,
+        block_binding_value: u64,
     ) -> RuntimeOrFatalResult<Vec<Val>> {
         let storage = self.column_storage();
         let file_kind = storage.file().file_kind();
@@ -1425,10 +1425,10 @@ impl<'op> UserTableAccessor<'op> {
                 )
             })?;
         let block = persisted.block();
-        if block.row_shape_fingerprint() != row_shape_fingerprint {
+        if block.block_binding_value() != block_binding_value {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, row shape fingerprint mismatch"
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, block binding value mismatch"
                 ))
                 .change_context(RuntimeError::TableAccess)
                 .attach(format!(
@@ -1468,11 +1468,11 @@ impl<'op> UserTableAccessor<'op> {
         guards: &PoolGuards,
         block_id: BlockID,
         row_idx: usize,
-        row_shape_fingerprint: u128,
+        block_binding_value: u64,
     ) -> RuntimeOrFatalResult<WriteIndexKeySet<'op>> {
         let read_set = self.layout().indexed_column_read_set();
         let vals = self
-            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, read_set)
+            .read_lwc_row(guards, block_id, row_idx, block_binding_value, read_set)
             .await?;
         Ok(WriteIndexKeySet::from_indexed_values(
             self.layout(),
@@ -1489,7 +1489,7 @@ impl<'op> UserTableAccessor<'op> {
         key_vals: &[Val],
         block_id: BlockID,
         row_idx: usize,
-        row_shape_fingerprint: u128,
+        block_binding_value: u64,
     ) -> RuntimeOrFatalResult<bool> {
         let read_set = self
             .metadata()
@@ -1500,7 +1500,7 @@ impl<'op> UserTableAccessor<'op> {
             .map(|key| key.column_ordinal.as_usize())
             .collect::<Vec<_>>();
         let vals = self
-            .read_lwc_row(guards, block_id, row_idx, row_shape_fingerprint, &read_set)
+            .read_lwc_row(guards, block_id, row_idx, block_binding_value, &read_set)
             .await?;
         Ok(vals.as_slice() != key_vals)
     }
@@ -1535,7 +1535,7 @@ impl<'op> UserTableAccessor<'op> {
             RowLocation::LwcBlock(LwcRowLocation {
                 block_id,
                 row_idx,
-                row_shape_fingerprint,
+                block_binding_value,
                 durable_deleted,
             }) => {
                 // LWC rows are immutable persisted images. If no globally
@@ -1550,7 +1550,7 @@ impl<'op> UserTableAccessor<'op> {
                             key_vals,
                             block_id,
                             row_idx,
-                            row_shape_fingerprint,
+                            block_binding_value,
                         )
                         .await?
                 {
@@ -1794,7 +1794,7 @@ impl<'op> UserTableAccessor<'op> {
                 rt.pool_guards(),
                 location.block_id,
                 location.row_idx,
-                location.row_shape_fingerprint,
+                location.block_binding_value,
             )
             .await?;
         // The unique index entry may be stale while purge is catching up, so
@@ -3234,10 +3234,10 @@ impl<'op> UserTableAccessor<'op> {
             .await
             .change_runtime_context(RuntimeError::TableAccess)?;
         let block = persisted.block();
-        if block.row_shape_fingerprint() != location.row_shape_fingerprint {
+        if block.block_binding_value() != location.block_binding_value {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "unique lookup row shape mismatch: block_id={}",
+                    "unique lookup block binding value mismatch: block_id={}",
                     location.block_id
                 ))
                 .change_context(RuntimeError::TableAccess)
@@ -3433,7 +3433,7 @@ fn compile_cold_scan_descriptors(
             end_row_id: entry.end_row_id,
             row_count: entry.row_count,
             row_id_span: entry.row_id_span,
-            row_shape_fingerprint: entry.row_shape_fingerprint,
+            block_binding_value: entry.block_binding_value,
             deletes,
         }));
     }
@@ -3465,10 +3465,10 @@ fn validate_cold_scan_descriptor(
             block.row_count()
         )));
     }
-    if block.row_shape_fingerprint() != descriptor.row_shape_fingerprint {
+    if block.block_binding_value() != descriptor.block_binding_value {
         return Err(
             Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "file={file_kind}, block=lwc_block, block_id={}, row shape fingerprint mismatch",
+                "file={file_kind}, block=lwc_block, block_id={}, block binding value mismatch",
                 descriptor.block_id
             )),
         );
@@ -3491,10 +3491,10 @@ fn validate_cold_scan_entry(
             row_ids.len()
         )));
     }
-    if block.row_shape_fingerprint() != entry.row_shape_fingerprint() {
+    if block.block_binding_value() != entry.block_binding_value() {
         return Err(
             Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "file={file_kind}, block=lwc_block, block_id={}, row shape fingerprint mismatch",
+                "file={file_kind}, block=lwc_block, block_id={}, block binding value mismatch",
                 entry.block_id()
             )),
         );
@@ -3650,7 +3650,7 @@ mod tests {
         Checksum,
         RowCodec,
         BlockId,
-        RowShape,
+        BindingValue,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3947,8 +3947,8 @@ mod tests {
                     DataIntegrityError::InvalidPayload,
                 )
             }
-            ColdReadCorruption::RowShape => {
-                corrupt_lwc_row_shape_fingerprint(path, entry.block_id());
+            ColdReadCorruption::BindingValue => {
+                corrupt_lwc_block_binding_value(path, entry.block_id());
                 (
                     entry.block_id(),
                     "lwc_block",
@@ -5089,7 +5089,7 @@ mod tests {
     }
 
     /// Purpose: Protect propagation of resolved column-index routing metadata.
-    /// Expected: Row lookup preserves the block, ordinal, fingerprint, and durable-deletion
+    /// Expected: Row lookup preserves the block, ordinal, binding value, and durable-deletion
     /// state of the resolved route.
     #[test]
     fn test_find_row_returns_resolved_lwc_page_location() {
@@ -5126,12 +5126,12 @@ mod tests {
                 RowLocation::LwcBlock(LwcRowLocation {
                     block_id,
                     row_idx,
-                    row_shape_fingerprint,
+                    block_binding_value,
                     durable_deleted,
                 }) => {
                     assert_eq!(block_id, resolved.block_id());
                     assert_eq!(row_idx, resolved.row_idx());
-                    assert_eq!(row_shape_fingerprint, resolved.row_shape_fingerprint());
+                    assert_eq!(block_binding_value, resolved.block_binding_value());
                     assert_eq!(durable_deleted, resolved.durable_deleted());
                 }
                 RowLocation::RowPage(..) => panic!("row should be in lwc"),
@@ -5225,11 +5225,13 @@ mod tests {
         smol::block_on(assert_cold_read_corruption(ColdReadCorruption::BlockId));
     }
 
-    /// Purpose: Protect cold point reads against inconsistent row-shape metadata.
+    /// Purpose: Protect cold point reads against inconsistent block binding metadata.
     /// Expected: The read reports an invalid column-block payload with block context.
     #[test]
-    fn test_lwc_select_surfaces_row_shape_fingerprint_mismatch_corruption() {
-        smol::block_on(assert_cold_read_corruption(ColdReadCorruption::RowShape));
+    fn test_lwc_select_surfaces_block_binding_value_mismatch_corruption() {
+        smol::block_on(assert_cold_read_corruption(
+            ColdReadCorruption::BindingValue,
+        ));
     }
 
     /// Purpose: Protect cold-row deletion against an active competing owner.
@@ -8356,10 +8358,7 @@ mod tests {
                 assert_eq!(descriptor.start_row_id, entry.start_row_id);
                 assert_eq!(descriptor.end_row_id, entry.end_row_id());
                 assert_eq!(descriptor.row_count(), usize::from(entry.row_count()));
-                assert_eq!(
-                    descriptor.row_shape_fingerprint,
-                    entry.row_shape_fingerprint()
-                );
+                assert_eq!(descriptor.block_binding_value, entry.block_binding_value());
             }
             assert_eq!(worklist.hot_pages, expected_hot_pages);
             assert!(!worklist.cold_entries.is_empty());

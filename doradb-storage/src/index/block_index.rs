@@ -320,7 +320,7 @@ impl BlockIndex {
             Some(resolved) => Ok(RowLocation::LwcBlock(LwcRowLocation {
                 block_id: resolved.block_id(),
                 row_idx: resolved.row_idx(),
-                row_shape_fingerprint: resolved.row_shape_fingerprint(),
+                block_binding_value: resolved.block_binding_value(),
                 durable_deleted: resolved.durable_deleted(),
             })),
             None => Ok(RowLocation::NotFound),

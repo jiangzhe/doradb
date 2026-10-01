@@ -197,10 +197,16 @@ retain no page guard, borrowed vector view, latch, logical lock, mutable-root
 borrow, or IO request owner. On failure, forward production stops while every
 accepted encode and write is still observed.
 
-The known checkpoint pivot is part of the final builder's logical shape before
-encoding. Fully deleted trailing pages therefore extend the final block's
-exclusive RowID span before its fingerprint is embedded in the checksummed LWC
-header, keeping that fingerprint identical to the later block-index entry.
+Before encoding, checkpoint finalizes each block's RowID coverage, including
+absent trailing positions up to the new checkpoint pivot. It selects a compact
+row-identity representation and creates matching binding metadata for the index
+entry and LWC block. Their membership, row order, and binding remain fixed
+through publication. Catalog checkpoints follow the same identity rules.
+
+Row identity must fit within its index entry alongside deletion metadata. If it
+cannot fit, checkpoint stops production, drains accepted writes, and publishes
+no partial root. Failures after the irreversible transition retain the existing
+fatal checkpoint policy.
 
 For every row accepted into an LWC block, checkpoint sends the identical
 visible value and RowID to the secondary-index sidecar. This produces companion

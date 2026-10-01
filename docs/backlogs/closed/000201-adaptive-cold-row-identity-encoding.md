@@ -140,3 +140,19 @@ Current findings:
   storage choices. Hashing segment or bitmap bytes directly would change the
   binding when the same rows are re-encoded.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented adaptive whole-entry and segmented row identity, compact runtime access,
+cache-admission validation, typed inline-capacity handling, and the approved u64
+block binding through [task 000322](../../tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md).
+
+Remaining joint identity/deletion capacity and identity-aware LWC splitting are
+carried forward in [backlog 000206](../000206-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md).
+Automatic splitting, identity offloading, and changes to the fatal checkpoint
+policy were not implemented; bounded inline splitting is the preferred next
+direction. Cross-use checksum algorithm evaluation remains in
+[backlog 000207](../000207-evaluate-checksum-algorithms-across-all-use-cases.md).
+- Closed By: backlog close
+- Reference: docs/tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md
+- Closed At: 2026-10-01

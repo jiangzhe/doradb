@@ -2,6 +2,7 @@
 
 pub(crate) mod block;
 
+use crate::index::column_row_set::RowSetSeed;
 pub(crate) use block::*;
 
 use crate::bitmap::Bitmap;
@@ -1035,6 +1036,8 @@ struct LwcColumnSnapshot {
 struct LwcSnapshot {
     row_count: usize,
     row_ids_len: usize,
+    seeds_len: usize,
+    last_seed: Option<RowSetSeed>,
     stats: Vec<LwcColumnSnapshot>,
 }
 
@@ -1043,6 +1046,7 @@ pub(crate) struct LwcBuilder {
     col_layout: Arc<TableColumnLayout>,
     buffer: ScanBuffer,
     row_ids: Vec<RowID>,
+    row_set_seeds: Vec<RowSetSeed>,
     stats: Vec<LwcColumnStats>,
 }
 
@@ -1058,6 +1062,7 @@ impl LwcBuilder {
             col_layout,
             buffer,
             row_ids: Vec::new(),
+            row_set_seeds: Vec::new(),
             stats,
         }
     }
@@ -1079,6 +1084,11 @@ impl LwcBuilder {
     #[inline]
     pub(crate) fn row_ids(&self) -> &[RowID] {
         &self.row_ids
+    }
+
+    /// Returns accepted logical range statistics used for identity planning.
+    pub(crate) fn row_set_seeds(&self) -> &[RowSetSeed] {
+        &self.row_set_seeds
     }
 
     /// Appends one validated decoded row if the block still fits.
@@ -1132,6 +1142,7 @@ impl LwcBuilder {
         }
         self.scan_page_stats(&view, &new_row_ids);
         self.buffer.scan(view);
+        RowSetSeed::append_page(&mut self.row_set_seeds, &new_row_ids, self.row_ids.len());
         self.row_ids.extend(new_row_ids);
         self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
@@ -1140,12 +1151,13 @@ impl LwcBuilder {
         self.scan_row_value_stats(vals);
         self.buffer
             .append_row_values(self.col_layout.as_ref(), vals);
+        RowSetSeed::append_window(&mut self.row_set_seeds, row_id, self.row_ids.len());
         self.row_ids.push(row_id);
         self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
     }
 
-    /// Builds a persisted LWC block with the supplied row-shape fingerprint.
-    pub(crate) fn build(self, row_shape_fingerprint: u128) -> InternalResult<DirectBuf> {
+    /// Builds a persisted LWC block with the supplied block binding value.
+    pub(crate) fn build(self, block_binding_value: u64) -> InternalResult<DirectBuf> {
         if self.buffer.is_empty() {
             return Err(Report::new(InternalError::LwcBuilderMisuse)
                 .attach("cannot build an empty LWC block"));
@@ -1242,7 +1254,7 @@ impl LwcBuilder {
         }
 
         let header = LwcBlockHeader::new(
-            row_shape_fingerprint,
+            block_binding_value,
             row_count as u16,
             self.col_layout.col_count() as u16,
             0,
@@ -1270,6 +1282,8 @@ impl LwcBuilder {
         LwcSnapshot {
             row_count: self.buffer.len(),
             row_ids_len: self.row_ids.len(),
+            seeds_len: self.row_set_seeds.len(),
+            last_seed: self.row_set_seeds.last().copied(),
             stats: self.stats.iter().map(|s| s.snapshot()).collect(),
         }
     }
@@ -1277,6 +1291,13 @@ impl LwcBuilder {
     fn rollback(&mut self, snapshot: LwcSnapshot) {
         self.buffer.truncate(snapshot.row_count);
         self.row_ids.truncate(snapshot.row_ids_len);
+        self.row_set_seeds.truncate(snapshot.seeds_len);
+        if let Some(last) = snapshot.last_seed {
+            *self
+                .row_set_seeds
+                .last_mut()
+                .expect("snapshot retained its last seed") = last;
+        }
         for (stat, snap) in self.stats.iter_mut().zip(snapshot.stats) {
             stat.restore(snap);
         }
@@ -2281,21 +2302,10 @@ mod tests {
     use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
     use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
-    use crate::index::ColumnBlockEntryShape;
     use crate::io::IOBuf;
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;
-
-    fn row_shape_fingerprint_for(row_ids: &[RowID], start_row_id: u64, end_row_id: u64) -> u128 {
-        ColumnBlockEntryShape::new(
-            RowID::new(start_row_id),
-            RowID::new(end_row_id),
-            row_ids.to_vec(),
-            Vec::new(),
-        )
-        .row_shape_fingerprint()
-    }
 
     #[track_caller]
     fn assert_invalid_payload<T>(case: &str, result: DataIntegrityResult<T>) {
@@ -2803,7 +2813,7 @@ mod tests {
     }
 
     /// Purpose: Build a persisted block from a row page containing nulls and deleted rows.
-    /// Expected: Live rows retain their values and nulls with the supplied row-shape fingerprint.
+    /// Expected: Live rows retain their values and nulls with the supplied block binding value.
     #[test]
     fn test_lwc_builder_from_row_page() {
         let metadata = TableMetadata::try_new(
@@ -2854,8 +2864,8 @@ mod tests {
             .map(|(row_id, _, _)| RowID::new(*row_id))
             .collect();
         assert_eq!(builder.row_ids(), expected_ids);
-        let expected_fingerprint = row_shape_fingerprint_for(&expected_ids, 100, 110);
-        let buf = builder.build(expected_fingerprint).unwrap();
+        let expected_binding_value = 0x0807_0605_0403_0201;
+        let buf = builder.build(expected_binding_value).unwrap();
 
         let lwc_block = LwcBlock::try_from_persisted_bytes(
             buf.as_bytes(),
@@ -2865,8 +2875,8 @@ mod tests {
         .unwrap();
         assert_eq!(lwc_block.header.row_count() as usize, expected_rows.len());
         assert_eq!(
-            lwc_block.header.row_shape_fingerprint(),
-            expected_fingerprint
+            lwc_block.header.block_binding_value(),
+            expected_binding_value
         );
 
         let column0 = lwc_block.column(metadata.col.as_ref(), 0).unwrap();
@@ -2933,9 +2943,9 @@ mod tests {
         let expected_ids = [RowID::new(10), RowID::new(11), RowID::new(12)];
         assert_eq!(direct_builder.row_ids(), expected_ids);
         assert_eq!(page_builder.row_ids(), expected_ids);
-        let fingerprint = row_shape_fingerprint_for(&expected_ids, 10, 13);
-        let page_buf = page_builder.build(fingerprint).unwrap();
-        let direct_buf = direct_builder.build(fingerprint).unwrap();
+        let binding_value = 0x0807_0605_0403_0201;
+        let page_buf = page_builder.build(binding_value).unwrap();
+        let direct_buf = direct_builder.build(binding_value).unwrap();
         assert_eq!(direct_buf.as_bytes(), page_buf.as_bytes());
         assert_persisted_rows(direct_buf.as_bytes(), metadata.col.as_ref(), &rows);
     }
@@ -3109,6 +3119,7 @@ mod tests {
         assert!(builder.append_view(view, page.header.start_row_id));
 
         let snapshot = builder.snapshot_state();
+        let expected_seeds = builder.row_set_seeds().to_vec();
         let expected_stats = vec![(true, 0, 0, 10, 11), (true, 20, 21, 0, 0)];
         assert_eq!(integer_stats(&builder), expected_stats);
 
@@ -3125,6 +3136,12 @@ mod tests {
         builder.rollback(snapshot);
 
         assert_eq!(builder.row_count(), 2);
+        assert_eq!(builder.row_set_seeds(), expected_seeds);
+        // A direct append extends the final window; rollback must restore its statistics.
+        let snapshot = builder.snapshot_state();
+        assert!(builder.append_row_values(RowID::new(3), &extra_rows[0]));
+        builder.rollback(snapshot);
+        assert_eq!(builder.row_set_seeds(), expected_seeds);
         assert_eq!(builder.row_ids(), &[RowID::new(1), RowID::new(2)]);
         assert_eq!(integer_stats(&builder), expected_stats);
         assert_built_rows(builder, &rows);

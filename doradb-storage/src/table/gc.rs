@@ -670,11 +670,11 @@ impl Table {
             .load_lwc_block(cleanup_context.disk_pool_guard, block_id)
             .await?;
         let block = persisted.block();
-        if block.row_shape_fingerprint() != row.row_shape_fingerprint() {
+        if block.block_binding_value() != row.block_binding_value() {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
                     "file={file_kind}, block=lwc_block, block_id={block_id}, \
-                     reason=row_shape_fingerprint_mismatch"
+                     reason=block_binding_value_mismatch"
                 ))
                 .change_context(RuntimeError::TableAccess)
                 .attach(format!(
@@ -1861,7 +1861,7 @@ mod tests {
             );
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
-            corrupt_lwc_row_shape_fingerprint(table_file_path, block_id);
+            corrupt_lwc_block_binding_value(table_file_path, block_id);
             let _ = table.disk_pool().invalidate_block(
                 session.pool_guards().disk_guard(),
                 table.file().sparse_file().file_id(),
