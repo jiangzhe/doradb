@@ -26,7 +26,7 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 /// Size in bytes of one validated persisted LWC payload, excluding the shared block envelope.
 pub(crate) const LWC_BLOCK_PAYLOAD_SIZE: usize = max_payload_len(COW_FILE_PAGE_SIZE);
 
-const LWC_BLOCK_HEADER_SIZE: usize = 32;
+const LWC_BLOCK_HEADER_SIZE: usize = 24;
 const _: () = assert!(mem::size_of::<LwcBlockHeader>() == LWC_BLOCK_HEADER_SIZE);
 const _: () = assert!(mem::size_of::<LwcBlock>() == LWC_BLOCK_PAYLOAD_SIZE);
 const _: () = assert!(mem::align_of::<LwcBlock>() == 1);
@@ -54,7 +54,7 @@ const _: () = assert!(mem::align_of::<LwcBlock>() == 1);
 /// |-------------------------|-----------|
 /// | field                   | length(B) |
 /// |-------------------------|-----------|
-/// | row_shape_fingerprint   | 16        |
+/// | block_binding_value     | 8         |
 /// | row_count               | 2         |
 /// | col_count               | 2         |
 /// | flags                   | 2         |
@@ -143,10 +143,10 @@ impl LwcBlock {
             .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
     }
 
-    /// Returns the canonical row-shape fingerprint stored in this block.
+    /// Returns the block binding value stored in this block.
     #[inline]
-    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
-        self.header.row_shape_fingerprint()
+    pub(crate) fn block_binding_value(&self) -> u64 {
+        self.header.block_binding_value()
     }
 
     /// Returns the number of rows encoded in this block.
@@ -602,8 +602,8 @@ impl ColOffsets<'_> {
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct LwcBlockHeader {
-    /// Canonical row-shape fingerprint sourced from column-block index shape.
-    row_shape_fingerprint: [u8; 16],
+    /// Block binding value sourced from column-block index shape.
+    block_binding_value: [u8; 8],
     /// Row count in this page.
     row_count: [u8; 2],
     /// Column count in this page.
@@ -618,13 +618,13 @@ impl LwcBlockHeader {
     /// Creates a deterministic block header from logical header fields.
     #[inline]
     pub(crate) fn new(
-        row_shape_fingerprint: u128,
+        block_binding_value: u64,
         row_count: u16,
         col_count: u16,
         flags: u16,
     ) -> Self {
         LwcBlockHeader {
-            row_shape_fingerprint: row_shape_fingerprint.to_le_bytes(),
+            block_binding_value: block_binding_value.to_le_bytes(),
             row_count: row_count.to_le_bytes(),
             col_count: col_count.to_le_bytes(),
             flags: flags.to_le_bytes(),
@@ -632,10 +632,10 @@ impl LwcBlockHeader {
         }
     }
 
-    /// Returns the canonical row-shape fingerprint.
+    /// Returns the block binding value.
     #[inline]
-    pub(crate) fn row_shape_fingerprint(&self) -> u128 {
-        u128::from_le_bytes(self.row_shape_fingerprint)
+    pub(crate) fn block_binding_value(&self) -> u64 {
+        u64::from_le_bytes(self.block_binding_value)
     }
 
     /// Returns the number of rows encoded in the block.
@@ -659,7 +659,7 @@ impl Ser<'_> for LwcBlockHeader {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_byte_array(start_idx, &self.row_shape_fingerprint);
+        let idx = out.ser_byte_array(start_idx, &self.block_binding_value);
         let idx = out.ser_byte_array(idx, &self.row_count);
         let idx = out.ser_byte_array(idx, &self.col_count);
         let idx = out.ser_byte_array(idx, &self.flags);
@@ -688,12 +688,13 @@ mod tests {
     use crate::file::block_integrity::{BLOCK_INTEGRITY_HEADER_SIZE, write_block_checksum};
     use crate::file::{FileKind, test_block_id};
     use crate::id::RowID;
-    use crate::index::ColumnBlockEntryShape;
     use crate::io::DirectBuf;
     use crate::layout::LayoutError;
     use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer, LwcPrimitiveSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
+
+    const TEST_BLOCK_BINDING_VALUE: u64 = 0x0807_0605_0403_0201;
 
     thread_local! {
         static DECODE_COUNTS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
@@ -730,18 +731,6 @@ mod tests {
     fn persisted_payload_mut(buf: &mut DirectBuf) -> &mut LwcBlock {
         let end = BLOCK_INTEGRITY_HEADER_SIZE + LWC_BLOCK_PAYLOAD_SIZE;
         LwcBlock::from_bytes_mut(&mut buf.data_mut()[BLOCK_INTEGRITY_HEADER_SIZE..end])
-    }
-
-    fn row_shape_fingerprint_for(row_ids: &[RowID]) -> u128 {
-        let start_row_id = row_ids.first().unwrap().as_u64();
-        let end_row_id = row_ids.last().unwrap().as_u64().saturating_add(1);
-        ColumnBlockEntryShape::new(
-            RowID::new(start_row_id),
-            RowID::new(end_row_id),
-            row_ids.to_vec(),
-            Vec::new(),
-        )
-        .row_shape_fingerprint()
     }
 
     fn assert_lwc_data_integrity(
@@ -784,8 +773,8 @@ mod tests {
             let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let view = page.vector_view(metadata.col.as_ref());
             assert!(builder.append_view(view, page.header.start_row_id));
-            let fingerprint = row_shape_fingerprint_for(builder.row_ids());
-            builder.build(fingerprint).unwrap()
+            let binding_value = TEST_BLOCK_BINDING_VALUE;
+            builder.build(binding_value).unwrap()
         };
         (metadata, buf)
     }
@@ -822,28 +811,33 @@ mod tests {
     /// Expected: Multibyte fields use the specified byte order and reserved bytes remain zero.
     #[test]
     fn test_lwc_block_header_persisted_layout() {
-        let header = LwcBlockHeader::new(
-            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201,
-            0x1211,
-            0x1413,
-            0x1615,
-        );
-        assert_eq!(
-            header.row_shape_fingerprint(),
-            0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201
-        );
-        assert_eq!(header.row_count(), 0x1211);
-        assert_eq!(header.col_count(), 0x1413);
+        let header = LwcBlockHeader::new(0x0807_0605_0403_0201, 0x0a09, 0x0c0b, 0x0e0d);
+        assert_eq!(header.block_binding_value(), 0x0807_0605_0403_0201);
+        assert_eq!(header.row_count(), 0x0a09);
+        assert_eq!(header.col_count(), 0x0c0b);
         let mut bytes = vec![0; header.ser_len()];
         assert_eq!(header.ser(&mut bytes[..], 0), bytes.len());
         assert_eq!(
             bytes,
             [
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(&bytes, layout::bytes_of(&header));
+    }
+
+    /// Purpose: Reject the former fingerprint header before interpreting it as a binding header.
+    /// Expected: A valid checksum cannot make the old LWC envelope version readable.
+    #[test]
+    fn lwc_block_rejects_previous_binding_format() {
+        let (_, mut buf) = build_valid_persisted_lwc_block();
+        buf.data_mut()[8..16].copy_from_slice(&1u64.to_le_bytes());
+        write_block_checksum(buf.data_mut());
+        let err =
+            LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(7))
+                .err()
+                .expect("previous LWC format must be rejected");
+        assert_lwc_data_integrity(err, test_block_id(7), DataIntegrityError::InvalidVersion);
     }
 
     /// Purpose: Decode a nullable column with interleaved null and non-null rows.
@@ -932,7 +926,7 @@ mod tests {
             page.body[2] = 0xAB;
         }
         let page = LwcBlock::try_from_bytes(buf.data()).unwrap();
-        assert_eq!(page.header.row_shape_fingerprint(), 11);
+        assert_eq!(page.header.block_binding_value(), 11);
         assert_eq!(page.header.row_count(), 2);
         assert_eq!(page.header.col_count(), 1);
         assert_eq!(page.body[..2], (3u16).to_le_bytes());
@@ -998,10 +992,7 @@ mod tests {
             vec![Val::U8(10), Val::I16(20)],
             "complete row in schema order"
         );
-        assert_eq!(
-            page.row_shape_fingerprint(),
-            row_shape_fingerprint_for(&[RowID::new(100), RowID::new(101), RowID::new(102)])
-        );
+        assert_eq!(page.block_binding_value(), TEST_BLOCK_BINDING_VALUE);
 
         let err = page.decode_value(metadata.col.as_ref(), 3, 0).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);

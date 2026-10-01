@@ -979,11 +979,14 @@ mod tests {
     fn lwc_block(start: u64, end: u64, payload: &[u8]) -> TestLwcBlock {
         TestLwcBlock {
             shape: ColumnBlockEntryShape::new(
+                test_user_table_id(1),
                 RowID::new(start),
                 RowID::new(end),
-                (start..end).map(RowID::new).collect(),
+                &(start..end).map(RowID::new).collect::<Vec<_>>(),
+                &[],
                 Vec::new(),
-            ),
+            )
+            .unwrap(),
             buf: page_buf(payload),
         }
     }

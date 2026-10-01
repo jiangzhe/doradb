@@ -217,10 +217,10 @@ impl<'a> CheckpointLwcPipeline<'a> {
                 "full checkpoint CPU stage must have a logical encoding head"
             );
         }
-        let row_shape_fingerprint = shape.row_shape_fingerprint();
+        let block_binding_value = shape.block_binding_value();
         let completion = self
             .thread_pool
-            .submit(move || builder.build(row_shape_fingerprint));
+            .submit(move || builder.build(block_binding_value));
         self.blocks
             .push(Some(LwcBlockState::Encoding { shape, completion }));
         #[cfg(feature = "profiling")]
@@ -1861,16 +1861,16 @@ impl Table {
         let persisted = self.storage.load_lwc_block(disk_guard, block_id).await?;
         let block = persisted.block();
         if block.row_count() != row_ids.len()
-            || block.row_shape_fingerprint() != entry.row_shape_fingerprint()
+            || block.block_binding_value() != entry.block_binding_value()
         {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "LWC block metadata mismatch: block_id={}, block_row_count={}, expected_row_count={}, block_fingerprint={}, expected_fingerprint={}",
+                    "LWC block metadata mismatch: block_id={}, block_row_count={}, expected_row_count={}, block_binding_value={}, expected_binding_value={}",
                     entry.block_id(),
                     block.row_count(),
                     row_ids.len(),
-                    block.row_shape_fingerprint(),
-                    entry.row_shape_fingerprint()
+                    block.block_binding_value(),
+                    entry.block_binding_value()
                 ))
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach(format!(
@@ -2384,12 +2384,15 @@ impl Table {
                                 )),
                         ));
                     }
-                    let shape = ColumnBlockEntryShape::new(
+                    let shape = ColumnBlockEntryShape::new(self.table_id(),
                         current_start,
                         current_end,
-                        builder.row_ids().to_vec(),
+                        builder.row_ids(),
+                        builder.row_set_seeds(),
                         Vec::new(),
-                    );
+                    )
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach("operation=plan_cold_row_identity")?;
                     let completed_builder = replace(
                         &mut builder,
                         LwcBuilder::new(Arc::clone(&metadata.col)),
@@ -2440,12 +2443,15 @@ impl Table {
                 pipeline.advance_ready().await?;
             }
             if !builder.is_empty() {
-                let shape = ColumnBlockEntryShape::new(
+                let shape = ColumnBlockEntryShape::new(self.table_id(),
                     current_start,
                     new_pivot_row_id,
-                    builder.row_ids().to_vec(),
+                    builder.row_ids(),
+                    builder.row_set_seeds(),
                     Vec::new(),
-                );
+                )
+                .change_context(RuntimeError::CheckpointExecution)
+                .attach("operation=plan_cold_row_identity")?;
                 pipeline.submit(builder, shape).await?;
             }
             Ok(())
@@ -3251,11 +3257,14 @@ mod tests {
         let start_row_id = RowID::new(start_row_id);
         LwcBlockState::Encoding {
             shape: ColumnBlockEntryShape::new(
+                TableID::new(1),
                 start_row_id,
                 start_row_id + 10,
-                vec![start_row_id],
+                &[start_row_id],
+                &[],
                 Vec::new(),
-            ),
+            )
+            .unwrap(),
             completion,
         }
     }
@@ -3263,11 +3272,14 @@ mod tests {
     fn test_lwc_entry(start_row_id: u64, block_id: u64) -> ColumnBlockEntryInput {
         let start_row_id = RowID::new(start_row_id);
         ColumnBlockEntryShape::new(
+            TableID::new(1),
             start_row_id,
             start_row_id + 10,
-            vec![start_row_id],
+            &[start_row_id],
+            &[],
             Vec::new(),
         )
+        .unwrap()
         .with_block_id(BlockID::new(block_id))
     }
 
@@ -3835,7 +3847,7 @@ mod tests {
     }
 
     /// Purpose: Protect final column-block shape when trailing rows are deleted.
-    /// Expected: The indexed row span reaches the final pivot and its fingerprint matches the
+    /// Expected: The indexed row span reaches the final pivot and its binding value matches the
     /// encoded block.
     #[test]
     fn checkpoint_lwc_pipeline_finalizes_trailing_deleted_span_before_encoding() {
@@ -3958,8 +3970,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                persisted.block().row_shape_fingerprint(),
-                entry.row_shape_fingerprint()
+                persisted.block().block_binding_value(),
+                entry.block_binding_value()
             );
         });
     }
@@ -3981,20 +3993,26 @@ mod tests {
             let second = Arc::new(Completion::new());
             pipeline.blocks.push(Some(LwcBlockState::Encoding {
                 shape: ColumnBlockEntryShape::new(
+                    TableID::new(1),
                     RowID::new(10),
                     RowID::new(20),
-                    vec![RowID::new(10)],
+                    &[RowID::new(10)],
+                    &[],
                     Vec::new(),
-                ),
+                )
+                .unwrap(),
                 completion: Arc::clone(&first),
             }));
             pipeline.blocks.push(Some(LwcBlockState::Encoding {
                 shape: ColumnBlockEntryShape::new(
+                    TableID::new(1),
                     RowID::new(20),
                     RowID::new(30),
-                    vec![RowID::new(20)],
+                    &[RowID::new(20)],
+                    &[],
                     Vec::new(),
-                ),
+                )
+                .unwrap(),
                 completion: Arc::clone(&second),
             }));
 

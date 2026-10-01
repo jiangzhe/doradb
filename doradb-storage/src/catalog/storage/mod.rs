@@ -740,8 +740,8 @@ impl CatalogStorage {
                 vals,
             })
             .collect::<Vec<_>>();
-        let new_pages =
-            build_lwc_blocks_from_row_records(metadata, &output_rows).attach_with(|| {
+        let new_pages = build_lwc_blocks_from_row_records(table_id, metadata, &output_rows)
+            .attach_with(|| {
                 format!(
                     "operation=apply_catalog_table_ops, phase=build_lwc_blocks, table_id={table_id}"
                 )
@@ -1382,6 +1382,7 @@ fn catalog_table_slot_checked(
 }
 
 fn build_lwc_blocks_from_row_records(
+    table_id: TableID,
     metadata: &TableMetadata,
     rows: &[RowRecord],
 ) -> RuntimeResult<Vec<PendingLwcBlock>> {
@@ -1435,13 +1436,17 @@ fn build_lwc_blocks_from_row_records(
                     .attach("operation=build_catalog_lwc_blocks, phase=finish_block");
             }
             let shape = ColumnBlockEntryShape::new(
+                table_id,
                 start_row_id,
                 builder_end,
-                builder.row_ids().to_vec(),
+                builder.row_ids(),
+                builder.row_set_seeds(),
                 Vec::new(),
-            );
+            )
+            .change_context(RuntimeError::CatalogAccess)
+            .attach("operation=plan_cold_row_identity")?;
             let buf = builder
-                .build(shape.row_shape_fingerprint())
+                .build(shape.block_binding_value())
                 .change_context(RuntimeError::CatalogAccess)
                 .attach("operation=build_catalog_lwc_blocks, phase=encode_block")?;
             lwc_blocks.push(PendingLwcBlock { shape, buf });
@@ -1478,13 +1483,17 @@ fn build_lwc_blocks_from_row_records(
                 .attach("operation=build_catalog_lwc_blocks, phase=finish_final_block");
         }
         let shape = ColumnBlockEntryShape::new(
+            table_id,
             start_row_id,
             builder_end,
-            builder.row_ids().to_vec(),
+            builder.row_ids(),
+            builder.row_set_seeds(),
             Vec::new(),
-        );
+        )
+        .change_context(RuntimeError::CatalogAccess)
+        .attach("operation=plan_cold_row_identity")?;
         let buf = builder
-            .build(shape.row_shape_fingerprint())
+            .build(shape.block_binding_value())
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=build_catalog_lwc_blocks, phase=encode_final_block")?;
         lwc_blocks.push(PendingLwcBlock { shape, buf });
@@ -1583,6 +1592,7 @@ pub(crate) mod tests {
     use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
     use crate::lock::{LockMode, LockResource};
     use crate::log::redo::{DDLRedo, RowRedoKind};
+    use crate::lwc::LwcBlock;
     use crate::row::ops::UpdateCol;
     use crate::session::tests::begin_test_mandatory_private_trx;
     use crate::session::{ManagedTableOps, MandatoryOperationGuard, Session};
@@ -1909,7 +1919,7 @@ pub(crate) mod tests {
     ) -> CatalogTableRootDesc {
         let mut mutable =
             MutableMultiTableFile::fork(&storage.mtb, storage.table_fs.background_writes());
-        let pages = build_lwc_blocks_from_row_records(metadata, rows).unwrap();
+        let pages = build_lwc_blocks_from_row_records(table_id, metadata, rows).unwrap();
         let mut entries = Vec::with_capacity(pages.len());
         for page in pages {
             let block_id = mutable.allocate_block().unwrap();
@@ -2361,7 +2371,7 @@ pub(crate) mod tests {
                 catalog_column_row_record(RowID::new(0), table_id, 0),
                 catalog_column_row_record(RowID::new(1), table_id, 1),
             ];
-            let blocks = build_lwc_blocks_from_row_records(metadata, &rows)
+            let blocks = build_lwc_blocks_from_row_records(TABLE_ID_COLUMNS, metadata, &rows)
                 .expect("small rows should build directly");
             assert!(!blocks.is_empty());
             assert_eq!(storage.meta_pool.allocated(), allocated_before);
@@ -2370,7 +2380,11 @@ pub(crate) mod tests {
             let index_metadata = index_catalog_table.metadata();
             let oversized_row =
                 catalog_index_row_record(RowID::new(0), table_id, 0, u16::MAX as usize);
-            let result = build_lwc_blocks_from_row_records(index_metadata, &[oversized_row]);
+            let result = build_lwc_blocks_from_row_records(
+                TABLE_ID_INDEXES,
+                index_metadata,
+                &[oversized_row],
+            );
             let err = match result {
                 Ok(_) => panic!("oversized row should fail LWC block build"),
                 Err(err) => err,
@@ -2395,6 +2409,42 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Bind catalog LWC blocks to their logical table even when row summaries coincide.
+    /// Expected: Each block retains its shape's binding and different tables produce different values.
+    #[test]
+    fn catalog_lwc_binding_uses_logical_table_id() {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U64,
+                StorageColumnFlags::empty(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        let rows = vec![RowRecord {
+            row_id: RowID::new(10),
+            vals: vec![Val::from(7u64)],
+        }];
+        let mut bindings = Vec::new();
+        for table_id in [TABLE_ID_COLUMNS, TABLE_ID_INDEXES] {
+            let blocks = build_lwc_blocks_from_row_records(table_id, &metadata, &rows).unwrap();
+            assert_eq!(blocks.len(), 1);
+            let pending = &blocks[0];
+            let block = LwcBlock::try_from_persisted_bytes(
+                pending.buf.data(),
+                FileKind::CatalogMultiTableFile,
+                BlockID::new(1),
+            )
+            .unwrap();
+            assert_eq!(
+                block.block_binding_value(),
+                pending.shape.block_binding_value()
+            );
+            bindings.push(block.block_binding_value());
+        }
+        assert_ne!(bindings[0], bindings[1]);
+    }
+
     /// Purpose: Validate catalog row types and nullability before trusted block construction.
     /// Expected: Invalid values are rejected with column context before reaching the trusted
     /// builder.
@@ -2417,7 +2467,7 @@ pub(crate) mod tests {
                 row_id: RowID::new(0),
                 vals: vec![value],
             }];
-            let err = match build_lwc_blocks_from_row_records(&metadata, &rows) {
+            let err = match build_lwc_blocks_from_row_records(TABLE_ID_COLUMNS, &metadata, &rows) {
                 Ok(_) => panic!("{case} must fail catalog row validation"),
                 Err(err) => err,
             };
@@ -3504,5 +3554,33 @@ pub(crate) mod tests {
                 columns_root2.pivot_row_id()
             );
         });
+    }
+
+    /// Purpose: Reject highly compressible values whose sparse inline identity exceeds leaf capacity.
+    /// Expected: Direct catalog construction returns the resource cause before producing a publishable block.
+    #[test]
+    fn compressed_values_reject_oversized_identity() {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U64,
+                StorageColumnFlags::empty(),
+            )],
+            vec![],
+        )
+        .unwrap();
+        let rows: Vec<_> = (0..20000)
+            .map(|i| RowRecord {
+                row_id: RowID::new(i * 100003),
+                vals: vec![Val::from(0u64)],
+            })
+            .collect();
+        let err = match build_lwc_blocks_from_row_records(TABLE_ID_COLUMNS, &metadata, &rows) {
+            Ok(_) => panic!("oversized sparse identity must not produce a block"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.downcast_ref::<crate::error::ResourceError>(),
+            Some(&crate::error::ResourceError::ColumnBlockEntryCapacityExceeded)
+        );
     }
 }

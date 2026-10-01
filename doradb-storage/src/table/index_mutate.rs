@@ -205,7 +205,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
         let LwcRowLocation {
             block_id,
             row_idx,
-            row_shape_fingerprint,
+            block_binding_value,
             durable_deleted,
         } = location;
         let storage = accessor.column_storage();
@@ -215,10 +215,10 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
             .await
             .disclose()?;
         let block = persisted.block();
-        if block.row_shape_fingerprint() != row_shape_fingerprint {
+        if block.block_binding_value() != block_binding_value {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, row shape fingerprint mismatch"
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, block binding value mismatch"
                 ))
                 .disclose().into());
         }
@@ -513,7 +513,7 @@ impl<'a, 'op, 'r, 'ctx> IndexMutator<'a, 'op, 'r, 'ctx> {
                             self.rt.pool_guards(),
                             location.block_id,
                             location.row_idx,
-                            location.row_shape_fingerprint,
+                            location.block_binding_value,
                         )
                         .await
                         .disclose()?;

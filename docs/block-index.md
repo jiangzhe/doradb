@@ -72,9 +72,11 @@ The ownership split between indexes and storage is deliberate:
 - `ColumnBlockIndex` owns cold-row routing and cold-row identity shape
 - LWC blocks own persisted values
 
-This means persisted LWC blocks are not the authoritative source of cold-row
-identity. They are bound to the block index, which supplies the cold-row layout
-needed for lookup, checkpoint, and recovery.
+The block index supplies cold-row identity for lookup, checkpoint, and recovery.
+Each index entry and its LWC block share a binding that describes the table,
+covered row range, and physical row count. Readers check this binding before
+accessing values. The index remains responsible for mapping RowIDs to row
+positions, while block checksums protect persisted contents.
 
 Persistent cold-row delete payload is part of this same contract. It belongs
 with the cold-row routing layer because it affects whether a cold RowID is
@@ -98,8 +100,7 @@ which resolves:
 
 - the target persisted block
 - the row's position inside that block
-- the identity binding needed to ensure the block still matches the expected
-  cold-row shape
+- the binding used to check that the index entry and block metadata agree
 
 Cold-row visibility is still controlled by runtime MVCC and deletion overlay.
 The persisted block index identifies where the row lives; it does not by itself
@@ -115,13 +116,11 @@ Scans use the same split:
 This allows the engine to scan across mixed hot/cold table state without
 pretending both tiers have the same physical structure.
 
-Cold full-scan planning compiles each leaf entry while its owning index page is
-already resident. The scan descriptor retains the LWC block id, coverage and
-row-shape binding, row count, and persisted delete plan; execution does not
-reopen the leaf. Row identity is represented only as either allocation-free
-dense span metadata or the persisted sorted sparse `u32` deltas. These forms
-translate temporary row-id metadata to LWC ordinals without expanding a dense
-`Vec<RowID>`.
+Cold-scan planning retains the routing, compact row identity, and deletion
+information needed for each block, so execution can proceed without revisiting
+its index entry. Point lookups and scans use compact identity directly;
+consumers materialize individual RowIDs only when they need them. Encoding
+choices preserve row membership and order.
 
 For the scan's fixed MVCC read view, the table deletion buffer is traversed
 once and its matching markers are immediately classified and sorted. Persisted

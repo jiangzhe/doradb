@@ -235,39 +235,29 @@ deletion-blob blocks hold delete payloads that exceed the inline policy.
 
 ### 6.1 ColumnBlockIndex And Row-ID Lists
 
-`ColumnBlockIndex` is a persisted CoW tree rooted at
-`MetaBlock.column_block_index_root`. Branch entries map inclusive RowID lower
-bounds to child block ids. Each logical leaf entry describes one LWC block
-and its RowID coverage.
+`ColumnBlockIndex` is a persisted copy-on-write tree. Branches route RowID
+ranges to leaf entries. Each leaf entry identifies an LWC block, its covered
+range, its physical row membership, and its durable deletion state.
 
-A leaf separates its compact search prefixes from variable-length entry
-payloads:
+Row identity uses a compact representation suited to the row distribution.
+Contiguous ranges, sparse rows, runs, and mostly populated ranges have different
+storage needs. A block can combine representations across subranges when that
+reduces metadata size. All representations preserve the same membership and
+row order and support direct lookup and ordered scans.
 
-| Leaf component | Persisted contents |
-| --- | --- |
-| Search prefix | Entry start RowID as a plain `u64` or a leaf-relative `u16`/`u32` delta, followed by a `u16` payload offset |
-| Entry header | LWC block id, `row_shape_fingerprint`, RowID span, entry length, and row-section length |
-| Row section | Authoritative row identity encoded as a dense span or a sparse delta list |
-| Optional delete section | Delete domain/count and either inline delete values or an external `BlobRef` |
+Row identity stays within its index entry, with room for deletion metadata.
+Checkpoint rejects entries that exceed this capacity before publishing a new
+root. Persisted metadata is validated when loaded; incompatible formats and
+malformed data are rejected. Readers can reuse validated immutable data while
+it remains cached.
 
-The leaf selects one search-prefix encoding for all its entries. The 32-byte
-entry header and its row/delete sections are packed from the end of the leaf
-payload, while search prefixes grow from the front.
-
-The row section has two current encodings:
-
-- **Dense:** all RowIDs in `[start_row_id, start_row_id + row_id_span)` are
-  present. The section stores only its codec header; row ordinal `i` maps to
-  `start_row_id + i`.
-- **Sparse:** a sorted list of little-endian `u32` deltas from `start_row_id`
-  identifies the rows physically present in the LWC block. A delta's position
-  in the list is its LWC row ordinal. Gaps in the covered range are absent rows.
-
-Both encodings live inside the leaf entry. Persistent deletes are a separate
-set over these physically present rows, so marking a row deleted preserves
-its ordinal and its stored values. Lookup resolves the LWC block id, row
-ordinal, row-shape fingerprint, and durable delete membership from the index.
-See [Block Index](./block-index.md) for routing and MVCC behavior.
+Persistent deletes are separate from physical membership. Deleting a row leaves
+its stored values and row position intact. Rewriting deletion metadata preserves
+both the row identity and the binding shared with the LWC block. That binding
+describes the table, covered row range, and physical row count; equal summaries
+share a binding even when their contents differ. Block checksums protect the
+contents of each persisted block. See [Block Index](./block-index.md) for routing
+and visibility behavior.
 
 ### 6.2 LWC Value Blocks
 
@@ -277,19 +267,11 @@ Persistent rows are stored in LWC blocks using a PAX-style layout optimized for:
 - range scan
 - lightweight compression
 
-An LWC payload begins with a 32-byte header containing:
-
-- `row_shape_fingerprint: u128`
-- `row_count: u16`
-- `col_count: u16`
-- `flags: u16`
-- ten reserved bytes
-
-The body contains a `u16` column-end-offset array, compressed column payloads,
-and padding. Row IDs and persistent delete sets are stored in the block index,
-not in this body. Readers obtain a row ordinal from the index, verify that its
-expected fingerprint matches the LWC header, and decode values at that ordinal.
-Recovery and checkpoint consumers likewise obtain row identity from the index.
+An LWC block contains row and column metadata, the shared binding, and
+compressed column values. The block index owns RowIDs and persistent deletion
+state. Readers resolve a RowID to its position in the LWC block and check the
+binding before decoding values. Recovery and checkpoint also obtain row
+identity from the index.
 
 LWC blocks are immutable once published. Updates and deletes against persistent
 rows are represented through:

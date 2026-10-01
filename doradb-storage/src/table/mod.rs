@@ -3233,11 +3233,8 @@ pub(crate) mod tests {
         assert_eq!(after.secondary_index_slots, before.secondary_index_slots);
     }
 
-    /// Corrupts lwc row shape fingerprint for an integrity test.
-    pub(crate) fn corrupt_lwc_row_shape_fingerprint(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-    ) {
+    /// Corrupts lwc block binding value for an integrity test.
+    pub(crate) fn corrupt_lwc_block_binding_value(path: impl AsRef<Path>, page_id: impl Into<u64>) {
         rewrite_page_with_checksum(path, page_id, |page| {
             let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
             page[payload_start] ^= 0xFF;

@@ -278,10 +278,10 @@ impl<'a> CreateIndexCollector<'a> {
                 .attach("operation=create_index, phase=validate_index_build_input")
                 .into());
             }
-            if block.row_shape_fingerprint() != entry.row_shape_fingerprint() {
+            if block.block_binding_value() != entry.block_binding_value() {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
-                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row shape mismatch"
+                    "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC block binding value mismatch"
                 ))
                 .change_context(RuntimeError::CatalogAccess)
                 .attach("operation=create_index, phase=validate_index_build_input")

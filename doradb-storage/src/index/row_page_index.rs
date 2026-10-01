@@ -1593,8 +1593,8 @@ pub(crate) struct LwcRowLocation {
     pub(crate) block_id: BlockID,
     /// Resolved row ordinal within the persisted LWC block.
     pub(crate) row_idx: usize,
-    /// Canonical authoritative row-shape fingerprint bound to the block.
-    pub(crate) row_shape_fingerprint: u128,
+    /// Expected table/bounds/count binding value for the LWC block.
+    pub(crate) block_binding_value: u64,
     /// Whether the row belongs to the resolved entry's durable delete set.
     ///
     /// This committed base fact applies only when no newer in-memory column
