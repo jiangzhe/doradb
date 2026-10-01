@@ -33,12 +33,14 @@ guarantee capacity.
 - Related backlogs: [000036](000036-deletion-blob-roaring-encoding-upgrade-and-compatibility.md),
   [000037](000037-roaring-deletion-bitmap-rowid-to-offset-mapping-in-checkpoint.md),
   [000075](000075-refine-column-block-index-inline-delete-field-and-delete-surface-cleanup.md),
-  and [000201](000201-adaptive-cold-row-identity-encoding.md).
+  and [000201](closed/000201-adaptive-cold-row-identity-encoding.md).
 
 ## Deferred From (Optional)
 
 Review of docs/tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md;
 replaces the follow-up originally tracked by backlog 000031 from task 000038.
+Task resolution also carries forward the remaining capacity and splitting
+scope of closed backlog 000201 here.
 
 ## Deferral Context (Optional)
 
@@ -46,10 +48,17 @@ replaces the follow-up originally tracked by backlog 000031 from task 000038.
   Task 000322 explicitly excludes changing deletion encodings and preserves
   existing deletion domains and publication behavior. Inline-only deletion
   storage needs a separate format, admission, splitting, and compatibility design.
+  The completed task rejects oversized identities; it does not guarantee that
+  arbitrary sparse inputs can checkpoint successfully. Changing the existing
+  fatal policy after checkpoint TRANSITION also needs a separate decision.
 - Findings:
-  - Row identity is already inline-only. Its body limit is 65,176 bytes, with
+  - Row identity is already inline-only. Its body limit is 65,184 bytes, with
     240 bytes reserved for current deletion metadata. Oversized identity returns
     a typed capacity error; there is no identity offload path.
+  - Task 000322 replaced canonical per-row fingerprints with a u64
+    `block_binding_value` derived from the logical table, final RowID bounds,
+    and row count. Split blocks need bindings for their own summaries; delete-only
+    rewrites preserve existing bindings and physical membership.
   - Persisted deletes currently use plain `u32` lists, inline or external. Point
     lookup expands the list before testing membership. Inline thresholds retain
     legacy value-count assumptions rather than using the encoded byte size.
@@ -69,8 +78,8 @@ replaces the follow-up originally tracked by backlog 000031 from task 000038.
   - Independent fits do not imply a combined fit. A probe using the current
     encoder produced a 64,000-byte identity for 16,000 RowIDs spaced 100,000 apart
     in a coverage span of 1,600,000,000. Deleting every other ordinal takes a
-    2,130-byte bitmap body. Including 128 bytes of current page, entry, section,
-    and standalone-prefix overhead gives 66,258 bytes, exceeding a 65,536-byte
+    2,130-byte bitmap body. Including 120 bytes of current page, entry, section,
+    and standalone-prefix overhead gives 66,250 bytes, exceeding a 65,536-byte
     page. The identity alone passes current admission.
   - Leaf splitting operates between entries and cannot fix an oversized single
     entry. A block admitted with few or no deletes must still fit after its
@@ -82,6 +91,10 @@ replaces the follow-up originally tracked by backlog 000031 from task 000038.
   compression. Guarantee capacity for identity plus any future deletion subset
   at LWC admission, with bounded splitting before submission and an explicit
   legacy-data transition.
+  Absorb the remaining identity-capacity scope from backlog 000201 into this
+  joint admission design. Evaluate recoverable rejection before irreversible
+  checkpoint work; revisit identity offloading only if bounded inline splitting
+  cannot meet the requirements.
 
 ## Scope Hint
 
@@ -100,9 +113,10 @@ replaces the follow-up originally tracked by backlog 000031 from task 000038.
   actual prefix widths and complete sizes when packing multiple entries.
 - Add bounded LWC splitting before block submission when the joint budget is
   exceeded, covering both user-table and catalog construction. Preserve ordered
-  rows, coverage, and canonical fingerprints in the resulting blocks. Do not
+  rows, coverage, and matching block binding values in the resulting blocks. Do not
   solve later deletion growth by renumbering ordinals or changing row identity
-  during a delete-only rewrite. Coordinate this work with backlog 000201.
+  during a delete-only rewrite. Backlog 000201 records the completed identity
+  encoding work; this item owns its remaining capacity and splitting follow-up.
 - Read durable deletion membership directly from validated compact bytes.
   Resolve RowID to LWC ordinal through the existing compact identity; avoid
   expanding the entire delete set for point lookup. Preserve scan visibility
@@ -131,7 +145,7 @@ replaces the follow-up originally tracked by backlog 000031 from task 000038.
   serialization agree, including headers and directories.
 - Joint-budget overflow triggers bounded splitting before block submission.
   Split/reopen tests prove no row loss or duplication and correct ordinal and
-  fingerprint binding. Delete-only rewrites preserve identity and ordinals.
+  block binding values. Delete-only rewrites preserve identity and ordinals.
 - Malformed codec metadata, lengths, counts, and out-of-range ordinals fail
   through typed integrity boundaries. MVCC, atomic publication, recovery, and
   the selected legacy-data transition remain correct.
