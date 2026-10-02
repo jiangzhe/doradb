@@ -108,6 +108,9 @@ Planning, iteration, statistics, and seed types use `IdentitySet*` names.
 Four targeted `#[inline]` hints remove nested deletion-adapter calls in release
 code, but paired measurements show no reliable additional end-to-end speedup.
 
+Rust 1.99 CI compatibility required atomic API, bit-width, and empty-collection
+assertion updates. These preserve atomic ordering and existing test conditions.
+
 Review caught a bounded-view edge: the bitmap iterator requires its backing
 word slice to be clipped as well as its bit length. Exact/partial word tests
 and large prepared-page tests now protect that boundary. Append rollback
@@ -123,9 +126,10 @@ one test, and complete replacement explicitly removes previous membership.
 No new production unsafe block was introduced; refreshed unsafe inventory was
 unchanged. Borrowed page views end before pipeline waits.
 
-Validation: 2,211 workspace tests and 2,032 storage tests without default features
-passed. Strict Clippy passed in both configurations. The final style gate passed 16 branch-diff Rust files and 465 test contracts.
-Focused production coverage is 88.61% across seven files: ordinal deletions
+Validation on Rust 1.99: 2,211 workspace tests and 2,032 storage tests without
+default features passed. Strict Clippy passed in both configurations. The final
+style gate passed 51 branch-diff Rust files and 1,005 test contracts.
+Previously measured focused coverage is 88.61% across seven files: ordinal deletions
 99.01%, column index 86.94%, LWC 88.88%, bounded views 93.75%, persistence 87.66%,
 table access 91.36%, and catalog storage 84.47%; every target exceeds 80%.
 

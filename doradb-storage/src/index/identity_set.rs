@@ -353,9 +353,6 @@ pub(crate) struct EncodedIdentitySet {
     body: Option<Arc<[u8]>>,
 }
 
-/// Encoded identity set interpreted as cold row membership.
-pub(crate) type EncodedRowSet = EncodedIdentitySet;
-
 impl EncodedIdentitySet {
     /// Plans and encodes exactly once, checking capacity before allocating bytes.
     pub(crate) fn plan(
@@ -431,6 +428,9 @@ impl EncodedIdentitySet {
     }
 }
 
+/// Encoded identity set interpreted as cold row membership.
+pub(crate) type EncodedRowSet = EncodedIdentitySet;
+
 /// Borrowed identity set for row identity or ordinal deletions.
 /// Usable only after validation or trusted encoding.
 #[derive(Clone, Copy)]
@@ -440,9 +440,6 @@ pub(crate) struct IdentitySetRef<'a> {
     span: u32,
     count: u16,
 }
-
-/// Borrowed identity set interpreted as cold row membership.
-pub(crate) type RowSetRef<'a> = IdentitySetRef<'a>;
 
 impl<'a> IdentitySetRef<'a> {
     /// Validates disk bytes completely before establishing a searchable view.
@@ -682,6 +679,9 @@ impl<'a> IdentitySetRef<'a> {
         )
     }
 }
+
+/// Borrowed identity set interpreted as cold row membership.
+pub(crate) type RowSetRef<'a> = IdentitySetRef<'a>;
 
 #[derive(Clone, Copy)]
 struct LocalRef<'a> {
