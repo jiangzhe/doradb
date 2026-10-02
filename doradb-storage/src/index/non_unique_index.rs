@@ -436,7 +436,7 @@ mod tests {
 
         // 测试不存在的键
         let non_existent_key = vec![Val::from(43i32)];
-        assert!(lookup_rows(&index, &non_existent_key).await.is_empty());
+        assert_eq!(lookup_rows(&index, &non_existent_key).await, []);
 
         // 测试用例2：重复插入
         let new_row_id = 200u64;

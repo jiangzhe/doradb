@@ -2819,8 +2819,8 @@ mod tests {
             let mut state = DiskTreeNodeCursorState::new(None);
             state.seek(&[7; 128]).await.unwrap();
 
-            assert!(state.stack.is_empty());
-            assert!(state.seek_key.is_empty());
+            assert_eq!(state.stack, [] as [BlockID; 0]);
+            assert_eq!(state.seek_key, []);
             assert!(!state.seek_pending);
         });
     }
@@ -2838,7 +2838,7 @@ mod tests {
             let runtime = unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(None, &guard);
             assert_eq!(tree.lookup(&[Val::from(1u32)]).await.unwrap(), None);
-            assert!(unique_scan_entries(&tree).await.is_empty());
+            assert_eq!(unique_scan_entries(&tree).await, []);
             drop(table);
             drop(fs);
         });
@@ -2862,12 +2862,11 @@ mod tests {
                     .await
                     .unwrap()
             );
-            assert!(
-                non_unique_prefix_scan_rows(&tree, &[Val::from(1u32)])
-                    .await
-                    .is_empty()
+            assert_eq!(
+                non_unique_prefix_scan_rows(&tree, &[Val::from(1u32)]).await,
+                []
             );
-            assert!(non_unique_scan_entries(&tree).await.is_empty());
+            assert_eq!(non_unique_scan_entries(&tree).await, []);
             drop(table);
             drop(fs);
         });
@@ -3468,7 +3467,7 @@ mod tests {
                 assert_eq!(empty_tree.lookup(key1).await.unwrap(), None);
                 assert_eq!(empty_tree.lookup(key2).await.unwrap(), None);
                 assert_eq!(empty_tree.lookup(key3).await.unwrap(), None);
-                assert!(unique_scan_entries(&empty_tree).await.is_empty());
+                assert_eq!(unique_scan_entries(&empty_tree).await, []);
 
                 let rows = unique_scan_entries(&tree)
                     .await
@@ -3569,17 +3568,9 @@ mod tests {
                     .await
                     .unwrap()
             );
-            assert!(
-                non_unique_prefix_scan_rows(&empty_tree, &key1)
-                    .await
-                    .is_empty()
-            );
-            assert!(
-                non_unique_prefix_scan_rows(&empty_tree, &key2)
-                    .await
-                    .is_empty()
-            );
-            assert!(non_unique_scan_entries(&empty_tree).await.is_empty());
+            assert_eq!(non_unique_prefix_scan_rows(&empty_tree, &key1).await, []);
+            assert_eq!(non_unique_prefix_scan_rows(&empty_tree, &key2).await, []);
+            assert_eq!(non_unique_scan_entries(&empty_tree).await, []);
 
             assert_eq!(
                 non_unique_prefix_scan_rows(&tree, &key1).await,

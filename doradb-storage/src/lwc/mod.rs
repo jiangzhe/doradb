@@ -1670,7 +1670,7 @@ impl Ser<'_> for LwcBytesSer {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert!(!self.offsets.is_empty());
+        debug_assert_ne!(self.offsets, []);
         let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
         for off in self.offsets.iter().copied() {
             idx = out.ser_u32(idx, off);
@@ -2810,7 +2810,7 @@ mod tests {
         assert_eq!(idx, out.len());
 
         let (bitmap, rest) = LwcNullBitmap::from_bytes(&out).unwrap();
-        assert!(rest.is_empty());
+        assert_eq!(rest, []);
         assert_eq!(bitmap.as_bytes(), bytes);
         assert!(bitmap.is_null(1));
         assert!(bitmap.is_null(3));

@@ -974,10 +974,9 @@ mod tests {
                 assert_eq!(unique_disk_tree_lookup(&table, &guards, &stale).await, None)
             }
             CleanupIndexKind::NonUnique => {
-                assert!(
-                    non_unique_disk_tree_prefix_scan(&table, &guards, &stale)
-                        .await
-                        .is_empty()
+                assert_eq!(
+                    non_unique_disk_tree_prefix_scan(&table, &guards, &stale).await,
+                    []
                 );
                 assert_eq!(
                     non_unique_disk_tree_prefix_scan(&table, &guards, &current).await,

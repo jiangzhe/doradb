@@ -309,7 +309,10 @@ mod tests {
     #[test]
     fn range_cursor_covers_empty_singleton_interior_and_full_ranges() {
         let units: Arc<[TableScanUnit]> = Arc::from([hot_unit(1), hot_unit(2), hot_unit(3)]);
-        assert!(collect(TableScanRangeCursor::new(Arc::clone(&units), 1, 1)).is_empty());
+        assert_eq!(
+            collect(TableScanRangeCursor::new(Arc::clone(&units), 1, 1)),
+            []
+        );
         assert_eq!(
             collect(TableScanRangeCursor::new(Arc::clone(&units), 1, 2)),
             [hot_unit(2)]

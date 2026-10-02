@@ -1892,7 +1892,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert!(!entries.is_empty());
+        assert_ne!(entries, []);
         assert_eq!(entries[0].start_row_id, RowID::new(0));
         for pair in entries.windows(2) {
             assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
@@ -3289,7 +3289,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(!entries1.is_empty());
+            assert_ne!(entries1, []);
 
             let cached_after_first = engine.inner().pools.disk.allocated();
             assert!(cached_after_first >= cached_before_first);

@@ -2345,7 +2345,7 @@ pub(crate) mod tests {
 
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].table_id, table_id);
-            assert!(dropped.is_empty());
+            assert_eq!(dropped, []);
             assert_eq!(Arc::strong_count(&table), owners_before);
 
             drop(table);

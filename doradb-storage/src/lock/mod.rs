@@ -1581,7 +1581,7 @@ pub(crate) mod tests {
         assert_eq!(_stats.current_linked_waiters, 0);
         #[cfg(feature = "profiling")]
         assert_eq!(_stats.current_live_waiter_nodes, 0);
-        assert!(debug_snapshot(manager).resources.is_empty());
+        assert_eq!(debug_snapshot(manager).resources, []);
         assert!(manager.user.is_empty());
     }
 
@@ -2409,7 +2409,7 @@ pub(crate) mod tests {
                 assert_eq!(diagnostics.waiter_slots, 0);
                 assert_eq!(diagnostics.waiter_capacity, 0);
                 assert_eq!(diagnostics.live_waiters, 0);
-                assert!(diagnostics.free_slots.is_empty());
+                assert_eq!(diagnostics.free_slots, []);
                 let grant = snapshot
                     .entries
                     .iter()
@@ -2478,7 +2478,7 @@ pub(crate) mod tests {
                 first_waiter.close(&manager);
                 second_waiter.close(&manager);
                 holder.close(&manager);
-                assert!(debug_snapshot(&manager).entries.is_empty());
+                assert_eq!(debug_snapshot(&manager).entries, []);
                 assert_drained(&manager);
             });
         }

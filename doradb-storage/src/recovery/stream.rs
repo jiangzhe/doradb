@@ -2486,7 +2486,7 @@ mod tests {
         assert_eq!(terminals[0].terminal_reason, terminal_reason);
         assert_eq!(terminals[0].accepted_end_offset, accepted_end_offset);
         assert_eq!(terminals[0].redo_range, redo_range);
-        assert!(stream.take_unsealed_terminals().is_empty());
+        assert_eq!(stream.take_unsealed_terminals(), []);
         assert!(stream.try_next().await.unwrap().is_none());
     }
 

@@ -3118,7 +3118,7 @@ mod tests {
                 .unwrap(),
         );
         let retired_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
-        assert!(!retired_page_ids.is_empty());
+        assert_ne!(retired_page_ids, [] as [PageID; 0]);
         let allocated_before_checkpoint = engine.inner().pools.mem.allocated();
         let outcome = checkpoint_session
             .checkpoint_table_with_wait(table_id)
@@ -4428,12 +4428,9 @@ mod tests {
             let outcome = session.checkpoint_table(table_id).await.unwrap();
             assert!(matches!(outcome, CheckpointOutcome::Published { .. }));
             assert!(refreshed_hook_ran.load(AtomicOrdering::Relaxed));
-            assert!(
-                table
-                    .file()
-                    .active_root_unchecked()
-                    .secondary_index_slots
-                    .is_empty()
+            assert_eq!(
+                table.file().active_root_unchecked().secondary_index_slots,
+                []
             );
             for row_id in row_ids
                 .iter()
@@ -5318,7 +5315,7 @@ mod tests {
             assert_eq!(table.checkpoint_workflow.state_name(), "Frozen");
             assert!(table.checkpoint_workflow.frozen_page_ids().is_some());
             let page_states = row_page_states(&table, &first_session.pool_guards()).await;
-            assert!(!page_states.is_empty());
+            assert_ne!(page_states, []);
             assert!(
                 page_states
                     .iter()
@@ -5370,7 +5367,7 @@ mod tests {
             let table = table_for_internal_assertion(&recovered, table_id);
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
             let states = row_page_states(&table, &session.pool_guards()).await;
-            assert!(!states.is_empty());
+            assert_ne!(states, []);
             assert!(states.iter().all(|state| *state == RowPageState::Active));
         });
     }
@@ -5934,7 +5931,7 @@ mod tests {
             insert_rows(table_id, &mut session, 1_000, 80, "delayed-frozen").await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
             let frozen_page_ids = table.checkpoint_workflow.frozen_page_ids().unwrap();
-            assert!(!frozen_page_ids.is_empty());
+            assert_ne!(frozen_page_ids, [] as [PageID; 0]);
             let first_frozen_page = frozen_page_ids[0];
             let root_before_delay = table.file().active_root_unchecked().clone();
 
@@ -8722,7 +8719,7 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let create_timestamps =
                 hot_page_create_timestamps(&table, &session.pool_guards()).await;
-            assert!(!create_timestamps.is_empty());
+            assert_ne!(create_timestamps, []);
 
             let root_before = table.file().active_root_unchecked().clone();
             let outcome = session.checkpoint_table_with_wait(table_id).await.unwrap();
@@ -8926,7 +8923,7 @@ mod tests {
             );
             assert_eq!(table.checkpoint_workflow.state_name(), "Idle");
             let states = row_page_states(&table, &session.pool_guards()).await;
-            assert!(!states.is_empty());
+            assert_ne!(states, []);
             assert!(states.iter().all(|state| *state == RowPageState::Active));
             table.release_index_metadata_change();
         });
@@ -9384,7 +9381,7 @@ mod tests {
                 }
             }
             let prepared_page_ids = table.checkpoint_workflow.prepared_page_ids().unwrap();
-            assert!(!prepared_page_ids.is_empty());
+            assert_ne!(prepared_page_ids, [] as [PageID; 0]);
             assert!(
                 prepared_page_ids
                     .iter()

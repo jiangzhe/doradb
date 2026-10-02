@@ -119,7 +119,7 @@ mod tests {
         let (list, next) = counted_free_list(0, 10, 100);
 
         list.push_batch(vec![7]);
-        assert!(list.pop_batch(0).is_empty());
+        assert_eq!(list.pop_batch(0), []);
         assert_eq!(list.pop(), 7, "empty batch must retain cached elements");
         assert_eq!(next.load(Ordering::SeqCst), 100);
     }

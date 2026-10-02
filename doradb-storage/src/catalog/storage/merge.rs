@@ -562,7 +562,7 @@ mod tests {
             .fold_insert(metadata, catalog_table_vals(new_table_id, 0))
             .unwrap();
         folded.fold_delete(&new_key).unwrap();
-        assert!(folded.materialize_output_rows().is_empty());
+        assert_eq!(folded.materialize_output_rows(), [] as [Vec<Val>; 0]);
         assert!(!folded.should_rewrite());
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
@@ -582,7 +582,7 @@ mod tests {
             .fold_update(metadata, &base_key, &catalog_table_update(5))
             .unwrap();
         folded.fold_delete(&base_key).unwrap();
-        assert!(folded.materialize_output_rows().is_empty());
+        assert_eq!(folded.materialize_output_rows(), [] as [Vec<Val>; 0]);
 
         let mut folded = folded_tables_with_base(vec![(base_table_id, 0)]);
         folded.fold_delete(&base_key).unwrap();

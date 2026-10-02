@@ -1486,7 +1486,7 @@ pub(crate) trait RowRead {
         index_spec: &TableIndexMetadata,
         key_vals: &[Val],
     ) -> bool {
-        debug_assert!(!key_vals.is_empty());
+        debug_assert_ne!(key_vals, []);
         if index_spec.keys.len() != key_vals.len() {
             return true;
         }

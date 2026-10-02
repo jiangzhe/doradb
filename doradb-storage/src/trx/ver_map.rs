@@ -110,7 +110,7 @@ impl RowVersionMap {
     /// Publishes the opening bump before a frozen-page mutation.
     #[inline]
     pub(crate) fn begin_frozen_mutation(&self) {
-        let bumped = self.frozen_mutation_version.fetch_update(
+        let bumped = self.frozen_mutation_version.try_update(
             Ordering::AcqRel,
             Ordering::Acquire,
             |version| version.checked_add(1),
@@ -124,7 +124,7 @@ impl RowVersionMap {
     /// Publishes the closing bump before the mutation guards are released.
     #[inline]
     pub(crate) fn finish_frozen_mutation(&self) {
-        let bumped = self.frozen_mutation_version.fetch_update(
+        let bumped = self.frozen_mutation_version.try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |version| version.checked_add(1),

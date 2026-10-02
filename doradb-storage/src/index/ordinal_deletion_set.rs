@@ -224,7 +224,7 @@ mod tests {
         }
         let all = OrdinalDeletionSet::from_ordinals(64, &(0..64).collect::<Vec<_>>()).unwrap();
         assert_eq!(all.codec(), Some(1));
-        assert!(all.body().is_empty());
+        assert_eq!(all.body(), []);
     }
 
     /// Purpose: Exercise deterministic codec changes over generated deletion subsets and word boundaries.

@@ -3916,14 +3916,14 @@ pub(crate) mod tests {
                 crate::IndexID::new(1)
             );
 
-            assert!(
+            assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
                     &session.pool_guards(),
                     &name_key("alpha"),
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
             assert_eq!(
                 non_unique_mem_state(
@@ -3948,7 +3948,7 @@ pub(crate) mod tests {
                 Some(true)
             );
             let layout = table.layout_snapshot();
-            assert!(
+            assert_eq!(
                 non_unique_runtime_lookup(
                     &layout,
                     active_secondary_root(&table, IndexSlot::new(1)),
@@ -3956,8 +3956,8 @@ pub(crate) mod tests {
                     IndexSlot::new(1),
                     &[Val::from("alpha")],
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
             assert_eq!(
                 non_unique_runtime_lookup(
@@ -4067,14 +4067,14 @@ pub(crate) mod tests {
             rows.sort_unstable();
             expected_rows.sort_unstable();
             assert_eq!(rows, expected_rows);
-            assert!(
+            assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
                     &session.pool_guards(),
                     &name_key("missing"),
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
         });
     }

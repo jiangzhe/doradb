@@ -3922,7 +3922,7 @@ mod tests {
         clear(&mut buffer);
         assert!(buffer.values.iter().all(|value| value == &Val::default()));
         assert!(buffer.ready.iter().all(|ready| !ready));
-        assert!(buffer.ready_columns.is_empty());
+        assert_eq!(buffer.ready_columns, []);
         assert_eq!(
             (
                 buffer.values.as_ptr(),
@@ -4254,7 +4254,7 @@ mod tests {
             let mut row = LazyRow::new(source(), &mut buffer, 2);
             assert_eq!(row.column_count(), 2);
             assert!(row.val(2).is_err());
-            assert!(row.buffer.values.is_empty());
+            assert_eq!(row.buffer.values, []);
             row.val(1).unwrap();
             row.val(1).unwrap();
             assert_eq!(row.buffer.ready_columns, vec![1]);
@@ -4265,16 +4265,16 @@ mod tests {
             assert_eq!(row.val(0).unwrap(), &Val::Null);
             let values = row.into_full_row().unwrap();
             assert_eq!(values[0], Val::Null);
-            assert!(buffer.values.is_empty());
+            assert_eq!(buffer.values, []);
             assert!(buffer.ready.iter().all(|ready| !ready));
-            assert!(buffer.ready_columns.is_empty());
+            assert_eq!(buffer.ready_columns, []);
             buffer.prepare(2);
-            assert!(buffer.values.is_empty());
+            assert_eq!(buffer.values, []);
             let mut row = LazyRow::new(source(), &mut buffer, 2);
             assert_eq!(row.val(0).unwrap(), &Val::from(1i32));
             let values = row.into_full_row().unwrap();
             assert_eq!(values[0], Val::from(1i32));
-            assert!(buffer.values.is_empty());
+            assert_eq!(buffer.values, []);
             buffer.prepare(3);
             assert_eq!(buffer.column_count, 3);
             buffer.cache_value(2, Val::Null);
@@ -6871,7 +6871,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_rows();
-            assert!(rows.is_empty());
+            assert_eq!(rows, [] as [Vec<Val>; 0]);
             trx.commit().await.unwrap();
         });
     }
@@ -8291,8 +8291,8 @@ mod tests {
                 assert_eq!(descriptor.block_binding_value, entry.block_binding_value());
             }
             assert_eq!(worklist.hot_pages, expected_hot_pages);
-            assert!(!worklist.cold_entries.is_empty());
-            assert!(!worklist.hot_pages.is_empty());
+            assert_ne!(worklist.cold_entries, []);
+            assert_ne!(worklist.hot_pages, []);
             trx.noop().await.unwrap();
             trx.rollback().await.unwrap();
         });

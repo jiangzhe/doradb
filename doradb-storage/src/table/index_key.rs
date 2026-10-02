@@ -255,7 +255,7 @@ mod tests {
     fn assert_empty_keys<R>(layout: &TableRuntimeLayout<R>) {
         let full = WriteIndexKeySet::from_full_row(layout, &[Val::from(7i32)]);
         let indexed = WriteIndexKeySet::from_indexed_values(layout, &[], vec![]);
-        assert!(full.as_slice().is_empty());
+        assert_eq!(full.as_slice(), []);
         assert!(indexed.into_keys().next().is_none());
     }
 

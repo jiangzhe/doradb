@@ -4117,7 +4117,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(empty.index_ids().is_empty());
+            assert_eq!(empty.index_ids(), []);
 
             let outcome = session
                 .create_table(
@@ -5773,13 +5773,13 @@ pub(crate) mod tests {
                 .unwrap();
             wait_for_no_dropped_table_operational_state(&engine, table_id).await;
             assert!(!Path::new(&table_file_path).exists());
-            assert!(
+            assert_eq!(
                 engine
                     .inner()
                     .core
                     .catalog()
-                    .retained_dropped_table_ids_now()
-                    .is_empty()
+                    .retained_dropped_table_ids_now(),
+                []
             );
             assert_no_dropped_table_operational_state(engine.inner().core.catalog(), table_id);
             assert!(

@@ -777,7 +777,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(session.outcomes.len(), 1);
-        assert!(session.waits.is_empty());
+        assert_eq!(session.waits, []);
     }
 
     /// Purpose: Allow run cancellation to interrupt checkpoint retry waiting.

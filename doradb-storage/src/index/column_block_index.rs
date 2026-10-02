@@ -3480,7 +3480,7 @@ pub(super) mod tests {
             4 * MAX_LWC_ROWS,
         )
         .unwrap();
-        assert!(dense.body().is_empty());
+        assert_eq!(dense.body(), []);
         assert_eq!(dense.ordinal_for_delta(0), Some(0));
         assert_eq!(dense.ordinal_for_delta(3), Some(3));
         assert_eq!(dense.ordinal_for_delta(4), None);
@@ -3946,7 +3946,7 @@ pub(super) mod tests {
             assert_eq!(scan_entries.len(), 2);
             assert_eq!(scan_entries[0].identity.codec(), COLUMN_ROW_CODEC_DENSE);
             assert_eq!(scan_entries[0].identity.row_id_span(), 4);
-            assert!(scan_entries[0].identity.body().is_empty());
+            assert_eq!(scan_entries[0].identity.body(), []);
             assert_eq!(
                 scan_entries[1].identity,
                 EncodedRowSet::plan(
@@ -4569,7 +4569,7 @@ pub(super) mod tests {
                     );
                 }
                 let identity = &scans[idx].identity;
-                assert!(!identity.body().is_empty());
+                assert_ne!(identity.body(), []);
                 let clone = identity.clone();
                 assert_eq!(clone.body().as_ptr(), identity.body().as_ptr());
             }

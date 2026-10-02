@@ -1016,7 +1016,7 @@ fn codec_order(codec: u8) -> u8 {
 
 #[inline]
 fn depth(n: usize) -> u32 {
-    usize::BITS - n.leading_zeros()
+    n.bit_width()
 }
 
 #[inline]
@@ -1635,11 +1635,11 @@ mod tests {
     #[test]
     fn capacity_and_row_id_boundaries() {
         let values = rows(0..65535);
-        assert!(
+        assert_eq!(
             EncodedIdentitySet::plan(RowID::new(0), RowID::new(65535), &values, &[], 0)
                 .unwrap()
-                .body()
-                .is_empty()
+                .body(),
+            []
         );
         for (end, values) in [
             (65536, rows(0..65536)),

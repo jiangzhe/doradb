@@ -491,7 +491,7 @@ mod tests {
                     .unwrap();
                 match completion {
                     Ok(completion) => {
-                        assert!(expected.is_empty());
+                        assert_eq!(expected, []);
                         assert_eq!(completion.entries(), oracle.len());
                     }
                     Err(conflict) => assert_eq!(Some(&conflict), expected.first()),
