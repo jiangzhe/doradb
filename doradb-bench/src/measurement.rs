@@ -107,6 +107,10 @@ pub enum LatencyUnit {
     InsertBatchTransaction,
     /// One index update range transaction from begin through successful commit.
     UpdateRangeTransaction,
+    /// One full-table delete transaction from begin through successful commit.
+    DeleteAllTransaction,
+    /// One point-delete batch transaction from begin through successful commit.
+    DeleteBatchTransaction,
     /// One transient table create-through-successful-drop cycle.
     TableCreateDropCycle,
     /// One lookup batch transaction from begin through successful commit.
@@ -148,6 +152,8 @@ impl fmt::Display for LatencyUnit {
             Self::TableBindingResolution => "table-binding-resolution",
             Self::InsertBatchTransaction => "insert-batch-transaction",
             Self::UpdateRangeTransaction => "update-range-transaction",
+            Self::DeleteAllTransaction => "delete-all-transaction",
+            Self::DeleteBatchTransaction => "delete-batch-transaction",
             Self::TableCreateDropCycle => "table-create-drop-cycle",
             Self::LookupBatchTransaction => "lookup-batch-transaction",
             Self::TableScanBatchTransaction => "table-scan-batch-transaction",
@@ -430,9 +436,11 @@ pub struct WorkloadCounters {
     pub inserted_rows: u64,
     /// Rows updated by successful range-mutation operations.
     pub updated_rows: u64,
-    /// Successful point lookups that found a row.
+    /// Rows deleted by successfully committed mutations.
+    pub deleted_rows: u64,
+    /// Successful point requests that found at least one row.
     pub found: u64,
-    /// Successful point lookups that found no row.
+    /// Successful point requests that found no row.
     pub not_found: u64,
     /// Rows returned by successful scans or streams.
     pub rows_returned: u64,
@@ -448,6 +456,7 @@ impl WorkloadCounters {
         self.inserted_rows =
             checked_counter(self.inserted_rows, other.inserted_rows, "inserted_rows")?;
         self.updated_rows = checked_counter(self.updated_rows, other.updated_rows, "updated_rows")?;
+        self.deleted_rows = checked_counter(self.deleted_rows, other.deleted_rows, "deleted_rows")?;
         self.found = checked_counter(self.found, other.found, "found")?;
         self.not_found = checked_counter(self.not_found, other.not_found, "not_found")?;
         self.rows_returned =
@@ -720,6 +729,32 @@ mod tests {
             counters
                 .merge(WorkloadCounters {
                     updated_rows: 1,
+                    ..WorkloadCounters::default()
+                })
+                .is_err()
+        );
+    }
+
+    /// Purpose: Preserve deleted-row accounting when combining workload results.
+    /// Expected: Valid contributions accumulate exactly and overflow is rejected.
+    #[test]
+    fn deleted_row_counter_merge_is_checked() {
+        let mut counters = WorkloadCounters {
+            deleted_rows: 2,
+            ..WorkloadCounters::default()
+        };
+        counters
+            .merge(WorkloadCounters {
+                deleted_rows: 3,
+                ..WorkloadCounters::default()
+            })
+            .unwrap();
+        assert_eq!(counters.deleted_rows, 5);
+        counters.deleted_rows = u64::MAX;
+        assert!(
+            counters
+                .merge(WorkloadCounters {
+                    deleted_rows: 1,
                     ..WorkloadCounters::default()
                 })
                 .is_err()

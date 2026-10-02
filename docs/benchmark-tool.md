@@ -330,6 +330,8 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `stmt-noop`, `trx-noop` | required `num` | none | safe |
 | `insert-seq`, `insert-rand` | required `num`; optional `seed`, `value_size`, `batch_size` | any primary | single run |
 | `update-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
+| `delete-all` | only `include_stats`; no worker fields | committed secondary index | single run, benchmark only |
+| `delete-rand` | required `num`; optional `seed`, `batch_size` | committed secondary index | single run, benchmark only |
 | `table-ddl` | optional `num` | none | single run |
 | `lookup-seq` | required `num`; optional `batch_size` | committed unique primary | safe |
 | `lookup-rand` | lookup controls plus optional `seed` | committed unique primary | safe |
@@ -396,6 +398,16 @@ undo, and redo history rather than representing independently cloned states.
 Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
 A create or drop failure is invocation-fatal.
+
+`delete-all` and `delete-rand` require loaded rows in the first created table,
+with a unique or non-unique index. Both allow zero warm-ups and one measured
+run; use a fresh root for each repetition. `delete-all` removes every row using
+one thread, one session, and one transaction.
+
+`delete-rand` samples keys with replacement; `seed` defaults to zero. `num`
+counts requests, and `batch_size` limits requests per transaction. A matching
+key deletes all its rows; missing or previously deleted keys count as
+`not_found`. Require `threads <= sessions <= candidate_key_count`.
 
 ### CREATE INDEX
 
@@ -563,6 +575,8 @@ uncontrolled caches; one sample does not establish a latency distribution.
 | `create-table` | `table-creation` | `tables` |
 | inserts | `insert-batch-transaction` | sum of per-session batch ceilings |
 | `update-rand` | `update-range-transaction` | sum of per-session key-width-budget batch ceilings |
+| `delete-all` | `delete-all-transaction` | 1 |
+| `delete-rand` | `delete-batch-transaction` | sum of nonempty per-session request batch ceilings |
 | `table-ddl` | `table-create-drop-cycle` | `num` |
 | lookups | `lookup-batch-transaction` | sum of per-session batch ceilings |
 | `table-scan` | `table-scan-batch-transaction` | sum of per-session batch ceilings |
@@ -596,6 +610,9 @@ Counter equations are verified before phase state advances:
 - Inserts: `operations = inserted_rows + duplicate_key + write_conflict`.
 - Random updates: `operations = updated_rows`; all other generic counters are
   zero. There is deliberately no equation between `num` and `updated_rows`.
+- Full deletion: `operations = 1`; `deleted_rows` is the prepared row count.
+- Random deletion: `operations = num = found + not_found`; `deleted_rows` is
+  the actual number of rows deleted.
 - Lookups: `operations = found + not_found`; `rows_returned = found`.
 - Table scan and index stream: `operations = num`; outcome classifications are
   zero and `rows_returned` is actual cardinality.
@@ -615,6 +632,8 @@ Aggregate throughput is total operations divided by total wall duration. For
 `update-rand`, this means actual updated rows per second, while every committed
 range transaction contributes a sample even when it matches no rows. A single
 p95/p99 sample does not establish a latency distribution.
+For deletion, `operations_per_second` counts requests; stdout also reports
+`deleted_rows` and `deleted_rows_per_second`.
 
 Optional engine statistics use explicit count/byte/nanosecond/frame units and
 are typed as counter deltas, end gauges, or lifetime peaks. Recovery uses
@@ -680,6 +699,8 @@ four recovery fixtures and six CREATE INDEX placement/mode combinations:
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
 insert-rand.toml     table-ddl.toml       lookup-seq.toml
 update-rand.toml     lookup-rand.toml     table-scan.toml
+delete-all-unique.toml                   delete-all-non-unique.toml
+delete-rand-unique.toml                  delete-rand-non-unique.toml
 parallel-table-scan.toml                  index-scan.toml
 index-stream.toml    index-ddl.toml       lock-table.toml
 checkpoint-table.toml                     catalog-checkpoint.toml

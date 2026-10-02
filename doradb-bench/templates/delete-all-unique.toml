@@ -1,0 +1,12 @@
+name = "unique full-table deletion"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+workload = { type = "delete-all" }

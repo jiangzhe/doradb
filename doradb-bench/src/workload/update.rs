@@ -337,6 +337,7 @@ fn verify_update_outcome(
     let counters = outcome.measurement.counters;
     if counters.operations != counters.updated_rows
         || counters.inserted_rows != 0
+        || counters.deleted_rows != 0
         || counters.found != 0
         || counters.not_found != 0
         || counters.rows_returned != 0

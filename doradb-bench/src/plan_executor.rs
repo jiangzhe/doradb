@@ -13,13 +13,13 @@ use crate::plan_output::{
 };
 use crate::workload::{
     CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor, CheckpointTableExecutor,
-    CreateIndexExecutor, CreateTableExecutor, FreezeTableExecutor, IndexDdlExecutor,
-    IndexScanExecutor, IndexStreamExecutor, InsertRandExecutor, InsertSeqExecutor,
-    LockTableExecutor, LookupRandExecutor, LookupSeqExecutor, ManagedBindingsPrepareExecutor,
-    ParallelTableScanExecutor, ParallelTableScanExecutorConfig, ResolveTableBindingExecutor,
-    RunCancellation, SessionPlan, StmtNoopExecutor, TableDdlExecutor, TableScanExecutor,
-    TrxNoopExecutor, UpdateRandExecutor, complete_create_index, prepare_create_fixture,
-    run_recovery,
+    CreateIndexExecutor, CreateTableExecutor, DeleteAllExecutor, DeleteRandExecutor,
+    FreezeTableExecutor, IndexDdlExecutor, IndexScanExecutor, IndexStreamExecutor,
+    InsertRandExecutor, InsertSeqExecutor, LockTableExecutor, LookupRandExecutor,
+    LookupSeqExecutor, ManagedBindingsPrepareExecutor, ParallelTableScanExecutor,
+    ParallelTableScanExecutorConfig, ResolveTableBindingExecutor, RunCancellation, SessionPlan,
+    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
+    complete_create_index, complete_delete, prepare_create_fixture, run_recovery,
 };
 use doradb_storage::profiling::InternalStatsSnapshot;
 use doradb_storage::{Engine, EngineConfig, Session};
@@ -541,6 +541,46 @@ async fn dispatch_workload(
                 sample_latency,
             )
             .await
+        }
+        ResolvedWorkload::DeleteAll(config) => {
+            let FixtureBinding::Primary(primary) = &binding else {
+                return Err(BenchError::message(
+                    "delete workload has no primary fixture binding",
+                ));
+            };
+            let primary = *primary;
+            let outcome = run_executor::<DeleteAllExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await?;
+            // Worker sessions and final statistics snapshots have completed; scans are unmeasured.
+            complete_delete(engine, primary, outcome.counters.deleted_rows).await?;
+            Ok(outcome)
+        }
+        ResolvedWorkload::DeleteRand(config) => {
+            let FixtureBinding::Primary(primary) = &binding else {
+                return Err(BenchError::message(
+                    "delete workload has no primary fixture binding",
+                ));
+            };
+            let primary = *primary;
+            let outcome = run_executor::<DeleteRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await?;
+            // Worker sessions and final statistics snapshots have completed; scans are unmeasured.
+            complete_delete(engine, primary, outcome.counters.deleted_rows).await?;
+            Ok(outcome)
         }
         ResolvedWorkload::TableDdl(config) => {
             run_executor::<TableDdlExecutor>(
@@ -1085,6 +1125,152 @@ mod tests {
         );
     }
 
+    /// Purpose: Keep delete content verification outside the production dispatch timer and diagnostic interval.
+    /// Expected: Worker locks drain first, verification advances neither reported time nor acquisition counters.
+    #[test]
+    fn delete_dispatch_completes_measurement_before_content_scans() {
+        use crate::workload::set_delete_completion_hook;
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use tempfile::TempDir;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            for controls in [
+                "type = 'delete-all'",
+                "type = 'delete-rand', num = 2, sessions = 3",
+            ] {
+                let root = temp.path().join(if controls.contains("delete-all") {
+                    "all"
+                } else {
+                    "rand"
+                });
+                let source = temp.path().join("plan.toml");
+                fs::write(&source, format!("[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 3 }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls}, include_stats = true }}")).unwrap();
+                let loaded = load_plan(&source, &root).unwrap();
+                let engine = Engine::bootstrap(loaded.engine_config).await.unwrap();
+                let (clock, mock) = MeasurementClock::mock();
+                let mut fixture = FixtureRuntimeState::default();
+                for phase in &loaded.plan.phases[..2] {
+                    let Phase::Prepare {
+                        workload,
+                        fixture_effect,
+                    } = phase
+                    else {
+                        unreachable!()
+                    };
+                    let binding = fixture.bind(workload.fixture_requirement()).unwrap();
+                    let outcome = dispatch_workload(
+                        &engine,
+                        &clock,
+                        workload,
+                        binding,
+                        fixture_effect,
+                        false,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    fixture.apply(outcome.effect).unwrap();
+                }
+                let mut inspector = engine.new_session().unwrap();
+                let before = inspector
+                    .logical_lock_stats()
+                    .unwrap()
+                    .immediate_physical_acquisitions;
+                let boundary = Rc::new(Cell::new(0));
+                let captured = Rc::clone(&boundary);
+                let advanced = Arc::clone(&mock);
+                set_delete_completion_hook(move |engine, _| {
+                    smol::block_on(async {
+                        let mut session = engine.new_session().unwrap();
+                        let stats = session.logical_lock_stats().unwrap();
+                        assert_eq!(stats.current_physical_resources, 0);
+                        assert_eq!(stats.current_linked_waiters, 0);
+                        captured.set(stats.immediate_physical_acquisitions);
+                        session.close().await.unwrap();
+                    });
+                    advanced.increment(1_000_000);
+                });
+                let start = clock.now();
+                let workload = loaded.plan.phases[2].workload();
+                let binding = fixture.bind(workload.fixture_requirement()).unwrap();
+                let outcome = dispatch_workload(
+                    &engine,
+                    &clock,
+                    workload,
+                    binding,
+                    &FixturePlanEffect::None,
+                    true,
+                    0,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    clock.wall_delta_nanos(start, clock.now()).unwrap(),
+                    1_000_000
+                );
+                assert_eq!(outcome.elapsed_nanos, 0);
+                assert_eq!(
+                    outcome
+                        .latency
+                        .summary(workload.latency_unit())
+                        .unwrap()
+                        .sum_nanos,
+                    0
+                );
+                let acquired = outcome
+                    .internal_metrics
+                    .iter()
+                    .find(|metric| metric.name == "logical_lock.immediate_physical_acquisitions")
+                    .unwrap();
+                assert_eq!(acquired.value, boundary.get() - before);
+                let after = inspector.logical_lock_stats().unwrap();
+                assert!(after.immediate_physical_acquisitions > boundary.get());
+                assert_eq!(after.current_physical_resources, 0);
+                inspector.close().await.unwrap();
+                engine.shutdown();
+            }
+        });
+    }
+
+    /// Purpose: Prevent success publication when final delete verification discovers unexpected surviving rows.
+    /// Expected: The invocation retains its diagnostic root, returns the verification error, and creates no artifact.
+    #[test]
+    fn delete_completion_failure_prevents_canonical_publication() {
+        use crate::workload::set_delete_completion_hook;
+        use doradb_storage::Val;
+        use tempfile::TempDir;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("delete.toml");
+            fs::write(&source, "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'delete-all' }").unwrap();
+            set_delete_completion_hook(|engine, primary| {
+                smol::block_on(async {
+                    let mut session = engine.new_session().unwrap();
+                    let mut trx = session.begin_trx().unwrap();
+                    trx.table_insert_mvcc(
+                        primary.table_id,
+                        vec![Val::from(99u64), Val::from("unexpected")],
+                    )
+                    .await
+                    .unwrap();
+                    trx.commit().await.unwrap();
+                    session.close().await.unwrap();
+                });
+            });
+            let root = temp.path().join("root");
+            let error = execute_plan(root.clone(), source).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("delete content verification failed")
+            );
+            assert!(root.exists());
+            assert!(!root.join("benchmark-result.toml").exists());
+            assert!(!root.join("benchmark-result.toml.tmp").exists());
+        });
+    }
+
     /// Purpose: Preserve type compatibility within related executor families.
     /// Expected: Related executors satisfy their shared configuration and outcome type
     /// contracts.
@@ -1092,6 +1278,7 @@ mod tests {
     fn related_executor_identities_share_associated_types() {
         assert_shared_config::<StmtNoopExecutor, TrxNoopExecutor>();
         assert_shared_outcome::<StmtNoopExecutor, TrxNoopExecutor>();
+        assert_shared_outcome::<DeleteAllExecutor, DeleteRandExecutor>();
         assert_shared_config::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_outcome::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_config::<TableDdlExecutor, IndexDdlExecutor>();
@@ -1113,6 +1300,8 @@ mod tests {
                 InsertSeqExecutor::IDENTITY,
                 InsertRandExecutor::IDENTITY,
                 UpdateRandExecutor::IDENTITY,
+                DeleteAllExecutor::IDENTITY,
+                DeleteRandExecutor::IDENTITY,
                 TableDdlExecutor::IDENTITY,
                 LookupSeqExecutor::IDENTITY,
                 LookupRandExecutor::IDENTITY,
@@ -1132,6 +1321,8 @@ mod tests {
                 "insert-seq",
                 "insert-rand",
                 "update-rand",
+                "delete-all",
+                "delete-rand",
                 "table-ddl",
                 "lookup-seq",
                 "lookup-rand",

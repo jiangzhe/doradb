@@ -296,6 +296,7 @@ fn verify_insert_outcome(
     if counters.operations != state.config.num
         || counters.operations != terminal
         || counters.updated_rows != 0
+        || counters.deleted_rows != 0
         || counters.found != 0
         || counters.not_found != 0
         || counters.rows_returned != 0

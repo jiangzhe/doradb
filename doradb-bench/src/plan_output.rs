@@ -124,6 +124,13 @@ pub(crate) fn render_stdout_summary(
             "\nverification: complete\nOne CREATE sample; p95/p99 do not establish a distribution.",
         );
     }
+    if matches!(workload.identity(), "delete-all" | "delete-rand") {
+        summary.push_str(&format!(
+            "\ndeleted_rows: {}\ndeleted_rows_per_second: {:.3}",
+            aggregate.counters.deleted_rows,
+            operations_per_second(aggregate.counters.deleted_rows, aggregate.elapsed_nanos),
+        ));
+    }
     if workload.identity() == "checkpoint-table" {
         let metrics = report
             .measured_runs
@@ -532,6 +539,51 @@ mod tests {
         }
     }
 
+    fn measured_report(
+        root: &Path,
+        workload: ResolvedWorkload,
+        metrics: WorkloadMetrics,
+    ) -> InvocationReport {
+        let mut report = report(root);
+        report.aggregate.latency.unit = workload.latency_unit();
+        let Phase::Benchmark {
+            workload: target, ..
+        } = &mut report.plan.phases[0]
+        else {
+            unreachable!()
+        };
+        *target = workload;
+        report.measured_runs.push(MeasuredRunResult {
+            run_index: 1,
+            elapsed_nanos: report.aggregate.elapsed_nanos,
+            counters: report.aggregate.counters,
+            operations_per_second: report.aggregate.operations_per_second,
+            latency: report.aggregate.latency.clone(),
+            workload_metrics: Some(metrics),
+            internal_metrics: Vec::new(),
+        });
+        report
+    }
+
+    fn assert_metric_shape_errors(report: &InvocationReport, owner: &str) {
+        for (metrics, expected) in [
+            (None, "has no workload metrics"),
+            (
+                Some(WorkloadMetrics::FreezeTable {
+                    approximate_rows: 1,
+                    page_count: 1,
+                    stable_page_count: 0,
+                }),
+                "has incompatible workload metrics",
+            ),
+        ] {
+            let mut invalid = report.clone();
+            invalid.measured_runs[0].workload_metrics = metrics;
+            let error = render_stdout_summary(&invalid, Path::new("result.toml")).unwrap_err();
+            assert_eq!(error.to_string(), format!("{owner} report {expected}"));
+        }
+    }
+
     /// Purpose: Publish index-creation results only when verification and accounting are
     /// complete.
     /// Expected: Valid reports preserve raw metrics and defined rates while invalid reports
@@ -638,6 +690,7 @@ mod tests {
     fn canonical_output_round_trips_one_entity() {
         let temp = TempDir::new().unwrap();
         let report = report(temp.path());
+        fs::write(staged_path(&result_toml_path(temp.path())), "stale").unwrap();
         let installed = write_plan_output(&report).unwrap();
         assert_eq!(
             installed,
@@ -660,6 +713,79 @@ mod tests {
         assert!(!encoded.contains("failure"));
         assert!(!staged_path(&installed).exists());
         assert!(!temp.path().join("benchmark-result.md").exists());
+    }
+
+    /// Purpose: Distinguish delete request throughput from affected-row throughput in canonical output.
+    /// Expected: Both delete identities retain counters/units on round trip and print independent rates, including zero time.
+    #[test]
+    fn delete_output_reports_request_and_row_rates() {
+        use crate::fixture::IndexMode;
+        use crate::plan::{DeleteAllConfig, DeleteRandConfig};
+        let temp = TempDir::new().unwrap();
+        for workload in [
+            ResolvedWorkload::DeleteAll(DeleteAllConfig {
+                include_stats: false,
+            }),
+            ResolvedWorkload::DeleteRand(DeleteRandConfig {
+                num: 3,
+                seed: 9,
+                threads: 1,
+                sessions: 1,
+                batch_size: 3,
+                index: IndexMode::NonUnique,
+                loaded_range: KeyRange { start: 0, len: 10 },
+                include_stats: false,
+            }),
+        ] {
+            let mut report = report(temp.path());
+            let Phase::Benchmark {
+                workload: target, ..
+            } = &mut report.plan.phases[0]
+            else {
+                unreachable!()
+            };
+            *target = workload.clone();
+            let full = matches!(workload, ResolvedWorkload::DeleteAll(_));
+            report.aggregate.counters = WorkloadCounters {
+                operations: if full { 1 } else { 3 },
+                deleted_rows: 7,
+                found: if full { 0 } else { 2 },
+                not_found: if full { 0 } else { 1 },
+                ..WorkloadCounters::default()
+            };
+            report.aggregate.latency.unit = workload.latency_unit();
+            for elapsed in [2_000_000_000, 0] {
+                report.aggregate.elapsed_nanos = elapsed;
+                report.aggregate.operations_per_second =
+                    operations_per_second(report.aggregate.counters.operations, elapsed);
+                report.measured_runs = vec![MeasuredRunResult {
+                    run_index: 1,
+                    elapsed_nanos: elapsed,
+                    counters: report.aggregate.counters,
+                    operations_per_second: report.aggregate.operations_per_second,
+                    latency: report.aggregate.latency.clone(),
+                    workload_metrics: None,
+                    internal_metrics: vec![],
+                }];
+                let path = write_plan_output(&report).unwrap();
+                let decoded: InvocationReport =
+                    toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(decoded, report);
+                let summary = render_stdout_summary(&decoded, &path).unwrap();
+                assert!(summary.contains("deleted_rows: 7\n"));
+                let request_rate = if elapsed == 0 {
+                    "0.000"
+                } else if full {
+                    "0.500"
+                } else {
+                    "1.500"
+                };
+                let row_rate = if elapsed == 0 { "0.000" } else { "3.500" };
+                assert!(summary.contains(&format!("\noperations_per_second: {request_rate}\n")));
+                assert!(summary.contains(&format!("\ndeleted_rows_per_second: {row_rate}\n")));
+                assert!(summary.contains(&format!("latency_unit: {}\n", workload.latency_unit())));
+            }
+        }
     }
 
     /// Purpose: Clean up failed result installation without disturbing an existing destination.
@@ -708,39 +834,178 @@ mod tests {
         );
     }
 
+    /// Purpose: Preserve catalog checkpoint I/O totals, RSS measurements, and changed-table write amplification.
+    /// Expected: Summaries sum every I/O record, exclude unchanged tables from the denominator, and report zero for an empty denominator.
+    #[test]
+    fn catalog_checkpoint_stdout_summary_preserves_io_totals_and_write_amplification() {
+        use crate::fixture::CatalogCardinalities;
+        use crate::measurement::SampledProcessRss;
+        use crate::plan::{
+            CatalogCheckpointCase, CatalogCheckpointConfig, CatalogCheckpointProfile,
+        };
+        use doradb_storage::id::{TableID, TrxID};
+        use doradb_storage::{
+            CatalogCheckpointOutcome, CatalogCheckpointReport, CatalogCheckpointResult,
+            CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let before = CatalogCardinalities {
+            user_tables: 0,
+            columns: 0,
+            indexes: 0,
+            bindings: 0,
+            descriptor_rows: 0,
+            descriptor_bytes: 0,
+        };
+        let mut report = measured_report(
+            temp.path(),
+            ResolvedWorkload::CatalogCheckpoint(CatalogCheckpointConfig {
+                profile: CatalogCheckpointProfile::Small,
+                case: CatalogCheckpointCase::ManagedCreate,
+                include_stats: true,
+            }),
+            WorkloadMetrics::CatalogCheckpoint {
+                profile: CatalogCheckpointProfile::Small,
+                case: CatalogCheckpointCase::ManagedCreate,
+                before,
+                final_state: CatalogCardinalities {
+                    user_tables: 1,
+                    columns: 2,
+                    ..before
+                },
+                sampled_process_rss: SampledProcessRss {
+                    baseline_bytes: 1000,
+                    peak_bytes: 1600,
+                    peak_above_baseline_bytes: 600,
+                },
+                checkpoint: CatalogCheckpointResult {
+                    outcome: CatalogCheckpointOutcome::Published {
+                        catalog_replay_start_ts: TrxID::new(42),
+                    },
+                    report: CatalogCheckpointReport {
+                        catalog_ddl_txn_count: 1,
+                        table_changes: vec![
+                            CatalogTableCheckpointChange {
+                                table_id: TableID::new(1),
+                                before_row_count: 0,
+                                after_row_count: 1,
+                            },
+                            CatalogTableCheckpointChange {
+                                table_id: TableID::new(2),
+                                before_row_count: 0,
+                                after_row_count: 2,
+                            },
+                        ]
+                        .into_boxed_slice(),
+                        table_io: [
+                            (1, 100, 200, 600, 100),
+                            (2, 300, 800, 900, 200),
+                            (3, 500, 9000, 0, 0),
+                        ]
+                        .into_iter()
+                        .map(
+                            |(
+                                id,
+                                compact_bytes_read,
+                                final_compact_bytes,
+                                lwc_bytes_written,
+                                index_bytes_written,
+                            )| CatalogTableCheckpointIoStats {
+                                table_id: TableID::new(id),
+                                compact_bytes_read,
+                                final_compact_bytes,
+                                lwc_bytes_written,
+                                index_bytes_written,
+                            },
+                        )
+                        .collect(),
+                        metadata_bytes_written: 400,
+                    },
+                },
+            },
+        );
+        assert_metric_shape_errors(&report, "catalog checkpoint");
+        for (empty_denominator, expected_compact, expected_amplification) in
+            [(false, "1000", "2.200000"), (true, "0", "0.000000")]
+        {
+            if empty_denominator {
+                let Some(WorkloadMetrics::CatalogCheckpoint { checkpoint, .. }) =
+                    report.measured_runs[0].workload_metrics.as_mut()
+                else {
+                    unreachable!()
+                };
+                for table in &mut checkpoint.report.table_io {
+                    table.final_compact_bytes = 0;
+                }
+            }
+            let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
+            for (name, expected) in [
+                ("catalog_profile", "small"),
+                ("catalog_case", "managed-create"),
+                ("sampled_process_rss_baseline_bytes", "1000"),
+                ("sampled_process_rss_peak_bytes", "1600"),
+                ("sampled_process_rss_peak_above_baseline_bytes", "600"),
+                ("catalog_compact_bytes_read", "900"),
+                ("catalog_lwc_bytes_written", "1500"),
+                ("catalog_index_bytes_written", "300"),
+                ("catalog_metadata_bytes_written", "400"),
+                ("catalog_changed_final_compact_bytes", expected_compact),
+                ("catalog_checkpoint_bytes_written", "2200"),
+                ("catalog_write_amplification", expected_amplification),
+            ] {
+                let expected = format!("{name}: {expected}");
+                assert!(
+                    summary.lines().any(|line| line == expected),
+                    "missing {expected:?} in {summary}"
+                );
+            }
+        }
+    }
+
+    /// Purpose: Preserve filesystem error context when an output root is missing or a directory blocks the staging path.
+    /// Expected: Failures identify the offending path, preserve the blocking directory, and publish no canonical artifact.
+    #[test]
+    fn output_path_failures_preserve_context_and_blocking_directory() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing-root");
+        let error = write_plan_output(&report(&missing))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to resolve benchmark artifact directory"));
+        assert!(error.contains(missing.to_str().unwrap()));
+        assert!(!missing.exists());
+
+        let canonical = result_toml_path(temp.path());
+        let staged = staged_path(&canonical);
+        fs::create_dir(&staged).unwrap();
+        let error = write_plan_output(&report(temp.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to write benchmark artifact"));
+        assert!(error.contains(staged.to_str().unwrap()));
+        assert!(staged.is_dir());
+        assert!(!canonical.exists());
+    }
+
     /// Purpose: Keep checkpoint work and retry waiting distinguishable in summaries.
-    /// Expected: Output preserves separate attempt and wait counts and durations.
+    /// Expected: Output preserves separate attempt/wait counts and durations and rejects missing or incompatible metrics.
     #[test]
     fn checkpoint_stdout_summary_includes_attempt_and_wait_breakdown() {
         let temp = TempDir::new().unwrap();
-        let mut report = report(temp.path());
-        let Phase::Benchmark {
-            workload,
-            fixture_effect,
-            ..
-        } = &mut report.plan.phases[0]
-        else {
-            unreachable!()
-        };
-        *workload = ResolvedWorkload::CheckpointTable(CheckpointTableConfig {
-            include_stats: false,
-        });
-        *fixture_effect = FixturePlanEffect::Checkpoint;
-        report.aggregate.latency.unit = LatencyUnit::TableCheckpoint;
-        report.measured_runs.push(MeasuredRunResult {
-            run_index: 1,
-            elapsed_nanos: 10,
-            counters: report.aggregate.counters,
-            operations_per_second: report.aggregate.operations_per_second,
-            latency: report.aggregate.latency.clone(),
-            workload_metrics: Some(WorkloadMetrics::CheckpointTable {
+        let report = measured_report(
+            temp.path(),
+            ResolvedWorkload::CheckpointTable(CheckpointTableConfig {
+                include_stats: false,
+            }),
+            WorkloadMetrics::CheckpointTable {
                 attempt_count: 3,
                 attempt_elapsed_nanos: 7,
                 retry_wait_count: 2,
                 retry_wait_elapsed_nanos: 2,
-            }),
-            internal_metrics: Vec::new(),
-        });
+            },
+        );
+        assert_metric_shape_errors(&report, "checkpoint");
         let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
         assert!(summary.contains("checkpoint_attempt_count: 3\n"));
         assert!(summary.contains("checkpoint_attempt_elapsed_nanos: 7\n"));
@@ -749,35 +1014,40 @@ mod tests {
     }
 
     /// Purpose: Expose parallel scan partitioning and row throughput consistently.
-    /// Expected: Summaries retain partition diagnostics and handle absent elapsed time without
-    /// an undefined rate.
+    /// Expected: Summaries retain partition diagnostics and defined row rates; missing, incompatible, or inconsistent metrics fail.
     #[test]
     fn parallel_scan_stdout_summary_includes_partition_and_row_throughput() {
         let temp = TempDir::new().unwrap();
-        let mut report = report(temp.path());
-        let Phase::Benchmark { workload, .. } = &mut report.plan.phases[0] else {
-            unreachable!()
-        };
-        *workload = ResolvedWorkload::ParallelTableScan(ParallelTableScanConfig {
-            num: 1,
-            target_partitions: 4,
-            loaded_range: KeyRange { start: 0, len: 8 },
-            include_stats: false,
-        });
-        report.aggregate.counters.rows_returned = 8;
-        report.aggregate.latency.unit = LatencyUnit::ParallelTableScanLifecycle;
-        report.measured_runs.push(MeasuredRunResult {
-            run_index: 1,
-            elapsed_nanos: 10,
-            counters: report.aggregate.counters,
-            operations_per_second: report.aggregate.operations_per_second,
-            latency: report.aggregate.latency.clone(),
-            workload_metrics: Some(WorkloadMetrics::ParallelTableScan {
+        let mut report = measured_report(
+            temp.path(),
+            ResolvedWorkload::ParallelTableScan(ParallelTableScanConfig {
+                num: 1,
+                target_partitions: 4,
+                loaded_range: KeyRange { start: 0, len: 8 },
+                include_stats: false,
+            }),
+            WorkloadMetrics::ParallelTableScan {
                 target_partitions: 4,
                 actual_partitions: 3,
-            }),
-            internal_metrics: Vec::new(),
+            },
+        );
+        report.aggregate.counters.rows_returned = 8;
+        report.measured_runs[0].counters.rows_returned = 8;
+        assert_metric_shape_errors(&report, "parallel scan");
+        let mut inconsistent = report.clone();
+        let mut second = inconsistent.measured_runs[0].clone();
+        second.run_index = 2;
+        second.workload_metrics = Some(WorkloadMetrics::ParallelTableScan {
+            target_partitions: 4,
+            actual_partitions: 2,
         });
+        inconsistent.measured_runs.push(second);
+        assert_eq!(
+            render_stdout_summary(&inconsistent, Path::new("result.toml"))
+                .unwrap_err()
+                .to_string(),
+            "parallel scan report has inconsistent per-run partition metrics"
+        );
         let summary = render_stdout_summary(&report, Path::new("result.toml")).unwrap();
         assert!(summary.contains("target_partitions: 4\n"));
         assert!(summary.contains("actual_partitions: 3\n"));
