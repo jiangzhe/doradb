@@ -138,9 +138,10 @@ A failure prevents success output or artifact publication.
 
 Canonical TOML retains normalized controls, counters, timing, and diagnostics.
 Generic throughput measures requests; delete stdout also reports deleted rows
-and their rate using measured wall time. Four mode/index templates and
-`docs/benchmark-tool.md` document fresh-root repetition, fixture depletion,
-duplicate-group batching, and the single full-delete sample limitation.
+and their rate using measured wall time. Four mode/index templates prepare
+10,000 rows; random templates issue 10,000 requests in batches of 100 with two
+threads and four sessions. `docs/benchmark-tool.md` retains concise user-facing
+controls, single-run rules, request semantics, metrics, and template names.
 
 ## Implementation Notes
 
@@ -151,24 +152,29 @@ There are no functional deviations from the approved task.
 
 Validation on 2026-10-02:
 
-- Standard workspace nextest and the final coverage workspace run each passed
-  all 2,225 tests. The focused benchmark suite passed all 160 tests.
+- Standard workspace nextest and the coverage workspace run each passed all
+  2,227 tests; all nine focused output tests passed. Template inventory and
+  CLI execution passed after increasing preparation and request
+  counts to 10,000. The final rollback regression also passed with measurement
+  enabled in both failure scenarios.
 - Formatting and strict workspace/all-target Clippy passed. The final branch
-  style gate covered 10 Rust files and 104 source-visible test contracts with
+  style gate covered 10 Rust files and 106 source-visible test contracts with
   no violations, including the new module.
 - Production coverage: delete executor 94.14%; the eight focused files combined
-  87.69%. The report is reproducible at `target/coverage/task-000324.md`.
-- `plan_output.rs` is 76.23% overall because existing catalog-checkpoint summary
-  branches and defensive failures remain uncovered. All added delete summary
+  90.00%, recorded in `target/coverage/task-000324.md` after the final test fixes.
+- `plan_output.rs` coverage rose from 76.23% to 98.09% with catalog-checkpoint
+  summary, invalid-metric, and artifact-error tests. All added delete summary
   lines are covered, including independent request/row rates and zero elapsed
-  time. Future reporting-test hardening should cover those existing branches;
-  no delete behavior is deferred.
+  time. Reporting-test hardening is complete with no separate backlog retained.
 
 Semantic review used fixed seed-seven target vectors and an independent
 survivor multiset with distinct and repeated payloads. Batch sizes one, two,
 three, and eight retain the same survivors. A held row mutation establishes
 conflicts deterministically after an earlier request; counter overflow also
-exercises whole-batch rollback. No sleep or retry establishes test readiness.
+exercises whole-batch rollback. Review found that these failure tests disabled
+latency recording, making their zero-sample assertions ineffective. Both now
+use an active measurement clock, and the focused regression and branch style
+gate pass. No sleep or retry establishes test readiness.
 Fatal cleanup precedence was reviewed at the public error-classification
 boundary; no storage poison-injection API was added for benchmark tests.
 
@@ -182,6 +188,54 @@ setup. Unit semantics, CLI template execution, and canonical output tests
 intentionally overlap at distinct boundaries: exact row contents, real worker
 and process lifecycle, and independent numeric report expectations. Existing
 update and delete merge tests retain separate named counter-regression cases.
+Reporting tests share measured-report setup and invalid-metric assertions while
+retaining independent numeric expectations for byte totals, RSS, and write
+amplification, including exclusion of unchanged tables and a zero denominator.
+Filesystem tests cover stale staging files, a missing output root, and blocking
+directories without relying on host permissions.
+
+### Benchmark observations
+
+All runs used an optimized release build on aarch64 with glibc 2.39, no
+allocator preload, `fsync`, 128-byte payloads, fresh roots, and one measured
+invocation per case. Preparation and final content verification are excluded
+from the reported wall times. Every invocation passed content verification.
+
+The four shipped 10,000-row templates produced:
+
+| Workload | Index | Deleted rows | Wall time (ms) | Deleted rows/s |
+| --- | --- | ---: | ---: | ---: |
+| Full table | Unique | 10,000 | 11.544 | 866,225 |
+| Full table | Non-unique | 10,000 | 10.727 | 932,216 |
+| Random | Unique | 6,350 | 51.159 | 124,124 |
+| Random | Non-unique | 6,329 | 52.846 | 119,763 |
+
+Full deletion contributed one transaction sample; random deletion contributed
+100 samples. Local canonical results, stdout, and environment metadata are
+indexed by `target/delete-cases-000324-mm6hmdnt/summary.json`.
+
+A separate experiment loaded 1,000,000 unique rows using four threads,
+16 sessions, and 1,000-row insert batches, then issued 10,000 seed-seven random
+delete requests with `batch_size = 1`:
+
+| Threads / sessions | Placement | Deleted rows | Wall time (s) | Deleted rows/s |
+| --- | --- | ---: | ---: | ---: |
+| 1 / 1 | Hot | 9,954 | 5.974 | 1,666 |
+| 1 / 1 | Checkpointed | 9,954 | 7.441 | 1,338 |
+| 4 / 16 | Hot | 9,953 | 0.751 | 13,247 |
+| 4 / 16 | Checkpointed | 9,953 | 0.784 | 12,700 |
+
+The checkpointed runs persisted all rows and verified zero hot pages before
+deleting; caches were not flushed. Cold deletion took 24.6% longer at 1/1 and
+4.3% longer at 4/16 in these single runs. Replacement sampling caused 46 or 47
+successful misses, so request counts differ from deleted-row counts.
+
+Indexed checkpoint preparation is restricted by the shipped plan validator.
+Only that restriction was relaxed in an ignored experiment copy; the delete
+executor was unchanged. These measurements do not add supported cold-fixture
+preparation or establish a general performance result. Plans, the isolated
+patch, environment metadata, and canonical result paths are retained under
+`target/delete-hot-cold-1m-volyeg9n/`, indexed by `summary.json`.
 
 ## Impacts
 
@@ -212,9 +266,12 @@ this is benchmark-only work using its existing profiling dependency.
 - All four shipped templates execute through the CLI. Output tests distinguish
   requests from deleted-row throughput, check zero-time rates, and round-trip
   normalized plans and canonical results. Common counter guards and overflow
-  checks cover the schema expansion.
+  checks cover the schema expansion. Additional output tests cover catalog I/O
+  totals and write amplification, missing/incompatible metrics, inconsistent
+  scan partitions, and artifact-path failures.
 
 ## Open Questions
 
-None for this implementation. Fixture restoration and broader mutation/mixed
-workloads remain future work under source backlog 000146.
+None for the delivered delete workloads. Fixture restoration, indexed cold
+preparation, and broader mutation/mixed workloads remain future work under
+source backlog 000146.

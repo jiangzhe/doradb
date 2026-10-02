@@ -10,13 +10,22 @@ docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/benchmark-to
 
 ## Deferred From (Optional)
 
-docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md
+docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/tasks/000324-doradb-bench-delete-workloads.md
 
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000211 intentionally avoids mutation and mixed workloads to keep the first benchmark crate focused on lifecycle, load generation, worker controls, and output contracts.
 - Findings: The load implementation inserts generated rows through public MVCC statements and records index mode in the manifest. Mutation and mixed workloads need additional choices around target-row selection, missing versus existing keys, duplicate logical keys when no unique index exists, update payload generation, and read/write concurrency reporting.
 - Direction Hint: Start from prepared load data and make target-key selection explicit. Keep unique-index behavior and no-index duplicate behavior visible in workload docs, use public statement APIs only, and avoid turning mixed workloads into correctness tests without benchmark-oriented metrics.
+
+- Task 000324 follow-up: Shipped delete plans consume their fixtures, and
+  indexed cold preparation remains outside that task's approved scope. A
+  one-million-row experiment successfully froze and checkpointed a unique
+  table after relaxing only the benchmark validator in an isolated copy.
+  Preserve the existing executor and measurement boundaries when planning
+  supported indexed preparation or fixture restoration; validate placement
+  explicitly and define restoration timing before allowing destructive replay.
+  The task record retains benchmark settings, results, and local artifact paths.
 
 ## Scope Hint
 

@@ -826,6 +826,7 @@ mod tests {
             let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
                 .await
                 .unwrap();
+            let clock = MeasurementClock::new();
             for index in [IndexMode::Unique, IndexMode::NonUnique] {
                 let rows = fixture_rows(index);
                 let (mut session, primary) = fixture(&engine, index, &rows).await;
@@ -850,7 +851,7 @@ mod tests {
                     primary,
                     DeleteTargets::Points(&[11, 13]),
                     &mut outcome.measurement,
-                    None,
+                    Some(&clock),
                 )
                 .await
                 .unwrap_err();
@@ -869,7 +870,7 @@ mod tests {
                     primary,
                     DeleteTargets::Points(&[11, 13]),
                     &mut outcome.measurement,
-                    None,
+                    Some(&clock),
                 )
                 .await
                 .unwrap_err();
