@@ -201,6 +201,7 @@ pub(super) fn verify_simple_counters(
     if counters.operations != operations
         || counters.inserted_rows != 0
         || counters.updated_rows != 0
+        || counters.deleted_rows != 0
         || counters.found != 0
         || counters.not_found != 0
         || counters.rows_returned != 0
@@ -218,6 +219,7 @@ pub(super) fn verify_simple_counters(
 pub(super) fn verify_no_write_counters(identity: &str, counters: WorkloadCounters) -> Result<()> {
     if counters.inserted_rows != 0
         || counters.updated_rows != 0
+        || counters.deleted_rows != 0
         || counters.expected_outcomes != ExpectedOutcomeCounters::default()
     {
         Err(BenchError::message(format!(
@@ -510,6 +512,12 @@ mod tests {
         assert!(verify_simple_counters("test", counters, 3).is_err());
         assert!(verify_read_shape("test", counters, 2, false).is_ok());
         assert!(verify_read_shape("test", counters, 2, true).is_err());
+        let deleted = WorkloadCounters {
+            deleted_rows: 1,
+            ..counters
+        };
+        assert!(verify_simple_counters("test", deleted, 2).is_err());
+        assert!(verify_read_shape("test", deleted, 2, false).is_err());
         let updated = WorkloadCounters {
             operations: 2,
             updated_rows: 1,

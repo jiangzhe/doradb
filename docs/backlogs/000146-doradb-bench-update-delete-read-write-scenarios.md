@@ -29,9 +29,14 @@ doradb-bench documents and supports representative update/delete/overwrite and m
 ## Notes (Optional)
 
 - Task `docs/tasks/000275-add-random-index-update-benchmark-workload.md`
-  implemented the deterministic unique/non-unique index-update slice. Delete,
-  overwrite/upsert, mixed read/write, and read-while-writing workloads remain
-  open under this backlog.
+  implemented the deterministic unique/non-unique index-update slice.
+- Task `docs/tasks/000324-doradb-bench-delete-workloads.md` implemented the
+  full-table and seeded random point-delete slice for unique and non-unique
+  secondary indexes, including request/row accounting, single-run admission,
+  final content verification, and four runnable templates.
+- Overwrite/upsert, mixed read/write, and read-while-writing workloads remain
+  open under this backlog. Fixture restoration for repeated destructive
+  measurements also remains outside the completed delete slice.
 
 
 ## Close Reason (Added When Closed)

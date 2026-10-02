@@ -7,6 +7,7 @@ mod binding;
 mod catalog;
 mod create_index;
 mod ddl;
+mod delete;
 mod index_fixture;
 mod insert;
 mod lock;
@@ -23,6 +24,9 @@ pub(crate) use binding::{ManagedBindingsPrepareExecutor, ResolveTableBindingExec
 pub(crate) use catalog::{CatalogCheckpointExecutor, CatalogCheckpointPrepareExecutor};
 pub(crate) use create_index::{CreateIndexExecutor, complete_create_index, prepare_create_fixture};
 pub(crate) use ddl::{CreateTableExecutor, IndexDdlExecutor, TableDdlExecutor};
+#[cfg(test)]
+pub(crate) use delete::set_delete_completion_hook;
+pub(crate) use delete::{DeleteAllExecutor, DeleteRandExecutor, complete_delete};
 pub(crate) use insert::{InsertRandExecutor, InsertSeqExecutor};
 pub(crate) use lock::LockTableExecutor;
 pub(crate) use maintenance::{CheckpointTableExecutor, FreezeTableExecutor};

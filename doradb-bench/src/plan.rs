@@ -192,6 +192,10 @@ pub enum WorkloadSpec {
     InsertRand(InsertSpec),
     /// Update seeded random logical-key ranges through a secondary index.
     UpdateRand(UpdateSpec),
+    /// Delete every primary-table row in one transaction.
+    DeleteAll(DeleteAllSpec),
+    /// Delete seeded equality-key requests through a secondary index.
+    DeleteRand(DeleteRandSpec),
     /// Create and drop transient tables.
     TableDdl(IterationWorkerSpec),
     /// Lookup sequential logical keys through the unique index.
@@ -408,6 +412,32 @@ pub struct UpdateSpec {
     /// Optional generated payload-size override.
     pub value_size: Option<Byte>,
     /// Optional preferred key-range width per transaction.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict full-table delete controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAllSpec {
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict random point-delete controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRandSpec {
+    /// Positive aggregate equality-key request count, sampled with replacement.
+    pub num: NonZeroU64,
+    /// Optional deterministic point-selection seed.
+    pub seed: Option<u64>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional maximum point requests per transaction.
     pub batch_size: Option<NonZeroU64>,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
@@ -849,6 +879,36 @@ pub struct UpdateConfig {
     pub include_stats: bool,
 }
 
+/// Resolved full-table delete configuration; execution uses one session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteAllConfig {
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved random point-delete configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRandConfig {
+    /// Aggregate equality-key request count, independent of affected rows.
+    pub num: u64,
+    /// Deterministic point-selection seed.
+    pub seed: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Maximum point requests per transaction.
+    pub batch_size: u64,
+    /// Bound primary-table secondary-index shape.
+    pub index: IndexMode,
+    /// Candidate loaded-key domain, including any preparation gaps.
+    pub loaded_range: KeyRange,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Resolved single-table freeze configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1005,6 +1065,10 @@ pub enum ResolvedWorkload {
     InsertRand(InsertConfig),
     /// Seeded random secondary-index update workload.
     UpdateRand(UpdateConfig),
+    /// One full-table delete transaction.
+    DeleteAll(DeleteAllConfig),
+    /// Seeded point-delete requests in per-session transaction batches.
+    DeleteRand(DeleteRandConfig),
     /// Transient table-DDL workload.
     TableDdl(DdlConfig),
     /// Sequential unique-index lookup workload.
@@ -1047,6 +1111,8 @@ impl ResolvedWorkload {
             Self::InsertSeq(_) => "insert-seq",
             Self::InsertRand(_) => "insert-rand",
             Self::UpdateRand(_) => "update-rand",
+            Self::DeleteAll(_) => "delete-all",
+            Self::DeleteRand(_) => "delete-rand",
             Self::TableDdl(_) => "table-ddl",
             Self::LookupSeq(_) => "lookup-seq",
             Self::LookupRand(_) => "lookup-rand",
@@ -1075,10 +1141,12 @@ impl ResolvedWorkload {
             Self::ManagedBindingsPrepare(_) => FixtureRequirement::AbsentManagedBindings,
             Self::ResolveTableBinding(_) => FixtureRequirement::ManagedBindings,
             Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Insert,
-            Self::UpdateRand(_) => FixtureRequirement::Primary {
-                index: IndexRequirement::Secondary,
-                load: LoadRequirement::Committed,
-            },
+            Self::UpdateRand(_) | Self::DeleteAll(_) | Self::DeleteRand(_) => {
+                FixtureRequirement::Primary {
+                    index: IndexRequirement::Secondary,
+                    load: LoadRequirement::Committed,
+                }
+            }
             Self::LookupSeq(_) | Self::LookupRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Exact(IndexMode::Unique),
                 load: LoadRequirement::Committed,
@@ -1114,7 +1182,9 @@ impl ResolvedWorkload {
     /// Return whether repeated execution against one fixture is safe.
     pub fn replay_policy(&self) -> ReplayPolicy {
         match self {
-            Self::Recovery(_) | Self::CreateIndex(_) => ReplayPolicy::SingleRun,
+            Self::Recovery(_) | Self::CreateIndex(_) | Self::DeleteAll(_) | Self::DeleteRand(_) => {
+                ReplayPolicy::SingleRun
+            }
             Self::StmtNoop(_)
             | Self::TrxNoop(_)
             | Self::LookupSeq(_)
@@ -1149,6 +1219,8 @@ impl ResolvedWorkload {
             Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
             Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
             Self::UpdateRand(config) => (config.threads, config.sessions),
+            Self::DeleteAll(_) => (1, 1),
+            Self::DeleteRand(config) => (config.threads, config.sessions),
             Self::TableDdl(config) | Self::IndexDdl(config) => (config.threads, config.sessions),
             Self::LookupSeq(config)
             | Self::LookupRand(config)
@@ -1175,6 +1247,8 @@ impl ResolvedWorkload {
             Self::StmtNoop(config) | Self::TrxNoop(config) => config.include_stats,
             Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
             Self::UpdateRand(config) => config.include_stats,
+            Self::DeleteAll(config) => config.include_stats,
+            Self::DeleteRand(config) => config.include_stats,
             Self::TableDdl(config) | Self::IndexDdl(config) => config.include_stats,
             Self::LookupSeq(config)
             | Self::LookupRand(config)
@@ -1202,6 +1276,8 @@ impl ResolvedWorkload {
             Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
             Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
             Self::UpdateRand(_) => LatencyUnit::UpdateRangeTransaction,
+            Self::DeleteAll(_) => LatencyUnit::DeleteAllTransaction,
+            Self::DeleteRand(_) => LatencyUnit::DeleteBatchTransaction,
             Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
             Self::LookupSeq(_) | Self::LookupRand(_) => LatencyUnit::LookupBatchTransaction,
             Self::TableScan(_) => LatencyUnit::TableScanBatchTransaction,
@@ -1230,7 +1306,7 @@ impl ResolvedWorkload {
     /// Return the exact successful sampled-run latency count.
     pub fn expected_samples(&self) -> Result<u64> {
         match self {
-            Self::Recovery(_) | Self::CreateIndex(_) => Ok(1),
+            Self::Recovery(_) | Self::CreateIndex(_) | Self::DeleteAll(_) => Ok(1),
             Self::CreateTable(config) => u64::try_from(config.table_count)
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
@@ -1240,6 +1316,9 @@ impl ResolvedWorkload {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
             Self::UpdateRand(config) => {
+                aggregate_batch_count(config.num, config.sessions, config.batch_size)
+            }
+            Self::DeleteRand(config) => {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
             Self::TableDdl(config) | Self::IndexDdl(config) => Ok(config.num),
@@ -1351,6 +1430,8 @@ fn validate_and_resolve_phases(
             && matches!(
                 workload,
                 ResolvedWorkload::UpdateRand(_)
+                    | ResolvedWorkload::DeleteAll(_)
+                    | ResolvedWorkload::DeleteRand(_)
                     | ResolvedWorkload::Recovery(_)
                     | ResolvedWorkload::CreateIndex(_)
             )
@@ -1519,6 +1600,12 @@ fn resolve_workload(
         WorkloadSpec::UpdateRand(spec) => no_effect(ResolvedWorkload::UpdateRand(resolve_update(
             spec, defaults, fixture,
         )?)),
+        WorkloadSpec::DeleteAll(spec) => no_effect(ResolvedWorkload::DeleteAll(DeleteAllConfig {
+            include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+        })),
+        WorkloadSpec::DeleteRand(spec) => no_effect(ResolvedWorkload::DeleteRand(
+            resolve_delete_rand(spec, defaults, fixture)?,
+        )),
         WorkloadSpec::TableDdl(spec) => {
             no_effect(ResolvedWorkload::TableDdl(resolve_ddl(spec, defaults)?))
         }
@@ -1740,6 +1827,36 @@ fn resolve_insert(
         ResolvedWorkload::InsertSeq(config)
     };
     Ok((workload, FixturePlanEffect::Insert { attempted_range }))
+}
+
+fn resolve_delete_rand(
+    spec: DeleteRandSpec,
+    defaults: ResolvedWorkloadDefaults,
+    fixture: &FixturePlanState,
+) -> Result<DeleteRandConfig> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    let batch_size = spec.batch_size.map_or(defaults.batch_size, NonZeroU64::get);
+    validate_batch_size(batch_size)?;
+    let loaded_range = fixture.loaded_range()?;
+    loaded_range.end()?;
+    let sessions_u64 =
+        u64::try_from(sessions).map_err(|_| BenchError::message("session count exceeds u64"))?;
+    if sessions_u64 > loaded_range.len {
+        return Err(BenchError::message(format!(
+            "delete sessions ({sessions}) exceed loaded key range length ({})",
+            loaded_range.len
+        )));
+    }
+    Ok(DeleteRandConfig {
+        num: spec.num.get(),
+        seed: spec.seed.unwrap_or(0),
+        threads,
+        sessions,
+        batch_size,
+        index: fixture.primary_shape()?.index,
+        loaded_range,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
 }
 
 fn resolve_update(
@@ -1990,6 +2107,173 @@ mod tests {
     fn resolve(raw: &str) -> Result<Vec<Phase>> {
         let raw = parse(raw)?;
         validate_and_resolve_phases(raw.phases, raw.workload_defaults.resolve()?)
+    }
+
+    fn delete_plan(index: &str, controls: &str) -> String {
+        format!(
+            "[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 7 }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}\n"
+        )
+    }
+
+    /// Purpose: Resolve delete request budgets, inherited controls, and destructive replay rules.
+    /// Expected: Both index modes retain exact configuration, shard-independent budgets, and sample units.
+    #[test]
+    fn delete_plans_resolve_defaults_overrides_and_single_run_contracts() {
+        for index in [IndexMode::Unique, IndexMode::NonUnique] {
+            for (num, sessions, batch, samples) in [(11, 3, 2, 6), (2, 4, 3, 2)] {
+                let phases = resolve(&delete_plan(&index.to_string(), &format!("type = 'delete-rand', num = {num}, sessions = {sessions}, threads = 2, batch_size = {batch}, seed = 19, include_stats = true"))).unwrap();
+                let workload = phases[2].workload();
+                let ResolvedWorkload::DeleteRand(config) = workload else {
+                    panic!("expected random delete")
+                };
+                assert_eq!(
+                    *config,
+                    DeleteRandConfig {
+                        num,
+                        seed: 19,
+                        threads: 2,
+                        sessions,
+                        batch_size: batch,
+                        index,
+                        loaded_range: KeyRange { start: 0, len: 7 },
+                        include_stats: true
+                    }
+                );
+                assert_eq!(workload.worker_counts(), (2, sessions));
+                assert_eq!(workload.replay_policy(), ReplayPolicy::SingleRun);
+                assert_eq!(workload.latency_unit(), LatencyUnit::DeleteBatchTransaction);
+                assert_eq!(workload.expected_samples().unwrap(), samples);
+                let encoded = toml::to_string(workload).unwrap();
+                assert_eq!(
+                    toml::from_str::<ResolvedWorkload>(&encoded).unwrap(),
+                    *workload
+                );
+            }
+            let defaults = "[workload_defaults]\nthreads = 2\nsessions = 3\nbatch_size = 4\nvalue_size = '19 B'\ninclude_stats = true\n";
+            let all = resolve(&format!(
+                "{defaults}{}",
+                delete_plan(&index.to_string(), "type = 'delete-all'")
+            ))
+            .unwrap();
+            let workload = all[2].workload();
+            assert_eq!(
+                *workload,
+                ResolvedWorkload::DeleteAll(DeleteAllConfig {
+                    include_stats: true
+                })
+            );
+            assert_eq!(workload.worker_counts(), (1, 1));
+            assert_eq!(workload.expected_samples().unwrap(), 1);
+            assert_eq!(workload.latency_unit(), LatencyUnit::DeleteAllTransaction);
+            assert_eq!(workload.replay_policy(), ReplayPolicy::SingleRun);
+            let rand = resolve(&format!(
+                "{defaults}{}",
+                delete_plan(
+                    &index.to_string(),
+                    "type = 'delete-rand', num = 3, include_stats = false"
+                )
+            ))
+            .unwrap();
+            let ResolvedWorkload::DeleteRand(config) = rand[2].workload() else {
+                panic!("expected random delete")
+            };
+            assert_eq!(
+                (
+                    config.seed,
+                    config.threads,
+                    config.sessions,
+                    config.batch_size,
+                    config.include_stats
+                ),
+                (0, 2, 3, 4, false)
+            );
+        }
+    }
+
+    /// Purpose: Reject unsupported delete fixtures, fields, controls, placement, and repetitions.
+    /// Expected: Invalid requests fail resolution while replacement sampling has no key-count request cap.
+    #[test]
+    fn delete_plans_reject_invalid_contracts() {
+        for controls in ["type = 'delete-all'", "type = 'delete-rand', num = 1"] {
+            for prefix in [
+                "",
+                "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n",
+            ] {
+                assert!(
+                    resolve(&format!(
+                        "{prefix}[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}"
+                    ))
+                    .is_err()
+                );
+            }
+            assert!(resolve(&delete_plan("none", controls)).is_err());
+            let valid = delete_plan("unique", controls);
+            for repetition in ["warmup_runs = 1", "measured_runs = 2"] {
+                assert!(
+                    resolve(&valid.replace(
+                        "kind = 'benchmark'",
+                        &format!("kind = 'benchmark'\n{repetition}")
+                    ))
+                    .is_err()
+                );
+            }
+            let prepare = valid.replace("kind = 'benchmark'", "kind = 'prepare'")
+                + "[[phase]]\nkind = 'benchmark'\nworkload = { type = 'trx-noop', num = 1 }\n";
+            assert!(
+                resolve(&prepare)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("final benchmark")
+            );
+            for field in [
+                "value_size = '1 B'",
+                "range = 1",
+                "index = 'unique'",
+                "change_key = true",
+                "unknown = 1",
+            ] {
+                assert!(
+                    parse(&delete_plan("unique", &format!("{controls}, {field}"))).is_err(),
+                    "{field}"
+                );
+            }
+            // A second preparation allocation overflows the candidate domain before bootstrap.
+            assert!(resolve(&valid.replace("num = 7", "num = 18446744073709551615").replace("[[phase]]\nkind = 'benchmark'", "[[phase]]\nworkload = { type = 'insert-seq', num = 1 }\n[[phase]]\nkind = 'benchmark'")).is_err());
+        }
+        for field in [
+            "num = 1",
+            "seed = 0",
+            "threads = 1",
+            "sessions = 1",
+            "batch_size = 1",
+        ] {
+            assert!(
+                parse(&delete_plan(
+                    "unique",
+                    &format!("type = 'delete-all', {field}")
+                ))
+                .is_err()
+            );
+        }
+        for controls in [
+            "",
+            ", num = 0",
+            ", num = 1, threads = 0",
+            ", num = 1, sessions = 0",
+            ", num = 1, batch_size = 0",
+            ", num = 1, threads = 3, sessions = 2",
+            ", num = 1, sessions = 8",
+        ] {
+            assert!(
+                resolve(&delete_plan(
+                    "unique",
+                    &format!("type = 'delete-rand'{controls}")
+                ))
+                .is_err(),
+                "{controls}"
+            );
+        }
+        assert!(resolve(&delete_plan("unique", "type = 'delete-rand', num = 100")).is_ok());
     }
 
     /// Purpose: Require valid managed-binding preparation before repeatable resolution
@@ -2654,6 +2938,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
             ("insert-seq.toml", "insert-seq"),
             ("insert-rand.toml", "insert-rand"),
             ("update-rand.toml", "update-rand"),
+            ("delete-all-unique.toml", "delete-all"),
+            ("delete-all-non-unique.toml", "delete-all"),
+            ("delete-rand-unique.toml", "delete-rand"),
+            ("delete-rand-non-unique.toml", "delete-rand"),
             ("table-ddl.toml", "table-ddl"),
             ("lookup-seq.toml", "lookup-seq"),
             ("lookup-rand.toml", "lookup-rand"),

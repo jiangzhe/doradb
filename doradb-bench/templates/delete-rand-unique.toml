@@ -1,0 +1,12 @@
+name = "unique random point deletion"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100 }
+
+[[phase]]
+kind = "benchmark"
+workload = { type = "delete-rand", num = 10000, seed = 7, threads = 2, sessions = 4, batch_size = 100 }

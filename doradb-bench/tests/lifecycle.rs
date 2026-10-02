@@ -197,6 +197,7 @@ mod tests {
     fn assert_update_counters(counters: WorkloadCounters) {
         assert_eq!(counters.operations, counters.updated_rows);
         assert_eq!(counters.inserted_rows, 0);
+        assert_eq!(counters.deleted_rows, 0);
         assert_eq!(counters.found, 0);
         assert_eq!(counters.not_found, 0);
         assert_eq!(counters.rows_returned, 0);
@@ -689,6 +690,111 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
         assert_update_counters(report.aggregate.counters);
         assert_eq!(report.aggregate.latency.sample_count, 16);
+    }
+
+    /// Purpose: Exercise both delete modes and index shapes through shipped CLI plans.
+    /// Expected: Canonical results preserve request/row accounting, sample units, diagnostics, and summary rates.
+    #[test]
+    fn checked_in_delete_templates_execute_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        for mode in ["all", "rand"] {
+            for index in ["unique", "non-unique"] {
+                let root = temp.path().join(format!("delete-{mode}-{index}"));
+                let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("templates")
+                    .join(format!("delete-{mode}-{index}.toml"));
+                let stdout =
+                    assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
+                let encoded = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
+                let report: InvocationReport = toml::from_str(&encoded).unwrap();
+                let run = &report.measured_runs[0];
+                assert_eq!(report.measured_runs.len(), 1);
+                assert_eq!(report.aggregate.counters, run.counters);
+                assert_eq!(run.counters.inserted_rows, 0);
+                assert_eq!(run.counters.updated_rows, 0);
+                assert_eq!(run.counters.rows_returned, 0);
+                assert_eq!(run.counters.expected_outcomes.duplicate_key, 0);
+                assert_eq!(run.counters.expected_outcomes.write_conflict, 0);
+                assert!(run.counters.deleted_rows > 0 && run.counters.deleted_rows <= 10_000);
+                if mode == "all" {
+                    assert_eq!(run.counters.operations, 1);
+                    assert_eq!(run.counters.deleted_rows, 10_000);
+                    assert_eq!((run.counters.found, run.counters.not_found), (0, 0));
+                    assert_eq!(run.latency.unit, LatencyUnit::DeleteAllTransaction);
+                    assert_eq!(run.latency.sample_count, 1);
+                } else {
+                    assert_eq!(run.counters.operations, 10_000);
+                    assert_eq!(run.counters.found + run.counters.not_found, 10_000);
+                    assert!(run.counters.not_found > 0);
+                    assert!(run.counters.found <= run.counters.deleted_rows);
+                    if index == "unique" {
+                        assert_eq!(run.counters.found, run.counters.deleted_rows);
+                    }
+                    assert_eq!(run.latency.unit, LatencyUnit::DeleteBatchTransaction);
+                    assert_eq!(run.latency.sample_count, 100);
+                }
+                assert!(stdout.contains(&format!("deleted_rows: {}\n", run.counters.deleted_rows)));
+                assert!(stdout.contains(&format!(
+                    "deleted_rows_per_second: {:.3}\n",
+                    doradb_bench::measurement::operations_per_second(
+                        run.counters.deleted_rows,
+                        run.elapsed_nanos
+                    )
+                )));
+                assert_eq!(
+                    toml::from_str::<InvocationReport>(&toml::to_string(&report).unwrap()).unwrap(),
+                    report
+                );
+            }
+        }
+    }
+
+    /// Purpose: Reject destructive replay and unsupported delete controls before filesystem ownership.
+    /// Expected: Invalid CLI plans leave no root or success output; sparse request budgets still execute.
+    #[test]
+    fn delete_cli_rejects_invalid_plans_before_root_creation() {
+        for controls in ["type = 'delete-all'", "type = 'delete-rand', num = 1"] {
+            let prepare = "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n";
+            for extra in ["warmup_runs = 1", "measured_runs = 2"] {
+                assert_plan_rejected_before_root_creation(
+                    &format!(
+                        "{prepare}[[phase]]\nkind = 'benchmark'\n{extra}\nworkload = {{ {controls} }}"
+                    ),
+                    "replay-safe",
+                );
+            }
+            assert_plan_rejected_before_root_creation(
+                &format!(
+                    "{prepare}[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls}, value_size = '1 B' }}"
+                ),
+                "unknown field",
+            );
+            assert_plan_rejected_before_root_creation(
+                &format!(
+                    "[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}"
+                ),
+                if controls.contains("delete-all") {
+                    "preceding nonempty insert phase"
+                } else {
+                    "requires loaded benchmark data"
+                },
+            );
+        }
+        let temp = TempDir::new().unwrap();
+        let (_, report) = execute_plan(
+            &temp,
+            "sparse-delete",
+            "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'delete-rand', num = 1, sessions = 3, include_stats = true }",
+        );
+        assert_eq!(report.aggregate.counters.operations, 1);
+        assert_eq!(report.aggregate.counters.deleted_rows, 1);
+        assert_eq!(report.aggregate.latency.sample_count, 1);
+        assert!(
+            report.measured_runs[0]
+                .internal_metrics
+                .iter()
+                .any(|metric| metric.name == "transaction.trx_count" && metric.value == 1)
+        );
     }
 
     /// Purpose: Keep the shipped random-update template executable through the public CLI.
