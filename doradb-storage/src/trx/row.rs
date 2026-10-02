@@ -1674,7 +1674,7 @@ pub(crate) mod tests {
                     MainBranchMvcc::Latest
                 }
             );
-            assert!(own_undo.is_empty());
+            assert_eq!(own_undo, []);
 
             for read_view in [&foreign, &ownerless] {
                 let mut actual_undo = Vec::new();

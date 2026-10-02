@@ -1633,7 +1633,7 @@ mod tests {
                             session = engine.new_session().unwrap();
                         }
                         Operation::DropIndex => {
-                            assert!(!model.indexes.is_empty());
+                            assert_ne!(model.indexes, []);
                             session
                                 .drop_managed_index(table_id, &[step], &mut model)
                                 .await
@@ -2832,13 +2832,7 @@ mod tests {
                 session.engine().catalog().curr_next_table_id(),
                 initial_next
             );
-            assert!(
-                session
-                    .engine()
-                    .catalog()
-                    .list_user_table_ids_now()
-                    .is_empty()
-            );
+            assert_eq!(session.engine().catalog().list_user_table_ids_now(), []);
 
             let mut interpreter = CreateFailureInterpreter {
                 result: Ok(vec![]),
@@ -3017,13 +3011,7 @@ mod tests {
                     !user_table_file_exists(&engine, table_id),
                     "failure={failure:?}: table file leaked"
                 );
-                assert!(
-                    session
-                        .engine()
-                        .catalog()
-                        .list_user_table_ids_now()
-                        .is_empty()
-                );
+                assert_eq!(session.engine().catalog().list_user_table_ids_now(), []);
                 assert!(
                     session
                         .resolve_table_binding(BindingNamespaceID::new(19), b"rollback", false)

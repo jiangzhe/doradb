@@ -478,7 +478,7 @@ mod tests {
         assert!(reused.ops.is_empty());
         assert!(reused.values.is_empty());
         assert!(reused.updates.is_empty());
-        assert!(reused.payload.is_empty());
+        assert_eq!(reused.payload, []);
         assert_eq!(
             pointers,
             (

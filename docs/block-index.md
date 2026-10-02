@@ -132,13 +132,9 @@ a delete. Ordinary cold-row advancement therefore checks one ordinal bit and
 does not reconstruct a row id, probe a delete hash set, or query the deletion
 buffer.
 
-Inline deletes are finalized during planning. An external deletion blob stays
-lazy so early callback stop does not read metadata for an unreached block. Its
-descriptor retains the validated blob reference, domain, declared count,
-already translated deletion-buffer overrides, and a sparse identity resolver
-only when a row-id-delta payload still needs it. Loading that block validates
-the blob, converts its values to ordinals, applies the saved overrides, and
-builds the final mask without consulting the column-index leaf.
+Durable deletions refer to physical row positions and are stored inline with
+row identity. Scan planning therefore has all persisted visibility metadata for
+each block. An early scan stop avoids loading values for unreached blocks.
 
 ### 5.3 Concurrent Boundary Movement
 
@@ -180,6 +176,11 @@ At a high level it does four things together:
 3. retire the corresponding hot row-page coverage
 4. advance the pivot and publish the new table root
 
+A common row limit for user and catalog blocks guarantees that each block's
+identity and every possible deletion set fit together in one index leaf,
+independently of value compression. See [Table File](./table-file.md) for the
+storage contract.
+
 These steps must become durable together. Otherwise the engine could expose a
 row movement where the data and the RowID routing disagree.
 
@@ -203,6 +204,10 @@ That contract is:
 - updates build new pages instead of mutating old ones
 - a new root is published atomically with the new table checkpoint metadata
 - old roots remain valid for readers until normal reclamation is safe
+
+Deletion-only checkpoints preserve row identity, physical positions, and stored
+values. Updating deletion metadata does not compact or reclaim the value blocks,
+even when every row in a block is deleted.
 
 This keeps checkpoint publication crash-safe and lets readers observe a stable
 persisted snapshot without latching through long rewrite operations.

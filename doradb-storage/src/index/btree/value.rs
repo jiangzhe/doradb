@@ -264,12 +264,12 @@ impl BTreeValue for BTreeNil {
 
     #[inline]
     fn encode_le(self, dst: &mut [u8]) {
-        debug_assert!(dst.is_empty());
+        debug_assert_eq!(dst, []);
     }
 
     #[inline]
     fn decode_le(src: &[u8]) -> Self {
-        debug_assert!(src.is_empty());
+        debug_assert_eq!(src, []);
         BTreeNil
     }
 }

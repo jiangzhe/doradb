@@ -70,22 +70,19 @@ root publication never recreates a marker that cleanup has removed.
 
 ### Persistent Delete Metadata
 
-Each `ColumnBlockIndex` leaf describes one LWC RowID range and stores a sorted
-set of deleted row-id deltas. A small encoded set remains inline in the leaf.
-A larger set is stored in immutable framed deletion-blob pages and referenced
-from the leaf.
+Each `ColumnBlockIndex` leaf entry stores the owning LWC block's persistent
+delete set inline. The set identifies deleted physical row positions; deleting
+a row does not change its logical identity or physical membership.
 
-The persisted set is the cold base state. Blob references, payload framing,
-delete counts, domains, and row ranges are validated when the delete set is
-loaded. Replacement uses CoW block-index nodes and immutable blob pages, so an
-unpublished mutable fork cannot alter the active delete state.
+The persisted set is the cold base state and is validated with the owning index
+entry. Changes become visible only through atomic CoW root publication.
 
 ### Secondary-Index State
 
 Persistent cold secondary-index entries live in per-index `DiskTree` roots.
 Deleting a cold row therefore has two durable effects:
 
-- add its delta to the owning LWC block's persistent delete set
+- add its physical ordinal to the owning LWC block's persistent delete set
 - remove or replace the corresponding cold secondary-index entries
 
 Both effects must be present in one table-root publication. A delete cutoff
@@ -142,11 +139,14 @@ advance the cutoff.
 Selected RowIDs are resolved and grouped by their persisted LWC block. For each
 affected block, checkpoint:
 
-1. Loads the authoritative persisted delete deltas and RowID array.
-2. Removes selected deltas already present in the durable set.
-3. Decodes the LWC block once for the remaining newly deleted rows.
-4. Reconstructs each row's old secondary-index keys.
-5. Adds the new deltas to the sorted persistent set.
+1. Resolves selected RowIDs to physical row positions.
+2. Excludes rows already marked deleted in persistent state.
+3. Reads the old values of the newly deleted rows.
+4. Derives the corresponding secondary-index changes.
+5. Merges the new deletions with the persistent set.
+
+A selected RowID inside a block's covered range but absent from its physical
+membership is an integrity failure.
 
 Old row values must remain decodable until this work publishes. Compaction,
 vacuum, or page reclamation cannot discard them after a foreground delete but
@@ -168,10 +168,10 @@ its own.
 
 ## CoW Persistence and Cutoff Advancement
 
-For every changed LWC range, checkpoint encodes the merged sorted delete set.
-It retains small sets inline and writes larger payloads to immutable deletion
-blob pages. A typed batch replacement produces the new
-`ColumnBlockIndex` root.
+For every changed LWC block, checkpoint replaces its complete inline deletion
+set through CoW. The shared block row limit guarantees space for any deletion
+subset. Physical row identity and values remain intact, including in blocks
+whose rows are all deleted.
 
 After all patches are represented, the mutable root advances
 `deletion_cutoff_ts` to `cutoff_ts`. The generic table-checkpoint path then

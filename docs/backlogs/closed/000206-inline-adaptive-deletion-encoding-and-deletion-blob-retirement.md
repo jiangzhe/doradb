@@ -15,25 +15,25 @@ guarantee capacity.
 
 ## Reference
 
-- Replaces [backlog 000031](closed/000031-column-deletion-blob-compression-policy-evaluation.md),
+- Replaces [backlog 000031](000031-column-deletion-blob-compression-policy-evaluation.md),
   closed at the user's request in favor of this separate design.
-- Original source: [task 000038](../tasks/000038-column-block-index-offloaded-deletion-bitmap.md).
-- [Task 000322](../tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md):
+- Original source: [task 000038](../../tasks/000038-column-block-index-offloaded-deletion-bitmap.md).
+- [Task 000322](../../tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md):
   adaptive row identity, compact membership, and current inline capacity contract.
 - User review on 2026-09-30: apply similar encoding to durable deletions and
   prefer keeping both sets inline so deletion blobs can be retired.
-- `doradb-storage/src/index/column_row_set.rs`: codec planning, validation,
+- `doradb-storage/src/index/identity_set.rs`: codec planning, validation,
   compact lookup, and iteration.
 - `doradb-storage/src/index/column_block_index.rs`: deletion domains, inline
   sizing, point lookup, delete rewrites, and leaf packing.
 - `doradb-storage/src/index/column_deletion_blob.rs`: existing blob format,
   reading, writing, and page traversal to retire.
-- [Deletion checkpoint](../deletion-checkpoint.md),
-  [block index](../block-index.md), and [table file](../table-file.md).
+- [Deletion checkpoint](../../deletion-checkpoint.md),
+  [block index](../../block-index.md), and [table file](../../table-file.md).
 - Related backlogs: [000036](000036-deletion-blob-roaring-encoding-upgrade-and-compatibility.md),
   [000037](000037-roaring-deletion-bitmap-rowid-to-offset-mapping-in-checkpoint.md),
   [000075](000075-refine-column-block-index-inline-delete-field-and-delete-surface-cleanup.md),
-  and [000201](closed/000201-adaptive-cold-row-identity-encoding.md).
+  and [000201](000201-adaptive-cold-row-identity-encoding.md).
 
 ## Deferred From (Optional)
 
@@ -158,3 +158,11 @@ scope of closed backlog 000201 here.
   competing deletion formats. Creating this backlog does not close those items.
 
 ## Notes (Optional)
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000323: capped inline adaptive ordinal deletions, direct membership, prepared-page splitting, version-4 cutover, and deletion-blob retirement; unsupported spans and values remain explicit follow-ups.
+- Closed By: backlog close
+- Reference: docs/tasks/000323-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md
+- Closed At: 2026-10-01

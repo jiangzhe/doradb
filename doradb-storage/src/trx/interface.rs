@@ -367,11 +367,11 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
 
             trx.noop().await.unwrap();
-            assert!(
+            assert_eq!(
                 trx.table_insert_batch_mvcc(table_id, Vec::new())
                     .await
-                    .unwrap()
-                    .is_empty()
+                    .unwrap(),
+                []
             );
             {
                 let mut checkout = trx.checkout().unwrap();

@@ -42,7 +42,6 @@ use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use futures::FutureExt;
 use std::any::Any;
-use std::collections::BTreeSet;
 use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -260,19 +259,21 @@ impl<'a> CreateIndexCollector<'a> {
         let mut rows = Vec::new();
         let file_kind = table.file().file_kind();
         for entry in column_index.collect_leaf_entries().await? {
-            let (delete_deltas, row_ids) =
-                column_index.load_delete_deltas_and_row_ids(&entry).await?;
+            let (identity, durable_deleted) = column_index
+                .load_entry_identity_and_deletions(&entry)
+                .await?;
             let block_id = entry.block_id();
             let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
             let block = persisted.block();
-            if usize::from(entry.row_count()) != row_ids.len() || block.row_count() != row_ids.len()
+            if usize::from(entry.row_count()) != identity.row_count()
+                || block.row_count() != identity.row_count()
             {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
                     "file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC row count mismatch: entry_rows={}, block_rows={}, row_ids={}",
                     entry.row_count(),
                     block.row_count(),
-                    row_ids.len()
+                    identity.row_count()
                 ))
                 .change_context(RuntimeError::CatalogAccess)
                 .attach("operation=create_index, phase=validate_index_build_input")
@@ -288,25 +289,13 @@ impl<'a> CreateIndexCollector<'a> {
                 .into());
             }
 
-            let mut durable_deleted = BTreeSet::new();
-            for delta in delete_deltas {
-                let row_id = entry
-                    .start_row_id
-                    .checked_add(u64::from(delta))
-                    .ok_or_else(|| {
-                        Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={file_kind}, block=lwc_block, block_id={block_id}, create index delete delta overflows row id: start_row_id={}, delta={delta}",
-                                entry.start_row_id
-                            ))
-                            .change_context(RuntimeError::CatalogAccess)
-                            .attach("operation=create_index, phase=validate_index_build_input")
-                    })?;
-                durable_deleted.insert(row_id);
-            }
-
-            for (row_idx, row_id) in row_ids.into_iter().enumerate() {
-                if durable_deleted.contains(&row_id) {
+            for (row_idx, row_id) in identity
+                .as_ref()
+                .iter_deltas()
+                .map(|delta| entry.start_row_id + u64::from(delta))
+                .enumerate()
+            {
+                if durable_deleted.contains(row_idx as u16) {
                     continue;
                 }
                 if create_index_current_cold_row_is_deleted(table, row_id)? {
@@ -3927,14 +3916,14 @@ pub(crate) mod tests {
                 crate::IndexID::new(1)
             );
 
-            assert!(
+            assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
                     &session.pool_guards(),
                     &name_key("alpha"),
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
             assert_eq!(
                 non_unique_mem_state(
@@ -3959,7 +3948,7 @@ pub(crate) mod tests {
                 Some(true)
             );
             let layout = table.layout_snapshot();
-            assert!(
+            assert_eq!(
                 non_unique_runtime_lookup(
                     &layout,
                     active_secondary_root(&table, IndexSlot::new(1)),
@@ -3967,8 +3956,8 @@ pub(crate) mod tests {
                     IndexSlot::new(1),
                     &[Val::from("alpha")],
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
             assert_eq!(
                 non_unique_runtime_lookup(
@@ -4078,14 +4067,14 @@ pub(crate) mod tests {
             rows.sort_unstable();
             expected_rows.sort_unstable();
             assert_eq!(rows, expected_rows);
-            assert!(
+            assert_eq!(
                 non_unique_disk_tree_prefix_scan(
                     &table,
                     &session.pool_guards(),
                     &name_key("missing"),
                 )
-                .await
-                .is_empty()
+                .await,
+                []
             );
         });
     }

@@ -53,3 +53,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented by task 000323: eight-byte version-2 inline deletion headers, adaptive ordinal bodies, exact capacity bounds, and retirement of deletion domains, legacy thresholds, and blob surfaces.
+- Closed By: backlog close
+- Reference: docs/tasks/000323-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md
+- Closed At: 2026-10-01

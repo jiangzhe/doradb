@@ -2084,7 +2084,7 @@ mod tests {
             "{report}"
         );
         assert_eq!(read(paths.marker_path()).unwrap(), original.as_bytes());
-        assert!(marker_temp_paths(&paths).is_empty());
+        assert_eq!(marker_temp_paths(&paths), [] as [PathBuf; 0]);
     }
 
     /// Purpose: Protect cleanup when marker publication fails before installation.
@@ -2102,7 +2102,7 @@ mod tests {
             let output = format!("{err:?}");
             assert!(output.contains("not_installed"), "{output}");
             assert!(!paths.marker_path().exists());
-            assert!(marker_temp_paths(&paths).is_empty());
+            assert_eq!(marker_temp_paths(&paths), [] as [PathBuf; 0]);
         }
     }
 
@@ -2120,7 +2120,7 @@ mod tests {
             let output = format!("{err:?}");
             assert!(output.contains("installed_durability_unknown"), "{output}");
             assert!(paths.validate_marker_if_present().unwrap());
-            assert!(marker_temp_paths(&paths).is_empty());
+            assert_eq!(marker_temp_paths(&paths), [] as [PathBuf; 0]);
         }
     }
 

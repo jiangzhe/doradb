@@ -24,3 +24,11 @@ Roaring encoding upgrade is specified and implemented with compatibility guarant
 ## Notes (Optional)
 
 If future work introduces a type-safe deletion payload representation and removes raw `ColumnPagePayload` patch writes, track that as a separate task instead of silently expanding this backlog.
+
+## Close Reason
+
+- Type: replaced
+- Detail: Superseded by task 000323 inline adaptive ordinal storage and a fresh-storage version-4 cutover. Roaring, deletion blobs, and legacy compatibility are not part of the implemented format.
+- Closed By: backlog close
+- Reference: docs/tasks/000323-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md
+- Closed At: 2026-10-01

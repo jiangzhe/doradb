@@ -731,12 +731,12 @@ mod tests {
             MemTableLayout::<FixedBufferPool>::new_memory(Arc::clone(&metadata), Box::new([]));
         assert_eq!(memory.generation(), 0);
         assert_eq!(memory.active_indexes().count(), 0);
-        assert!(memory.indexed_column_read_set().is_empty());
+        assert_eq!(memory.indexed_column_read_set(), []);
 
         assert_eq!(layout.generation(), 7);
         assert_eq!(layout.metadata().idx.index_slot_count(), 0);
         assert_eq!(layout.index_slot_count(), 0);
-        assert!(layout.indexed_column_read_set().is_empty());
+        assert_eq!(layout.indexed_column_read_set(), []);
     }
 
     /// Purpose: Protect runtime layout construction against inconsistent index metadata.

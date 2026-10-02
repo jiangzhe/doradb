@@ -2248,7 +2248,7 @@ mod tests {
             assert_eq!(failure.current_context(), &FatalError::PurgeDeallocate);
             entered.recv_async().await.unwrap();
             let retained = test_remaining(&cleanup);
-            assert!(!retained.is_empty());
+            assert_ne!(retained, [] as [PageID; 0]);
             assert_eq!(pool.allocated(), retained.len() + 1);
             assert!(retained.iter().all(|&id| pool.is_allocated(id)));
             assert!(poisoner.poison_error().is_some());

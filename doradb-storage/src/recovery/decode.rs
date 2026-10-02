@@ -1031,7 +1031,7 @@ mod tests {
             }
         }
         for (min, max) in [(0, u64::MAX), (8, 6)] {
-            assert!(compare_decoders(&[], min, max).unwrap().is_empty());
+            assert_eq!(compare_decoders(&[], min, max).unwrap(), []);
         }
         for cts in [0, u64::MAX] {
             let log = value_log(vec![], cts);

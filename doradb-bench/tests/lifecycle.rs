@@ -417,7 +417,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
                 );
                 assert_eq!(run.latency.unit, LatencyUnit::TableBindingResolution);
                 assert_eq!(run.latency.sample_count, 17);
-                assert!(!run.internal_metrics.is_empty());
+                assert_ne!(run.internal_metrics, []);
             }
             assert_eq!(report.aggregate.latency.sample_count, 34);
         }

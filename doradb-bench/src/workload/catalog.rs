@@ -1338,7 +1338,7 @@ mod tests {
                 first,
                 deterministic_descriptor(INDEX_PROBE_ORDINAL + 1, lengths[1])
             );
-            assert!(deterministic_descriptor(DROP_PROBE_ORDINAL, 0).is_empty());
+            assert_eq!(deterministic_descriptor(DROP_PROBE_ORDINAL, 0), []);
         }
     }
 
@@ -1707,7 +1707,7 @@ mod tests {
             );
             let definition = interpreter.create_table(&7_u64.to_le_bytes()).unwrap();
             assert_eq!(definition.storage().table(), &benchmark_table_spec());
-            assert!(definition.storage().indexes().is_empty());
+            assert_eq!(definition.storage().indexes(), []);
             assert_eq!(definition.descriptor(), descriptor);
             assert_eq!(definition.bindings(), deterministic_bindings(7));
             assert!(interpreter.descriptor.is_none());

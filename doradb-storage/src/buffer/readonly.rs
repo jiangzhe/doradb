@@ -1371,93 +1371,56 @@ pub(crate) fn begin_write_barrier(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
     use crate::buffer::page::Page;
-
     use crate::buffer::{test_outstanding_base_guard_count, test_page_id};
-
     use crate::catalog::{
         StorageColumnFlags, StorageColumnSpec, TableMetadata, USER_TABLE_ID_START,
     };
-
     use crate::conf::{EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, TrxSysConfig};
-
     use crate::engine::Engine;
-
     use crate::error::RuntimeOrFatalError;
-
     use crate::error::{
         DataIntegrityError, DataIntegrityResult, LifecycleError, ResourceError, RuntimeError,
     };
-
     use crate::file::block_integrity::{
-        BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC,
-        COLUMN_DELETION_BLOB_BLOCK_SPEC, LWC_BLOCK_SPEC, max_payload_len, write_block_checksum,
-        write_block_header,
+        BLOCK_INTEGRITY_HEADER_SIZE, COLUMN_BLOCK_INDEX_BLOCK_SPEC, LWC_BLOCK_SPEC,
+        write_block_checksum, write_block_header,
     };
-
     use crate::file::build_test_fs;
-
     use crate::file::build_test_fs_in;
-
     #[cfg(feature = "profiling")]
     use crate::file::cow_file::SUPER_BLOCK_ID;
-
     use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile};
-
     use crate::file::fs::FileSystem;
-
     use crate::file::fs::tests::{TestFileSystem, build_test_fs_owner_in};
-
     use crate::file::table_file::{MutableTableFile, TableFile};
-
     use crate::file::{CATALOG_MTB_FILE_ID, FileKind, test_block_id, test_file_id};
-
     use crate::id::{RowID, TableID, TrxID};
-
     use crate::index::{
-        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE,
-        COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockNodeHeader, validate_persisted_blob_page,
-        validate_persisted_column_block_index_page,
+        COLUMN_BLOCK_HEADER_SIZE, COLUMN_BLOCK_NODE_PAYLOAD_SIZE, ColumnBlockNodeHeader,
+        inline_deletion_leaf_fixture, validate_persisted_column_block_index_page,
     };
-
     use crate::io::{
         DirectBuf, IOBuf, IOKind, StorageBackendOp, StorageBackendTestHook,
         install_storage_backend_test_hook,
     };
-
     use crate::layout;
-
     use crate::lwc::{
         LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, validate_persisted_lwc_block,
     };
-
     use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
-
     use crate::table::test_user_table_id;
-
     use crate::value::ValKind;
-
     use smol::Timer;
-
     use std::io::Error as StdIoError;
-
     use std::ops::Deref;
-
     use std::os::fd::{AsRawFd, RawFd};
-
     use std::panic::{AssertUnwindSafe, catch_unwind};
-
     use std::sync::Arc;
-
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
     use std::sync::mpsc::{self, RecvTimeoutError};
-
     use std::thread;
-
     use std::time::Duration;
-
     use tempfile::TempDir;
 
     const TEST_WAIT_RETRIES: usize = 100;
@@ -1999,18 +1962,6 @@ pub(crate) mod tests {
         let entry_start = payload_start + COLUMN_BLOCK_HEADER_SIZE;
         buf[entry_start..entry_start + 8].copy_from_slice(&0u64.to_le_bytes());
         buf[entry_start + 8..entry_start + 16].copy_from_slice(&11u64.to_le_bytes());
-        write_block_checksum(&mut buf);
-        buf
-    }
-
-    fn build_valid_persisted_blob_page() -> Vec<u8> {
-        let mut buf = vec![0u8; COW_FILE_PAGE_SIZE];
-        let payload_start = write_block_header(&mut buf, COLUMN_DELETION_BLOB_BLOCK_SPEC);
-        let payload_end = payload_start + max_payload_len(COW_FILE_PAGE_SIZE);
-        let payload = &mut buf[payload_start..payload_end];
-        payload[..COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE].fill(0);
-        payload[8..10].copy_from_slice(&(1u16).to_le_bytes());
-        payload[COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE] = 7;
         write_block_checksum(&mut buf);
         buf
     }
@@ -3666,18 +3617,21 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Purpose: Reject checksum corruption in a cold deletion-blob block.
-    /// Expected: The integrity failure leaves the blob unmapped and releases its frame.
+    /// Purpose: Reject malformed inline ordinal deletions before column-index cache admission.
+    /// Expected: Typed payload failure leaves the index page unmapped and releases its frame.
     #[test]
-    fn test_readonly_pool_validated_blob_miss_rejects_corruption_without_mapping() {
+    fn test_readonly_pool_inline_deletions_reject_corruption_without_mapping() {
         smol::block_on(assert_invalid_page_not_cached(
-            "deletion-blob checksum",
+            "inline deletion payload",
             test_user_table_id(109),
             test_block_id(11),
-            build_valid_persisted_blob_page(),
-            validate_persisted_blob_page,
-            corrupt_checksum,
-            DataIntegrityError::ChecksumMismatch,
+            inline_deletion_leaf_fixture(),
+            validate_persisted_column_block_index_page,
+            |page| {
+                page[COW_FILE_PAGE_SIZE - 32 - 1] = 0xff;
+                write_block_checksum(page);
+            },
+            DataIntegrityError::InvalidPayload,
         ));
     }
 

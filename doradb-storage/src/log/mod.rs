@@ -3351,7 +3351,7 @@ mod tests {
                     assert_eq!(calls[0].kind(), kind);
                     assert_eq!(calls[0].fd(), ended_fd);
                 }
-                None => assert!(calls.is_empty()),
+                None => assert_eq!(calls, []),
             }
 
             drop(harness);
@@ -4002,7 +4002,7 @@ mod tests {
                 assert_eq!(writer.write_driver.submitted_len(), 1);
             }
 
-            assert!(hook.calls().is_empty());
+            assert_eq!(hook.calls(), []);
             assert_eq!(
                 harness
                     .trx_sys

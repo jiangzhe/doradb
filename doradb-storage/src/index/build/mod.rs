@@ -1427,7 +1427,7 @@ mod tests {
                 .into_iter()
                 .filter(|(_, row)| start <= *row && *row < end)
                 .collect();
-            assert!(!expected.is_empty());
+            assert_ne!(expected, []);
             assert_eq!(contents(&runs), expected);
 
             let mut source = fixture.source(&plan, policy, true).await;

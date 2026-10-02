@@ -1021,8 +1021,8 @@ impl CatalogStorage {
             .fetch_add(1, Ordering::Relaxed);
         let lwc_block = persisted.block();
         let row_count = lwc_block.row_count();
-        let (delete_deltas, row_ids) = column_index
-            .load_delete_deltas_and_row_ids(entry)
+        let (identity, deletions) = column_index
+            .load_entry_identity_and_deletions(entry)
             .await
             .change_runtime_context(RuntimeError::CatalogAccess)
             .attach_with(|| {
@@ -1030,20 +1030,20 @@ impl CatalogStorage {
                     "operation=decode_catalog_lwc_page_rows, phase=load_row_shape, block_id={block_id}"
                 )
             })?;
-        if !delete_deltas.is_empty() {
+        if !deletions.is_empty() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
                 "catalog root contains delete deltas: table_id={table_id}, block_id={block_id}, delete_count={}",
-                delete_deltas.len()
+                deletions.len()
             )))
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=decode_catalog_lwc_page_rows, phase=validate_delete_deltas").map_err(Into::into);
         }
-        if row_count != row_ids.len() {
+        if row_count != identity.row_count() {
             return Err(
                 Report::new(DataIntegrityError::InvalidPayload).attach(format!(
                     "file={file_kind}, block=lwc_block, block_id={block_id}, \
                          row_count={row_count}, index_row_id_count={}",
-                    row_ids.len()
+                    identity.row_count()
                 )),
             )
             .change_context(RuntimeError::CatalogAccess)
@@ -1051,7 +1051,12 @@ impl CatalogStorage {
             .map_err(Into::into);
         }
         let mut rows = Vec::with_capacity(row_count);
-        for (row_idx, row_id) in row_ids.into_iter().enumerate() {
+        for (row_idx, row_id) in identity
+            .as_ref()
+            .iter_deltas()
+            .map(|delta| entry.start_row_id + u64::from(delta))
+            .enumerate()
+        {
             let vals = lwc_block
                 .decode_full_row_values(&metadata.col, row_idx)
                 .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
@@ -1142,8 +1147,8 @@ impl CatalogStorage {
             column_index.with_logical_read_counter(measurement.compact_read_counter(root.table_id));
         for entry in entries {
             let block_id = entry.block_id();
-            let (delete_deltas, row_ids) = column_index
-                .load_delete_deltas_and_row_ids(&entry)
+            let (identity, deletions) = column_index
+                .load_entry_identity_and_deletions(&entry)
                 .await
                 .change_runtime_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
@@ -1152,12 +1157,12 @@ impl CatalogStorage {
                         root.table_id
                     )
                 })?;
-            if !delete_deltas.is_empty() {
+            if !deletions.is_empty() {
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
                         "projected catalog root contains delete deltas: table_id={}, block_id={block_id}, delete_count={}",
                         root.table_id,
-                        delete_deltas.len()
+                        deletions.len()
                     ))
                     .change_context(RuntimeError::CatalogAccess).into());
             }
@@ -1183,12 +1188,12 @@ impl CatalogStorage {
             let block = persisted.block();
             let block_row_count = block.row_count();
             let entry_row_count = usize::from(entry.row_count());
-            if block_row_count != entry_row_count || block_row_count != row_ids.len() {
+            if block_row_count != entry_row_count || block_row_count != identity.row_count() {
                 return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
                     .attach(format!(
                         "projected catalog row count disagreement: table_id={}, block_id={block_id}, lwc_row_count={block_row_count}, entry_row_count={entry_row_count}, row_id_count={}",
                         root.table_id,
-                        row_ids.len()
+                        identity.row_count()
                     ))
                     .change_context(RuntimeError::CatalogAccess).into());
             }
@@ -1441,7 +1446,6 @@ fn build_lwc_blocks_from_row_records(
                 builder_end,
                 builder.row_ids(),
                 builder.row_set_seeds(),
-                Vec::new(),
             )
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=plan_cold_row_identity")?;
@@ -1488,7 +1492,6 @@ fn build_lwc_blocks_from_row_records(
             builder_end,
             builder.row_ids(),
             builder.row_set_seeds(),
-            Vec::new(),
         )
         .change_context(RuntimeError::CatalogAccess)
         .attach("operation=plan_cold_row_identity")?;
@@ -1589,7 +1592,7 @@ pub(crate) mod tests {
     #[cfg(feature = "profiling")]
     use crate::file::super_block::SUPER_BLOCK_SIZE;
     use crate::id::{BlockID, PageID};
-    use crate::index::{ColumnBlockIndex, ColumnDeleteDeltaPatch};
+    use crate::index::{ColumnBlockIndex, ColumnDeletionPatch, OrdinalDeletionSet};
     use crate::lock::{LockMode, LockResource};
     use crate::log::redo::{DDLRedo, RowRedoKind};
     use crate::lwc::LwcBlock;
@@ -1889,7 +1892,7 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert!(!entries.is_empty());
+        assert_ne!(entries, []);
         assert_eq!(entries[0].start_row_id, RowID::new(0));
         for pair in entries.windows(2) {
             assert_eq!(pair[1].start_row_id, pair[0].end_row_id());
@@ -1904,7 +1907,10 @@ pub(crate) mod tests {
             &disk_pool_guard,
         );
         for entry in entries {
-            let (delete_deltas, _) = index.load_delete_deltas_and_row_ids(&entry).await.unwrap();
+            let (_, delete_deltas) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
             assert!(delete_deltas.is_empty());
         }
         rows
@@ -1950,11 +1956,18 @@ pub(crate) mod tests {
                 &disk_pool_guard,
             );
             root_block_id = column_index
-                .batch_replace_delete_deltas(
+                .batch_replace_deletions(
                     &mut mutable,
-                    &[ColumnDeleteDeltaPatch {
+                    &[ColumnDeletionPatch {
                         start_row_id: RowID::new(0),
-                        delete_deltas,
+                        deletions: &OrdinalDeletionSet::from_ordinals(
+                            rows.len() as u16,
+                            &delete_deltas
+                                .iter()
+                                .map(|delta| *delta as u16)
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap(),
                     }],
                     TrxID::new(78),
                 )
@@ -3276,7 +3289,7 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(!entries1.is_empty());
+            assert_ne!(entries1, []);
 
             let cached_after_first = engine.inner().pools.disk.allocated();
             assert!(cached_after_first >= cached_before_first);
@@ -3556,10 +3569,10 @@ pub(crate) mod tests {
         });
     }
 
-    /// Purpose: Reject highly compressible values whose sparse inline identity exceeds leaf capacity.
-    /// Expected: Direct catalog construction returns the resource cause before producing a publishable block.
+    /// Purpose: Split compressible catalog rows before sparse identities exceed standalone leaf capacity.
+    /// Expected: Every block obeys the common cap and preserves ordered values, identity, and binding.
     #[test]
-    fn compressed_values_reject_oversized_identity() {
+    fn compressed_values_split_sparse_identity_at_row_cap() {
         let metadata = TableMetadata::try_new(
             vec![StorageColumnSpec::new(
                 ValKind::U64,
@@ -3574,13 +3587,37 @@ pub(crate) mod tests {
                 vals: vec![Val::from(0u64)],
             })
             .collect();
-        let err = match build_lwc_blocks_from_row_records(TABLE_ID_COLUMNS, &metadata, &rows) {
-            Ok(_) => panic!("oversized sparse identity must not produce a block"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.downcast_ref::<crate::error::ResourceError>(),
-            Some(&crate::error::ResourceError::ColumnBlockEntryCapacityExceeded)
-        );
+        let blocks = build_lwc_blocks_from_row_records(TABLE_ID_COLUMNS, &metadata, &rows).unwrap();
+        assert_eq!(blocks.len(), 2);
+        let mut offset = 0;
+        for pending in blocks {
+            let block = LwcBlock::try_from_persisted_bytes(
+                pending.buf.data(),
+                FileKind::CatalogMultiTableFile,
+                BlockID::from(1u64),
+            )
+            .unwrap();
+            let count = block.row_count();
+            assert!(count <= crate::lwc::MAX_LWC_ROWS);
+            assert_eq!(pending.shape.start_row_id(), rows[offset].row_id);
+            assert_eq!(
+                pending.shape.end_row_id(),
+                rows[offset + count - 1].row_id + 1
+            );
+            assert_eq!(
+                block.block_binding_value(),
+                pending.shape.block_binding_value()
+            );
+            for ordinal in 0..count {
+                assert_eq!(
+                    block
+                        .decode_full_row_values(&metadata.col, ordinal)
+                        .unwrap(),
+                    rows[offset + ordinal].vals
+                );
+            }
+            offset += count;
+        }
+        assert_eq!(offset, rows.len());
     }
 }

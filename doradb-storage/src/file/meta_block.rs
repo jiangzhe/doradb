@@ -557,7 +557,7 @@ mod tests {
         let active_root = ActiveRoot::new(TrxID::new(7), 1024, Arc::clone(&metadata));
         let meta_block = roundtrip_table_meta(&active_root);
         assert_eq!(meta_block.schema, *active_root.metadata);
-        assert!(meta_block.secondary_index_slots.is_empty());
+        assert_eq!(meta_block.secondary_index_slots, []);
     }
 
     /// Purpose: Preserve multiple active secondary-index roots through metadata serialization.

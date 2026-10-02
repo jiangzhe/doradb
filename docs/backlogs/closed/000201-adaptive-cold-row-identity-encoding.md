@@ -148,7 +148,7 @@ cache-admission validation, typed inline-capacity handling, and the approved u64
 block binding through [task 000322](../../tasks/000322-adaptive-cold-row-id-encoding-with-compact-lookup.md).
 
 Remaining joint identity/deletion capacity and identity-aware LWC splitting are
-carried forward in [backlog 000206](../000206-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md).
+carried forward in [backlog 000206](000206-inline-adaptive-deletion-encoding-and-deletion-blob-retirement.md).
 Automatic splitting, identity offloading, and changes to the fatal checkpoint
 policy were not implemented; bounded inline splitting is the preferred next
 direction. Cross-use checksum algorithm evaluation remains in

@@ -31,7 +31,6 @@ by the CoW allocator; block kinds do not occupy fixed regions or positions.
 |   MetaBlock snapshots, including inline AllocMap        |
 |   ColumnBlockIndex branch and leaf nodes                |
 |   LWC value blocks                                      |
-|   External deletion-blob blocks                         |
 |   Secondary-index DiskTree nodes                        |
 |   Free blocks                                           |
 +---------------------------------------------------------+
@@ -39,11 +38,11 @@ by the CoW allocator; block kinds do not occupy fixed regions or positions.
 
 The allocation bitmap is serialized inside each `MetaBlock`; there is no
 separate space-map block. Row-ID lists live inside `ColumnBlockIndex` leaf
-entries, and external deletion blobs are reached through those entries.
+entries alongside inline ordinal deletion sets.
 
-Meta blocks, column block-index nodes, LWC blocks, and deletion-blob blocks use
-a shared integrity envelope: a 16-byte magic/version header and a 32-byte
-BLAKE3 checksum trailer, leaving 65,488 bytes for payload and padding.
+Meta blocks, column block-index nodes, and LWC blocks use a shared integrity
+envelope: a 16-byte magic/version header and a 32-byte BLAKE3 checksum trailer,
+leaving 65,488 bytes for payload and padding.
 `DiskTree` nodes use their own node layout with the shared checksum trailer;
 super-block slots use the header/body/footer format described below.
 
@@ -61,7 +60,7 @@ Each slot stores:
 
 Commit protocol:
 
-1. complete writes of the new data, index, and deletion-blob blocks
+1. complete writes of the new data and index blocks
 2. write the new `MetaBlock`
 3. write the inactive slot with the new `MetaBlock` pointer
 4. submit `fsync` through the shared storage backend and wait for completion
@@ -84,9 +83,8 @@ The active `MetaBlock` stores:
 - `deletion_cutoff_ts`
 
 Cold-row identity and persistent delete state are reached through
-`column_block_index_root`. Its leaf entries own the row-ID sections, inline
-delete sections, and references to external deletion blobs. `MetaBlock` has no
-separate deletion root or direct deletion-blob references.
+`column_block_index_root`. Its leaf entries own both row identity and inline
+deletion state. `MetaBlock` has no separate deletion root.
 
 The runtime `ActiveRoot` combines this payload with the super-block anchor.
 Its `root_ts` is serialized as `checkpoint_cts` in the super-block header and
@@ -205,8 +203,7 @@ Long-running readers are protected by root indirection:
 - block reclamation only happens after that retention condition is satisfied
 - transition from `GC_Wait` to `Free` is checkpoint-integrated
   root-reachability work, covering table metadata, `ColumnBlockIndex` nodes,
-  LWC replacement blocks, external deletion-blob blocks, and secondary-index
-  `DiskTree` blocks
+  LWC replacement blocks, and secondary-index `DiskTree` blocks
 
 User-table reclamation traces two protected roots when the checkpoint gate
 allows reclamation: the current active root and the mutable root about to be
@@ -215,9 +212,9 @@ checkpoint boundary, so catalog checkpoints that rewrite catalog file blocks
 trace only the to-be-committed mutable catalog root. The final new catalog
 meta-block id is reserved before the allocation map is rebuilt, allowing the
 newly serialized `catalog.mtb` root to free displaced catalog meta blocks,
-catalog `ColumnBlockIndex` nodes, LWC blocks, and external deletion-blob blocks
-that are no longer reachable from the committed catalog root. Metadata-only
-catalog checkpoints skip the trace and clear only the displaced meta block.
+catalog `ColumnBlockIndex` nodes, and LWC blocks that are no longer reachable
+from the committed catalog root. Metadata-only catalog checkpoints skip the
+trace and clear only the displaced meta block.
 
 Whole-table deletion is outside table-file block GC. After a committed
 `DROP TABLE`, transaction GC first destroys the removed runtime after
@@ -229,9 +226,8 @@ the checkpointed catalog table list.
 
 ## 6. Cold-Row Storage
 
-Cold rows span three related structures: `ColumnBlockIndex` owns row identity
-and persistent delete state, LWC blocks store values by row ordinal, and
-deletion-blob blocks hold delete payloads that exceed the inline policy.
+Cold rows span two related structures: `ColumnBlockIndex` owns inline row
+identity and ordinal deletion state; LWC blocks store values by physical ordinal.
 
 ### 6.1 ColumnBlockIndex And Row-ID Lists
 
@@ -245,11 +241,11 @@ storage needs. A block can combine representations across subranges when that
 reduces metadata size. All representations preserve the same membership and
 row order and support direct lookup and ordered scans.
 
-Row identity stays within its index entry, with room for deletion metadata.
-Checkpoint rejects entries that exceed this capacity before publishing a new
-root. Persisted metadata is validated when loaded; incompatible formats and
-malformed data are rejected. Readers can reuse validated immutable data while
-it remains cached.
+Row identity stays within its index entry. A shared row limit for user and
+catalog blocks guarantees room for identity and any future deletion set.
+Persisted metadata is validated when loaded; incompatible formats and malformed
+data are rejected. Readers can reuse validated immutable data while it remains
+cached.
 
 Persistent deletes are separate from physical membership. Deleting a row leaves
 its stored values and row position intact. Rewriting deletion metadata preserves
@@ -280,33 +276,19 @@ rows are represented through:
 - reinsertion of updated rows into hot RowStore
 - companion secondary-index maintenance
 
-### 6.3 Delete Sections And Deletion-Blob Blocks
+### 6.3 Inline Ordinal Deletion Sections
 
-An entry with no persistent deletes omits its delete section. A small delete
-set is serialized inline after the row section. Larger sets use a delete
-section containing a `BlobRef` with `start_block_id: u64`, `start_offset: u16`,
-and `byte_len: u32`. The offset is relative to the first block's blob body,
-and the byte length includes the blob's framing header.
+Persistent deletion sets live inline alongside row identity in each index entry.
+They identify physical row positions within the associated LWC block. Their
+compact representation adapts to the deletion distribution and supports direct
+membership checks and ordered scans.
 
-The delete section records its codec, version, domain, and count. Current
-payloads are sorted little-endian `u32` lists. The domain tag distinguishes
-RowID deltas from row ordinals; new entries default to RowID deltas, and delete
-rewrites preserve the existing domain. These lists represent a delete set,
-rather than a persisted bit-per-row bitmap.
-
-External payloads are packed into immutable deletion-blob blocks. Each block
-has a ten-byte payload header containing the next block id and used byte count.
-Each referenced blob begins with an eight-byte framing header containing its
-kind, codec, codec version, flags, and payload length. A block can contain
-multiple blobs, and a blob can continue across linked blocks. `BlobRef` selects
-the exact framed byte range; it does not imply one dedicated block per LWC
-block.
-
-Deletion checkpoint rewrites affected `ColumnBlockIndex` entries through CoW,
-writes any new external blobs, and publishes the replacement column-index
-root together with companion secondary-index changes. Reachability tracing
-follows leaf references to retain the required blob blocks. See
+Deletion checkpoint replaces these sets through CoW and publishes companion
+secondary-index changes in the same root. See
 [Deletion Checkpoint](./deletion-checkpoint.md) for selection and publication.
+
+The inline deletion format requires fresh storage; older column-index formats
+are not accepted. The LWC value layout is unchanged.
 
 For cold-row deletes, the table file owns a retention contract needed by
 deletion checkpoint and secondary-index maintenance: deleted cold row values
@@ -399,8 +381,7 @@ blocks, but cannot expose a partially built LWC/index pair.
 
 Deletion checkpoint publishes:
 
-- a new `ColumnBlockIndex` root with updated delete sections and any new
-  external deletion-blob blocks
+- a new `ColumnBlockIndex` root with inline ordinal deletion sections
 - updated secondary-index `DiskTree` roots for the deleted cold rows
 - updated `deletion_cutoff_ts`
 

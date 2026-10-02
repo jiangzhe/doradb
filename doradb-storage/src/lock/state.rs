@@ -1205,7 +1205,7 @@ mod tests {
             blocker.close(&manager);
             family.assert_empty();
             scope.assert_cleared();
-            assert!(debug_snapshot(&manager).entries.is_empty());
+            assert_eq!(debug_snapshot(&manager).entries, []);
         });
     }
 
@@ -2061,7 +2061,7 @@ mod tests {
             assert_eq!(owner_count(&manager, scope.owner()), 1);
             blocker.close(&manager);
             family.close_scope(scope, &manager);
-            assert!(debug_snapshot(&manager).entries.is_empty());
+            assert_eq!(debug_snapshot(&manager).entries, []);
         });
     }
 
@@ -2111,7 +2111,7 @@ mod tests {
             assert!(blocker.release(&manager, blocked_resource));
             blocker.close(&manager);
             family.close_scope(scope, &manager);
-            assert!(debug_snapshot(&manager).entries.is_empty());
+            assert_eq!(debug_snapshot(&manager).entries, []);
         });
     }
 
@@ -2148,7 +2148,7 @@ mod tests {
 
             family.close_scope(&mut second, &manager);
             family.close_scope(&mut first, &manager);
-            assert!(debug_snapshot(&manager).entries.is_empty());
+            assert_eq!(debug_snapshot(&manager).entries, []);
         });
     }
 

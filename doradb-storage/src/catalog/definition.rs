@@ -582,7 +582,7 @@ mod tests {
             original_definition.schema().columns()[0].column_id(),
             crate::ColumnID::new(0)
         );
-        assert!(original_definition.schema().indexes().is_empty());
+        assert_eq!(original_definition.schema().indexes(), []);
         let definition = ManagedTableDefinition::recover(
             table_id,
             &metadata,

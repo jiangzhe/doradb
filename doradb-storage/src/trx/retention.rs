@@ -1098,7 +1098,7 @@ pub(crate) mod tests {
             vec![sealed_non_empty(0, 2, 15)],
         );
 
-        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.candidates, []);
         assert_eq!(
             plan.blockers,
             vec![RedoTruncationBlocker::LiveTableFloor {
@@ -1121,7 +1121,7 @@ pub(crate) mod tests {
         );
 
         assert_eq!(plan.global_floor, TrxID::new(7));
-        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.candidates, []);
         assert_eq!(
             plan.blockers,
             vec![
@@ -1151,7 +1151,7 @@ pub(crate) mod tests {
     fn catalog_floor_blocks_catalog_unsafe_segment() {
         let plan = plan_with_fallback(10, vec![], vec![], vec![sealed_non_empty(0, 8, 12)]);
 
-        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.candidates, []);
         assert_eq!(
             plan.blockers,
             vec![RedoTruncationBlocker::CatalogFloor {
@@ -1189,7 +1189,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.candidates, []);
         assert_eq!(
             plan.blockers,
             vec![RedoTruncationBlocker::LiveTableFloor {
@@ -1242,7 +1242,7 @@ pub(crate) mod tests {
     fn unsealed_segment_blocks_prefix_growth() {
         let plan = plan_with_fallback(10, vec![], vec![], vec![unsealed(0), sealed_empty(1)]);
 
-        assert!(plan.candidates.is_empty());
+        assert_eq!(plan.candidates, []);
         assert_eq!(
             plan.blockers,
             vec![RedoTruncationBlocker::UnsealedFile { file_seq: 0 }]

@@ -1475,15 +1475,14 @@ mod tests {
         CompletionErrorBridge, DataIntegrityError, ErrorKind, InternalError, OperationError,
         RuntimeError, RuntimeOrFatalResult,
     };
-    use crate::file::block_integrity::BLOCK_INTEGRITY_HEADER_SIZE;
-    use crate::file::cow_file::tests::{corrupt_page_checksum, rewrite_page_with_checksum};
+    use crate::file::cow_file::tests::corrupt_page_checksum;
     use crate::index::build::{HotBuildPolicy, HotBuildSource};
     use crate::table::RowPageDescriptor;
 
     use crate::CallbackResult;
     use crate::file::table_file::MutableTableFile;
     use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
-    use crate::index::{COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE, ColumnBlockIndex, RowLocation};
+    use crate::index::{ColumnBlockIndex, RowLocation, corrupt_leaf_delete_codec};
     use crate::log::LogSync;
     use crate::log::block_group::TrxLog;
     use crate::log::format::{
@@ -2508,19 +2507,6 @@ mod tests {
         );
         drop(session);
         drop(table);
-    }
-
-    fn corrupt_blob_header_kind(
-        path: impl AsRef<Path>,
-        page_id: impl Into<u64>,
-        start_offset: u16,
-    ) {
-        let byte_offset = BLOCK_INTEGRITY_HEADER_SIZE
-            + COLUMN_DELETION_BLOB_PAGE_HEADER_SIZE
-            + start_offset as usize;
-        rewrite_page_with_checksum(path, page_id, |page| {
-            page[byte_offset] = 0xFF;
-        });
     }
 
     fn row_recovery_for_table(engine: &Engine, table_id: TableID) -> RecoveryCoordinator<'_> {
@@ -5792,10 +5778,10 @@ mod tests {
         })
     }
 
-    /// Purpose: Defer validation of malformed persisted deletion metadata during recovery.
-    /// Expected: Bootstrap succeeds and loading deletion deltas reports invalid framing with blob context.
+    /// Purpose: Enforce inline deletion validation when a recovered cold index leaf is read.
+    /// Expected: Bootstrap succeeds and leaf lookup reports the malformed deletion codec with index context.
     #[test]
-    fn test_log_recover_defers_invalid_delete_blob_framing_until_delta_load() {
+    fn test_log_recover_rejects_invalid_inline_deletions_on_leaf_read() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let main_dir = temp_dir.path().to_path_buf();
@@ -5876,7 +5862,7 @@ mod tests {
             assert_checkpoint_published(&mut checkpoint_session, table.table_id()).await;
 
             let active_root = table.file().active_root_unchecked();
-            let blob_ref = {
+            let leaf_block_id = {
                 let disk_pool_guard = table.disk_pool().create_base_guard();
                 let index = ColumnBlockIndex::new(
                     active_root.column_block_index_root,
@@ -5891,9 +5877,7 @@ mod tests {
                     .await
                     .unwrap()
                     .expect("checkpointed table should keep the deleted row's block entry");
-                entry
-                    .deletion_blob_ref()
-                    .expect("delete checkpoint should offload large delete sets")
+                entry.leaf_block_id
             };
 
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -5902,11 +5886,7 @@ mod tests {
             drop(session);
             drop(engine);
 
-            corrupt_blob_header_kind(
-                table_file_path,
-                blob_ref.start_block_id,
-                blob_ref.start_offset,
-            );
+            corrupt_leaf_delete_codec(table_file_path, leaf_block_id, 0);
 
             let engine = Engine::bootstrap(recovery_engine_config(main_dir, "recover9"))
                 .await
@@ -5925,19 +5905,14 @@ mod tests {
                     table.disk_pool(),
                     pool_guards.disk_guard(),
                 );
-                let entry = index
-                    .locate_block(RowID::new(0))
-                    .await
-                    .unwrap()
-                    .expect("deleted row should still have a checkpoint entry");
-                let err = match index.load_delete_deltas_and_row_ids(&entry).await {
-                    Ok(_) => panic!("expected invalid delete blob on delta load"),
+                let err = match index.locate_block(RowID::new(0)).await {
+                    Ok(_) => panic!("invalid inline deletion section must fail leaf admission"),
                     Err(err) => err,
                 };
                 assert_table_runtime_data_integrity(
                     err,
-                    "column_deletion_blob",
-                    blob_ref.start_block_id,
+                    "column_block_index",
+                    leaf_block_id,
                     DataIntegrityError::InvalidPayload,
                 );
             }

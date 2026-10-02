@@ -490,7 +490,7 @@ mod tests {
     /// primary keys.
     #[test]
     fn schema_index_specs_match_index_mode_without_primary_key() {
-        assert!(benchmark_index_specs(IndexMode::None).is_empty());
+        assert_eq!(benchmark_index_specs(IndexMode::None), []);
         let unique = benchmark_index_specs(IndexMode::Unique);
         assert!(unique[0].flags.contains(StorageIndexFlags::UK));
         assert!(!unique[0].flags.contains(StorageIndexFlags::PK));

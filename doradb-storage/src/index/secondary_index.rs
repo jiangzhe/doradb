@@ -1060,7 +1060,7 @@ where
         let mut out = Vec::new();
         loop {
             if !self.ensure_mem().await? {
-                debug_assert!(out.is_empty());
+                debug_assert_eq!(out, []);
                 self.state = DualTreeStreamState::DiskOnly;
                 return self.next_disk_batch().await;
             }

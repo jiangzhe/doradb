@@ -916,7 +916,7 @@ pub(in crate::lock) mod tests {
         assert_eq!(empty.slab.slots_len, 0);
         assert_eq!(empty.slab.capacity, 0);
         assert_eq!(empty.slab.live_count, 0);
-        assert!(empty.slab.free_order.is_empty());
+        assert_eq!(empty.slab.free_order, []);
 
         let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
         let _ = queue.remove_queued(first);
@@ -931,7 +931,7 @@ pub(in crate::lock) mod tests {
         let snapshot = queue_snapshot(&queue);
         assert_eq!(snapshot.slab.slots_len, 1);
         assert_eq!(snapshot.slab.capacity, retained_capacity);
-        assert!(snapshot.slab.free_order.is_empty());
+        assert_eq!(snapshot.slab.free_order, []);
 
         let appended = queue.append(owner(3), ClaimNo::new(3), LockMode::Shared, completion());
         assert_eq!(appended.slot, 1);
@@ -961,7 +961,7 @@ pub(in crate::lock) mod tests {
         let _ = queue.remove_queued(ids[3]);
         assert_eq!(linked_ids(&queue), vec![ids[2]]);
         let _ = queue.remove_queued(ids[2]);
-        assert!(linked_ids(&queue).is_empty());
+        assert_eq!(linked_ids(&queue), []);
         assert!(queue.head().is_none());
         assert_eq!(queue.live_count(), 0);
     }
@@ -1074,7 +1074,7 @@ pub(in crate::lock) mod tests {
             reused.iter().map(|id| id.slot).collect::<Vec<_>>(),
             vec![2, 0, 1]
         );
-        assert!(queue_snapshot(&queue).slab.free_order.is_empty());
+        assert_eq!(queue_snapshot(&queue).slab.free_order, []);
     }
 
     /// Purpose: Exercise mixed queue operations against independent sequence and free-list models.

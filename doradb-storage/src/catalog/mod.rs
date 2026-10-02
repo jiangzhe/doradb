@@ -1614,7 +1614,7 @@ pub(crate) mod tests {
     use crate::engine::Engine;
     use crate::error::{CompletionErrorBridge, DataIntegrityError, Error};
     use crate::file::cow_file::tests::corrupt_page_checksum;
-    use crate::index::{ColumnBlockIndex, ColumnLeafEntry, corrupt_leaf_delete_codec};
+    use crate::index::{ColumnBlockIndex, ColumnLeafEntry, corrupt_leaf_reserved};
     use crate::table::tests::assert_freeze_created;
     use crate::trx::MIN_SNAPSHOT_TS;
     use crate::trx::purge::PurgeTestEvent;
@@ -2345,7 +2345,7 @@ pub(crate) mod tests {
 
             assert_eq!(live.len(), 1);
             assert_eq!(live[0].table_id, table_id);
-            assert!(dropped.is_empty());
+            assert_eq!(dropped, []);
             assert_eq!(Arc::strong_count(&table), owners_before);
 
             drop(table);
@@ -2451,7 +2451,7 @@ pub(crate) mod tests {
             )
             .await;
 
-            corrupt_leaf_delete_codec(
+            corrupt_leaf_reserved(
                 main_dir.join("catalog.mtb"),
                 u64::from(entry.leaf_block_id),
                 0,
