@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
     use doradb_bench::measurement::{
         LatencyUnit, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
     };
@@ -14,6 +15,13 @@ mod tests {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    const CREATE_INDEX_ENGINE: &str = concat!(
+        "[engine.thread_pool]\nworker_threads = 1\n",
+        "[engine.index_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
+        "[engine.data_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
+        "[engine.file]\nreadonly_buffer_size = '17 MiB'\n",
+    );
 
     const SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -411,16 +419,48 @@ mod tests {
         }
     }
 
-    fn check_update_template(mode: &str, index: &str) {
+    #[track_caller]
+    fn execute_small_template(name: &str) -> (String, InvocationReport) {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("root");
-        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("templates")
-            .join(format!("{mode}-{index}.toml"));
-        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
+        let templates = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
+        let source = fs::read_to_string(templates.join(format!("{name}.toml"))).unwrap();
+        let mut plan: toml::Value = toml::from_str(&source).unwrap();
+        // Keep template controls and durable engine settings, with small fixtures
+        // and enough batches to exercise partial per-session tails.
+        for phase in plan["phase"].as_array_mut().unwrap() {
+            let workload = phase["workload"].as_table_mut().unwrap();
+            if matches!(
+                workload["type"].as_str().unwrap(),
+                "insert-seq" | "insert-rand" | "update-rand" | "update-point-rand" | "delete-rand"
+            ) {
+                workload.insert("num".to_owned(), 100.into());
+                workload.insert("batch_size".to_owned(), 10.into());
+            }
+        }
+        let defaults = plan["engine_defaults"].as_str().unwrap();
+        fs::copy(templates.join(defaults), temp.path().join(defaults)).unwrap();
+        let source = temp.path().join(format!("{name}.toml"));
+        fs::write(&source, toml::to_string(&plan).unwrap()).unwrap();
+        let stdout = assert_success(run_bench(&root, &["--plan", source.to_str().unwrap()]));
         let report: InvocationReport =
             toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
                 .unwrap();
+        assert_eq!(
+            report
+                .prepare_phases
+                .iter()
+                .map(|phase| phase.counters.inserted_rows)
+                .sum::<u64>(),
+            100,
+            "{name} fixture"
+        );
+        (stdout, report)
+    }
+
+    #[track_caller]
+    fn check_update_template(mode: &str, index: &str) {
+        let (stdout, report) = execute_small_template(&format!("{mode}-{index}"));
         assert_eq!(report.measured_runs.len(), 1);
         let run = &report.measured_runs[0];
         assert_eq!(report.aggregate.counters, run.counters);
@@ -431,22 +471,22 @@ mod tests {
         assert_eq!(run.counters.expected_outcomes.write_conflict, 0);
         if mode == "update-all" {
             assert_eq!(run.counters.operations, 1);
-            assert_eq!(run.counters.updated_rows, 10_000);
+            assert_eq!(run.counters.updated_rows, 100);
             assert_eq!((run.counters.found, run.counters.not_found), (0, 0));
             assert_eq!(run.latency.unit, LatencyUnit::UpdateAllTransaction);
             assert_eq!(run.latency.sample_count, 1);
         } else {
-            assert_eq!(run.counters.operations, 10_000);
-            assert_eq!(run.counters.found + run.counters.not_found, 10_000);
+            assert_eq!(run.counters.operations, 100);
+            assert_eq!(run.counters.found + run.counters.not_found, 100);
             if index == "unique" {
-                assert_eq!(run.counters.found, 10_000);
-                assert_eq!(run.counters.updated_rows, 10_000);
+                assert_eq!(run.counters.found, 100);
+                assert_eq!(run.counters.updated_rows, 100);
             } else {
                 assert!(run.counters.not_found > 0);
                 assert!(run.counters.updated_rows > run.counters.found);
             }
             assert_eq!(run.latency.unit, LatencyUnit::UpdatePointBatchTransaction);
-            assert_eq!(run.latency.sample_count, 100);
+            assert_eq!(run.latency.sample_count, 12);
         }
         assert!(stdout.contains(&format!("updated_rows: {}\n", run.counters.updated_rows)));
         assert!(stdout.contains(&format!(
@@ -462,15 +502,216 @@ mod tests {
         );
     }
 
-    /// Purpose: Support repeated managed-binding resolution with optional schema loading.
-    /// Expected: Prepared bindings resolve successfully across sessions with consistent run and
-    /// aggregate accounting.
-    #[test]
-    fn managed_binding_resolution_repeats_with_exact_results_and_samples() {
-        for full in [false, true] {
-            let temp = TempDir::new().unwrap();
-            let phases = format!(
-                r#"
+    #[track_caller]
+    fn check_delete_template(mode: &str, index: &str) {
+        let (stdout, report) = execute_small_template(&format!("delete-{mode}-{index}"));
+        let run = &report.measured_runs[0];
+        assert_eq!(report.measured_runs.len(), 1);
+        assert_eq!(report.aggregate.counters, run.counters);
+        assert_eq!(run.counters.inserted_rows, 0);
+        assert_eq!(run.counters.updated_rows, 0);
+        assert_eq!(run.counters.rows_returned, 0);
+        assert_eq!(run.counters.expected_outcomes.duplicate_key, 0);
+        assert_eq!(run.counters.expected_outcomes.write_conflict, 0);
+        assert!(run.counters.deleted_rows > 0 && run.counters.deleted_rows <= 100);
+        if mode == "all" {
+            assert_eq!(run.counters.operations, 1);
+            assert_eq!(run.counters.deleted_rows, 100);
+            assert_eq!((run.counters.found, run.counters.not_found), (0, 0));
+            assert_eq!(run.latency.unit, LatencyUnit::DeleteAllTransaction);
+            assert_eq!(run.latency.sample_count, 1);
+        } else {
+            assert_eq!(run.counters.operations, 100);
+            assert_eq!(run.counters.found + run.counters.not_found, 100);
+            assert!(run.counters.not_found > 0);
+            assert!(run.counters.found <= run.counters.deleted_rows);
+            if index == "unique" {
+                assert_eq!(run.counters.found, run.counters.deleted_rows);
+            }
+            assert_eq!(run.latency.unit, LatencyUnit::DeleteBatchTransaction);
+            assert_eq!(run.latency.sample_count, 12);
+        }
+        assert!(stdout.contains(&format!("deleted_rows: {}\n", run.counters.deleted_rows)));
+        assert!(stdout.contains(&format!(
+            "deleted_rows_per_second: {:.3}\n",
+            doradb_bench::measurement::operations_per_second(
+                run.counters.deleted_rows,
+                run.elapsed_nanos
+            )
+        )));
+        assert_eq!(
+            toml::from_str::<InvocationReport>(&toml::to_string(&report).unwrap()).unwrap(),
+            report
+        );
+    }
+
+    #[track_caller]
+    fn check_dependent_read(
+        name: &str,
+        index: &str,
+        controls: &str,
+        counters: WorkloadCounters,
+        unit: LatencyUnit,
+        samples: u64,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let phases = format!(
+            "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"{index}\" }}\n\
+         [[phase]]\nworkload = {{ type = \"insert-seq\", num = 8, batch_size = 4 }}\n\
+         [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
+         workload = {{ type = \"{name}\", {controls} }}\n"
+        );
+        let (_root, report) = execute_plan(&temp, name, &phases);
+        assert_eq!(report.measured_runs.len(), 2, "{name}");
+        for (run_index, run) in report.measured_runs.iter().enumerate() {
+            assert_eq!(run.counters, counters, "{name} run {run_index}");
+            assert_eq!(run.latency.unit, unit, "{name} run {run_index}");
+            assert_eq!(run.latency.sample_count, samples, "{name} run {run_index}");
+        }
+        assert_eq!(report.aggregate.measured_runs, 2, "{name}");
+        assert_eq!(
+            report.aggregate.counters,
+            WorkloadCounters {
+                operations: counters.operations * 2,
+                found: counters.found * 2,
+                rows_returned: counters.rows_returned * 2,
+                ..WorkloadCounters::default()
+            },
+            "{name} aggregate"
+        );
+        assert_eq!(report.aggregate.latency.unit, unit, "{name} aggregate");
+        assert_eq!(
+            report.aggregate.latency.sample_count,
+            samples * 2,
+            "{name} aggregate"
+        );
+    }
+
+    #[track_caller]
+    fn check_explicit_update_replay(name: &str, controls: &str, rows: u64) {
+        let temp = TempDir::new().unwrap();
+        let (_, report) = execute_plan(
+            &temp,
+            name,
+            &format!(
+                "[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 3 }}\n[[phase]]\nkind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 3\nworkload = {{ {controls}, change_key = true, include_stats = true }}"
+            ),
+        );
+        assert_eq!(report.measured_runs.len(), 3);
+        for run in &report.measured_runs {
+            assert_eq!(run.counters.operations, 1);
+            assert_eq!(run.counters.updated_rows, rows);
+            assert_eq!(run.latency.sample_count, 1);
+            assert_drained_transaction_diagnostics(name, run);
+        }
+        assert_eq!(report.aggregate.counters.operations, 3);
+        assert_eq!(report.aggregate.counters.updated_rows, rows * 3);
+        assert_eq!(report.aggregate.latency.sample_count, 3);
+    }
+
+    #[track_caller]
+    fn check_specialized_lock(scenario: &str, mode: &str, width: usize, tables: usize) {
+        let temp = TempDir::new().unwrap();
+        let phases = format!(
+            "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"none\", tables = {tables} }}\n\
+             [[phase]]\nkind = \"benchmark\"\n\
+             workload = {{ type = \"lock-table\", num = 1, scenario = \"{scenario}\", mode = \"{mode}\", width = {width}, threads = 1, sessions = 1 }}\n"
+        );
+        let (_root, report) = execute_plan(&temp, &format!("lock-{scenario}"), &phases);
+        assert_eq!(report.aggregate.counters.operations, 1, "{scenario}");
+        assert_eq!(report.aggregate.latency.sample_count, 1, "{scenario}");
+    }
+
+    #[track_caller]
+    fn check_create_index_placement(placement: &str, kind: PlacementKind, index: &str) {
+        let temp = TempDir::new().unwrap();
+        let mut phases = CREATE_INDEX_ENGINE.to_owned();
+        phases.push_str("[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 4, value_size = '64 B', batch_size = 2 }\n");
+        if placement != "hot" {
+            phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
+        }
+        if placement == "mixed" {
+            phases.push_str(
+                "[[phase]]\nworkload = { type = 'insert-seq', num = 2, value_size = '64 B' }\n",
+            );
+        }
+        let stats = index == "unique";
+        phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = '{index}', include_stats = {stats} }}\n"));
+        let (_, report) = execute_plan(&temp, &format!("create-{placement}-{index}"), &phases);
+        let run = &report.measured_runs[0];
+        let Some(WorkloadMetrics::CreateIndex { report: create }) = &run.workload_metrics else {
+            panic!("missing CREATE report")
+        };
+        assert_eq!(create.placement, kind);
+        assert_eq!(
+            create.index,
+            if stats {
+                IndexMode::Unique
+            } else {
+                IndexMode::NonUnique
+            }
+        );
+        assert_eq!(
+            create.rows,
+            match placement {
+                "hot" => RowPlacement {
+                    hot_rows: 4,
+                    checkpointed_rows: 0
+                },
+                "checkpointed" => RowPlacement {
+                    hot_rows: 0,
+                    checkpointed_rows: 4
+                },
+                _ => RowPlacement {
+                    hot_rows: 2,
+                    checkpointed_rows: 4
+                },
+            }
+        );
+        let total = if placement == "mixed" { 6 } else { 4 };
+        assert_eq!(create.total_rows, total);
+        let verification = create.verification.as_ref().unwrap();
+        assert_eq!(verification.table_rows, total);
+        assert_eq!(verification.index_rows, total);
+        assert_eq!(verification.fingerprint.len(), 64);
+        assert_eq!(create.sampled_process_rss.is_some(), stats);
+        assert_eq!(!run.internal_metrics.is_empty(), stats);
+        for metric_name in [
+            "hot_index_build.completed_builds",
+            "create_index.completed_builds",
+        ] {
+            let metric = run
+                .internal_metrics
+                .iter()
+                .find(|metric| metric.name == metric_name);
+            assert_eq!(
+                metric.map(|metric| metric.value),
+                stats.then_some(1),
+                "{metric_name}"
+            );
+        }
+        assert_eq!(run.latency.unit, LatencyUnit::IndexCreation);
+        assert_eq!(run.latency.sum_nanos, create.create_elapsed_nanos);
+        assert_eq!(run.latency.sample_count, 1);
+        assert_eq!(
+            run.counters,
+            WorkloadCounters {
+                operations: 1,
+                ..WorkloadCounters::default()
+            }
+        );
+    }
+
+    fn duplicate_index_plan() -> String {
+        let random = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-rand', num = 8, seed = 42, batch_size = 2 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'non-unique' }\n";
+        format!("{CREATE_INDEX_ENGINE}{random}")
+    }
+
+    #[track_caller]
+    fn check_managed_binding_resolution(full: bool) {
+        let temp = TempDir::new().unwrap();
+        let phases = format!(
+            r#"
 [[phase]]
 workload = {{ type = "managed-bindings-prepare", tables = 4 }}
 [[phase]]
@@ -479,25 +720,75 @@ warmup_runs = 1
 measured_runs = 2
 workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 4, include_full_schema = {full}, include_stats = true }}
 "#
+        );
+        let (_, report) = execute_plan(&temp, "bindings", &phases);
+        assert_eq!(report.prepare_phases[0].counters.operations, 4);
+        assert_eq!(report.measured_runs.len(), 2);
+        for run in &report.measured_runs {
+            assert_eq!(
+                run.counters,
+                WorkloadCounters {
+                    operations: 17,
+                    found: 17,
+                    ..WorkloadCounters::default()
+                }
             );
-            let (_, report) = execute_plan(&temp, "bindings", &phases);
-            assert_eq!(report.prepare_phases[0].counters.operations, 4);
-            assert_eq!(report.measured_runs.len(), 2);
-            for run in &report.measured_runs {
-                assert_eq!(
-                    run.counters,
-                    WorkloadCounters {
-                        operations: 17,
-                        found: 17,
-                        ..WorkloadCounters::default()
-                    }
-                );
-                assert_eq!(run.latency.unit, LatencyUnit::TableBindingResolution);
-                assert_eq!(run.latency.sample_count, 17);
-                assert_ne!(run.internal_metrics, []);
-            }
-            assert_eq!(report.aggregate.latency.sample_count, 34);
+            assert_eq!(run.latency.unit, LatencyUnit::TableBindingResolution);
+            assert_eq!(run.latency.sample_count, 17);
+            assert_ne!(run.internal_metrics, []);
         }
+        assert_eq!(report.aggregate.latency.sample_count, 34);
+    }
+
+    #[track_caller]
+    fn check_freeze_failure(name: &str, preparation: &str, max_rows: u64) {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join(format!("{name}.toml"));
+        fs::write(
+            &source,
+            format!(
+                "[engine.transaction]\nlog_sync = 'none'\n\
+                 [[phase]]\nworkload = {{ type = 'create-table', index = 'none' }}\n\
+                 {preparation}\n\
+                 [[phase]]\nkind = 'benchmark'\nwarmup_runs = 0\nmeasured_runs = 1\n\
+                 workload = {{ type = 'freeze-table', max_rows = {max_rows} }}\n"
+            ),
+        )
+        .unwrap();
+        let root = temp.path().join(format!("{name}-root"));
+        let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = assert_failure(output);
+        assert!(
+            stderr.contains("did not install a nonempty proper prefix"),
+            "{name}: {stderr}"
+        );
+        assert!(!stdout.contains("DoraDB benchmark summary"));
+        assert!(root.exists());
+        assert!(!root.join("benchmark-result.toml").exists());
+    }
+
+    fn checkpointed_freeze_failure_plan() -> String {
+        let hot = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '128 B', batch_size = 8 }\n";
+        format!(
+            "[[phase]]\nworkload = {{ type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }}\n\
+             [[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n\
+             [[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{hot}"
+        )
+    }
+
+    /// Purpose: Resolve managed table bindings repeatedly without full schema loading.
+    /// Expected: All sessions retain exact successful operations, statistics, and run/aggregate samples.
+    #[test]
+    fn managed_binding_resolution_replays_without_schema() {
+        check_managed_binding_resolution(false);
+    }
+
+    /// Purpose: Resolve managed table bindings repeatedly with full schema loading.
+    /// Expected: All sessions retain exact successful operations, statistics, and run/aggregate samples.
+    #[test]
+    fn managed_binding_resolution_replays_with_schema() {
+        check_managed_binding_resolution(true);
     }
 
     /// Purpose: Reject incomplete and obsolete CLI invocations before touching storage.
@@ -562,110 +853,106 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert!(!ignored_environment_root.exists());
     }
 
-    /// Purpose: Preserve workload accounting across dependent reads and index DDL.
-    /// Expected: Run and aggregate results match each workload's operation, row, hit, and
-    /// latency contracts.
+    /// Purpose: Exercise lookup-seq after committed preparation and a warmup.
+    /// Expected: Measured runs and aggregates retain exact operation, row, hit, and transaction sample counts.
     #[test]
-    fn dependent_read_and_index_ddl_plans_execute_with_exact_equations() {
-        let temp = TempDir::new().unwrap();
-        let read_cases = [
-            (
-                "lookup-seq",
-                "unique",
-                "num = 7, batch_size = 2",
-                WorkloadCounters {
-                    operations: 7,
-                    found: 7,
-                    rows_returned: 7,
-                    ..WorkloadCounters::default()
-                },
-                LatencyUnit::LookupBatchTransaction,
-                4,
-            ),
-            (
-                "lookup-rand",
-                "unique",
-                "num = 7, seed = 9, batch_size = 2",
-                WorkloadCounters {
-                    operations: 7,
-                    found: 7,
-                    rows_returned: 7,
-                    ..WorkloadCounters::default()
-                },
-                LatencyUnit::LookupBatchTransaction,
-                4,
-            ),
-            (
-                "table-scan",
-                "none",
-                "num = 2, batch_size = 1",
-                WorkloadCounters {
-                    operations: 2,
-                    rows_returned: 16,
-                    ..WorkloadCounters::default()
-                },
-                LatencyUnit::TableScanBatchTransaction,
-                2,
-            ),
-            (
-                "index-scan",
-                "non-unique",
-                "num = 3, range = 2, seed = 9, batch_size = 2",
-                WorkloadCounters {
-                    operations: 3,
-                    found: 3,
-                    rows_returned: 6,
-                    ..WorkloadCounters::default()
-                },
-                LatencyUnit::IndexScanBatchTransaction,
-                2,
-            ),
-            (
-                "index-stream",
-                "non-unique",
-                "num = 3, range = 2, seed = 9",
-                WorkloadCounters {
-                    operations: 3,
-                    rows_returned: 6,
-                    ..WorkloadCounters::default()
-                },
-                LatencyUnit::IndexStreamTransaction,
-                3,
-            ),
-        ];
-        for (name, index, controls, counters, unit, samples) in read_cases {
-            let phases = format!(
-                "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"{index}\" }}\n\
-             [[phase]]\nworkload = {{ type = \"insert-seq\", num = 8, batch_size = 4 }}\n\
-             [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
-             workload = {{ type = \"{name}\", {controls} }}\n"
-            );
-            let (_root, report) = execute_plan(&temp, name, &phases);
-            assert_eq!(report.measured_runs.len(), 2, "{name}");
-            for (run_index, run) in report.measured_runs.iter().enumerate() {
-                assert_eq!(run.counters, counters, "{name} run {run_index}");
-                assert_eq!(run.latency.unit, unit, "{name} run {run_index}");
-                assert_eq!(run.latency.sample_count, samples, "{name} run {run_index}");
-            }
-            assert_eq!(report.aggregate.measured_runs, 2, "{name}");
-            assert_eq!(
-                report.aggregate.counters,
-                WorkloadCounters {
-                    operations: counters.operations * 2,
-                    found: counters.found * 2,
-                    rows_returned: counters.rows_returned * 2,
-                    ..WorkloadCounters::default()
-                },
-                "{name} aggregate"
-            );
-            assert_eq!(report.aggregate.latency.unit, unit, "{name} aggregate");
-            assert_eq!(
-                report.aggregate.latency.sample_count,
-                samples * 2,
-                "{name} aggregate"
-            );
-        }
+    fn lookup_seq_plan_preserves_exact_accounting() {
+        check_dependent_read(
+            "lookup-seq",
+            "unique",
+            "num = 7, batch_size = 2",
+            WorkloadCounters {
+                operations: 7,
+                found: 7,
+                rows_returned: 7,
+                ..WorkloadCounters::default()
+            },
+            LatencyUnit::LookupBatchTransaction,
+            4,
+        );
+    }
 
+    /// Purpose: Exercise lookup-rand after committed preparation and a warmup.
+    /// Expected: Measured runs and aggregates retain exact operation, row, hit, and transaction sample counts.
+    #[test]
+    fn lookup_rand_plan_preserves_exact_accounting() {
+        check_dependent_read(
+            "lookup-rand",
+            "unique",
+            "num = 7, seed = 9, batch_size = 2",
+            WorkloadCounters {
+                operations: 7,
+                found: 7,
+                rows_returned: 7,
+                ..WorkloadCounters::default()
+            },
+            LatencyUnit::LookupBatchTransaction,
+            4,
+        );
+    }
+
+    /// Purpose: Exercise table-scan after committed preparation and a warmup.
+    /// Expected: Measured runs and aggregates retain exact operation, row, hit, and transaction sample counts.
+    #[test]
+    fn table_scan_plan_preserves_exact_accounting() {
+        check_dependent_read(
+            "table-scan",
+            "none",
+            "num = 2, batch_size = 1",
+            WorkloadCounters {
+                operations: 2,
+                found: 0,
+                rows_returned: 16,
+                ..WorkloadCounters::default()
+            },
+            LatencyUnit::TableScanBatchTransaction,
+            2,
+        );
+    }
+
+    /// Purpose: Exercise index-scan after committed preparation and a warmup.
+    /// Expected: Measured runs and aggregates retain exact operation, row, hit, and transaction sample counts.
+    #[test]
+    fn index_scan_plan_preserves_exact_accounting() {
+        check_dependent_read(
+            "index-scan",
+            "non-unique",
+            "num = 3, range = 2, seed = 9, batch_size = 2",
+            WorkloadCounters {
+                operations: 3,
+                found: 3,
+                rows_returned: 6,
+                ..WorkloadCounters::default()
+            },
+            LatencyUnit::IndexScanBatchTransaction,
+            2,
+        );
+    }
+
+    /// Purpose: Exercise index-stream after committed preparation and a warmup.
+    /// Expected: Measured runs and aggregates retain exact operation, row, hit, and transaction sample counts.
+    #[test]
+    fn index_stream_plan_preserves_exact_accounting() {
+        check_dependent_read(
+            "index-stream",
+            "non-unique",
+            "num = 3, range = 2, seed = 9",
+            WorkloadCounters {
+                operations: 3,
+                found: 0,
+                rows_returned: 6,
+                ..WorkloadCounters::default()
+            },
+            LatencyUnit::IndexStreamTransaction,
+            3,
+        );
+    }
+
+    /// Purpose: Exercise a complete index create/drop cycle through the CLI.
+    /// Expected: One cycle reports two operations and one index-DDL latency sample.
+    #[test]
+    fn index_ddl_plan_preserves_exact_accounting() {
+        let temp = TempDir::new().unwrap();
         let phases = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n\
                   [[phase]]\nworkload = { type = \"insert-seq\", num = 8, batch_size = 4 }\n\
                   [[phase]]\nkind = \"benchmark\"\nworkload = { type = \"index-ddl\", num = 1 }\n";
@@ -728,11 +1015,10 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Preserve replayable updates for unique keys and non-unique payloads.
-    /// Expected: Repeated runs retain successful update accounting and consistent transaction
-    /// sample totals.
+    /// Purpose: Replay random range updates that move unique keys.
+    /// Expected: Warmups and measured runs retain stable affected-row counts and transaction samples.
     #[test]
-    fn random_index_updates_replay_unique_keys_and_non_unique_payloads() {
+    fn random_index_updates_replay_unique_keys() {
         let temp = TempDir::new().unwrap();
         let unique = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n\
                       [[phase]]\nworkload = { type = \"insert-seq\", num = 12, batch_size = 4 }\n\
@@ -751,7 +1037,13 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_update_counters(report.aggregate.counters);
         assert_eq!(report.aggregate.counters.updated_rows, updated_rows * 3);
         assert_eq!(report.aggregate.latency.sample_count, 18);
+    }
 
+    /// Purpose: Replay random range updates on duplicate-bearing non-unique keys.
+    /// Expected: Payload-only replay retains successful row accounting and per-run and aggregate samples.
+    #[test]
+    fn random_index_updates_replay_non_unique_payloads() {
+        let temp = TempDir::new().unwrap();
         let non_unique = "\n[[phase]]\nworkload = { type = \"create-table\", index = \"non-unique\" }\n\
                           [[phase]]\nworkload = { type = \"insert-rand\", num = 32, seed = 2, batch_size = 8 }\n\
                           [[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nmeasured_runs = 2\n\
@@ -828,95 +1120,50 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
     }
 
-    /// Purpose: Exercise new update replay with a warmup ending in the alternate domain and idle point sessions.
-    /// Expected: Measured runs retain continuous parity, exact requests/rows, samples, aggregate counts, transaction diagnostics, and drained worker locks.
+    /// Purpose: Replay full-table key-changing updates after an alternate-domain warmup.
+    /// Expected: Runs retain parity, exact row and sample counts, transaction diagnostics, and drained locks.
     #[test]
-    fn explicit_update_cli_replay_preserves_accounting() {
-        let temp = TempDir::new().unwrap();
-        for (name, controls, requests, rows) in [
-            ("all", "type = 'update-all'", 1, 3),
-            (
-                "point",
-                "type = 'update-point-rand', num = 1, sessions = 3, batch_size = 2",
-                1,
-                1,
-            ),
-        ] {
-            let (_, report) = execute_plan(
-                &temp,
-                name,
-                &format!(
-                    "[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 3 }}\n[[phase]]\nkind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 3\nworkload = {{ {controls}, change_key = true, include_stats = true }}"
-                ),
-            );
-            assert_eq!(report.measured_runs.len(), 3);
-            for run in &report.measured_runs {
-                assert_eq!(run.counters.operations, requests);
-                assert_eq!(run.counters.updated_rows, rows);
-                assert_eq!(run.latency.sample_count, 1);
-                assert_drained_transaction_diagnostics(name, run);
-            }
-            assert_eq!(report.aggregate.counters.operations, requests * 3);
-            assert_eq!(report.aggregate.counters.updated_rows, rows * 3);
-            assert_eq!(report.aggregate.latency.sample_count, 3);
-        }
+    fn update_all_cli_replay_preserves_accounting() {
+        check_explicit_update_replay("all", "type = 'update-all'", 3);
     }
 
-    /// Purpose: Exercise both delete modes and index shapes through shipped CLI plans.
-    /// Expected: Canonical results preserve request/row accounting, sample units, diagnostics, and summary rates.
+    /// Purpose: Replay key-changing point updates with idle sessions after a warmup.
+    /// Expected: Runs retain parity, exact request/row and sample counts, transaction diagnostics, and drained locks.
     #[test]
-    fn checked_in_delete_templates_execute_end_to_end() {
-        let temp = TempDir::new().unwrap();
-        for mode in ["all", "rand"] {
-            for index in ["unique", "non-unique"] {
-                let root = temp.path().join(format!("delete-{mode}-{index}"));
-                let template = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("templates")
-                    .join(format!("delete-{mode}-{index}.toml"));
-                let stdout =
-                    assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
-                let encoded = fs::read_to_string(root.join("benchmark-result.toml")).unwrap();
-                let report: InvocationReport = toml::from_str(&encoded).unwrap();
-                let run = &report.measured_runs[0];
-                assert_eq!(report.measured_runs.len(), 1);
-                assert_eq!(report.aggregate.counters, run.counters);
-                assert_eq!(run.counters.inserted_rows, 0);
-                assert_eq!(run.counters.updated_rows, 0);
-                assert_eq!(run.counters.rows_returned, 0);
-                assert_eq!(run.counters.expected_outcomes.duplicate_key, 0);
-                assert_eq!(run.counters.expected_outcomes.write_conflict, 0);
-                assert!(run.counters.deleted_rows > 0 && run.counters.deleted_rows <= 10_000);
-                if mode == "all" {
-                    assert_eq!(run.counters.operations, 1);
-                    assert_eq!(run.counters.deleted_rows, 10_000);
-                    assert_eq!((run.counters.found, run.counters.not_found), (0, 0));
-                    assert_eq!(run.latency.unit, LatencyUnit::DeleteAllTransaction);
-                    assert_eq!(run.latency.sample_count, 1);
-                } else {
-                    assert_eq!(run.counters.operations, 10_000);
-                    assert_eq!(run.counters.found + run.counters.not_found, 10_000);
-                    assert!(run.counters.not_found > 0);
-                    assert!(run.counters.found <= run.counters.deleted_rows);
-                    if index == "unique" {
-                        assert_eq!(run.counters.found, run.counters.deleted_rows);
-                    }
-                    assert_eq!(run.latency.unit, LatencyUnit::DeleteBatchTransaction);
-                    assert_eq!(run.latency.sample_count, 100);
-                }
-                assert!(stdout.contains(&format!("deleted_rows: {}\n", run.counters.deleted_rows)));
-                assert!(stdout.contains(&format!(
-                    "deleted_rows_per_second: {:.3}\n",
-                    doradb_bench::measurement::operations_per_second(
-                        run.counters.deleted_rows,
-                        run.elapsed_nanos
-                    )
-                )));
-                assert_eq!(
-                    toml::from_str::<InvocationReport>(&toml::to_string(&report).unwrap()).unwrap(),
-                    report
-                );
-            }
-        }
+    fn update_point_cli_replay_preserves_accounting() {
+        check_explicit_update_replay(
+            "point",
+            "type = 'update-point-rand', num = 1, sessions = 3, batch_size = 2",
+            1,
+        );
+    }
+
+    /// Purpose: Execute the unique full-table delete template with a small fixture.
+    /// Expected: Every prepared row is deleted in one sampled transaction with exact output accounting.
+    #[test]
+    fn delete_all_unique_template_executes() {
+        check_delete_template("all", "unique");
+    }
+
+    /// Purpose: Execute the non-unique full-table delete template with a small fixture.
+    /// Expected: Every prepared row is deleted in one sampled transaction with exact output accounting.
+    #[test]
+    fn delete_all_non_unique_template_executes() {
+        check_delete_template("all", "non-unique");
+    }
+
+    /// Purpose: Execute the unique point delete template with a small fixture.
+    /// Expected: Requests retain hit/miss, affected-row, and batch-sample accounting in canonical output.
+    #[test]
+    fn delete_rand_unique_template_executes() {
+        check_delete_template("rand", "unique");
+    }
+
+    /// Purpose: Execute the non-unique point delete template with a small fixture.
+    /// Expected: Requests retain hit/miss, affected-row, and batch-sample accounting in canonical output.
+    #[test]
+    fn delete_rand_non_unique_template_executes() {
+        check_delete_template("rand", "non-unique");
     }
 
     /// Purpose: Reject destructive replay and unsupported delete controls before filesystem ownership.
@@ -968,15 +1215,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     /// aggregate samples.
     #[test]
     fn checked_in_update_template_executes_end_to_end() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("update-template-root");
-        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("templates")
-            .join("update-rand.toml");
-        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
-        let report: InvocationReport =
-            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
-                .unwrap();
+        let (stdout, report) = execute_small_template("update-rand");
         assert!(stdout.contains("workload: update-rand\n"));
         assert_eq!(report.measured_runs.len(), 3);
         for run in &report.measured_runs {
@@ -994,23 +1233,15 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     /// aggregate sample accounting.
     #[test]
     fn checked_in_parallel_scan_template_executes_end_to_end() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("parallel-scan-template-root");
-        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("templates")
-            .join("parallel-table-scan.toml");
-        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
-        let report: InvocationReport =
-            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
-                .unwrap();
+        let (stdout, report) = execute_small_template("parallel-table-scan");
         assert!(stdout.contains("workload: parallel-table-scan\n"));
         assert!(stdout.contains("target_partitions: 4\n"));
-        assert!(stdout.contains("rows_returned: 60000\n"));
+        assert!(stdout.contains("rows_returned: 600\n"));
         assert!(stdout.contains("rows_per_second: "));
         assert_eq!(report.measured_runs.len(), 3);
         for run in &report.measured_runs {
             assert_eq!(run.counters.operations, 2);
-            assert_eq!(run.counters.rows_returned, 20_000);
+            assert_eq!(run.counters.rows_returned, 200);
             assert_eq!(run.latency.unit, LatencyUnit::ParallelTableScanLifecycle);
             assert_eq!(run.latency.sample_count, 2);
             assert!(matches!(
@@ -1022,7 +1253,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
             ));
         }
         assert_eq!(report.aggregate.counters.operations, 6);
-        assert_eq!(report.aggregate.counters.rows_returned, 60_000);
+        assert_eq!(report.aggregate.counters.rows_returned, 600);
         assert_eq!(report.aggregate.latency.sample_count, 6);
     }
 
@@ -1040,32 +1271,67 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.latency.sample_count, 16);
     }
 
-    /// Purpose: Complete specialized lock scenarios through the public CLI.
-    /// Expected: Coordinated participants drain successfully with consistent operation and
-    /// lifecycle accounting.
+    /// Purpose: Exercise the nested-covered lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
     #[test]
-    fn specialized_lock_plans_coordinate_and_drain_participants() {
-        let temp = TempDir::new().unwrap();
-        for (scenario, mode, width, tables) in [
-            ("nested-covered", "shared", 3, 3),
-            ("convert", "exclusive", 1, 1),
-            ("enqueue", "exclusive", 3, 1),
-            ("cancel-head", "exclusive", 3, 1),
-            ("cancel-middle", "exclusive", 3, 1),
-            ("cancel-tail", "exclusive", 3, 1),
-            ("promote", "exclusive", 3, 1),
-            ("first-touch", "shared", 1, 1),
-            ("scope-close", "shared", 3, 3),
-        ] {
-            let phases = format!(
-                "\n[[phase]]\nworkload = {{ type = \"create-table\", index = \"none\", tables = {tables} }}\n\
-                 [[phase]]\nkind = \"benchmark\"\n\
-                 workload = {{ type = \"lock-table\", num = 1, scenario = \"{scenario}\", mode = \"{mode}\", width = {width}, threads = 1, sessions = 1 }}\n"
-            );
-            let (_root, report) = execute_plan(&temp, &format!("lock-{scenario}"), &phases);
-            assert_eq!(report.aggregate.counters.operations, 1, "{scenario}");
-            assert_eq!(report.aggregate.latency.sample_count, 1, "{scenario}");
-        }
+    fn lock_nested_covered_plan_drains_participants() {
+        check_specialized_lock("nested-covered", "shared", 3, 3);
+    }
+
+    /// Purpose: Exercise the convert lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_convert_plan_drains_participants() {
+        check_specialized_lock("convert", "exclusive", 1, 1);
+    }
+
+    /// Purpose: Exercise the enqueue lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_enqueue_plan_drains_participants() {
+        check_specialized_lock("enqueue", "exclusive", 3, 1);
+    }
+
+    /// Purpose: Exercise the cancel-head lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_cancel_head_plan_drains_participants() {
+        check_specialized_lock("cancel-head", "exclusive", 3, 1);
+    }
+
+    /// Purpose: Exercise the cancel-middle lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_cancel_middle_plan_drains_participants() {
+        check_specialized_lock("cancel-middle", "exclusive", 3, 1);
+    }
+
+    /// Purpose: Exercise the cancel-tail lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_cancel_tail_plan_drains_participants() {
+        check_specialized_lock("cancel-tail", "exclusive", 3, 1);
+    }
+
+    /// Purpose: Exercise the promote lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_promote_plan_drains_participants() {
+        check_specialized_lock("promote", "exclusive", 3, 1);
+    }
+
+    /// Purpose: Exercise the first-touch lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_first_touch_plan_drains_participants() {
+        check_specialized_lock("first-touch", "shared", 1, 1);
+    }
+
+    /// Purpose: Exercise the scope-close lock scenario through the CLI.
+    /// Expected: Coordinated participants drain and publish one operation and one lifecycle sample.
+    #[test]
+    fn lock_scope_close_plan_drains_participants() {
+        check_specialized_lock("scope-close", "shared", 3, 3);
     }
 
     /// Purpose: Reject dependent reads without committed preparation before acquiring storage.
@@ -1080,104 +1346,54 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
-    /// Purpose: Verify index creation across row placements and uniqueness modes.
-    /// Expected: Reports preserve placement and duplicate multiplicity while uniqueness
-    /// violations prevent success publication.
+    /// Purpose: Create a unique index over hot rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
     #[test]
-    fn create_index_verifies_all_placements_modes_and_duplicate_multiplicity() {
-        use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
+    fn create_index_hot_unique_preserves_placement() {
+        check_create_index_placement("hot", PlacementKind::Hot, "unique");
+    }
+
+    /// Purpose: Create a non-unique index over hot rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
+    #[test]
+    fn create_index_hot_non_unique_preserves_placement() {
+        check_create_index_placement("hot", PlacementKind::Hot, "non-unique");
+    }
+
+    /// Purpose: Create a unique index over checkpointed rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
+    #[test]
+    fn create_index_checkpointed_unique_preserves_placement() {
+        check_create_index_placement("checkpointed", PlacementKind::Checkpointed, "unique");
+    }
+
+    /// Purpose: Create a non-unique index over checkpointed rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
+    #[test]
+    fn create_index_checkpointed_non_unique_preserves_placement() {
+        check_create_index_placement("checkpointed", PlacementKind::Checkpointed, "non-unique");
+    }
+
+    /// Purpose: Create a unique index over mixed rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
+    #[test]
+    fn create_index_mixed_unique_preserves_placement() {
+        check_create_index_placement("mixed", PlacementKind::Mixed, "unique");
+    }
+
+    /// Purpose: Create a non-unique index over mixed rows through the CLI.
+    /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
+    #[test]
+    fn create_index_mixed_non_unique_preserves_placement() {
+        check_create_index_placement("mixed", PlacementKind::Mixed, "non-unique");
+    }
+
+    /// Purpose: Create a non-unique index over repeated logical keys.
+    /// Expected: Verification counts every duplicate row in the resulting index.
+    #[test]
+    fn create_non_unique_index_preserves_duplicate_multiplicity() {
         let temp = TempDir::new().unwrap();
-        let engine = concat!(
-            "[engine.thread_pool]\nworker_threads = 1\n",
-            "[engine.index_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
-            "[engine.data_buffer]\nmax_mem_size = '16 MiB'\nmax_file_size = '32 MiB'\n",
-            "[engine.file]\nreadonly_buffer_size = '17 MiB'\n",
-        );
-        for (placement, kind) in [
-            ("hot", PlacementKind::Hot),
-            ("checkpointed", PlacementKind::Checkpointed),
-            ("mixed", PlacementKind::Mixed),
-        ] {
-            for index in ["unique", "non-unique"] {
-                let mut phases = engine.to_owned();
-                phases.push_str("[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 4, value_size = '64 B', batch_size = 2 }\n");
-                if placement != "hot" {
-                    phases.push_str("[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
-                }
-                if placement == "mixed" {
-                    phases.push_str("[[phase]]\nworkload = { type = 'insert-seq', num = 2, value_size = '64 B' }\n");
-                }
-                let stats = index == "unique";
-                phases.push_str(&format!("[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = '{index}', include_stats = {stats} }}\n"));
-                let (_, report) =
-                    execute_plan(&temp, &format!("create-{placement}-{index}"), &phases);
-                let run = &report.measured_runs[0];
-                let Some(WorkloadMetrics::CreateIndex { report: create }) = &run.workload_metrics
-                else {
-                    panic!("missing CREATE report")
-                };
-                assert_eq!(create.placement, kind);
-                assert_eq!(
-                    create.index,
-                    if stats {
-                        IndexMode::Unique
-                    } else {
-                        IndexMode::NonUnique
-                    }
-                );
-                assert_eq!(
-                    create.rows,
-                    match placement {
-                        "hot" => RowPlacement {
-                            hot_rows: 4,
-                            checkpointed_rows: 0
-                        },
-                        "checkpointed" => RowPlacement {
-                            hot_rows: 0,
-                            checkpointed_rows: 4
-                        },
-                        _ => RowPlacement {
-                            hot_rows: 2,
-                            checkpointed_rows: 4
-                        },
-                    }
-                );
-                let total = if placement == "mixed" { 6 } else { 4 };
-                assert_eq!(create.total_rows, total);
-                let verification = create.verification.as_ref().unwrap();
-                assert_eq!(verification.table_rows, total);
-                assert_eq!(verification.index_rows, total);
-                assert_eq!(verification.fingerprint.len(), 64);
-                assert_eq!(create.sampled_process_rss.is_some(), stats);
-                assert_eq!(!run.internal_metrics.is_empty(), stats);
-                for metric_name in [
-                    "hot_index_build.completed_builds",
-                    "create_index.completed_builds",
-                ] {
-                    let metric = run
-                        .internal_metrics
-                        .iter()
-                        .find(|metric| metric.name == metric_name);
-                    assert_eq!(
-                        metric.map(|metric| metric.value),
-                        stats.then_some(1),
-                        "{metric_name}"
-                    );
-                }
-                assert_eq!(run.latency.unit, LatencyUnit::IndexCreation);
-                assert_eq!(run.latency.sum_nanos, create.create_elapsed_nanos);
-                assert_eq!(run.latency.sample_count, 1);
-                assert_eq!(
-                    run.counters,
-                    WorkloadCounters {
-                        operations: 1,
-                        ..WorkloadCounters::default()
-                    }
-                );
-            }
-        }
-        let random = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-rand', num = 8, seed = 42, batch_size = 2 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'create-index', index = 'non-unique' }\n";
-        let random = format!("{engine}{random}");
+        let random = duplicate_index_plan();
         let (_, report) = execute_plan(&temp, "create-duplicates", &random);
         let Some(WorkloadMetrics::CreateIndex { report }) =
             &report.measured_runs[0].workload_metrics
@@ -1185,6 +1401,14 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
             panic!("missing CREATE")
         };
         assert_eq!(report.verification.as_ref().unwrap().index_rows, 8);
+    }
+
+    /// Purpose: Reject unique-index creation over repeated logical keys.
+    /// Expected: The CLI retains the diagnostic root and reports duplicate keys without publishing success.
+    #[test]
+    fn create_unique_index_rejects_duplicate_keys() {
+        let temp = TempDir::new().unwrap();
+        let random = duplicate_index_plan();
         let source = temp.path().join("unique-duplicates.toml");
         fs::write(
             &source,
@@ -1259,51 +1483,44 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         )));
     }
 
-    /// Purpose: Reject prefix freezing when page boundaries cannot preserve a nonempty suffix.
-    /// Expected: Failure identifies the invalid prefix, retains storage, and publishes no
-    /// success output.
+    /// Purpose: Reject a hot prefix that rounds up to the whole row page.
+    /// Expected: The invalid prefix retains its root and publishes no success artifact.
     #[test]
-    fn whole_page_freeze_failure_retains_root_without_success_artifact() {
-        let temp = TempDir::new().unwrap();
+    fn whole_page_freeze_rejects_rounded_hot_prefix() {
         let hot = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '128 B', batch_size = 8 }\n";
-        let checkpointed = format!(
-            "[[phase]]\nworkload = {{ type = 'insert-seq', num = 64, value_size = '128 B', batch_size = 8 }}\n\
-             [[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n\
-             [[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n{hot}"
+        check_freeze_failure("hot-rounded", hot, 4);
+    }
+
+    /// Purpose: Reject a prefix larger than the hot suffix after a full checkpoint.
+    /// Expected: The invalid prefix retains its root and publishes no success artifact.
+    #[test]
+    fn whole_page_freeze_rejects_oversized_checkpointed_prefix() {
+        check_freeze_failure(
+            "checkpointed-oversized",
+            &checkpointed_freeze_failure_plan(),
+            16,
         );
+    }
+
+    /// Purpose: Reject a hot prefix rounded to its whole page after a full checkpoint.
+    /// Expected: The invalid prefix retains its root and publishes no success artifact.
+    #[test]
+    fn whole_page_freeze_rejects_rounded_checkpointed_prefix() {
+        check_freeze_failure(
+            "checkpointed-rounded",
+            &checkpointed_freeze_failure_plan(),
+            4,
+        );
+    }
+
+    /// Purpose: Reject a prefix that consumes the remaining hot rows after a partial checkpoint.
+    /// Expected: The invalid prefix retains its root and publishes no success artifact.
+    #[test]
+    fn whole_page_freeze_rejects_prefix_after_partial_checkpoint() {
         let prefix_checkpointed = "[[phase]]\nworkload = { type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }\n\
                                    [[phase]]\nworkload = { type = 'freeze-table', max_rows = 4 }\n\
                                    [[phase]]\nworkload = { type = 'checkpoint-table' }\n";
-        for (name, preparation, max_rows) in [
-            ("hot-rounded", hot, 4),
-            ("checkpointed-oversized", checkpointed.as_str(), 16),
-            ("checkpointed-rounded", checkpointed.as_str(), 4),
-            ("prefix-checkpointed", prefix_checkpointed, 7),
-        ] {
-            let source = temp.path().join(format!("{name}.toml"));
-            fs::write(
-                &source,
-                format!(
-                    "[engine.transaction]\nlog_sync = 'none'\n\
-                     [[phase]]\nworkload = {{ type = 'create-table', index = 'none' }}\n\
-                     {preparation}\n\
-                     [[phase]]\nkind = 'benchmark'\nwarmup_runs = 0\nmeasured_runs = 1\n\
-                     workload = {{ type = 'freeze-table', max_rows = {max_rows} }}\n"
-                ),
-            )
-            .unwrap();
-            let root = temp.path().join(format!("{name}-root"));
-            let output = run_bench(&root, &["--plan", source.to_str().unwrap()]);
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = assert_failure(output);
-            assert!(
-                stderr.contains("did not install a nonempty proper prefix"),
-                "{name}: {stderr}"
-            );
-            assert!(!stdout.contains("DoraDB benchmark summary"));
-            assert!(root.exists());
-            assert!(!root.join("benchmark-result.toml").exists());
-        }
+        check_freeze_failure("prefix-checkpointed", prefix_checkpointed, 7);
     }
 
     /// Purpose: Preserve an appended hot suffix when freezing a prefix after checkpointing.

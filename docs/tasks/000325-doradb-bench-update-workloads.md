@@ -191,18 +191,20 @@ share deterministic drained-lock checks while latency samples verify completed
 transaction counts. This test correction does not change engine statistics
 publication or claim to resolve backlog 000197's separate timeout.
 
-Final validation on 2026-10-03 passed all 2,243 workspace tests with retries
-disabled. Focused 100-iteration runs passed for the completion and replay cases,
-and again for the shared update/delete CLI checks. The resolve style gate
-passed formatting, strict Clippy, structure checks, and all 97 test contracts
-across seven branch-diff Rust files. Semantic review retained distinct unit,
-coordinator, and CLI coverage with exact seeded vectors and row oracles.
+Later CI coverage runs exhausted the ten-second deadline shared by four delete
+templates. Template smoke tests now use 100-row copies and batches of ten;
+shipped benchmark sizes and fsync settings remain intact. Independent delete,
+read, replay, lock, index-placement, binding, and freeze-failure CLI scenarios
+were split into named cases with shared helpers and preserved semantic checks.
 
-The 16 new cases were also timed under parallel and serial execution. None
-exceeded 0.474 seconds in that audit; the existing ten-second test watchdog was
-unchanged. The audit exposed the counter assertion subsequently corrected.
-Earlier production coverage measured 89.96% across six changed production
-files, including 92.40% for the update module; later Rust edits were test-only.
+Validation on 2026-10-03 passed all 2,272 workspace tests in normal and coverage
+runs with retries disabled.
+All 64 lifecycle cases passed 100 iterations in debug and another 100 under
+coverage with four CPUs, retaining the ten-second watchdog. Formatting, strict
+Clippy, structure checks, and 126 test contracts passed across seven branch-diff
+Rust files. Exact seeded vectors, row oracles, and coupled scan comparisons
+remain covered. Earlier production coverage measured 89.96% across six changed
+production files, including 92.40% for updates; later Rust edits were test-only.
 
 ### Benchmark observations
 
@@ -245,6 +247,7 @@ Local ignored evidence remains under:
 - `target/benchmark-runs/task-000325-20261003T013733Z/`
 - `target/benchmark-runs/hot-cold-1m-20261003T014410Z/`
 - `target/test-timings/task-000325-20261003T020718Z/`
+- `target/ci-delete-timeout-000325/` for CI evidence and the resized-test checks
 - `target/coverage/task-000325.md` and `target/test-audit/`
 
 The timing audit retains the original assertion failure; final stress and
