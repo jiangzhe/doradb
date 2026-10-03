@@ -70,3 +70,12 @@ concurrency. Failed child runs must provide actionable diagnostics and clean up
 subprocesses. A passing rerun alone is insufficient to close this item.
 
 ## Notes (Optional)
+
+- Task 000325 later reduced template smoke tests to temporary 100-row plans
+  with batches of ten and split independent CLI scenarios into named tests.
+  The shipped update template remains unchanged. All 64 lifecycle cases passed
+  100 debug iterations and 100 coverage iterations with four CPUs and the
+  existing watchdog. This reduces test workload but does not establish the
+  cause of this backlog's original update-template timeout; it remains open.
+  The related delete-template CI investigation and validation are retained in
+  `target/ci-delete-timeout-000325/` in the task worktree.

@@ -18,8 +18,9 @@ use crate::workload::{
     InsertRandExecutor, InsertSeqExecutor, LockTableExecutor, LookupRandExecutor,
     LookupSeqExecutor, ManagedBindingsPrepareExecutor, ParallelTableScanExecutor,
     ParallelTableScanExecutorConfig, ResolveTableBindingExecutor, RunCancellation, SessionPlan,
-    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateRandExecutor,
-    complete_create_index, complete_delete, prepare_create_fixture, run_recovery,
+    StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateAllExecutor,
+    UpdatePointRandExecutor, UpdateRandExecutor, complete_create_index, complete_delete,
+    complete_update, prepare_create_fixture, run_recovery,
 };
 use doradb_storage::profiling::InternalStatsSnapshot;
 use doradb_storage::{Engine, EngineConfig, Session};
@@ -344,6 +345,21 @@ async fn execute_phases(
                         phase_effect = Some(outcome.effect);
                     }
                 }
+                if matches!(
+                    workload,
+                    ResolvedWorkload::UpdateAll(_) | ResolvedWorkload::UpdatePointRand(_)
+                ) {
+                    let FixtureBinding::Primary(primary) =
+                        fixture.bind(workload.fixture_requirement())?
+                    else {
+                        return Err(BenchError::message(
+                            "update workload has no primary fixture binding",
+                        ));
+                    };
+                    // All worker sessions and final statistics snapshots have completed.
+                    // Verification must not warm data for a later measured run.
+                    complete_update(current_engine(owner.as_ref())?, primary).await?;
+                }
                 fixture.apply(phase_effect.unwrap_or(FixtureRuntimeEffect::None))?;
                 final_aggregate = Some(aggregate.finish(workload.latency_unit())?);
             }
@@ -533,6 +549,28 @@ async fn dispatch_workload(
         }
         ResolvedWorkload::UpdateRand(config) => {
             run_executor::<UpdateRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::UpdateAll(config) => {
+            run_executor::<UpdateAllExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await
+        }
+        ResolvedWorkload::UpdatePointRand(config) => {
+            run_executor::<UpdatePointRandExecutor>(
                 engine,
                 clock,
                 workload,
@@ -1125,6 +1163,166 @@ mod tests {
         );
     }
 
+    /// Purpose: Verify new update workloads only once after warmups and all measurements, without warming a later run.
+    /// Expected: Completion observes final replay parity and drained workers; its clock advance and held lock are absent from run time, latency, and diagnostics.
+    #[test]
+    fn update_completion_follows_all_runs_and_statistics() {
+        use crate::workload::set_update_completion_hook;
+        use doradb_storage::{
+            CallbackResult, IndexID, ScanRowDecision, TableIndex, TableLockMode, Val,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use tempfile::TempDir;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            for controls in [
+                "type = 'update-all'",
+                "type = 'update-point-rand', num = 2, batch_size = 2",
+            ] {
+                let source = temp.path().join("update.toml");
+                let root = temp.path().join(if controls.contains("update-all") {
+                    "all"
+                } else {
+                    "point"
+                });
+                fs::write(&source, format!("[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 1 }}\n[[phase]]\nkind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 2\nworkload = {{ {controls}, change_key = true, value_size = '1 B', include_stats = true }}")).unwrap();
+                let loaded = load_plan(&source, &root).unwrap();
+                let mut owner = Some(
+                    Engine::bootstrap(loaded.engine_config.clone())
+                        .await
+                        .unwrap(),
+                );
+                let (clock, mock) = MeasurementClock::mock();
+                let calls = Rc::new(Cell::new(0));
+                let observed = Rc::clone(&calls);
+                let completion_session = Rc::new(RefCell::new(None));
+                let held_session = Rc::clone(&completion_session);
+                set_update_completion_hook(move |engine, primary| {
+                    observed.set(observed.get() + 1);
+                    smol::block_on(async {
+                        let mut session = engine.new_session().unwrap();
+                        let stats = session.logical_lock_stats().unwrap();
+                        assert_eq!(stats.current_physical_resources, 0);
+                        assert_eq!(stats.current_linked_waiters, 0);
+                        let mut trx = session.begin_trx().unwrap();
+                        // Three executions end in the alternate domain with parity-zero payload.
+                        let mut stream = trx
+                            .table_scan_mvcc_stream(
+                                primary.table_id,
+                                &[0, 1],
+                                |_| -> CallbackResult<_> { Ok(ScanRowDecision::Include) },
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            stream.next().await.unwrap(),
+                            Some(vec![Val::from(1u64), Val::from(vec![0u8])])
+                        );
+                        assert_eq!(stream.next().await.unwrap(), None);
+                        drop(stream);
+                        let mut stream = trx
+                            .table_index_scan_mvcc_stream(
+                                TableIndex(primary.table_id, IndexID::new(0)),
+                                ..,
+                                &[0, 1],
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            stream.next().await.unwrap(),
+                            Some(vec![Val::from(1u64), Val::from(vec![0u8])])
+                        );
+                        assert_eq!(stream.next().await.unwrap(), None);
+                        drop(stream);
+                        trx.commit().await.unwrap();
+                        // Keep a diagnostic marker until results are inspected. Unlike
+                        // redo counters, lock gauges are updated before the API returns.
+                        session
+                            .lock_table(primary.table_id, TableLockMode::Shared)
+                            .await
+                            .unwrap();
+                        *held_session.borrow_mut() = Some(session);
+                    });
+                    mock.increment(1_000_000);
+                });
+                let start = clock.now();
+                let result =
+                    execute_phases(&mut owner, &loaded.engine_config, &clock, &loaded.plan)
+                        .await
+                        .unwrap();
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    clock.wall_delta_nanos(start, clock.now()).unwrap(),
+                    1_000_000
+                );
+                assert_eq!(result.measured_runs.len(), 2);
+                assert_eq!(result.aggregate.elapsed_nanos, 0);
+                assert_eq!(result.aggregate.latency.sum_nanos, 0);
+                assert_eq!(result.aggregate.latency.sample_count, 2);
+                assert_eq!(result.aggregate.counters.updated_rows, 2);
+                let mut completion_session = completion_session.borrow_mut().take().unwrap();
+                let stats = completion_session.logical_lock_stats().unwrap();
+                assert!(stats.current_physical_resources > 0, "{stats:?}");
+                for run in result.measured_runs {
+                    assert_eq!(run.elapsed_nanos, 0);
+                    assert_eq!(run.latency.sample_count, 1);
+                    assert_eq!(run.counters.updated_rows, 1);
+                    let locks = run
+                        .internal_metrics
+                        .iter()
+                        .find(|metric| metric.name == "logical_lock.current_physical_resources")
+                        .unwrap();
+                    assert_eq!(
+                        locks.value, 0,
+                        "{controls}: run {} included the completion lock: {locks:?}",
+                        run.run_index
+                    );
+                }
+                completion_session.close().await.unwrap();
+                owner.take().unwrap().shutdown();
+            }
+        });
+    }
+
+    /// Purpose: Suppress canonical publication when final update verification finds unexpected rows.
+    /// Expected: Verification returns an error and keeps the diagnostic root without creating a success artifact.
+    #[test]
+    fn update_completion_failure_prevents_canonical_publication() {
+        use crate::workload::set_update_completion_hook;
+        use doradb_storage::Val;
+        use tempfile::TempDir;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let source = temp.path().join("update.toml");
+            fs::write(&source, "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'update-all' }").unwrap();
+            set_update_completion_hook(|engine, primary| {
+                smol::block_on(async {
+                    let mut session = engine.new_session().unwrap();
+                    let mut trx = session.begin_trx().unwrap();
+                    trx.table_insert_mvcc(
+                        primary.table_id,
+                        vec![Val::from(99u64), Val::from("unexpected")],
+                    )
+                    .await
+                    .unwrap();
+                    trx.commit().await.unwrap();
+                    session.close().await.unwrap();
+                });
+            });
+            let root = temp.path().join("root");
+            let error = execute_plan(root.clone(), source).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("update content verification failed")
+            );
+            assert!(root.exists());
+            assert!(!root.join("benchmark-result.toml").exists());
+            assert!(!root.join("benchmark-result.toml.tmp").exists());
+        });
+    }
+
     /// Purpose: Keep delete content verification outside the production dispatch timer and diagnostic interval.
     /// Expected: Worker locks drain first, verification advances neither reported time nor acquisition counters.
     #[test]
@@ -1279,6 +1477,8 @@ mod tests {
         assert_shared_config::<StmtNoopExecutor, TrxNoopExecutor>();
         assert_shared_outcome::<StmtNoopExecutor, TrxNoopExecutor>();
         assert_shared_outcome::<DeleteAllExecutor, DeleteRandExecutor>();
+        assert_shared_outcome::<UpdateRandExecutor, UpdateAllExecutor>();
+        assert_shared_outcome::<UpdateAllExecutor, UpdatePointRandExecutor>();
         assert_shared_config::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_outcome::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_config::<TableDdlExecutor, IndexDdlExecutor>();
@@ -1300,6 +1500,8 @@ mod tests {
                 InsertSeqExecutor::IDENTITY,
                 InsertRandExecutor::IDENTITY,
                 UpdateRandExecutor::IDENTITY,
+                UpdateAllExecutor::IDENTITY,
+                UpdatePointRandExecutor::IDENTITY,
                 DeleteAllExecutor::IDENTITY,
                 DeleteRandExecutor::IDENTITY,
                 TableDdlExecutor::IDENTITY,
@@ -1321,6 +1523,8 @@ mod tests {
                 "insert-seq",
                 "insert-rand",
                 "update-rand",
+                "update-all",
+                "update-point-rand",
                 "delete-all",
                 "delete-rand",
                 "table-ddl",

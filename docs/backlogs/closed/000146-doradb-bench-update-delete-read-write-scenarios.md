@@ -6,11 +6,11 @@ Plan and implement doradb-bench workloads for overwrite or upsert, update, delet
 
 ## Reference
 
-docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/benchmark-tool.md
+docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/tasks/000325-doradb-bench-update-workloads.md; docs/benchmark-tool.md
 
 ## Deferred From (Optional)
 
-docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/tasks/000324-doradb-bench-delete-workloads.md
+docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/tasks/000324-doradb-bench-delete-workloads.md; docs/tasks/000325-doradb-bench-update-workloads.md
 
 ## Deferral Context (Optional)
 
@@ -26,6 +26,17 @@ docs/tasks/000211-create-doradb-bench-load-benchmark-crate.md; docs/tasks/000324
   supported indexed preparation or fixture restoration; validate placement
   explicitly and define restoration timing before allowing destructive replay.
   The task record retains benchmark settings, results, and local artifact paths.
+
+- Task 000325 follow-up: Indexed cold preparation and distinct-key sampling
+  remain outside the shipped update plans. A separate public-API runner
+  compared 10,000 distinct single-row updates on one million hot or
+  checkpointed rows at one thread/session and four threads/sixteen sessions.
+  All cold updates replaced their physical row IDs, with exact table/index
+  verification after measurement. Future indexed-preparation work should
+  preserve these placement checks and distinguish checkpointed placement from
+  flushed caches. Keep the shipped point workload's sampling-with-replacement
+  contract separate from this experimental distinct-target selection. The task
+  record retains the settings, results, and local evidence paths.
 
 ## Scope Hint
 
@@ -43,21 +54,19 @@ doradb-bench documents and supports representative update/delete/overwrite and m
   full-table and seeded random point-delete slice for unique and non-unique
   secondary indexes, including request/row accounting, single-run admission,
   final content verification, and four runnable templates.
-- Overwrite/upsert, mixed read/write, and read-while-writing workloads remain
-  open under this backlog. Fixture restoration for repeated destructive
-  measurements also remains outside the completed delete slice.
+- Task `docs/tasks/000325-doradb-bench-update-workloads.md` implemented full-table
+  and seeded random point updates for both index modes, including request/row
+  accounting, key-change replay, final verification, and four templates.
+- Remaining overwrite/upsert work moved to
+  `docs/backlogs/000209-doradb-bench-upsert-workloads.md`.
+- Mixed read/write, concurrent readers/writers, indexed preparation, and
+  fixture restoration moved to
+  `docs/backlogs/000210-doradb-bench-mixed-read-write-workloads.md`.
 
-
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: replaced
+- Detail: Update and delete workloads were completed by tasks 000275, 000324, and 000325. The user approved splitting the remaining scope into backlog 000209 (upsert/overwrite) and backlog 000210 (mixed read/write, concurrent readers/writers, and shared fixture preparation/restoration). Close this umbrella as replaced; the remaining work is not claimed as implemented.
+- Closed By: backlog close
+- Reference: docs/backlogs/000209-doradb-bench-upsert-workloads.md; docs/backlogs/000210-doradb-bench-mixed-read-write-workloads.md; docs/tasks/000325-doradb-bench-update-workloads.md
+- Closed At: 2026-10-03

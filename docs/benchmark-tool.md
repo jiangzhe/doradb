@@ -330,6 +330,8 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `stmt-noop`, `trx-noop` | required `num` | none | safe |
 | `insert-seq`, `insert-rand` | required `num`; optional `seed`, `value_size`, `batch_size` | any primary | single run |
 | `update-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
+| `update-all` | optional `seed`, `change_key`, `value_size`; no worker/batch fields | committed secondary index | safe, benchmark only |
+| `update-point-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
 | `delete-all` | only `include_stats`; no worker fields | committed secondary index | single run, benchmark only |
 | `delete-rand` | required `num`; optional `seed`, `batch_size` | committed secondary index | single run, benchmark only |
 | `table-ddl` | optional `num` | none | single run |
@@ -394,6 +396,17 @@ ordinals replay the same relative ranges in the alternate domain and move the
 same union back. Unique and non-unique multiplicity are preserved. All
 repetitions share the evolving fixture and therefore accumulate MVCC, index,
 undo, and redo history rather than representing independently cloned states.
+
+`update-all` updates every row in one transaction using one thread and one
+session. It rejects `num`, `threads`, `sessions`, and `batch_size`.
+
+`update-point-rand` samples keys with replacement. `num` counts requests, and
+`batch_size` limits requests per transaction. Each request updates every
+matching row; missing keys count as `not_found`. Require
+`threads <= sessions <= candidate_key_count`.
+
+Both use the same payload, seed, and `change_key` controls as `update-rand`.
+Warm-ups and repeated measurements share the same table.
 
 Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
@@ -575,6 +588,8 @@ uncontrolled caches; one sample does not establish a latency distribution.
 | `create-table` | `table-creation` | `tables` |
 | inserts | `insert-batch-transaction` | sum of per-session batch ceilings |
 | `update-rand` | `update-range-transaction` | sum of per-session key-width-budget batch ceilings |
+| `update-all` | `update-all-transaction` | 1 |
+| `update-point-rand` | `update-point-batch-transaction` | sum of nonempty per-session request batch ceilings |
 | `delete-all` | `delete-all-transaction` | 1 |
 | `delete-rand` | `delete-batch-transaction` | sum of nonempty per-session request batch ceilings |
 | `table-ddl` | `table-create-drop-cycle` | `num` |
@@ -601,15 +616,18 @@ Each parallel-table-scan sample starts immediately before
 `begin_read_snapshot` and ends only after every partition task has joined and
 `ReadSnapshot::close` has completed. Warm-ups execute the identical lifecycle
 but discard samples and diagnostics.
-For random updates, the exact sample equation is
+For `update-rand`, the exact sample equation is
 `sum(ceil(session_budget / batch_size))`; a zero-budget session contributes
 zero. The equation uses planned key widths, not matched rows.
 
 Counter equations are verified before phase state advances:
 
 - Inserts: `operations = inserted_rows + duplicate_key + write_conflict`.
-- Random updates: `operations = updated_rows`; all other generic counters are
+- `update-rand`: `operations = updated_rows`; all other generic counters are
   zero. There is deliberately no equation between `num` and `updated_rows`.
+- Full update: `operations = 1`; `updated_rows` is the prepared row count.
+- Random point update: `operations = num = found + not_found`; `updated_rows`
+  counts actual row updates.
 - Full deletion: `operations = 1`; `deleted_rows` is the prepared row count.
 - Random deletion: `operations = num = found + not_found`; `deleted_rows` is
   the actual number of rows deleted.
@@ -632,6 +650,8 @@ Aggregate throughput is total operations divided by total wall duration. For
 `update-rand`, this means actual updated rows per second, while every committed
 range transaction contributes a sample even when it matches no rows. A single
 p95/p99 sample does not establish a latency distribution.
+Both `update-all` and `update-point-rand` also report `updated_rows` and
+`updated_rows_per_second`.
 For deletion, `operations_per_second` counts requests; stdout also reports
 `deleted_rows` and `deleted_rows_per_second`.
 
@@ -699,6 +719,8 @@ four recovery fixtures and six CREATE INDEX placement/mode combinations:
 trx-noop.toml        stmt-noop.toml       insert-seq.toml
 insert-rand.toml     table-ddl.toml       lookup-seq.toml
 update-rand.toml     lookup-rand.toml     table-scan.toml
+update-all-unique.toml                   update-all-non-unique.toml
+update-point-rand-unique.toml            update-point-rand-non-unique.toml
 delete-all-unique.toml                   delete-all-non-unique.toml
 delete-rand-unique.toml                  delete-rand-non-unique.toml
 parallel-table-scan.toml                  index-scan.toml

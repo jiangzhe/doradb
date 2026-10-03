@@ -38,7 +38,11 @@ pub(crate) use recovery::run_recovery;
 pub(crate) use table_scan::{
     ParallelTableScanExecutor, ParallelTableScanExecutorConfig, TableScanExecutor,
 };
-pub(crate) use update::UpdateRandExecutor;
+#[cfg(test)]
+pub(crate) use update::set_update_completion_hook;
+pub(crate) use update::{
+    UpdateAllExecutor, UpdatePointRandExecutor, UpdateRandExecutor, complete_update,
+};
 pub(crate) use util::build_session_plans;
 
 /// First-error-wins cooperative cancellation shared by one plan run.
