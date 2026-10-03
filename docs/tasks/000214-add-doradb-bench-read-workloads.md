@@ -78,7 +78,7 @@ Source Backlogs:
 
 Related Backlogs:
 - docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md
-- docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md
+- docs/backlogs/closed/000146-doradb-bench-update-delete-read-write-scenarios.md
 - docs/backlogs/000148-doradb-bench-richer-index-controls.md
 
 ## Goals

@@ -38,7 +38,7 @@ This task has no parent RFC.
 
 Source Backlogs:
 
-- `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`
+- `docs/backlogs/closed/000146-doradb-bench-update-delete-read-write-scenarios.md`
 
 Issue Labels:
 
@@ -46,8 +46,9 @@ Issue Labels:
 - priority:medium
 - codex
 
-Backlog 000146 remains open for overwrite/upsert, mixed read/write, and
-read-while-writing scenarios. This task completes only its delete slice.
+This task completed backlog 000146's delete slice. The umbrella was later
+closed as replaced by backlog 000209 for upsert and backlog 000210 for mixed
+read/write and read-while-writing scenarios.
 
 ## Goals
 
@@ -272,6 +273,7 @@ this is benchmark-only work using its existing profiling dependency.
 
 ## Open Questions
 
-None for the delivered delete workloads. Fixture restoration, indexed cold
-preparation, and broader mutation/mixed workloads remain future work under
-source backlog 000146.
+None for the delivered delete workloads. Upsert remains in
+[backlog 000209](../backlogs/000209-doradb-bench-upsert-workloads.md).
+Fixture restoration, indexed cold preparation, and mixed read/write workloads
+remain in [backlog 000210](../backlogs/000210-doradb-bench-mixed-read-write-workloads.md).

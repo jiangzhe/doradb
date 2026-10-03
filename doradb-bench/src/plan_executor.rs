@@ -1164,12 +1164,14 @@ mod tests {
     }
 
     /// Purpose: Verify new update workloads only once after warmups and all measurements, without warming a later run.
-    /// Expected: Completion observes final replay parity and drained workers; its mock-clock and transaction activity is absent from run time, latency, and diagnostics.
+    /// Expected: Completion observes final replay parity and drained workers; its clock advance and held lock are absent from run time, latency, and diagnostics.
     #[test]
     fn update_completion_follows_all_runs_and_statistics() {
         use crate::workload::set_update_completion_hook;
-        use doradb_storage::{CallbackResult, IndexID, ScanRowDecision, TableIndex, Val};
-        use std::cell::Cell;
+        use doradb_storage::{
+            CallbackResult, IndexID, ScanRowDecision, TableIndex, TableLockMode, Val,
+        };
+        use std::cell::{Cell, RefCell};
         use std::rc::Rc;
         use tempfile::TempDir;
         smol::block_on(async {
@@ -1194,6 +1196,8 @@ mod tests {
                 let (clock, mock) = MeasurementClock::mock();
                 let calls = Rc::new(Cell::new(0));
                 let observed = Rc::clone(&calls);
+                let completion_session = Rc::new(RefCell::new(None));
+                let held_session = Rc::clone(&completion_session);
                 set_update_completion_hook(move |engine, primary| {
                     observed.set(observed.get() + 1);
                     smol::block_on(async {
@@ -1232,7 +1236,13 @@ mod tests {
                         assert_eq!(stream.next().await.unwrap(), None);
                         drop(stream);
                         trx.commit().await.unwrap();
-                        session.close().await.unwrap();
+                        // Keep a diagnostic marker until results are inspected. Unlike
+                        // redo counters, lock gauges are updated before the API returns.
+                        session
+                            .lock_table(primary.table_id, TableLockMode::Shared)
+                            .await
+                            .unwrap();
+                        *held_session.borrow_mut() = Some(session);
                     });
                     mock.increment(1_000_000);
                 });
@@ -1251,17 +1261,25 @@ mod tests {
                 assert_eq!(result.aggregate.latency.sum_nanos, 0);
                 assert_eq!(result.aggregate.latency.sample_count, 2);
                 assert_eq!(result.aggregate.counters.updated_rows, 2);
+                let mut completion_session = completion_session.borrow_mut().take().unwrap();
+                let stats = completion_session.logical_lock_stats().unwrap();
+                assert!(stats.current_physical_resources > 0, "{stats:?}");
                 for run in result.measured_runs {
                     assert_eq!(run.elapsed_nanos, 0);
                     assert_eq!(run.latency.sample_count, 1);
                     assert_eq!(run.counters.updated_rows, 1);
-                    assert!(
-                        run.internal_metrics
-                            .iter()
-                            .any(|metric| metric.name == "transaction.trx_count"
-                                && metric.value == 1)
+                    let locks = run
+                        .internal_metrics
+                        .iter()
+                        .find(|metric| metric.name == "logical_lock.current_physical_resources")
+                        .unwrap();
+                    assert_eq!(
+                        locks.value, 0,
+                        "{controls}: run {} included the completion lock: {locks:?}",
+                        run.run_index
                     );
                 }
+                completion_session.close().await.unwrap();
                 owner.take().unwrap().shutdown();
             }
         });

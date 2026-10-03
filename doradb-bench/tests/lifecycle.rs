@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use doradb_bench::measurement::{LatencyUnit, WorkloadCounters, WorkloadMetrics};
+    use doradb_bench::measurement::{
+        LatencyUnit, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
+    };
     use doradb_bench::plan::Phase;
     use doradb_bench::plan_output::InvocationReport;
     use rustix::process::{Pid, Signal, kill_process};
@@ -192,6 +194,29 @@ mod tests {
         assert!(!root.join("benchmark-result.csv").exists());
         assert!(!root.join("benchmark-internal-stats.csv").exists());
         (root, report)
+    }
+
+    #[track_caller]
+    fn assert_drained_transaction_diagnostics(name: &str, run: &MeasuredRunResult) {
+        // Redo counters can be published after commit wakes the caller;
+        // workload transaction counts are checked through latency samples.
+        assert!(
+            run.internal_metrics
+                .iter()
+                .any(|metric| metric.name == "transaction.trx_count"),
+            "{name}: run {} omitted transaction diagnostics",
+            run.run_index
+        );
+        let locks = run
+            .internal_metrics
+            .iter()
+            .find(|metric| metric.name == "logical_lock.current_physical_resources")
+            .unwrap();
+        assert_eq!(
+            locks.value, 0,
+            "{name}: run {} retained worker locks: {locks:?}",
+            run.run_index
+        );
     }
 
     fn assert_update_counters(counters: WorkloadCounters) {
@@ -804,7 +829,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     }
 
     /// Purpose: Exercise new update replay with a warmup ending in the alternate domain and idle point sessions.
-    /// Expected: Measured runs retain continuous parity, exact requests/rows, samples, aggregate counts, and transaction diagnostics.
+    /// Expected: Measured runs retain continuous parity, exact requests/rows, samples, aggregate counts, transaction diagnostics, and drained worker locks.
     #[test]
     fn explicit_update_cli_replay_preserves_accounting() {
         let temp = TempDir::new().unwrap();
@@ -829,11 +854,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
                 assert_eq!(run.counters.operations, requests);
                 assert_eq!(run.counters.updated_rows, rows);
                 assert_eq!(run.latency.sample_count, 1);
-                assert!(
-                    run.internal_metrics
-                        .iter()
-                        .any(|metric| metric.name == "transaction.trx_count" && metric.value == 1)
-                );
+                assert_drained_transaction_diagnostics(name, run);
             }
             assert_eq!(report.aggregate.counters.operations, requests * 3);
             assert_eq!(report.aggregate.counters.updated_rows, rows * 3);
@@ -899,7 +920,7 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
     }
 
     /// Purpose: Reject destructive replay and unsupported delete controls before filesystem ownership.
-    /// Expected: Invalid CLI plans leave no root or success output; sparse request budgets still execute.
+    /// Expected: Invalid CLI plans leave no root or success output; sparse request budgets retain exact accounting, diagnostics, and drained worker locks.
     #[test]
     fn delete_cli_rejects_invalid_plans_before_root_creation() {
         for controls in ["type = 'delete-all'", "type = 'delete-rand', num = 1"] {
@@ -938,12 +959,8 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         assert_eq!(report.aggregate.counters.operations, 1);
         assert_eq!(report.aggregate.counters.deleted_rows, 1);
         assert_eq!(report.aggregate.latency.sample_count, 1);
-        assert!(
-            report.measured_runs[0]
-                .internal_metrics
-                .iter()
-                .any(|metric| metric.name == "transaction.trx_count" && metric.value == 1)
-        );
+        assert_eq!(report.measured_runs.len(), 1);
+        assert_drained_transaction_diagnostics("sparse-delete", &report.measured_runs[0]);
     }
 
     /// Purpose: Keep the shipped random-update template executable through the public CLI.

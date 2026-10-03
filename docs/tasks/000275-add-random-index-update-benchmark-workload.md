@@ -50,7 +50,7 @@ semantics changed.
 
 Source Backlogs:
 
-- `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`
+- `docs/backlogs/closed/000146-doradb-bench-update-delete-read-write-scenarios.md`
 
 Issue Labels:
 
@@ -58,9 +58,10 @@ Issue Labels:
 - priority:medium
 - codex
 
-Backlog 000146 is broader than this task. Task 000275 completes only its random
-index-update slice; delete, overwrite/upsert, mixed read/write, and
-read-while-writing workloads remain open there.
+Task 000275 completed only backlog 000146's random index-update slice. Tasks
+000324 and 000325 subsequently added explicit delete and update workloads.
+The umbrella was then closed as replaced by backlog 000209 for upsert and
+backlog 000210 for mixed read/write and read-while-writing scenarios.
 
 ## Goals
 
@@ -232,8 +233,8 @@ the already-open source backlog retains its non-update and mixed-workload work.
   workload plans.
 - Result TOML schema changes additively through the new counter and workload
   configuration fields; no persisted database format changes.
-- Backlog 000146 remains open for delete, overwrite/upsert, mixed read/write,
-  and read-while-writing scenarios.
+- Remaining work from backlog 000146 is now tracked by backlog 000209 for
+  upsert and backlog 000210 for mixed read/write scenarios.
 
 ## Test Cases
 
@@ -263,7 +264,6 @@ the already-open source backlog retains its non-update and mixed-workload work.
 
 No unresolved question remains for `update-rand`.
 
-The broader mutation and concurrency work remains tracked by
-`docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`,
-specifically delete, overwrite/upsert, mixed read/write, and
-read-while-writing workloads.
+The remaining upsert and concurrency work is tracked by
+[backlog 000209](../backlogs/000209-doradb-bench-upsert-workloads.md) and
+[backlog 000210](../backlogs/000210-doradb-bench-mixed-read-write-workloads.md).

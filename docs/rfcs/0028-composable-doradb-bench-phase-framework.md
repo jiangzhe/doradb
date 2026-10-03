@@ -137,8 +137,9 @@ output publication, workload ownership, cancellation, and template sizing.
 
 ### Related Backlogs
 
-- [B2] `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`
-  - deferred mutation and mixed-workload coverage.
+- [B2] `docs/backlogs/closed/000146-doradb-bench-update-delete-read-write-scenarios.md`
+  - update/delete coverage shipped; remaining work moved to backlog 000209
+    (upsert) and backlog 000210 (mixed read/write and shared fixture facilities).
 - [B3] `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md` -
   deferred cold-cache and end-to-end persisted read measurement.
 - [B4] `docs/backlogs/000184-dynamic-table-file-expansion.md` - storage growth
@@ -420,9 +421,10 @@ None for the implemented four-phase program.
 
 ## Future Work
 
-- [B2] Add update/delete/overwrite and mixed read/write benchmark semantics,
-  fixture effects, counters, and templates through
-  `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`.
+- [B2] Add upsert/overwrite scenarios through
+  `docs/backlogs/000209-doradb-bench-upsert-workloads.md`, and mixed read/write,
+  concurrent readers/writers, and shared fixture facilities through
+  `docs/backlogs/000210-doradb-bench-mixed-read-write-workloads.md`.
 - [B3] Add cold-cache lookup and end-to-end persisted row fetch/decode coverage
   through `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`.
 - [B4] Design failure-atomic online table-file/allocation-map expansion,
@@ -442,7 +444,9 @@ None for the implemented four-phase program.
 - `docs/tasks/000268-migrate-doradb-bench-dependent-and-coordinated-workloads.md`
 - `docs/tasks/000269-single-table-checkpoint-benchmark.md`
 - `docs/backlogs/closed/000147-doradb-bench-checkpoint-lifecycle-scenarios.md`
-- `docs/backlogs/000146-doradb-bench-update-delete-read-write-scenarios.md`
+- `docs/backlogs/closed/000146-doradb-bench-update-delete-read-write-scenarios.md`
+- `docs/backlogs/000209-doradb-bench-upsert-workloads.md`
+- `docs/backlogs/000210-doradb-bench-mixed-read-write-workloads.md`
 - `docs/backlogs/000074-expand-runtime-lookup-benchmark-coverage.md`
 - `docs/backlogs/000184-dynamic-table-file-expansion.md`
 - [HdrHistogram Rust](https://github.com/HdrHistogram/HdrHistogram_rust)
