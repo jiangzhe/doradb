@@ -40,3 +40,11 @@ A documented CLI workload exercises both insert-on-miss and update-on-hit, inclu
 ## Notes (Optional)
 
 This backlog replaces the upsert/overwrite portion of closed backlog 000146. It does not reopen the completed update/delete workload tasks or require a generic mutation framework. Coordinate with the sibling mixed read/write backlog when shared fixture facilities are needed.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000326-doradb-bench-upsert-workload.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-10-03

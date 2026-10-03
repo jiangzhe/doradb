@@ -124,7 +124,17 @@ pub(crate) fn render_stdout_summary(
             "\nverification: complete\nOne CREATE sample; p95/p99 do not establish a distribution.",
         );
     }
-    if matches!(workload.identity(), "update-all" | "update-point-rand") {
+    if workload.identity() == "upsert-point-rand" {
+        summary.push_str(&format!(
+            "\ninserted_rows: {}\ninserted_rows_per_second: {:.3}",
+            aggregate.counters.inserted_rows,
+            operations_per_second(aggregate.counters.inserted_rows, aggregate.elapsed_nanos),
+        ));
+    }
+    if matches!(
+        workload.identity(),
+        "update-all" | "update-point-rand" | "upsert-point-rand"
+    ) {
         summary.push_str(&format!(
             "\nupdated_rows: {}\nupdated_rows_per_second: {:.3}",
             aggregate.counters.updated_rows,
@@ -795,12 +805,12 @@ mod tests {
         }
     }
 
-    /// Purpose: Distinguish update request throughput from affected-row throughput in canonical output.
-    /// Expected: Both update identities retain counters/units on round trip and print independent rates, including zero time.
+    /// Purpose: Distinguish mutation request throughput from affected-row throughput in canonical output.
+    /// Expected: Update and upsert identities retain counters/units on round trip and print independent rates, including zero time.
     #[test]
-    fn update_output_reports_request_and_row_rates() {
+    fn mutation_output_reports_request_and_row_rates() {
         use crate::fixture::IndexMode;
-        use crate::plan::{UpdateAllConfig, UpdatePointRandConfig};
+        use crate::plan::{UpdateAllConfig, UpdatePointRandConfig, UpsertPointRandConfig};
         let temp = TempDir::new().unwrap();
         for workload in [
             ResolvedWorkload::UpdateAll(UpdateAllConfig {
@@ -825,6 +835,16 @@ mod tests {
                 loaded_range: KeyRange { start: 0, len: 10 },
                 include_stats: false,
             }),
+            ResolvedWorkload::UpsertPointRand(UpsertPointRandConfig {
+                num: 3,
+                seed: 9,
+                threads: 1,
+                sessions: 1,
+                batch_size: 3,
+                key_range: KeyRange { start: 5, len: 10 },
+                value_size_bytes: 1,
+                include_stats: false,
+            }),
         ] {
             let mut report = report(temp.path());
             let Phase::Benchmark {
@@ -835,9 +855,11 @@ mod tests {
             };
             *target = workload.clone();
             let full = matches!(workload, ResolvedWorkload::UpdateAll(_));
+            let upsert = matches!(workload, ResolvedWorkload::UpsertPointRand(_));
             report.aggregate.counters = WorkloadCounters {
                 operations: if full { 1 } else { 3 },
-                updated_rows: 7,
+                inserted_rows: if upsert { 1 } else { 0 },
+                updated_rows: if upsert { 2 } else { 7 },
                 found: if full { 0 } else { 2 },
                 not_found: if full { 0 } else { 1 },
                 ..WorkloadCounters::default()
@@ -861,7 +883,18 @@ mod tests {
                     toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
                 assert_eq!(decoded, report);
                 let summary = render_stdout_summary(&decoded, &path).unwrap();
-                assert!(summary.contains("updated_rows: 7\n"));
+                assert!(summary.contains(if upsert {
+                    "updated_rows: 2\n"
+                } else {
+                    "updated_rows: 7\n"
+                }));
+                if upsert {
+                    assert!(summary.contains("inserted_rows: 1\n"));
+                    let insert_rate = if elapsed == 0 { "0.000" } else { "0.500" };
+                    assert!(
+                        summary.contains(&format!("\ninserted_rows_per_second: {insert_rate}\n"))
+                    );
+                }
                 let request_rate = if elapsed == 0 {
                     "0.000"
                 } else if full {
@@ -869,7 +902,13 @@ mod tests {
                 } else {
                     "1.500"
                 };
-                let row_rate = if elapsed == 0 { "0.000" } else { "3.500" };
+                let row_rate = if elapsed == 0 {
+                    "0.000"
+                } else if upsert {
+                    "1.000"
+                } else {
+                    "3.500"
+                };
                 assert!(summary.contains(&format!("\noperations_per_second: {request_rate}\n")));
                 assert!(summary.contains(&format!("\nupdated_rows_per_second: {row_rate}\n")));
                 assert!(summary.contains(&format!("latency_unit: {}\n", workload.latency_unit())));

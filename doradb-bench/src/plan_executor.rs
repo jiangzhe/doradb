@@ -19,8 +19,8 @@ use crate::workload::{
     LookupSeqExecutor, ManagedBindingsPrepareExecutor, ParallelTableScanExecutor,
     ParallelTableScanExecutorConfig, ResolveTableBindingExecutor, RunCancellation, SessionPlan,
     StmtNoopExecutor, TableDdlExecutor, TableScanExecutor, TrxNoopExecutor, UpdateAllExecutor,
-    UpdatePointRandExecutor, UpdateRandExecutor, complete_create_index, complete_delete,
-    complete_update, prepare_create_fixture, run_recovery,
+    UpdatePointRandExecutor, UpdateRandExecutor, UpsertPointRandExecutor, complete_create_index,
+    complete_delete, complete_update, complete_upsert, prepare_create_fixture, run_recovery,
 };
 use doradb_storage::profiling::InternalStatsSnapshot;
 use doradb_storage::{Engine, EngineConfig, Session};
@@ -580,6 +580,26 @@ async fn dispatch_workload(
             )
             .await
         }
+        ResolvedWorkload::UpsertPointRand(config) => {
+            let FixtureBinding::Primary(primary) = &binding else {
+                return Err(BenchError::message(
+                    "upsert workload has no primary fixture binding",
+                ));
+            };
+            let primary = *primary;
+            let outcome = run_executor::<UpsertPointRandExecutor>(
+                engine,
+                clock,
+                workload,
+                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                planned_effect,
+                sample_latency,
+            )
+            .await?;
+            // Worker sessions and final statistics snapshots have completed; scans are unmeasured.
+            complete_upsert(engine, primary, outcome.counters.inserted_rows).await?;
+            Ok(outcome)
+        }
         ResolvedWorkload::DeleteAll(config) => {
             let FixtureBinding::Primary(primary) = &binding else {
                 return Err(BenchError::message(
@@ -1083,6 +1103,7 @@ fn prepare_plan_root(storage_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture::PrimaryBinding;
     use std::io::ErrorKind;
     use std::sync::{Condvar, Mutex as StdMutex, mpsc};
     use std::thread::{self, ThreadId};
@@ -1323,11 +1344,11 @@ mod tests {
         });
     }
 
-    /// Purpose: Keep delete content verification outside the production dispatch timer and diagnostic interval.
+    /// Purpose: Keep terminal mutation verification outside the production dispatch timer and diagnostic interval.
     /// Expected: Worker locks drain first, verification advances neither reported time nor acquisition counters.
     #[test]
-    fn delete_dispatch_completes_measurement_before_content_scans() {
-        use crate::workload::set_delete_completion_hook;
+    fn terminal_mutation_dispatch_completes_measurement_before_content_scans() {
+        use crate::workload::{set_delete_completion_hook, set_upsert_completion_hook};
         use std::cell::Cell;
         use std::rc::Rc;
         use tempfile::TempDir;
@@ -1336,9 +1357,12 @@ mod tests {
             for controls in [
                 "type = 'delete-all'",
                 "type = 'delete-rand', num = 2, sessions = 3",
+                "type = 'upsert-point-rand', num = 2, sessions = 3, key_range = { start = 1, len = 4 }",
             ] {
                 let root = temp.path().join(if controls.contains("delete-all") {
                     "all"
+                } else if controls.contains("upsert-point-rand") {
+                    "upsert"
                 } else {
                     "rand"
                 });
@@ -1378,7 +1402,7 @@ mod tests {
                 let boundary = Rc::new(Cell::new(0));
                 let captured = Rc::clone(&boundary);
                 let advanced = Arc::clone(&mock);
-                set_delete_completion_hook(move |engine, _| {
+                let hook = move |engine: &Engine, _: PrimaryBinding| {
                     smol::block_on(async {
                         let mut session = engine.new_session().unwrap();
                         let stats = session.logical_lock_stats().unwrap();
@@ -1388,7 +1412,12 @@ mod tests {
                         session.close().await.unwrap();
                     });
                     advanced.increment(1_000_000);
-                });
+                };
+                if controls.contains("upsert") {
+                    set_upsert_completion_hook(hook);
+                } else {
+                    set_delete_completion_hook(hook);
+                }
                 let start = clock.now();
                 let workload = loaded.plan.phases[2].workload();
                 let binding = fixture.bind(workload.fixture_requirement()).unwrap();
@@ -1431,41 +1460,50 @@ mod tests {
         });
     }
 
-    /// Purpose: Prevent success publication when final delete verification discovers unexpected surviving rows.
+    /// Purpose: Prevent success publication when final terminal mutation verification discovers unexpected surviving rows.
     /// Expected: The invocation retains its diagnostic root, returns the verification error, and creates no artifact.
     #[test]
-    fn delete_completion_failure_prevents_canonical_publication() {
-        use crate::workload::set_delete_completion_hook;
+    fn terminal_mutation_completion_failure_prevents_canonical_publication() {
+        use crate::workload::{set_delete_completion_hook, set_upsert_completion_hook};
         use doradb_storage::Val;
         use tempfile::TempDir;
         smol::block_on(async {
-            let temp = TempDir::new().unwrap();
-            let source = temp.path().join("delete.toml");
-            fs::write(&source, "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'delete-all' }").unwrap();
-            set_delete_completion_hook(|engine, primary| {
-                smol::block_on(async {
-                    let mut session = engine.new_session().unwrap();
-                    let mut trx = session.begin_trx().unwrap();
-                    trx.table_insert_mvcc(
-                        primary.table_id,
-                        vec![Val::from(99u64), Val::from("unexpected")],
-                    )
-                    .await
-                    .unwrap();
-                    trx.commit().await.unwrap();
-                    session.close().await.unwrap();
-                });
-            });
-            let root = temp.path().join("root");
-            let error = execute_plan(root.clone(), source).await.unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("delete content verification failed")
-            );
-            assert!(root.exists());
-            assert!(!root.join("benchmark-result.toml").exists());
-            assert!(!root.join("benchmark-result.toml.tmp").exists());
+            for upsert in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let source = temp.path().join("delete.toml");
+                let raw = "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'delete-all' }";
+                let raw = if upsert {
+                    raw.replace("type = 'delete-all'", "type = 'upsert-point-rand', num = 5")
+                } else {
+                    raw.to_owned()
+                };
+                fs::write(&source, raw).unwrap();
+                let hook = |engine: &Engine, primary: PrimaryBinding| {
+                    smol::block_on(async {
+                        let mut session = engine.new_session().unwrap();
+                        let mut trx = session.begin_trx().unwrap();
+                        trx.table_insert_mvcc(
+                            primary.table_id,
+                            vec![Val::from(99u64), Val::from("unexpected")],
+                        )
+                        .await
+                        .unwrap();
+                        trx.commit().await.unwrap();
+                        session.close().await.unwrap();
+                    });
+                };
+                if upsert {
+                    set_upsert_completion_hook(hook);
+                } else {
+                    set_delete_completion_hook(hook);
+                }
+                let root = temp.path().join("root");
+                let error = execute_plan(root.clone(), source).await.unwrap_err();
+                assert!(error.to_string().contains("content verification failed"));
+                assert!(root.exists());
+                assert!(!root.join("benchmark-result.toml").exists());
+                assert!(!root.join("benchmark-result.toml.tmp").exists());
+            }
         });
     }
 
@@ -1479,6 +1517,7 @@ mod tests {
         assert_shared_outcome::<DeleteAllExecutor, DeleteRandExecutor>();
         assert_shared_outcome::<UpdateRandExecutor, UpdateAllExecutor>();
         assert_shared_outcome::<UpdateAllExecutor, UpdatePointRandExecutor>();
+        assert_shared_outcome::<UpdatePointRandExecutor, UpsertPointRandExecutor>();
         assert_shared_config::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_outcome::<InsertSeqExecutor, InsertRandExecutor>();
         assert_shared_config::<TableDdlExecutor, IndexDdlExecutor>();
@@ -1502,6 +1541,7 @@ mod tests {
                 UpdateRandExecutor::IDENTITY,
                 UpdateAllExecutor::IDENTITY,
                 UpdatePointRandExecutor::IDENTITY,
+                UpsertPointRandExecutor::IDENTITY,
                 DeleteAllExecutor::IDENTITY,
                 DeleteRandExecutor::IDENTITY,
                 TableDdlExecutor::IDENTITY,
@@ -1525,6 +1565,7 @@ mod tests {
                 "update-rand",
                 "update-all",
                 "update-point-rand",
+                "upsert-point-rand",
                 "delete-all",
                 "delete-rand",
                 "table-ddl",

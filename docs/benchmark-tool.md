@@ -332,6 +332,7 @@ All serde-facing counts, ranges, widths, and table counts are positive.
 | `update-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
 | `update-all` | optional `seed`, `change_key`, `value_size`; no worker/batch fields | committed secondary index | safe, benchmark only |
 | `update-point-rand` | required `num`; optional `seed`, `change_key`, `value_size`, `batch_size` | committed secondary index | safe, benchmark only |
+| `upsert-point-rand` | required `num`; optional `key_range`, `seed`, `value_size`, `batch_size` | unique primary; load optional with explicit range | single run, benchmark only |
 | `delete-all` | only `include_stats`; no worker fields | committed secondary index | single run, benchmark only |
 | `delete-rand` | required `num`; optional `seed`, `batch_size` | committed secondary index | single run, benchmark only |
 | `table-ddl` | optional `num` | none | single run |
@@ -407,6 +408,16 @@ matching row; missing keys count as `not_found`. Require
 
 Both use the same payload, seed, and `change_key` controls as `update-rand`.
 Warm-ups and repeated measurements share the same table.
+
+`upsert-point-rand` inserts missing keys or replaces existing payloads without
+changing keys. `num` counts random requests sampled with replacement;
+`batch_size` limits requests per transaction. Require positive `value_size`,
+`threads <= sessions <= key_range.len`, zero warm-ups, and one measured run.
+
+Optional `key_range = { start = 0, len = 20000 }` targets `[0, 20000)`;
+omitting it targets the prepared range for overwrites. An empty unique-index
+table requires an explicit nonempty range. Repeated keys become updates, so
+the range does not specify a fixed insert/update ratio.
 
 Index DDL creates the fixed non-unique logical-key index, uses the exact
 returned index number for drop, and counts two operations per completed cycle.
@@ -590,6 +601,7 @@ uncontrolled caches; one sample does not establish a latency distribution.
 | `update-rand` | `update-range-transaction` | sum of per-session key-width-budget batch ceilings |
 | `update-all` | `update-all-transaction` | 1 |
 | `update-point-rand` | `update-point-batch-transaction` | sum of nonempty per-session request batch ceilings |
+| `upsert-point-rand` | `upsert-point-batch-transaction` | sum of nonempty per-session request batch ceilings |
 | `delete-all` | `delete-all-transaction` | 1 |
 | `delete-rand` | `delete-batch-transaction` | sum of nonempty per-session request batch ceilings |
 | `table-ddl` | `table-create-drop-cycle` | `num` |
@@ -628,6 +640,8 @@ Counter equations are verified before phase state advances:
 - Full update: `operations = 1`; `updated_rows` is the prepared row count.
 - Random point update: `operations = num = found + not_found`; `updated_rows`
   counts actual row updates.
+- Random point upsert: `operations = num = inserted_rows + updated_rows`,
+  `found = updated_rows`, and `not_found = inserted_rows`.
 - Full deletion: `operations = 1`; `deleted_rows` is the prepared row count.
 - Random deletion: `operations = num = found + not_found`; `deleted_rows` is
   the actual number of rows deleted.
@@ -652,6 +666,8 @@ range transaction contributes a sample even when it matches no rows. A single
 p95/p99 sample does not establish a latency distribution.
 Both `update-all` and `update-point-rand` also report `updated_rows` and
 `updated_rows_per_second`.
+For upsert, stdout reports request throughput plus inserted/updated row counts
+and their respective rates.
 For deletion, `operations_per_second` counts requests; stdout also reports
 `deleted_rows` and `deleted_rows_per_second`.
 
@@ -721,6 +737,7 @@ insert-rand.toml     table-ddl.toml       lookup-seq.toml
 update-rand.toml     lookup-rand.toml     table-scan.toml
 update-all-unique.toml                   update-all-non-unique.toml
 update-point-rand-unique.toml            update-point-rand-non-unique.toml
+upsert-point-rand.toml                   upsert-point-rand-overwrite.toml
 delete-all-unique.toml                   delete-all-non-unique.toml
 delete-rand-unique.toml                  delete-rand-non-unique.toml
 parallel-table-scan.toml                  index-scan.toml
