@@ -39,17 +39,15 @@ sampled user CPU to full-block BLAKE3 checksums. Task 000322 had already replace
 per-RowID fingerprinting with a fixed 36-byte table/bounds/count binding. This
 change preserves that binding's semantics and does not restore the old stream.
 
-The approved scope replaced legacy algorithms across all integrity uses and
-explicitly accepted fresh storage. The user subsequently chose native XXH3-64
-for block bindings to retain their compact representation; all other digests
-remain XXH3-128. There is no parent RFC. Algorithm-selection microbenchmarks
-and a broader architecture/workload campaign were not prerequisites.
+The approved scope covered all integrity uses and explicitly accepted fresh
+storage. There is no parent RFC. Algorithm-selection microbenchmarks and a
+broader architecture/workload campaign were outside the approved scope.
 
 The implementation and performance baseline is
 `5493f486c6f9247317dfe02174ce4bc0a51c3b4d`. The starting worktree had no lockfile;
 normal resolution selected BLAKE3 1.8.7 and crc32fast 1.5.2, differing from the
-proposal's earlier research resolution. Both actual lockfiles are retained with
-the binaries. No unrelated retained dependency version changed.
+proposal's earlier research resolution. No unrelated retained dependency
+version changed.
 
 ## Goals
 
@@ -80,58 +78,32 @@ the binaries. No unrelated retained dependency version changed.
 
 ## Plan
 
-### Primitive and physical integrity
+### Final integrity contracts
 
-The internal `checksum` module exposes `CHECKSUM_SIZE = 16`, `checksum128`, and
-an incremental `ChecksumHasher` wrapping `Xxh3Default`, plus a native one-shot
-`checksum64` used only for block bindings. All use the default seed/secret.
-Persisted representations use `to_le_bytes`/`from_le_bytes`; 128-bit digest text
-is lowercase hex of those bytes, exactly 32 characters. Benchmark and coverage
-code use the same dependency and encoding without exporting a new storage API.
+Storage shares unseeded one-shot and streaming XXH3 helpers. Benchmark and
+coverage tooling use the same digest encoding without a new public storage API:
+little-endian bytes, rendered as 32 lowercase hex characters for 128-bit text.
 
-All physical block trailers are 16 bytes. A 64 KiB page places its checksum at
-65,520; shared-envelope payload/padding occupies 65,504 bytes after the 16-byte
-header. Checksums cover all preceding bytes, including deterministic padding.
-Row pages, row-page-index nodes, BTree/DiskTree nodes, and column-index nodes
-retain exact 64 KiB layouts and derived capacity assertions.
+Physical block trailers are 16 bytes and cover the preceding image, including
+padding. Table/catalog super-block footers additionally repeat the checkpoint
+timestamp for torn-write detection. Readonly admission still validates once
+per residency generation; dirty spill reload validates before publication.
+Redo checksums cover every byte after their 16-byte field. Atomic group
+publication and sealed/unsealed corruption policies remain unchanged.
 
-Table/catalog super-block slots remain 32 KiB. Their 24-byte footer holds a
-16-byte checksum over the preceding 32,744 bytes plus the repeated 8-byte
-checkpoint timestamp. Timestamp equality independently detects torn writes.
-Readonly admission still validates once per residency generation; dirty spill
-writeback stamps the checksum and reload validates before publication.
+Native XXH3-64 block bindings retain the 36-byte canonical table/bounds/count
+input with domain `LWCBIND2`. Placement, interior membership, values, deletion
+state, and codec choice remain outside the binding; delete-only rewrites
+preserve it. Leaf-entry and LWC headers remain 24 bytes. This deliberately
+accepts 64-bit collision protection for association checks while separate
+128-bit checksums protect physical contents.
 
-### Redo, logical bindings, and auxiliary digests
-
-Redo data has an unpadded 23-byte common header: checksum at 0, flags at 16,
-payload length at 17, and group block index at 19. The START extension remains
-28 bytes, with group length/count/minimum CTS/maximum CTS at 23/31/35/43.
-START and continuation payloads begin at 51 and 23, respectively. A 4 KiB block
-holds 4,045 or 4,073 payload bytes. The checksum covers all bytes after its
-16-byte field. Group publication stays atomic; required sealed corruption is
-fatal and incomplete/corrupt unsealed tails retain their existing policy.
-
-Block bindings are native XXH3-64 values represented as `u64` throughout
-routing, scans, reads, checkpointing, mutation, GC, and catalog access. The
-canonical input remains 36 bytes: `LWCBIND2`, table ID, inclusive start/exclusive
-end RowIDs, and row count. Placement, interior membership, values, deletion
-state, and codec choice remain outside the binding. Leaf-entry and LWC headers
-both remain 24 bytes; LWC reserves ten bytes. Delete-only rewrites preserve
-bindings. This intentionally accepts 64-bit collision protection for the
-association check; separate 128-bit checksums protect physical block contents.
-
-Schema fingerprints retain canonical active-field ordering and inclusion rules,
-use canonical domain version 2, and store exactly 16 bytes. Old 32-byte values
-are rejected. The opaque descriptor limit remains 64,000 bytes; its checkpoint
-row estimate shrinks from 64,151 to 64,135 bytes.
-
-Benchmark verification hashes `key:u64 LE || payload_length:u64 LE || payload`
-and sums row digests modulo 2^128 with an independent checked row count. Count
-overflow leaves state unchanged. CREATE validates 32 lowercase hex characters;
-recovery retains colon-separated per-table fingerprints. Empty sums are zero.
-Coverage source/build/raw/canonical digests share the encoding and manifest
-schema 2 rejects schema-1 artifacts with regeneration guidance. The coverage
-build-directory ownership marker remains independent of artifact schema.
+Schema fingerprints retain canonical active-field ordering, now occupy 16
+bytes, and reject old 32-byte values. The descriptor limit remains 64,000 bytes.
+Benchmark verification sums length-delimited row hashes modulo 2^128 with an
+independent checked count; count overflow preserves state. Recovery retains
+per-table fingerprints. Coverage manifest schema 2 requires regeneration of
+old artifacts; its build-directory ownership marker is unchanged.
 
 ### Version gates
 
@@ -150,36 +122,31 @@ build-directory ownership marker remains independent of artifact schema.
 Unsupported slots cannot supply roots; a valid current alternate slot remains
 eligible. Entirely legacy files are rejected. Headerless DiskTree blocks stay
 behind table/catalog root gates; swap owners already recreate their files.
-The binding refinement retains these pending version numbers because the
-cutover is uncommitted. Earlier intermediate storage is disposable.
 
 ## Implementation Notes
 
-Implemented the full cutover and verified successful checkpoint publication,
-corruption handling, descriptor recovery, and auxiliary digest contracts. Direct
-BLAKE3/crc32fast dependencies and calls are gone; ordinary routing hashes and
-the test-only RowID sum remain unchanged.
+Replaced all repository-owned integrity algorithms and verified checkpoint
+publication, corruption handling, descriptor recovery, and auxiliary digests.
+Direct BLAKE3/crc32fast dependencies and calls are gone; ordinary routing hashes
+and the test-only RowID sum remain unchanged. Dependency and license policy
+were updated for xxhash-rust.
 
-Capacity review updated independent boundary fixtures instead of relaxing them:
-open-root fanout increases to 4,090/2,727 for the tested 4/8-byte key shapes;
-the worst supported standalone column leaf occupies 63,588 bytes with 104 fixed
-bytes; the deletion-growth fixture retains 1,920 entries. The separate
-prefix-width split fixture now forces a deletion bitmap across the capacity
-boundary and asserts one original leaf followed by 1,924/1 output entries.
-This prevents an already split setup from satisfying the test. Row-estimator
-fixtures distinguish column-count boundaries exposed by the extra 16 bytes.
-The shared LWC binding mutation changes the highest byte of the `u64` value.
+The material plan refinement was the user's choice of native XXH3-64 `u64`
+bindings instead of 128-bit bindings, preserving the original header widths.
+This was completed within the same format cutover. Capacity fixtures were
+updated for smaller trailers. Review strengthened the deletion-split test to
+require one original leaf before the deletion forces a split; an already split
+setup can no longer satisfy it. Corruption tests exercise the highest binding
+byte as well as every physical checksum byte.
 
 ### Correctness and review
 
-- Formatting and strict workspace Clippy passed; profiling-disabled storage
-  Clippy passed separately.
-- `cargo nextest run --workspace`: 2,291 passed.
-- `cargo nextest run -p doradb-storage --no-default-features`: 2,037 passed.
-- Pinned-nightly coverage-script tests: 24 passed in the original validation;
-  coverage tooling is unchanged by the binding refinement.
-- Style gate: 28 changed tracked Rust files, 431 test contracts, no violations.
-  Forced checksum/coverage style targets: three files and five tests, no violations.
+- Implementation validation passed 2,291 workspace tests, 2,037 storage tests
+  with profiling disabled, and 24 pinned-nightly coverage-script tests.
+  Strict workspace and profiling-disabled storage Clippy passed.
+- Resolution reran formatting, strict workspace Clippy, style, and test-contract
+  checks: 29 branch-diff Rust files, 433 contracts, no violations. The existing
+  execution results remain applicable; resolution changed documentation only.
 - Independent literals came from upstream C libxxhash 0.8.2, including algorithm
   boundaries, block-sized inputs, schema and fixed-input binding digests. The
   binding vector is native XXH3-64, not the low half of XXH3-128.
@@ -188,13 +155,12 @@ The shared LWC binding mutation changes the highest byte of the `u64` value.
   Repeated corruption cases use offset tables; existing setup helpers remain
   shared. No synchronization or runtime ownership change was needed.
 
-The artifact directory is
-[`target/checksum-migration-u64-binding/`](../../target/checksum-migration-u64-binding/README.md).
-It retains release binaries, lockfiles, build IDs, plans, environment details,
-commands, canonical results, stdout/stderr, raw captures, SVGs, analysis scripts,
-and verification logs. These are ignored local artifacts, not committed files.
-The earlier `u128` binding candidate and its measurements remain separately in
-[`target/checksum-migration/`](../../target/checksum-migration/README.md).
+Review found that ignored artifact links were unavailable in fresh checkouts.
+The per-run [checkpoint measurements](#checkpoint-measurements) and
+[profile counts](#cpu-attribution) are now preserved in this tracked document
+and were checked against the original results and captures. Raw benchmark
+results, captures, binaries, lockfiles, and flamegraphs remain local and are
+unavailable in fresh checkouts.
 
 ### Checkpoint measurements
 
@@ -204,9 +170,37 @@ features, the system allocator, and no CPU/allocator overrides on the same
 resolvable engine defaults. Only checkpoint diagnostics were enabled equally;
 profile copies additionally paused the final benchmark phase.
 
+The release binary build IDs were:
+
+| Revision | Build ID |
+| --- | --- |
+| Baseline | `fd2c2cc1382ccfa32ca137fb9d4e8034a04bacb1` |
+| Candidate | `3a293d07cf074b1dd864ac907fc7b6892e0c254e` |
+
+Each fixture inserted 1,000,000 sequential rows with 128-byte payloads, four
+threads, 16 sessions, batches of 100, and no index, then requested freezing a
+500,000-row prefix.
+
 Five independent baseline/candidate pairs ran interleaved, each against a fresh
 root with zero warm-ups and one measured checkpoint. Every run froze 500,416
 rows in 1,117 pages, published with one attempt, and recorded no retry waits.
+
+The following values come from each run's canonical benchmark result. Durations
+are milliseconds; the backend counter measures submit/wait elapsed time.
+Execution order was baseline 1, candidate 1, then the remaining pairs in order.
+
+| Revision | Run | Checkpoint sample | Attempt elapsed | Generic run elapsed | Backend submit/wait |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 1 | 93.504629 | 93.503962 | 93.648256 | 67.908600 |
+| Candidate | 1 | 54.991387 | 54.990554 | 55.099514 | 46.758667 |
+| Baseline | 2 | 76.631502 | 76.630752 | 76.739087 | 53.616149 |
+| Candidate | 2 | 67.593514 | 67.592931 | 67.727318 | 62.378181 |
+| Baseline | 3 | 59.705925 | 59.705050 | 59.840056 | 32.522527 |
+| Candidate | 3 | 42.077578 | 42.076703 | 42.180038 | 36.494617 |
+| Baseline | 4 | 81.912879 | 81.912129 | 82.047007 | 51.110503 |
+| Candidate | 4 | 62.481579 | 62.481079 | 62.589664 | 58.108977 |
+| Baseline | 5 | 69.256175 | 69.255341 | 69.369092 | 38.529683 |
+| Candidate | 5 | 44.496621 | 44.495871 | 44.626789 | 38.012736 |
 
 | Metric | Baseline median [range] | Candidate median [range] |
 | --- | --- | --- |
@@ -229,22 +223,28 @@ contains 1,117 LWC blocks, one column-index block, two table-meta blocks, and on
 super-block page. Allocated table bytes were 73,465,856 in every timed run.
 Thus smaller bindings save eight bytes per index entry versus the intermediate
 candidate without changing physical block counts for this fixture. Preparation
-redo allocations are retained without attributing batching variation solely to
-the wider checksum.
+redo batching variation is not attributed solely to the wider checksum.
 
-### CPU attribution and saved flamegraphs
+### CPU attribution
 
 Three additional profiles per revision used `perf record` with `cpu-clock:u`,
-9,970 Hz, DWARF stacks, and deterministic rendering. This matches the earlier
-high-frequency investigation; its 997 Hz candidate captures had too few hash
-samples for precise attribution. Attachment waited for the pause record,
+9,970 Hz, DWARF stacks, and deterministic rendering with perf 6.8.12 and
+flamegraph 0.6.13. Attachment waited for the pause record,
 `/proc` state T/t, and the profiler enable acknowledgement before SIGCONT.
 All PID threads were attached and both LWC worker TIDs contributed samples.
 
-Baseline profiles contained 837/812/856 total samples, 771/761/781 checkpoint
-samples, and 473/446/455 BLAKE3 samples. Candidate profiles contained
-342/390/366 total samples, 302/334/321 checkpoint samples, and 29/37/18 XXH3
-samples. Combined checksum shares were 1,374/2,313 (59.40%) and 84/957 (8.78%).
+Counts from the six saved profile captures are:
+
+| Revision | Run | All samples | Checkpoint/LWC samples | Checksum samples |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 1 | 837 | 771 | 473 |
+| Candidate | 1 | 342 | 302 | 29 |
+| Baseline | 2 | 812 | 761 | 446 |
+| Candidate | 2 | 390 | 334 | 37 |
+| Baseline | 3 | 856 | 781 | 455 |
+| Candidate | 3 | 366 | 321 | 18 |
+
+Combined checksum shares were 1,374/2,313 (59.40%) and 84/957 (8.78%).
 Whole-profile totals were 2,505 and 1,098; these are different denominators and
 are not substituted for checkpoint attribution.
 
@@ -252,8 +252,7 @@ The checkpoint denominator includes execution and asynchronous LWC pipeline
 stacks even when no coordinator checkpoint frame appears. Hash frames count
 once per sample; candidate attribution includes either XXH3 width. Other
 process/shutdown samples remain outside that denominator. Profiled timings
-are not timing baselines. All six final SVGs and raw captures are linked from
-the artifact README under `{baseline,candidate}/profile-{1,2,3}/`.
+are not timing baselines.
 
 ## Impacts
 
@@ -279,8 +278,7 @@ the necessary contract updates.
 
 ## Open Questions
 
-None blocking this cutover. Backlog 000207 is closed against the approved
-repository-wide policy and checkpoint evidence. Its original microbenchmark,
-other-workload, and x86_64 campaign hints were not performed and are not claimed
-as delivered. They remain possible future evidence, rather than prerequisites
-for this implementation or justification for broader performance claims.
+None. Source backlog 000207 is closed as implemented under the approved scope.
+Its broader microbenchmark, other-workload, and x86_64 campaign hints were not
+performed and are not claimed as delivered. No actionable follow-up was
+deferred by this implementation.
