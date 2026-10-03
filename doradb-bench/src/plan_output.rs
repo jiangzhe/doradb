@@ -124,6 +124,13 @@ pub(crate) fn render_stdout_summary(
             "\nverification: complete\nOne CREATE sample; p95/p99 do not establish a distribution.",
         );
     }
+    if matches!(workload.identity(), "update-all" | "update-point-rand") {
+        summary.push_str(&format!(
+            "\nupdated_rows: {}\nupdated_rows_per_second: {:.3}",
+            aggregate.counters.updated_rows,
+            operations_per_second(aggregate.counters.updated_rows, aggregate.elapsed_nanos),
+        ));
+    }
     if matches!(workload.identity(), "delete-all" | "delete-rand") {
         summary.push_str(&format!(
             "\ndeleted_rows: {}\ndeleted_rows_per_second: {:.3}",
@@ -783,6 +790,88 @@ mod tests {
                 let row_rate = if elapsed == 0 { "0.000" } else { "3.500" };
                 assert!(summary.contains(&format!("\noperations_per_second: {request_rate}\n")));
                 assert!(summary.contains(&format!("\ndeleted_rows_per_second: {row_rate}\n")));
+                assert!(summary.contains(&format!("latency_unit: {}\n", workload.latency_unit())));
+            }
+        }
+    }
+
+    /// Purpose: Distinguish update request throughput from affected-row throughput in canonical output.
+    /// Expected: Both update identities retain counters/units on round trip and print independent rates, including zero time.
+    #[test]
+    fn update_output_reports_request_and_row_rates() {
+        use crate::fixture::IndexMode;
+        use crate::plan::{UpdateAllConfig, UpdatePointRandConfig};
+        let temp = TempDir::new().unwrap();
+        for workload in [
+            ResolvedWorkload::UpdateAll(UpdateAllConfig {
+                seed: 9,
+                change_key: false,
+                value_size_bytes: 1,
+                index: IndexMode::NonUnique,
+                loaded_range: KeyRange { start: 0, len: 10 },
+                alternate_range: None,
+                include_stats: false,
+            }),
+            ResolvedWorkload::UpdatePointRand(UpdatePointRandConfig {
+                change_key: false,
+                value_size_bytes: 1,
+                alternate_range: None,
+                num: 3,
+                seed: 9,
+                threads: 1,
+                sessions: 1,
+                batch_size: 3,
+                index: IndexMode::NonUnique,
+                loaded_range: KeyRange { start: 0, len: 10 },
+                include_stats: false,
+            }),
+        ] {
+            let mut report = report(temp.path());
+            let Phase::Benchmark {
+                workload: target, ..
+            } = &mut report.plan.phases[0]
+            else {
+                unreachable!()
+            };
+            *target = workload.clone();
+            let full = matches!(workload, ResolvedWorkload::UpdateAll(_));
+            report.aggregate.counters = WorkloadCounters {
+                operations: if full { 1 } else { 3 },
+                updated_rows: 7,
+                found: if full { 0 } else { 2 },
+                not_found: if full { 0 } else { 1 },
+                ..WorkloadCounters::default()
+            };
+            report.aggregate.latency.unit = workload.latency_unit();
+            for elapsed in [2_000_000_000, 0] {
+                report.aggregate.elapsed_nanos = elapsed;
+                report.aggregate.operations_per_second =
+                    operations_per_second(report.aggregate.counters.operations, elapsed);
+                report.measured_runs = vec![MeasuredRunResult {
+                    run_index: 1,
+                    elapsed_nanos: elapsed,
+                    counters: report.aggregate.counters,
+                    operations_per_second: report.aggregate.operations_per_second,
+                    latency: report.aggregate.latency.clone(),
+                    workload_metrics: None,
+                    internal_metrics: vec![],
+                }];
+                let path = write_plan_output(&report).unwrap();
+                let decoded: InvocationReport =
+                    toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+                assert_eq!(decoded, report);
+                let summary = render_stdout_summary(&decoded, &path).unwrap();
+                assert!(summary.contains("updated_rows: 7\n"));
+                let request_rate = if elapsed == 0 {
+                    "0.000"
+                } else if full {
+                    "0.500"
+                } else {
+                    "1.500"
+                };
+                let row_rate = if elapsed == 0 { "0.000" } else { "3.500" };
+                assert!(summary.contains(&format!("\noperations_per_second: {request_rate}\n")));
+                assert!(summary.contains(&format!("\nupdated_rows_per_second: {row_rate}\n")));
                 assert!(summary.contains(&format!("latency_unit: {}\n", workload.latency_unit())));
             }
         }

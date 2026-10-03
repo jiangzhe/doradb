@@ -107,6 +107,10 @@ pub enum LatencyUnit {
     InsertBatchTransaction,
     /// One index update range transaction from begin through successful commit.
     UpdateRangeTransaction,
+    /// One full-table update transaction.
+    UpdateAllTransaction,
+    /// One transaction containing equality-key update requests.
+    UpdatePointBatchTransaction,
     /// One full-table delete transaction from begin through successful commit.
     DeleteAllTransaction,
     /// One point-delete batch transaction from begin through successful commit.
@@ -152,6 +156,8 @@ impl fmt::Display for LatencyUnit {
             Self::TableBindingResolution => "table-binding-resolution",
             Self::InsertBatchTransaction => "insert-batch-transaction",
             Self::UpdateRangeTransaction => "update-range-transaction",
+            Self::UpdateAllTransaction => "update-all-transaction",
+            Self::UpdatePointBatchTransaction => "update-point-batch-transaction",
             Self::DeleteAllTransaction => "delete-all-transaction",
             Self::DeleteBatchTransaction => "delete-batch-transaction",
             Self::TableCreateDropCycle => "table-create-drop-cycle",

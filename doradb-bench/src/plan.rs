@@ -192,6 +192,10 @@ pub enum WorkloadSpec {
     InsertRand(InsertSpec),
     /// Update seeded random logical-key ranges through a secondary index.
     UpdateRand(UpdateSpec),
+    /// Update every primary-table row in one transaction.
+    UpdateAll(UpdateAllSpec),
+    /// Update seeded equality-key requests through a secondary index.
+    UpdatePointRand(UpdatePointRandSpec),
     /// Delete every primary-table row in one transaction.
     DeleteAll(DeleteAllSpec),
     /// Delete seeded equality-key requests through a secondary index.
@@ -412,6 +416,42 @@ pub struct UpdateSpec {
     /// Optional generated payload-size override.
     pub value_size: Option<Byte>,
     /// Optional preferred key-range width per transaction.
+    pub batch_size: Option<NonZeroU64>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict full-table update controls; worker and batch overrides are unsupported.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAllSpec {
+    /// Optional deterministic payload seed.
+    pub seed: Option<u64>,
+    /// Optionally move logical keys between disjoint replay domains.
+    pub change_key: Option<bool>,
+    /// Optional positive generated payload-size override.
+    pub value_size: Option<Byte>,
+    /// Optional engine-diagnostic override.
+    pub include_stats: Option<bool>,
+}
+
+/// Strict random point-update controls.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePointRandSpec {
+    /// Positive aggregate equality-key request count, sampled with replacement.
+    pub num: NonZeroU64,
+    /// Optional deterministic point-selection and payload seed.
+    pub seed: Option<u64>,
+    /// Optionally move logical keys between disjoint replay domains.
+    pub change_key: Option<bool>,
+    /// Optional executor thread override.
+    pub threads: Option<NonZeroUsize>,
+    /// Optional public session override.
+    pub sessions: Option<NonZeroUsize>,
+    /// Optional positive generated payload-size override.
+    pub value_size: Option<Byte>,
+    /// Optional maximum point requests per transaction.
     pub batch_size: Option<NonZeroU64>,
     /// Optional engine-diagnostic override.
     pub include_stats: Option<bool>,
@@ -879,6 +919,54 @@ pub struct UpdateConfig {
     pub include_stats: bool,
 }
 
+/// Resolved full-table update configuration; execution uses one session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateAllConfig {
+    /// Deterministic payload and selection seed.
+    pub seed: u64,
+    /// Whether updates move the logical index key.
+    pub change_key: bool,
+    /// Positive generated payload bytes.
+    pub value_size_bytes: usize,
+    /// Bound primary-table secondary-index shape.
+    pub index: IndexMode,
+    /// Original candidate loaded-key domain, including preparation gaps.
+    pub loaded_range: KeyRange,
+    /// Equal-width disjoint replay domain, present only for key changes.
+    pub alternate_range: Option<KeyRange>,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
+/// Resolved random point-update configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePointRandConfig {
+    /// Aggregate equality-key request count, independent of affected rows.
+    pub num: u64,
+    /// Executor thread count.
+    pub threads: usize,
+    /// Independent public session count.
+    pub sessions: usize,
+    /// Maximum point requests per transaction.
+    pub batch_size: u64,
+    /// Deterministic payload and selection seed.
+    pub seed: u64,
+    /// Whether updates move the logical index key.
+    pub change_key: bool,
+    /// Positive generated payload bytes.
+    pub value_size_bytes: usize,
+    /// Bound primary-table secondary-index shape.
+    pub index: IndexMode,
+    /// Original candidate loaded-key domain, including preparation gaps.
+    pub loaded_range: KeyRange,
+    /// Equal-width disjoint replay domain, present only for key changes.
+    pub alternate_range: Option<KeyRange>,
+    /// Whether engine diagnostics are captured around the run.
+    pub include_stats: bool,
+}
+
 /// Resolved full-table delete configuration; execution uses one session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1065,6 +1153,10 @@ pub enum ResolvedWorkload {
     InsertRand(InsertConfig),
     /// Seeded random secondary-index update workload.
     UpdateRand(UpdateConfig),
+    /// Full-table update through one transaction.
+    UpdateAll(UpdateAllConfig),
+    /// Seeded random equality-key update requests.
+    UpdatePointRand(UpdatePointRandConfig),
     /// One full-table delete transaction.
     DeleteAll(DeleteAllConfig),
     /// Seeded point-delete requests in per-session transaction batches.
@@ -1111,6 +1203,8 @@ impl ResolvedWorkload {
             Self::InsertSeq(_) => "insert-seq",
             Self::InsertRand(_) => "insert-rand",
             Self::UpdateRand(_) => "update-rand",
+            Self::UpdateAll(_) => "update-all",
+            Self::UpdatePointRand(_) => "update-point-rand",
             Self::DeleteAll(_) => "delete-all",
             Self::DeleteRand(_) => "delete-rand",
             Self::TableDdl(_) => "table-ddl",
@@ -1141,12 +1235,14 @@ impl ResolvedWorkload {
             Self::ManagedBindingsPrepare(_) => FixtureRequirement::AbsentManagedBindings,
             Self::ResolveTableBinding(_) => FixtureRequirement::ManagedBindings,
             Self::InsertSeq(_) | Self::InsertRand(_) => FixtureRequirement::Insert,
-            Self::UpdateRand(_) | Self::DeleteAll(_) | Self::DeleteRand(_) => {
-                FixtureRequirement::Primary {
-                    index: IndexRequirement::Secondary,
-                    load: LoadRequirement::Committed,
-                }
-            }
+            Self::UpdateRand(_)
+            | Self::UpdateAll(_)
+            | Self::UpdatePointRand(_)
+            | Self::DeleteAll(_)
+            | Self::DeleteRand(_) => FixtureRequirement::Primary {
+                index: IndexRequirement::Secondary,
+                load: LoadRequirement::Committed,
+            },
             Self::LookupSeq(_) | Self::LookupRand(_) => FixtureRequirement::Primary {
                 index: IndexRequirement::Exact(IndexMode::Unique),
                 load: LoadRequirement::Committed,
@@ -1194,6 +1290,8 @@ impl ResolvedWorkload {
             | Self::IndexScan(_)
             | Self::IndexStream(_)
             | Self::UpdateRand(_)
+            | Self::UpdateAll(_)
+            | Self::UpdatePointRand(_)
             | Self::LockTable(_)
             | Self::ResolveTableBinding(_) => ReplayPolicy::Safe,
             Self::CreateTable(_)
@@ -1219,7 +1317,8 @@ impl ResolvedWorkload {
             Self::StmtNoop(config) | Self::TrxNoop(config) => (config.threads, config.sessions),
             Self::InsertSeq(config) | Self::InsertRand(config) => (config.threads, config.sessions),
             Self::UpdateRand(config) => (config.threads, config.sessions),
-            Self::DeleteAll(_) => (1, 1),
+            Self::UpdateAll(_) | Self::DeleteAll(_) => (1, 1),
+            Self::UpdatePointRand(config) => (config.threads, config.sessions),
             Self::DeleteRand(config) => (config.threads, config.sessions),
             Self::TableDdl(config) | Self::IndexDdl(config) => (config.threads, config.sessions),
             Self::LookupSeq(config)
@@ -1247,6 +1346,8 @@ impl ResolvedWorkload {
             Self::StmtNoop(config) | Self::TrxNoop(config) => config.include_stats,
             Self::InsertSeq(config) | Self::InsertRand(config) => config.include_stats,
             Self::UpdateRand(config) => config.include_stats,
+            Self::UpdateAll(config) => config.include_stats,
+            Self::UpdatePointRand(config) => config.include_stats,
             Self::DeleteAll(config) => config.include_stats,
             Self::DeleteRand(config) => config.include_stats,
             Self::TableDdl(config) | Self::IndexDdl(config) => config.include_stats,
@@ -1276,6 +1377,8 @@ impl ResolvedWorkload {
             Self::TrxNoop(_) => LatencyUnit::TransactionLifecycle,
             Self::InsertSeq(_) | Self::InsertRand(_) => LatencyUnit::InsertBatchTransaction,
             Self::UpdateRand(_) => LatencyUnit::UpdateRangeTransaction,
+            Self::UpdateAll(_) => LatencyUnit::UpdateAllTransaction,
+            Self::UpdatePointRand(_) => LatencyUnit::UpdatePointBatchTransaction,
             Self::DeleteAll(_) => LatencyUnit::DeleteAllTransaction,
             Self::DeleteRand(_) => LatencyUnit::DeleteBatchTransaction,
             Self::TableDdl(_) => LatencyUnit::TableCreateDropCycle,
@@ -1306,7 +1409,9 @@ impl ResolvedWorkload {
     /// Return the exact successful sampled-run latency count.
     pub fn expected_samples(&self) -> Result<u64> {
         match self {
-            Self::Recovery(_) | Self::CreateIndex(_) | Self::DeleteAll(_) => Ok(1),
+            Self::Recovery(_) | Self::CreateIndex(_) | Self::DeleteAll(_) | Self::UpdateAll(_) => {
+                Ok(1)
+            }
             Self::CreateTable(config) => u64::try_from(config.table_count)
                 .map_err(|_| BenchError::message("table count exceeds u64")),
             Self::StmtNoop(config) | Self::TrxNoop(config) => Ok(config.num),
@@ -1316,6 +1421,9 @@ impl ResolvedWorkload {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
             Self::UpdateRand(config) => {
+                aggregate_batch_count(config.num, config.sessions, config.batch_size)
+            }
+            Self::UpdatePointRand(config) => {
                 aggregate_batch_count(config.num, config.sessions, config.batch_size)
             }
             Self::DeleteRand(config) => {
@@ -1430,6 +1538,8 @@ fn validate_and_resolve_phases(
             && matches!(
                 workload,
                 ResolvedWorkload::UpdateRand(_)
+                    | ResolvedWorkload::UpdateAll(_)
+                    | ResolvedWorkload::UpdatePointRand(_)
                     | ResolvedWorkload::DeleteAll(_)
                     | ResolvedWorkload::DeleteRand(_)
                     | ResolvedWorkload::Recovery(_)
@@ -1600,6 +1710,12 @@ fn resolve_workload(
         WorkloadSpec::UpdateRand(spec) => no_effect(ResolvedWorkload::UpdateRand(resolve_update(
             spec, defaults, fixture,
         )?)),
+        WorkloadSpec::UpdateAll(spec) => no_effect(ResolvedWorkload::UpdateAll(
+            resolve_update_all(spec, defaults, fixture)?,
+        )),
+        WorkloadSpec::UpdatePointRand(spec) => no_effect(ResolvedWorkload::UpdatePointRand(
+            resolve_update_point_rand(spec, defaults, fixture)?,
+        )),
         WorkloadSpec::DeleteAll(spec) => no_effect(ResolvedWorkload::DeleteAll(DeleteAllConfig {
             include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
         })),
@@ -1859,6 +1975,85 @@ fn resolve_delete_rand(
     })
 }
 
+fn resolve_update_all(
+    spec: UpdateAllSpec,
+    defaults: ResolvedWorkloadDefaults,
+    fixture: &FixturePlanState,
+) -> Result<UpdateAllConfig> {
+    let value_size_bytes = spec
+        .value_size
+        .map_or(Ok(defaults.value_size_bytes), |value| {
+            byte_usize(value, "update.value_size")
+        })?;
+    validate_value_size(value_size_bytes)?;
+    if value_size_bytes == 0 {
+        return Err(BenchError::message("update value size must be positive"));
+    }
+    let loaded_range = fixture.loaded_range()?;
+    let loaded_end = loaded_range.end()?;
+    let change_key = spec.change_key.unwrap_or(false);
+    let alternate_range = if change_key {
+        let alternate = KeyRange {
+            start: loaded_end,
+            len: loaded_range.len,
+        };
+        alternate.end()?;
+        Some(alternate)
+    } else {
+        None
+    };
+    Ok(UpdateAllConfig {
+        seed: spec.seed.unwrap_or(0),
+        change_key,
+        value_size_bytes,
+        index: fixture.primary_shape()?.index,
+        loaded_range,
+        alternate_range,
+        include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
+    })
+}
+
+fn resolve_update_point_rand(
+    spec: UpdatePointRandSpec,
+    defaults: ResolvedWorkloadDefaults,
+    fixture: &FixturePlanState,
+) -> Result<UpdatePointRandConfig> {
+    let (threads, sessions) = resolve_workers(spec.threads, spec.sessions, defaults)?;
+    let batch_size = spec.batch_size.map_or(defaults.batch_size, NonZeroU64::get);
+    validate_batch_size(batch_size)?;
+    let common = resolve_update_all(
+        UpdateAllSpec {
+            seed: spec.seed,
+            change_key: spec.change_key,
+            value_size: spec.value_size,
+            include_stats: spec.include_stats,
+        },
+        defaults,
+        fixture,
+    )?;
+    let sessions_u64 =
+        u64::try_from(sessions).map_err(|_| BenchError::message("session count exceeds u64"))?;
+    if sessions_u64 > common.loaded_range.len {
+        return Err(BenchError::message(format!(
+            "update sessions ({sessions}) exceed loaded key range length ({})",
+            common.loaded_range.len
+        )));
+    }
+    Ok(UpdatePointRandConfig {
+        num: spec.num.get(),
+        threads,
+        sessions,
+        batch_size,
+        seed: common.seed,
+        change_key: common.change_key,
+        value_size_bytes: common.value_size_bytes,
+        index: common.index,
+        loaded_range: common.loaded_range,
+        alternate_range: common.alternate_range,
+        include_stats: common.include_stats,
+    })
+}
+
 fn resolve_update(
     spec: UpdateSpec,
     defaults: ResolvedWorkloadDefaults,
@@ -2113,6 +2308,186 @@ mod tests {
         format!(
             "[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 7 }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}\n"
         )
+    }
+
+    /// Purpose: Resolve full and point updates with inherited controls, independent request budgets, and replay.
+    /// Expected: Both indexes retain normalized settings, fixed full-table topology, exact sample counts, and TOML round trips.
+    #[test]
+    fn explicit_update_plans_resolve_controls_and_replay() {
+        let defaults = "[workload_defaults]\nthreads = 2\nsessions = 3\nbatch_size = 4\nvalue_size = '19 B'\ninclude_stats = true\n";
+        for index in [IndexMode::Unique, IndexMode::NonUnique] {
+            let all = resolve(&format!(
+                "{defaults}{}",
+                delete_plan(&index.to_string(), "type = 'update-all'")
+            ))
+            .unwrap();
+            let full = UpdateAllConfig {
+                seed: 0,
+                change_key: false,
+                value_size_bytes: 19,
+                index,
+                loaded_range: KeyRange { start: 0, len: 7 },
+                alternate_range: None,
+                include_stats: true,
+            };
+            assert_eq!(*all[2].workload(), ResolvedWorkload::UpdateAll(full));
+            assert_eq!(all[2].workload().worker_counts(), (1, 1));
+            assert_eq!(all[2].workload().expected_samples().unwrap(), 1);
+            assert_eq!(
+                all[2].workload().latency_unit(),
+                LatencyUnit::UpdateAllTransaction
+            );
+            for (num, sessions, batch, samples) in [(11, 3, 2, 6), (2, 4, 3, 2)] {
+                let raw = delete_plan(&index.to_string(), &format!("type = 'update-point-rand', num = {num}, sessions = {sessions}, threads = 2, batch_size = {batch}, seed = 19, change_key = true, value_size = '3 B', include_stats = false"))
+                    .replace("kind = 'benchmark'", "kind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 3");
+                let phases = resolve(&format!("{defaults}{raw}")).unwrap();
+                let workload = phases[2].workload();
+                assert_eq!(
+                    *workload,
+                    ResolvedWorkload::UpdatePointRand(UpdatePointRandConfig {
+                        num,
+                        threads: 2,
+                        sessions,
+                        batch_size: batch,
+                        seed: 19,
+                        change_key: true,
+                        value_size_bytes: 3,
+                        index,
+                        loaded_range: full.loaded_range,
+                        alternate_range: Some(KeyRange { start: 7, len: 7 }),
+                        include_stats: false,
+                    })
+                );
+                assert_eq!(workload.worker_counts(), (2, sessions));
+                assert_eq!(workload.expected_samples().unwrap(), samples);
+                assert_eq!(
+                    workload.latency_unit(),
+                    LatencyUnit::UpdatePointBatchTransaction
+                );
+                assert_eq!(workload.replay_policy(), ReplayPolicy::Safe);
+                assert_eq!(
+                    toml::from_str::<ResolvedWorkload>(&toml::to_string(workload).unwrap())
+                        .unwrap(),
+                    *workload
+                );
+            }
+            let point = resolve(&format!(
+                "{defaults}{}",
+                delete_plan(&index.to_string(), "type = 'update-point-rand', num = 1")
+            ))
+            .unwrap();
+            assert_eq!(
+                *point[2].workload(),
+                ResolvedWorkload::UpdatePointRand(UpdatePointRandConfig {
+                    num: 1,
+                    threads: 2,
+                    sessions: 3,
+                    batch_size: 4,
+                    seed: 0,
+                    change_key: false,
+                    value_size_bytes: 19,
+                    index,
+                    loaded_range: full.loaded_range,
+                    alternate_range: None,
+                    include_stats: true,
+                })
+            );
+            let changed = resolve(&delete_plan(&index.to_string(), "type = 'update-all', seed = 9, change_key = true, value_size = '1 B', include_stats = false")
+                .replace("kind = 'benchmark'", "kind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 2")).unwrap();
+            let workload = changed[2].workload();
+            assert_eq!(
+                *workload,
+                ResolvedWorkload::UpdateAll(UpdateAllConfig {
+                    seed: 9,
+                    change_key: true,
+                    value_size_bytes: 1,
+                    alternate_range: Some(KeyRange { start: 7, len: 7 }),
+                    include_stats: false,
+                    ..full
+                })
+            );
+            assert_eq!(workload.replay_policy(), ReplayPolicy::Safe);
+            assert_eq!(
+                toml::from_str::<ResolvedWorkload>(&toml::to_string(workload).unwrap()).unwrap(),
+                *workload
+            );
+        }
+    }
+
+    /// Purpose: Reject invalid new update plans before runtime and reserve replay space only for key movement.
+    /// Expected: Unsupported fields, fixtures, placement, limits, and overflowing replay domains fail while payload-only maximum domains resolve.
+    #[test]
+    fn explicit_update_plans_reject_invalid_controls_and_domains() {
+        for controls in ["type = 'update-all'", "type = 'update-point-rand', num = 1"] {
+            assert!(resolve(&delete_plan("none", controls)).is_err());
+            for prefix in [
+                "",
+                "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n",
+            ] {
+                assert!(
+                    resolve(&format!(
+                        "{prefix}[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}"
+                    ))
+                    .is_err()
+                );
+            }
+            for extra in [
+                "value_size = '0 B'",
+                "value_size = '1 MiB'",
+                "range = 1",
+                "index = 'unique'",
+                "unknown = 1",
+            ] {
+                assert!(
+                    resolve(&delete_plan("unique", &format!("{controls}, {extra}"))).is_err(),
+                    "{extra}"
+                );
+            }
+            let valid = delete_plan("unique", controls);
+            let prepare = valid.replace("kind = 'benchmark'", "kind = 'prepare'")
+                + "[[phase]]\nkind = 'benchmark'\nworkload = { type = 'trx-noop', num = 1 }";
+            assert!(
+                resolve(&prepare)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("final benchmark")
+            );
+            let huge = valid.replace("num = 7", "num = 18446744073709551615");
+            assert!(resolve(&huge).is_ok());
+            assert!(
+                resolve(&huge.replace(controls, &format!("{controls}, change_key = true")))
+                    .is_err()
+            );
+            let overflow = huge.replace("[[phase]]\nkind = 'benchmark'", "[[phase]]\nworkload = { type = 'insert-seq', num = 1 }\n[[phase]]\nkind = 'benchmark'");
+            assert!(resolve(&overflow).is_err());
+        }
+        for field in ["num = 1", "threads = 1", "sessions = 1", "batch_size = 1"] {
+            assert!(
+                parse(&delete_plan(
+                    "unique",
+                    &format!("type = 'update-all', {field}")
+                ))
+                .is_err()
+            );
+        }
+        for controls in [
+            "num = 0",
+            "num = 1, sessions = 0",
+            "num = 1, threads = 0",
+            "num = 1, batch_size = 0",
+            "num = 1, threads = 2, sessions = 1",
+            "num = 1, sessions = 8",
+        ] {
+            assert!(
+                resolve(&delete_plan(
+                    "unique",
+                    &format!("type = 'update-point-rand', {controls}")
+                ))
+                .is_err(),
+                "{controls}"
+            );
+        }
+        assert!(parse(&delete_plan("unique", "type = 'update-point-rand'")).is_err());
     }
 
     /// Purpose: Resolve delete request budgets, inherited controls, and destructive replay rules.
@@ -2938,6 +3313,10 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
             ("insert-seq.toml", "insert-seq"),
             ("insert-rand.toml", "insert-rand"),
             ("update-rand.toml", "update-rand"),
+            ("update-all-unique.toml", "update-all"),
+            ("update-all-non-unique.toml", "update-all"),
+            ("update-point-rand-unique.toml", "update-point-rand"),
+            ("update-point-rand-non-unique.toml", "update-point-rand"),
             ("delete-all-unique.toml", "delete-all"),
             ("delete-all-non-unique.toml", "delete-all"),
             ("delete-rand-unique.toml", "delete-rand"),

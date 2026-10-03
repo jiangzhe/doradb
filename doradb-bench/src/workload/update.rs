@@ -1,22 +1,30 @@
 use crate::error::{BenchError, Result};
-use crate::fixture::{FixturePlanEffect, FixtureRuntimeEffect, KeyRange, PrimaryBinding};
+use crate::fixture::{
+    FixturePlanEffect, FixtureRuntimeEffect, IndexMode, KeyRange, PrimaryBinding,
+};
 use crate::measurement::{
     ExpectedOutcomeCounters, LatencyDistribution, MeasurementClock, WorkloadCounters,
 };
-use crate::plan::UpdateConfig;
+use crate::plan::{UpdateAllConfig, UpdateConfig, UpdatePointRandConfig};
 use crate::plan_executor::{
     SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
 };
 use crate::workload::util::{
-    generate_payload, merge_measurement, operation_plans, require_primary, verify_no_effect,
-    verify_samples,
+    RandomScanRangeGenerator, build_session_plans, effective_batch_size, generate_payload,
+    merge_measurement, operation_plans, require_primary, verify_no_effect, verify_samples,
 };
+use crate::workload::verification::{Fingerprint, scan_content};
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::id::TableID;
 use doradb_storage::{
-    CallbackError, CallbackResult, Engine, ErrorKind, IndexID, RowMutation, Session, TableIndex,
+    CallbackError, CallbackResult, Engine, ErrorKind, IndexID, LazyRow, RowMutation, Session,
+    TableIndex, TableMutationOutcome, Transaction, UniqueMutation, UniqueMutationOutcome,
     UpdateCol, Val,
 };
+use std::sync::Arc;
+
+#[cfg(test)]
+pub(crate) use tests::set_update_completion_hook;
 
 const SPLITMIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 const UPDATE_RANGE_SALT: u64 = 0xd743_8f29_51ce_6a0b;
@@ -78,6 +86,215 @@ impl SessionExecutor for UpdateRandExecutor {
         expected_samples: u64,
     ) -> Result<FixtureRuntimeEffect> {
         verify_update_outcome(planned_effect, outcome, expected_samples)
+    }
+}
+
+/// Full primary-table update in one transaction and session.
+#[derive(Clone, Copy)]
+pub(crate) struct UpdateAllExecutor {
+    config: UpdateAllConfig,
+    primary: PrimaryBinding,
+    execution_ordinal: u32,
+}
+
+impl SessionExecutor for UpdateAllExecutor {
+    type Config = SessionExecutorConfig<UpdateAllConfig>;
+    type Outcome = UpdateSessionOutcome;
+
+    const IDENTITY: &'static str = "update-all";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        let primary = require_primary(config.binding, Self::IDENTITY)?;
+        let resolved = config.resolved;
+        validate_update_binding(
+            primary,
+            resolved.index,
+            resolved.loaded_range,
+            resolved.alternate_range,
+            resolved.change_key,
+            resolved.value_size_bytes,
+        )?;
+        Ok(Self {
+            config: resolved,
+            primary,
+            execution_ordinal: config.execution_ordinal,
+        })
+    }
+
+    fn threads(&self) -> usize {
+        1
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(1, 1)
+    }
+
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        _plan: &SessionPlan,
+        clock: &MeasurementClock,
+        sample_latency: bool,
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
+        let mut outcome = UpdateSessionOutcome::empty()?;
+        if !cancellation.is_cancelled() {
+            update_transaction(
+                session,
+                self.primary,
+                UpdateTargets::All,
+                UpdateValues::new(
+                    self.config.seed,
+                    self.config.value_size_bytes,
+                    self.config.loaded_range,
+                    self.config.alternate_range,
+                    self.execution_ordinal,
+                ),
+                &mut outcome.measurement,
+                sample_latency.then_some(clock),
+            )
+            .await?;
+        }
+        Ok(outcome)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_explicit_update_outcome(
+            Self::IDENTITY,
+            self.primary,
+            None,
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
+    }
+}
+
+/// Seeded equality-key updates over disjoint candidate-key ranges.
+#[derive(Clone)]
+pub(crate) struct UpdatePointRandExecutor {
+    config: UpdatePointRandConfig,
+    primary: PrimaryBinding,
+    execution_ordinal: u32,
+    shards: Arc<[KeyRange]>,
+}
+
+impl SessionExecutor for UpdatePointRandExecutor {
+    type Config = SessionExecutorConfig<UpdatePointRandConfig>;
+    type Outcome = UpdateSessionOutcome;
+
+    const IDENTITY: &'static str = "update-point-rand";
+
+    fn new(config: Self::Config) -> Result<Self> {
+        let primary = require_primary(config.binding, Self::IDENTITY)?;
+        let resolved = config.resolved;
+        validate_update_binding(
+            primary,
+            resolved.index,
+            resolved.loaded_range,
+            resolved.alternate_range,
+            resolved.change_key,
+            resolved.value_size_bytes,
+        )?;
+        let shards = build_session_plans(resolved.loaded_range, resolved.sessions)?
+            .into_iter()
+            .map(|plan| KeyRange {
+                start: plan.key_start,
+                len: plan.number,
+            })
+            .collect::<Vec<_>>();
+        if shards.iter().any(|shard| shard.is_empty()) {
+            return Err(BenchError::message(
+                "update session shards must be nonempty",
+            ));
+        }
+        Ok(Self {
+            config: resolved,
+            primary,
+            execution_ordinal: config.execution_ordinal,
+            shards: shards.into(),
+        })
+    }
+
+    fn threads(&self) -> usize {
+        self.config.threads
+    }
+
+    fn session_plans(&self) -> Result<Vec<SessionPlan>> {
+        operation_plans(self.config.num, self.config.sessions)
+    }
+
+    async fn execute(
+        &self,
+        _engine: &Engine,
+        session: &mut Session,
+        plan: &SessionPlan,
+        clock: &MeasurementClock,
+        sample_latency: bool,
+        cancellation: &RunCancellation,
+    ) -> Result<Self::Outcome> {
+        let mut outcome = UpdateSessionOutcome::empty()?;
+        if plan.number == 0 {
+            return Ok(outcome);
+        }
+        let shard = *self
+            .shards
+            .get(plan.session_index)
+            .ok_or_else(|| BenchError::message("update session shard index is invalid"))?;
+        // Generate in the original domain on every run. Batch boundaries and replay
+        // parity must not change the relative sequence, including repeated keys.
+        let mut generator = RandomScanRangeGenerator::new(self.config.seed, shard, 1, plan)?;
+        let values = UpdateValues::new(
+            self.config.seed,
+            self.config.value_size_bytes,
+            self.config.loaded_range,
+            self.config.alternate_range,
+            self.execution_ordinal,
+        );
+        let batch_size = effective_batch_size(self.config.batch_size, plan.number)?;
+        let mut keys = Vec::with_capacity(batch_size);
+        let mut remaining = plan.number;
+        while remaining != 0 && !cancellation.is_cancelled() {
+            keys.clear();
+            for _ in 0..remaining.min(batch_size as u64) {
+                let offset =
+                    domain_offset(generator.next_range()?.start, self.config.loaded_range)?;
+                keys.push(key_at_domain_offset(values.source_domain, offset)?);
+            }
+            update_transaction(
+                session,
+                self.primary,
+                UpdateTargets::Points(&keys),
+                values,
+                &mut outcome.measurement,
+                sample_latency.then_some(clock),
+            )
+            .await?;
+            remaining -= keys.len() as u64;
+        }
+        Ok(outcome)
+    }
+
+    fn verify_outcome(
+        &self,
+        planned_effect: &FixturePlanEffect,
+        outcome: &Self::Outcome,
+        expected_samples: u64,
+    ) -> Result<FixtureRuntimeEffect> {
+        verify_explicit_update_outcome(
+            Self::IDENTITY,
+            self.primary,
+            Some(self.config.num),
+            planned_effect,
+            outcome,
+            expected_samples,
+        )
     }
 }
 
@@ -196,6 +413,275 @@ impl RandomUpdateRangeGenerator {
             .ok_or_else(|| BenchError::message("update chunk ordinal overflow"))?;
         Ok(Some(range))
     }
+}
+
+#[derive(Clone, Copy)]
+struct UpdateValues {
+    seed: u64,
+    value_size: usize,
+    change_key: bool,
+    source_domain: KeyRange,
+    target_domain: KeyRange,
+    payload_variant: bool,
+}
+
+impl UpdateValues {
+    fn new(
+        seed: u64,
+        value_size: usize,
+        loaded: KeyRange,
+        alternate: Option<KeyRange>,
+        ordinal: u32,
+    ) -> Self {
+        let reverse = ordinal % 2 == 1;
+        let (source_domain, target_domain) = match alternate {
+            Some(alternate) if reverse => (alternate, loaded),
+            Some(alternate) => (loaded, alternate),
+            None => (loaded, loaded),
+        };
+        Self {
+            seed,
+            value_size,
+            change_key: alternate.is_some(),
+            source_domain,
+            target_domain,
+            payload_variant: reverse,
+        }
+    }
+}
+
+enum UpdateTargets<'a> {
+    All,
+    Points(&'a [u64]),
+}
+
+/// Verify row cardinality and table/index agreement once after all benchmark runs.
+pub(crate) async fn complete_update(engine: &Engine, primary: PrimaryBinding) -> Result<()> {
+    #[cfg(test)]
+    tests::run_completion_hook(engine, primary);
+    let mut session = engine.new_session()?;
+    let result = async {
+        let table = scan_content(&mut session, primary.table_id, None).await?;
+        let index = scan_content(&mut session, primary.table_id, Some(IndexID::new(0))).await?;
+        verify_updated_content(primary.inserted_rows, &table, &index)
+    }
+    .await;
+    let close = session.close().await;
+    match result {
+        Ok(()) => close.map_err(BenchError::from),
+        Err(error) => Err(cleanup_error(error, close)),
+    }
+}
+
+fn validate_update_binding(
+    primary: PrimaryBinding,
+    index: IndexMode,
+    loaded: KeyRange,
+    alternate: Option<KeyRange>,
+    change_key: bool,
+    value_size: usize,
+) -> Result<()> {
+    let end = loaded.end()?;
+    if primary.shape.index != index
+        || index == IndexMode::None
+        || primary.loaded_range != Some(loaded)
+        || loaded.is_empty()
+        || value_size == 0
+        || change_key != alternate.is_some()
+    {
+        return Err(BenchError::message(
+            "update runtime binding differs from the resolved plan",
+        ));
+    }
+    if let Some(alternate) = alternate {
+        alternate.end()?;
+        if alternate.start != end || alternate.len != loaded.len {
+            return Err(BenchError::message(
+                "update replay domain differs from the resolved plan",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn update_transaction(
+    session: &mut Session,
+    primary: PrimaryBinding,
+    targets: UpdateTargets<'_>,
+    values: UpdateValues,
+    measurement: &mut SessionMeasurement,
+    clock: Option<&MeasurementClock>,
+) -> Result<()> {
+    let started = clock.map(MeasurementClock::raw);
+    let mut trx = session.begin_trx()?;
+    let result = async {
+        let batch = update_targets(&mut trx, primary, targets, values).await?;
+        let mut counters = measurement.counters;
+        counters.merge(batch)?;
+        Ok::<_, BenchError>(counters)
+    }
+    .await;
+    let counters = match result {
+        Ok(counters) => counters,
+        Err(error) => return Err(cleanup_error(error, trx.rollback().await)),
+    };
+    trx.commit().await?;
+    let ended = clock.map(MeasurementClock::raw);
+    // Report only complete committed batches, including batches consisting of misses.
+    measurement.counters = counters;
+    if let (Some(clock), Some(started), Some(ended)) = (clock, started, ended) {
+        measurement
+            .latency
+            .record(clock.raw_delta_nanos(started, ended)?)?;
+    }
+    Ok(())
+}
+
+async fn update_targets(
+    trx: &mut Transaction,
+    primary: PrimaryBinding,
+    targets: UpdateTargets<'_>,
+    values: UpdateValues,
+) -> Result<WorkloadCounters> {
+    let mut counters = WorkloadCounters::default();
+    match targets {
+        UpdateTargets::All => {
+            let outcome = trx
+                .table_mutate_mvcc(primary.table_id, |row| {
+                    Ok(RowMutation::Update(update_values(row, values)?))
+                })
+                .await?;
+            let updated_rows = update_count(outcome)?;
+            if updated_rows != primary.inserted_rows {
+                return Err(BenchError::message(
+                    "update-all affected rows differ from prepared inserts",
+                ));
+            }
+            counters.operations = 1;
+            counters.updated_rows = updated_rows;
+        }
+        UpdateTargets::Points(keys) => {
+            for &key in keys {
+                let updated_rows = update_point(trx, primary, key, values).await?;
+                counters.merge(WorkloadCounters {
+                    operations: 1,
+                    updated_rows,
+                    found: u64::from(updated_rows != 0),
+                    not_found: u64::from(updated_rows == 0),
+                    ..WorkloadCounters::default()
+                })?;
+            }
+        }
+    }
+    Ok(counters)
+}
+
+async fn update_point(
+    trx: &mut Transaction,
+    primary: PrimaryBinding,
+    key: u64,
+    values: UpdateValues,
+) -> Result<u64> {
+    let index = TableIndex(primary.table_id, IndexID::new(0));
+    let key = [Val::from(key)];
+    match primary.shape.index {
+        IndexMode::Unique => {
+            let mut matched = false;
+            let outcome = trx
+                .table_unique_mutate_mvcc(index, &key, |row| -> CallbackResult<_, BenchError> {
+                    match row {
+                        Some(row) => {
+                            matched = true;
+                            Ok(UniqueMutation::Update(update_values(row, values)?))
+                        }
+                        None => Ok(UniqueMutation::Skip),
+                    }
+                })
+                .await?;
+            match outcome {
+                UniqueMutationOutcome::Updated(_) if matched => Ok(1),
+                UniqueMutationOutcome::Noop if !matched => Ok(0),
+                _ => Err(BenchError::message(
+                    "update-point-rand received an unexpected unique mutation outcome",
+                )),
+            }
+        }
+        IndexMode::NonUnique => {
+            // Equality bounds do not need a successor key, even at the range edge.
+            let outcome = trx
+                .table_index_mutate_mvcc(index, &key[..]..=&key[..], |row| {
+                    Ok(RowMutation::Update(update_values(row, values)?))
+                })
+                .await?;
+            update_count(outcome)
+        }
+        IndexMode::None => Err(BenchError::message(
+            "update-point-rand requires a secondary index",
+        )),
+    }
+}
+
+fn update_count(outcome: TableMutationOutcome) -> Result<u64> {
+    if outcome.delete_count != 0 {
+        return Err(BenchError::message(
+            "update workload unexpectedly deleted rows",
+        ));
+    }
+    u64::try_from(outcome.update_count)
+        .map_err(|_| BenchError::message("updated row count exceeds u64"))
+}
+
+fn cleanup_error(primary: BenchError, cleanup: doradb_storage::Result<()>) -> BenchError {
+    // Keep the initiating error across ordinary cleanup failures; fatal cleanup wins.
+    match cleanup {
+        Err(error) if error.is_kind(ErrorKind::Fatal) => BenchError::Storage(error),
+        _ => primary,
+    }
+}
+
+fn verify_explicit_update_outcome(
+    identity: &str,
+    primary: PrimaryBinding,
+    requests: Option<u64>,
+    planned_effect: &FixturePlanEffect,
+    outcome: &UpdateSessionOutcome,
+    expected_samples: u64,
+) -> Result<FixtureRuntimeEffect> {
+    verify_samples(identity, &outcome.measurement.latency, expected_samples)?;
+    let counters = outcome.measurement.counters;
+    let valid = if let Some(requests) = requests {
+        counters.operations == requests
+            && counters.found.checked_add(counters.not_found) == Some(requests)
+            && counters.found <= counters.updated_rows
+            && (primary.shape.index != IndexMode::Unique || counters.updated_rows == counters.found)
+    } else {
+        counters.operations == 1
+            && counters.updated_rows == primary.inserted_rows
+            && counters.found == 0
+            && counters.not_found == 0
+    };
+    if !valid
+        || counters.inserted_rows != 0
+        || counters.deleted_rows != 0
+        || counters.rows_returned != 0
+        || counters.expected_outcomes != ExpectedOutcomeCounters::default()
+    {
+        return Err(BenchError::message(format!(
+            "{identity} counters violate the update equation"
+        )));
+    }
+    verify_no_effect(planned_effect)
+}
+
+fn verify_updated_content(rows: u64, table: &Fingerprint, index: &Fingerprint) -> Result<()> {
+    if table.rows() != rows || table != index {
+        return Err(BenchError::message(format!(
+            "update content verification failed: expected={rows}, table={}, index={}",
+            table.rows(),
+            index.rows()
+        )));
+    }
+    Ok(())
 }
 
 fn build_update_state(config: SessionExecutorConfig<UpdateConfig>) -> Result<UpdateExecutorState> {
@@ -384,48 +870,17 @@ async fn run_update_operations(
                 TableIndex(spec.table_id, IndexID::new(0)),
                 &lower[..]..&upper[..],
                 |row| -> CallbackResult<_, BenchError> {
-                    let key = row.val(0)?.as_u64().ok_or_else(|| {
-                        CallbackError::User(BenchError::message(
-                            "update callback logical key is not u64",
-                        ))
-                    })?;
-                    let base_offset =
-                        domain_offset(key, spec.source_domain).map_err(CallbackError::User)?;
-                    let preferred = generate_update_payload(
-                        base_offset,
-                        spec.seed,
-                        spec.value_size,
-                        payload_variant,
-                    );
-                    let current_payload = row.val(1)?.as_bytes().ok_or_else(|| {
-                        CallbackError::User(BenchError::message(
-                            "update callback payload is not variable bytes",
-                        ))
-                    })?;
-                    let payload = if current_payload == preferred.as_slice() {
-                        generate_update_payload(
-                            base_offset,
-                            spec.seed,
-                            spec.value_size,
-                            !payload_variant,
-                        )
-                    } else {
-                        preferred
-                    };
-                    let mut update = Vec::with_capacity(usize::from(spec.change_key) + 1);
-                    if spec.change_key {
-                        let mapped_key = key_at_domain_offset(spec.target_domain, base_offset)
-                            .map_err(CallbackError::User)?;
-                        update.push(UpdateCol {
-                            idx: 0,
-                            val: Val::from(mapped_key),
-                        });
-                    }
-                    update.push(UpdateCol {
-                        idx: 1,
-                        val: Val::from(payload),
-                    });
-                    Ok(RowMutation::Update(update))
+                    Ok(RowMutation::Update(update_values(
+                        row,
+                        UpdateValues {
+                            seed: spec.seed,
+                            value_size: spec.value_size,
+                            change_key: spec.change_key,
+                            source_domain: spec.source_domain,
+                            target_domain: spec.target_domain,
+                            payload_variant,
+                        },
+                    )?))
                 },
             )
             .await;
@@ -476,6 +931,53 @@ async fn run_update_operations(
         }
     }
     Ok(result)
+}
+
+fn update_values(
+    row: &mut LazyRow<'_>,
+    spec: UpdateValues,
+) -> CallbackResult<Vec<UpdateCol>, BenchError> {
+    let key = row.val(0)?.as_u64().ok_or_else(|| {
+        CallbackError::User(BenchError::message(
+            "update callback logical key is not u64",
+        ))
+    })?;
+    let base_offset = domain_offset(key, spec.source_domain).map_err(CallbackError::User)?;
+    let preferred = generate_update_payload(
+        base_offset,
+        spec.seed,
+        spec.value_size,
+        spec.payload_variant,
+    );
+    let current_payload = row.val(1)?.as_bytes().ok_or_else(|| {
+        CallbackError::User(BenchError::message(
+            "update callback payload is not variable bytes",
+        ))
+    })?;
+    let payload = if current_payload == preferred.as_slice() {
+        generate_update_payload(
+            base_offset,
+            spec.seed,
+            spec.value_size,
+            !spec.payload_variant,
+        )
+    } else {
+        preferred
+    };
+    let mut update = Vec::with_capacity(usize::from(spec.change_key) + 1);
+    if spec.change_key {
+        let mapped_key =
+            key_at_domain_offset(spec.target_domain, base_offset).map_err(CallbackError::User)?;
+        update.push(UpdateCol {
+            idx: 0,
+            val: Val::from(mapped_key),
+        });
+    }
+    update.push(UpdateCol {
+        idx: 1,
+        val: Val::from(payload),
+    });
+    Ok(update)
 }
 
 fn shift_range(range: KeyRange, offset: u64) -> Result<KeyRange> {
@@ -536,13 +1038,232 @@ fn splitmix64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixture::IndexMode;
+    use crate::fixture::{FixtureBinding, PrimaryTableShape};
     use crate::workload::util::generate_insert_keys;
     use doradb_storage::{
-        EngineConfig, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
-        StorageIndexSpec, StorageTableSpec, ValKind,
+        EngineConfig, OperationError, ScanRowDecision, StorageColumnFlags, StorageColumnSpec,
+        StorageIndexFlags, StorageIndexKey, StorageIndexSpec, StorageTableSpec, ValKind,
     };
+    use std::cell::RefCell;
     use tempfile::TempDir;
+
+    type CompletionHook = Box<dyn FnOnce(&Engine, PrimaryBinding)>;
+
+    thread_local! {
+        static COMPLETION_HOOK: RefCell<Option<CompletionHook>> = const { RefCell::new(None) };
+    }
+
+    /// Install one coordinator-local observation or fault at the completion boundary.
+    pub(crate) fn set_update_completion_hook(hook: impl FnOnce(&Engine, PrimaryBinding) + 'static) {
+        COMPLETION_HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+    }
+
+    /// Consume the one-shot hook before verification begins.
+    pub(super) fn run_completion_hook(engine: &Engine, primary: PrimaryBinding) {
+        let hook = COMPLETION_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(engine, primary);
+        }
+    }
+
+    async fn test_engine() -> (TempDir, Engine) {
+        let root = TempDir::new().unwrap();
+        let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
+            .await
+            .unwrap();
+        (root, engine)
+    }
+
+    fn fixture_rows(index: IndexMode) -> Vec<(u64, Vec<u8>)> {
+        let mut rows = vec![
+            (10, b"left".to_vec()),
+            (11, b"selected".to_vec()),
+            (13, b"middle".to_vec()),
+            (15, b"right".to_vec()),
+            (16, vec![0, 255]),
+        ];
+        if index == IndexMode::NonUnique {
+            rows.extend([
+                (11, b"selected".to_vec()),
+                (11, b"different".to_vec()),
+                (11, vec![]),
+                (13, b"middle".to_vec()),
+            ]);
+        }
+        rows
+    }
+
+    async fn fixture(
+        engine: &Engine,
+        index: IndexMode,
+        rows: &[(u64, Vec<u8>)],
+    ) -> (Session, PrimaryBinding) {
+        let mut session = engine.new_session().unwrap();
+        let table_id = session
+            .create_table(
+                StorageTableSpec::new(vec![
+                    StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                ]),
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    if index == IndexMode::Unique {
+                        StorageIndexFlags::UK
+                    } else {
+                        StorageIndexFlags::empty()
+                    },
+                )],
+            )
+            .await
+            .unwrap()
+            .table_id();
+        let mut trx = session.begin_trx().unwrap();
+        for (key, payload) in rows {
+            trx.table_insert_mvcc(table_id, vec![Val::from(*key), Val::from(payload.clone())])
+                .await
+                .unwrap();
+        }
+        let fence = trx.commit().await.unwrap();
+        (
+            session,
+            PrimaryBinding {
+                placement: None,
+                table_id,
+                shape: PrimaryTableShape { index },
+                loaded_range: Some(KeyRange { start: 10, len: 7 }),
+                inserted_rows: rows.len() as u64,
+                latest_write_fence: Some(fence),
+                frozen: None,
+            },
+        )
+    }
+
+    async fn assert_rows(
+        session: &mut Session,
+        primary: PrimaryBinding,
+        expected: &[(u64, Vec<u8>)],
+    ) {
+        let mut expected = expected.to_vec();
+        expected.sort();
+        let mut trx = session.begin_trx().unwrap();
+        for indexed in [false, true] {
+            let mut actual = Vec::new();
+            if indexed {
+                let mut stream = trx
+                    .table_index_scan_mvcc_stream(
+                        TableIndex(primary.table_id, IndexID::new(0)),
+                        ..,
+                        &[0, 1],
+                    )
+                    .await
+                    .unwrap();
+                while let Some(row) = stream.next().await.unwrap() {
+                    actual.push((
+                        row[0].as_u64().unwrap(),
+                        row[1].as_bytes().unwrap().to_vec(),
+                    ));
+                }
+            } else {
+                let mut stream = trx
+                    .table_scan_mvcc_stream(primary.table_id, &[0, 1], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                    .unwrap();
+                while let Some(row) = stream.next().await.unwrap() {
+                    actual.push((
+                        row[0].as_u64().unwrap(),
+                        row[1].as_bytes().unwrap().to_vec(),
+                    ));
+                }
+            }
+            actual.sort();
+            assert_eq!(actual, expected, "indexed={indexed}");
+        }
+        trx.commit().await.unwrap();
+    }
+
+    fn full_config(primary: PrimaryBinding, change_key: bool) -> UpdateAllConfig {
+        UpdateAllConfig {
+            seed: 7,
+            change_key,
+            value_size_bytes: 1,
+            index: primary.shape.index,
+            loaded_range: primary.loaded_range.unwrap(),
+            alternate_range: change_key.then_some(KeyRange { start: 17, len: 7 }),
+            include_stats: false,
+        }
+    }
+
+    fn point_executor(
+        primary: PrimaryBinding,
+        change_key: bool,
+        ordinal: u32,
+        num: u64,
+        sessions: usize,
+        batch_size: u64,
+    ) -> UpdatePointRandExecutor {
+        let config = full_config(primary, change_key);
+        UpdatePointRandExecutor::new(SessionExecutorConfig {
+            resolved: UpdatePointRandConfig {
+                num,
+                sessions,
+                threads: 1,
+                batch_size,
+                seed: config.seed,
+                change_key,
+                value_size_bytes: config.value_size_bytes,
+                index: config.index,
+                loaded_range: config.loaded_range,
+                alternate_range: config.alternate_range,
+                include_stats: false,
+            },
+            binding: FixtureBinding::Primary(primary),
+            execution_ordinal: ordinal,
+        })
+        .unwrap()
+    }
+
+    // A one-byte payload has an independent two-value oracle: prefer run parity,
+    // switch it if already present. This avoids deriving expected rows from the callback.
+    fn expected_points(
+        rows: &mut [(u64, Vec<u8>)],
+        keys: &[u64],
+        ordinal: u32,
+        change_key: bool,
+    ) -> WorkloadCounters {
+        let mut counters = WorkloadCounters::default();
+        for &key in keys {
+            let mut count = 0;
+            for (stored_key, payload) in
+                rows.iter_mut().filter(|(stored_key, _)| *stored_key == key)
+            {
+                let before = payload.clone();
+                let preferred = (ordinal % 2) as u8;
+                *payload = vec![if *payload == [preferred] {
+                    1 - preferred
+                } else {
+                    preferred
+                }];
+                assert_ne!(*payload, before);
+                if change_key {
+                    *stored_key = if ordinal.is_multiple_of(2) {
+                        key + 7
+                    } else {
+                        key - 7
+                    };
+                }
+                count += 1;
+            }
+            counters.operations += 1;
+            counters.updated_rows += count;
+            counters.found += u64::from(count != 0);
+            counters.not_found += u64::from(count == 0);
+        }
+        counters
+    }
 
     fn collect_ranges(mut generator: RandomUpdateRangeGenerator) -> Vec<KeyRange> {
         let mut ranges = Vec::new();
@@ -552,16 +1273,485 @@ mod tests {
         ranges
     }
 
+    /// Purpose: Update all rows across both indexes, payload sizes, and successive replay domains.
+    /// Expected: Every row changes on each run, duplicate multiplicity and exact table/index contents persist, and each run has one operation/sample.
+    #[test]
+    fn full_updates_preserve_exact_content_and_replay() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let clock = MeasurementClock::new();
+            for index in [IndexMode::Unique, IndexMode::NonUnique] {
+                for change_key in [false, true] {
+                    let mut rows = fixture_rows(index);
+                    let (mut session, primary) = fixture(&engine, index, &rows).await;
+                    for ordinal in 0..4 {
+                        let executor = UpdateAllExecutor::new(SessionExecutorConfig {
+                            resolved: full_config(primary, change_key),
+                            binding: FixtureBinding::Primary(primary),
+                            execution_ordinal: ordinal,
+                        })
+                        .unwrap();
+                        let plan = executor.session_plans().unwrap().remove(0);
+                        assert_eq!(executor.threads(), 1);
+                        let outcome = executor
+                            .execute(
+                                &engine,
+                                &mut session,
+                                &plan,
+                                &clock,
+                                true,
+                                &RunCancellation::new(),
+                            )
+                            .await
+                            .unwrap();
+                        executor
+                            .verify_outcome(&FixturePlanEffect::None, &outcome, 1)
+                            .unwrap();
+                        assert_eq!(
+                            outcome.measurement.counters,
+                            WorkloadCounters {
+                                operations: 1,
+                                updated_rows: rows.len() as u64,
+                                ..WorkloadCounters::default()
+                            }
+                        );
+                        for (key, payload) in &mut rows {
+                            assert_ne!(*payload, vec![(ordinal % 2) as u8]);
+                            *payload = vec![(ordinal % 2) as u8];
+                            if change_key {
+                                *key = if ordinal.is_multiple_of(2) {
+                                    *key + 7
+                                } else {
+                                    *key - 7
+                                };
+                            }
+                        }
+                        assert_rows(&mut session, primary, &rows).await;
+                    }
+                    complete_update(&engine, primary).await.unwrap();
+                    session.close().await.unwrap();
+                }
+            }
+            engine.shutdown();
+        });
+    }
+
+    /// Purpose: Distinguish request hits from row updates for gaps, duplicate groups, repetitions, and key moves.
+    /// Expected: Selected groups match an independent row oracle within/across batches and replay runs, edge neighbors stay untouched, and all-miss batches still sample.
+    #[test]
+    fn point_updates_apply_exact_groups_and_repeated_request_semantics() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let clock = MeasurementClock::new();
+            for index in [IndexMode::Unique, IndexMode::NonUnique] {
+                for change_key in [false, true] {
+                    let mut rows = fixture_rows(index);
+                    let (mut session, primary) = fixture(&engine, index, &rows).await;
+                    for ordinal in 0..4 {
+                        let mut outcome = UpdateSessionOutcome::empty().unwrap();
+                        let mut expected = WorkloadCounters::default();
+                        let config = full_config(primary, change_key);
+                        let values = UpdateValues::new(
+                            7,
+                            1,
+                            config.loaded_range,
+                            config.alternate_range,
+                            ordinal,
+                        );
+                        let batches: &[&[u64]] = &[&[11, 11, 12, 13], &[11, 10, 16], &[12, 14]];
+                        for batch in batches {
+                            let keys: Vec<_> = batch
+                                .iter()
+                                .map(|&key| {
+                                    if change_key && ordinal % 2 == 1 {
+                                        key + 7
+                                    } else {
+                                        key
+                                    }
+                                })
+                                .collect();
+                            expected
+                                .merge(expected_points(&mut rows, &keys, ordinal, change_key))
+                                .unwrap();
+                            update_transaction(
+                                &mut session,
+                                primary,
+                                UpdateTargets::Points(&keys),
+                                values,
+                                &mut outcome.measurement,
+                                Some(&clock),
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(outcome.measurement.counters, expected);
+                            assert_rows(&mut session, primary, &rows).await;
+                        }
+                        assert_eq!(expected.operations, 9);
+                        assert_eq!(expected.found, if change_key { 4 } else { 6 });
+                        assert_eq!(
+                            expected.updated_rows,
+                            match (index, change_key) {
+                                (IndexMode::Unique, false) => 6,
+                                (IndexMode::Unique, true) => 4,
+                                (IndexMode::NonUnique, false) => 16,
+                                (IndexMode::NonUnique, true) => 8,
+                                _ => unreachable!(),
+                            }
+                        );
+                        point_executor(primary, change_key, ordinal, 9, 1, 4)
+                            .verify_outcome(&FixturePlanEffect::None, &outcome, 3)
+                            .unwrap();
+                    }
+                    complete_update(&engine, primary).await.unwrap();
+                    session.close().await.unwrap();
+                }
+            }
+            engine.shutdown();
+        });
+    }
+
+    /// Purpose: Keep seeded targets independent of transaction batches and execution parity, including idle sessions.
+    /// Expected: Disjoint ranges cover the domain, exact seeded requests preserve contents across batch sizes and replay, and zero-budget sessions create no samples.
+    #[test]
+    fn seeded_point_execution_is_batch_independent_and_handles_idle_sessions() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let clock = MeasurementClock::new();
+            for (change_key, batch_size) in [
+                (false, 1),
+                (false, 3),
+                (false, 20),
+                (true, 1),
+                (true, 3),
+                (true, 20),
+            ] {
+                let mut rows = fixture_rows(IndexMode::NonUnique);
+                let (mut session, primary) = fixture(&engine, IndexMode::NonUnique, &rows).await;
+                for ordinal in 0..4 {
+                    let executor = point_executor(primary, change_key, ordinal, 11, 3, batch_size);
+                    assert_eq!(executor.threads(), 1);
+                    assert_eq!(
+                        &*executor.shards,
+                        &[
+                            KeyRange { start: 10, len: 3 },
+                            KeyRange { start: 13, len: 2 },
+                            KeyRange { start: 15, len: 2 }
+                        ]
+                    );
+                    assert!(Arc::ptr_eq(&executor.shards, &executor.clone().shards));
+                    let plans = executor.session_plans().unwrap();
+                    assert_eq!(
+                        plans.iter().map(|p| p.number).collect::<Vec<_>>(),
+                        [4, 4, 3]
+                    );
+                    let mut outcome = UpdateSessionOutcome::empty().unwrap();
+                    let mut expected = WorkloadCounters::default();
+                    let targets: &[&[u64]] = &[&[12, 11, 11, 11], &[14, 13, 13, 13], &[16, 16, 16]];
+                    let different_targets: &[&[u64]] =
+                        &[&[11, 11, 12, 11], &[13, 13, 14, 14], &[15, 16, 16]];
+                    for (plan, keys) in plans.iter().zip(targets) {
+                        let shard = executor.shards[plan.session_index];
+                        for (seed, expected_keys) in
+                            [(7, *keys), (8, different_targets[plan.session_index])]
+                        {
+                            let mut generator =
+                                RandomScanRangeGenerator::new(seed, shard, 1, plan).unwrap();
+                            let actual = (0..plan.number)
+                                .map(|_| generator.next_range().unwrap().start)
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                actual, expected_keys,
+                                "seed={seed}, session={}",
+                                plan.session_index
+                            );
+                        }
+                        let keys: Vec<_> = keys
+                            .iter()
+                            .map(|&key| {
+                                if change_key && ordinal % 2 == 1 {
+                                    key + 7
+                                } else {
+                                    key
+                                }
+                            })
+                            .collect();
+                        expected
+                            .merge(expected_points(&mut rows, &keys, ordinal, change_key))
+                            .unwrap();
+                        outcome
+                            .merge(
+                                executor
+                                    .execute(
+                                        &engine,
+                                        &mut session,
+                                        plan,
+                                        &clock,
+                                        true,
+                                        &RunCancellation::new(),
+                                    )
+                                    .await
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    assert_eq!(outcome.measurement.counters, expected);
+                    assert_rows(&mut session, primary, &rows).await;
+                    let samples = match batch_size {
+                        1 => 11,
+                        3 => 5,
+                        _ => 3,
+                    };
+                    executor
+                        .verify_outcome(&FixturePlanEffect::None, &outcome, samples)
+                        .unwrap();
+                }
+                session.close().await.unwrap();
+            }
+            let rows = fixture_rows(IndexMode::Unique);
+            let (mut session, primary) = fixture(&engine, IndexMode::Unique, &rows).await;
+            let executor = point_executor(primary, false, 0, 2, 4, 10);
+            let mut outcome = UpdateSessionOutcome::empty().unwrap();
+            for plan in executor.session_plans().unwrap() {
+                let part = executor
+                    .execute(
+                        &engine,
+                        &mut session,
+                        &plan,
+                        &clock,
+                        true,
+                        &RunCancellation::new(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(part.measurement.counters.operations, plan.number);
+                assert_eq!(part.measurement.latency.sample_count(), plan.number);
+                outcome.merge(part).unwrap();
+            }
+            executor
+                .verify_outcome(&FixturePlanEffect::None, &outcome, 2)
+                .unwrap();
+            let cancelled = RunCancellation::new();
+            cancelled.fail(BenchError::message("peer failed"));
+            let part = executor
+                .execute(
+                    &engine,
+                    &mut session,
+                    &executor.session_plans().unwrap()[0],
+                    &clock,
+                    true,
+                    &cancelled,
+                )
+                .await
+                .unwrap();
+            assert_eq!(part.measurement.counters, WorkloadCounters::default());
+            assert_eq!(part.measurement.latency.sample_count(), 0);
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
+    /// Purpose: Roll back successful earlier point statements when a later callback, storage operation, or counter merge fails.
+    /// Expected: Original errors survive, exact rows and measurements remain unchanged, and the session remains reusable with an active clock.
+    #[test]
+    fn point_batch_failures_roll_back_progress_before_commit() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let clock = MeasurementClock::new();
+            for index in [IndexMode::Unique, IndexMode::NonUnique] {
+                let rows = fixture_rows(index);
+                let (mut session, primary) = fixture(&engine, index, &rows).await;
+                let mut outcome = UpdateSessionOutcome::empty().unwrap();
+                let values = UpdateValues::new(7, 1, KeyRange { start: 10, len: 3 }, None, 0);
+                let error = update_transaction(
+                    &mut session,
+                    primary,
+                    UpdateTargets::Points(&[11, 13]),
+                    values,
+                    &mut outcome.measurement,
+                    Some(&clock),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("outside its source domain"));
+                assert_eq!(outcome.measurement.counters, WorkloadCounters::default());
+                assert_eq!(outcome.measurement.latency.sample_count(), 0);
+                assert_rows(&mut session, primary, &rows).await;
+                let values = UpdateValues::new(7, 1, primary.loaded_range.unwrap(), None, 0);
+                let mut blocker = engine.new_session().unwrap();
+                let mut blocking = blocker.begin_trx().unwrap();
+                update_point(&mut blocking, primary, 13, values)
+                    .await
+                    .unwrap();
+                let error = update_transaction(
+                    &mut session,
+                    primary,
+                    UpdateTargets::Points(&[11, 13]),
+                    values,
+                    &mut outcome.measurement,
+                    Some(&clock),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    matches!(error, BenchError::Storage(ref error) if error.operation_error() == Some(OperationError::WriteConflict)),
+                    "{error}"
+                );
+                blocking.rollback().await.unwrap();
+                blocker.close().await.unwrap();
+                assert_rows(&mut session, primary, &rows).await;
+                outcome.measurement.counters.operations = u64::MAX;
+                let error = update_transaction(
+                    &mut session,
+                    primary,
+                    UpdateTargets::Points(&[11, 13]),
+                    values,
+                    &mut outcome.measurement,
+                    Some(&clock),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("counter overflow: operations"));
+                assert_eq!(outcome.measurement.counters.operations, u64::MAX);
+                assert_eq!(outcome.measurement.counters.updated_rows, 0);
+                assert_eq!(outcome.measurement.latency.sample_count(), 0);
+                assert_rows(&mut session, primary, &rows).await;
+                session.close().await.unwrap();
+            }
+            engine.shutdown();
+        });
+    }
+
+    /// Purpose: Reject corrupted completion content and invalid update counters without confusing rows with requests.
+    /// Expected: Equal-cardinality payload differences and wrong totals fail, valid duplicate-heavy outcomes pass, and verification sessions close on failures.
+    #[test]
+    fn update_completion_and_counter_guards_reject_invalid_results() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let rows = fixture_rows(IndexMode::NonUnique);
+            let (mut session, primary) = fixture(&engine, IndexMode::NonUnique, &rows).await;
+            complete_update(&engine, primary).await.unwrap();
+            assert!(
+                complete_update(
+                    &engine,
+                    PrimaryBinding {
+                        inserted_rows: primary.inserted_rows + 1,
+                        ..primary
+                    }
+                )
+                .await
+                .is_err()
+            );
+            let table = scan_content(&mut session, primary.table_id, None)
+                .await
+                .unwrap();
+            let mut altered = rows.clone();
+            altered[0].1 = b"different content".to_vec();
+            let (mut second, changed) = fixture(&engine, IndexMode::NonUnique, &altered).await;
+            let changed = scan_content(&mut second, changed.table_id, Some(IndexID::new(0)))
+                .await
+                .unwrap();
+            assert_eq!(table.rows(), changed.rows());
+            assert!(verify_updated_content(primary.inserted_rows, &table, &changed).is_err());
+            second.close().await.unwrap();
+            let executor = point_executor(primary, false, 0, 3, 1, 3);
+            let mut outcome = UpdateSessionOutcome::empty().unwrap();
+            let valid = WorkloadCounters {
+                operations: 3,
+                updated_rows: 12,
+                found: 3,
+                ..WorkloadCounters::default()
+            };
+            outcome.measurement.counters = valid;
+            executor
+                .verify_outcome(&FixturePlanEffect::None, &outcome, 0)
+                .unwrap();
+            for invalid in [
+                WorkloadCounters {
+                    operations: 2,
+                    ..valid
+                },
+                WorkloadCounters {
+                    inserted_rows: 1,
+                    ..valid
+                },
+                WorkloadCounters {
+                    deleted_rows: 1,
+                    ..valid
+                },
+                WorkloadCounters {
+                    rows_returned: 1,
+                    ..valid
+                },
+                WorkloadCounters {
+                    updated_rows: 2,
+                    ..valid
+                },
+                WorkloadCounters {
+                    found: u64::MAX,
+                    not_found: 4,
+                    ..valid
+                },
+                WorkloadCounters {
+                    expected_outcomes: ExpectedOutcomeCounters {
+                        duplicate_key: 1,
+                        write_conflict: 0,
+                    },
+                    ..valid
+                },
+            ] {
+                outcome.measurement.counters = invalid;
+                assert!(
+                    executor
+                        .verify_outcome(&FixturePlanEffect::None, &outcome, 0)
+                        .is_err()
+                );
+            }
+            outcome.measurement.counters = valid;
+            assert!(
+                executor
+                    .verify_outcome(&FixturePlanEffect::None, &outcome, 1)
+                    .is_err()
+            );
+            assert!(
+                update_count(TableMutationOutcome {
+                    update_count: 0,
+                    delete_count: 1
+                })
+                .is_err()
+            );
+            let mut bad = full_config(primary, true);
+            bad.alternate_range = None;
+            assert!(
+                UpdateAllExecutor::new(SessionExecutorConfig {
+                    resolved: bad,
+                    binding: FixtureBinding::Primary(primary),
+                    execution_ordinal: 0
+                })
+                .is_err()
+            );
+            let mut bad = full_config(primary, true);
+            bad.alternate_range.as_mut().unwrap().start += 1;
+            assert!(
+                UpdateAllExecutor::new(SessionExecutorConfig {
+                    resolved: bad,
+                    binding: FixtureBinding::Primary(primary),
+                    execution_ordinal: 0
+                })
+                .is_err()
+            );
+            complete_update(&engine, primary).await.unwrap();
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
+
     /// Purpose: Roll back partial update progress when an application callback fails.
     /// Expected: The original error survives, earlier row changes are undone, and transaction
     /// ownership is released.
     #[test]
     fn update_callback_failure_rolls_back_preceding_rows_and_releases_transaction() {
         smol::block_on(async {
-            let root = TempDir::new().unwrap();
-            let engine = Engine::bootstrap(EngineConfig::default().storage_root(root.path()))
-                .await
-                .unwrap();
+            let (_root, engine) = test_engine().await;
             let mut session = engine.new_session().unwrap();
             let table_id = session
                 .create_table(

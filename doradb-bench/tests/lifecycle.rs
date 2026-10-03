@@ -386,6 +386,57 @@ mod tests {
         }
     }
 
+    fn check_update_template(mode: &str, index: &str) {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let template = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates")
+            .join(format!("{mode}-{index}.toml"));
+        let stdout = assert_success(run_bench(&root, &["--plan", template.to_str().unwrap()]));
+        let report: InvocationReport =
+            toml::from_str(&fs::read_to_string(root.join("benchmark-result.toml")).unwrap())
+                .unwrap();
+        assert_eq!(report.measured_runs.len(), 1);
+        let run = &report.measured_runs[0];
+        assert_eq!(report.aggregate.counters, run.counters);
+        assert_eq!(run.counters.inserted_rows, 0);
+        assert_eq!(run.counters.deleted_rows, 0);
+        assert_eq!(run.counters.rows_returned, 0);
+        assert_eq!(run.counters.expected_outcomes.duplicate_key, 0);
+        assert_eq!(run.counters.expected_outcomes.write_conflict, 0);
+        if mode == "update-all" {
+            assert_eq!(run.counters.operations, 1);
+            assert_eq!(run.counters.updated_rows, 10_000);
+            assert_eq!((run.counters.found, run.counters.not_found), (0, 0));
+            assert_eq!(run.latency.unit, LatencyUnit::UpdateAllTransaction);
+            assert_eq!(run.latency.sample_count, 1);
+        } else {
+            assert_eq!(run.counters.operations, 10_000);
+            assert_eq!(run.counters.found + run.counters.not_found, 10_000);
+            if index == "unique" {
+                assert_eq!(run.counters.found, 10_000);
+                assert_eq!(run.counters.updated_rows, 10_000);
+            } else {
+                assert!(run.counters.not_found > 0);
+                assert!(run.counters.updated_rows > run.counters.found);
+            }
+            assert_eq!(run.latency.unit, LatencyUnit::UpdatePointBatchTransaction);
+            assert_eq!(run.latency.sample_count, 100);
+        }
+        assert!(stdout.contains(&format!("updated_rows: {}\n", run.counters.updated_rows)));
+        assert!(stdout.contains(&format!(
+            "updated_rows_per_second: {:.3}\n",
+            doradb_bench::measurement::operations_per_second(
+                run.counters.updated_rows,
+                run.elapsed_nanos
+            )
+        )));
+        assert_eq!(
+            toml::from_str::<InvocationReport>(&toml::to_string(&report).unwrap()).unwrap(),
+            report
+        );
+    }
+
     /// Purpose: Support repeated managed-binding resolution with optional schema loading.
     /// Expected: Prepared bindings resolve successfully across sessions with consistent run and
     /// aggregate accounting.
@@ -690,6 +741,104 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
         assert_update_counters(report.aggregate.counters);
         assert_eq!(report.aggregate.latency.sample_count, 16);
+    }
+
+    /// Purpose: Execute the unique full-table update template through the CLI.
+    /// Expected: Every prepared row updates in one sampled transaction and output preserves exact counters.
+    #[test]
+    fn update_all_unique_template_executes() {
+        check_update_template("update-all", "unique");
+    }
+
+    /// Purpose: Execute full-table updates of the duplicate-bearing random template through the CLI.
+    /// Expected: Every duplicate row updates in one sampled transaction and verified output preserves cardinality.
+    #[test]
+    fn update_all_non_unique_template_executes() {
+        check_update_template("update-all", "non-unique");
+    }
+
+    /// Purpose: Execute seeded unique point requests through the shipped CLI template.
+    /// Expected: Every payload-only request hits, each changes one row, and batch samples and rates remain exact.
+    #[test]
+    fn update_point_unique_template_executes() {
+        check_update_template("update-point-rand", "unique");
+    }
+
+    /// Purpose: Execute seeded duplicate-group requests through the shipped CLI template.
+    /// Expected: Gaps miss, group updates exceed hit counts, and canonical output retains request/row semantics.
+    #[test]
+    fn update_point_non_unique_template_executes() {
+        check_update_template("update-point-rand", "non-unique");
+    }
+
+    /// Purpose: Reject statically invalid new update controls before acquiring a storage root.
+    /// Expected: Unsupported fields, empty payloads, excessive sessions, and missing replay capacity create no root or success output.
+    #[test]
+    fn explicit_update_cli_rejects_invalid_plans_before_root_creation() {
+        let prepare = "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n";
+        for (controls, error) in [
+            ("type = 'update-all', num = 1", "unknown field"),
+            ("type = 'update-all', threads = 1", "unknown field"),
+            ("type = 'update-all', batch_size = 1", "unknown field"),
+            ("type = 'update-all', value_size = '0 B'", "positive"),
+            (
+                "type = 'update-point-rand', num = 1, sessions = 4",
+                "exceed loaded",
+            ),
+            ("type = 'update-point-rand', num = 0", "nonzero"),
+        ] {
+            assert_plan_rejected_before_root_creation(
+                &format!("{prepare}[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls} }}"),
+                error,
+            );
+        }
+        for controls in ["type = 'update-all'", "type = 'update-point-rand', num = 1"] {
+            assert_plan_rejected_before_root_creation(
+                &format!(
+                    "{}[[phase]]\nkind = 'benchmark'\nworkload = {{ {controls}, change_key = true }}",
+                    prepare.replace("num = 3", "num = 18446744073709551615")
+                ),
+                "overflow",
+            );
+        }
+    }
+
+    /// Purpose: Exercise new update replay with a warmup ending in the alternate domain and idle point sessions.
+    /// Expected: Measured runs retain continuous parity, exact requests/rows, samples, aggregate counts, and transaction diagnostics.
+    #[test]
+    fn explicit_update_cli_replay_preserves_accounting() {
+        let temp = TempDir::new().unwrap();
+        for (name, controls, requests, rows) in [
+            ("all", "type = 'update-all'", 1, 3),
+            (
+                "point",
+                "type = 'update-point-rand', num = 1, sessions = 3, batch_size = 2",
+                1,
+                1,
+            ),
+        ] {
+            let (_, report) = execute_plan(
+                &temp,
+                name,
+                &format!(
+                    "[[phase]]\nworkload = {{ type = 'create-table', index = 'unique' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 3 }}\n[[phase]]\nkind = 'benchmark'\nwarmup_runs = 1\nmeasured_runs = 3\nworkload = {{ {controls}, change_key = true, include_stats = true }}"
+                ),
+            );
+            assert_eq!(report.measured_runs.len(), 3);
+            for run in &report.measured_runs {
+                assert_eq!(run.counters.operations, requests);
+                assert_eq!(run.counters.updated_rows, rows);
+                assert_eq!(run.latency.sample_count, 1);
+                assert!(
+                    run.internal_metrics
+                        .iter()
+                        .any(|metric| metric.name == "transaction.trx_count" && metric.value == 1)
+                );
+            }
+            assert_eq!(report.aggregate.counters.operations, requests * 3);
+            assert_eq!(report.aggregate.counters.updated_rows, rows * 3);
+            assert_eq!(report.aggregate.latency.sample_count, 3);
+        }
     }
 
     /// Purpose: Exercise both delete modes and index shapes through shipped CLI plans.
