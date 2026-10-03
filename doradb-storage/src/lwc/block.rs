@@ -811,8 +811,8 @@ mod tests {
     /// Expected: Multibyte fields use the specified byte order and reserved bytes remain zero.
     #[test]
     fn test_lwc_block_header_persisted_layout() {
-        let header = LwcBlockHeader::new(0x0807_0605_0403_0201, 0x0a09, 0x0c0b, 0x0e0d);
-        assert_eq!(header.block_binding_value(), 0x0807_0605_0403_0201);
+        let header = LwcBlockHeader::new(TEST_BLOCK_BINDING_VALUE, 0x0a09, 0x0c0b, 0x0e0d);
+        assert_eq!(header.block_binding_value(), TEST_BLOCK_BINDING_VALUE);
         assert_eq!(header.row_count(), 0x0a09);
         assert_eq!(header.col_count(), 0x0c0b);
         let mut bytes = vec![0; header.ser_len()];
@@ -826,12 +826,12 @@ mod tests {
         assert_eq!(&bytes, layout::bytes_of(&header));
     }
 
-    /// Purpose: Reject the former fingerprint header before interpreting it as a binding header.
+    /// Purpose: Reject the preceding checksum and binding format before interpreting its payload.
     /// Expected: A valid checksum cannot make the old LWC envelope version readable.
     #[test]
     fn lwc_block_rejects_previous_binding_format() {
         let (_, mut buf) = build_valid_persisted_lwc_block();
-        buf.data_mut()[8..16].copy_from_slice(&1u64.to_le_bytes());
+        buf.data_mut()[8..16].copy_from_slice(&(LWC_BLOCK_SPEC.version - 1).to_le_bytes());
         write_block_checksum(buf.data_mut());
         let err =
             LwcBlock::try_from_persisted_bytes(buf.data(), FileKind::TableFile, test_block_id(7))

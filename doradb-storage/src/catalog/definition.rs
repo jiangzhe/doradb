@@ -16,11 +16,11 @@ pub const MAX_TABLE_DESCRIPTOR_BYTES: usize = 64_000;
 /// Maximum opaque key length accepted for one managed table binding.
 pub const MAX_TABLE_BINDING_KEY_BYTES: usize = 16_000;
 
-// One descriptor row has three U64 columns, one 32-byte fingerprint, and two
-// one-row VarByte offset tables. The exact current LWC estimate adds 151 bytes
+// One descriptor row has three U64 columns, one 16-byte fingerprint, and two
+// one-row VarByte offset tables. The exact current LWC estimate adds 135 bytes
 // around the payload. Keep a separate conservative row-page proof so the
 // public maximum cannot become constructible in memory but uncheckpointable.
-const MAX_DESCRIPTOR_CHECKPOINT_ROW_BYTES: usize = MAX_TABLE_DESCRIPTOR_BYTES + 151;
+const MAX_DESCRIPTOR_CHECKPOINT_ROW_BYTES: usize = MAX_TABLE_DESCRIPTOR_BYTES + 135;
 const MAX_DESCRIPTOR_ROW_PAGE_BYTES: usize = MAX_TABLE_DESCRIPTOR_BYTES + 512;
 const _: () = assert!(MAX_DESCRIPTOR_CHECKPOINT_ROW_BYTES <= crate::lwc::LWC_BLOCK_PAYLOAD_SIZE);
 const _: () = assert!(MAX_DESCRIPTOR_ROW_PAGE_BYTES <= crate::row::ROW_PAGE_USABLE_SIZE);
@@ -596,7 +596,7 @@ mod tests {
             match case {
                 0 => descriptor.table_id = TableID::new(8),
                 1 => descriptor.compiled_storage_epoch += 1,
-                2 => descriptor.storage_schema_fingerprint = [0xff; 32],
+                2 => descriptor.storage_schema_fingerprint = [0xff; 16],
                 _ => descriptor.payload = vec![0; MAX_TABLE_DESCRIPTOR_BYTES + 1].into(),
             }
             let error = ManagedTableDefinition::recover(table_id, &metadata, descriptor)

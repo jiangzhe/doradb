@@ -40,7 +40,7 @@ enum ReadGroup {
     SegmentExhausted,
     /// The replay stream reached logical EOF.
     ReplayEof(Option<UnsealedSegmentTerminal>),
-    /// A transaction log iterator assembled from CRC32-validated redo blocks.
+    /// A transaction log iterator assembled from XXH3-128-validated redo blocks.
     Group(TrxLogIterator),
 }
 

@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 use std::result;
+use xxhash_rust::xxh3::xxh3_128;
 
-pub(super) const SCHEMA: u32 = 1;
+pub(super) const SCHEMA: u32 = 2;
 
 pub(super) type Result<T> = result::Result<T, String>;
 pub(super) type CoverageReport = BTreeMap<String, FileCoverage>;
@@ -131,7 +133,12 @@ pub(super) struct Manifest {
 }
 
 pub(super) fn digest(bytes: impl AsRef<[u8]>) -> String {
-    blake3::hash(bytes.as_ref()).to_hex().to_string()
+    let mut hex = String::with_capacity(32);
+    for byte in xxh3_128(bytes.as_ref()).to_le_bytes() {
+        // Writing into a String is infallible.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Resolve lexical aliases without permitting relative paths to leave the root.
@@ -159,4 +166,17 @@ pub(super) fn repo_path(root: &Path, path: &Path) -> Result<String> {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| format!("source is outside repository: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Purpose: Fix artifact digests to the shared unseeded, little-endian XXH3-128 text contract.
+    /// Expected: Empty content matches the independent reference vector with exact lowercase width.
+    #[test]
+    fn digest_encoding_contract() {
+        assert_eq!(digest([]), "7f498d4624c30160d8984701d306aa99");
+        assert_eq!(SCHEMA, 2);
+    }
 }

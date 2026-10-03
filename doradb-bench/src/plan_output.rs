@@ -642,7 +642,7 @@ mod tests {
             verification: Some(CreateIndexVerification {
                 table_rows: 100,
                 index_rows: 100,
-                fingerprint: "a".repeat(64),
+                fingerprint: "a".repeat(32),
             }),
         };
         report.measured_runs.push(MeasuredRunResult {
@@ -654,7 +654,15 @@ mod tests {
             workload_metrics: Some(WorkloadMetrics::CreateIndex { report: create }),
             internal_metrics: Vec::new(),
         });
-        for failure in ["pending", "count", "placement", "counters", "latency"] {
+        for failure in [
+            "pending",
+            "count",
+            "placement",
+            "counters",
+            "latency",
+            "legacy-digest",
+            "uppercase-digest",
+        ] {
             let mut invalid = report.clone();
             let Some(WorkloadMetrics::CreateIndex { report: create }) =
                 invalid.measured_runs[0].workload_metrics.as_mut()
@@ -664,6 +672,12 @@ mod tests {
             match failure {
                 "pending" => create.verification = None,
                 "count" => create.verification.as_mut().unwrap().index_rows -= 1,
+                "legacy-digest" => {
+                    create.verification.as_mut().unwrap().fingerprint = "a".repeat(64)
+                }
+                "uppercase-digest" => {
+                    create.verification.as_mut().unwrap().fingerprint = "A".repeat(32)
+                }
                 "placement" => create.rows.hot_rows += 1,
                 "counters" => invalid.measured_runs[0].counters.operations = 2,
                 "latency" => invalid.measured_runs[0].latency.sum_nanos += 1,

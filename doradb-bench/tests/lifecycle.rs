@@ -302,7 +302,7 @@ mod tests {
             verification.index_verified,
             index.is_some_and(|index| index != "none")
         );
-        assert_eq!(verification.fingerprint.len(), 64);
+        assert_eq!(verification.fingerprint.len(), 32);
         assert!(report.redo.consumed_bytes >= report.redo.validated_payload_bytes);
         if insert.is_some() {
             assert_eq!(report.work.user_row_ops_seen, inserted);
@@ -738,7 +738,7 @@ mod tests {
         let verification = create.verification.as_ref().unwrap();
         assert_eq!(verification.table_rows, total);
         assert_eq!(verification.index_rows, total);
-        assert_eq!(verification.fingerprint.len(), 64);
+        assert_eq!(verification.fingerprint.len(), 32);
         assert_eq!(create.sampled_process_rss.is_some(), stats);
         assert_eq!(!run.internal_metrics.is_empty(), stats);
         for metric_name in [

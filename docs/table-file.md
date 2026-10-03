@@ -41,10 +41,13 @@ separate space-map block. Row-ID lists live inside `ColumnBlockIndex` leaf
 entries alongside inline ordinal deletion sets.
 
 Meta blocks, column block-index nodes, and LWC blocks use a shared integrity
-envelope: a 16-byte magic/version header and a 32-byte BLAKE3 checksum trailer,
-leaving 65,488 bytes for payload and padding.
+envelope: a 16-byte magic/version header and a 16-byte XXH3-128 checksum trailer,
+leaving 65,504 bytes for payload and padding.
 `DiskTree` nodes use their own node layout with the shared checksum trailer;
 super-block slots use the header/body/footer format described below.
+
+The XXH3-128 format requires fresh storage, including catalog and redo files;
+files written with the previous checksum formats cannot be reopened.
 
 ## 3. SuperBlock
 

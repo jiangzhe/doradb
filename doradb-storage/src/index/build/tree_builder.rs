@@ -2580,7 +2580,7 @@ mod tests {
     #[test]
     fn packed_root_fit_and_parent_groups() {
         smol::block_on(async {
-            for (width, capacity) in [(4, 4089), (8, 2726), (64, 818), (256, 241)] {
+            for (width, capacity) in [(4, 4090), (8, 2727), (64, 818), (256, 241)] {
                 let keys = (0..capacity + 1)
                     .map(|index| {
                         if width == 4 {

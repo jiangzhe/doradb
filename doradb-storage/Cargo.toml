@@ -37,8 +37,7 @@ ahash = { workspace = true }
 glob = { workspace = true }
 futures = { workspace = true }
 async-executor = { workspace = true }
-blake3 = { workspace = true }
-crc32fast = { workspace = true }
+xxhash-rust = { workspace = true }
 ordered-float = { workspace = true }
 dashmap = { workspace = true }
 io-uring = { workspace = true }

@@ -4,6 +4,7 @@ use crate::catalog::storage::layout::BUILTIN_CATALOG_TABLE_COUNT;
 use crate::catalog::{
     USER_TABLE_ID_LIMIT, USER_TABLE_ID_START, catalog_table_id_from_slot, catalog_table_slot,
 };
+use crate::checksum::checksum128;
 use crate::error::{
     CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult, MultiDomainResultExt,
     ResourceError, ResourceResult, RuntimeError, RuntimeOrFatalResult, RuntimeResult,
@@ -45,7 +46,7 @@ pub(crate) use crate::file::CATALOG_MTB_FILE_ID;
 pub(crate) use tests::publish_first_redo_log_seq_for_test;
 
 /// On-disk format version of `catalog.mtb`.
-pub(crate) const CATALOG_MTB_VERSION: u64 = 6;
+pub(crate) const CATALOG_MTB_VERSION: u64 = 7;
 /// Reserved number of catalog logical-table root descriptors.
 pub(crate) const CATALOG_TABLE_ROOT_DESC_COUNT: usize = BUILTIN_CATALOG_TABLE_COUNT;
 /// Initial sparse-file size for `catalog.mtb`.
@@ -710,9 +711,9 @@ fn build_super_block(slot_no: u64, checkpoint_cts: TrxID, meta_block_id: BlockID
     let ser_idx = ser_view.ser(buf.as_bytes_mut(), 0);
     debug_assert_eq!(ser_idx, ser_len);
 
-    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
+    let checksum = checksum128(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]).to_le_bytes();
     let footer = SuperBlockFooter {
-        b3sum: *b3sum.as_bytes(),
+        checksum,
         checkpoint_cts,
     };
     let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
@@ -1196,12 +1197,14 @@ mod tests {
             // overwrite both super-block versions to simulate format mismatch.
             file.seek(SeekFrom::Start(MULTI_TABLE_FILE_MAGIC_WORD.len() as u64))
                 .unwrap();
-            file.write_all(&2u64.to_le_bytes()).unwrap();
+            file.write_all(&(SUPER_BLOCK_VERSION - 1).to_le_bytes())
+                .unwrap();
             file.seek(SeekFrom::Start(
                 SUPER_BLOCK_SIZE as u64 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64,
             ))
             .unwrap();
-            file.write_all(&2u64.to_le_bytes()).unwrap();
+            file.write_all(&(SUPER_BLOCK_VERSION - 1).to_le_bytes())
+                .unwrap();
             file.sync_all().unwrap();
 
             let fs = build_test_fs_in(dir.path());
@@ -1224,7 +1227,7 @@ mod tests {
                 overwrite_file_bytes(
                     path,
                     version_offset,
-                    &(CATALOG_MTB_VERSION + 1).to_le_bytes(),
+                    &(CATALOG_MTB_VERSION - 1).to_le_bytes(),
                 );
             },
             DataIntegrityError::InvalidVersion,
@@ -1289,7 +1292,11 @@ mod tests {
 
             let version_offset = active_super_slot * SUPER_BLOCK_SIZE as u64
                 + MULTI_TABLE_FILE_MAGIC_WORD.len() as u64;
-            overwrite_file_bytes(&path, version_offset, &2u64.to_le_bytes());
+            overwrite_file_bytes(
+                &path,
+                version_offset,
+                &(SUPER_BLOCK_VERSION - 1).to_le_bytes(),
+            );
 
             let fs = build_test_fs_in(dir.path());
             let mtb = open_catalog_file(&fs, global.guard()).await;

@@ -3237,7 +3237,8 @@ pub(crate) mod tests {
     pub(crate) fn corrupt_lwc_block_binding_value(path: impl AsRef<Path>, page_id: impl Into<u64>) {
         rewrite_page_with_checksum(path, page_id, |page| {
             let payload_start = BLOCK_INTEGRITY_HEADER_SIZE;
-            page[payload_start] ^= 0xFF;
+            // Exercise the highest byte so every consumer must compare all 64 bits.
+            page[payload_start + 7] ^= 0xFF;
         });
     }
 

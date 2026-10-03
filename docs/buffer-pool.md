@@ -62,7 +62,7 @@ Characteristics:
 1. Supports page allocation/deallocation.
 2. Supports read/write IO on backing sparse file.
 3. Supports dirty-page writeback and drop from memory.
-4. Stamps a BLAKE3 checksum trailer on dirty spill-file writeback and
+4. Stamps an XXH3-128 checksum trailer on dirty spill-file writeback and
    validates that trailer before a full-page reload is published as resident.
 
 Key components:

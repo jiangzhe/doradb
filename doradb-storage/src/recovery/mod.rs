@@ -1902,7 +1902,7 @@ mod tests {
 
         let mut group = vec![0u8; CORRUPTION_RECOVERY_LOG_BLOCK_SIZE];
         let header = RedoBlockHeader {
-            checksum: 1,
+            checksum: [1; 16],
             flags: REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END,
             payload_len: 1,
             group_block_idx: 0,

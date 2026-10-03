@@ -209,7 +209,7 @@ pub(super) fn catalog_definition_of_table_descriptors() -> &'static CatalogDefin
                 StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
                 // compiled_storage_epoch U64: numeric schema epoch described by the payload.
                 StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                // storage_schema_fingerprint VARBYTE: canonical 32-byte numeric schema digest.
+                // storage_schema_fingerprint VARBYTE: canonical 16-byte numeric schema digest.
                 StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
                 // payload VARBYTE: exact opaque higher-layer descriptor bytes.
                 StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
@@ -255,9 +255,9 @@ pub(super) fn table_descriptor_object_from_vals(
         Report::new(DataIntegrityError::InvalidPayload)
             .attach("catalog.table_descriptors fingerprint has wrong type")
     })?;
-    let storage_schema_fingerprint: [u8; 32] = fingerprint.try_into().map_err(|_| {
+    let storage_schema_fingerprint: [u8; 16] = fingerprint.try_into().map_err(|_| {
         Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-            "catalog.table_descriptors fingerprint length {}, expected 32",
+            "catalog.table_descriptors fingerprint length {}, expected 16",
             fingerprint.len()
         ))
     })?;
@@ -316,7 +316,7 @@ mod tests {
             Val::from(TableID::new(7)),
             Val::from(3u64),
             Val::from(4u64),
-            Val::from(vec![5; 32]),
+            Val::from(vec![5; 16]),
             Val::from(payload),
         ]
     }
@@ -349,7 +349,7 @@ mod tests {
             assert_eq!(descriptor.table_id, TableID::new(7));
             assert_eq!(descriptor.descriptor_revision, 3);
             assert_eq!(descriptor.compiled_storage_epoch, 4);
-            assert_eq!(descriptor.storage_schema_fingerprint, [5; 32]);
+            assert_eq!(descriptor.storage_schema_fingerprint, [5; 16]);
             assert_eq!(&*descriptor.payload, vec![0xff; len]);
         }
     }
@@ -376,9 +376,11 @@ mod tests {
         vals[3] = Val::from(1u64);
         assert_invalid(&vals);
 
-        let mut vals = descriptor_vals(vec![]);
-        vals[3] = Val::from(vec![0; 31]);
-        assert_invalid(&vals);
+        for len in [0, 15, 17, 31, 32] {
+            let mut vals = descriptor_vals(vec![]);
+            vals[3] = Val::from(vec![0; len]);
+            assert_invalid(&vals);
+        }
 
         let mut vals = descriptor_vals(vec![]);
         vals[4] = Val::from(1u64);
@@ -420,7 +422,7 @@ mod tests {
                 ..descriptor.clone()
             },
             TableDescriptorObject {
-                storage_schema_fingerprint: [0; 32],
+                storage_schema_fingerprint: [0; 16],
                 ..descriptor.clone()
             },
         ] {

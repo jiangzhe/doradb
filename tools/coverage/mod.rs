@@ -350,6 +350,7 @@ mod tests {
         assert_eq!(report["doradb-storage/src/lib.rs"].lines[&1], 0);
         let original = fs::read(moved.join("coverage.json")).unwrap();
         for (field, value) in [
+            ("schema", serde_json::json!(1)),
             ("schema", serde_json::json!(99)),
             ("complete", serde_json::json!(false)),
             (
@@ -379,6 +380,13 @@ mod tests {
                 .contains("digest mismatch")
         );
         fs::copy(output.join("lcov.info"), moved.join("lcov.info")).unwrap();
+        fs::write(moved.join("raw.lcov"), "tampered").unwrap();
+        assert!(
+            load(second.path(), &moved)
+                .unwrap_err()
+                .contains("digest mismatch")
+        );
+        fs::copy(output.join("raw.lcov"), moved.join("raw.lcov")).unwrap();
         fs::write(second.path().join("doradb-storage/src/lib.rs"), "changed").unwrap();
         assert!(
             load(second.path(), &moved)

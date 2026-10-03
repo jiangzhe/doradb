@@ -1,6 +1,7 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
 use crate::catalog::{IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, table::TableMetadata};
+use crate::checksum::checksum128;
 use crate::completion::Completion;
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, IoResult,
@@ -805,9 +806,9 @@ fn build_table_super_block(root: &ActiveRoot) -> DirectBuf {
     let ser_idx = super_block.ser(buf.as_bytes_mut(), 0);
     debug_assert_eq!(ser_idx, ser_len);
 
-    let b3sum = blake3::hash(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]);
+    let checksum = checksum128(&buf.as_bytes()[..SUPER_BLOCK_FOOTER_OFFSET]).to_le_bytes();
     let footer = SuperBlockFooter {
-        b3sum: *b3sum.as_bytes(),
+        checksum,
         checkpoint_cts: root.root_ts,
     };
     let ser_idx = footer.ser(buf.as_bytes_mut(), SUPER_BLOCK_FOOTER_OFFSET);
@@ -1508,7 +1509,7 @@ mod tests {
                 overwrite_file_bytes(
                     path,
                     version_offset,
-                    &(TABLE_META_BLOCK_VERSION + 1).to_le_bytes(),
+                    &(TABLE_META_BLOCK_VERSION - 1).to_le_bytes(),
                 );
             },
             DataIntegrityError::InvalidVersion,

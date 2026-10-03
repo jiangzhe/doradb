@@ -4,12 +4,13 @@ use crate::error::{BenchError, Result};
 use doradb_storage::id::TableID;
 use doradb_storage::{CallbackResult, IndexID, ScanRowDecision, Session, TableIndex, Val};
 use std::fmt::Write;
+use xxhash_rust::xxh3::Xxh3Default;
 
 /// Order-independent sum of length-delimited row hashes and exact count.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Fingerprint {
     rows: u64,
-    sum: [u8; 32],
+    sum: u128,
 }
 
 impl Fingerprint {
@@ -36,25 +37,19 @@ impl Fingerprint {
             .rows
             .checked_add(1)
             .ok_or_else(|| BenchError::message("content verification row count overflow"))?;
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Xxh3Default::new();
         hasher.update(&key.to_le_bytes());
         hasher.update(&length.to_le_bytes());
         hasher.update(payload);
-        let digest = hasher.finalize();
-        let mut carry = 0u16;
-        for (sum, byte) in self.sum.iter_mut().zip(digest.as_bytes()) {
-            let value = u16::from(*sum) + u16::from(*byte) + carry;
-            *sum = value as u8;
-            carry = value >> 8;
-        }
+        self.sum = self.sum.wrapping_add(hasher.digest128());
         self.rows = rows;
         Ok(())
     }
 
     /// Return the multiplicity-preserving digest as hexadecimal.
     pub(crate) fn hex(&self) -> String {
-        let mut hex = String::with_capacity(64);
-        for byte in self.sum {
+        let mut hex = String::with_capacity(32);
+        for byte in self.sum.to_le_bytes() {
             // Writing into a String is infallible.
             let _ = write!(hex, "{byte:02x}");
         }
@@ -133,16 +128,11 @@ mod tests {
             fingerprint(&[(0, b"a"), (1, b"bc")]),
             fingerprint(&[(0, b"ab"), (1, b"c")])
         );
-        assert_eq!(fingerprint(&[]).hex(), "0".repeat(64));
-        let encoded = [
-            0u64.to_le_bytes().as_slice(),
-            5u64.to_le_bytes().as_slice(),
-            first.1,
-        ]
-        .concat();
+        assert_eq!(fingerprint(&[]).hex(), "0".repeat(32));
+        // Independent upstream C XXH3_128bits vector for key=0, length=5, payload="hello".
         assert_eq!(
             fingerprint(&[first]).hex(),
-            blake3::hash(&encoded).to_hex().as_str()
+            "6086575bdd745f4ed984086493b96fd8"
         );
     }
 
@@ -162,7 +152,7 @@ mod tests {
         }
         let mut full = Fingerprint {
             rows: u64::MAX,
-            sum: [0xff; 32],
+            sum: u128::MAX,
         };
         let before = full.clone();
         assert!(full.add_row(&[Val::from(0u64), Val::from("")]).is_err());
@@ -171,14 +161,7 @@ mod tests {
         full.rows = 0;
         full.add_row(&[Val::from(0u64), Val::from("")]).unwrap();
         let expected = fingerprint(&[(0, b"")]);
-        let mut minus_one = expected.sum;
-        for byte in &mut minus_one {
-            let (value, borrow) = byte.overflowing_sub(1);
-            *byte = value;
-            if !borrow {
-                break;
-            }
-        }
+        let minus_one = expected.sum.wrapping_sub(1);
         assert_eq!(full.sum, minus_one);
     }
 }

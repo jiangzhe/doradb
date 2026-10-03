@@ -162,7 +162,7 @@ identity for hot RowStore reconstruction.
 After catalog replay, recovery validates every `catalog.table_descriptors` row
 against its central `catalog.tables` parent and reconstructed numeric schema.
 The opaque payload is never decoded, but its length must be at most 64,000
-bytes, its fingerprint must be exactly 32 bytes, and its compiled epoch and
+bytes, its fingerprint must be exactly 16 bytes, and its compiled epoch and
 fingerprint must match the current numeric definition. This validation occurs
 before final table-root reconciliation, so a catalog definition that is
 legitimately newer than a checkpointed table root remains eligible for the

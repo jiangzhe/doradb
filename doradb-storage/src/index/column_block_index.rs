@@ -1,4 +1,5 @@
 use crate::buffer::{PoolGuard, ReadonlyBlockGuard, ReadonlyBufferPool};
+use crate::checksum::checksum64;
 use crate::error::{
     DataIntegrityError, DataIntegrityResult, MultiDomainResultExt, ResourceError, ResourceResult,
     RuntimeError, RuntimeOrFatalResult, RuntimeOrFatalResultExt, RuntimeResult,
@@ -72,7 +73,7 @@ const _: () = assert!(
     COLUMN_STANDALONE_FIXED_SIZE + 4 * MAX_LWC_ROWS + deletion_body_bound(MAX_LWC_ROWS)
         <= COLUMN_BLOCK_PAGE_SIZE
 );
-const BLOCK_BINDING_FORMAT_TAG: &[u8; 8] = b"LWCBIND1";
+const BLOCK_BINDING_FORMAT_TAG: &[u8; 8] = b"LWCBIND2";
 
 /// Maximum number of logical entries that can fit in one leaf node.
 pub(crate) const COLUMN_BLOCK_MAX_ENTRIES: usize =
@@ -2179,10 +2180,7 @@ fn calculate_block_binding_value(
     payload[16..24].copy_from_slice(&start_row_id.to_le_bytes());
     payload[24..32].copy_from_slice(&end_row_id.to_le_bytes());
     payload[32..].copy_from_slice(&row_count.to_le_bytes());
-    let hash = blake3::hash(&payload);
-    let mut truncated = [0u8; 8];
-    truncated.copy_from_slice(&hash.as_bytes()[..8]);
-    u64::from_le_bytes(truncated)
+    checksum64(&payload)
 }
 
 fn leaf_entry_slice(
@@ -3295,20 +3293,32 @@ pub(super) mod tests {
                 pool.global_pool().clone(),
                 guard.clone(),
             );
-            let entries: Vec<_> = (0..1925).map(|i| dense_logical(i * 64, 8)).collect();
+            let entries: Vec<_> = (0..1925).map(|i| dense_logical(i * 128, 128)).collect();
             let root = index
                 .build_tree_from_logical_entries(&mut mutable, &entries, TrxID::new(2))
                 .await
                 .unwrap();
             let index = ColumnBlockIndex::new(
                 root,
-                RowID::new(1925 * 64),
+                RowID::new(1925 * 128),
                 pool.file_kind(),
                 pool.sparse_file(),
                 pool.global_pool(),
                 &guard,
             );
-            let deletes = OrdinalDeletionSet::from_ordinals(8, &[1]).unwrap();
+            let original = index.read_node(root).await.unwrap();
+            assert_eq!(original.header_ref().height(), 0);
+            assert_eq!(original.header_ref().count(), 1925);
+            assert_eq!(
+                original.leaf_prefix_plane().unwrap().search_type(),
+                ColumnBlockLeafSearchType::DeltaU32
+            );
+            drop(original);
+            // The leaf has 22 spare bytes. This deletion bitmap must force the final entry out.
+            let deletes =
+                OrdinalDeletionSet::from_ordinals(128, &(1..128).step_by(2).collect::<Vec<_>>())
+                    .unwrap();
+            assert!(COLUMN_DELETE_SECTION_HEADER_SIZE + deletes.body().len() > 22);
             let updated = index
                 .batch_replace_deletions(
                     &mut mutable,
@@ -3323,16 +3333,17 @@ pub(super) mod tests {
             let branch = index.read_node(updated).await.unwrap();
             assert_eq!(branch.header_ref().height(), 1);
             assert_eq!(branch.branch_entries().len(), 2);
-            for (child, search) in branch.branch_entries().iter().zip([
-                ColumnBlockLeafSearchType::DeltaU32,
-                ColumnBlockLeafSearchType::DeltaU16,
+            for (child, (search, count)) in branch.branch_entries().iter().zip([
+                (ColumnBlockLeafSearchType::DeltaU32, 1924),
+                (ColumnBlockLeafSearchType::DeltaU16, 1),
             ]) {
                 let leaf = index.read_node(child.block_id()).await.unwrap();
                 assert_eq!(leaf.leaf_prefix_plane().unwrap().search_type(), search);
+                assert_eq!(leaf.header_ref().count(), count);
             }
             let current = ColumnBlockIndex::new(
                 updated,
-                RowID::new(1925 * 64),
+                RowID::new(1925 * 128),
                 pool.file_kind(),
                 pool.sparse_file(),
                 pool.global_pool(),
@@ -3348,18 +3359,18 @@ pub(super) mod tests {
                 assert_eq!(row.block_binding_value(), entry.block_binding_value);
                 assert_eq!(
                     row.durable_deleted(),
-                    entry.start_row_id == RowID::new(900 * 64)
+                    entry.start_row_id == RowID::new(900 * 128)
                 );
             }
         });
     }
 
     /// Purpose: Independently account for the worst supported identity and deletion bodies in a complete leaf.
-    /// Expected: The cap serializes in 63,604 bytes including framing, while 16,384 rows cannot meet the bound.
+    /// Expected: The cap serializes in 63,588 bytes including framing, while 16,384 rows cannot meet the bound.
     #[test]
     fn standalone_capacity_bound_matches_serialization() {
-        assert_eq!(COLUMN_STANDALONE_FIXED_SIZE, 120);
-        assert_eq!(120 + 4 * 16_384 + deletion_body_bound(16_384), 67_836);
+        assert_eq!(COLUMN_STANDALONE_FIXED_SIZE, 104);
+        assert_eq!(104 + 4 * 16_384 + deletion_body_bound(16_384), 67_820);
         for count in [1, 63, 64, 65, 4096, MAX_LWC_ROWS] {
             let rows: Vec<_> = (0..count).map(|i| RowID::new(i as u64 * 100003)).collect();
             let mut input = sparse_entry(
@@ -3374,17 +3385,17 @@ pub(super) mod tests {
             )
             .unwrap();
             let encoded = EncodedLeafEntry::from_logical(&build_logical_entry_from_input(&input));
-            let actual = 48
+            let actual = 32
                 + 32
                 + leaf_chunk_encoded_len(
                     slice::from_ref(&encoded),
                     ColumnBlockLeafSearchType::DeltaU16,
                 );
-            assert!(actual <= 120 + 4 * count + deletion_body_bound(count));
+            assert!(actual <= 104 + 4 * count + deletion_body_bound(count));
             if count == MAX_LWC_ROWS {
                 assert_eq!(input.row_set.body().len(), 61_440);
                 assert_eq!(input.deletions.body().len(), 2_044);
-                assert_eq!(actual, 63_604);
+                assert_eq!(actual, 63_588);
             }
             let page = encoded_leaf_page(&[encoded]);
             validate_persisted_column_block_index_page(
@@ -3548,7 +3559,7 @@ pub(super) mod tests {
     #[test]
     fn column_index_rejects_previous_binding_format() {
         let mut page = adaptive_leaf_fixture();
-        page[8..16].copy_from_slice(&3u64.to_le_bytes());
+        page[8..16].copy_from_slice(&(COLUMN_BLOCK_INDEX_BLOCK_SPEC.version - 1).to_le_bytes());
         write_block_checksum(&mut page);
         let err = validate_persisted_column_block_index_page(
             &page,
@@ -3584,7 +3595,7 @@ pub(super) mod tests {
             start_row_id: RowID::new(10),
             block_id: test_block_id(1001),
             row_id_span: 32,
-            block_binding_value: 42,
+            block_binding_value: 0x0807_0605_0403_0201,
             row_section: vec![0u8; 4 + 7 * mem::size_of::<u32>()],
             delete_section: vec![
                 0u8;
@@ -3596,7 +3607,8 @@ pub(super) mod tests {
         assert_eq!(header.row_id_span(), 32);
         assert_eq!(header.entry_len(), 24 + 32 + 16);
         assert_eq!(header.row_section_len(), 32);
-        assert_eq!(header.block_binding_value(), 42);
+        assert_eq!(header.block_binding_value(), encoded.block_binding_value);
+        assert_eq!(&layout::bytes_of(&header)[8..16], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(mem::size_of::<ColumnBlockLeafEntryHeader>(), 24);
         assert_eq!(mem::size_of::<ColumnBlockLeafHeaderExt>(), 8);
         assert_eq!(COLUMN_BLOCK_LEAF_HEADER_SIZE, 32);
@@ -3605,16 +3617,16 @@ pub(super) mod tests {
         assert_eq!(COLUMN_BLOCK_LEAF_PREFIX_U16_SIZE, 4);
     }
 
-    /// Purpose: Fix the binding hash's domain tag, field widths, byte order, and truncation.
-    /// Expected: The binding matches BLAKE3 of the literal 36-byte format input.
+    /// Purpose: Fix the binding hash's domain tag, field widths, byte order, and complete digest.
+    /// Expected: The binding matches the independent XXH3-64 reference for the canonical input.
     #[test]
     fn block_binding_value_has_fixed_input_layout() {
         let payload = [
-            b'L', b'W', b'C', b'B', b'I', b'N', b'D', b'1', 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20,
+            b'L', b'W', b'C', b'B', b'I', b'N', b'D', b'2', 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20,
             21, 22, 23, 24, 33, 34, 35, 36, 37, 38, 39, 40, 49, 50, 51, 52,
         ];
-        let digest = blake3::hash(&payload);
-        let expected = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap());
+        let expected = 0xa48c_ea28_8740_e390;
+        assert_eq!(checksum64(&payload), expected);
         assert_eq!(
             calculate_block_binding_value(
                 TableID::new(0x0807_0605_0403_0201),
