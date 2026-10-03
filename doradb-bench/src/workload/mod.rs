@@ -12,11 +12,13 @@ mod index_fixture;
 mod insert;
 mod lock;
 mod maintenance;
+mod mutation;
 mod noop;
 mod read;
 mod recovery;
 mod table_scan;
 mod update;
+mod upsert;
 mod util;
 mod verification;
 
@@ -43,6 +45,9 @@ pub(crate) use update::set_update_completion_hook;
 pub(crate) use update::{
     UpdateAllExecutor, UpdatePointRandExecutor, UpdateRandExecutor, complete_update,
 };
+#[cfg(test)]
+pub(crate) use upsert::set_upsert_completion_hook;
+pub(crate) use upsert::{UpsertPointRandExecutor, complete_upsert};
 pub(crate) use util::build_session_plans;
 
 /// First-error-wins cooperative cancellation shared by one plan run.

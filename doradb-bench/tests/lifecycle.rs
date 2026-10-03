@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use doradb_bench::fixture::{IndexMode, PlacementKind, RowPlacement};
+    use doradb_bench::fixture::{IndexMode, KeyRange, PlacementKind, RowPlacement};
     use doradb_bench::measurement::{
-        LatencyUnit, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
+        ExpectedOutcomeCounters, LatencyUnit, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
     };
-    use doradb_bench::plan::Phase;
+    use doradb_bench::plan::{Phase, ResolvedWorkload};
     use doradb_bench::plan_output::InvocationReport;
     use rustix::process::{Pid, Signal, kill_process};
     use std::fs;
@@ -432,10 +432,18 @@ mod tests {
             let workload = phase["workload"].as_table_mut().unwrap();
             if matches!(
                 workload["type"].as_str().unwrap(),
-                "insert-seq" | "insert-rand" | "update-rand" | "update-point-rand" | "delete-rand"
+                "insert-seq"
+                    | "insert-rand"
+                    | "update-rand"
+                    | "update-point-rand"
+                    | "upsert-point-rand"
+                    | "delete-rand"
             ) {
                 workload.insert("num".to_owned(), 100.into());
                 workload.insert("batch_size".to_owned(), 10.into());
+                if let Some(range) = workload.get_mut("key_range") {
+                    range["len"] = 200.into();
+                }
             }
         }
         let defaults = plan["engine_defaults"].as_str().unwrap();
@@ -456,6 +464,63 @@ mod tests {
             "{name} fixture"
         );
         (stdout, report)
+    }
+
+    #[track_caller]
+    fn check_upsert_template(name: &str, overwrite: bool) {
+        let (stdout, report) = execute_small_template(name);
+        assert_eq!(report.measured_runs.len(), 1);
+        let run = &report.measured_runs[0];
+        assert_eq!(run.counters.operations, 100);
+        assert_eq!(run.counters.inserted_rows + run.counters.updated_rows, 100);
+        assert_eq!(run.counters.found, run.counters.updated_rows);
+        assert_eq!(run.counters.not_found, run.counters.inserted_rows);
+        assert_eq!(run.counters.deleted_rows, 0);
+        assert_eq!(run.counters.rows_returned, 0);
+        assert_eq!(
+            run.counters.expected_outcomes,
+            ExpectedOutcomeCounters::default()
+        );
+        assert_eq!(run.latency.unit, LatencyUnit::UpsertPointBatchTransaction);
+        assert_eq!(run.latency.sample_count, 12);
+        assert!(run.counters.updated_rows > 0);
+        if overwrite {
+            assert_eq!(run.counters.inserted_rows, 0);
+        } else {
+            assert!(run.counters.inserted_rows > 0);
+        }
+        for (name, count) in [
+            ("operations", 100),
+            ("inserted_rows", run.counters.inserted_rows),
+            ("updated_rows", run.counters.updated_rows),
+        ] {
+            assert!(stdout.contains(&format!("{name}: {count}\n")));
+            let rate = if run.elapsed_nanos == 0 {
+                0.0
+            } else {
+                count as f64 * 1_000_000_000.0 / run.elapsed_nanos as f64
+            };
+            assert!(stdout.contains(&format!("{name}_per_second: {rate:.3}\n")));
+        }
+        let ResolvedWorkload::UpsertPointRand(config) =
+            report.plan.phases.last().unwrap().workload()
+        else {
+            panic!("upsert template identity")
+        };
+        assert_eq!(
+            config.key_range,
+            KeyRange {
+                start: 0,
+                len: if overwrite { 100 } else { 200 }
+            }
+        );
+        assert_eq!(config.seed, 42);
+        assert_eq!(
+            (config.threads, config.sessions, config.batch_size),
+            (2, 4, 10)
+        );
+        let decoded: InvocationReport = toml::from_str(&toml::to_string(&report).unwrap()).unwrap();
+        assert_eq!(decoded, report);
     }
 
     #[track_caller]
@@ -1058,6 +1123,96 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         }
         assert_update_counters(report.aggregate.counters);
         assert_eq!(report.aggregate.latency.sample_count, 16);
+    }
+
+    /// Purpose: Execute the mixed-occupancy upsert template through the public CLI.
+    /// Expected: Both logical actions occur, normalized controls round trip, and request/row rates and batch samples match independently.
+    #[test]
+    fn upsert_mixed_template_executes() {
+        check_upsert_template("upsert-point-rand", false);
+    }
+
+    /// Purpose: Execute the overwrite upsert template through the public CLI.
+    /// Expected: The omitted domain resolves to preparation and every request updates with zero inserts.
+    #[test]
+    fn upsert_overwrite_template_executes() {
+        check_upsert_template("upsert-point-rand-overwrite", true);
+    }
+
+    /// Purpose: Start upsert from a created empty table with repeated targets across batches.
+    /// Expected: The explicit singleton range inserts once then updates with one sample per committed batch.
+    #[test]
+    fn upsert_empty_cli_plan_executes() {
+        let temp = TempDir::new().unwrap();
+        let (_, report) = execute_plan(
+            &temp,
+            "empty-upsert",
+            "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'upsert-point-rand', num = 3, key_range = { start = 42, len = 1 }, batch_size = 2 }",
+        );
+        assert_eq!(report.aggregate.counters.operations, 3);
+        assert_eq!(report.aggregate.counters.inserted_rows, 1);
+        assert_eq!(report.aggregate.counters.updated_rows, 2);
+        assert_eq!(report.aggregate.latency.sample_count, 2);
+    }
+
+    /// Purpose: Reject invalid upsert plans before acquiring storage-root ownership.
+    /// Expected: Invalid controls, shapes, domains, preparation placement, and repetition create neither a root nor success output.
+    #[test]
+    fn upsert_cli_rejects_invalid_plans_before_root_creation() {
+        let prepare = "[[phase]]\nworkload = { type = 'create-table', index = 'unique' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n";
+        for (fields, error) in [
+            ("num = 0", "nonzero"),
+            ("num = 1, threads = 0", "nonzero"),
+            ("num = 1, sessions = 0", "nonzero"),
+            ("num = 1, batch_size = 0", "nonzero"),
+            ("num = 1, threads = 2, sessions = 1", "must not exceed"),
+            ("num = 1, sessions = 4", "exceed target"),
+            ("num = 1, value_size = '0 B'", "positive"),
+            ("num = 1, value_size = '1 MiB'", "must not exceed"),
+            ("num = 1, change_key = false", "unknown field"),
+            ("num = 1, key_range = { start = 0, len = 0 }", "nonempty"),
+            (
+                "num = 1, key_range = { start = 18446744073709551615, len = 1 }",
+                "overflow",
+            ),
+        ] {
+            assert_plan_rejected_before_root_creation(
+                &format!(
+                    "{prepare}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'upsert-point-rand', {fields} }}"
+                ),
+                error,
+            );
+        }
+        let base = format!(
+            "{prepare}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'upsert-point-rand', num = 1 }}"
+        );
+        for repetition in ["warmup_runs = 1", "measured_runs = 2"] {
+            assert_plan_rejected_before_root_creation(
+                &base.replace(
+                    "kind = 'benchmark'",
+                    &format!("kind = 'benchmark'\n{repetition}"),
+                ),
+                "not replay-safe",
+            );
+        }
+        for index in ["none", "non-unique"] {
+            assert_plan_rejected_before_root_creation(
+                &base.replace("index = 'unique'", &format!("index = '{index}'")),
+                "incompatible",
+            );
+        }
+        assert_plan_rejected_before_root_creation(
+            "[[phase]]\nkind = 'benchmark'\nworkload = { type = 'upsert-point-rand', num = 1, key_range = { start = 0, len = 1 } }",
+            "preceding create-table",
+        );
+        let empty = base.replace(
+            "[[phase]]\nworkload = { type = 'insert-seq', num = 3 }\n",
+            "",
+        );
+        assert_plan_rejected_before_root_creation(&empty, "loaded");
+        let prepare = base.replace("kind = 'benchmark'", "kind = 'prepare'")
+            + "\n[[phase]]\nkind = 'benchmark'\nworkload = { type = 'trx-noop', num = 1 }";
+        assert_plan_rejected_before_root_creation(&prepare, "final benchmark");
     }
 
     /// Purpose: Execute the unique full-table update template through the CLI.

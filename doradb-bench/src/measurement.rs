@@ -111,6 +111,8 @@ pub enum LatencyUnit {
     UpdateAllTransaction,
     /// One transaction containing equality-key update requests.
     UpdatePointBatchTransaction,
+    /// One point-upsert batch transaction from begin through successful commit.
+    UpsertPointBatchTransaction,
     /// One full-table delete transaction from begin through successful commit.
     DeleteAllTransaction,
     /// One point-delete batch transaction from begin through successful commit.
@@ -158,6 +160,7 @@ impl fmt::Display for LatencyUnit {
             Self::UpdateRangeTransaction => "update-range-transaction",
             Self::UpdateAllTransaction => "update-all-transaction",
             Self::UpdatePointBatchTransaction => "update-point-batch-transaction",
+            Self::UpsertPointBatchTransaction => "upsert-point-batch-transaction",
             Self::DeleteAllTransaction => "delete-all-transaction",
             Self::DeleteBatchTransaction => "delete-batch-transaction",
             Self::TableCreateDropCycle => "table-create-drop-cycle",
@@ -440,13 +443,13 @@ pub struct WorkloadCounters {
     pub operations: u64,
     /// Rows inserted by successful operations.
     pub inserted_rows: u64,
-    /// Rows updated by successful range-mutation operations.
+    /// Rows updated by successfully committed mutations.
     pub updated_rows: u64,
     /// Rows deleted by successfully committed mutations.
     pub deleted_rows: u64,
-    /// Successful point requests that found at least one row.
+    /// Successful point requests that found at least one row before their action.
     pub found: u64,
-    /// Successful point requests that found no row.
+    /// Successful point requests that found no row before their action.
     pub not_found: u64,
     /// Rows returned by successful scans or streams.
     pub rows_returned: u64,

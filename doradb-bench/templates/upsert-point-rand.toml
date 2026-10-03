@@ -1,0 +1,14 @@
+name = "mixed upsert-point-rand"
+engine_defaults = "engine-defaults.toml"
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000, batch_size = 100, value_size = "128 B" }
+
+[[phase]]
+kind = "benchmark"
+warmup_runs = 0
+measured_runs = 1
+workload = { type = "upsert-point-rand", num = 10000, threads = 2, sessions = 4, batch_size = 100, seed = 42, key_range = { start = 0, len = 20000 }, value_size = "128 B" }
