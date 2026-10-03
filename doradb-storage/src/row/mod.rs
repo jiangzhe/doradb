@@ -1997,8 +1997,15 @@ pub(crate) mod tests {
     #[test]
     fn test_estimate_max_row_count() {
         // Known capacities for the persisted page layout, independent of the estimator.
-        for (row_len, expected) in [(100, 641), (200, 324), (300, 216), (400, 162), (500, 130)] {
-            for col_count in 1..6 {
+        for (row_len, capacities) in [
+            (100, [642, 642, 641, 641, 641]),
+            (200, [324; 5]),
+            (300, [216; 5]),
+            (400, [162; 5]),
+            (500, [130; 5]),
+        ] {
+            for (idx, expected) in capacities.into_iter().enumerate() {
+                let col_count = idx + 1;
                 assert_eq!(
                     estimate_max_row_count(row_len, col_count),
                     expected,
@@ -2009,8 +2016,8 @@ pub(crate) mod tests {
         for (case, row_len, col_count, expected) in [
             ("full null-bitmap byte", 100, 8, 641),
             ("next null-bitmap byte", 100, 9, 635),
-            ("last fitting row", 65_468, 1, 1),
-            ("oversized row", 65_469, 1, 0),
+            ("last fitting row", 65_484, 1, 1),
+            ("oversized row", 65_485, 1, 0),
         ] {
             assert_eq!(
                 estimate_max_row_count(row_len, col_count),

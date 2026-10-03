@@ -58,7 +58,7 @@ pub(crate) struct TableDescriptorObject {
     /// Storage epoch against which the opaque payload was compiled.
     pub(crate) compiled_storage_epoch: u64,
     /// Canonical fingerprint of the separately persisted numeric schema.
-    pub(crate) storage_schema_fingerprint: [u8; 32],
+    pub(crate) storage_schema_fingerprint: [u8; 16],
     /// Exact opaque higher-layer descriptor bytes.
     pub(crate) payload: Box<[u8]>,
 }

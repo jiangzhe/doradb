@@ -30,26 +30,26 @@ const MIN_TRX_LOG_FRAME_LEN: usize =
 /// use little-endian encoding, with no implicit alignment or padding between fields.
 ///
 /// Each group occupies consecutive fixed-size blocks within one file's data
-/// region. Every block starts with the 11-byte [`RedoBlockHeader`]:
+/// region. Every block starts with the 23-byte [`RedoBlockHeader`]:
 ///
 /// | Block offset | Field | Encoding |
 /// | --- | --- | --- |
-/// | 0 | `checksum` | `u32`, CRC32 of every remaining byte in this block |
-/// | 4 | `flags` | `u8`, START = 1, END = 2; other bits are invalid |
-/// | 5 | `payload_len` | `u16`, logical payload bytes in this block |
-/// | 7 | `group_block_idx` | `u32`, zero-based position within the group |
+/// | 0 | `checksum` | `[u8; 16]`, little-endian XXH3-128 of every remaining byte in this block |
+/// | 16 | `flags` | `u8`, START = 1, END = 2; other bits are invalid |
+/// | 17 | `payload_len` | `u16`, logical payload bytes in this block |
+/// | 19 | `group_block_idx` | `u32`, zero-based position within the group |
 ///
 /// Only the START block has the following 28-byte [`RedoGroupStartExtension`]
 /// immediately after its common header:
 ///
 /// | Block offset | Field | Encoding |
 /// | --- | --- | --- |
-/// | 11 | `group_payload_len` | `u64`, total logical bytes, including frame prefixes |
-/// | 19 | `group_block_count` | `u32`, total physical blocks in this group |
-/// | 23 | `min_redo_cts` | `u64`, inclusive lower transaction CTS bound |
-/// | 31 | `max_redo_cts` | `u64`, inclusive upper transaction CTS bound |
+/// | 23 | `group_payload_len` | `u64`, total logical bytes, including frame prefixes |
+/// | 31 | `group_block_count` | `u32`, total physical blocks in this group |
+/// | 35 | `min_redo_cts` | `u64`, inclusive lower transaction CTS bound |
+/// | 43 | `max_redo_cts` | `u64`, inclusive upper transaction CTS bound |
 ///
-/// Payload starts at byte 39 in the START block and byte 11 in continuation
+/// Payload starts at byte 51 in the START block and byte 23 in continuation
 /// blocks. Bytes after each block's payload must be zero; the checksum includes
 /// this padding and, for the START block, the extension. Block indices must be
 /// consecutive from zero, START appears only at index zero, and END appears only

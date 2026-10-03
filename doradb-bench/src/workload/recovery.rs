@@ -240,6 +240,17 @@ mod tests {
                 } else {
                     let run = result.unwrap();
                     assert_eq!(run.verification.table_count, 2);
+                    let fingerprints = run.verification.fingerprint.split(':').collect::<Vec<_>>();
+                    assert_eq!(fingerprints.len(), 2);
+                    assert!(fingerprints.iter().all(|digest| {
+                        digest.len() == 32
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    }));
+                    let encoded = toml::to_string(&run.verification).unwrap();
+                    let decoded: RecoveryVerification = toml::from_str(&encoded).unwrap();
+                    assert_eq!(decoded, run.verification);
                     assert!(run.verification.index_verified);
                     let deleted = if mutate_every == 0 {
                         0

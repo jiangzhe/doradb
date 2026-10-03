@@ -3361,7 +3361,7 @@ mod tests {
                     ..original.clone()
                 },
                 TableDescriptorObject {
-                    storage_schema_fingerprint: [0xff; 32],
+                    storage_schema_fingerprint: [0xff; 16],
                     ..original.clone()
                 },
             ] {

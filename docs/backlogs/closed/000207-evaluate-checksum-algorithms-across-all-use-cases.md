@@ -49,3 +49,11 @@ table ID, start/end RowIDs, and row count. Evaluate that current fixed-input
 use alongside the historical fingerprint measurements; full-block checksums
 still use the existing BLAKE3 algorithm. Task 000322 summarizes the resulting
 checkpoint CPU measurements.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000327-replace-all-checksum-algorithms-with-xxh3-128.md. The final policy uses unseeded XXH3-128 for physical checksums, schema fingerprints and auxiliary digests, with native XXH3-64 u64 block bindings as explicitly selected by the user. The coordinated cutover requires fresh storage and passes broad correctness checks. Refreshed evidence in target/checksum-migration-u64-binding contains five paired checkpoint runs and three profiles per revision: the measured median fell from 76.632 ms to 54.991 ms, with overlapping ranges and identical frozen work; checkpoint/LWC checksum attribution fell from 59.40% to 8.78%. This measures the full migration against BLAKE3/CRC32, not an isolated gain from narrowing bindings. The earlier u128 binding candidate remains in target/checksum-migration. Original microbenchmark, alternative-algorithm, x86_64, cold-read/spill/redo/recovery campaign hints were superseded by the approved task scope and were not performed; no broader performance result is claimed.
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-10-03

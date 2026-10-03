@@ -94,7 +94,7 @@ Each file reserves two super-block slots for checksummed metadata. This metadata
 describes the file's format and block size; recovery selects the newest valid
 metadata when a metadata write is torn. Existing files are read using their
 persisted layout; new files use the current configuration. Unsupported format
-versions are rejected.
+versions are rejected. Redo data blocks and file metadata use XXH3-128 checksums.
 
 An active file is **unsealed**. Once its completed prefix is closed, sealing
 records the durable end and the CTS range of the actual redo records in the

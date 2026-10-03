@@ -12,6 +12,7 @@ use crate::catalog::{
     Catalog, CatalogDefinitionEffects, ColumnID, ColumnOrdinal, ID_DOMAIN_END, IndexID, IndexRef,
     IndexSlot, ManagedTableDefinition, TableBinding, TableBindingObject,
 };
+use crate::checksum::ChecksumHasher;
 use crate::component::EnginePools;
 use crate::engine::EngineCore;
 use crate::error::{
@@ -1582,12 +1583,12 @@ impl TableMetadata {
     }
 
     /// Computes the canonical active storage-schema fingerprint.
-    pub(crate) fn storage_schema_fingerprint(&self) -> [u8; 32] {
+    pub(crate) fn storage_schema_fingerprint(&self) -> [u8; 16] {
         #[cfg(test)]
         tests::record_storage_schema_fingerprint();
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = ChecksumHasher::new();
         hasher.update(b"doradb.storage-schema\0");
-        hasher.update(&[1]);
+        hasher.update(&[2]);
         hasher.update(&(self.col.col_count() as u32).to_le_bytes());
         for column in self.col.columns() {
             hasher.update(&column.id.get().to_le_bytes());
@@ -1608,7 +1609,7 @@ impl TableMetadata {
                 hasher.update(&[key.order as u8]);
             }
         }
-        *hasher.finalize().as_bytes()
+        hasher.finalize().to_le_bytes()
     }
 }
 
@@ -3447,8 +3448,7 @@ pub(crate) mod tests {
         assert_eq!(
             fingerprint,
             [
-                93, 98, 157, 121, 231, 186, 186, 42, 170, 226, 50, 231, 4, 188, 50, 164, 167, 7,
-                108, 60, 242, 232, 63, 176, 70, 255, 16, 249, 122, 34, 127, 207,
+                13, 28, 110, 157, 201, 97, 175, 62, 20, 13, 155, 42, 45, 73, 158, 57
             ]
         );
 

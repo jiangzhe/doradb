@@ -1,3 +1,4 @@
+use crate::checksum::{CHECKSUM_SIZE, checksum128};
 use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
 use crate::file::block_integrity::{
     BLOCK_INTEGRITY_HEADER_SIZE, BlockIntegritySpec, checksum_offset, validate_block,
@@ -12,7 +13,7 @@ use std::mem;
 /// Magic bytes stored in every redo file super-block header.
 pub(crate) const REDO_FILE_MAGIC: [u8; 8] = *b"DREDO\0\0\0";
 /// Redo file format version for framing and serialized redo payloads.
-pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 6;
+pub(crate) const REDO_FILE_FORMAT_VERSION: u64 = 7;
 /// Shared block-integrity envelope used by redo super-block slots.
 pub(crate) const REDO_SUPER_BLOCK_SPEC: BlockIntegritySpec =
     BlockIntegritySpec::new(REDO_FILE_MAGIC, REDO_FILE_FORMAT_VERSION);
@@ -25,7 +26,7 @@ pub(crate) const REDO_DEFAULT_DATA_START_OFFSET: usize =
     REDO_SUPER_BLOCK_SLOT_COUNT * REDO_SUPER_BLOCK_SLOT_SIZE;
 /// Serialized size of the common header at the front of every redo data block.
 pub(crate) const REDO_BLOCK_COMMON_HEADER_SIZE: usize =
-    mem::size_of::<u32>() + mem::size_of::<u8>() + mem::size_of::<u16>() + mem::size_of::<u32>();
+    CHECKSUM_SIZE + mem::size_of::<u8>() + mem::size_of::<u16>() + mem::size_of::<u32>();
 /// Serialized size of metadata present only on group-start redo data blocks.
 pub(crate) const REDO_GROUP_START_EXTENSION_SIZE: usize =
     mem::size_of::<u64>() + mem::size_of::<u32>() + mem::size_of::<u64>() * 2;
@@ -42,8 +43,8 @@ const REDO_BLOCK_VALID_FLAGS: u8 = REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END
 /// Common fixed header stored at the front of every redo data block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RedoBlockHeader {
-    /// CRC32 of this complete fixed-size block excluding this field.
-    pub(crate) checksum: u32,
+    /// XXH3-128 of this complete fixed-size block excluding this field.
+    pub(crate) checksum: [u8; CHECKSUM_SIZE],
     /// Block role flags.
     pub(crate) flags: u8,
     /// Number of logical payload bytes stored in this block.
@@ -73,7 +74,7 @@ impl RedoBlockHeader {
             ))
         })?;
         Ok(Self {
-            checksum: 0,
+            checksum: [0; CHECKSUM_SIZE],
             flags,
             payload_len,
             group_block_idx,
@@ -140,11 +141,11 @@ impl RedoBlockHeader {
                 )),
             );
         }
-        let actual = crc32fast::hash(&block[mem::size_of::<u32>()..]);
+        let actual = checksum128(&block[CHECKSUM_SIZE..]).to_le_bytes();
         if actual != self.checksum {
             return Err(
                 Report::new(DataIntegrityError::ChecksumMismatch).attach(format!(
-                    "block=redo-data, expected_checksum={:08x}, actual_checksum={actual:08x}",
+                    "block=redo-data, expected_checksum={:02x?}, actual_checksum={actual:02x?}",
                     self.checksum
                 )),
             );
@@ -161,7 +162,7 @@ impl Ser<'_> for RedoBlockHeader {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u32(start_idx, self.checksum);
+        let idx = out.ser_byte_array(start_idx, &self.checksum);
         let idx = out.ser_u8(idx, self.flags);
         let idx = out.ser_u16(idx, self.payload_len);
         out.ser_u32(idx, self.group_block_idx)
@@ -173,7 +174,7 @@ impl Deser for RedoBlockHeader {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, checksum) = input.deser_u32(start_idx)?;
+        let (idx, checksum) = input.deser_byte_array::<CHECKSUM_SIZE>(start_idx)?;
         let (idx, flags) = input.deser_u8(idx)?;
         let (idx, payload_len) = input.deser_u16(idx)?;
         let (idx, group_block_idx) = input.deser_u32(idx)?;
@@ -313,8 +314,8 @@ impl Deser for RedoGroupStartExtension {
 /// |------------------|-------------------------------|
 /// | 0..16            | block-integrity header        |
 /// | 16..72           | redo super-block payload      |
-/// | 72..slot_size-32 | zero padding                  |
-/// | slot_size-32..   | block-integrity BLAKE3 trailer |
+/// | 72..slot_size-16 | zero padding                  |
+/// | slot_size-16..   | block-integrity XXH3-128 trailer |
 /// ```
 ///
 /// The redo payload is serialized at byte `16`:
@@ -498,17 +499,17 @@ pub(crate) fn is_zero_redo_block(block: &[u8]) -> bool {
     block.iter().all(|&byte| byte == 0)
 }
 
-/// Compute and write the redo data block checksum into the first four bytes.
+/// Compute and write the redo data block checksum into the first 16 bytes.
 #[inline]
-pub(crate) fn patch_redo_block_checksum(block: &mut [u8]) -> u32 {
+pub(crate) fn patch_redo_block_checksum(block: &mut [u8]) -> [u8; CHECKSUM_SIZE] {
     assert!(
         block.len() >= RedoBlockHeader::SIZE,
         "trusted redo block must fit its header before checksum patching: block_len={}, header_len={}",
         block.len(),
         RedoBlockHeader::SIZE
     );
-    let checksum = crc32fast::hash(&block[mem::size_of::<u32>()..]);
-    block.ser_u32(0, checksum);
+    let checksum = checksum128(&block[CHECKSUM_SIZE..]).to_le_bytes();
+    block.ser_byte_array(0, &checksum);
     checksum
 }
 
@@ -807,7 +808,7 @@ mod tests {
     #[test]
     fn redo_block_header_serializes_fixed_layout() {
         let header = RedoBlockHeader {
-            checksum: 0x1122_3344,
+            checksum: 0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201u128.to_le_bytes(),
             flags: REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END,
             payload_len: 0x0102,
             group_block_idx: 0x0304_0506,
@@ -817,10 +818,14 @@ mod tests {
         let idx = header.ser(&mut buf[..], 0);
 
         assert_eq!(idx, RedoBlockHeader::SIZE);
-        assert_eq!(&buf[0..4], &0x1122_3344u32.to_le_bytes());
-        assert_eq!(buf[4], REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END);
-        assert_eq!(&buf[5..7], &0x0102u16.to_le_bytes());
-        assert_eq!(&buf[7..11], &0x0304_0506u32.to_le_bytes());
+        assert_eq!(RedoBlockHeader::SIZE, 23);
+        assert_eq!(
+            &buf[0..16],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(buf[16], REDO_BLOCK_GROUP_START | REDO_BLOCK_GROUP_END);
+        assert_eq!(&buf[17..19], &0x0102u16.to_le_bytes());
+        assert_eq!(&buf[19..23], &0x0304_0506u32.to_le_bytes());
 
         let (idx, parsed) = RedoBlockHeader::deser(&buf[..], 0).unwrap();
         assert_eq!(idx, RedoBlockHeader::SIZE);
@@ -838,18 +843,18 @@ mod tests {
             min_redo_cts: TrxID::new(0x2122_2324_2526_2728),
             max_redo_cts: TrxID::new(0x3132_3334_3536_3738),
         };
-        let mut buf = [0u8; RedoGroupStartExtension::SIZE];
+        let mut buf = [0u8; RedoBlockHeader::SIZE + RedoGroupStartExtension::SIZE];
 
-        let idx = extension.ser(&mut buf[..], 0);
+        let idx = extension.ser(&mut buf[..], RedoBlockHeader::SIZE);
 
-        assert_eq!(idx, RedoGroupStartExtension::SIZE);
-        assert_eq!(&buf[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
-        assert_eq!(&buf[8..12], &0x1112_1314u32.to_le_bytes());
-        assert_eq!(&buf[12..20], &0x2122_2324_2526_2728u64.to_le_bytes());
-        assert_eq!(&buf[20..28], &0x3132_3334_3536_3738u64.to_le_bytes());
+        assert_eq!(idx, 51);
+        assert_eq!(&buf[23..31], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&buf[31..35], &0x1112_1314u32.to_le_bytes());
+        assert_eq!(&buf[35..43], &0x2122_2324_2526_2728u64.to_le_bytes());
+        assert_eq!(&buf[43..51], &0x3132_3334_3536_3738u64.to_le_bytes());
 
-        let (idx, parsed) = RedoGroupStartExtension::deser(&buf[..], 0).unwrap();
-        assert_eq!(idx, RedoGroupStartExtension::SIZE);
+        let (idx, parsed) = RedoGroupStartExtension::deser(&buf[..], 23).unwrap();
+        assert_eq!(idx, 51);
         assert_eq!(parsed, extension);
     }
 
@@ -869,18 +874,15 @@ mod tests {
         block[payload_start..payload_start + 16].copy_from_slice(&[7u8; 16]);
 
         let checksum = patch_redo_block_checksum(&mut block);
-        assert_eq!(checksum, crc32fast::hash(&block[mem::size_of::<u32>()..]));
+        assert_eq!(checksum, checksum128(&block[CHECKSUM_SIZE..]).to_le_bytes());
         let (_, parsed) = RedoBlockHeader::deser(&block[..RedoBlockHeader::SIZE], 0).unwrap();
         parsed.verify_checksum(&block).unwrap();
 
-        for mutate in [
-            mem::size_of::<u32>(),
-            payload_start,
-            STORAGE_SECTOR_SIZE - 1,
-        ] {
+        for mutate in (0..payload_start).chain([payload_start, STORAGE_SECTOR_SIZE - 1]) {
             let mut corrupted = block.clone();
             corrupted[mutate] ^= 0x80;
-            let err = parsed.verify_checksum(&corrupted).unwrap_err();
+            let (_, corrupted_header) = RedoBlockHeader::deser(&corrupted[..], 0).unwrap();
+            let err = corrupted_header.verify_checksum(&corrupted).unwrap_err();
             assert_integrity_error(err, DataIntegrityError::ChecksumMismatch);
         }
     }
@@ -892,11 +894,11 @@ mod tests {
     fn redo_block_payload_capacity_uses_fixed_headers() {
         assert_eq!(
             redo_start_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap(),
-            STORAGE_SECTOR_SIZE - RedoBlockHeader::SIZE - RedoGroupStartExtension::SIZE
+            4045
         );
         assert_eq!(
             redo_continuation_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap(),
-            STORAGE_SECTOR_SIZE - RedoBlockHeader::SIZE
+            4073
         );
     }
 
@@ -909,37 +911,37 @@ mod tests {
             redo_continuation_block_payload_capacity(STORAGE_SECTOR_SIZE).unwrap();
         let cases = [
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: REDO_BLOCK_GROUP_START,
                 payload_len: 0,
                 group_block_idx: 0,
             },
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: 0b1000_0000,
                 payload_len: 1,
                 group_block_idx: 0,
             },
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: REDO_BLOCK_GROUP_START,
                 payload_len: 1,
                 group_block_idx: 1,
             },
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: 0,
                 payload_len: 1,
                 group_block_idx: 0,
             },
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: REDO_BLOCK_GROUP_START,
                 payload_len: u16::try_from(start_capacity + 1).unwrap(),
                 group_block_idx: 0,
             },
             RedoBlockHeader {
-                checksum: 1,
+                checksum: [1; CHECKSUM_SIZE],
                 flags: 0,
                 payload_len: u16::try_from(continuation_capacity + 1).unwrap(),
                 group_block_idx: 1,
@@ -1256,6 +1258,40 @@ mod tests {
     fn slot_selection_falls_back_to_valid_older_slot() {
         assert_selected_slot([0, 1], Some(1), 0, 0);
         assert_selected_slot([1, 0], Some(0), 1, 0);
+    }
+
+    /// Purpose: Reject legacy redo before any unsealed-tail interpretation while retaining slot fallback.
+    /// Expected: A current alternate slot is usable; entirely legacy metadata reports InvalidVersion.
+    #[test]
+    fn slot_selection_rejects_legacy_versions() {
+        let mut slots = [
+            serialized_slot(&valid_super_block(0, 0)),
+            serialized_slot(&valid_super_block(1, 1)),
+        ];
+        slots[1][8..16].copy_from_slice(&(REDO_FILE_FORMAT_VERSION - 1).to_le_bytes());
+        assert_eq!(
+            select_redo_super_block(&slots.concat(), 7).unwrap().slot_no,
+            0
+        );
+        slots[0][8..16].copy_from_slice(&(REDO_FILE_FORMAT_VERSION - 1).to_le_bytes());
+        let err = select_redo_super_block(&slots.concat(), 7).unwrap_err();
+        assert_integrity_error(err, DataIntegrityError::InvalidVersion);
+    }
+
+    /// Purpose: Protect every checksum byte and padding in a redo super-block.
+    /// Expected: Each mutation fails checksum validation before metadata acceptance.
+    #[test]
+    fn redo_super_block_checks_all_digest_bytes() {
+        let original = serialized_slot(&valid_super_block(0, 0));
+        for offset in [32, checksum_offset(original.len()) - 1]
+            .into_iter()
+            .chain(checksum_offset(original.len())..original.len())
+        {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 1;
+            let err = parse_redo_super_block(&bytes, 7, 0).unwrap_err();
+            assert_integrity_error(err, DataIntegrityError::ChecksumMismatch);
+        }
     }
 
     /// Purpose: Reject files with no initialized super-block slot.

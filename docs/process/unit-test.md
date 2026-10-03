@@ -117,6 +117,8 @@ Rerun `run` after source or configuration changes. See `--help` for other option
 
 Artifacts are stored in `target/coverage/`: `lcov.info` is the authoritative
 report, `coverage.json` records provenance, and `raw.lcov` is diagnostic only.
+Manifest schema 2 uses 32-character lowercase, little-endian XXH3-128 content
+digests. Schema-1 artifacts must be regenerated before reuse.
 `N/A` means no production executable lines. CI uses
 [coverage.yml](../../.github/workflows/coverage.yml).
 

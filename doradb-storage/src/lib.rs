@@ -1,4 +1,5 @@
 mod bitmap;
+mod checksum;
 pub mod id;
 mod io;
 #[macro_use]

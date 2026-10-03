@@ -9,7 +9,7 @@ quote = "=1.0.47"
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.151"
-blake3 = "=1.8.7"
+xxhash-rust = { version = "=0.8.19", features = ["xxh3"] }
 toml = "=1.1.4"
 
 [dev-dependencies]

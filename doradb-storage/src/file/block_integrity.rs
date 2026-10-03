@@ -1,3 +1,4 @@
+use crate::checksum::{CHECKSUM_SIZE, checksum128};
 use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
@@ -6,14 +7,14 @@ use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Size in bytes of the fixed block-integrity header.
 pub(crate) const BLOCK_INTEGRITY_HEADER_SIZE: usize = mem::size_of::<BlockIntegrityHeader>();
-/// Size in bytes of the fixed BLAKE3 checksum trailer.
+/// Size in bytes of the fixed XXH3-128 checksum trailer.
 pub(crate) const BLOCK_INTEGRITY_TRAILER_SIZE: usize = mem::size_of::<BlockIntegrityTrailer>();
 
 /// Block-integrity markers for persisted LWC blocks.
-pub(crate) const LWC_BLOCK_SPEC: BlockIntegritySpec = BlockIntegritySpec::new(*b"LWCPAGE\0", 2);
+pub(crate) const LWC_BLOCK_SPEC: BlockIntegritySpec = BlockIntegritySpec::new(*b"LWCPAGE\0", 3);
 /// Block-integrity markers for persisted column block-index nodes.
 pub(crate) const COLUMN_BLOCK_INDEX_BLOCK_SPEC: BlockIntegritySpec =
-    BlockIntegritySpec::new(*b"CBINDEX\0", 4);
+    BlockIntegritySpec::new(*b"CBINDEX\0", 5);
 /// Expected block-envelope markers for one persisted CoW block kind.
 ///
 /// The shared integrity helpers use this to validate that a block belongs to
@@ -77,7 +78,7 @@ impl Deser for BlockIntegrityHeader {
 #[derive(Debug, Clone, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub(crate) struct BlockIntegrityTrailer {
-    b3sum: [u8; 32],
+    checksum: [u8; CHECKSUM_SIZE],
 }
 
 impl Ser<'_> for BlockIntegrityTrailer {
@@ -88,7 +89,7 @@ impl Ser<'_> for BlockIntegrityTrailer {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        out.ser_byte_array(start_idx, &self.b3sum)
+        out.ser_byte_array(start_idx, &self.checksum)
     }
 }
 
@@ -97,8 +98,8 @@ impl Deser for BlockIntegrityTrailer {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
-        Ok((idx, BlockIntegrityTrailer { b3sum }))
+        let (idx, checksum) = input.deser_byte_array::<CHECKSUM_SIZE>(start_idx)?;
+        Ok((idx, BlockIntegrityTrailer { checksum }))
     }
 }
 
@@ -127,17 +128,17 @@ pub(crate) fn write_block_header(buf: &mut [u8], spec: BlockIntegritySpec) -> us
     header.ser(buf, 0)
 }
 
-/// Computes and writes the trailing BLAKE3 checksum for one full block image.
+/// Computes and writes the trailing XXH3-128 checksum for one full block image.
 #[inline]
 pub(crate) fn write_block_checksum(buf: &mut [u8]) {
     let trailer = BlockIntegrityTrailer {
-        b3sum: *blake3::hash(&buf[..checksum_offset(buf.len())]).as_bytes(),
+        checksum: checksum128(&buf[..checksum_offset(buf.len())]).to_le_bytes(),
     };
     let idx = trailer.ser(buf, checksum_offset(buf.len()));
     debug_assert_eq!(idx, buf.len());
 }
 
-/// Validates only the trailing BLAKE3 checksum for one full block image.
+/// Validates only the trailing XXH3-128 checksum for one full block image.
 ///
 /// This is used by block formats, such as DiskTree nodes, that reuse the
 /// shared checksum trailer without the shared magic/version header.
@@ -154,13 +155,12 @@ pub(crate) fn validate_block_checksum(buf: &[u8]) -> DataIntegrityResult<()> {
     let checksum_offset = checksum_offset(buf.len());
     let (_, trailer) = BlockIntegrityTrailer::deser(buf, checksum_offset)
         .map_err(|_| Report::new(DataIntegrityError::ChecksumMismatch))?;
-    let b3sum = blake3::hash(&buf[..checksum_offset]);
-    if b3sum.as_bytes() != &trailer.b3sum {
+    let checksum = checksum128(&buf[..checksum_offset]).to_le_bytes();
+    if checksum != trailer.checksum {
         return Err(
             Report::new(DataIntegrityError::ChecksumMismatch).attach(format!(
                 "block=integrity-envelope, expected_checksum={:02x?}, actual_checksum={:02x?}",
-                trailer.b3sum,
-                b3sum.as_bytes()
+                trailer.checksum, checksum
             )),
         );
     }
@@ -228,6 +228,9 @@ mod tests {
     /// Expected: Validation accepts the envelope and exposes the written payload.
     #[test]
     fn test_block_integrity_roundtrip() {
+        assert_eq!(BLOCK_INTEGRITY_TRAILER_SIZE, 16);
+        assert_eq!(checksum_offset(65536), 65520);
+        assert_eq!(max_payload_len(65536), 65504);
         let spec = BlockIntegritySpec::new(*b"TSTMETA\0", 7);
         let mut buf = vec![0u8; 4096];
         let payload_start = write_block_header(&mut buf, spec);
@@ -238,7 +241,7 @@ mod tests {
         assert_eq!(&payload[..5], b"hello");
     }
 
-    /// Purpose: Detect corruption of an integrity envelope's checksum trailer.
+    /// Purpose: Detect corruption throughout an integrity envelope and its checksum trailer.
     /// Expected: Validation reports a checksum mismatch with comparison context.
     #[test]
     fn test_block_integrity_rejects_bad_checksum() {
@@ -248,18 +251,23 @@ mod tests {
         buf[payload_start] = 1;
         write_block_checksum(&mut buf);
         let checksum_idx = checksum_offset(buf.len());
-        buf[checksum_idx] ^= 0xff;
-
-        let err = validate_block(&buf, spec).unwrap_err();
-        assert_integrity_report(
-            err,
-            DataIntegrityError::ChecksumMismatch,
-            &[
-                "block=integrity-envelope",
-                "expected_checksum",
-                "actual_checksum",
-            ],
-        );
+        for offset in [0, 8, payload_start, checksum_idx - 1]
+            .into_iter()
+            .chain(checksum_idx..buf.len())
+        {
+            let mut corrupted = buf.clone();
+            corrupted[offset] ^= 0xff;
+            let err = validate_block_checksum(&corrupted).unwrap_err();
+            assert_integrity_report(
+                err,
+                DataIntegrityError::ChecksumMismatch,
+                &[
+                    "block=integrity-envelope",
+                    "expected_checksum",
+                    "actual_checksum",
+                ],
+            );
+        }
     }
 
     /// Purpose: Protect checksum validation for blocks without an integrity header.

@@ -257,7 +257,7 @@ pub struct RecoveryVerification {
     pub candidate_range: Option<KeyRange>,
     /// Checked row count, also compared with successful preparation inserts.
     pub verified_rows: u64,
-    /// Per-table sums of BLAKE3 row hashes modulo 2^256, separated by colons.
+    /// Per-table sums of XXH3-128 row hashes modulo 2^128, separated by colons.
     pub fingerprint: String,
     /// Whether the complete unbounded index stream matched the table scan.
     pub index_verified: bool,
@@ -303,11 +303,11 @@ impl CreateIndexReport {
             || self.placement != self.rows.kind()
             || verification.table_rows != self.total_rows
             || verification.index_rows != self.total_rows
-            || verification.fingerprint.len() != 64
+            || verification.fingerprint.len() != 32
             || !verification
                 .fingerprint
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(BenchError::message("invalid CREATE result or verification"));
         }

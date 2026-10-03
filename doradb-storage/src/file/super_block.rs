@@ -1,4 +1,5 @@
 use crate::buffer::page::PAGE_SIZE;
+use crate::checksum::{CHECKSUM_SIZE, checksum128};
 use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::id::{BlockID, TrxID};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
@@ -6,7 +7,7 @@ use error_stack::Report;
 use std::mem;
 
 /// On-disk super-block format version.
-pub(crate) const SUPER_BLOCK_VERSION: u64 = 1;
+pub(crate) const SUPER_BLOCK_VERSION: u64 = 2;
 /// Size in bytes of one ping-pong super-block slot.
 pub(crate) const SUPER_BLOCK_SIZE: usize = PAGE_SIZE / 2;
 /// Size in bytes of the checksummed super-block footer.
@@ -106,8 +107,8 @@ impl Deser for SuperBlockBody {
 /// Footer fields stored at the end of every super-block slot.
 #[derive(Default, PartialEq, Eq)]
 pub(crate) struct SuperBlockFooter {
-    /// Blake3 checksum of the super-block bytes before the footer.
-    pub(crate) b3sum: [u8; 32],
+    /// XXH3-128 checksum of the super-block bytes before the footer.
+    pub(crate) checksum: [u8; CHECKSUM_SIZE],
     /// Checkpoint timestamp repeated from the header to detect torn writes.
     pub(crate) checkpoint_cts: TrxID,
 }
@@ -117,12 +118,12 @@ impl Deser for SuperBlockFooter {
 
     #[inline]
     fn deser<S: Serde + ?Sized>(input: &S, start_idx: usize) -> DeserResult<(usize, Self)> {
-        let (idx, b3sum) = input.deser_byte_array::<32>(start_idx)?;
+        let (idx, checksum) = input.deser_byte_array::<CHECKSUM_SIZE>(start_idx)?;
         let (idx, checkpoint_cts) = TrxID::deser(input, idx)?;
         Ok((
             idx,
             SuperBlockFooter {
-                b3sum,
+                checksum,
                 checkpoint_cts,
             },
         ))
@@ -137,7 +138,7 @@ impl Ser<'_> for SuperBlockFooter {
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_byte_array(start_idx, &self.b3sum);
+        let idx = out.ser_byte_array(start_idx, &self.checksum);
         out.ser_u64(idx, self.checkpoint_cts.as_u64())
     }
 }
@@ -209,8 +210,8 @@ pub(crate) fn parse_super_block(
             header.checkpoint_cts, footer.checkpoint_cts
         )));
     }
-    let b3sum = blake3::hash(&buf[..SUPER_BLOCK_FOOTER_OFFSET]);
-    if b3sum != footer.b3sum {
+    let checksum = checksum128(&buf[..SUPER_BLOCK_FOOTER_OFFSET]).to_le_bytes();
+    if checksum != footer.checksum {
         return Err(Report::new(DataIntegrityError::ChecksumMismatch).attach("block=super-block"));
     }
     let (_, body) = SuperBlockBody::deser(buf, body_start).map_err(|_| {
@@ -228,6 +229,67 @@ mod tests {
     use super::*;
     use crate::file::table_file::TABLE_FILE_MAGIC_WORD;
     use crate::file::test_block_id;
+
+    /// Purpose: Protect both file kinds' super-block widths, integrity coverage, and legacy gate.
+    /// Expected: Current slots validate; mutations retain checksum, torn-write, or version errors.
+    #[test]
+    fn super_block_integrity_and_version_contract() {
+        assert_eq!(SUPER_BLOCK_SIZE, 32768);
+        assert_eq!(SUPER_BLOCK_FOOTER_SIZE, 24);
+        assert_eq!(SUPER_BLOCK_FOOTER_OFFSET, 32744);
+        for magic_word in [TABLE_FILE_MAGIC_WORD, *b"DORAMTB\0"] {
+            let mut bytes = vec![0; SUPER_BLOCK_SIZE];
+            let view = SuperBlockSerView {
+                header: SuperBlockHeader {
+                    magic_word,
+                    version: SUPER_BLOCK_VERSION,
+                    slot_no: 0,
+                    checkpoint_cts: TrxID::new(12),
+                },
+                body: SuperBlockBody {
+                    meta_block_id: test_block_id(7),
+                },
+            };
+            view.ser(&mut bytes[..], 0);
+            let checksum = checksum128(&bytes[..SUPER_BLOCK_FOOTER_OFFSET]).to_le_bytes();
+            SuperBlockFooter {
+                checksum,
+                checkpoint_cts: TrxID::new(12),
+            }
+            .ser(&mut bytes[..], SUPER_BLOCK_FOOTER_OFFSET);
+            let parsed = parse_super_block(&bytes, magic_word, SUPER_BLOCK_VERSION).unwrap();
+            assert_eq!(parsed.body.meta_block_id, test_block_id(7));
+            assert_eq!(&bytes[32744..32760], &checksum);
+            assert_eq!(&bytes[32760..], &12u64.to_le_bytes());
+            for offset in [16, 32, SUPER_BLOCK_FOOTER_OFFSET - 1]
+                .into_iter()
+                .chain(SUPER_BLOCK_FOOTER_OFFSET..SUPER_BLOCK_FOOTER_OFFSET + CHECKSUM_SIZE)
+            {
+                let mut corrupt = bytes.clone();
+                corrupt[offset] ^= 1;
+                let err = parse_super_block(&corrupt, magic_word, SUPER_BLOCK_VERSION)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    err.current_context(),
+                    &DataIntegrityError::ChecksumMismatch,
+                    "offset={offset}"
+                );
+            }
+            let mut torn = bytes.clone();
+            torn[SUPER_BLOCK_SIZE - 1] ^= 1;
+            let err = parse_super_block(&torn, magic_word, SUPER_BLOCK_VERSION)
+                .err()
+                .unwrap();
+            assert_eq!(err.current_context(), &DataIntegrityError::TornWrite);
+            bytes[8..16].copy_from_slice(&(SUPER_BLOCK_VERSION - 1).to_le_bytes());
+            // Version rejection precedes interpretation of the changed checksum/footer layout.
+            let err = parse_super_block(&bytes, magic_word, SUPER_BLOCK_VERSION)
+                .err()
+                .unwrap();
+            assert_eq!(err.current_context(), &DataIntegrityError::InvalidVersion);
+        }
+    }
 
     /// Purpose: Preserve super-block header and root-pointer metadata through serialization.
     /// Expected: Decoding recovers the original header and meta-block identifier.
