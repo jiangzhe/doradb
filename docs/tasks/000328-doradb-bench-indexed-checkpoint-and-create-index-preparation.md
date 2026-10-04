@@ -132,6 +132,8 @@ Formatting, strict workspace Clippy, and the branch style audit passed. The
 style gate checked 11 changed Rust files and 155 test contracts with no violations.
 Production coverage is 91.24% across changed production files and exceeds 85%
 in every such file; detailed coverage is retained in `target/task-000328/coverage.md`.
+The resolution style gate passed again after the template-comment review fix;
+the focused template inventory test and whitespace check also passed.
 
 Semantic review retained distinct unit/coordinator/CLI coverage: unit tests prove
 sample/effect equations, fixture transitions, and mutation content; coordinator
@@ -141,26 +143,58 @@ found. Existing initial-index CLI cases complement nonzero-ID mutation unit
 fixtures. Successful checkpoint setup uses the existing retry/wait API; no new
 sleep or timeout changes were introduced.
 
-Cache scenarios used each new template with 32,768 rows, 1 KiB payloads,
-32,768 sequential lookups per run, batch size 100, one warmup, and two measured
-runs. Only readonly-cache capacity changed between resident and pressure runs.
-The following are per-run `buffer.disk` counter deltas:
+Release benchmarks ran sequentially on Linux aarch64/OrbStack using Rust 1.99.0,
+one thread/session, batch size 100, one warmup, and three measured runs per fresh
+root. Lookup projected both columns; preparation was excluded from measured
+throughput and latency. Latency percentiles describe transactions containing up
+to 100 lookups. The default templates used 10,000 rows with 128-byte payloads;
+the larger scenarios used 32,768 rows with 1 KiB payloads. Each run requested as
+many sequential lookups as loaded rows. Only cache capacity changed between the
+larger resident and pressure scenarios.
 
-| Composition | Cache | Hits, runs 1 / 2 | Misses, runs 1 / 2 | Completed reads, runs 1 / 2 |
+| Composition | Rows / payload | Cache | Million lookups/s | Batch p95 / p99 (us) |
 | --- | --- | --- | --- | --- |
-| Initially indexed checkpoint | 64 MiB | 65,536 / 65,536 | 0 / 0 | 0 / 0 |
-| Initially indexed checkpoint | 17 MiB | 65,006 / 65,005 | 530 / 531 | 530 / 531 |
-| CREATE in preparation | 64 MiB | 131,072 / 131,072 | 0 / 0 | 0 / 0 |
-| CREATE in preparation | 17 MiB | 130,530 / 130,530 | 542 / 542 | 542 / 542 |
+| Initially indexed checkpoint | 10,000 / 128 B | 17 MiB | 1.294 | 81.7 / 84.9 |
+| CREATE in preparation | 10,000 / 128 B | 17 MiB | 0.987 | 110.1 / 119.2 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 64 MiB | 1.249 | 87.4 / 94.6 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 17 MiB | 0.615 | 216.1 / 318.5 |
+| CREATE in preparation | 32,768 / 1 KiB | 64 MiB | 0.977 | 111.4 / 117.8 |
+| CREATE in preparation | 32,768 / 1 KiB | 17 MiB | 0.493 | 249.0 / 393.0 |
 
-Every measured run returned all 32,768 requested rows with no misses in logical
-lookup results. These observations establish readonly-cache residency versus
-capacity misses and persisted row-read IO, without inferring OS cache state or
-performance thresholds. CREATE verification itself reads data, so zero warmup
-alone is not a cold-cache guarantee. Reproducible input plans, result artifacts,
-and counter summaries are under `target/task-000328/cache-evidence/`.
+For the larger scenarios, these are summed `buffer.disk` counter deltas across
+all three measured runs. The default scenarios had zero misses and reads.
 
-Backlog 000074 was closed as implemented after these scenarios and content checks.
+| Composition | Cache | Hits | Misses | Completed reads | Cache-access miss rate |
+| --- | --- | --- | --- | --- | --- |
+| Initially indexed checkpoint | 64 MiB | 196,608 | 0 | 0 | 0% |
+| Initially indexed checkpoint | 17 MiB | 195,016 | 1,592 | 1,592 | 0.81% |
+| CREATE in preparation | 64 MiB | 393,216 | 0 | 0 | 0% |
+| CREATE in preparation | 17 MiB | 391,590 | 1,626 | 1,626 | 0.41% |
+
+All 453,216 measured lookups found their rows, with zero read errors. CREATE
+took 7.4 ms for the default dataset and 42.4-46.6 ms for the larger dataset,
+outside lookup measurements. Cache pressure roughly halved lookup throughput
+in these short local runs; no timing thresholds are acceptance requirements.
+
+Cache misses count block-cache accesses, not missing logical rows. The 64 MiB
+cache held 1,022 pages, exceeding the observed 531-540 resident pages; the
+17 MiB cache held 271 pages. Sequential access reuses loaded 64 KiB pages across
+nearby rows, so pressure runs still mostly hit. Misses equaled completed reads
+with no inflight-load joins or read errors. These observations demonstrate
+engine-cache capacity misses and completed IO, without establishing uncached
+physical-device reads or individually cold random-lookup latency.
+
+Template review removed the inapplicable CREATE-verification reference from the
+initially indexed flow. Both templates retain the warning that zero warmup
+alone does not establish a cold cache; the CREATE-preparation template also
+explains that its content verification reads data before lookup measurement.
+
+Reproducible plans, commands, raw results, and per-run summaries are under
+`target/task-000328/release-benchmarks-w52jfry6/`. Earlier development-build
+cache evidence remains under `target/task-000328/cache-evidence/`.
+
+Backlog 000074 remains closed as implemented; the persisted-read compositions
+and cache/content checks satisfy its acceptance hints.
 No implementation work was deferred. Task ID state was refreshed; there is no
 parent RFC to synchronize.
 

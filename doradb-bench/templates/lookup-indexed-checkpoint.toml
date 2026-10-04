@@ -25,9 +25,9 @@ workload = { type = "freeze-table", all = true }
 workload = { type = "checkpoint-table" }
 
 # Lookup projects both c0 and c1. Warmup encourages residency when the working
-# set fits. CREATE content verification also reads data: zero warmup alone does
-# not establish a cold cache. Inspect each measured run's readonly cache hits,
-# misses, and completed reads to demonstrate persisted IO and capacity pressure.
+# set fits. Zero warmup alone does not establish a cold cache. Inspect each
+# measured run's readonly cache hits, misses, and completed reads to demonstrate
+# persisted IO and capacity pressure.
 [[phase]]
 kind = "benchmark"
 warmup_runs = 1
