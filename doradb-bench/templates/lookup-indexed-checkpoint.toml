@@ -1,0 +1,35 @@
+name = "Persisted unique-index lookups"
+engine_defaults = "engine-defaults.toml"
+
+# Increase insert num and value_size until persisted data exceeds this cache for
+# capacity misses; keep them small for a resident working set. The cache requires
+# more than 16 MiB; 17 MiB is a supported small capacity.
+[engine.file]
+readonly_buffer_size = "17 MiB"
+
+[workload_defaults]
+value_size = "128 B"
+batch_size = 100
+include_stats = true
+
+[[phase]]
+workload = { type = "create-table", index = "unique" }
+
+[[phase]]
+workload = { type = "insert-seq", num = 10000 }
+
+[[phase]]
+workload = { type = "freeze-table", all = true }
+
+[[phase]]
+workload = { type = "checkpoint-table" }
+
+# Lookup projects both c0 and c1. Warmup encourages residency when the working
+# set fits. CREATE content verification also reads data: zero warmup alone does
+# not establish a cold cache. Inspect each measured run's readonly cache hits,
+# misses, and completed reads to demonstrate persisted IO and capacity pressure.
+[[phase]]
+kind = "benchmark"
+warmup_runs = 1
+measured_runs = 3
+workload = { type = "lookup-seq", num = 10000, threads = 1, sessions = 1 }

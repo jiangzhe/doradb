@@ -10,7 +10,7 @@ use crate::measurement::{
     CreateIndexReport, CreateIndexVerification, LatencyDistribution, LatencyUnit, MeasurementClock,
     ProcessRssSampler, WorkloadCounters, WorkloadMetrics, process_cpu_nanos,
 };
-use crate::plan::{CreateIndexConfig, CreateIndexKey};
+use crate::plan::CreateIndexConfig;
 use crate::plan_executor::{
     SessionExecutor, SessionExecutorConfig, SessionMeasurement, SessionOutcome,
 };
@@ -53,11 +53,6 @@ impl SessionExecutor for CreateIndexExecutor {
             .placement
             .ok_or_else(|| BenchError::message("CREATE placement is unknown"))?
             .validate(primary.inserted_rows)?;
-        let columns = match config.resolved.key {
-            CreateIndexKey::Key => vec![0],
-            CreateIndexKey::Payload => vec![1],
-            CreateIndexKey::Composite => vec![1, 0],
-        };
         let flags = match config.resolved.index {
             IndexMode::Unique => StorageIndexFlags::UK,
             IndexMode::NonUnique => StorageIndexFlags::empty(),
@@ -66,7 +61,12 @@ impl SessionExecutor for CreateIndexExecutor {
             }
         };
         let index_spec = StorageIndexSpec::new(
-            columns.into_iter().map(StorageIndexKey::new).collect(),
+            config
+                .resolved
+                .columns
+                .iter()
+                .map(|column| StorageIndexKey::new(column.position()))
+                .collect(),
             flags,
         );
         Ok(Self {
@@ -159,13 +159,14 @@ impl SessionExecutor for CreateIndexExecutor {
             .report
             .as_ref()
             .ok_or_else(|| BenchError::message("CREATE has no measurements"))?;
-        if expected_samples != 1
-            || outcome
-                .measurement
-                .latency
-                .summary(LatencyUnit::IndexCreation)?
-                .sum_nanos
-                != report.create_elapsed_nanos
+        if expected_samples > 1
+            || (expected_samples == 1
+                && outcome
+                    .measurement
+                    .latency
+                    .summary(LatencyUnit::IndexCreation)?
+                    .sum_nanos
+                    != report.create_elapsed_nanos)
             || *planned_effect
                 != if self.config.fixture.is_some() {
                     FixturePlanEffect::None
@@ -225,7 +226,7 @@ impl SessionOutcome for CreateIndexOutcome {
 /// Prepare a varied fixture and verify existing indexes before any measurement window.
 pub(crate) async fn prepare_create_fixture(
     engine: &Engine,
-    config: CreateIndexConfig,
+    config: &CreateIndexConfig,
 ) -> Result<FixtureBinding> {
     let recipe = config
         .fixture
@@ -259,6 +260,7 @@ pub(crate) async fn prepare_create_fixture(
     Ok(FixtureBinding::Primary(PrimaryBinding {
         placement: Some(table.placement),
         table_id: table.table_id,
+        index_id: table.indexes.first().copied(),
         shape: PrimaryTableShape {
             index: recipe.index,
         },
@@ -332,7 +334,8 @@ mod tests {
     use crate::fixture::{
         PlacementKind, RowPlacement, benchmark_non_unique_index_spec, benchmark_table_spec,
     };
-    use doradb_storage::{EngineConfig, Val};
+    use crate::plan::CreateIndexColumn::{C0, C1};
+    use doradb_storage::{EngineConfig, SelectMvcc, TableIndex, Val};
     use std::cell::Cell;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -343,10 +346,11 @@ mod tests {
     fn varied_create_fixture_verifies_contents_and_identity() {
         use crate::plan::RecoveryFixture;
         smol::block_on(async {
-            for (rows, mode, key) in [
-                (0, IndexMode::Unique, CreateIndexKey::Key),
-                (97, IndexMode::NonUnique, CreateIndexKey::Payload),
-                (97, IndexMode::Unique, CreateIndexKey::Composite),
+            for (rows, mode, columns, ordinals) in [
+                (0, IndexMode::Unique, vec![C0], vec![0]),
+                (97, IndexMode::NonUnique, vec![C1], vec![1]),
+                (97, IndexMode::Unique, vec![C1, C0], vec![1, 0]),
+                (97, IndexMode::Unique, vec![C0, C1], vec![0, 1]),
             ] {
                 let temp = TempDir::new().unwrap();
                 let engine = Engine::bootstrap(
@@ -356,7 +360,7 @@ mod tests {
                 .unwrap();
                 let config = CreateIndexConfig {
                     index: mode,
-                    key,
+                    columns,
                     include_stats: false,
                     fixture: Some(RecoveryFixture {
                         tables: 1,
@@ -370,13 +374,20 @@ mod tests {
                         mutate_every: 7,
                     }),
                 };
-                let binding = prepare_create_fixture(&engine, config).await.unwrap();
+                let binding = prepare_create_fixture(&engine, &config).await.unwrap();
                 let executor = CreateIndexExecutor::new(SessionExecutorConfig {
                     resolved: config,
                     binding,
                     execution_ordinal: 0,
                 })
                 .unwrap();
+                assert_eq!(
+                    executor.index_spec.keys,
+                    ordinals
+                        .iter()
+                        .map(|ordinal| StorageIndexKey::new(*ordinal))
+                        .collect::<Vec<_>>()
+                );
                 let mut session = engine.new_session().unwrap();
                 let outcome = executor
                     .execute(
@@ -399,6 +410,116 @@ mod tests {
                 report.rows.validate(report.total_rows).unwrap();
                 complete_create_index(&engine, &mut report).await.unwrap();
                 assert_eq!(report.verification.unwrap().index_rows, report.total_rows);
+                if ordinals.len() == 2 {
+                    // Row two survives the mutation stride with the original cardinality-three payload.
+                    let mut payload = vec![b'x'; 512];
+                    payload[..8].copy_from_slice(&2u64.to_le_bytes());
+                    let row = vec![Val::from(2u64), Val::from(payload)];
+                    let key: Vec<_> = ordinals
+                        .iter()
+                        .map(|ordinal| row[*ordinal as usize].clone())
+                        .collect();
+                    let mut session = engine.new_session().unwrap();
+                    let mut trx = session.begin_trx().unwrap();
+                    let found = trx
+                        .table_lookup_unique_mvcc(
+                            TableIndex(
+                                TableID::new(report.table_id),
+                                IndexID::new(report.index_id),
+                            ),
+                            &key,
+                            &[0, 1],
+                        )
+                        .await
+                        .unwrap();
+                    let SelectMvcc::Found(found) = found else {
+                        panic!("composite key order mismatch")
+                    };
+                    assert_eq!(found, row);
+                    trx.commit().await.unwrap();
+                    session.close().await.unwrap();
+                }
+                engine.shutdown();
+            }
+        });
+    }
+
+    /// Purpose: Keep CREATE preparation unsampled while enforcing operation, latency, and effect accounting.
+    /// Expected: Untimed CREATE accepts only zero samples, measured CREATE preserves exact elapsed time, and malformed outcomes never authorize publication.
+    #[test]
+    fn create_sampling_modes_verify_exact_accounting_before_publication() {
+        use crate::plan::RecoveryFixture;
+        smol::block_on(async {
+            for measured in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let engine = Engine::bootstrap(EngineConfig::default().storage_root(temp.path()))
+                    .await
+                    .unwrap();
+                let mut config = CreateIndexConfig {
+                    columns: vec![C0],
+                    index: IndexMode::Unique,
+                    include_stats: false,
+                    fixture: Some(RecoveryFixture {
+                        tables: 1,
+                        rows: 8,
+                        indexes: 0,
+                        index: IndexMode::None,
+                        composite: false,
+                        cardinality: 0,
+                        value_bytes: 8,
+                        cold_rows: 8,
+                        mutate_every: 0,
+                    }),
+                };
+                let binding = prepare_create_fixture(&engine, &config).await.unwrap();
+                config.fixture = None;
+                let executor = CreateIndexExecutor::new(SessionExecutorConfig {
+                    resolved: config,
+                    binding,
+                    execution_ordinal: 0,
+                })
+                .unwrap();
+                let mut session = engine.new_session().unwrap();
+                let mut outcome = executor
+                    .execute(
+                        &engine,
+                        &mut session,
+                        &executor.session_plans().unwrap()[0],
+                        &MeasurementClock::new(),
+                        measured,
+                        &RunCancellation::new(),
+                    )
+                    .await
+                    .unwrap();
+                session.close().await.unwrap();
+                let effect = FixturePlanEffect::CreateIndex {
+                    index: IndexMode::Unique,
+                };
+                let samples = u64::from(measured);
+                assert_eq!(
+                    executor.verify_outcome(&effect, &outcome, samples).unwrap(),
+                    FixtureRuntimeEffect::None
+                );
+                assert_eq!(outcome.measurement.latency.sample_count(), samples);
+                assert!(
+                    executor
+                        .verify_outcome(&effect, &outcome, 1 - samples)
+                        .is_err()
+                );
+                assert!(executor.verify_outcome(&effect, &outcome, 2).is_err());
+                assert!(
+                    executor
+                        .verify_outcome(&FixturePlanEffect::None, &outcome, samples)
+                        .is_err()
+                );
+                outcome.measurement.counters.operations = 2;
+                assert!(executor.verify_outcome(&effect, &outcome, samples).is_err());
+                outcome.measurement.counters.operations = 1;
+                outcome.report.as_mut().unwrap().create_elapsed_nanos += 1;
+                assert_eq!(
+                    executor.verify_outcome(&effect, &outcome, samples).is_err(),
+                    measured
+                );
                 engine.shutdown();
             }
         });

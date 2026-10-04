@@ -315,6 +315,7 @@ struct UpdateOperationResult {
 #[derive(Clone, Copy)]
 struct UpdateOperationSpec {
     table_id: TableID,
+    index_id: IndexID,
     seed: u64,
     value_size: usize,
     batch_size: u64,
@@ -440,7 +441,12 @@ pub(crate) async fn complete_update(engine: &Engine, primary: PrimaryBinding) ->
     let mut session = engine.new_session()?;
     let result = async {
         let table = scan_content(&mut session, primary.table_id, None).await?;
-        let index = scan_content(&mut session, primary.table_id, Some(IndexID::new(0))).await?;
+        let index = scan_content(
+            &mut session,
+            primary.table_id,
+            Some(primary.require_index_id()?),
+        )
+        .await?;
         verify_updated_content(primary.inserted_rows, &table, &index)
     }
     .await;
@@ -541,7 +547,7 @@ async fn update_point(
     key: u64,
     values: UpdateValues,
 ) -> Result<u64> {
-    let index = TableIndex(primary.table_id, IndexID::new(0));
+    let index = TableIndex(primary.table_id, primary.require_index_id()?);
     let key = [Val::from(key)];
     match primary.shape.index {
         IndexMode::Unique => {
@@ -735,6 +741,7 @@ async fn execute_update_session(
         session,
         UpdateOperationSpec {
             table_id: state.primary.table_id,
+            index_id: state.primary.require_index_id()?,
             seed: state.config.seed,
             value_size: state.config.value_size_bytes,
             batch_size: state.config.batch_size,
@@ -818,7 +825,7 @@ async fn run_update_operations(
         let upper = [Val::from(range_end)];
         let mutation_result = trx
             .table_index_mutate_mvcc(
-                TableIndex(spec.table_id, IndexID::new(0)),
+                TableIndex(spec.table_id, spec.index_id),
                 &lower[..]..&upper[..],
                 |row| -> CallbackResult<_, BenchError> {
                     Ok(RowMutation::Update(update_values(
@@ -1021,6 +1028,22 @@ mod tests {
             .await
             .unwrap()
             .table_id();
+        session.drop_index(table_id, IndexID::new(0)).await.unwrap();
+        let index_id = session
+            .create_index(
+                table_id,
+                StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    if index == IndexMode::Unique {
+                        StorageIndexFlags::UK
+                    } else {
+                        StorageIndexFlags::empty()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_ne!(index_id, IndexID::new(0));
         let mut trx = session.begin_trx().unwrap();
         for (key, payload) in rows {
             trx.table_insert_mvcc(table_id, vec![Val::from(*key), Val::from(payload.clone())])
@@ -1033,6 +1056,7 @@ mod tests {
             PrimaryBinding {
                 placement: None,
                 table_id,
+                index_id: Some(index_id),
                 shape: PrimaryTableShape { index },
                 loaded_range: Some(KeyRange { start: 10, len: 7 }),
                 inserted_rows: rows.len() as u64,
@@ -1056,7 +1080,7 @@ mod tests {
             if indexed {
                 let mut stream = trx
                     .table_index_scan_mvcc_stream(
-                        TableIndex(primary.table_id, IndexID::new(0)),
+                        TableIndex(primary.table_id, primary.require_index_id().unwrap()),
                         ..,
                         &[0, 1],
                     )
@@ -1577,7 +1601,7 @@ mod tests {
             let mut altered = rows.clone();
             altered[0].1 = b"different content".to_vec();
             let (mut second, changed) = fixture(&engine, IndexMode::NonUnique, &altered).await;
-            let changed = scan_content(&mut second, changed.table_id, Some(IndexID::new(0)))
+            let changed = scan_content(&mut second, changed.table_id, changed.index_id)
                 .await
                 .unwrap();
             assert_eq!(table.rows(), changed.rows());
@@ -1711,6 +1735,7 @@ mod tests {
                 &mut session,
                 UpdateOperationSpec {
                     table_id,
+                    index_id: IndexID::new(0),
                     seed: 7,
                     value_size: 16,
                     batch_size: 3,

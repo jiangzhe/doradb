@@ -328,6 +328,8 @@ struct ReadOperationSpec {
     operation: ReadOperationType,
     /// Bound primary table ID.
     table_id: TableID,
+    /// Retained secondary index returned by fixture binding.
+    index_id: IndexID,
     /// Candidate loaded logical-key range.
     loaded_range: KeyRange,
     /// Deterministic request seed.
@@ -376,6 +378,7 @@ async fn execute_read_session(
         ReadOperationSpec {
             operation: state.operation,
             table_id: state.primary.table_id,
+            index_id: state.primary.require_index_id()?,
             loaded_range: state.config.loaded_range,
             seed: state.config.seed,
             batch_size: state.config.batch_size,
@@ -444,6 +447,7 @@ async fn run_read_operations(
                 session,
                 spec.batch_size,
                 spec.table_id,
+                spec.index_id,
                 &keys,
                 clock,
                 cancellation,
@@ -461,6 +465,7 @@ async fn lookup_keys(
     session: &mut Session,
     batch_size: u64,
     table_id: TableID,
+    index_id: IndexID,
     keys: &[u64],
     clock: Option<&MeasurementClock>,
     cancellation: Option<&RunCancellation>,
@@ -480,7 +485,7 @@ async fn lookup_keys(
         for key in batch {
             let key_vals = [Val::from(*key)];
             let lookup = trx
-                .table_lookup_unique_mvcc(TableIndex(table_id, IndexID::new(0)), &key_vals, &[0, 1])
+                .table_lookup_unique_mvcc(TableIndex(table_id, index_id), &key_vals, &[0, 1])
                 .await;
             match lookup {
                 Ok(SelectMvcc::Found(_)) => {
@@ -542,7 +547,7 @@ async fn index_scans(
             let upper = [Val::from(range.end()?)];
             let scan = trx
                 .table_index_scan_mvcc(
-                    TableIndex(spec.table_id, IndexID::new(0)),
+                    TableIndex(spec.table_id, spec.index_id),
                     &lower[..]..&upper[..],
                     &[0, 1],
                 )
@@ -600,7 +605,7 @@ async fn index_streams(
         let scan_result = async {
             let mut stream = trx
                 .table_index_scan_mvcc_stream(
-                    TableIndex(spec.table_id, IndexID::new(0)),
+                    TableIndex(spec.table_id, spec.index_id),
                     &lower[..]..&upper[..],
                     &[0, 1],
                 )

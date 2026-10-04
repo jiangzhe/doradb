@@ -1501,6 +1501,90 @@ workload = {{ type = "resolve-table-binding", num = 17, threads = 2, sessions = 
         );
     }
 
+    /// Purpose: Execute both shipped persisted lookup compositions through the CLI.
+    /// Expected: Bounded templates publish verified preparation and only lookup operations, rows, and samples in the measured aggregate.
+    #[test]
+    fn indexed_lookup_templates_compose_through_cli() {
+        let temp = TempDir::new().unwrap();
+        for (name, template, prepares) in [
+            (
+                "initial-index",
+                include_str!("../templates/lookup-indexed-checkpoint.toml"),
+                4,
+            ),
+            (
+                "prepared-index",
+                include_str!("../templates/lookup-create-index-prepare.toml"),
+                5,
+            ),
+        ] {
+            let input = template
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("name =") && !line.starts_with("engine_defaults =")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace("num = 10000", "num = 8")
+                .replace("batch_size = 100", "batch_size = 2");
+            let (_, report) = execute_plan(&temp, name, &input);
+            assert_eq!(report.prepare_phases.len(), prepares);
+            assert_eq!(report.aggregate.measured_runs, 3);
+            assert_eq!(report.aggregate.latency.sample_count, 12);
+            assert_eq!(
+                report.aggregate.counters,
+                WorkloadCounters {
+                    operations: 24,
+                    found: 24,
+                    rows_returned: 24,
+                    ..WorkloadCounters::default()
+                }
+            );
+            if prepares == 5 {
+                let create = &report.prepare_phases[4];
+                assert_eq!(create.counters.operations, 1);
+                let Some(WorkloadMetrics::CreateIndex { report: create }) =
+                    &create.workload_metrics
+                else {
+                    panic!("CREATE")
+                };
+                assert_eq!(create.placement, PlacementKind::Checkpointed);
+                assert_eq!(create.verification.as_ref().unwrap().index_rows, 8);
+            }
+        }
+    }
+
+    /// Purpose: Preserve indexed reads across a prefix checkpoint whose exact row placement is unknown.
+    /// Expected: Unique lookups and non-unique scans return all loaded rows across both hot and persisted storage.
+    #[test]
+    fn indexed_prefix_checkpoints_remain_readable() {
+        let temp = TempDir::new().unwrap();
+        for index in ["unique", "non-unique"] {
+            let workload = if index == "unique" {
+                "type = 'lookup-seq', num = 8"
+            } else {
+                "type = 'index-scan', num = 1, range = 8"
+            };
+            let input = format!(
+                "{CREATE_INDEX_ENGINE}[[phase]]\nworkload = {{ type = 'create-table', index = '{index}' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = 8, value_size = '32 KiB', batch_size = 8 }}\n[[phase]]\nworkload = {{ type = 'freeze-table', max_rows = 4 }}\n[[phase]]\nworkload = {{ type = 'checkpoint-table' }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ {workload} }}\n"
+            );
+            let (_, report) = execute_plan(&temp, index, &input);
+            assert_eq!(report.aggregate.counters.rows_returned, 8);
+            assert_eq!(report.aggregate.counters.not_found, 0);
+            assert_eq!(
+                report.aggregate.counters.operations,
+                if index == "unique" { 8 } else { 1 }
+            );
+            let Some(WorkloadMetrics::FreezeTable {
+                approximate_rows, ..
+            }) = report.prepare_phases[2].workload_metrics
+            else {
+                panic!("freeze")
+            };
+            assert!(approximate_rows > 0 && approximate_rows < 8);
+        }
+    }
+
     /// Purpose: Create a unique index over hot rows through the CLI.
     /// Expected: Placement, exact table/index cardinality, diagnostics, and creation latency remain consistent.
     #[test]

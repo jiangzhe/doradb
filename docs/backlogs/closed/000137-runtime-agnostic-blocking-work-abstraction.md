@@ -26,19 +26,10 @@ Design and implement a runtime-agnostic blocking-work abstraction owned by the s
 
 Future work should define the abstraction contract, default implementation, shutdown behavior, error propagation, and tests proving async executor threads are not blocked by long filesystem cleanup. The implementation should keep the storage engine runtime-agnostic and should not require public callers to use smol, tokio, or another specific runtime.
 
-## Notes (Optional)
-
-
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: wontfix
+- Detail: The engine-owned ThreadPool already supports finite synchronous computations and asynchronous tasks with explicit shutdown and error handling. Per user decision, future storage I/O should use the existing asynchronous I/O paths; a separate runtime-agnostic blocking-work abstraction and its broad call-site migration are not planned.
+- Closed By: backlog close
+- Reference: User decision on 2026-10-04 after investigating backlog 000137; docs/tasks/000308-support-finite-sync-and-async-thread-pool-jobs.md; doradb-storage/src/runtime/thread_pool.rs
+- Closed At: 2026-10-04
