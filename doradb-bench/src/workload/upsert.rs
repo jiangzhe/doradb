@@ -18,8 +18,8 @@ use crate::workload::util::{
 use crate::workload::verification::{Fingerprint, scan_content};
 use crate::workload::{RunCancellation, SessionPlan};
 use doradb_storage::{
-    CallbackError, CallbackResult, Engine, IndexID, Session, TableIndex, Transaction,
-    UniqueMutation, UniqueMutationOutcome, UpdateCol, Val,
+    CallbackError, CallbackResult, Engine, Session, TableIndex, Transaction, UniqueMutation,
+    UniqueMutationOutcome, UpdateCol, Val,
 };
 use std::sync::Arc;
 
@@ -170,7 +170,12 @@ pub(crate) async fn complete_upsert(
     let mut session = engine.new_session()?;
     let result = async {
         let table = scan_content(&mut session, primary.table_id, None).await?;
-        let index = scan_content(&mut session, primary.table_id, Some(IndexID::new(0))).await?;
+        let index = scan_content(
+            &mut session,
+            primary.table_id,
+            Some(primary.require_index_id()?),
+        )
+        .await?;
         verify_upserted_content(expected, &table, &index)
     }
     .await;
@@ -222,7 +227,7 @@ async fn upsert_point(
 ) -> Result<UniqueMutationOutcome> {
     Ok(trx
         .table_unique_mutate_mvcc(
-            TableIndex(primary.table_id, IndexID::new(0)),
+            TableIndex(primary.table_id, primary.require_index_id()?),
             &[Val::from(key)],
             |row| -> CallbackResult<_, BenchError> {
                 let offset = key
@@ -741,7 +746,7 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let updated = trx
                 .table_lookup_unique_mvcc(
-                    TableIndex(primary.table_id, IndexID::new(0)),
+                    TableIndex(primary.table_id, primary.require_index_id().unwrap()),
                     &[Val::from(10u64)],
                     &[0, 1],
                 )
@@ -754,7 +759,7 @@ mod tests {
             assert_eq!(payload[0], 0);
             let neighbor = trx
                 .table_lookup_unique_mvcc(
-                    TableIndex(primary.table_id, IndexID::new(0)),
+                    TableIndex(primary.table_id, primary.require_index_id().unwrap()),
                     &[Val::from(11u64)],
                     &[1],
                 )
@@ -957,7 +962,7 @@ mod tests {
                 .unwrap();
             let (mut second, different) =
                 fixture(&engine, IndexMode::Unique, &[(10, vec![43])]).await;
-            let index = scan_content(&mut second, different.table_id, Some(IndexID::new(0)))
+            let index = scan_content(&mut second, different.table_id, different.index_id)
                 .await
                 .unwrap();
             assert_eq!(table.rows(), index.rows());

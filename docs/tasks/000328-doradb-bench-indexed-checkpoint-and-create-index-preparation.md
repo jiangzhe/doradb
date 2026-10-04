@@ -1,0 +1,277 @@
+---
+id: 000328
+title: Enable Indexed Checkpoint and CREATE INDEX Preparation in doradb-bench
+status: implemented
+created: 2026-10-04
+github_issue: 1141
+---
+
+# Task: Enable Indexed Checkpoint and CREATE INDEX Preparation in doradb-bench
+
+## Summary
+
+Enabled indexed persisted-read benchmark plans in one invocation. Ordinary
+unique and non-unique tables can now be frozen and checkpointed, and an eligible
+index-free table can acquire a verified retained index during preparation.
+Subsequent reads, mutations, and recovery use the actual retained index ID.
+CREATE preparation remains outside the final benchmark's latency and counters.
+
+CREATE configuration accepts ordered column references such as
+`columns = ["c0"]`. Existing `key` selectors remain accepted as input aliases.
+Two templates demonstrate initially indexed and preparation-indexed persisted
+lookups, with cache sizing and diagnostic guidance.
+
+## Context
+
+Source Backlogs:
+
+- docs/backlogs/closed/000074-expand-runtime-lookup-benchmark-coverage.md
+
+Issue Labels:
+
+- type:task
+- priority:medium
+- codex
+
+The existing lookup workloads already used the public MVCC API and projected
+both generated columns. Readonly-cache capacity and cache/IO diagnostics were
+also available. Benchmark fixture guards prevented composing those capabilities:
+maintenance rejected indexed tables, and CREATE was final-benchmark-only.
+Hardcoded index zero also made simply relaxing the guards incorrect after an
+earlier index create/drop cycle.
+
+This was a standalone benchmark follow-up with no parent RFC. Backlog 000074
+is satisfied by runnable resident and capacity-miss persisted reads, including
+row fetch/decode, alongside the previously available lookup measurements.
+
+## Goals
+
+- Compose load, indexed freeze/checkpoint, and lookup in one fresh-root plan.
+- Compose index-free load/checkpoint, verified CREATE preparation, and lookup.
+- Preserve retained index identity through inserts, maintenance, and recovery.
+- Normalize explicit ordered columns while accepting existing input selectors.
+- Keep preparation diagnostics separate from measured workload aggregation.
+- Demonstrate cache residency and capacity misses using measured counters.
+
+## Non-Goals
+
+- Storage API, transaction, checkpoint, recovery, or persisted-format changes.
+- Arbitrary schemas, named resource graphs, or multiple retained ordinary indexes.
+- Recipe, payload, or composite CREATE preparation for downstream consumers.
+- Composite lookup-key generation or non-unique point-lookup semantics.
+- OS page-cache controls, cache-flush operations, or timing-based assertions.
+
+## Rejected Alternatives
+
+- A separate preparation action language would duplicate existing untimed
+  workload execution; typed fixture transitions already express this scope.
+- Named tables and indexes with a dependency graph would broaden the task
+  beyond its single ordinary table and single retained index contract.
+
+## Plan
+
+CREATE input resolves to an ordered vector of typed `c0`/`c1` references.
+The ordinary and recipe schemas share these two physical columns. Omitted
+selectors default to `c0`; legacy `key`, `payload`, and `composite` aliases
+normalize to `[c0]`, `[c1]`, and `[c1, c0]`. Empty, duplicate, malformed,
+out-of-schema, and simultaneous selectors fail before root creation.
+Final CREATE supports either composite order and retains its single-run policy.
+
+Preparation requires one ordinary, committed, index-free table, exact placement,
+no active frozen batch, no recipe, and columns exactly `[c0]`. The planned
+fixture effect changes the index mode before subsequent requirements resolve.
+Unique lookups retain their unique-index requirement. Duplicate retained CREATE,
+table pools, and incompatible consumers fail preflight.
+
+Maintenance accepts all three ordinary index modes while preserving its existing
+load, table-count, freeze-selection, and consumption rules. A full checkpoint
+establishes exact cold placement. Prefix checkpoint placement remains unknown;
+CREATE requires a subsequent full checkpoint to restore exact accounting.
+Full checkpoint followed by appended hot rows provides supported mixed placement.
+
+`PrimaryBinding` and `RecoverableTable` carry an optional stable index ID.
+An initially indexed table binds zero from the CREATE TABLE construction
+contract; standalone CREATE binds the returned ID. Indexed consumers require
+that binding rather than falling back to zero. Recovery captures the same ID
+and verifies that index after reopening.
+
+CREATE execution accepts zero samples for preparation or one measured sample.
+Both modes require exactly one operation and the planned effect; measured CREATE
+also requires an exact latency sum equal to CREATE elapsed time. Coordinator
+completion scans the table and returned index, verifies row counts and content
+fingerprints, validates the report, and only then publishes the fixture effect.
+A failure stops later phases and success-artifact publication. Verification
+failure does not roll back an already committed CREATE.
+
+Artifact validation checks CREATE preparation reports independently of the final
+workload, including missing, duplicate, mismatched, and unverified reports.
+Preparation retains elapsed time and optional CPU/RSS/engine diagnostics without
+a measured histogram or contribution to the benchmark aggregate.
+
+## Implementation Notes
+
+Shipped both persisted-read compositions, ordered CREATE columns, retained index
+identity propagation, and verified untimed CREATE reports without storage-engine
+changes or material deviations from the task's scope.
+
+The only production `IndexID::new(0)` remaining in the benchmark crate is the
+initial ordinary-table construction binding. Mutation test fixtures recreate
+their initial index, exercising existing independent content oracles with a
+nonzero ID. Coordinator tests consume two index-DDL cycles before CREATE and
+verify reads and recovery through returned ID 2.
+
+Composed-read tests compare complete table/index rows and unique lookups against
+fixed independent payload vectors after measurement. Composite CREATE tests use
+literal expected column positions and complete-key lookups in both orders.
+Failure tests cover duplicate-key CREATE, wrong index identity, inconsistent
+reports, and altered row content; later inserts never execute and roots remain
+reopenable without a success artifact.
+
+Validation completed with 230 benchmark tests and 2,300 workspace tests passing.
+Formatting, strict workspace Clippy, and the branch style audit passed. The
+style gate checked 11 changed Rust files and 155 test contracts with no violations.
+Production coverage is 91.24% across changed production files and exceeds 85%
+in every such file; detailed coverage is retained in `target/task-000328/coverage.md`.
+The resolution style gate passed again after the template-comment review fix;
+the focused template inventory test and whitespace check also passed.
+
+Semantic review retained distinct unit/coordinator/CLI coverage: unit tests prove
+sample/effect equations, fixture transitions, and mutation content; coordinator
+tests prove ordering, complete row contents, and failure cleanup; CLI tests prove
+runnable templates and output publication. No exact duplicate contracts were
+found. Existing initial-index CLI cases complement nonzero-ID mutation unit
+fixtures. Successful checkpoint setup uses the existing retry/wait API; no new
+sleep or timeout changes were introduced.
+
+Release benchmarks ran sequentially on Linux aarch64/OrbStack using Rust 1.99.0,
+one thread/session, batch size 100, one warmup, and three measured runs per fresh
+root. Lookup projected both columns; preparation was excluded from measured
+throughput and latency. Latency percentiles describe transactions containing up
+to 100 lookups. The default templates used 10,000 rows with 128-byte payloads;
+the larger scenarios used 32,768 rows with 1 KiB payloads. Each run requested as
+many sequential lookups as loaded rows. Only cache capacity changed between the
+larger resident and pressure scenarios.
+
+| Composition | Rows / payload | Cache | Million lookups/s | Batch p95 / p99 (us) |
+| --- | --- | --- | --- | --- |
+| Initially indexed checkpoint | 10,000 / 128 B | 17 MiB | 1.263 | 88.4 / 130.4 |
+| CREATE in preparation | 10,000 / 128 B | 17 MiB | 0.994 | 108.7 / 114.9 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 64 MiB | 1.213 | 91.5 / 100.6 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 17 MiB | 0.564 | 233.3 / 269.1 |
+| CREATE in preparation | 32,768 / 1 KiB | 64 MiB | 0.982 | 112.3 / 117.2 |
+| CREATE in preparation | 32,768 / 1 KiB | 17 MiB | 0.468 | 261.9 / 413.2 |
+
+For the larger scenarios, these are summed `buffer.disk` counter deltas across
+all three measured runs. The default scenarios had zero misses and reads.
+
+| Composition | Cache | Hits | Misses | Completed reads | Cache-access miss rate |
+| --- | --- | --- | --- | --- | --- |
+| Initially indexed checkpoint | 64 MiB | 196,608 | 0 | 0 | 0% |
+| Initially indexed checkpoint | 17 MiB | 195,016 | 1,592 | 1,592 | 0.81% |
+| CREATE in preparation | 64 MiB | 393,216 | 0 | 0 | 0% |
+| CREATE in preparation | 17 MiB | 391,590 | 1,626 | 1,626 | 0.41% |
+
+All 453,216 measured lookups found their rows, with zero read errors. CREATE
+took 8.6 ms for the default dataset and 49.7-50.4 ms for the larger dataset,
+outside lookup measurements. Cache pressure roughly halved lookup throughput
+in these short local runs; no timing thresholds are acceptance requirements.
+
+Cache misses count block-cache accesses, not missing logical rows. The 64 MiB
+cache held 1,022 pages, exceeding the observed 531-540 resident pages; the
+17 MiB cache held 271 pages. Sequential access reuses loaded 64 KiB pages across
+nearby rows, so pressure runs still mostly hit. Misses equaled completed reads
+with no inflight-load joins or read errors. These observations demonstrate
+engine-cache capacity misses and completed IO, without establishing uncached
+physical-device reads or individually cold random-lookup latency.
+
+Template review removed the inapplicable CREATE-verification reference from the
+initially indexed flow. Both templates retain the warning that zero warmup
+alone does not establish a cold cache; the CREATE-preparation template also
+explains that its content verification reads data before lookup measurement.
+
+The original ignored release and development artifacts were not retained.
+The tables above preserve the important results from a fresh rerun: aggregate
+throughput, merged latency percentiles, and summed cache counters. Detailed
+per-run reports remain local artifacts and are not archived in the repository.
+
+The rerun used benchmark code at `bc11230f66aa68f0ea0db6cd52a33ae5f130aa57`,
+Rust 1.99.0, and the system glibc 2.39 allocator with no allocator overrides.
+Run the following from the repository root with Python 3 and Linux io_uring
+support. It uses only checked-in templates, saves the exact generated plans,
+and executes all six scenarios sequentially with fresh roots. Each root contains
+the full `benchmark-result.toml`; those regenerated files are local artifacts,
+while the inline summaries are the durable record for this task. Timing values vary
+with the host and are not expected to reproduce exactly.
+
+```sh
+rtk cargo build --release -p doradb-bench
+python3 - <<'PY'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+templates = Path("doradb-bench/templates")
+out = Path(tempfile.mkdtemp(prefix="task-000328-", dir="target"))
+shutil.copyfile(templates / "engine-defaults.toml", out / "engine-defaults.toml")
+env = os.environ.copy()
+for key in ["LD_PRELOAD", "MALLOC_CONF", "MALLOC_ARENA_MAX", "GLIBC_TUNABLES"]:
+    env.pop(key, None)
+for flow in ["indexed-checkpoint", "create-index-prepare"]:
+    template = (templates / f"lookup-{flow}.toml").read_text()
+    for case, rows, payload, cache in [
+        ("template", 10000, "128 B", 17),
+        ("resident", 32768, "1 KiB", 64),
+        ("pressure", 32768, "1 KiB", 17),
+    ]:
+        name = f"{flow}-{case}"
+        plan = template.replace("num = 10000", f"num = {rows}")
+        plan = plan.replace('value_size = "128 B"', f'value_size = "{payload}"')
+        plan = plan.replace('readonly_buffer_size = "17 MiB"',
+                            f'readonly_buffer_size = "{cache} MiB"')
+        source = out / f"{name}.toml"
+        source.write_text(plan)
+        with (out / f"{name}.log").open("w") as log:
+            subprocess.run(["target/release/doradb-bench", "--root",
+                            str(out / f"{name}-root"), "--plan", str(source)],
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        print(name, "completed", flush=True)
+print("Plans, logs, and canonical results:", out)
+PY
+```
+
+Backlog 000074 remains closed as implemented; the persisted-read compositions
+and cache/content checks satisfy its acceptance hints.
+No implementation work was deferred. Task ID state was refreshed; there is no
+parent RFC to synchronize.
+
+## Impacts
+
+Changes are confined to benchmark configuration, fixture bindings, consumer
+index selection, CREATE verification/output, tests, and two lookup templates.
+Input compatibility is retained through alias normalization; resolved CREATE
+metadata now records canonical ordered columns. Engine APIs and persisted
+formats are unchanged.
+
+## Test Cases
+
+- Column defaults/aliases, both composite orders, invalid selectors, canonical
+  serialization, and failure before storage-root creation.
+- Hot/cold/mixed CREATE preparation, consumer eligibility, duplicate CREATE,
+  active freeze rejection, and exact versus unknown placement.
+- Initial and preparation-created unique/non-unique indexes through full and
+  prefix checkpoints, appended inserts, and recovery binding capture.
+- Sequential/random lookups, index scans/streams, and nonzero-ID recovery with
+  independent full-content verification and exact workload accounting.
+- Nonzero-ID update, delete, and upsert execution and completion verification.
+- Unsampled preparation, measured CREATE exact latency, corrupt preparation
+  artifacts, CREATE failures, and verification failures preventing advancement.
+- Existing recipe, payload, composite, placement, and measured CREATE contracts.
+- Template inventory and bounded CLI execution, plus resident/capacity-miss
+  scenarios substantiated by cache misses and completed reads.
+
+## Open Questions
+
+None within this task's scope. Composite consumers and multiple retained indexes
+remain separate future extensions rather than prerequisites for these flows.

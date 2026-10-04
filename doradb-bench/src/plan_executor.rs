@@ -464,7 +464,7 @@ async fn dispatch_workload(
         )),
         ResolvedWorkload::CreateIndex(config) => {
             let binding = if config.fixture.is_some() {
-                prepare_create_fixture(engine, *config).await?
+                prepare_create_fixture(engine, config).await?
             } else {
                 binding
             };
@@ -472,7 +472,7 @@ async fn dispatch_workload(
                 engine,
                 clock,
                 workload,
-                SessionExecutorConfig::new(*config, binding, execution_ordinal),
+                SessionExecutorConfig::new(config.clone(), binding, execution_ordinal),
                 planned_effect,
                 sample_latency,
             )
@@ -484,6 +484,8 @@ async fn dispatch_workload(
                     "CREATE coordinator received no measurements",
                 ));
             };
+            #[cfg(test)]
+            tests::run_create_completion_hook(engine, report);
             let effect = complete_create_index(engine, report).await?;
             outcome.effect = if config.fixture.is_some() {
                 FixtureRuntimeEffect::None
@@ -1104,10 +1106,19 @@ fn prepare_plan_root(storage_root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::fixture::PrimaryBinding;
+    use crate::measurement::CreateIndexReport;
+    use doradb_storage::id::TableID;
+    use std::cell::RefCell;
     use std::io::ErrorKind;
     use std::sync::{Condvar, Mutex as StdMutex, mpsc};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
+
+    type CreateCompletionHook = Box<dyn FnOnce(&Engine, &mut CreateIndexReport)>;
+
+    thread_local! {
+        static CREATE_COMPLETION_HOOK: RefCell<Option<CreateCompletionHook>> = const { RefCell::new(None) };
+    }
 
     struct WriteFailure;
 
@@ -1134,6 +1145,13 @@ mod tests {
         }
     }
 
+    /// Apply a coordinator-local observation or fault before CREATE publication.
+    pub(super) fn run_create_completion_hook(engine: &Engine, report: &mut CreateIndexReport) {
+        if let Some(hook) = CREATE_COMPLETION_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(engine, report);
+        }
+    }
+
     fn assert_shared_config<A, B>()
     where
         A: SessionExecutor,
@@ -1146,6 +1164,295 @@ mod tests {
         A: SessionExecutor,
         B: SessionExecutor<Outcome = A::Outcome>,
     {
+    }
+
+    /// Purpose: Compose persisted reads and recovery with initial or preparation-created indexes, including nonzero retained IDs.
+    /// Expected: Measured counters exclude preparation, CREATE reports are verified, and every table/index row matches an independent key and payload oracle.
+    #[test]
+    fn composed_indexed_reads_preserve_contents_and_measurement_boundaries() {
+        use doradb_storage::{
+            CallbackResult, IndexID, ScanRowDecision, SelectMvcc, TableIndex, Val,
+        };
+        use tempfile::TempDir;
+        smol::block_on(async {
+            for (index, prepared, placement, workload) in [
+                ("unique", false, "cold", "lookup-seq"),
+                ("unique", true, "cold", "lookup-rand"),
+                ("unique", true, "mixed", "lookup-seq"),
+                ("non-unique", false, "cold", "index-scan"),
+                ("non-unique", true, "hot", "index-stream"),
+                ("unique", true, "cold", "recovery"),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let source = temp.path().join("plan.toml");
+                let initial = if prepared { "none" } else { index };
+                let rows = if placement == "mixed" { 6 } else { 8 };
+                let mut input = format!(
+                    "[workload_defaults]\nvalue_size = '8 B'\nbatch_size = 2\ninclude_stats = true\n[[phase]]\nworkload = {{ type = 'create-table', index = '{initial}' }}\n[[phase]]\nworkload = {{ type = 'insert-seq', num = {rows}, seed = 0 }}\n"
+                );
+                if placement != "hot" {
+                    input.push_str("[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n");
+                }
+                if placement == "mixed" {
+                    input.push_str(
+                        "[[phase]]\nworkload = { type = 'insert-seq', num = 2, seed = 0 }\n",
+                    );
+                }
+                if prepared {
+                    input.push_str(&format!("[[phase]]\nworkload = {{ type = 'index-ddl', num = 2 }}\n[[phase]]\nworkload = {{ type = 'create-index', index = '{index}', columns = ['c0'] }}\n"));
+                }
+                let controls = match workload {
+                    "recovery" => String::new(),
+                    "index-stream" | "index-scan" => ", num = 8, range = 8".to_owned(),
+                    _ => ", num = 8".to_owned(),
+                };
+                let repeats = if workload == "recovery" {
+                    ""
+                } else {
+                    "warmup_runs = 1\nmeasured_runs = 2\n"
+                };
+                input.push_str(&format!("[[phase]]\nkind = 'benchmark'\n{repeats}workload = {{ type = '{workload}'{controls} }}\n"));
+                fs::write(&source, input).unwrap();
+                let loaded = load_plan(&source, &root).unwrap();
+                let mut owner = Some(
+                    Engine::bootstrap(loaded.engine_config.clone())
+                        .await
+                        .unwrap(),
+                );
+                let result = execute_phases(
+                    &mut owner,
+                    &loaded.engine_config,
+                    &MeasurementClock::new(),
+                    &loaded.plan,
+                )
+                .await
+                .unwrap();
+                let index_id = if prepared {
+                    let phase = result
+                        .prepare_phases
+                        .iter()
+                        .find(|phase| phase.workload == "create-index")
+                        .unwrap();
+                    assert_eq!(
+                        phase.counters,
+                        WorkloadCounters {
+                            operations: 1,
+                            ..WorkloadCounters::default()
+                        }
+                    );
+                    let Some(WorkloadMetrics::CreateIndex { report }) = &phase.workload_metrics
+                    else {
+                        panic!("CREATE")
+                    };
+                    report.validate().unwrap();
+                    assert_eq!(report.index_id, 2);
+                    assert_eq!(report.total_rows, 8);
+                    assert_eq!(
+                        report.rows.hot_rows,
+                        match placement {
+                            "hot" => 8,
+                            "mixed" => 2,
+                            _ => 0,
+                        }
+                    );
+                    IndexID::new(report.index_id)
+                } else {
+                    IndexID::new(0)
+                };
+                if workload == "recovery" {
+                    let Some(WorkloadMetrics::Recovery { verification, .. }) =
+                        &result.measured_runs[0].workload_metrics
+                    else {
+                        panic!("recovery")
+                    };
+                    assert!(verification.index_verified);
+                    assert_eq!(verification.verified_rows, 8);
+                } else {
+                    let stream = workload == "index-stream";
+                    let scan = stream || workload == "index-scan";
+                    let expected = WorkloadCounters {
+                        operations: 16,
+                        found: if stream { 0 } else { 16 },
+                        rows_returned: if scan { 128 } else { 16 },
+                        ..WorkloadCounters::default()
+                    };
+                    assert_eq!(result.aggregate.counters, expected, "{workload}");
+                    assert_eq!(
+                        result.aggregate.latency.sample_count,
+                        if stream { 16 } else { 8 }
+                    );
+                    assert_eq!(result.measured_runs.len(), 2);
+                    for run in &result.measured_runs {
+                        for metric in run
+                            .internal_metrics
+                            .iter()
+                            .filter(|metric| metric.name == "create_index.completed_builds")
+                        {
+                            assert_eq!(metric.value, 0, "CREATE leaked into {workload}");
+                        }
+                    }
+                }
+                // Fixed seed-zero eight-byte payload vectors, independent of the runtime generator.
+                let payloads = [
+                    0x1b2b_3d64_92a3_41dbu64,
+                    0xd07c_2af7_190a_3766,
+                    0x059e_66e7_2fa8_49ec,
+                    0xd83c_afc0_ccb4_5867,
+                    0x0b90_47cf_5875_ce68,
+                    0x4048_68ee_fff1_175b,
+                    0xe6c4_9c53_5f15_9652,
+                    0xde9a_e8ac_66d4_50de,
+                ];
+                let expected: Vec<_> = payloads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(key, payload)| {
+                        vec![
+                            Val::from(key as u64),
+                            Val::from(payload.to_le_bytes().to_vec()),
+                        ]
+                    })
+                    .collect();
+                let mut session = owner.as_ref().unwrap().new_session().unwrap();
+                let table_id = session.list_table_ids().unwrap()[0];
+                let mut trx = session.begin_trx().unwrap();
+                let mut actual = Vec::new();
+                let mut scan = trx
+                    .table_scan_mvcc_stream(table_id, &[0, 1], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                    .unwrap();
+                while let Some(row) = scan.next().await.unwrap() {
+                    actual.push(row);
+                }
+                drop(scan);
+                actual.sort_by_key(|row| row[0].as_u64().unwrap());
+                assert_eq!(actual, expected, "{workload}: table content");
+                let mut scan = trx
+                    .table_index_scan_mvcc_stream(TableIndex(table_id, index_id), .., &[0, 1])
+                    .await
+                    .unwrap();
+                for row in &expected {
+                    assert_eq!(scan.next().await.unwrap().as_ref(), Some(row));
+                }
+                assert_eq!(scan.next().await.unwrap(), None);
+                drop(scan);
+                if index == "unique" {
+                    for row in &expected {
+                        let found = trx
+                            .table_lookup_unique_mvcc(
+                                TableIndex(table_id, index_id),
+                                &row[..1],
+                                &[0, 1],
+                            )
+                            .await
+                            .unwrap();
+                        let SelectMvcc::Found(found) = found else {
+                            panic!("missing row")
+                        };
+                        assert_eq!(&found, row);
+                    }
+                }
+                trx.commit().await.unwrap();
+                session.close().await.unwrap();
+                let report = InvocationReport {
+                    root: root.clone(),
+                    plan_source: source,
+                    plan: loaded.plan,
+                    prepare_phases: result.prepare_phases,
+                    measured_runs: result.measured_runs,
+                    aggregate: result.aggregate,
+                };
+                write_plan_output(&report).unwrap();
+                owner.take().unwrap().shutdown();
+            }
+        });
+    }
+
+    /// Purpose: Stop composed plans when CREATE or its completion verification fails.
+    /// Expected: The later insert never runs, no successful artifact is installed, and the root remains reopenable after participant cleanup.
+    #[test]
+    fn failed_create_preparation_stops_later_phases_and_result_publication() {
+        use doradb_storage::{CallbackResult, RowMutation, ScanRowDecision};
+        use tempfile::TempDir;
+        smol::block_on(async {
+            for failure in ["create", "identity", "report", "content"] {
+                let temp = TempDir::new().unwrap();
+                let root = temp.path().join("root");
+                let source = temp.path().join("plan.toml");
+                let insert = if failure == "create" {
+                    "insert-rand"
+                } else {
+                    "insert-seq"
+                };
+                fs::write(&source, format!("[[phase]]\nworkload = {{ type = 'create-table', index = 'none' }}\n[[phase]]\nworkload = {{ type = '{insert}', num = 8, seed = 42 }}\n[[phase]]\nworkload = {{ type = 'create-index', index = 'unique' }}\n[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'insert-seq', num = 1 }}\n")).unwrap();
+                if failure != "create" {
+                    CREATE_COMPLETION_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move |engine, report| match failure {
+                            "identity" => report.index_id = u32::MAX,
+                            "report" => report.rows.hot_rows += 1,
+                            "content" => smol::block_on(async {
+                                let mut session = engine.new_session().unwrap();
+                                let mut trx = session.begin_trx().unwrap();
+                                trx.table_mutate_mvcc(
+                                    TableID::new(report.table_id),
+                                    |row| -> CallbackResult<_> {
+                                        Ok(if row.val(0)?.as_u64() == Some(0) {
+                                            RowMutation::Delete
+                                        } else {
+                                            RowMutation::Skip
+                                        })
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                                trx.commit().await.unwrap();
+                                session.close().await.unwrap();
+                            }),
+                            _ => unreachable!(),
+                        }));
+                    });
+                }
+                let error = execute_plan(root.clone(), source.clone())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    !root.join("benchmark-result.toml").exists(),
+                    "{failure}: {error}"
+                );
+                assert!(CREATE_COMPLETION_HOOK.with(|slot| slot.borrow().is_none()));
+                let loaded = load_plan(&source, &root).unwrap();
+                let engine = Engine::bootstrap(loaded.engine_config).await.unwrap();
+                let mut session = engine.new_session().unwrap();
+                let table = session.list_table_ids().unwrap()[0];
+                let mut trx = session.begin_trx().unwrap();
+                let mut scan = trx
+                    .table_scan_mvcc_stream(table, &[0, 1], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                    .unwrap();
+                let mut rows = 0;
+                while let Some(row) = scan.next().await.unwrap() {
+                    assert!(
+                        row[0].as_u64().unwrap() < 8,
+                        "later phase inserted its key after {failure}"
+                    );
+                    rows += 1;
+                }
+                assert_eq!(
+                    rows,
+                    if failure == "content" { 7 } else { 8 },
+                    "{failure}: {error}"
+                );
+                drop(scan);
+                trx.commit().await.unwrap();
+                session.close().await.unwrap();
+                engine.shutdown();
+            }
+        });
     }
 
     /// Purpose: Protect the public profiler pause and resume protocol.

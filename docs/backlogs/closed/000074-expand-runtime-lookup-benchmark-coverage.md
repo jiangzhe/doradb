@@ -42,3 +42,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented and verified resident and capacity-miss persisted lookup plans via task 000328.
+- Closed By: backlog close
+- Reference: docs/tasks/000328-doradb-bench-indexed-checkpoint-and-create-index-preparation.md
+- Closed At: 2026-10-04

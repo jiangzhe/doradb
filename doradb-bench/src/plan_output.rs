@@ -3,7 +3,7 @@ use crate::measurement::{
     BenchmarkAggregate, InternalMetric, MeasuredRunResult, WorkloadCounters, WorkloadMetrics,
     operations_per_second,
 };
-use crate::plan::Plan;
+use crate::plan::{Phase, Plan, ResolvedWorkload};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
@@ -429,6 +429,71 @@ pub(crate) fn absolute_result_path(storage_root: &Path) -> Result<PathBuf> {
 }
 
 fn validate_create_result(report: &InvocationReport) -> Result<()> {
+    let counters = WorkloadCounters {
+        operations: 1,
+        ..WorkloadCounters::default()
+    };
+    for prepare in &report.prepare_phases {
+        if prepare.workload != "create-index"
+            && !matches!(
+                prepare.workload_metrics,
+                Some(WorkloadMetrics::CreateIndex { .. })
+            )
+        {
+            continue;
+        }
+        let phase = prepare
+            .phase_index
+            .checked_sub(1)
+            .and_then(|index| report.plan.phases.get(index));
+        let Some(Phase::Prepare {
+            workload: ResolvedWorkload::CreateIndex(config),
+            ..
+        }) = phase
+        else {
+            return Err(BenchError::message(
+                "CREATE preparation has no matching plan phase",
+            ));
+        };
+        let Some(WorkloadMetrics::CreateIndex { report: create }) = &prepare.workload_metrics
+        else {
+            return Err(BenchError::message(
+                "CREATE preparation has no measurements",
+            ));
+        };
+        create.validate()?;
+        if prepare.workload != "create-index"
+            || prepare.counters != counters
+            || create.index != config.index
+        {
+            return Err(BenchError::message(
+                "CREATE preparation identity or counters mismatch",
+            ));
+        }
+    }
+    for (index, phase) in report.plan.phases.iter().enumerate() {
+        if matches!(
+            phase,
+            Phase::Prepare {
+                workload: ResolvedWorkload::CreateIndex(_),
+                ..
+            }
+        ) {
+            let mut results = report
+                .prepare_phases
+                .iter()
+                .filter(|prepare| prepare.phase_index == index + 1);
+            if results
+                .next()
+                .is_none_or(|prepare| prepare.workload != "create-index")
+                || results.next().is_some()
+            {
+                return Err(BenchError::message(
+                    "CREATE requires exactly one preparation result",
+                ));
+            }
+        }
+    }
     if report
         .plan
         .phases
@@ -446,11 +511,8 @@ fn validate_create_result(report: &InvocationReport) -> Result<()> {
         return Err(BenchError::message("CREATE report has no measurements"));
     };
     create.validate()?;
-    let counters = WorkloadCounters {
-        operations: 1,
-        ..WorkloadCounters::default()
-    };
-    if run.counters != counters
+    if report.aggregate.measured_runs != 1
+        || run.counters != counters
         || report.aggregate.counters != counters
         || run.latency.sample_count != 1
         || run.latency.sum_nanos != create.create_elapsed_nanos
@@ -601,22 +663,16 @@ mod tests {
         }
     }
 
-    /// Purpose: Publish index-creation results only when verification and accounting are
-    /// complete.
-    /// Expected: Valid reports preserve raw metrics and defined rates while invalid reports
-    /// produce no artifact.
-    #[test]
-    fn create_output_requires_complete_verification_and_preserves_raw_units() {
+    fn create_report(root: &Path) -> InvocationReport {
         use crate::fixture::{IndexMode, PlacementKind, RowPlacement};
         use crate::measurement::{CreateIndexReport, CreateIndexVerification, SampledProcessRss};
-        use crate::plan::{CreateIndexConfig, CreateIndexKey};
-        let temp = TempDir::new().unwrap();
-        let mut report = report(temp.path());
+        use crate::plan::{CreateIndexColumn, CreateIndexConfig};
+        let mut report = report(root);
         let Phase::Benchmark { workload, .. } = &mut report.plan.phases[0] else {
             panic!("benchmark")
         };
         *workload = ResolvedWorkload::CreateIndex(CreateIndexConfig {
-            key: CreateIndexKey::Key,
+            columns: vec![CreateIndexColumn::C0],
             fixture: None,
             index: IndexMode::Unique,
             include_stats: true,
@@ -654,6 +710,17 @@ mod tests {
             workload_metrics: Some(WorkloadMetrics::CreateIndex { report: create }),
             internal_metrics: Vec::new(),
         });
+        report
+    }
+
+    /// Purpose: Publish index-creation results only when verification and accounting are
+    /// complete.
+    /// Expected: Valid reports preserve raw metrics and defined rates while invalid reports
+    /// produce no artifact.
+    #[test]
+    fn create_output_requires_complete_verification_and_preserves_raw_units() {
+        let temp = TempDir::new().unwrap();
+        let mut report = create_report(temp.path());
         for failure in [
             "pending",
             "count",
@@ -712,6 +779,98 @@ mod tests {
         let summary = render_stdout_summary(&report, &path).unwrap();
         assert!(!summary.contains("create_rows_per_second:"));
         assert!(!summary.contains("average_cpu_cores:"));
+    }
+
+    /// Purpose: Validate CREATE preparation even when the final measured workload is a lookup.
+    /// Expected: Verified untimed reports round-trip without a histogram; missing, duplicated, corrupt, or misattributed preparation prevents artifact publication.
+    #[test]
+    fn preparation_create_reports_are_validated_independently_of_final_workload() {
+        use crate::fixture::IndexMode;
+        use crate::plan::ReadConfig;
+        let temp = TempDir::new().unwrap();
+        let mut report = create_report(temp.path());
+        let Phase::Benchmark {
+            workload: create, ..
+        } = report.plan.phases.remove(0)
+        else {
+            panic!("CREATE")
+        };
+        report.plan.phases.push(Phase::Prepare {
+            workload: create,
+            fixture_effect: FixturePlanEffect::CreateIndex {
+                index: IndexMode::Unique,
+            },
+        });
+        report.prepare_phases.push(PreparePhaseResult {
+            phase_index: 1,
+            workload: "create-index".to_owned(),
+            elapsed_nanos: 50,
+            counters: report.measured_runs[0].counters,
+            workload_metrics: report.measured_runs[0].workload_metrics.take(),
+            internal_metrics: vec![],
+        });
+        report.plan.phases.push(Phase::Benchmark {
+            workload: ResolvedWorkload::LookupSeq(ReadConfig {
+                num: 1,
+                seed: 0,
+                threads: 1,
+                sessions: 1,
+                batch_size: 1,
+                loaded_range: KeyRange { start: 0, len: 100 },
+                range: None,
+                include_stats: false,
+            }),
+            fixture_effect: FixturePlanEffect::None,
+            measurement: MeasurementSpec {
+                warmup_runs: 0,
+                measured_runs: NonZeroU32::MIN,
+                pause: false,
+            },
+        });
+        report.aggregate.latency.unit = LatencyUnit::TransactionLifecycle;
+        report.measured_runs[0].latency.unit = LatencyUnit::TransactionLifecycle;
+        for failure in [
+            "missing-result",
+            "duplicate",
+            "missing-metrics",
+            "unverified",
+            "count",
+            "placement",
+            "mode",
+            "counters",
+            "phase",
+            "identity",
+        ] {
+            let mut invalid = report.clone();
+            let prepare = &mut invalid.prepare_phases[0];
+            let Some(WorkloadMetrics::CreateIndex { report: create }) =
+                prepare.workload_metrics.as_mut()
+            else {
+                panic!("CREATE")
+            };
+            match failure {
+                "missing-result" => invalid.prepare_phases.clear(),
+                "duplicate" => invalid
+                    .prepare_phases
+                    .push(invalid.prepare_phases[0].clone()),
+                "missing-metrics" => prepare.workload_metrics = None,
+                "unverified" => create.verification = None,
+                "count" => create.verification.as_mut().unwrap().index_rows -= 1,
+                "placement" => create.rows.hot_rows += 1,
+                "mode" => create.index = IndexMode::NonUnique,
+                "counters" => prepare.counters.operations = 2,
+                "phase" => prepare.phase_index = 2,
+                "identity" => prepare.workload = "lookup-seq".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(write_plan_output(&invalid).is_err(), "{failure}");
+            assert!(!result_toml_path(temp.path()).exists());
+        }
+        let path = write_plan_output(&report).unwrap();
+        assert_eq!(
+            toml::from_str::<InvocationReport>(&fs::read_to_string(path).unwrap()).unwrap(),
+            report
+        );
     }
 
     /// Purpose: Publish a canonical success report with strict numeric serialization.

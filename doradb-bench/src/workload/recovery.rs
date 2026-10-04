@@ -53,15 +53,19 @@ pub(crate) async fn run_recovery(
         prepare_fixture(engine, fixture).await?
     } else {
         table
-            .map(|table| PreparedTable {
-                table_id: table.table_id,
-                rows: table.inserted_rows,
-                indexes: if table.shape.index == IndexMode::None {
-                    vec![]
-                } else {
-                    vec![IndexID::new(0)]
-                },
+            .map(|table| {
+                if (table.shape.index == IndexMode::None) != table.index_id.is_none() {
+                    return Err(BenchError::message(
+                        "recovery fixture index binding mismatch",
+                    ));
+                }
+                Ok(PreparedTable {
+                    table_id: table.table_id,
+                    rows: table.inserted_rows,
+                    indexes: table.index_id.into_iter().collect(),
+                })
             })
+            .transpose()?
             .into_iter()
             .collect()
     };
@@ -304,6 +308,7 @@ mod tests {
                 drop(session);
                 let table = RecoverableTable {
                     table_id,
+                    index_id: Some(IndexID::new(0)),
                     shape: PrimaryTableShape {
                         index: IndexMode::Unique,
                     },

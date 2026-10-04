@@ -206,12 +206,12 @@ pub enum FixtureRequirement {
         /// Checked minimum table count.
         minimum: usize,
     },
-    /// Consume one loaded index-free primary that can install a frozen batch.
+    /// Consume one loaded primary that can install a frozen batch.
     FreezeCandidate {
         /// Requested full or prefix selection.
         selection: FreezeSelection,
     },
-    /// Consume one index-free primary with an installed frozen-batch summary.
+    /// Consume one primary with an installed frozen-batch summary.
     FrozenPrimary,
     /// No catalog-checkpoint fixture may already be pending.
     AbsentCatalogCheckpoint,
@@ -372,7 +372,7 @@ impl FixturePlanState {
                 let primary = self.primary.as_ref().ok_or_else(|| {
                     BenchError::message("freeze-table requires a preceding create-table phase")
                 })?;
-                validate_maintenance_primary(primary.shape, primary.table_count, "freeze-table")?;
+                validate_maintenance_primary(primary.table_count, "freeze-table")?;
                 let candidate_rows = primary
                     .attempted_range
                     .filter(|range| !range.is_empty())
@@ -399,11 +399,7 @@ impl FixturePlanState {
                 let primary = self.primary.as_ref().ok_or_else(|| {
                     BenchError::message("checkpoint-table requires a preceding create-table phase")
                 })?;
-                validate_maintenance_primary(
-                    primary.shape,
-                    primary.table_count,
-                    "checkpoint-table",
-                )?;
+                validate_maintenance_primary(primary.table_count, "checkpoint-table")?;
                 if primary.frozen.is_none() {
                     return Err(BenchError::message(
                         "checkpoint-table requires a preceding successful freeze-table phase",
@@ -694,6 +690,8 @@ pub(crate) struct PrimaryBinding {
     pub(crate) placement: Option<RowPlacement>,
     /// Public primary table identifier.
     pub(crate) table_id: TableID,
+    /// Stable retained index identity, absent for an index-free table.
+    pub(crate) index_id: Option<IndexID>,
     /// Bound logical shape.
     pub(crate) shape: PrimaryTableShape,
     /// Cumulative candidate range allocated by inserts.
@@ -706,11 +704,21 @@ pub(crate) struct PrimaryBinding {
     pub(crate) frozen: Option<FrozenFixtureSummary>,
 }
 
+impl PrimaryBinding {
+    /// Require the retained index identity without inferring it from the schema.
+    pub(crate) fn require_index_id(self) -> Result<IndexID> {
+        self.index_id
+            .ok_or_else(|| BenchError::message("primary fixture has no retained index ID"))
+    }
+}
+
 /// Value-only ordinary table identity and committed content accounting for reopening.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RecoverableTable {
     /// Public identity that must survive reopening.
     pub(crate) table_id: TableID,
+    /// Stable retained index identity carried across reopening.
+    pub(crate) index_id: Option<IndexID>,
     /// Prepared secondary-index shape.
     pub(crate) shape: PrimaryTableShape,
     /// Candidate range allocated by prepare inserts.
@@ -739,7 +747,7 @@ pub(crate) enum FixtureBinding {
 #[derive(Debug)]
 struct RuntimePrimaryFixture {
     placement: Option<RowPlacement>,
-    created_index_id: Option<IndexID>,
+    index_id: Option<IndexID>,
     shape: PrimaryTableShape,
     table_ids: Arc<[TableID]>,
     next_key: u64,
@@ -808,6 +816,7 @@ impl FixtureRuntimeState {
                 Ok(FixtureBinding::Recoverable(self.primary.as_ref().map(
                     |primary| RecoverableTable {
                         table_id: primary.table_ids[0],
+                        index_id: primary.index_id,
                         shape: primary.shape,
                         loaded_range: primary.attempted_range,
                         inserted_rows: primary.inserted_rows,
@@ -857,11 +866,7 @@ impl FixtureRuntimeState {
                     .primary
                     .as_ref()
                     .ok_or_else(|| BenchError::message("runtime primary fixture is missing"))?;
-                validate_maintenance_primary(
-                    primary.shape,
-                    primary.table_ids.len(),
-                    "freeze-table",
-                )?;
+                validate_maintenance_primary(primary.table_ids.len(), "freeze-table")?;
                 if primary.attempted_range.is_none_or(KeyRange::is_empty)
                     || primary.inserted_rows == 0
                     || primary.latest_write_fence.is_none()
@@ -886,11 +891,7 @@ impl FixtureRuntimeState {
                     .primary
                     .as_ref()
                     .ok_or_else(|| BenchError::message("runtime primary fixture is missing"))?;
-                validate_maintenance_primary(
-                    primary.shape,
-                    primary.table_ids.len(),
-                    "checkpoint-table",
-                )?;
+                validate_maintenance_primary(primary.table_ids.len(), "checkpoint-table")?;
                 if primary.frozen.is_none() {
                     return Err(BenchError::message(
                         "checkpoint-table runtime fixture has no frozen batch",
@@ -941,11 +942,11 @@ impl FixtureRuntimeState {
                     .primary
                     .as_mut()
                     .ok_or_else(|| BenchError::message("missing CREATE primary"))?;
-                if primary.created_index_id.is_some() {
+                if primary.index_id.is_some() {
                     return Err(BenchError::message("CREATE already installed an index"));
                 }
                 primary.shape.index = index;
-                primary.created_index_id = Some(index_id);
+                primary.index_id = Some(index_id);
                 Ok(())
             }
             FixtureRuntimeEffect::None => Ok(()),
@@ -957,7 +958,8 @@ impl FixtureRuntimeState {
                 }
                 self.primary = Some(RuntimePrimaryFixture {
                     placement: Some(RowPlacement::default()),
-                    created_index_id: None,
+                    // create_table assigns its single initial index ID zero.
+                    index_id: (shape.index != IndexMode::None).then_some(IndexID::new(0)),
                     shape,
                     table_ids,
                     next_key: 0,
@@ -1019,11 +1021,7 @@ impl FixtureRuntimeState {
                 let primary = self.primary.as_mut().ok_or_else(|| {
                     BenchError::message("runtime freeze effect requires a primary table")
                 })?;
-                validate_maintenance_primary(
-                    primary.shape,
-                    primary.table_ids.len(),
-                    "freeze-table",
-                )?;
+                validate_maintenance_primary(primary.table_ids.len(), "freeze-table")?;
                 summary.selection.validate(primary.inserted_rows)?;
                 if primary.frozen.is_some()
                     || summary.approximate_rows == 0
@@ -1128,19 +1126,10 @@ fn validate_index(actual: IndexMode, requirement: IndexRequirement) -> Result<()
     }
 }
 
-fn validate_maintenance_primary(
-    shape: PrimaryTableShape,
-    table_count: usize,
-    identity: &str,
-) -> Result<()> {
+fn validate_maintenance_primary(table_count: usize, identity: &str) -> Result<()> {
     if table_count != 1 {
         return Err(BenchError::message(format!(
             "{identity} requires exactly one table; found {table_count}"
-        )));
-    }
-    if shape.index != IndexMode::None {
-        return Err(BenchError::message(format!(
-            "{identity} requires an index-free primary table"
         )));
     }
     Ok(())
@@ -1150,6 +1139,7 @@ fn runtime_primary_binding(primary: &RuntimePrimaryFixture) -> PrimaryBinding {
     PrimaryBinding {
         placement: primary.placement,
         table_id: primary.table_ids[0],
+        index_id: primary.index_id,
         shape: primary.shape,
         loaded_range: primary.attempted_range,
         inserted_rows: primary.inserted_rows,
@@ -1299,9 +1289,90 @@ mod tests {
             .unwrap();
         assert!(state.bind(FixtureRequirement::CreateIndex).is_err());
         assert_eq!(
-            state.primary.as_ref().unwrap().created_index_id,
+            state.primary.as_ref().unwrap().index_id,
             Some(IndexID::new(17))
         );
+    }
+
+    /// Purpose: Preserve retained index identity across indexed maintenance, inserts, and recovery capture.
+    /// Expected: All index modes allow maintenance, prefix placement stays unknown, and a CREATE-assigned nonzero ID survives later transitions.
+    #[test]
+    fn retained_index_identity_survives_maintenance_and_recovery_binding() {
+        for mode in [IndexMode::None, IndexMode::Unique, IndexMode::NonUnique] {
+            for selection in [
+                FreezeSelection::All,
+                FreezeSelection::Prefix { max_rows: 4 },
+            ] {
+                let mut state = loaded_runtime(8);
+                if mode != IndexMode::None {
+                    state
+                        .apply(FixtureRuntimeEffect::CreateIndex {
+                            index: mode,
+                            index_id: IndexID::new(17),
+                        })
+                        .unwrap();
+                }
+                let expected_id = (mode != IndexMode::None).then_some(IndexID::new(17));
+                state
+                    .bind(FixtureRequirement::FreezeCandidate { selection })
+                    .unwrap();
+                freeze_runtime(&mut state, selection);
+                let FixtureBinding::Primary(frozen) =
+                    state.bind(FixtureRequirement::FrozenPrimary).unwrap()
+                else {
+                    panic!("primary")
+                };
+                assert_eq!(frozen.index_id, expected_id);
+                assert_eq!(frozen.require_index_id().is_ok(), expected_id.is_some());
+                state.apply(FixtureRuntimeEffect::Checkpoint).unwrap();
+                assert_eq!(
+                    placement(&state).is_some(),
+                    selection == FreezeSelection::All
+                );
+                state
+                    .apply(FixtureRuntimeEffect::Insert {
+                        attempted_range: KeyRange { start: 20, len: 2 },
+                        inserted_rows: 2,
+                        latest_write_fence: Some(TrxID::new(12)),
+                    })
+                    .unwrap();
+                let FixtureBinding::Recoverable(Some(table)) =
+                    state.bind(FixtureRequirement::Recoverable).unwrap()
+                else {
+                    panic!("recovery")
+                };
+                assert_eq!(table.index_id, expected_id);
+                assert_eq!(table.shape.index, mode);
+                assert_eq!(table.inserted_rows, 10);
+                if selection == FreezeSelection::All {
+                    assert_eq!(
+                        placement(&state),
+                        Some(RowPlacement {
+                            hot_rows: 2,
+                            checkpointed_rows: 8
+                        })
+                    );
+                } else {
+                    assert_eq!(placement(&state), None);
+                }
+            }
+            let mut state = FixtureRuntimeState::default();
+            state
+                .apply(FixtureRuntimeEffect::CreateTables {
+                    shape: PrimaryTableShape { index: mode },
+                    table_ids: vec![TableID::new(7)].into(),
+                })
+                .unwrap();
+            let FixtureBinding::Recoverable(Some(table)) =
+                state.bind(FixtureRequirement::Recoverable).unwrap()
+            else {
+                panic!("recovery")
+            };
+            assert_eq!(
+                table.index_id,
+                (mode != IndexMode::None).then_some(IndexID::new(0))
+            );
+        }
     }
 
     /// Purpose: Require a committed, unindexed fixture with exact placement for index creation.

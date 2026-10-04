@@ -524,9 +524,10 @@ pub enum CreateIndexKey {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexSpec {
-    /// Physical columns; defaults to the numeric logical key.
-    #[serde(default)]
-    pub key: CreateIndexKey,
+    /// Ordered column references; defaults to c0 when neither selector is present.
+    pub columns: Option<Vec<String>>,
+    /// Compatibility alias for older plans; mutually exclusive with columns.
+    pub key: Option<CreateIndexKey>,
     /// Optional untimed fixture; requires an empty plan and exactly one table.
     pub fixture: Option<RecoveryFixture>,
     /// Required secondary-index mode; none is rejected during resolution.
@@ -535,12 +536,71 @@ pub struct CreateIndexSpec {
     pub include_stats: Option<bool>,
 }
 
-/// Resolved single-session CREATE INDEX configuration.
+impl CreateIndexSpec {
+    fn resolve_columns(&self) -> Result<Vec<CreateIndexColumn>> {
+        use CreateIndexColumn::{C0, C1};
+        let Some(columns) = &self.columns else {
+            return Ok(match self.key.unwrap_or_default() {
+                CreateIndexKey::Key => vec![C0],
+                CreateIndexKey::Payload => vec![C1],
+                CreateIndexKey::Composite => vec![C1, C0],
+            });
+        };
+        if self.key.is_some() || columns.is_empty() {
+            return Err(BenchError::message(
+                "create-index columns must be nonempty and cannot be combined with key",
+            ));
+        }
+        let mut resolved = Vec::with_capacity(columns.len());
+        for column in columns {
+            // Ordinary and recipe fixtures both use benchmark_table_spec's two columns.
+            let reference = match column.as_str() {
+                "c0" => C0,
+                "c1" => C1,
+                _ => {
+                    return Err(BenchError::message(format!(
+                        "create-index column {column:?} is invalid; expected c0 or c1"
+                    )));
+                }
+            };
+            if resolved.contains(&reference) {
+                return Err(BenchError::message(format!(
+                    "create-index columns contain duplicate {column}"
+                )));
+            }
+            resolved.push(reference);
+        }
+        Ok(resolved)
+    }
+}
+
+/// Resolved column reference in the fixed ordinary and recipe table schema.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CreateIndexColumn {
+    /// Generated numeric row identity.
+    #[serde(rename = "c0")]
+    C0,
+    /// Variable-width payload bytes.
+    #[serde(rename = "c1")]
+    C1,
+}
+
+impl CreateIndexColumn {
+    /// Return the physical position used in the public index definition.
+    pub(crate) fn position(self) -> u16 {
+        match self {
+            Self::C0 => 0,
+            Self::C1 => 1,
+        }
+    }
+}
+
+/// Resolved single-session CREATE INDEX configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexConfig {
-    /// Physical columns selected for the new index.
-    pub key: CreateIndexKey,
+    /// Ordered physical columns selected for the new index.
+    pub columns: Vec<CreateIndexColumn>,
     /// Optional untimed shared index-build fixture.
     pub fixture: Option<RecoveryFixture>,
     /// Secondary-index uniqueness mode for the selected physical columns.
@@ -1605,7 +1665,6 @@ fn validate_and_resolve_phases(
                     | ResolvedWorkload::DeleteAll(_)
                     | ResolvedWorkload::DeleteRand(_)
                     | ResolvedWorkload::Recovery(_)
-                    | ResolvedWorkload::CreateIndex(_)
             )
         {
             return Err(BenchError::message(format!(
@@ -1613,6 +1672,14 @@ fn validate_and_resolve_phases(
                 index + 1,
                 workload.identity()
             )));
+        }
+        if raw.kind == PhaseKind::Prepare
+            && let ResolvedWorkload::CreateIndex(config) = &workload
+            && (config.fixture.is_some() || config.columns != [CreateIndexColumn::C0])
+        {
+            return Err(BenchError::message(
+                "create-index preparation requires an ordinary table and columns = [\"c0\"]",
+            ));
         }
         if raw.kind == PhaseKind::Benchmark
             && matches!(
@@ -1728,7 +1795,7 @@ fn resolve_workload(
             Ok((
                 ResolvedWorkload::CreateIndex(CreateIndexConfig {
                     index: spec.index,
-                    key: spec.key,
+                    columns: spec.resolve_columns()?,
                     fixture: spec.fixture,
                     include_stats: spec.include_stats.unwrap_or(defaults.include_stats),
                 }),
@@ -3227,7 +3294,6 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
     fn maintenance_fixture_and_replay_contracts_fail_during_resolution() {
         let invalid = [
             "[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\", max_rows = 1 }\n",
-            "[[phase]]\nworkload = { type = \"create-table\", index = \"unique\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\", max_rows = 4 }\n",
             "[[phase]]\nworkload = { type = \"create-table\", index = \"none\", tables = 2 }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"freeze-table\", max_rows = 4 }\n",
             "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n[[phase]]\nkind = \"benchmark\"\nworkload = { type = \"checkpoint-table\" }\n",
             "[[phase]]\nworkload = { type = \"create-table\", index = \"none\" }\n[[phase]]\nworkload = { type = \"insert-seq\", num = 8 }\n[[phase]]\nkind = \"benchmark\"\nwarmup_runs = 1\nworkload = { type = \"freeze-table\", max_rows = 4 }\n",
@@ -3528,6 +3594,143 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         assert!(resolve(&restore).is_ok());
     }
 
+    /// Purpose: Normalize CREATE selectors while preserving ordered composite definitions.
+    /// Expected: Defaults and legacy aliases resolve to canonical columns; ambiguous or invalid references fail before root creation.
+    #[test]
+    fn create_columns_are_ordered_and_validated_before_root_creation() {
+        use CreateIndexColumn::{C0, C1};
+        let fixture = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 8 }\n";
+        for (selector, expected) in [
+            ("", vec![C0]),
+            (", key = 'key'", vec![C0]),
+            (", key = 'payload'", vec![C1]),
+            (", key = 'composite'", vec![C1, C0]),
+            (", columns = ['c0']", vec![C0]),
+            (", columns = ['c1']", vec![C1]),
+            (", columns = ['c0', 'c1']", vec![C0, C1]),
+            (", columns = ['c1', 'c0']", vec![C1, C0]),
+        ] {
+            let phases = resolve(&format!("{fixture}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = 'unique'{selector} }}")).unwrap();
+            let ResolvedWorkload::CreateIndex(config) = phases.last().unwrap().workload() else {
+                panic!("CREATE")
+            };
+            assert_eq!(config.columns, expected, "{selector}");
+            let metadata = toml::to_string(config).unwrap();
+            assert!(metadata.contains("columns = ["));
+            assert!(!metadata.contains("key ="));
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("invalid.toml");
+        let root = temp.path().join("root");
+        for selector in [
+            "columns = []",
+            "columns = ['c0', 'c0']",
+            "columns = ['c2']",
+            "columns = ['C0']",
+            "columns = ['c01']",
+            "columns = ['key']",
+            "columns = ['c-1']",
+            "columns = ['']",
+            "columns = [0]",
+            "columns = ['c0'], key = 'key'",
+        ] {
+            fs::write(&source, format!("{fixture}[[phase]]\nkind = 'benchmark'\nworkload = {{ type = 'create-index', index = 'unique', {selector} }}")).unwrap();
+            assert!(load_plan(&source, &root).is_err(), "{selector}");
+            assert!(!root.exists());
+        }
+    }
+
+    /// Purpose: Admit indexed maintenance and ordinary CREATE preparation with precise placement and consumer requirements.
+    /// Expected: Hot, cold, and cold-then-hot preparation compose; unsupported selectors, fixtures, and incompatible consumers fail preflight.
+    #[test]
+    fn create_preparation_and_indexed_maintenance_follow_fixture_capabilities() {
+        let fixture = "[[phase]]\nworkload = { type = 'create-table', index = 'none' }\n[[phase]]\nworkload = { type = 'insert-seq', num = 8 }\n";
+        let checkpoint = "[[phase]]\nworkload = { type = 'freeze-table', all = true }\n[[phase]]\nworkload = { type = 'checkpoint-table' }\n";
+        let tail = "[[phase]]\nworkload = { type = 'insert-seq', num = 4 }\n";
+        let lookup = "[[phase]]\nkind = 'benchmark'\nworkload = { type = 'lookup-seq', num = 8 }\n";
+        for index in ["unique", "non-unique"] {
+            let create = format!(
+                "[[phase]]\nworkload = {{ type = 'create-index', index = '{index}', columns = ['c0'] }}\n"
+            );
+            let scan = lookup.replace("type = 'lookup-seq'", "type = 'index-scan', range = 2");
+            for placement in [
+                String::new(),
+                checkpoint.to_owned(),
+                format!("{checkpoint}{tail}"),
+            ] {
+                let phases = resolve(&format!("{fixture}{placement}{create}{scan}")).unwrap();
+                assert_eq!(
+                    phases[phases.len() - 2].fixture_effect(),
+                    &FixturePlanEffect::CreateIndex {
+                        index: if index == "unique" {
+                            IndexMode::Unique
+                        } else {
+                            IndexMode::NonUnique
+                        }
+                    }
+                );
+                assert_eq!(
+                    resolve(&format!("{fixture}{placement}{create}{lookup}")).is_ok(),
+                    index == "unique"
+                );
+            }
+            for selection in ["all = true", "max_rows = 4"] {
+                assert!(
+                    resolve(
+                        &format!(
+                            "{}{checkpoint}{scan}",
+                            fixture.replace("index = 'none'", &format!("index = '{index}'"))
+                        )
+                        .replace("all = true", selection)
+                    )
+                    .is_ok()
+                );
+            }
+        }
+        let create =
+            "[[phase]]\nworkload = { type = 'create-index', index = 'unique', columns = ['c0'] }\n";
+        let mut invalid = vec![
+            format!("{create}{lookup}"),
+            format!(
+                "{}{create}{lookup}",
+                fixture.replace(", num = 8", ", num = 0")
+            ),
+            format!(
+                "{}{create}{lookup}",
+                fixture.replace("index = 'none'", "index = 'none', tables = 2")
+            ),
+            format!(
+                "{}{create}{lookup}",
+                fixture.replace("index = 'none'", "index = 'unique'")
+            ),
+            format!("{fixture}{create}{create}{lookup}"),
+            format!(
+                "{fixture}[[phase]]\nworkload = {{ type = 'freeze-table', all = true }}\n{create}{lookup}"
+            ),
+            format!(
+                "{fixture}{}{create}{lookup}",
+                checkpoint.replace("all = true", "max_rows = 4")
+            ),
+            format!(
+                "[[phase]]\nworkload = {{ type = 'create-index', index = 'unique', fixture = {{ tables = 1, rows = 8, indexes = 0, index = 'none', value_bytes = 16 }} }}\n{lookup}"
+            ),
+        ];
+        for selector in ["['c1']", "['c0', 'c1']", "['c1', 'c0']"] {
+            invalid.push(format!(
+                "{fixture}{}{lookup}",
+                create.replace("['c0']", selector)
+            ));
+        }
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("invalid.toml");
+        let root = temp.path().join("root");
+        for input in invalid {
+            fs::write(&source, &input).unwrap();
+            assert!(load_plan(&source, &root).is_err(), "{input}");
+            assert!(!root.exists());
+        }
+    }
+
     /// Purpose: Keep shipped benchmark templates aligned with the supported workload inventory.
     /// Expected: Every supported template resolves its intended configuration without missing
     /// or unexpected templates.
@@ -3562,6 +3765,8 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
             ("delete-rand-non-unique.toml", "delete-rand"),
             ("table-ddl.toml", "table-ddl"),
             ("lookup-seq.toml", "lookup-seq"),
+            ("lookup-indexed-checkpoint.toml", "lookup-seq"),
+            ("lookup-create-index-prepare.toml", "lookup-seq"),
             ("lookup-rand.toml", "lookup-rand"),
             ("table-scan.toml", "table-scan"),
             ("parallel-table-scan.toml", "parallel-table-scan"),
