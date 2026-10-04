@@ -154,12 +154,12 @@ larger resident and pressure scenarios.
 
 | Composition | Rows / payload | Cache | Million lookups/s | Batch p95 / p99 (us) |
 | --- | --- | --- | --- | --- |
-| Initially indexed checkpoint | 10,000 / 128 B | 17 MiB | 1.294 | 81.7 / 84.9 |
-| CREATE in preparation | 10,000 / 128 B | 17 MiB | 0.987 | 110.1 / 119.2 |
-| Initially indexed checkpoint | 32,768 / 1 KiB | 64 MiB | 1.249 | 87.4 / 94.6 |
-| Initially indexed checkpoint | 32,768 / 1 KiB | 17 MiB | 0.615 | 216.1 / 318.5 |
-| CREATE in preparation | 32,768 / 1 KiB | 64 MiB | 0.977 | 111.4 / 117.8 |
-| CREATE in preparation | 32,768 / 1 KiB | 17 MiB | 0.493 | 249.0 / 393.0 |
+| Initially indexed checkpoint | 10,000 / 128 B | 17 MiB | 1.263 | 88.4 / 130.4 |
+| CREATE in preparation | 10,000 / 128 B | 17 MiB | 0.994 | 108.7 / 114.9 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 64 MiB | 1.213 | 91.5 / 100.6 |
+| Initially indexed checkpoint | 32,768 / 1 KiB | 17 MiB | 0.564 | 233.3 / 269.1 |
+| CREATE in preparation | 32,768 / 1 KiB | 64 MiB | 0.982 | 112.3 / 117.2 |
+| CREATE in preparation | 32,768 / 1 KiB | 17 MiB | 0.468 | 261.9 / 413.2 |
 
 For the larger scenarios, these are summed `buffer.disk` counter deltas across
 all three measured runs. The default scenarios had zero misses and reads.
@@ -172,7 +172,7 @@ all three measured runs. The default scenarios had zero misses and reads.
 | CREATE in preparation | 17 MiB | 391,590 | 1,626 | 1,626 | 0.41% |
 
 All 453,216 measured lookups found their rows, with zero read errors. CREATE
-took 7.4 ms for the default dataset and 42.4-46.6 ms for the larger dataset,
+took 8.6 ms for the default dataset and 49.7-50.4 ms for the larger dataset,
 outside lookup measurements. Cache pressure roughly halved lookup throughput
 in these short local runs; no timing thresholds are acceptance requirements.
 
@@ -189,9 +189,57 @@ initially indexed flow. Both templates retain the warning that zero warmup
 alone does not establish a cold cache; the CREATE-preparation template also
 explains that its content verification reads data before lookup measurement.
 
-Reproducible plans, commands, raw results, and per-run summaries are under
-`target/task-000328/release-benchmarks-w52jfry6/`. Earlier development-build
-cache evidence remains under `target/task-000328/cache-evidence/`.
+The original ignored release and development artifacts were not retained.
+The tables above preserve the important results from a fresh rerun: aggregate
+throughput, merged latency percentiles, and summed cache counters. Detailed
+per-run reports remain local artifacts and are not archived in the repository.
+
+The rerun used benchmark code at `bc11230f66aa68f0ea0db6cd52a33ae5f130aa57`,
+Rust 1.99.0, and the system glibc 2.39 allocator with no allocator overrides.
+Run the following from the repository root with Python 3 and Linux io_uring
+support. It uses only checked-in templates, saves the exact generated plans,
+and executes all six scenarios sequentially with fresh roots. Each root contains
+the full `benchmark-result.toml`; those regenerated files are local artifacts,
+while the inline summaries are the durable record for this task. Timing values vary
+with the host and are not expected to reproduce exactly.
+
+```sh
+rtk cargo build --release -p doradb-bench
+python3 - <<'PY'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+templates = Path("doradb-bench/templates")
+out = Path(tempfile.mkdtemp(prefix="task-000328-", dir="target"))
+shutil.copyfile(templates / "engine-defaults.toml", out / "engine-defaults.toml")
+env = os.environ.copy()
+for key in ["LD_PRELOAD", "MALLOC_CONF", "MALLOC_ARENA_MAX", "GLIBC_TUNABLES"]:
+    env.pop(key, None)
+for flow in ["indexed-checkpoint", "create-index-prepare"]:
+    template = (templates / f"lookup-{flow}.toml").read_text()
+    for case, rows, payload, cache in [
+        ("template", 10000, "128 B", 17),
+        ("resident", 32768, "1 KiB", 64),
+        ("pressure", 32768, "1 KiB", 17),
+    ]:
+        name = f"{flow}-{case}"
+        plan = template.replace("num = 10000", f"num = {rows}")
+        plan = plan.replace('value_size = "128 B"', f'value_size = "{payload}"')
+        plan = plan.replace('readonly_buffer_size = "17 MiB"',
+                            f'readonly_buffer_size = "{cache} MiB"')
+        source = out / f"{name}.toml"
+        source.write_text(plan)
+        with (out / f"{name}.log").open("w") as log:
+            subprocess.run(["target/release/doradb-bench", "--root",
+                            str(out / f"{name}-root"), "--plan", str(source)],
+                           env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        print(name, "completed", flush=True)
+print("Plans, logs, and canonical results:", out)
+PY
+```
 
 Backlog 000074 remains closed as implemented; the persisted-read compositions
 and cache/content checks satisfy its acceptance hints.
