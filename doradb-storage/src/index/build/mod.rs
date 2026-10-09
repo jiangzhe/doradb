@@ -1,4 +1,4 @@
-//! Finite hot-row extraction, bounded merging, and private packed construction.
+//! Resident sorted input, bounded merging, and private memory/disk construction.
 //!
 //! Factories in catalog/recovery establish source stability. A retained local-sort
 //! coordinator owns every accepted completion independently of its borrowed execution future.
@@ -6,9 +6,12 @@ mod budget;
 mod co_rank;
 /// Retained cold-key validation for unique CREATE builds.
 pub(crate) mod cold_validation;
+/// Streaming durable construction and invocation admission.
+pub(crate) mod disk_builder;
 mod loser_tree;
 /// Bounded partition streaming and separately settled completion authority.
 pub(crate) mod merge;
+mod packing;
 mod page_cleanup;
 mod pipeline;
 mod source;
@@ -16,9 +19,9 @@ mod source;
 pub(crate) mod tree_builder;
 mod worker;
 
-#[cfg(test)]
-pub(crate) use budget::fail_at as fail_build_budget;
 pub(crate) use budget::{BudgetedVec, MemoryBudget, MemoryReservation};
+#[cfg(test)]
+pub(crate) use budget::{fail_after as fail_build_budget_after, fail_at as fail_build_budget};
 pub(crate) use pipeline::{HotIndexBuild, merge_build_result};
 #[cfg(test)]
 pub(crate) use pipeline::{TestPoint as HotBuildTestPoint, test_observe as observe_hot_build};
@@ -33,7 +36,9 @@ use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, Runt
 use crate::id::RowID;
 use crate::index::BTreeKey;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotBuildMeasurements, HotBuildProfile, HotBuildWorkerProfile};
+use crate::profiling::{
+    HotExtractionMeasurements, HotExtractionProfile, HotExtractionWorkerProfile,
+};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
 use std::cmp::Ordering;
@@ -117,8 +122,26 @@ pub(crate) struct IndexBuildEntry {
     pub(crate) row_id: RowID,
 }
 
+/// Mutable admitted input; owned keys always drop before their payload charge.
+pub(crate) struct BuildEntries {
+    /// Encoded physical keys in admitted element storage.
+    pub(crate) entries: BudgetedVec<IndexBuildEntry>,
+    /// Outlined-key capacity, released after entries are destroyed.
+    pub(crate) payload: MemoryReservation,
+}
+
+impl BuildEntries {
+    /// Start serial collection without allocating input storage.
+    pub(crate) fn new(budget: &MemoryBudget) -> Self {
+        Self {
+            entries: BudgetedVec::new(budget),
+            payload: MemoryReservation::new(budget),
+        }
+    }
+}
+
 /// Immutable sorted entries and their allocation-lifetime reservations.
-pub(crate) struct HotSortedRun {
+pub(crate) struct SortedRun {
     /// Original deterministic group identity, independent of completion order.
     pub(crate) group_id: usize,
     entries: BudgetedVec<IndexBuildEntry>,
@@ -127,10 +150,35 @@ pub(crate) struct HotSortedRun {
     // Entries (including keys) are destroyed before their payload admission.
     payload: MemoryReservation,
     #[cfg(feature = "profiling")]
-    profile: HotBuildWorkerProfile,
+    profile: HotExtractionWorkerProfile,
 }
 
-impl HotSortedRun {
+impl SortedRun {
+    /// Sort admitted entries in place and establish duplicate evidence before sharing.
+    pub(crate) fn finish(
+        mut entries: BudgetedVec<IndexBuildEntry>,
+        payload: MemoryReservation,
+        duplicates: DuplicateCheck,
+    ) -> Self {
+        entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        let evidence = worker::local_duplicates(&entries, duplicates, &AtomicBool::new(false));
+        Self {
+            group_id: 0,
+            entries,
+            payload,
+            duplicates: evidence,
+            #[cfg(feature = "profiling")]
+            profile: HotExtractionWorkerProfile::default(),
+        }
+    }
+
+    /// Accounted capacity retained by entries and outlined keys.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        (self.entries.capacity() * size_of::<IndexBuildEntry>() + self.payload.bytes()) as u64
+    }
+
     /// Borrow sorted owned entries without cloning keys or building references.
     #[inline]
     pub(crate) fn entries(&self) -> &[IndexBuildEntry] {
@@ -139,21 +187,40 @@ impl HotSortedRun {
 }
 
 /// Shared immutable run owners in planned order with checked coordinate access.
-pub(crate) struct SortedHotRuns {
-    runs: Vec<Arc<HotSortedRun>>,
+pub(crate) struct SortedRuns {
+    runs: Vec<Arc<SortedRun>>,
     // Source-selected policy survives even an empty extraction.
     duplicates: DuplicateCheck,
     /// Shared admission retained for run ownership and downstream phases.
     pub(crate) budget: MemoryBudget,
     /// Completed build counts, durations, and scratch high-water.
     #[cfg(feature = "profiling")]
-    pub(crate) measurements: HotBuildMeasurements,
+    pub(crate) measurements: HotExtractionMeasurements,
 }
 
-impl SortedHotRuns {
+impl SortedRuns {
+    /// Retain one finalized resident run and its caller-selected evidence policy.
+    pub(crate) fn from_run(
+        run: Arc<SortedRun>,
+        budget: MemoryBudget,
+        duplicates: DuplicateCheck,
+    ) -> Self {
+        Self {
+            runs: if run.entries().is_empty() {
+                Vec::new()
+            } else {
+                vec![run]
+            },
+            duplicates,
+            budget,
+            #[cfg(feature = "profiling")]
+            measurements: HotExtractionMeasurements::default(),
+        }
+    }
+
     /// Borrow the retained nonempty run owners.
     #[inline]
-    pub(crate) fn runs(&self) -> &[Arc<HotSortedRun>] {
+    pub(crate) fn runs(&self) -> &[Arc<SortedRun>] {
         &self.runs
     }
 
@@ -184,7 +251,7 @@ impl SortedHotRuns {
     }
 }
 
-type JobResult = RuntimeOrFatalResult<Option<Arc<HotSortedRun>>>;
+type JobResult = RuntimeOrFatalResult<Option<Arc<SortedRun>>>;
 type JobCompletion = Arc<Completion<JobResult>>;
 
 /// Planned page range and its completion retained until collection.
@@ -202,13 +269,13 @@ pub(crate) struct HotLocalSort {
     max_workers: usize,
     stop: Arc<AtomicBool>,
     jobs: Vec<HotBuildJob>,
-    runs: Vec<Arc<HotSortedRun>>,
+    runs: Vec<Arc<SortedRun>>,
     submitted: usize,
     collected: usize,
     failure: Option<RuntimeOrFatalError>,
     finished: bool,
     #[cfg(feature = "profiling")]
-    profile: HotBuildProfile,
+    profile: HotExtractionProfile,
 }
 
 impl HotLocalSort {
@@ -229,7 +296,7 @@ impl HotLocalSort {
         let groups = jobs.len();
         let runs = Vec::with_capacity(groups);
         #[cfg(feature = "profiling")]
-        let profile = HotBuildProfile::new(HotBuildMeasurements {
+        let profile = HotExtractionProfile::new(HotExtractionMeasurements {
             capture_elapsed_nanos: source.capture_elapsed_nanos,
             source_pages: source.pages.len() as u64,
             workers: policy.max_workers as u64,
@@ -255,7 +322,7 @@ impl HotLocalSort {
 
     /// Extract and locally sort page groups through a borrowed future.
     /// Cancellation leaves all records in this owner.
-    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<SortedHotRuns> {
+    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<SortedRuns> {
         assert!(
             !self.finished,
             "hot local sort executed after terminal settlement"
@@ -292,8 +359,8 @@ impl HotLocalSort {
         #[cfg(feature = "profiling")]
         let measurements = self.profile.finish(self.source.budget.peak(), runs.len());
         #[cfg(feature = "profiling")]
-        self.source.profiler.record(measurements);
-        Ok(SortedHotRuns {
+        self.source.profiler.record_hot_extraction(measurements);
+        Ok(SortedRuns {
             runs,
             duplicates: self.source.key.duplicates,
             budget: self.source.budget.clone(),
@@ -593,7 +660,12 @@ mod tests {
                     TrxID::new(42),
                     policy,
                     #[cfg(feature = "profiling")]
-                    self.engine.inner().core.trx_sys.hot_build_profiler.clone(),
+                    self.engine
+                        .inner()
+                        .core
+                        .trx_sys
+                        .index_build_profiler
+                        .clone(),
                 )
                 .await
                 .unwrap();
@@ -714,7 +786,7 @@ mod tests {
             .gate(0, if panic { Fault::Panic } else { Fault::None })
     }
 
-    fn contents(runs: &SortedHotRuns) -> Vec<(BTreeKey, RowID)> {
+    fn contents(runs: &SortedRuns) -> Vec<(BTreeKey, RowID)> {
         let mut entries: Vec<_> = runs
             .runs()
             .iter()
@@ -751,7 +823,7 @@ mod tests {
             let mut session = fixture.engine.new_session().unwrap();
             let plan = fixture.plan(&[0], true);
             let policy = fixture.policy(2, 1);
-            assert_eq!(session.hot_index_build_stats().unwrap().completed_builds, 0);
+            assert_eq!(session.index_build_stats().unwrap().completed_builds, 0);
             for (index, recovery) in [false, true].into_iter().enumerate() {
                 let source = fixture.source(&plan, policy, recovery).await;
                 let mut sort = HotLocalSort::new(
@@ -760,7 +832,7 @@ mod tests {
                     policy,
                 );
                 let runs = sort.execute().await.unwrap();
-                let stats = session.hot_index_build_stats().unwrap();
+                let stats = session.index_build_stats().unwrap();
                 assert_eq!(stats.completed_builds, (index + 1) as u64);
                 assert_eq!(stats.entries, ((index + 1) * 8) as u64);
                 assert_eq!(stats.source_pages, (index + 1) as u64);
@@ -772,7 +844,7 @@ mod tests {
                     assert_eq!(runs.measurements.duplicate_wall_elapsed_nanos, 0);
                 }
             }
-            let before = session.hot_index_build_stats().unwrap();
+            let before = session.index_build_stats().unwrap();
             let source = fixture.source(&plan, policy, false).await;
             budget::fail_at(&source.budget, "run entries");
             let mut sort = HotLocalSort::new(
@@ -781,9 +853,9 @@ mod tests {
                 policy,
             );
             assert!(sort.execute().await.is_err());
-            assert_eq!(session.hot_index_build_stats().unwrap(), before);
+            assert_eq!(session.index_build_stats().unwrap(), before);
             session.close().await.unwrap();
-            assert!(session.hot_index_build_stats().is_err());
+            assert!(session.index_build_stats().is_err());
         });
     }
 

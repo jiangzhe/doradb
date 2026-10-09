@@ -1373,7 +1373,9 @@ impl BTreeNode {
 
     #[inline]
     fn search_key_with_hints(&self, k: &[u8], head: KeyHeadInt) -> SearchKey {
-        debug_assert!(self.hints_enabled());
+        // An optimistic caller can cross the hint-count threshold after dispatch.
+        // Clamp the probe to the current slots; its final guard validation owns
+        // rejection of concurrent mutation, including changed hint eligibility.
         let slots = self.slots();
         let count = slots.len();
         let (lo, up) = self.header.hints.search(head);
@@ -2454,6 +2456,51 @@ mod tests {
         assert_eq!(node.key_checked(0).unwrap(), key1);
         assert_eq!(node.key_checked(1).unwrap(), key2);
         assert!(node.validate_persisted_layout::<BTreeNil>());
+    }
+
+    /// Purpose: Keep hinted probes bounded when optimistic dispatch eligibility becomes stale after deletion.
+    /// Expected: Crossing the hint-count threshold cannot panic; speculative positions stay within current slots and normal validated lookup reflects the remaining keys.
+    #[test]
+    fn test_btree_node_hint_eligibility_changes_after_dispatch() {
+        for retained in [0, 1, BTREE_HINTS_MIN_KEYS - 1] {
+            let mut node =
+                BTreeNodeBox::alloc(0, TrxID::new(7), &[], BTreeU64::INVALID_VALUE, &[], true);
+            for key in 0..BTREE_HINTS_MIN_KEYS as u32 {
+                let index = node.count();
+                node.insert_at::<BTreeU64>(
+                    index,
+                    &key.to_be_bytes(),
+                    BTreeU64::from(u64::from(key)),
+                );
+            }
+            assert!(node.update_hints());
+            assert!(node.hints_enabled());
+            // Model the writer's transition between the dispatch predicate and
+            // the hinted probe. Hints intentionally retain their old contents;
+            // an optimistic owner would reject this result on version validation.
+            while node.count() > retained {
+                let last = node.count() - 1;
+                node.delete_at(last, BTreeU64::ENCODED_LEN);
+            }
+            assert!(!node.hints_enabled());
+            for key in [0, retained as u32, u32::MAX] {
+                let bytes = key.to_be_bytes();
+                match node.search_key_with_hints(&bytes, head_int(&bytes)) {
+                    Ok(index) => assert!(index < retained),
+                    Err(index) => assert!(index <= retained),
+                }
+                let expected = if key < retained as u32 {
+                    Ok(key as usize)
+                } else {
+                    Err(retained)
+                };
+                assert_eq!(
+                    node.search_key(&bytes),
+                    expected,
+                    "retained={retained}, key={key}"
+                );
+            }
+        }
     }
 
     /// Purpose: Protect hinted lookup when a key-only leaf exhausts its usable space.

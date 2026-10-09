@@ -31,7 +31,7 @@ use crate::map::{FastDashMap, FastHashMap};
 use crate::notify::EventNotifyOnDrop;
 #[cfg(feature = "profiling")]
 use crate::profiling::{
-    BufferPoolStats, HotIndexBuildStats, LogicalLockStats, MandatoryRuntimeStats, StorageIoStats,
+    BufferPoolStats, IndexBuildStats, LogicalLockStats, MandatoryRuntimeStats, StorageIoStats,
     TransactionSystemStats, buffer_pool_runtime_stats_snapshot, storage_io_stats_snapshot,
     transaction_system_stats_snapshot,
 };
@@ -1523,12 +1523,12 @@ impl Session {
     /// session close, or registry removal.
     #[cfg(feature = "profiling")]
     #[inline]
-    pub fn hot_index_build_stats(&self) -> Result<HotIndexBuildStats> {
+    pub fn index_build_stats(&self) -> Result<IndexBuildStats> {
         let session = self
             .pin_inspection()
-            .attach("operation=query_hot_index_build_stats")
+            .attach("operation=query_index_build_stats")
             .disclose()?;
-        Ok(session.runtime.trx_sys.hot_build_profiler.snapshot())
+        Ok(session.runtime.trx_sys.index_build_profiler.snapshot())
     }
 
     /// Return cumulative logical-lock work and current physical-state statistics.
@@ -4974,8 +4974,8 @@ pub(crate) mod tests {
             assert!(session.logical_lock_stats().is_ok());
             #[cfg(feature = "profiling")]
             assert_eq!(
-                session.hot_index_build_stats().unwrap(),
-                HotIndexBuildStats::default()
+                session.index_build_stats().unwrap(),
+                IndexBuildStats::default()
             );
             assert!(
                 session
@@ -7419,7 +7419,7 @@ pub(crate) mod tests {
                 session.buffer_pool_stats().unwrap_err(),
                 session.mandatory_runtime_stats().unwrap_err(),
                 session.logical_lock_stats().unwrap_err(),
-                session.hot_index_build_stats().unwrap_err(),
+                session.index_build_stats().unwrap_err(),
             ] {
                 assert_unavailable(err);
             }
@@ -7455,7 +7455,7 @@ pub(crate) mod tests {
             #[cfg(feature = "profiling")]
             assert_runtime_unavailable_after_shutdown(session.logical_lock_stats().unwrap_err());
             #[cfg(feature = "profiling")]
-            assert_runtime_unavailable_after_shutdown(session.hot_index_build_stats().unwrap_err());
+            assert_runtime_unavailable_after_shutdown(session.index_build_stats().unwrap_err());
         });
     }
 
@@ -7495,8 +7495,8 @@ pub(crate) mod tests {
             assert!(session.logical_lock_stats().is_ok());
             #[cfg(feature = "profiling")]
             assert_eq!(
-                session.hot_index_build_stats().unwrap(),
-                HotIndexBuildStats::default()
+                session.index_build_stats().unwrap(),
+                IndexBuildStats::default()
             );
 
             let err = session.truncate_redo_log().await.unwrap_err();

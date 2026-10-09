@@ -1,6 +1,6 @@
 use super::{
-    BudgetedVec, DuplicateCheck, HotBuildSource, HotSortedRun, IndexBuildEntry, JobCompletion,
-    LocalDuplicates, MemoryReservation,
+    BudgetedVec, DuplicateCheck, HotBuildSource, IndexBuildEntry, JobCompletion, LocalDuplicates,
+    MemoryReservation, SortedRun,
 };
 use crate::buffer::guard::PageGuard;
 use crate::error::{
@@ -8,7 +8,7 @@ use crate::error::{
 };
 use crate::memcmp::MEM_CMP_KEY_INLINE;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotBuildWorkerProfile, clock::Instant};
+use crate::profiling::{HotExtractionWorkerProfile, clock::Instant};
 use crate::row::RowRead;
 use crate::runtime::thread_pool::ThreadPool;
 use crate::runtime::yield_now;
@@ -68,7 +68,7 @@ async fn extract_group(
     stop: &AtomicBool,
     group: usize,
     pages: Range<usize>,
-) -> RuntimeOrFatalResult<Option<Arc<HotSortedRun>>> {
+) -> RuntimeOrFatalResult<Option<Arc<SortedRun>>> {
     #[cfg(feature = "profiling")]
     let started = Instant::now();
     #[cfg(test)]
@@ -77,13 +77,13 @@ async fn extract_group(
         return Ok(None);
     }
     let budget = &source.budget;
-    let mut run = HotSortedRun {
+    let mut run = SortedRun {
         group_id: group,
         entries: BudgetedVec::new(budget),
         duplicates: LocalDuplicates::Unchecked,
         payload: MemoryReservation::new(budget),
         #[cfg(feature = "profiling")]
-        profile: HotBuildWorkerProfile::default(),
+        profile: HotExtractionWorkerProfile::default(),
     };
     if !extract_rows(source, stop, pages, &mut run).await? {
         return Ok(None);
@@ -105,7 +105,7 @@ async fn extract_group(
     }
     #[cfg(feature = "profiling")]
     {
-        run.profile = HotBuildWorkerProfile::finish(
+        run.profile = HotExtractionWorkerProfile::finish(
             started,
             sort_started,
             duplicate_started,
@@ -120,7 +120,7 @@ async fn extract_rows(
     source: &HotBuildSource,
     stop: &AtomicBool,
     pages: Range<usize>,
-    run: &mut HotSortedRun,
+    run: &mut SortedRun,
 ) -> RuntimeOrFatalResult<bool> {
     let group = run.group_id;
     let mut projection =

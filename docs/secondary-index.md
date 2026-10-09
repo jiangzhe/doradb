@@ -221,6 +221,6 @@ work and cleanup have settled. Shutdown and engine failure do not cancel these
 obligations. Supervision retains resources when safe reclamation cannot be
 established.
 
-The hot construction memory limit does not bound cold-data preparation.
-Bounded, streaming cold construction remains
-[follow-up work](backlogs/000104-stream-parallel-create-index-cold-build.md).
+Cold-index creation uses a separate memory budget and supports parallel tree
+construction. See the [cold-index build settings](benchmark-tool.md#cold-index-build-settings)
+and [RFC 0033](rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md).

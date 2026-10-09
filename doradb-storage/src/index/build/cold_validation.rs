@@ -1,6 +1,8 @@
 //! Partition-local validation against CREATE's already sorted, distinct cold keys.
-use super::IndexBuildEntry;
-use super::merge::{HotBatch, PreparedHotMerge, execution_error, observe_stop};
+use super::SortedRun;
+use super::merge::{HotBatch, PreparedMerge, execution_error, observe_stop};
+#[cfg(test)]
+use super::{BudgetedVec, DuplicateCheck, IndexBuildEntry, MemoryBudget, MemoryReservation};
 use crate::error::RuntimeOrFatalResult;
 use crate::id::RowID;
 use crate::index::BTreeKey;
@@ -12,27 +14,41 @@ use std::sync::atomic::AtomicBool;
 
 /// Immutable ownership transferred after cold sorting and cold/cold validation.
 #[derive(Clone)]
-pub(crate) struct ColdUniqueKeys(Arc<Vec<IndexBuildEntry>>);
+pub(crate) struct ColdUniqueKeys(Arc<SortedRun>);
 
 impl ColdUniqueKeys {
-    /// Move the existing allocation without copying entries or encoded keys.
-    pub(crate) fn new(entries: Vec<IndexBuildEntry>) -> Self {
-        Self(Arc::new(entries))
+    /// Retain the charged run without copying keys or releasing admission.
+    #[inline]
+    pub(crate) fn from_run(run: Arc<SortedRun>) -> Self {
+        Self(run)
     }
 
-    /// Retained allocation bytes, excluding allocator overhead and shared-owner headers.
-    #[cfg(feature = "profiling")]
-    pub(crate) fn retained_bytes(&self) -> u64 {
+    /// Build an admitted cold-owner fixture through the production finalizer.
+    #[cfg(test)]
+    pub(crate) fn new(entries: Vec<IndexBuildEntry>) -> Self {
         use crate::memcmp::MEM_CMP_KEY_INLINE;
-        (self.0.capacity() * size_of::<IndexBuildEntry>()
-            + self
-                .0
-                .iter()
-                .map(|entry| {
-                    let len = entry.key.as_bytes().len();
-                    if len > MEM_CMP_KEY_INLINE { len } else { 0 }
-                })
-                .sum::<usize>()) as u64
+        let budget = MemoryBudget::new(usize::MAX);
+        let mut owned = BudgetedVec::new(&budget);
+        let mut payload = MemoryReservation::new(&budget);
+        for entry in entries {
+            let len = entry.key.as_bytes().len();
+            if len > MEM_CMP_KEY_INLINE {
+                payload.grow(len, "test key").unwrap();
+            }
+            owned.push(entry, "test cold entries").unwrap();
+        }
+        Self::from_run(Arc::new(SortedRun::finish(
+            owned,
+            payload,
+            DuplicateCheck::Collect,
+        )))
+    }
+
+    /// Allocation capacity retained by the cold input owner.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        self.0.retained_bytes()
     }
 }
 
@@ -49,7 +65,7 @@ impl ColdValidation {
     /// Verify every expected partition before selecting its earliest conflict.
     pub(super) fn complete<'a>(
         &self,
-        plan: &Arc<PreparedHotMerge>,
+        plan: &Arc<PreparedMerge>,
         summaries: impl Iterator<Item = Option<&'a ColdHotSummary>>,
     ) -> RuntimeOrFatalResult<Result<ColdHotCompletion, ColdHotDuplicate>> {
         let mut entries = 0;
@@ -123,7 +139,7 @@ pub(crate) struct ColdHotDuplicate {
 
 /// Only the cursor can mint this plan-bound, exhaustive coverage summary.
 pub(super) struct ColdHotSummary {
-    plan: Arc<PreparedHotMerge>,
+    plan: Arc<PreparedMerge>,
     keys: ColdUniqueKeys,
     partition: usize,
     consumed: usize,
@@ -174,13 +190,13 @@ pub(super) struct ColdHotCursor {
 
 impl ColdHotCursor {
     /// Include both endpoint keys; equal keys may belong to adjacent cold slices.
-    pub(super) fn new(keys: ColdUniqueKeys, plan: Arc<PreparedHotMerge>, partition: usize) -> Self {
+    pub(super) fn new(keys: ColdUniqueKeys, plan: Arc<PreparedMerge>, partition: usize) -> Self {
         #[cfg(feature = "profiling")]
         let started = Instant::now();
         let (first, last) = plan.endpoints(partition);
         #[cfg(feature = "profiling")]
         let mut comparisons = 0;
-        let position = keys.0.partition_point(|entry| {
+        let position = keys.0.entries().partition_point(|entry| {
             #[cfg(feature = "profiling")]
             {
                 comparisons += 1;
@@ -188,7 +204,7 @@ impl ColdHotCursor {
             entry.key < first.key
         });
         let end = position
-            + keys.0[position..].partition_point(|entry| {
+            + keys.0.entries()[position..].partition_point(|entry| {
                 #[cfg(feature = "profiling")]
                 {
                     comparisons += 1;
@@ -244,7 +260,7 @@ impl ColdHotCursor {
                     self.summary.conflict = Some(ColdHotDuplicate {
                         hot_rank: ranks.start + offset,
                         hot_row: hot.row_id,
-                        cold_row: self.keys.0[self.position].row_id,
+                        cold_row: self.keys.0.entries()[self.position].row_id,
                     });
                     batch.inhibit_construction();
                     break;
@@ -269,7 +285,7 @@ impl ColdHotCursor {
         {
             self.summary.measurements.comparisons += 1;
         }
-        self.keys.0[position].key.cmp(key)
+        self.keys.0.entries()[position].key.cmp(key)
     }
 
     // At most twice usize::BITS comparisons, even for a very large cold gap.
@@ -311,7 +327,7 @@ mod tests {
     use crate::component::{ComponentRegistry, RegistryBuilder};
     use crate::conf::ThreadPoolConfig;
     use crate::index::build::merge::{
-        CompletedPartition, HotMergeConsumption, HotPartitionConsumer, PartitionMergeStream,
+        CompletedPartition, MergeConsumption, PartitionConsumer, PartitionMergeStream,
         test_prepare_packed, test_runs,
     };
     use crate::index::build::{DuplicateCheck, MemoryBudget};
@@ -330,7 +346,7 @@ mod tests {
 
     struct Check(ColdUniqueKeys);
 
-    impl HotPartitionConsumer for Check {
+    impl PartitionConsumer for Check {
         type Output = ColdHotSummary;
 
         async fn consume(
@@ -449,7 +465,7 @@ mod tests {
                 let plan =
                     test_prepare_packed(runs.clone(), pool.clone(), 2, partitions, batch).await;
                 let mut merge =
-                    HotMergeConsumption::new(plan.clone(), pool.clone(), Check(cold.clone()));
+                    MergeConsumption::new(plan.clone(), pool.clone(), Check(cold.clone()));
                 let outcome = merge.execute().await.unwrap();
                 let hot_conflict = oracle.windows(2).enumerate().find_map(|(rank, pair)| {
                     let left = runs.entry(pair[0].0, pair[0].1).unwrap();
@@ -466,6 +482,7 @@ mod tests {
                     .filter_map(|(rank, &(run, position))| {
                         let hot = runs.entry(run, position).unwrap();
                         cold.0
+                            .entries()
                             .iter()
                             .find(|entry| entry.key == hot.key)
                             .map(|entry| ColdHotDuplicate {
@@ -554,22 +571,33 @@ mod tests {
     /// Expected: Shared owners point at the moved allocation and retained bytes include vector capacity plus only outlined payloads.
     #[test]
     fn cold_owner_moves_storage_without_copying() {
-        let mut entries = Vec::with_capacity(8);
-        entries.push(IndexBuildEntry {
+        let budget = MemoryBudget::new(4096);
+        let mut entries = BudgetedVec::new(&budget);
+        entries.ensure_capacity(8, "cold test input").unwrap();
+        let mut payload = MemoryReservation::new(&budget);
+        payload.grow(512, "cold test payload").unwrap();
+        entries.push_reserved(IndexBuildEntry {
             key: BTreeKey::from(1u32),
             row_id: RowID::new(1),
         });
-        entries.push(IndexBuildEntry {
+        entries.push_reserved(IndexBuildEntry {
             key: BTreeKey::from(vec![42u8; 512].as_slice()),
             row_id: RowID::new(2),
         });
         let pointer = entries.as_ptr();
         #[cfg(feature = "profiling")]
         let expected = entries.capacity() * size_of::<IndexBuildEntry>() + 512;
-        let keys = ColdUniqueKeys::new(entries);
-        assert_eq!(keys.0.as_ptr(), pointer);
+        let charged = budget.used();
+        let run = Arc::new(SortedRun::finish(entries, payload, DuplicateCheck::Collect));
+        let keys = ColdUniqueKeys::from_run(run.clone());
+        assert_eq!(budget.used(), charged);
+        assert_eq!(keys.0.entries().as_ptr(), pointer);
         assert!(Arc::ptr_eq(&keys.0, &keys.clone().0));
         #[cfg(feature = "profiling")]
         assert_eq!(keys.retained_bytes(), expected as u64);
+        drop(run);
+        assert_eq!(budget.used(), charged);
+        drop(keys);
+        assert_eq!(budget.used(), 0);
     }
 }

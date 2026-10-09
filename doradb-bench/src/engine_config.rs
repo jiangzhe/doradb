@@ -12,6 +12,8 @@ pub struct EngineConfigOverlay {
     pub thread_pool: ThreadPoolOverlay,
     /// Per-index hot extraction limits.
     pub hot_index_build: HotIndexBuildOverlay,
+    /// Cold index construction admission and output limits.
+    pub cold_index_build: ColdIndexBuildOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Deterministic table-scan planning overrides.
@@ -36,6 +38,7 @@ impl EngineConfigOverlay {
     pub fn merge(&mut self, other: Self) {
         self.thread_pool.merge(other.thread_pool);
         self.hot_index_build.merge(other.hot_index_build);
+        self.cold_index_build.merge(other.cold_index_build);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
@@ -77,6 +80,49 @@ pub struct ResolvedHotIndexBuildConfig {
     pub max_workers: usize,
     /// Soft page target per run.
     pub target_pages_per_run: usize,
+}
+
+/// Strict cold index construction overlay; omitted fields retain engine defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ColdIndexBuildOverlay {
+    /// Scratch limit with byte units.
+    pub max_scratch_bytes: Option<Byte>,
+    /// Explicit maximum workers.
+    pub max_workers: Option<usize>,
+    /// Queued leaf-buffer limit.
+    pub max_ready_buffers: Option<usize>,
+    /// Accepted unsettled writes, including parent progress.
+    pub max_in_flight_writes: Option<usize>,
+}
+
+impl ColdIndexBuildOverlay {
+    fn merge(&mut self, other: Self) {
+        replace(&mut self.max_scratch_bytes, other.max_scratch_bytes);
+        replace(&mut self.max_workers, other.max_workers);
+        replace(&mut self.max_ready_buffers, other.max_ready_buffers);
+        replace(&mut self.max_in_flight_writes, other.max_in_flight_writes);
+    }
+}
+
+/// Normalized cold index construction configuration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedColdIndexBuildConfig {
+    /// Accounted scratch ceiling in bytes.
+    pub max_scratch_bytes: usize,
+    /// Effective worker limit.
+    pub max_workers: usize,
+    /// Queued leaf-buffer limit.
+    pub max_ready_buffers: usize,
+    /// Accepted unsettled write limit.
+    pub max_in_flight_writes: usize,
+    /// Fixed target entries per merge partition.
+    pub partition_entries: usize,
+    /// Fixed bounded merge pull size.
+    pub batch_entries: usize,
+    /// Partition cap per effective worker.
+    pub partitions_per_worker: usize,
 }
 
 /// Strict deterministic table-scan planning overlay.
@@ -299,6 +345,8 @@ pub struct ResolvedEngineConfig {
     pub thread_pool: ResolvedThreadPoolConfig,
     /// Normalized per-index hot extraction limits.
     pub hot_index_build: ResolvedHotIndexBuildConfig,
+    /// Normalized cold index construction limits.
+    pub cold_index_build: ResolvedColdIndexBuildConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
     /// Startup recovery settings with automatic limits resolved.
@@ -328,6 +376,18 @@ impl ResolvedEngineConfig {
                     .max_workers
                     .expect("validated hot build workers"),
                 target_pages_per_run: config.hot_index_build.target_pages_per_run,
+            },
+            cold_index_build: ResolvedColdIndexBuildConfig {
+                max_scratch_bytes: config.cold_index_build.max_scratch_bytes,
+                max_workers: config
+                    .cold_index_build
+                    .max_workers
+                    .expect("validated cold build workers"),
+                max_ready_buffers: config.cold_index_build.max_ready_buffers,
+                max_in_flight_writes: config.cold_index_build.max_in_flight_writes,
+                partition_entries: 65_536,
+                batch_entries: 32_768,
+                partitions_per_worker: 4,
             },
             thread_pool: ResolvedThreadPoolConfig {
                 worker_threads: config.thread_pool.worker_threads,
@@ -551,6 +611,22 @@ pub fn resolve_engine_config(
         hot_index_build.target_pages_per_run = value;
     }
 
+    let mut cold_index_build = default.cold_index_build;
+    if let Some(value) = overlay.cold_index_build.max_scratch_bytes {
+        cold_index_build.max_scratch_bytes =
+            byte_usize(value, "cold_index_build.max_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.cold_index_build.max_workers {
+        cold_index_build.max_workers = Some(value);
+    }
+    if let Some(value) = overlay.cold_index_build.max_ready_buffers {
+        cold_index_build.max_ready_buffers = value;
+    }
+
+    if let Some(value) = overlay.cold_index_build.max_in_flight_writes {
+        cold_index_build.max_in_flight_writes = value;
+    }
+
     let mut recovery = default.recovery;
     if let Some(value) = overlay.recovery.io_depth {
         recovery = recovery.io_depth(value);
@@ -607,6 +683,7 @@ pub fn resolve_engine_config(
         .storage_root(storage_root)
         .thread_pool(thread_pool)
         .hot_index_build(hot_index_build)
+        .cold_index_build(cold_index_build)
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
         .trx(transaction)
@@ -1072,5 +1149,47 @@ mod tests {
                 .max_workers,
             3
         );
+    }
+
+    /// Purpose: Preserve every cold construction limit through strict benchmark overlays and normalized result serialization.
+    /// Expected: Partial overrides merge independently, normalized values survive serialization, and invalid or unknown limits fail validation.
+    #[test]
+    fn cold_build_overlay_roundtrip_and_validation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[cold_index_build]\nmax_scratch_bytes = '64 MiB'\nmax_ready_buffers = 3\nmax_in_flight_writes = 7\n").unwrap();
+        overlay.merge(toml::from_str("[cold_index_build]\nmax_workers = 2\n").unwrap());
+        let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(config.cold_index_build.max_workers, Some(2));
+        assert_eq!(
+            resolved.cold_index_build,
+            ResolvedColdIndexBuildConfig {
+                max_scratch_bytes: 64 * 1024 * 1024,
+                max_workers: 2,
+                max_ready_buffers: 3,
+                max_in_flight_writes: 7,
+                partition_entries: 65_536,
+                batch_entries: 32_768,
+                partitions_per_worker: 4
+            }
+        );
+        assert_eq!(
+            toml::from_str::<ResolvedEngineConfig>(&toml::to_string(&resolved).unwrap()).unwrap(),
+            resolved
+        );
+        for field in [
+            "max_workers = 0",
+            "max_workers = 5",
+            "max_ready_buffers = 0",
+            "max_in_flight_writes = 1",
+            "max_scratch_bytes = '0 B'",
+        ] {
+            let mut changed = overlay.clone();
+            changed.merge(toml::from_str(&format!("[cold_index_build]\n{field}")).unwrap());
+            assert!(
+                resolve_engine_config(temp.path(), &changed).is_err(),
+                "{field}"
+            );
+        }
+        assert!(toml::from_str::<EngineConfigOverlay>("[cold_index_build]\nunknown = 1").is_err());
     }
 }

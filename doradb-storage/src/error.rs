@@ -234,6 +234,9 @@ pub(crate) enum ConfigError {
     /// Hot-index extraction sizing is unusable or overflows allocation arithmetic.
     #[error("invalid hot-index build limit")]
     InvalidHotIndexBuildLimit,
+    /// Cold-index build admission limits are invalid.
+    #[error("invalid cold-index build limit")]
+    InvalidColdIndexBuildLimit,
     #[error("invalid purge thread count")]
     InvalidPurgeThreads,
     #[error("invalid transaction GC bucket count")]

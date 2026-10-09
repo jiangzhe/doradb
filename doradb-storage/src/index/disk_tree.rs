@@ -340,7 +340,9 @@ pub(crate) trait DiskTreeSpec: Copy + Send + Sync + 'static {
     /// Convert a normalized logical entry into the leaf value stored on disk.
     fn leaf_value(entry: &LogicalEntry) -> Self::LeafValue;
 
-    /// Decode one leaf slot from a validated block into a normalized entry.
+    /// Decode one leaf slot after layout validation, validating its leaf value.
+    ///
+    /// Also called during block admission, before spec-specific values are trusted.
     fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry>;
 
     /// Apply encoded batch operations to a sorted entry set.
@@ -385,7 +387,7 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
 
     #[inline]
     fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
-        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
+        let key = validated_node_key(node, idx);
         let row_id = node.value::<BTreeU64>(idx);
         if row_id.is_deleted() {
             return Err(invalid_node_decode());
@@ -459,7 +461,7 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
 
     #[inline]
     fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
-        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
+        let key = validated_node_key(node, idx);
         Ok(LogicalEntry::non_unique(key))
     }
 
@@ -743,7 +745,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             if node.is_leaf() {
                 continue;
             }
-            let child_height = self.node_result(block_id, branch_child_height(node))?;
+            let child_height = branch_child_height(node);
             if child_height == 0 {
                 for idx in (0..node.count()).rev() {
                     let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
@@ -862,7 +864,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     entries: self.pack_leaf_rewrite_entries(&entries, range_upper_fence)?,
                 });
             }
-            let entries = self.node_result(block_id, branch_entries_from_node(node))?;
+            let entries = branch_entries_from_node(node);
             // Flatten the branch while the guard is alive, then release it before
             // recursive children perform mutable writes through the CoW fork.
             drop(guard);
@@ -1211,10 +1213,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
             }
             Ok(BranchEntryPayload::Leaf(entries))
         } else {
-            Ok(BranchEntryPayload::Branch(self.node_result(
-                entry.block_id,
-                branch_entries_from_node(node),
-            )?))
+            Ok(BranchEntryPayload::Branch(branch_entries_from_node(node)))
         }
     }
 
@@ -1663,20 +1662,7 @@ impl DiskTreeNodeCursorState {
                 // sibling subtrees and can be scanned from their lower fence.
                 0
             };
-            let branch_entries = branch_entries_from_node(node)
-                .attach_with(|| {
-                    format!(
-                        "file={}, block=secondary_disk_tree, block_id={block_id}",
-                        Self::file_kind(runtime)
-                    )
-                })
-                .change_context(RuntimeError::IndexAccess)
-                .attach_with(|| {
-                    format!(
-                        "operation=scan_secondary_disk_tree_leaf, file={}, block_id={block_id}",
-                        Self::file_kind(runtime)
-                    )
-                })?;
+            let branch_entries = branch_entries_from_node(node);
             if start_idx >= branch_entries.len() {
                 return Err(Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!(
@@ -1984,6 +1970,21 @@ impl<M: MutableCowFile> NonUniqueDiskTreeBatchWriter<'_, '_, M> {
     }
 }
 
+/// View a trusted zeroed direct buffer as a mutable B-tree node image.
+///
+/// Writers allocate exactly [`DISK_TREE_BLOCK_SIZE`] bytes with
+/// `DirectBuf::zeroed`; a compile-time assertion equates that size with
+/// `BTreeNode`. Nodes are built directly inside the final block so the checksum
+/// covers exactly the bytes that will be written.
+///
+/// # Panics
+///
+/// Panics when `block` is not exactly one mutable DiskTree node block.
+#[inline]
+pub(crate) fn btree_node_from_block_mut(block: &mut [u8]) -> &mut BTreeNode {
+    layout::mut_from_bytes(block)
+}
+
 #[inline]
 fn invalid_node_decode() -> Report<DataIntegrityError> {
     Report::new(DataIntegrityError::InvalidPayload)
@@ -1997,28 +1998,16 @@ fn persisted_disk_tree_node(block: &[u8]) -> DataIntegrityResult<&BTreeNode> {
         .attach_with(|| "format=secondary_disk_tree, field=node_layout")
 }
 
-/// View a trusted zeroed direct buffer as a mutable B-tree node image.
-///
-/// Writers allocate exactly [`DISK_TREE_BLOCK_SIZE`] bytes with
-/// `DirectBuf::zeroed`; a compile-time assertion equates that size with
-/// `BTreeNode`. Nodes are built directly inside the final block so the checksum
-/// covers exactly the bytes that will be written.
-///
-/// # Panics
-///
-/// Panics when `block` is not exactly one mutable DiskTree node block.
-#[inline]
-fn btree_node_from_block_mut(block: &mut [u8]) -> &mut BTreeNode {
-    layout::mut_from_bytes(block)
-}
-
 #[inline]
 fn validate_checksum(block: &[u8]) -> DataIntegrityResult<()> {
-    if block.len() != DISK_TREE_BLOCK_SIZE {
-        return Err(invalid_node_decode());
-    }
-    validate_block_checksum(block)?;
-    Ok(())
+    // Readonly admission supplies one fixed-size Page and rejects short IO reads
+    // before invoking this validator, so the slice length is a caller contract.
+    assert_eq!(
+        block.len(),
+        DISK_TREE_BLOCK_SIZE,
+        "DiskTree validation invariant violated: block length differs from readonly page size"
+    );
+    validate_block_checksum(block)
 }
 
 /// Validate one persisted DiskTree block before handing it to a reader.
@@ -2062,6 +2051,19 @@ fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
         }
     }
     Ok(())
+}
+
+/// Copy an occupied key after persisted layout validation has succeeded.
+#[inline]
+fn validated_node_key(node: &BTreeNode, idx: usize) -> Vec<u8> {
+    // Layout validation checks every slot's key range. Callers use an occupied
+    // slot index and retain immutable node bytes through validation and decoding.
+    node.key_checked(idx).unwrap_or_else(|| {
+        panic!(
+            "DiskTree decode invariant violated: validated key is missing: slot_idx={idx}, count={}",
+            node.count()
+        )
+    })
 }
 
 /// Ensure caller-provided batches are already in strict durable key order.
@@ -2126,13 +2128,17 @@ fn validate_sorted_non_unique_exact_keys(entries: &[NonUniqueDiskTreeEncodedExac
     }
 }
 
+/// Return the child height after the caller has selected a branch node.
 #[inline]
-fn branch_child_height(node: &BTreeNode) -> DataIntegrityResult<u16> {
-    let child_height = node
-        .height()
-        .checked_sub(1)
-        .ok_or_else(invalid_node_decode)?;
-    u16::try_from(child_height).map_err(|_| invalid_node_decode())
+fn branch_child_height(node: &BTreeNode) -> u16 {
+    let height = node.height();
+    // Callers exclude leaves, and the node header stores height as u16, so a
+    // positive height can be decremented and converted without overflow.
+    assert!(
+        height > 0,
+        "DiskTree decode invariant violated: branch child height requested for leaf: height={height}"
+    );
+    (height - 1) as u16
 }
 
 /// Calculate a branch height from a homogeneous rewrite child-entry run.
@@ -2220,13 +2226,13 @@ fn lookup_child_block(node: &BTreeNode, key: &[u8]) -> Option<BlockID> {
     }
 }
 
-/// Decode a branch node into flattened lower-fence child entries.
+/// Decode a validated branch node into flattened lower-fence child entries.
 ///
 /// `BTreeNode` stores the first child in the lower fence and later children in
 /// slots. The rewrite path uses this normalized sequence when routing batch
 /// operations and rebuilding parent levels.
-fn branch_entries_from_node(node: &BTreeNode) -> DataIntegrityResult<Vec<BranchEntry>> {
-    let child_height = branch_child_height(node)?;
+fn branch_entries_from_node(node: &BTreeNode) -> Vec<BranchEntry> {
+    let child_height = branch_child_height(node);
     let mut entries = Vec::with_capacity(node.count() + 1);
     entries.push(BranchEntry::persisted(
         node.lower_fence_key().as_bytes().to_vec(),
@@ -2234,14 +2240,14 @@ fn branch_entries_from_node(node: &BTreeNode) -> DataIntegrityResult<Vec<BranchE
         child_height,
     ));
     for idx in 0..node.count() {
-        let key = node.key_checked(idx).ok_or_else(invalid_node_decode)?;
+        let key = validated_node_key(node, idx);
         entries.push(BranchEntry::persisted(
             key,
             BlockID::from(node.value::<BTreeU64>(idx).to_u64()),
             child_height,
         ));
     }
-    Ok(entries)
+    entries
 }
 
 #[cfg(test)]
@@ -2258,7 +2264,7 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::fs::tests::TestFileSystem;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::index::btree::{BTreeKey, KeyRange};
+    use crate::index::btree::{BTreeHeader, BTreeKey, KeyRange};
     use crate::index::util::tests::{drain_candidates, drain_row_ids};
     use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
@@ -2717,7 +2723,7 @@ mod tests {
             let child_entries = if node.is_leaf() {
                 None
             } else {
-                Some(tree.node_result(block_id, branch_entries_from_node(node))?)
+                Some(branch_entries_from_node(node))
             };
             summaries.push(NodeSummary {
                 is_leaf: node.is_leaf(),
@@ -2763,7 +2769,7 @@ mod tests {
                     keys,
                 });
             } else {
-                let branch_entries = tree.node_result(block_id, branch_entries_from_node(node))?;
+                let branch_entries = branch_entries_from_node(node);
                 for entry in branch_entries.into_iter().rev() {
                     stack.push(entry.block_id);
                 }
@@ -2776,6 +2782,19 @@ mod tests {
         let mut key = format!("branch-prefix-{idx:06}-").into_bytes();
         key.resize(4096, b'x');
         key
+    }
+
+    fn disk_tree_test_block(
+        height: u16,
+        lower_fence_value: BTreeU64,
+        value: BTreeU64,
+    ) -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
+        let node = btree_node_from_block_mut(buf.data_mut());
+        node.init(height, TrxID::new(1), b"a", lower_fence_value, &[], false);
+        node.insert_at::<BTreeU64>(0, b"entry-key", value);
+        write_block_checksum(buf.data_mut());
+        buf
     }
 
     /// Purpose: Protect error adaptation for truncated persisted disk-tree nodes.
@@ -2809,6 +2828,70 @@ mod tests {
             LogicalEntry::unique(vec![1], RowID::new(2)),
         ];
         validate_logical_entries_sorted(&entries);
+    }
+
+    /// Purpose: Enforce the readonly loader's fixed-page contract at DiskTree validation.
+    /// Expected: A short buffer triggers the block-length invariant before payload decoding.
+    #[test]
+    #[should_panic(
+        expected = "DiskTree validation invariant violated: block length differs from readonly page size"
+    )]
+    fn test_disk_tree_block_length_asserts() {
+        let _ = validate_disk_tree_block::<UniqueDiskTreeSpec>(&[0u8; 1]);
+    }
+
+    /// Purpose: Enforce occupied-slot access after DiskTree layout validation.
+    /// Expected: Decoding a missing slot reports the invariant with its index and node count.
+    #[test]
+    #[should_panic(
+        expected = "DiskTree decode invariant violated: validated key is missing: slot_idx=1, count=1"
+    )]
+    fn test_disk_tree_missing_validated_key_asserts() {
+        let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
+        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+        let node = persisted_disk_tree_node(buf.data()).unwrap();
+        let _ = UniqueDiskTreeSpec::leaf_entry(node, 1);
+    }
+
+    /// Purpose: Enforce branch selection before decoding DiskTree children.
+    /// Expected: Decoding a validated leaf as a branch triggers the child-height invariant.
+    #[test]
+    #[should_panic(
+        expected = "DiskTree decode invariant violated: branch child height requested for leaf: height=0"
+    )]
+    fn test_disk_tree_branch_decode_rejects_leaf() {
+        let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
+        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+        let node = persisted_disk_tree_node(buf.data()).unwrap();
+        let _ = branch_entries_from_node(node);
+    }
+
+    /// Purpose: Protect branch decoding at the limits of the persisted height representation.
+    /// Expected: Minimum and maximum branch heights preserve child keys, pointers, and heights.
+    #[test]
+    fn test_disk_tree_branch_decode_height_boundaries() {
+        for (height, expected_child_height) in [(1, 0), (u16::MAX, 65534)] {
+            let buf = disk_tree_test_block(height, BTreeU64::from(11), BTreeU64::from(7));
+            validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+            let node = persisted_disk_tree_node(buf.data()).unwrap();
+            let entries = branch_entries_from_node(node);
+            let decoded = entries
+                .iter()
+                .map(|entry| (entry.key.as_slice(), entry.block_id, entry.height))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                decoded,
+                vec![
+                    (b"a".as_slice(), BlockID::new(11), expected_child_height),
+                    (
+                        b"entry-key".as_slice(),
+                        BlockID::new(7),
+                        expected_child_height
+                    ),
+                ],
+                "parent height={height}"
+            );
+        }
     }
 
     /// Purpose: Protect cursor setup for a disk tree without a root.
@@ -3715,9 +3798,7 @@ mod tests {
             let root_block_id = root.unwrap();
             let root_guard = inspect_tree.read_node(root_block_id).await.unwrap();
             assert_eq!(root_guard.node().height(), 1);
-            let leaf_entries = inspect_tree
-                .node_result(root_block_id, branch_entries_from_node(root_guard.node()))
-                .unwrap();
+            let leaf_entries = branch_entries_from_node(root_guard.node());
             assert!(leaf_entries.iter().all(|entry| entry.height == 0));
             drop(root_guard);
 
@@ -4012,14 +4093,7 @@ mod tests {
     /// Expected: An intact block validates and either corruption reports a checksum mismatch.
     #[test]
     fn test_disk_tree_block_checksum_trailer_rejects_corruption() {
-        let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-        {
-            let node = btree_node_from_block_mut(buf.data_mut());
-            node.init(0, TrxID::new(1), b"a", BTreeU64::INVALID_VALUE, &[], false);
-            node.insert_at::<BTreeU64>(0, b"a", BTreeU64::from(7));
-        }
-        write_block_checksum(buf.data_mut());
-
+        let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
         validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
 
         let mut payload_corrupted = buf.data().to_vec();
@@ -4032,5 +4106,68 @@ mod tests {
         footer_corrupted[checksum_idx] ^= 0xff;
         let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(&footer_corrupted).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
+    }
+
+    /// Purpose: Reject malformed persisted keys before assertion-backed DiskTree decoding.
+    /// Expected: Checksum-valid leaf and branch blocks with invalid key offsets return InvalidPayload.
+    #[test]
+    fn test_disk_tree_invalid_key_layout_returns_integrity_error() {
+        for height in [0, 1] {
+            let mut buf = disk_tree_test_block(height, BTreeU64::from(11), BTreeU64::from(7));
+            validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+            // The first slot follows the header and stores its u16 offset after
+            // its u16 length. Keep the long key length but move it past the body.
+            let offset = mem::size_of::<BTreeHeader>() + mem::size_of::<u16>();
+            buf.data_mut()[offset..offset + mem::size_of::<u16>()]
+                .copy_from_slice(&u16::MAX.to_le_bytes());
+            write_block_checksum(buf.data_mut());
+            validate_checksum(buf.data()).unwrap();
+
+            let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap_err();
+            assert_eq!(
+                *err.current_context(),
+                DataIntegrityError::InvalidPayload,
+                "node height={height}"
+            );
+        }
+    }
+
+    /// Purpose: Preserve integrity errors for invalid persisted leaf owners and branch pointers.
+    /// Expected: Checksum-valid deleted owners and either superblock child pointer return InvalidPayload.
+    #[test]
+    fn test_disk_tree_invalid_values_return_integrity_errors() {
+        let cases = [
+            (
+                "deleted unique row id",
+                0,
+                BTreeU64::INVALID_VALUE,
+                BTreeU64::from(7).deleted(),
+            ),
+            (
+                "lower-fence superblock child",
+                1,
+                BTreeU64::from(SUPER_BLOCK_ID.as_u64()),
+                BTreeU64::from(7),
+            ),
+            (
+                "slot superblock child",
+                1,
+                BTreeU64::from(11),
+                BTreeU64::from(SUPER_BLOCK_ID.as_u64()),
+            ),
+        ];
+        for (name, height, lower_fence_value, value) in cases {
+            let buf = disk_tree_test_block(height, lower_fence_value, value);
+            validate_checksum(buf.data()).unwrap();
+            let node = persisted_disk_tree_node(buf.data()).unwrap();
+            assert!(node.validate_persisted_layout::<BTreeU64>(), "{name}");
+
+            let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap_err();
+            assert_eq!(
+                *err.current_context(),
+                DataIntegrityError::InvalidPayload,
+                "{name}"
+            );
+        }
     }
 }

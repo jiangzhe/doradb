@@ -2,13 +2,14 @@ use crate::profiling::clock::Instant;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-/// Stage measurements; worker durations are sums, not stage wall durations.
+/// Hot-row extraction, sorting, and local duplicate-check measurements.
+/// Worker durations are sums, not stage wall durations.
 ///
 /// Counts, byte sizes, and nanosecond timings use `u64`; overflow is assumed
 /// impossible for supported workloads.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct HotBuildMeasurements {
+pub struct HotExtractionMeasurements {
     /// Wall duration of source and descriptor capture.
     pub capture_elapsed_nanos: u64,
     /// Sum of worker extraction and encoding durations.
@@ -48,15 +49,17 @@ pub struct HotBuildMeasurements {
     pub nonempty_runs: u64,
 }
 
-/// Engine-lifetime snapshot of successfully completed hot-row extraction builds.
+/// Engine-lifetime snapshot of hot extraction and completed CREATE operations.
+/// Top-level counters measure successful hot-row extraction; `create` includes
+/// both hot and cold construction from successfully published indexes.
 ///
 /// Counts and nanosecond duration sums use ordinary `u64` arithmetic, assuming
 /// no overflow. They are monotonic and support before/after deltas.
 /// Maxima are lifetime high-water marks and must not be subtracted. Failed or
-/// cancelled builds publish no sample. A completed extraction is not a published
-/// index; the separate `create` subsection covers completed CREATE publication.
+/// cancelled extractions publish no extraction sample. A completed extraction is
+/// not a published index; `create` records only completed CREATE publication.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct HotIndexBuildStats {
+pub struct IndexBuildStats {
     /// Completed CREATE publications, separate from successful extraction.
     pub create: CreateIndexMeasurements,
     /// Number of successful extraction samples published after child settlement.
@@ -96,11 +99,54 @@ pub struct HotIndexBuildStats {
     pub scratch_peak_bytes: u64,
 }
 
+/// Cold index construction counters; scratch is admitted capacity, not process RSS.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdBuildMeasurements {
+    /// Static construction control-object sizes, separate from admitted scratch.
+    pub fixed_overhead_bytes: u64,
+    /// Effective packing worker allowance.
+    pub workers: u64,
+    /// Total completed leaf partitions.
+    pub partitions: u64,
+    /// Peak simultaneous synchronous leaf or parent packing.
+    pub packing_peak: u64,
+    /// Sum of synchronous planning, packing, and checksum durations.
+    pub packing_worker_nanos: u64,
+    /// Leaf construction wall duration including handoff waits.
+    pub packing_wall_nanos: u64,
+    /// Accepted node writes.
+    pub write_count: u64,
+    /// Accepted node bytes.
+    pub write_bytes: u64,
+    /// Peak live packing and handoff buffers.
+    pub buffer_peak: u64,
+    /// Largest observed queued leaf-buffer occupancy.
+    pub ready_peak: u64,
+    /// Peak accepted unsettled writes.
+    pub write_peak: u64,
+    /// Sum of waits for shared-storage ingress.
+    pub ingress_nanos: u64,
+    /// Wall duration of final write settlement.
+    pub settlement_nanos: u64,
+    /// Wall duration from preparation to private-root completion.
+    pub completion_nanos: u64,
+    /// Peak admitted producer and backend-owned scratch; excludes pool pins.
+    pub scratch_peak_bytes: u64,
+    /// Peak retained resident input capacity.
+    pub input_bytes: u64,
+    /// Maximum pool-owned bytes pinned by serial cold traversal.
+    /// Zero for builds that skip cold traversal.
+    pub pool_pin_bytes: u64,
+}
+
 /// Successful CREATE publications, with worker sums distinct from wall durations.
 /// Byte capacities, settings and longest intervals are engine-lifetime maxima.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexMeasurements {
+    /// Streaming cold construction measurements.
+    pub cold: ColdBuildMeasurements,
     /// Shared installed-tree measurements; completed builds count published CREATEs.
     pub hot: HotIndexMeasurements,
     /// Total live cold entries in completed builds.
@@ -123,13 +169,13 @@ pub struct CreateIndexMeasurements {
     pub total_elapsed_nanos: u64,
 }
 
-/// Shared engine recorder; one short update per successful extraction.
+/// Shared engine recorder for successful hot extraction and CREATE publication.
 #[derive(Default)]
-pub(crate) struct HotIndexBuildProfiler(Mutex<HotIndexBuildStats>);
+pub(crate) struct IndexBuildProfiler(Mutex<IndexBuildStats>);
 
-impl HotIndexBuildProfiler {
+impl IndexBuildProfiler {
     /// Read a coherent snapshot without resetting counters or maxima.
-    pub(crate) fn snapshot(&self) -> HotIndexBuildStats {
+    pub(crate) fn snapshot(&self) -> IndexBuildStats {
         *self.0.lock()
     }
 
@@ -137,14 +183,37 @@ impl HotIndexBuildProfiler {
     pub(crate) fn record_create(
         &self,
         sample: &CreateIndexMeasurements,
-        extraction: HotBuildMeasurements,
-        merge: &HotMergeMeasurements,
+        extraction: HotExtractionMeasurements,
+        merge: &MergeMeasurements,
         packed: &HotPackedMeasurements,
         cleanup_nanos: u64,
     ) {
         let mut stats = self.0.lock();
         let create = &mut stats.create;
         create.hot.record(extraction, merge, packed, cleanup_nanos);
+        create.cold.fixed_overhead_bytes = create
+            .cold
+            .fixed_overhead_bytes
+            .max(sample.cold.fixed_overhead_bytes);
+        create.cold.workers = create.cold.workers.max(sample.cold.workers);
+        create.cold.partitions += sample.cold.partitions;
+        create.cold.packing_peak = create.cold.packing_peak.max(sample.cold.packing_peak);
+        create.cold.packing_worker_nanos += sample.cold.packing_worker_nanos;
+        create.cold.packing_wall_nanos += sample.cold.packing_wall_nanos;
+        create.cold.write_count += sample.cold.write_count;
+        create.cold.write_bytes += sample.cold.write_bytes;
+        create.cold.buffer_peak = create.cold.buffer_peak.max(sample.cold.buffer_peak);
+        create.cold.ready_peak = create.cold.ready_peak.max(sample.cold.ready_peak);
+        create.cold.write_peak = create.cold.write_peak.max(sample.cold.write_peak);
+        create.cold.ingress_nanos += sample.cold.ingress_nanos;
+        create.cold.settlement_nanos += sample.cold.settlement_nanos;
+        create.cold.completion_nanos += sample.cold.completion_nanos;
+        create.cold.scratch_peak_bytes = create
+            .cold
+            .scratch_peak_bytes
+            .max(sample.cold.scratch_peak_bytes);
+        create.cold.input_bytes = create.cold.input_bytes.max(sample.cold.input_bytes);
+        create.cold.pool_pin_bytes = create.cold.pool_pin_bytes.max(sample.cold.pool_pin_bytes);
         create.cold_entries += sample.cold_entries;
         create.retained_cold_bytes = create.retained_cold_bytes.max(sample.retained_cold_bytes);
         create.cold_collect_nanos += sample.cold_collect_nanos;
@@ -158,8 +227,8 @@ impl HotIndexBuildProfiler {
         create.total_elapsed_nanos += sample.total_elapsed_nanos;
     }
 
-    /// Publish once after all accepted children have completed successfully.
-    pub(crate) fn record(&self, sample: HotBuildMeasurements) {
+    /// Publish hot extraction once after all accepted children complete successfully.
+    pub(crate) fn record_hot_extraction(&self, sample: HotExtractionMeasurements) {
         let mut stats = self.0.lock();
         stats.completed_builds += 1;
         stats.source_pages += sample.source_pages;
@@ -185,14 +254,14 @@ impl HotIndexBuildProfiler {
     }
 }
 
-/// Per-worker stage boundaries transferred with an accepted result.
+/// Hot extraction worker stage boundaries transferred with an accepted result.
 #[derive(Default)]
-pub(crate) struct HotBuildWorkerProfile {
+pub(crate) struct HotExtractionWorkerProfile {
     stages: [Option<(Instant, Instant)>; 3],
     job_elapsed_nanos: u64,
 }
 
-impl HotBuildWorkerProfile {
+impl HotExtractionWorkerProfile {
     /// Finish local timing; skipped duplicate checks have no stage interval.
     pub(crate) fn finish(
         started: Instant,
@@ -213,15 +282,15 @@ impl HotBuildWorkerProfile {
 }
 
 /// Owner-retained timing state, independent of the borrowed extraction future.
-pub(crate) struct HotBuildProfile {
-    sample: HotBuildMeasurements,
+pub(crate) struct HotExtractionProfile {
+    sample: HotExtractionMeasurements,
     started: Option<Instant>,
     stage_spans: [Option<(Instant, Instant)>; 3],
 }
 
-impl HotBuildProfile {
+impl HotExtractionProfile {
     /// Capture the fixed source and run plan before submission starts.
-    pub(crate) fn new(sample: HotBuildMeasurements) -> Self {
+    pub(crate) fn new(sample: HotExtractionMeasurements) -> Self {
         Self {
             sample,
             started: None,
@@ -235,7 +304,7 @@ impl HotBuildProfile {
     }
 
     /// Collect a completed worker without clock reads or cross-worker locks.
-    pub(crate) fn collect(&mut self, worker: &HotBuildWorkerProfile, entries: usize) {
+    pub(crate) fn collect(&mut self, worker: &HotExtractionWorkerProfile, entries: usize) {
         let mut durations = [0; 3];
         for ((span, stage), duration) in self
             .stage_spans
@@ -267,7 +336,7 @@ impl HotBuildProfile {
         &mut self,
         scratch_peak_bytes: usize,
         nonempty_runs: usize,
-    ) -> HotBuildMeasurements {
+    ) -> HotExtractionMeasurements {
         let started = self
             .started
             .unwrap_or_else(|| unreachable!("hot-build profiling starts before completion"));
@@ -286,12 +355,12 @@ impl HotBuildProfile {
     }
 }
 
-/// One fully consumed hot merge, independent of extraction and publication stats.
+/// One fully consumed sorted-input merge, independent of extraction and publication stats.
 /// Worker sums include cooperative scheduling; batch durations cover only fused
 /// synchronous merge/check work. Consumer work outside pulls is reported separately.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct HotMergeMeasurements {
+pub struct MergeMeasurements {
     /// Total input entries.
     pub entries: u64,
     /// Retained nonempty runs.
@@ -341,7 +410,7 @@ pub struct HotMergeMeasurements {
 
 /// Local batch counters; no per-entry clocks or shared writes.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct HotMergeWorkerProfile {
+pub(crate) struct MergeWorkerProfile {
     /// Start of the first returned batch, relative to job start.
     pub(crate) first_batch: Option<Instant>,
     /// Accumulated fused merge/check time.
@@ -397,7 +466,7 @@ pub(crate) struct HotPackedMeasurements {
     pub(crate) scratch_peak_bytes: usize,
 }
 
-/// Shared completed index measurements, distinct from extraction samples.
+/// Shared completed hot-index measurements, distinct from extraction samples.
 /// Worker sums and overlapping stage spans are attribution within phase wall time.
 /// Extraction and merge counts, work, and wall spans add across indexes. Settings,
 /// byte capacities, longest intervals, and merge first-batch latency use maxima.
@@ -410,9 +479,9 @@ pub(crate) struct HotPackedMeasurements {
 #[serde(deny_unknown_fields)]
 pub struct HotIndexMeasurements {
     /// Accumulated extraction samples for installed indexes; settings and peaks use maxima.
-    pub extraction: HotBuildMeasurements,
+    pub extraction: HotExtractionMeasurements,
     /// Accumulated merge samples; limits and high-water values use maxima.
-    pub merge: HotMergeMeasurements,
+    pub merge: MergeMeasurements,
     /// Indexes installed and cleaned successfully.
     pub completed_builds: u64,
     /// Source finalization wall time, counted once per table including index-free tables.
@@ -453,8 +522,8 @@ impl HotIndexMeasurements {
     /// Accumulate one installed and cleaned index, assuming no arithmetic overflow.
     pub(crate) fn record(
         &mut self,
-        extraction: HotBuildMeasurements,
-        merge: &HotMergeMeasurements,
+        extraction: HotExtractionMeasurements,
+        merge: &MergeMeasurements,
         packed: &HotPackedMeasurements,
         cleanup_nanos: u64,
     ) {
@@ -608,7 +677,8 @@ pub(crate) struct ColdHotMeasurements {
 #[cfg(test)]
 mod tests {
     use super::{
-        HotBuildMeasurements, HotBuildProfile, HotBuildWorkerProfile, HotIndexBuildProfiler,
+        HotExtractionMeasurements, HotExtractionProfile, HotExtractionWorkerProfile,
+        IndexBuildProfiler,
     };
     use crate::profiling::clock::Instant;
     use std::time::Duration;
@@ -618,18 +688,17 @@ mod tests {
     #[test]
     fn recovery_aggregate_adds_work_and_preserves_peaks() {
         use super::{
-            HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements,
-            RecoveryHotIndexMeasurements,
+            HotPackedLevel, HotPackedMeasurements, MergeMeasurements, RecoveryHotIndexMeasurements,
         };
         let mut stats = RecoveryHotIndexMeasurements::default();
         for peak in [4096, 2048] {
             stats.record(
-                HotBuildMeasurements {
+                HotExtractionMeasurements {
                     entries: 7,
                     max_sort_elapsed_nanos: peak,
                     ..Default::default()
                 },
-                &HotMergeMeasurements {
+                &MergeMeasurements {
                     partitions: 2,
                     max_job_nanos: peak,
                     ..Default::default()
@@ -690,13 +759,13 @@ mod tests {
         let origin = Instant::now();
         let at = |n| origin + Duration::from_nanos(n);
         for checked in [false, true] {
-            let mut profile = HotBuildProfile::new(HotBuildMeasurements::default());
+            let mut profile = HotExtractionProfile::new(HotExtractionMeasurements::default());
             profile.collect(
-                &HotBuildWorkerProfile::finish(at(0), at(10), at(15), at(19), checked),
+                &HotExtractionWorkerProfile::finish(at(0), at(10), at(15), at(19), checked),
                 7,
             );
             profile.collect(
-                &HotBuildWorkerProfile::finish(at(5), at(12), at(23), at(25), checked),
+                &HotExtractionWorkerProfile::finish(at(5), at(12), at(23), at(25), checked),
                 3,
             );
             assert_eq!(profile.sample.entries, 10);
@@ -718,8 +787,8 @@ mod tests {
     /// Expected: Successive snapshots add counts and nanosecond durations and retain larger prior maxima.
     #[test]
     fn completed_snapshots_and_maxima() {
-        let recorder = HotIndexBuildProfiler::default();
-        let first = HotBuildMeasurements {
+        let recorder = IndexBuildProfiler::default();
+        let first = HotExtractionMeasurements {
             source_pages: 2,
             entries: 7,
             planned_groups: 2,
@@ -736,10 +805,10 @@ mod tests {
             max_job_elapsed_nanos: 10,
             max_sort_elapsed_nanos: 4,
             scratch_peak_bytes: 8192,
-            ..HotBuildMeasurements::default()
+            ..HotExtractionMeasurements::default()
         };
-        recorder.record(first);
-        recorder.record(HotBuildMeasurements {
+        recorder.record_hot_extraction(first);
+        recorder.record_hot_extraction(HotExtractionMeasurements {
             max_job_elapsed_nanos: 6,
             scratch_peak_bytes: 4096,
             ..first

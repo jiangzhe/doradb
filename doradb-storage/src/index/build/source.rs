@@ -9,7 +9,7 @@ use crate::id::{RowID, TrxID};
 use crate::index::{BTreeKeyEncoder, secondary_index_encoder};
 use crate::map::{FastHashSet, FastRandomState};
 #[cfg(feature = "profiling")]
-use crate::profiling::HotIndexBuildProfiler;
+use crate::profiling::IndexBuildProfiler;
 use crate::table::{RowPageDescriptor, Table, TableRuntimeLayout};
 use error_stack::{Report, ResultExt};
 use std::sync::Arc;
@@ -45,7 +45,7 @@ pub(crate) struct HotBuildCapture {
     pub(crate) ddl: Option<Arc<IndexDdlGateScope>>,
     /// Engine recorder retained by this source.
     #[cfg(feature = "profiling")]
-    pub(crate) profiler: Arc<HotIndexBuildProfiler>,
+    pub(crate) profiler: Arc<IndexBuildProfiler>,
 }
 
 /// Captured physical source owned through all accepted child completions.
@@ -74,7 +74,7 @@ pub(crate) struct HotBuildSource {
     pub(crate) capture_elapsed_nanos: u64,
     /// Shared publication target for completed extraction samples.
     #[cfg(feature = "profiling")]
-    pub(crate) profiler: Arc<HotIndexBuildProfiler>,
+    pub(crate) profiler: Arc<IndexBuildProfiler>,
 }
 
 impl HotBuildSource {

@@ -22,6 +22,7 @@ use crate::error::{
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::index::build::HotBuildPolicy;
+use crate::index::build::disk_builder::ColdBuildPolicy;
 use crate::lock::LockManager;
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -539,6 +540,8 @@ pub(crate) struct EngineCore {
     table_scan_config: TableScanConfig,
     /// Validated per-index extraction policy shared with bootstrap.
     pub(crate) hot_build_policy: HotBuildPolicy,
+    /// Validated cold index construction limits.
+    pub(crate) cold_build_policy: ColdBuildPolicy,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned executor for finite synchronous and asynchronous jobs.
@@ -814,6 +817,11 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
     let lifecycle = Arc::new(EngineLifecycle::new());
     let core = Arc::new(EngineCore {
         table_scan_config,
+        cold_build_policy: ColdBuildPolicy::new(
+            config.cold_index_build,
+            config.thread_pool.worker_threads,
+        )
+        .disclose()?,
         hot_build_policy: HotBuildPolicy::new(
             config.hot_index_build,
             config.thread_pool.worker_threads,

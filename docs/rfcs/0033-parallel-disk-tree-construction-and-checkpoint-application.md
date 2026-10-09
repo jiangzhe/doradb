@@ -4,6 +4,7 @@ title: Parallel DiskTree Construction and Checkpoint Application
 status: proposal
 tags: [storage, index, ddl, checkpoint, parallelism, performance]
 created: 2026-10-05
+github_issue: 1144
 ---
 
 # RFC-0033: Parallel DiskTree Construction and Checkpoint Application
@@ -171,7 +172,7 @@ Issue Labels:
   `doradb-bench/src/workload/` — public-call benchmarks, fixture admission,
   verification and normalized configuration.
 - [C11] `doradb-storage/src/conf/index_build.rs` and
-  `doradb-storage/src/profiling/hot_index_build.rs` — existing limits and
+  `doradb-storage/src/profiling/index_build.rs` — existing limits and
   separation of extraction, construction and publication measurements.
 - [C12] `doradb-storage/src/index/column_block_index.rs` — descriptor traversal,
   physical RowID membership and durable deletion metadata; `collect_leaf_entries`
@@ -726,7 +727,7 @@ sidecar failure after other checkpoint writes uses their existing settlement
 path. Streaming and parallelism do not relax these admission boundaries.
 [U12] [C2] [C5] [C6]
 
-Keep existing hot-build settings and semantics. Add a disk-build policy usable
+Keep existing hot-build settings and semantics. Add a cold-build policy usable
 by CREATE and checkpoint, with an invocation-wide worker/scratch bound for
 multi-index checkpoint work and explicit bounded output admission. Final
 configuration names/defaults and byte accounting are Phase 1 choices reviewed
@@ -816,13 +817,15 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     settlement and production CREATE integration.
   - Prerequisites: Implemented RFC 0032 mechanisms and the existing CREATE
     source exclusion, cold/cold checks and publication sequence.
-  - Phase-local Choices: Shared type/helper extraction; charged descriptor and
-    decode/projection interfaces; zero-copy single-run adapter, target partition
-    size and legacy validator ownership; disk policy names/defaults, capacity
-    and progress reserves; packed-buffer/acceptance message shape, coordinator
-    submission helper and bounded parent assembly. Coordinator allocation,
-    submission ownership and progress barriers are fixed by this RFC.
-    Merge bypass does not fix the partition count.
+  - Phase-local Choices: Shared sorted runs, partition streams, and synchronous
+    leaf planning retain separate hot/cold construction lifecycles. Serial
+    collection and retained-key validation share one admitted run; direct rank
+    partitions target 65,536 entries, with at most four partitions per worker.
+    `ColdIndexBuildConfig` defaults to 256 MiB scratch, pool-sized workers,
+    eight ready buffers, and 32 unsettled writes. Checked minimum progress
+    reservations precede runtime worker admission. Coordinator-owned allocation,
+    explicit storage acceptance, a reserved parent write slot, and retained
+    packet/write draining govern progress and settlement.
   - Goals: Replace CREATE's accumulating DiskTree writer for both index modes;
     preserve ordinary reads/checkpoints/restart and failure cleanup. Establish
     the final packing-plan contract and leaf/branch tests where finite-fence
@@ -837,16 +840,16 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     benchmarks within this phase.
   - After This Phase: CREATE packs one sorted cold run in parallel through the
     new durable consumer, with admitted serial input preparation and charged
-    retained-vector validation. Completed private roots, reusable node/level
-    packing with ordered child descriptors, and settled write ownership are
+    retained-run validation. Completed private roots, shared leaf planning,
+    ordered child descriptors, and settled write ownership are
     available to Phases 2 and 4. Root-read/write ownership is separate from
     input ownership so Phase 2 can consume and release the latter.
   - Non-goals: Parallel cold extraction, replacing cross-tier validation,
     checkpoint delta reconciliation or spill.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md`
+  - Task Issue: `#1145`
+  - Phase Status: done
+  - Implementation Summary: Delivered bounded parallel cold CREATE for both index modes with admitted serial input, shared leaf planning, retained write settlement, public limits, and profiling. Final validation passed 2,325 workspace tests, 2,060 profiling-disabled storage tests, and the branch style gate. Earlier matched benchmarks covered 171 invocations and showed 76.6% unique and 72.5% non-unique improvements for million-row checkpointed CREATE; timing was not rerun after review refinements. Completed-root validation, parallel extraction, and checkpoint integration remain in Phases 2–4; both source backlogs stay open. [Task Resolve Sync: docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md @ 2026-10-09]
   - Related Backlogs:
     - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
     - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
@@ -1117,10 +1120,10 @@ authorities; no runner-policy changes are proposed. [D6]
 The direction and phase dependencies above define this proposal. Coordinator
 allocation/write submission and the progress model are settled above for
 Phase 1; a worker-owned mutable-file write interface is not required. Phase 1
-task design will resolve the remaining configuration choice within these
-contracts:
+selected `ColdIndexBuildConfig` for CREATE. Phase 4 retains one configuration
+choice within these contracts:
 
-- Should one public disk-build policy configure both CREATE and checkpoint,
+- Should the public cold-build policy also configure checkpoint,
   with invocation-wide checkpoint admission, or should callers expose separate
   controls backed by the same internal limits? Budget ownership is fixed either way.
 

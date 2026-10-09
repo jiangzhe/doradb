@@ -17,7 +17,7 @@ use crate::runtime::thread_pool::ThreadPool;
 
 use super::RecoveryCoordinator;
 #[cfg(feature = "profiling")]
-use crate::profiling::HotIndexBuildProfiler;
+use crate::profiling::IndexBuildProfiler;
 #[cfg(feature = "profiling")]
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ pub(crate) struct RecoveryResources<'a> {
     pub(crate) hot_build_policy: HotBuildPolicy,
     /// Recorder shared by bootstrap extraction and later runtime builds.
     #[cfg(feature = "profiling")]
-    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
+    pub(crate) index_build_profiler: Arc<IndexBuildProfiler>,
 }
 
 impl<'a> RecoveryResources<'a> {
@@ -65,7 +65,7 @@ impl<'a> RecoveryResources<'a> {
             catalog,
             hot_build_policy,
             #[cfg(feature = "profiling")]
-            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
+            index_build_profiler: Arc::new(IndexBuildProfiler::default()),
         }
     }
 

@@ -11,25 +11,29 @@ use crate::error::{
     MultiDomainResultExt, OperationError, OperationResult, QuadError, QuadResult, RuntimeError,
     RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
 };
-use crate::file::cow_file::SUPER_BLOCK_ID;
+use crate::file::cow_file::{COW_FILE_PAGE_SIZE, SUPER_BLOCK_ID};
 use crate::file::meta_block::validate_secondary_index_state;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::build::cold_validation::{ColdUniqueKeys, ColdValidation};
+use crate::index::build::disk_builder::{CompletedDiskBuild, DiskBuildAdmission, DiskBulkBuild};
 use crate::index::build::tree_builder::{HotPackedOutcome, ReadyHotTree};
+use crate::index::build::{
+    BudgetedVec, BuildEntries, LocalDuplicates, MemoryBudget, MemoryReservation, SortedRun,
+};
 use crate::index::build::{
     DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildSource, HotIndexBuild,
     IndexBuildEntry, merge_build_result,
 };
-use crate::index::disk_tree::{NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut};
 use crate::index::{
-    BTreeKey, BTreeKeyEncoder, ColumnBlockIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime,
-    SecondaryIndex, UniqueMemIndex, secondary_index_encoder,
+    BTreeKeyEncoder, ColumnBlockIndex, NonUniqueMemIndex, SecondaryDiskTreeRuntime, SecondaryIndex,
+    UniqueMemIndex, secondary_index_encoder,
 };
+use crate::memcmp::MEM_CMP_KEY_INLINE;
 use crate::obs;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::{CreateIndexMeasurements, HotIndexBuildProfiler, clock::Instant};
+use crate::profiling::{CreateIndexMeasurements, IndexBuildProfiler, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::runtime::yield_now;
@@ -158,21 +162,14 @@ impl Drop for IndexDdlGateScope {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+#[cfg(test)]
 enum CreateIndexKeyValidator {
     Unique,
     NonUnique,
 }
 
+#[cfg(test)]
 impl CreateIndexKeyValidator {
-    #[inline]
-    fn new(index_spec: &TableIndexMetadata) -> Self {
-        if index_spec.unique() {
-            Self::Unique
-        } else {
-            Self::NonUnique
-        }
-    }
-
     fn prepare_cold(self, rows: &mut [IndexBuildEntry]) -> OperationResult<()> {
         rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
         if self == Self::NonUnique {
@@ -230,9 +227,60 @@ impl<'a> CreateIndexCollector<'a> {
         }
     }
 
-    // Future improvement: stream/batch and parallelize this cold-row build to
-    // avoid materializing every persisted row. See docs/backlogs/000104.
-    async fn collect_current_cold(&self) -> QuadResult<Vec<IndexBuildEntry>> {
+    async fn prepare_cold(
+        &self,
+        engine: &EngineCore,
+        #[cfg(feature = "profiling")] measurements: &mut CreateIndexMeasurements,
+    ) -> QuadResult<(Arc<SortedRun>, DiskBuildAdmission)> {
+        #[cfg(feature = "profiling")]
+        let cold_started = Instant::now();
+        let admission =
+            DiskBuildAdmission::new(engine.cold_build_policy, self.index_spec.unique())?;
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .configure_cold_budget(&admission.budget);
+        let cold_rows = self.collect_current_cold(&admission.budget).await?;
+        #[cfg(feature = "profiling")]
+        {
+            measurements.cold_collect_nanos = cold_started.elapsed().as_nanos() as u64;
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
+            .await;
+        #[cfg(feature = "profiling")]
+        let sort_started = Instant::now();
+        let duplicates = if self.index_spec.unique() {
+            DuplicateCheck::Collect
+        } else {
+            DuplicateCheck::Skip
+        };
+        let run = Arc::new(SortedRun::finish(
+            cold_rows.entries,
+            cold_rows.payload,
+            duplicates,
+        ));
+        if let LocalDuplicates::Checked {
+            first_duplicate_position: Some(position),
+        } = run.duplicates
+        {
+            return Err(Report::new(OperationError::DuplicateKey)
+                .attach(format!(
+                    "create unique index found duplicate cold key: row_id={}",
+                    run.entries()[position].row_id
+                ))
+                .into());
+        }
+        #[cfg(feature = "profiling")]
+        {
+            measurements.cold_sort_nanos = sort_started.elapsed().as_nanos() as u64;
+        }
+        Ok((run, admission))
+    }
+
+    async fn collect_current_cold(&self, budget: &MemoryBudget) -> QuadResult<BuildEntries> {
         let table = self.table;
         let guards = self.guards;
         let metadata = self.layout.metadata();
@@ -240,7 +288,7 @@ impl<'a> CreateIndexCollector<'a> {
         let column_block_index_root = self.column_block_index_root;
         let pivot_row_id = self.pivot_row_id;
         if !create_index_cold_root_has_rows(column_block_index_root, pivot_row_id) {
-            return Ok(Vec::new());
+            return Ok(BuildEntries::new(budget));
         }
         let disk_guard = guards.disk_guard();
         let column_index = ColumnBlockIndex::new(
@@ -251,16 +299,33 @@ impl<'a> CreateIndexCollector<'a> {
             table.disk_pool(),
             disk_guard,
         );
-        let read_set = index_spec
-            .keys
-            .iter()
-            .map(|index_key| index_key.column_ordinal.as_usize())
-            .collect::<Vec<_>>();
-        let mut rows = Vec::new();
+        // Values are destroyed before their nested-payload admission on every exit.
+        struct Projection {
+            values: BudgetedVec<Val>,
+            payload: MemoryReservation,
+        }
+        let mut projection = Projection {
+            values: BudgetedVec::new(budget),
+            payload: MemoryReservation::new(budget),
+        };
+        projection
+            .values
+            .ensure_capacity(
+                index_spec.keys.len() + usize::from(!index_spec.unique()),
+                "cold projection",
+            )
+            .change_context(RuntimeError::CatalogAccess)?;
+        let mut rows = BuildEntries::new(budget);
         let file_kind = table.file().file_kind();
-        for entry in column_index.collect_leaf_entries().await? {
+        let descriptors = column_index.collect_leaf_entries_budgeted(budget).await?;
+        for entry in descriptors.iter() {
+            // Both encoded bodies are slices of a single validated column-index
+            // block; one block is a conservative bound including both Arc headers.
+            let identity_admission = budget
+                .reserve(COW_FILE_PAGE_SIZE, "cold identity and deletions")
+                .change_context(RuntimeError::CatalogAccess)?;
             let (identity, durable_deleted) = column_index
-                .load_entry_identity_and_deletions(&entry)
+                .load_entry_identity_and_deletions(entry)
                 .await?;
             let block_id = entry.block_id();
             let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
@@ -301,58 +366,47 @@ impl<'a> CreateIndexCollector<'a> {
                 if create_index_current_cold_row_is_deleted(table, row_id)? {
                     continue;
                 }
-                let key_vals = block
-                    .decode_row_values(&metadata.col, row_idx, &read_set)
-                    .attach_with(|| {
-                        format!("file={file_kind}, block=lwc_block, block_id={block_id}")
-                    })
-                    .change_context(RuntimeError::CatalogAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=create_index, phase=decode_cold_row, table_id={}, row_id={row_id}",
-                            table.table_id()
-                        )
-                    })?;
-                let key = self.encode_key(&key_vals, row_id);
-                rows.push(IndexBuildEntry { key, row_id });
+                projection.values.clear();
+                projection.payload.release_all();
+                for index_key in &index_spec.keys {
+                    let column = index_key.column_ordinal.as_usize();
+                    let bytes = block
+                        .owned_value_bytes(&metadata.col, row_idx, column)
+                        .change_context(RuntimeError::CatalogAccess)?;
+                    projection
+                        .payload
+                        .grow(bytes, "cold projected value")
+                        .change_context(RuntimeError::CatalogAccess)?;
+                    let value = block.decode_value(&metadata.col, row_idx, column).change_context(RuntimeError::CatalogAccess)
+                        .attach_with(|| format!("operation=create_index, phase=decode_cold_row, file={file_kind}, block_id={block_id}, row_id={row_id}"))?;
+                    projection.values.push_reserved(value);
+                }
+                if !index_spec.unique() {
+                    projection.values.push_reserved(Val::from(row_id));
+                }
+                rows.entries
+                    .reserve_one("cold run entries")
+                    .change_context(RuntimeError::CatalogAccess)?;
+                let len = self
+                    .key_encoder
+                    .encoded_len(&projection.values)
+                    .change_context(RuntimeError::CatalogAccess)?;
+                rows.payload
+                    .grow(
+                        if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+                        "cold outlined key",
+                    )
+                    .change_context(RuntimeError::CatalogAccess)?;
+                let key = self.key_encoder.encode_with_len(&projection.values, len);
+                rows.entries.push_reserved(IndexBuildEntry { key, row_id });
             }
+            drop(persisted);
+            drop(durable_deleted);
+            drop(identity);
+            drop(identity_admission);
             yield_now().await;
         }
         Ok(rows)
-    }
-
-    #[cfg(test)]
-    async fn collect_current_hot(&self) -> RuntimeOrFatalResult<Vec<IndexBuildEntry>> {
-        use crate::row::RowRead;
-        let mut rows = Vec::new();
-        self.table
-            .accessor_with_layout(self.layout)
-            .mem_scan_uncommitted_from(self.guards, self.pivot_row_id, |col_layout, row| {
-                if row.is_deleted() {
-                    return true;
-                }
-                let row_id = row.row_id();
-                let key_vals = self
-                    .index_spec
-                    .keys
-                    .iter()
-                    .map(|index_key| row.val(col_layout, index_key.column_ordinal.as_usize()))
-                    .collect::<Vec<_>>();
-                let key = self.encode_key(&key_vals, row_id);
-                rows.push(IndexBuildEntry { key, row_id });
-                true
-            })
-            .await?;
-        Ok(rows)
-    }
-
-    #[inline]
-    fn encode_key(&self, key_vals: &[Val], row_id: RowID) -> BTreeKey {
-        if self.index_spec.unique() {
-            self.key_encoder.encode(key_vals)
-        } else {
-            self.key_encoder.encode_pair(key_vals, Val::from(row_id))
-        }
     }
 }
 
@@ -387,6 +441,8 @@ struct CreateIndexProgress {
     hot_build: Option<HotIndexBuild<EvictableBufferPool>>,
     ready: Option<ReadyHotTree<EvictableBufferPool>>,
     hot_phase: CreateHotPhase,
+    cold_build: Option<DiskBulkBuild>,
+    disk_ready: Option<CompletedDiskBuild>,
 }
 
 impl CreateIndexProgress {
@@ -404,6 +460,8 @@ impl CreateIndexProgress {
             hot_build: None,
             ready: None,
             hot_phase: CreateHotPhase::Unsettled,
+            cold_build: None,
+            disk_ready: None,
         }
     }
 
@@ -428,9 +486,7 @@ impl CreateIndexProgress {
         plan: &mut CreateIndexPlan,
         #[cfg(feature = "profiling")] measurements: &mut CreateIndexMeasurements,
     ) -> QuadResult<(MutableTableFile, SecondaryDiskTreeRuntime, ColdValidation)> {
-        let index_slot = self.index.slot();
-        let mut secondary_index_slots = plan.take_secondary_index_slots();
-        let key_validator = CreateIndexKeyValidator::new(plan.new_index_spec());
+        let secondary_index_slots = plan.take_secondary_index_slots();
         let collector = CreateIndexCollector::new(
             plan.table(),
             guards,
@@ -438,89 +494,114 @@ impl CreateIndexProgress {
             plan.new_index_spec(),
             plan.active_root(),
         );
-        let mut mutable_file = MutableTableFile::fork(
+        let mut mutable_file = Some(MutableTableFile::fork(
             plan.table().file(),
             engine.table_fs.background_writes(),
             plan.table().disk_pool().clone(),
             guards.disk_guard().clone(),
-        );
+        ));
         // Keep the private file and its writer claim alive through rollback.
-        let result: QuadResult<_> = async {
-            let disk_runtime = SecondaryDiskTreeRuntime::new(
-                index_slot,
-                Arc::clone(plan.new_metadata()),
-                Arc::clone(plan.table().file()),
-                plan.table().disk_pool().clone(),
-            )?;
-            #[cfg(feature = "profiling")]
-            let cold_started = Instant::now();
-            let mut cold_rows = collector.collect_current_cold().await?;
-            #[cfg(feature = "profiling")]
-            {
-                measurements.cold_collect_nanos = cold_started.elapsed().as_nanos() as u64;
-            }
-            #[cfg(test)]
-            engine
-                .index_ddl_test
-                .reach_phase(IndexDdlTestPhase::CreateColdCollectionComplete)
-                .await;
-            #[cfg(feature = "profiling")]
-            let sort_started = Instant::now();
-            key_validator.prepare_cold(&mut cold_rows)?;
-            #[cfg(feature = "profiling")]
-            {
-                measurements.cold_sort_nanos = sort_started.elapsed().as_nanos() as u64;
-            }
-            #[cfg(feature = "profiling")]
-            let disk_started = Instant::now();
-            let cold_root = build_create_index_disk_tree(
-                &mut mutable_file,
-                &disk_runtime,
-                guards,
-                plan.new_index_spec(),
-                &cold_rows,
-                self.build_ts(),
-            )
-            .await?;
-            #[cfg(feature = "profiling")]
-            {
-                measurements.cold_build_nanos = disk_started.elapsed().as_nanos() as u64;
-                measurements.cold_entries = cold_rows.len() as u64;
-            }
-            let cold_keys = ColdUniqueKeys::new(cold_rows);
-            #[cfg(feature = "profiling")]
-            {
-                measurements.retained_cold_bytes = cold_keys.retained_bytes();
-            }
-            #[cfg(test)]
-            engine
-                .index_ddl_test
-                .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
-                .await;
-            secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
-                index_id: self.index.id(),
-                root: SecondaryIndexRoot::from_block_id(cold_root),
-            };
-            mutable_file.replace_metadata_and_secondary_index_slots(
-                Arc::clone(plan.new_metadata()),
+        let result = self
+            .build_cold_inner(
+                engine,
+                plan,
+                collector,
                 secondary_index_slots,
-            );
-            let cold = if plan.new_index_spec().unique() {
-                ColdValidation::Required(cold_keys)
-            } else {
-                drop(cold_keys);
-                ColdValidation::NotRequired
-            };
-            Ok((disk_runtime, cold))
-        }
-        .await;
+                &mut mutable_file,
+                #[cfg(feature = "profiling")]
+                measurements,
+            )
+            .await;
         match result {
-            Ok((disk_runtime, cold)) => Ok((mutable_file, disk_runtime, cold)),
+            Ok(built) => Ok(built),
             Err(source) => {
                 let cleanup = self.rollback_before_catalog_commit(guards).await;
                 Err(merge_create_failure(source, cleanup))
             }
         }
+    }
+
+    async fn build_cold_inner(
+        &mut self,
+        engine: &EngineCore,
+        plan: &CreateIndexPlan,
+        collector: CreateIndexCollector<'_>,
+        mut secondary_index_slots: Vec<SecondaryIndexSlot>,
+        mutable_file: &mut Option<MutableTableFile>,
+        #[cfg(feature = "profiling")] measurements: &mut CreateIndexMeasurements,
+    ) -> QuadResult<(MutableTableFile, SecondaryDiskTreeRuntime, ColdValidation)> {
+        let index_slot = self.index.slot();
+        let disk_runtime = SecondaryDiskTreeRuntime::new(
+            index_slot,
+            Arc::clone(plan.new_metadata()),
+            Arc::clone(plan.table().file()),
+            plan.table().disk_pool().clone(),
+        )?;
+        let (run, admission) = collector
+            .prepare_cold(
+                engine,
+                #[cfg(feature = "profiling")]
+                measurements,
+            )
+            .await?;
+        #[cfg(feature = "profiling")]
+        let disk_started = Instant::now();
+        let input_entries = run.entries().len();
+        let cold_keys = ColdUniqueKeys::from_run(run.clone());
+        let build = DiskBulkBuild::new(
+            mutable_file
+                .take()
+                .unwrap_or_else(|| unreachable!("CREATE retains private fork")),
+            run,
+            admission,
+            engine.thread_pool.clone(),
+            engine.poisoner.clone(),
+            self.build_ts(),
+        )?;
+        let build = self.cold_build.insert(build);
+        let completed = self.disk_ready.insert(build.build().await?);
+        assert_eq!(
+            completed.entries(),
+            input_entries,
+            "CREATE disk completion must cover captured cold input"
+        );
+        let cold_root = completed.root;
+        let mut mutable_file = build.take_file(completed);
+        #[cfg(feature = "profiling")]
+        {
+            measurements.cold_build_nanos = disk_started.elapsed().as_nanos() as u64;
+            measurements.cold_entries = completed.entries() as u64;
+            measurements.cold = build.measurements();
+            measurements.cold.pool_pin_bytes = if create_index_cold_root_has_rows(
+                collector.column_block_index_root,
+                collector.pivot_row_id,
+            ) {
+                COW_FILE_PAGE_SIZE as u64
+            } else {
+                0
+            };
+            measurements.retained_cold_bytes = cold_keys.retained_bytes();
+        }
+        #[cfg(test)]
+        engine
+            .index_ddl_test
+            .reach_phase(IndexDdlTestPhase::CreateDiskTreeBuilt)
+            .await;
+        secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
+            index_id: self.index.id(),
+            root: SecondaryIndexRoot::from_block_id(cold_root),
+        };
+        mutable_file.replace_metadata_and_secondary_index_slots(
+            Arc::clone(plan.new_metadata()),
+            secondary_index_slots,
+        );
+        let cold = if plan.new_index_spec().unique() {
+            ColdValidation::Required(cold_keys)
+        } else {
+            drop(cold_keys);
+            ColdValidation::NotRequired
+        };
+        Ok((mutable_file, disk_runtime, cold))
     }
 
     async fn build_hot(
@@ -542,7 +623,7 @@ impl CreateIndexProgress {
             self.build_ts,
             engine.hot_build_policy,
             #[cfg(feature = "profiling")]
-            engine.trx_sys.hot_build_profiler.clone(),
+            engine.trx_sys.index_build_profiler.clone(),
         )
         .await?;
         let build = self.hot_build.insert(HotIndexBuild::new(
@@ -876,7 +957,7 @@ impl CreateIndexProgress {
     #[cfg(feature = "profiling")]
     fn record_create_measurements(
         &self,
-        profiler: &HotIndexBuildProfiler,
+        profiler: &IndexBuildProfiler,
         mut measurements: CreateIndexMeasurements,
         create_started: Instant,
     ) {
@@ -952,7 +1033,12 @@ impl CreateIndexProgress {
     }
 
     async fn cleanup_staged_runtime(&mut self, guards: &PoolGuards) -> RuntimeOrFatalResult<()> {
-        let settlement = self.settle_hot().await;
+        let cold = if let Some(build) = &mut self.cold_build {
+            build.settle().await
+        } else {
+            Ok(())
+        };
+        let settlement = merge_build_result(cold, self.settle_hot().await);
         self.new_layout = None;
         self.ready = None;
         // Taking the runtime before awaiting disarms destruction even if it unwinds.
@@ -1320,7 +1406,7 @@ impl AcceptedCreateIndex {
             .map_err(CompletionErrorBridge::capture_runtime_or_fatal)?;
         #[cfg(feature = "profiling")]
         progress.record_create_measurements(
-            &engine.trx_sys.hot_build_profiler,
+            &engine.trx_sys.index_build_profiler,
             measurements,
             create_started,
         );
@@ -1758,7 +1844,7 @@ pub(crate) async fn capture_hot_index_build(
     guards: PoolGuards,
     build_ts: TrxID,
     policy: HotBuildPolicy,
-    #[cfg(feature = "profiling")] profiler: Arc<HotIndexBuildProfiler>,
+    #[cfg(feature = "profiling")] profiler: Arc<IndexBuildProfiler>,
 ) -> RuntimeOrFatalResult<HotBuildSource> {
     #[cfg(feature = "profiling")]
     let started = Instant::now();
@@ -1898,48 +1984,6 @@ fn create_index_current_cold_row_is_deleted(table: &Table, row_id: RowID) -> Ope
     }
 }
 
-async fn build_create_index_disk_tree(
-    mutable_file: &mut MutableTableFile,
-    disk_runtime: &SecondaryDiskTreeRuntime,
-    guards: &PoolGuards,
-    index_spec: &TableIndexMetadata,
-    rows: &[IndexBuildEntry],
-    build_ts: TrxID,
-) -> RuntimeOrFatalResult<Option<BlockID>> {
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    if index_spec.unique() {
-        assert!(
-            rows.windows(2).all(|pair| pair[0].key != pair[1].key),
-            "create-index build invariant violated: unique cold keys were not validated before DiskTree construction"
-        );
-        let batch = rows
-            .iter()
-            .map(|entry| UniqueDiskTreeEncodedPut {
-                key: entry.key.as_bytes(),
-                row_id: entry.row_id,
-            })
-            .collect::<Vec<_>>();
-        let tree = disk_runtime.open_unique_at(None, guards.disk_guard())?;
-        let mut writer = tree.batch_writer(mutable_file, build_ts);
-        writer.batch_put_encoded(&batch);
-        writer.finish().await
-    } else {
-        let batch = rows
-            .iter()
-            .map(|entry| NonUniqueDiskTreeEncodedExact {
-                key: entry.key.as_bytes(),
-            })
-            .collect::<Vec<_>>();
-        let tree = disk_runtime.open_non_unique_at(None, guards.disk_guard())?;
-        let mut writer = tree.batch_writer(mutable_file, build_ts);
-        writer.batch_insert_encoded(&batch)?;
-        writer.finish().await
-    }
-}
-
 fn build_created_index_runtime_layout(
     old_layout: &Arc<TableRuntimeLayout>,
     new_metadata: Arc<TableMetadata>,
@@ -2068,8 +2112,8 @@ pub(crate) mod tests {
     use crate::error::RuntimeResult;
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
-    use crate::index::IndexBatchStream;
     use crate::index::build::tree_builder::panic_install_transfer;
+    use crate::index::{BTreeKey, IndexBatchStream};
     use crate::row::ops::{SelectKey, UniqueMutationOutcome, UpdateCol};
     use crate::session::Session;
     use crate::session::tests::{
@@ -2137,10 +2181,13 @@ pub(crate) mod tests {
         release: flume::Receiver<()>,
     }
 
+    type ColdBudgetHook = Arc<dyn Fn(&MemoryBudget) + Send + Sync>;
+
     type HotBuildHook = Arc<dyn Fn(&mut HotIndexBuild<EvictableBufferPool>) + Send + Sync>;
 
     #[derive(Default)]
     struct IndexDdlTestState {
+        cold_budget: parking_lot::Mutex<Option<ColdBudgetHook>>,
         hot_build: parking_lot::Mutex<Option<HotBuildHook>>,
         create_failure: parking_lot::Mutex<Option<CreateIndexTestFailure>>,
         panic_phase: parking_lot::Mutex<Option<IndexDdlTestPhase>>,
@@ -2156,6 +2203,12 @@ pub(crate) mod tests {
     }
 
     impl IndexDdlTestController {
+        pub(super) fn configure_cold_budget(&self, budget: &MemoryBudget) {
+            if let Some(hook) = self.state.cold_budget.lock().take() {
+                hook(budget);
+            }
+        }
+
         /// Move installation panic injection to the actual partial-transfer edge.
         pub(super) fn configure_install(&self, ready: &mut ReadyHotTree<EvictableBufferPool>) {
             let mut phase = self.state.panic_phase.lock();
@@ -2311,19 +2364,64 @@ pub(crate) mod tests {
         plan: &CreateIndexPlan,
         guards: &PoolGuards,
     ) -> Vec<(BTreeKey, RowID)> {
-        CreateIndexCollector::new(
+        let collector = CreateIndexCollector::new(
             plan.table(),
             guards,
             plan.old_layout(),
             plan.new_index_spec(),
             plan.active_root(),
-        )
-        .collect_current_hot()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|entry| (entry.key, entry.row_id))
-        .collect()
+        );
+        collect_current_hot(&collector)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.key, entry.row_id))
+            .collect()
+    }
+
+    async fn collect_current_hot(
+        collector: &CreateIndexCollector<'_>,
+    ) -> RuntimeOrFatalResult<Vec<IndexBuildEntry>> {
+        use crate::row::RowRead;
+        let mut rows = Vec::new();
+        collector
+            .table
+            .accessor_with_layout(collector.layout)
+            .mem_scan_uncommitted_from(
+                collector.guards,
+                collector.pivot_row_id,
+                |col_layout, row| {
+                    if row.is_deleted() {
+                        return true;
+                    }
+                    let row_id = row.row_id();
+                    let key_vals = collector
+                        .index_spec
+                        .keys
+                        .iter()
+                        .map(|index_key| row.val(col_layout, index_key.column_ordinal.as_usize()))
+                        .collect::<Vec<_>>();
+                    let key = encode_key(collector, &key_vals, row_id);
+                    rows.push(IndexBuildEntry { key, row_id });
+                    true
+                },
+            )
+            .await?;
+        Ok(rows)
+    }
+
+    fn encode_key(
+        collector: &CreateIndexCollector<'_>,
+        key_vals: &[Val],
+        row_id: RowID,
+    ) -> BTreeKey {
+        if collector.index_spec.unique() {
+            collector.key_encoder.encode(key_vals)
+        } else {
+            collector
+                .key_encoder
+                .encode_pair(key_vals, Val::from(row_id))
+        }
     }
 
     fn index_ddl_snapshot(engine: &Engine, table_id: TableID, table: &Table) -> IndexDdlSnapshot {
@@ -2360,7 +2458,7 @@ pub(crate) mod tests {
             published_creates: engine
                 .inner()
                 .trx_sys
-                .hot_build_profiler
+                .index_build_profiler
                 .snapshot()
                 .create
                 .hot
@@ -2380,7 +2478,7 @@ pub(crate) mod tests {
             engine
                 .inner()
                 .trx_sys
-                .hot_build_profiler
+                .index_build_profiler
                 .snapshot()
                 .create
                 .hot
@@ -3368,7 +3466,7 @@ pub(crate) mod tests {
                 let before = index_ddl_snapshot(&engine, table_id, &table);
                 let allocated = engine.inner().pools.index.allocated();
                 #[cfg(feature = "profiling")]
-                let stats = engine.inner().trx_sys.hot_build_profiler.snapshot();
+                let stats = engine.inner().trx_sys.index_build_profiler.snapshot();
                 match case {
                     Case::Ready => engine
                         .inner()
@@ -3465,7 +3563,7 @@ pub(crate) mod tests {
                     engine
                         .inner()
                         .trx_sys
-                        .hot_build_profiler
+                        .index_build_profiler
                         .snapshot()
                         .create
                         .hot
@@ -3585,6 +3683,7 @@ pub(crate) mod tests {
 
     /// Purpose: Distinguish successful extraction from completed CREATE publication and rollback resource failures in the accepted owner.
     /// Expected: Empty and populated builds publish once; duplicates and packing-budget failures publish no CREATE sample, reclaim private roots, and preserve the table layout.
+    /// Builds without cold traversal report no pool pins.
     #[cfg(feature = "profiling")]
     #[test]
     fn create_completion_stats_require_successful_publication() {
@@ -3598,7 +3697,7 @@ pub(crate) mod tests {
             let mut retention_session = engine.new_session().unwrap();
             let retention_trx = retention_session.begin_trx().unwrap();
             let mut session = engine.new_session().unwrap();
-            let initial = session.hot_index_build_stats().unwrap();
+            let initial = session.index_build_stats().unwrap();
             let id = session
                 .create_index(
                     table_id,
@@ -3606,7 +3705,8 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            let empty = session.hot_index_build_stats().unwrap();
+            let empty = session.index_build_stats().unwrap();
+            assert_eq!(empty.create.cold.pool_pin_bytes, 0);
             assert_eq!(
                 empty.create.hot.completed_builds,
                 initial.create.hot.completed_builds + 1
@@ -3620,7 +3720,7 @@ pub(crate) mod tests {
             let _retained_empty_layout = table.layout_snapshot();
             session.drop_index(table_id, id).await.unwrap();
             insert_rows(table_id, &mut session, 0, 17, "profile").await;
-            let before = session.hot_index_build_stats().unwrap();
+            let before = session.index_build_stats().unwrap();
             let before_layout = index_ddl_snapshot(&engine, table_id, &table);
             let allocated = engine.inner().pools.index.allocated();
             *engine.inner().index_ddl_test.state.hot_build.lock() = Some(Arc::new(|build| {
@@ -3640,7 +3740,7 @@ pub(crate) mod tests {
                 err.report().downcast_ref::<RuntimeError>().copied(),
                 Some(RuntimeError::IndexAccess)
             );
-            let failed = session.hot_index_build_stats().unwrap();
+            let failed = session.index_build_stats().unwrap();
             assert_eq!(failed.completed_builds, before.completed_builds + 1);
             assert_eq!(failed.create, before.create);
             assert_eq!(engine.inner().pools.index.allocated(), allocated);
@@ -3655,7 +3755,8 @@ pub(crate) mod tests {
                 )
                 .await
                 .unwrap();
-            let published = session.hot_index_build_stats().unwrap();
+            let published = session.index_build_stats().unwrap();
+            assert_eq!(published.create.cold.pool_pin_bytes, 0);
             assert_eq!(
                 published.create.hot.completed_builds,
                 before.create.hot.completed_builds + 1
@@ -3688,7 +3789,7 @@ pub(crate) mod tests {
                 vec![Val::from(18), Val::from("duplicate")],
             )
             .await;
-            let before_duplicate = session.hot_index_build_stats().unwrap();
+            let before_duplicate = session.index_build_stats().unwrap();
             let before_layout = index_ddl_snapshot(&engine, table_id, &table);
             let err = session
                 .create_index(
@@ -3698,7 +3799,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(err.operation_error(), Some(OperationError::DuplicateKey));
-            let duplicate = session.hot_index_build_stats().unwrap();
+            let duplicate = session.index_build_stats().unwrap();
             assert_eq!(
                 duplicate.completed_builds,
                 before_duplicate.completed_builds + 1
@@ -3706,6 +3807,57 @@ pub(crate) mod tests {
             assert_eq!(duplicate.create, before_duplicate.create);
             assert_index_ddl_snapshot_unchanged(&before_layout, &engine, table_id, &table);
             retention_trx.rollback().await.unwrap();
+        });
+    }
+
+    /// Purpose: Count cold traversal memory even when every persisted row is deleted.
+    /// Expected: CREATE publishes an empty index with no collected entries but reports one pinned page.
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn create_deleted_cold_rows_report_pool_pins() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "create_deleted_cold_stats").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::from("cold")],
+            )
+            .await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            expect_delete_committed(table_id, &mut session, &single_key(1)).await;
+            assert_ne!(
+                table.file().active_root_unchecked().column_block_index_root,
+                SUPER_BLOCK_ID
+            );
+            assert_eq!(
+                session
+                    .index_build_stats()
+                    .unwrap()
+                    .create
+                    .cold
+                    .pool_pin_bytes,
+                0
+            );
+
+            session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap();
+
+            let stats = session.index_build_stats().unwrap();
+            assert_eq!(stats.create.hot.completed_builds, 1);
+            assert_eq!(stats.create.hot.extraction.entries, 0);
+            assert_eq!(stats.create.cold_entries, 0);
+            assert_eq!(stats.create.cold.pool_pin_bytes, COW_FILE_PAGE_SIZE as u64);
+            assert!(active_secondary_root(&table, IndexSlot::new(1)).is_none());
         });
     }
 
@@ -4021,7 +4173,7 @@ pub(crate) mod tests {
 
     /// Purpose: Build a usable non-unique index over checkpointed rows.
     /// Expected: Disk lookup finds exactly the matching persisted rows and excludes absent
-    /// keys.
+    /// keys; profiling reports one page pinned by cold traversal.
     #[test]
     fn test_create_index_builds_non_unique_cold_disk_tree() {
         smol::block_on(async {
@@ -4061,6 +4213,16 @@ pub(crate) mod tests {
 
             assert_eq!(index_id, IndexID::new(1));
             assert!(active_secondary_root(&table, IndexSlot::new(1)).is_some());
+            #[cfg(feature = "profiling")]
+            assert_eq!(
+                session
+                    .index_build_stats()
+                    .unwrap()
+                    .create
+                    .cold
+                    .pool_pin_bytes,
+                COW_FILE_PAGE_SIZE as u64
+            );
             let mut rows =
                 non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key("cold"))
                     .await;
@@ -4075,6 +4237,75 @@ pub(crate) mod tests {
                 )
                 .await,
                 []
+            );
+        });
+    }
+
+    /// Purpose: Fail cold collection at each owned-allocation boundary, including after partial key collection.
+    /// Expected: Resource causes survive without publication or retained charges, and the same table remains readable and accepts a successful retry.
+    #[test]
+    fn cold_collection_admission_failure_and_retry() {
+        use crate::index::build::fail_build_budget_after;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "cold_admission").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            let value = "v".repeat(512);
+            insert_rows(table_id, &mut session, 0, 128, &value).await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            let before = index_ddl_snapshot(&engine, table_id, &table);
+            for (purpose, successful) in [
+                ("cold traversal stack", 0),
+                ("cold descriptors", 0),
+                ("cold identity and deletions", 0),
+                ("cold projection", 0),
+                ("cold projected value", 3),
+                ("cold run entries", 1),
+                ("cold outlined key", 3),
+            ] {
+                let captured = Arc::new(parking_lot::Mutex::new(None));
+                let inspect = captured.clone();
+                *engine.inner().index_ddl_test.state.cold_budget.lock() =
+                    Some(Arc::new(move |budget| {
+                        *inspect.lock() = Some(budget.clone());
+                        fail_build_budget_after(budget, purpose, successful);
+                    }));
+                let error = session
+                    .create_index(
+                        table_id,
+                        StorageIndexSpec::new(
+                            vec![StorageIndexKey::new(1)],
+                            StorageIndexFlags::empty(),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.report().contains::<crate::error::ResourceError>(),
+                    "{purpose}: {error:?}"
+                );
+                assert_eq!(captured.lock().as_ref().unwrap().used(), 0, "{purpose}");
+                assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
+            }
+            let id = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(id, IndexID::new(1));
+            assert_eq!(
+                non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key(&value))
+                    .await
+                    .len(),
+                128
             );
         });
     }

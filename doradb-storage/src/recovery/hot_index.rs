@@ -16,7 +16,7 @@ use crate::index::build::{
 use crate::map::FastHashMap;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotIndexBuildProfiler, RecoveryHotIndexReport, clock::Instant};
+use crate::profiling::{IndexBuildProfiler, RecoveryHotIndexReport, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{block_on, thread_pool::ThreadPool};
 use crate::table::Table;
@@ -97,7 +97,7 @@ impl RecoveryHotIndexWorker {
             #[cfg(test)]
             hooks: tests::Hooks::capture(),
             #[cfg(feature = "profiling")]
-            profiler: resources.hot_build_profiler.clone(),
+            profiler: resources.index_build_profiler.clone(),
             #[cfg(feature = "profiling")]
             report: RecoveryHotIndexResult::default(),
         };
@@ -185,7 +185,7 @@ struct RecoveryHotIndexTask {
     #[cfg(test)]
     hooks: tests::Hooks,
     #[cfg(feature = "profiling")]
-    profiler: Arc<HotIndexBuildProfiler>,
+    profiler: Arc<IndexBuildProfiler>,
     #[cfg(feature = "profiling")]
     report: RecoveryHotIndexReport,
 }

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
 pub(super) use tests::BudgetFailure;
 #[cfg(test)]
-pub(crate) use tests::fail_at;
+pub(crate) use tests::{fail_after, fail_at};
 
 struct BudgetState {
     limit: usize,
@@ -19,8 +19,9 @@ struct BudgetState {
     peak: AtomicUsize,
 }
 
-/// Concurrent bulk scratch admission within each of a table's serial index builds.
-/// Bookkeeping and bounded worker temporaries are outside this accounting.
+/// Concurrent allocation admission for one resident index-build invocation.
+/// Each caller defines its charged allocations and separately reports fixed
+/// runtime and pool-owned costs; reservations can follow accepted storage work.
 #[derive(Clone)]
 pub(crate) struct MemoryBudget(Arc<BudgetState>);
 
@@ -113,6 +114,36 @@ pub(crate) struct MemoryReservation {
 }
 
 impl MemoryReservation {
+    /// Transfer earmarked admission without releasing or charging it again.
+    #[inline]
+    pub(crate) fn split(&mut self, bytes: usize) -> Self {
+        assert!(
+            bytes <= self.bytes,
+            "scratch subdivision exceeds reservation: bytes={bytes}, owned={}",
+            self.bytes
+        );
+        self.bytes -= bytes;
+        Self {
+            budget: self.budget.clone(),
+            bytes,
+        }
+    }
+
+    /// Consume earmarked bytes, admitting only a missing remainder.
+    #[inline]
+    pub(crate) fn take(&mut self, bytes: usize, purpose: &'static str) -> ResourceResult<Self> {
+        if bytes > self.bytes {
+            self.grow(bytes - self.bytes, purpose)?;
+        }
+        Ok(self.split(bytes))
+    }
+
+    /// Return this owner's admitted allocation capacity.
+    #[inline]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Construct an empty reservation without admitting any bytes.
     pub(crate) fn new(budget: &MemoryBudget) -> Self {
         Self {
@@ -167,6 +198,30 @@ pub(crate) struct BudgetedVec<T> {
 }
 
 impl<T> BudgetedVec<T> {
+    /// Allocate exact element capacity from an existing earmark.
+    pub(crate) fn from_reservation(mut reservation: MemoryReservation, capacity: usize) -> Self {
+        let bytes = Layout::array::<T>(capacity)
+            .unwrap_or_else(|_| unreachable!("admitted vector layout"))
+            .size();
+        let reservation = reservation.split(bytes);
+        Self {
+            values: Vec::with_capacity(capacity),
+            reservation,
+        }
+    }
+
+    /// Remove an unordered element while retaining its backing capacity.
+    #[inline]
+    pub(crate) fn swap_remove(&mut self, index: usize) -> T {
+        self.values.swap_remove(index)
+    }
+
+    /// Remove the final element while retaining backing allocation admission.
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.values.pop()
+    }
+
     /// Admit the next insertion before performing work that cannot fail or await.
     #[inline]
     pub(crate) fn reserve_one(&mut self, purpose: &'static str) -> ResourceResult<()> {
@@ -291,25 +346,39 @@ fn memory_error(
 mod tests {
     use super::MemoryBudget;
     use parking_lot::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Named admission failure control with no mutex traffic while disabled.
     #[derive(Default)]
     pub(crate) struct BudgetFailure {
         enabled: AtomicBool,
         purpose: Mutex<Option<&'static str>>,
+        remaining: AtomicUsize,
     }
 
     impl BudgetFailure {
         /// Check a configured failure only after the cheap enabled predicate.
         pub(super) fn rejects(&self, purpose: &'static str) -> bool {
-            self.enabled.load(Ordering::Acquire) && *self.purpose.lock() == Some(purpose)
+            self.enabled.load(Ordering::Acquire)
+                && *self.purpose.lock() == Some(purpose)
+                && self
+                    .remaining
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_err()
         }
     }
 
     /// Fail a named admission boundary to exercise production error/settlement paths.
     pub(crate) fn fail_at(budget: &MemoryBudget, purpose: &'static str) {
+        fail_after(budget, purpose, 0);
+    }
+
+    /// Reject a named request after a deterministic number of successful admissions.
+    pub(crate) fn fail_after(budget: &MemoryBudget, purpose: &'static str, successful: usize) {
         *budget.0.test.purpose.lock() = Some(purpose);
+        budget.0.test.remaining.store(successful, Ordering::Release);
         budget.0.test.enabled.store(true, Ordering::Release);
     }
 }

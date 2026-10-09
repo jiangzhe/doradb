@@ -27,7 +27,7 @@ use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
 pub(crate) use crate::profiling::TrxSysStats;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotIndexBuildProfiler, RecoveryReport, clock::Instant};
+use crate::profiling::{IndexBuildProfiler, RecoveryReport, clock::Instant};
 use crate::quiescent::{QuiescentBox, QuiescentGuard, SyncQuiescentGuard};
 use crate::recovery::stream::CatalogSafeRedoSegment;
 use crate::recovery::{RecoveryOutcome, RecoveryResources};
@@ -603,7 +603,7 @@ pub(crate) struct TransactionSystem {
     pub(crate) recovery_report: RecoveryReport,
     /// Recorder retained from bootstrap for public hot-build snapshots.
     #[cfg(feature = "profiling")]
-    pub(crate) hot_build_profiler: Arc<HotIndexBuildProfiler>,
+    pub(crate) index_build_profiler: Arc<IndexBuildProfiler>,
 }
 
 impl TransactionSystem {
@@ -641,7 +641,7 @@ impl TransactionSystem {
         )
         .with_hot_build_policy(hot_build_policy);
         #[cfg(feature = "profiling")]
-        let hot_build_profiler = recovery_resources.hot_build_profiler.clone();
+        let index_build_profiler = recovery_resources.index_build_profiler.clone();
         let coordinator = recovery_resources.prepare(&config, &recovery, file_prefix.clone())?;
         #[cfg(feature = "profiling")]
         let preparation_elapsed = preparation_started.elapsed();
@@ -687,7 +687,7 @@ impl TransactionSystem {
         };
         #[cfg(feature = "profiling")]
         {
-            trx_sys.hot_build_profiler = hot_build_profiler;
+            trx_sys.index_build_profiler = index_build_profiler;
         }
         Ok((
             trx_sys,
@@ -755,7 +755,7 @@ impl TransactionSystem {
             #[cfg(feature = "profiling")]
             recovery_report: RecoveryReport::default(),
             #[cfg(feature = "profiling")]
-            hot_build_profiler: Arc::new(HotIndexBuildProfiler::default()),
+            index_build_profiler: Arc::new(IndexBuildProfiler::default()),
         }
     }
 

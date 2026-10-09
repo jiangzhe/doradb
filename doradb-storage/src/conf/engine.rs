@@ -12,7 +12,8 @@ use super::consts::{
     MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
 use super::{
-    EvictableBufferPoolConfig, FileSystemConfig, HotIndexBuildConfig, RecoveryConfig, TrxSysConfig,
+    ColdIndexBuildConfig, EvictableBufferPoolConfig, FileSystemConfig, HotIndexBuildConfig,
+    RecoveryConfig, TrxSysConfig,
 };
 
 /// Immutable sizing for the engine-owned thread pool.
@@ -163,6 +164,8 @@ pub struct EngineConfig {
     pub recovery: RecoveryConfig,
     /// Per-index hot extraction scratch and worker limits.
     pub hot_index_build: HotIndexBuildConfig,
+    /// Per-invocation cold index construction limits.
+    pub cold_index_build: ColdIndexBuildConfig,
     /// Engine-owned thread-pool configuration.
     pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
@@ -187,6 +190,7 @@ impl Default for EngineConfig {
             trx: TrxSysConfig::default(),
             recovery: RecoveryConfig::default(),
             hot_index_build: HotIndexBuildConfig::default(),
+            cold_index_build: ColdIndexBuildConfig::default(),
             thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
             table_scan: TableScanConfig::default(),
@@ -215,6 +219,8 @@ impl EngineConfig {
     pub(crate) fn validate_inner(mut self) -> ConfigResult<Self> {
         self.thread_pool.validate()?;
         self.hot_index_build
+            .validate(self.thread_pool.worker_threads)?;
+        self.cold_index_build
             .validate(self.thread_pool.worker_threads)?;
         self.recovery.validate(self.thread_pool.worker_threads)?;
         self.mandatory_runtime.validate()?;
@@ -269,6 +275,13 @@ impl EngineConfig {
     /// Set per-index hot extraction scratch and parallelism limits.
     pub fn hot_index_build(mut self, config: HotIndexBuildConfig) -> Self {
         self.hot_index_build = config;
+        self
+    }
+
+    /// Set cold index construction admission and worker limits.
+    #[inline]
+    pub fn cold_index_build(mut self, config: ColdIndexBuildConfig) -> Self {
+        self.cold_index_build = config;
         self
     }
 

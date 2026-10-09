@@ -2,11 +2,11 @@
 
 ## Summary
 
-CREATE INDEX cold-row construction collects all live persisted index entries
-before building the new secondary DiskTree. Collection, sorting and DiskTree
-construction remain sequential and retain memory proportional to cold input.
-Task 000319 parallelized the hot build, but unique CREATE still retains every
-cold encoded key and RowID for hot/cold duplicate validation.
+Task 000329 delivered admitted serial cold collection and sorting followed by
+bounded parallel DiskTree construction. Input remains resident, and unique
+CREATE retains its cold encoded keys and RowIDs for hot/cold validation.
+Parallel extraction, completed-root validation, and larger-than-memory input
+remain unfinished parts of this backlog.
 
 Design bounded streaming cold construction and cross-tier validation together.
 Prefer a hybrid validator: probe cold storage when hot input is relatively small,
@@ -20,23 +20,26 @@ determine the concrete representations, selection policy and thresholds.
 - [Task 000236: non-unique CREATE completeness](../tasks/000236-non-unique-create-index-mvcc-candidate-complete.md).
 - [Task 000306: recovery profiling](../tasks/000306-recovery-benchmark-and-startup-metrics.md).
 - [Task 000319: CREATE hot-build integration](../tasks/000319-create-index-hot-build-integration.md) and [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md), which deliberately retained the cold vector and deferred disk-backed validation here.
+- [Task 000329: streaming parallel DiskTree construction](../tasks/000329-streaming-parallel-disk-tree-bulk-construction.md) implements [RFC 0033](../rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md) Phase 1; Phases 2 and 3 own the remaining validation and extraction work.
 
 Current implementation boundaries:
 
-- `CreateIndexCollector::collect_current_cold`, `CreateIndexKeyValidator::prepare_cold`, and `build_create_index_disk_tree` in `doradb-storage/src/catalog/index.rs`.
+- `CreateIndexCollector::collect_current_cold`, `prepare_cold`, and `CreateIndexProgress::build_cold` in `doradb-storage/src/catalog/index.rs`.
 - `ColdUniqueKeys`, `ColdValidation`, `ColdHotCursor`, and completion evidence in `doradb-storage/src/index/build/cold_validation.rs`; the checked leaf consumer in `doradb-storage/src/index/build/tree_builder.rs`.
-- `UniqueDiskTreeBatchWriter`, root-snapshot lookups/cursors and CoW construction in `doradb-storage/src/index/disk_tree.rs`.
+- `DiskBulkBuild` in `doradb-storage/src/index/build/disk_builder.rs`; root-snapshot lookups/cursors and checkpoint mutation writers in `doradb-storage/src/index/disk_tree.rs`.
 
 ## Deferred From (Optional)
 
-docs/tasks/000149-implement-create-index-storage-api.md; docs/tasks/000236-non-unique-create-index-mvcc-candidate-complete.md; docs/rfcs/0018-create-drop-index.md Phase 4; docs/tasks/000306-recovery-benchmark-and-startup-metrics.md profiling follow-up; docs/tasks/000319-create-index-hot-build-integration.md / docs/rfcs/0032-in-memory-parallel-hot-index-build.md Phase 5
+docs/tasks/000149-implement-create-index-storage-api.md; docs/tasks/000236-non-unique-create-index-mvcc-candidate-complete.md; docs/rfcs/0018-create-drop-index.md Phase 4; docs/tasks/000306-recovery-benchmark-and-startup-metrics.md profiling follow-up; docs/tasks/000319-create-index-hot-build-integration.md / docs/rfcs/0032-in-memory-parallel-hot-index-build.md Phase 5; docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md / docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 1
 
 ## Deferral Context (Optional)
 
 - Defer Reason: Earlier tasks established CREATE correctness and parallel hot construction. Streaming cold construction changes durable writes, sorting/spill, memory budgets, cross-tier validation authority and rollback ownership together, so it requires a dedicated design.
 - Findings: Cold collection first materializes ColumnBlockIndex leaf entries, then loads LWC blocks, filters persisted delete deltas and current ColumnDeletionBuffer markers, and retains all live encoded keys and RowIDs. LWC blocks are ordered by RowID; locally sorted worker batches do not establish global secondary-key order or uniqueness.
-- Findings: DiskTree input is materialized as an additional batch. The existing writer copies keys into an accumulated operation map and flattens that map at `finish()`. Feeding it smaller batches alone does not bound memory. Unique `Put` replaces an existing owner; it is not duplicate-rejecting insertion, and current safety depends on prior cold/cold validation.
-- Findings: Task 000319 replaced serial hot preparation with partition-local cold cursors in the shared hot merge. `ColdValidation::Required(ColdUniqueKeys)` retains an `Arc<Vec<IndexBuildEntry>>`; summaries bind the exact cold owner, hot plan, partition and consumed hot range. Replacing this vector requires new validation inputs and completion evidence, not only a different collector. The earlier `cold_unique_keys: BTreeSet` and `prepare_hot` descriptions are historical.
+- Findings: Task 000329 removed CREATE's additional mutation batch and operation map. Parallel workers now pack sorted partitions under one admission budget while a retained coordinator allocates and settles writes. Mutation writers still have replacement/coalescing semantics and are not duplicate-rejecting insertion APIs.
+- Findings: Task 000319 established partition-local cold cursors in the shared hot merge. Task 000329 changed `ColdUniqueKeys` to retain an admitted `Arc<SortedRun>`; summaries still bind the exact cold owner, hot plan, partition and consumed range. Replacing retained keys requires new validation inputs and completion evidence, not only a different collector.
+- Defer Reason: RFC 0033 deliberately separates initial construction, completed-root validation, and parallel extraction. Phase 1 benchmarks made serial collection the dominant CREATE cost; completion evidence can still indirectly retain the input. External runs/spill remain outside the resident-only RFC scope.
+- Direction Hint: Consume retaining evidence into a sealed completed-root contract before parallelizing extraction. Preserve Phase 1's allocation-lifetime admission and settlement; do not introduce a flattening adapter or release input while existing validation still borrows it.
 - Direction Hint: Start with bounded LWC dispatch/decode/filter, sorted runs and bounded merge or duplicate-aware incremental construction, followed by a completed readable but unpublished cold root. Select a hybrid cross-tier validation strategy over complete private inputs. Preserve typed duplicates, deterministic conflict selection, accepted-work settlement and publication ordering. Avoid unbounded channels, accumulated writer operations, or retaining all cold keys solely for validation.
 
 ## Scope Hint
@@ -103,6 +106,9 @@ rollback can reclaim or reuse staged blocks.
 - Benchmark end-to-end CREATE and validation separately across hot/cold ratios, absolute sizes and cache conditions. Record selected strategy, peak scratch, read/write I/O, validation work and worker scaling. Use measured crossover points to justify thresholds; do not fix them in this backlog.
 
 ## Notes (Optional)
+
+Phase 1 is implemented; this backlog remains open because its hybrid validation,
+parallel extraction, and external-memory acceptance criteria are not complete.
 
 Reuse the mechanisms delivered by [closed backlog 000110](closed/000110-unify-hot-row-mem-scan-index-build-recovery.md) and RFC 0032 where appropriate: encoded-key partitioning, sorted runs/merging, bounded scheduling and backpressure, duplicate-boundary checks and packed node construction. Keep LWC decoding, delete filtering, durable allocation/writes and root publication in the cold adapter; preserve the hot builder's recovery behavior and caller-owned installation/settlement. The hybrid policy and reverse-lookup completion contract belong to this design, not an independent later optimization that leaves all cold keys retained.
 

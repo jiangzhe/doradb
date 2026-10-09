@@ -116,7 +116,8 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
 `mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `hot_index_build`,
-`index_buffer`, `data_buffer`, and `file`; `meta_buffer_size` is an `[engine]` leaf.
+`cold_index_build`, `index_buffer`, `data_buffer`, and `file`;
+`meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
 `concurrency_limit` because orchestration always uses one runner.
 `[table_scan]` accepts `lwc_blocks_per_partition` and
@@ -135,6 +136,14 @@ workers cannot exceed the pool size. These settings control recovery index build
 
 The scratch limit bounds bulk-build working memory. Its reported peak excludes
 auxiliary overhead and does not represent total process memory.
+
+### Cold-index build settings
+
+`[engine.cold_index_build]` accepts `max_scratch_bytes` (default `"256 MiB"`),
+`max_workers` (omitted selects the engine pool size), `max_ready_buffers`
+(default 8, positive), and `max_in_flight_writes` (default 32, at least 2).
+Scratch and worker limits must be positive, and workers cannot exceed the pool
+size. These settings control cold-index construction during index creation.
 
 The benchmark uses io_uring and always collects profiling data. `include_stats`
 controls whether general engine statistics appear in the output. Recovery's
@@ -500,6 +509,11 @@ CREATE. Worker durations can overlap, so their sum may exceed elapsed time.
 Counter differences describe the measured interval, while peak values describe
 lifetime maxima. Cold preparation memory and hot construction memory are
 reported separately from process RSS.
+
+`hot_index_extraction.*` metrics describe successful hot-row extraction.
+`create_index.*` metrics describe successfully published index creation;
+`create_index.cold.*` reports its cold-build memory, concurrency, timing, and
+write statistics.
 
 ### Maintenance controls and terminal policy
 

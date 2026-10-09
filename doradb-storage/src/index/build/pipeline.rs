@@ -1,6 +1,6 @@
 //! Caller-owned orchestration from captured rows to an uninstalled packed tree.
 use super::cold_validation::ColdValidation;
-use super::merge::HotMergePreparation;
+use super::merge::MergePreparation;
 use super::tree_builder::{
     HotPackedBuild, HotPackedOutcome, HotPackedSpec, ReadyHotTree, StagedPageCleanup,
 };
@@ -11,7 +11,7 @@ use crate::error::{FatalError, RuntimeOrFatalResult};
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
 use crate::profiling::{
-    HotBuildMeasurements, HotMergeMeasurements, HotPackedMeasurements, clock::Instant,
+    HotExtractionMeasurements, HotPackedMeasurements, MergeMeasurements, clock::Instant,
 };
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
@@ -52,13 +52,13 @@ pub(crate) struct HotIndexBuild<P: BufferPool + 'static> {
     cold_validation: ColdValidation,
     phase: BuildPhase,
     sort: Option<HotLocalSort>,
-    preparation: Option<HotMergePreparation>,
+    preparation: Option<MergePreparation>,
     packing: Option<HotPackedBuild<P>>,
     cleanup: Option<StagedPageCleanup<P>>,
     #[cfg(test)]
     hooks: tests::Hooks<P>,
     #[cfg(feature = "profiling")]
-    extraction: Option<HotBuildMeasurements>,
+    extraction: Option<HotExtractionMeasurements>,
     #[cfg(feature = "profiling")]
     cleanup_elapsed_nanos: u64,
 }
@@ -172,7 +172,7 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         }
         self.sort = None;
         self.phase = BuildPhase::MergePreparation;
-        self.preparation = Some(HotMergePreparation::new(
+        self.preparation = Some(MergePreparation::new(
             Arc::new(runs),
             self.thread_pool.clone(),
             self.policy.max_workers,
@@ -265,8 +265,8 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         &self,
         ready: &'a ReadyHotTree<P>,
     ) -> (
-        HotBuildMeasurements,
-        &'a HotMergeMeasurements,
+        HotExtractionMeasurements,
+        &'a MergeMeasurements,
         &'a HotPackedMeasurements,
         u64,
     ) {

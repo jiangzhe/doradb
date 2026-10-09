@@ -1,5 +1,5 @@
 use super::merge::{HotEntryRef, execution_error, observe_stop};
-use super::{BudgetedVec, SortedHotRuns};
+use super::{BudgetedVec, SortedRuns};
 use crate::error::{RuntimeError, RuntimeOrFatalResult};
 #[cfg(feature = "profiling")]
 use crate::profiling::clock::Instant;
@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use std::sync::atomic::AtomicBool;
 
 /// A rank's exact prefixes and immediate total-order neighbors.
-pub(super) struct HotMergeCut {
+pub(super) struct MergeCut {
     /// Number of entries consumed by this cut.
     pub(super) rank: usize,
     /// Per-run prefix counts with allocation-lifetime admission.
@@ -22,12 +22,36 @@ pub(super) struct HotMergeCut {
     pub(super) elapsed_nanos: u64,
 }
 
+/// Select an array position directly, without search or merge workspace.
+pub(super) fn direct(runs: &SortedRuns, rank: usize) -> RuntimeOrFatalResult<MergeCut> {
+    let entries = runs
+        .single_run()
+        .unwrap_or_else(|| unreachable!("direct cut requires one run"));
+    assert!(
+        rank <= entries.len(),
+        "direct cut exceeds resident run: rank={rank}"
+    );
+    let mut positions = BudgetedVec::new(&runs.budget);
+    positions
+        .ensure_capacity(1, "merge boundary positions")
+        .change_context(RuntimeError::IndexAccess)?;
+    positions.push_reserved(rank);
+    Ok(MergeCut {
+        rank,
+        positions,
+        left: rank.checked_sub(1).map(|p| HotEntryRef::new(runs, 0, p)),
+        right: (rank < entries.len()).then(|| HotEntryRef::new(runs, 0, rank)),
+        #[cfg(feature = "profiling")]
+        elapsed_nanos: 0,
+    })
+}
+
 /// Independently select a prefix from zero in one finite synchronous search.
 pub(super) fn co_rank(
-    runs: &SortedHotRuns,
+    runs: &SortedRuns,
     rank: usize,
     stop: &AtomicBool,
-) -> RuntimeOrFatalResult<HotMergeCut> {
+) -> RuntimeOrFatalResult<MergeCut> {
     #[cfg(feature = "profiling")]
     let started = Instant::now();
     let mut positions = BudgetedVec::new(&runs.budget);
@@ -70,7 +94,7 @@ pub(super) fn co_rank(
         remaining -= count;
     }
     let (left, right) = neighbors(runs, &positions);
-    Ok(HotMergeCut {
+    Ok(MergeCut {
         rank,
         positions,
         left,
@@ -81,7 +105,7 @@ pub(super) fn co_rank(
 }
 
 /// Construct a global endpoint in O(K), without searching or submitting a job.
-pub(super) fn endpoint(runs: &SortedHotRuns, rank: usize) -> RuntimeOrFatalResult<HotMergeCut> {
+pub(super) fn endpoint(runs: &SortedRuns, rank: usize) -> RuntimeOrFatalResult<MergeCut> {
     let mut positions = BudgetedVec::new(&runs.budget);
     positions
         .ensure_capacity(runs.runs().len(), "merge boundary positions")
@@ -95,7 +119,7 @@ pub(super) fn endpoint(runs: &SortedHotRuns, rank: usize) -> RuntimeOrFatalResul
             .change_context(RuntimeError::IndexAccess)?;
     }
     let (left, right) = neighbors(runs, &positions);
-    Ok(HotMergeCut {
+    Ok(MergeCut {
         rank,
         positions,
         left,
@@ -105,10 +129,7 @@ pub(super) fn endpoint(runs: &SortedHotRuns, rank: usize) -> RuntimeOrFatalResul
     })
 }
 
-fn neighbors(
-    runs: &SortedHotRuns,
-    positions: &[usize],
-) -> (Option<HotEntryRef>, Option<HotEntryRef>) {
+fn neighbors(runs: &SortedRuns, positions: &[usize]) -> (Option<HotEntryRef>, Option<HotEntryRef>) {
     let mut left: Option<HotEntryRef> = None;
     let mut right: Option<HotEntryRef> = None;
     for (run, &position) in positions.iter().enumerate() {
@@ -129,7 +150,7 @@ fn neighbors(
 }
 
 /// Check coverage and monotonicity before any partition consumer is admitted.
-pub(super) fn verify(runs: &SortedHotRuns, cuts: &[HotMergeCut]) -> RuntimeOrFatalResult<()> {
+pub(super) fn verify(runs: &SortedRuns, cuts: &[MergeCut]) -> RuntimeOrFatalResult<()> {
     for (index, cut) in cuts.iter().enumerate() {
         if cut.positions.len() != runs.runs().len() {
             return Err(execution_error("co-rank vector length mismatch"));
