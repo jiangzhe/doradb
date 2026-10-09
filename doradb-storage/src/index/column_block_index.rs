@@ -11,6 +11,7 @@ use crate::file::block_integrity::{
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
+use crate::index::build::{BudgetedVec, MemoryBudget};
 use crate::index::identity_set::{EncodedRowSet, IdentitySetSeed, RowSetRef};
 use crate::index::ordinal_deletion_set::{
     OrdinalDeletionSet, OrdinalDeletionSetRef, deletion_body_bound,
@@ -1477,6 +1478,76 @@ impl<'a> ColumnBlockIndex<'a> {
                         .into());
                 }
                 stack.push(child_block_id);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Collects all leaf entries in ascending `start_row_id` order.
+    pub(crate) async fn collect_leaf_entries_budgeted(
+        &self,
+        budget: &MemoryBudget,
+    ) -> RuntimeOrFatalResult<BudgetedVec<ColumnLeafEntry>> {
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(BudgetedVec::new(budget));
+        }
+        let mut stack = BudgetedVec::new(budget);
+        stack
+            .push(self.root_block_id, "cold traversal stack")
+            .change_context(RuntimeError::IndexAccess)?;
+        let mut entries = BudgetedVec::new(budget);
+        let mut last_end = None;
+        while let Some(block_id) = stack.pop() {
+            let node = self.read_node(block_id).await?;
+            if node.is_leaf() {
+                let prefixes = self
+                    .node_result(block_id, node.leaf_prefix_plane())
+                    .change_context(RuntimeError::IndexAccess)
+                    .attach("operation=collect_column_leaf_entries")?;
+                for idx in 0..prefixes.count() {
+                    let view = self
+                        .node_result(block_id, node.leaf_entry_view_with_prefixes(&prefixes, idx))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_leaf_entries")?;
+                    let entry = self
+                        .node_result(block_id, build_leaf_entry(block_id, &view))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_leaf_entries")?;
+                    if let Some(prev_end) = last_end
+                        && entry.start_row_id < prev_end
+                    {
+                        return Err(invalid_node_payload()
+                            .attach(format!(
+                                "file={}, block=column_block_index, block_id={block_id}",
+                                self.file_kind()
+                            ))
+                            .change_context(RuntimeError::IndexAccess)
+                            .attach("operation=collect_column_leaf_entries")
+                            .into());
+                    }
+                    last_end = Some(entry.end_row_id());
+                    entries
+                        .push(entry, "cold descriptors")
+                        .change_context(RuntimeError::IndexAccess)?;
+                }
+                continue;
+            }
+            let branch_entries = node.branch_entries();
+            for entry in branch_entries.iter().rev() {
+                let child_block_id = entry.block_id();
+                if child_block_id == SUPER_BLOCK_ID {
+                    return Err(invalid_node_payload()
+                        .attach(format!(
+                            "file={}, block=column_block_index, block_id={block_id}",
+                            self.file_kind()
+                        ))
+                        .change_context(RuntimeError::IndexAccess)
+                        .attach("operation=collect_column_leaf_entries")
+                        .into());
+                }
+                stack
+                    .push(child_block_id, "cold traversal stack")
+                    .change_context(RuntimeError::IndexAccess)?;
             }
         }
         Ok(entries)

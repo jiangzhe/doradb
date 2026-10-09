@@ -4,6 +4,7 @@ title: Parallel DiskTree Construction and Checkpoint Application
 status: proposal
 tags: [storage, index, ddl, checkpoint, parallelism, performance]
 created: 2026-10-05
+github_issue: 1144
 ---
 
 # RFC-0033: Parallel DiskTree Construction and Checkpoint Application
@@ -171,7 +172,7 @@ Issue Labels:
   `doradb-bench/src/workload/` — public-call benchmarks, fixture admission,
   verification and normalized configuration.
 - [C11] `doradb-storage/src/conf/index_build.rs` and
-  `doradb-storage/src/profiling/hot_index_build.rs` — existing limits and
+  `doradb-storage/src/profiling/index_build.rs` — existing limits and
   separation of extraction, construction and publication measurements.
 - [C12] `doradb-storage/src/index/column_block_index.rs` — descriptor traversal,
   physical RowID membership and durable deletion metadata; `collect_leaf_entries`
@@ -726,7 +727,7 @@ sidecar failure after other checkpoint writes uses their existing settlement
 path. Streaming and parallelism do not relax these admission boundaries.
 [U12] [C2] [C5] [C6]
 
-Keep existing hot-build settings and semantics. Add a disk-build policy usable
+Keep existing hot-build settings and semantics. Add a cold-build policy usable
 by CREATE and checkpoint, with an invocation-wide worker/scratch bound for
 multi-index checkpoint work and explicit bounded output admission. Final
 configuration names/defaults and byte accounting are Phase 1 choices reviewed
@@ -818,7 +819,7 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     source exclusion, cold/cold checks and publication sequence.
   - Phase-local Choices: Shared type/helper extraction; charged descriptor and
     decode/projection interfaces; zero-copy single-run adapter, target partition
-    size and legacy validator ownership; disk policy names/defaults, capacity
+    size and legacy validator ownership; cold policy names/defaults, capacity
     and progress reserves; packed-buffer/acceptance message shape, coordinator
     submission helper and bounded parent assembly. Coordinator allocation,
     submission ownership and progress barriers are fixed by this RFC.
@@ -843,10 +844,10 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     input ownership so Phase 2 can consume and release the latter.
   - Non-goals: Parallel cold extraction, replacing cross-tier validation,
     checkpoint delta reconciliation or spill.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md`
+  - Task Issue: `#1145`
+  - Phase Status: done
+  - Implementation Summary: Implemented bounded parallel durable CREATE construction for both index modes, including admitted serial input, shared direct single-run partitions, retained asynchronous write settlement, public limits, and profiling. Verified 2311 workspace and 2047 profiling-disabled storage tests plus 171 matched benchmark invocations; million-row checkpointed CREATE medians improved 76.6% unique and 72.5% non-unique. Serial extraction and retained-key validation remain for Phases 2 and 3; both source backlogs stay open. [Task Resolve Sync: docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md @ 2026-10-05]
   - Related Backlogs:
     - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
     - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
@@ -1120,7 +1121,7 @@ Phase 1; a worker-owned mutable-file write interface is not required. Phase 1
 task design will resolve the remaining configuration choice within these
 contracts:
 
-- Should one public disk-build policy configure both CREATE and checkpoint,
+- Should one public cold-build policy configure both CREATE and checkpoint,
   with invocation-wide checkpoint admission, or should callers expose separate
   controls backed by the same internal limits? Budget ownership is fixed either way.
 

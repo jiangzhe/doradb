@@ -1559,7 +1559,7 @@ mod tests {
                     pivot,
                     ddl: None,
                     #[cfg(feature = "profiling")]
-                    profiler: self.resources.hot_build_profiler.clone(),
+                    profiler: self.resources.index_build_profiler.clone(),
                 },
                 spec,
                 MIN_SNAPSHOT_TS,
@@ -1607,8 +1607,8 @@ mod tests {
         recovery.resources.hot_build_policy = policy;
         #[cfg(feature = "profiling")]
         {
-            recovery.resources.hot_build_profiler =
-                engine.inner().core.trx_sys.hot_build_profiler.clone();
+            recovery.resources.index_build_profiler =
+                engine.inner().core.trx_sys.index_build_profiler.clone();
         }
         let source = recovery.capture_hot_index_build(table, spec).await?;
         assert!(recovery.dispatcher.page_history.is_empty());

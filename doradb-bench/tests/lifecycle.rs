@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             run.internal_metrics
                 .iter()
-                .any(|metric| metric.name.starts_with("hot_index_build.")),
+                .any(|metric| metric.name.starts_with("hot_index_extraction.")),
             stats && index.is_some_and(|index| index != "none"),
         );
 
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(create.sampled_process_rss.is_some(), stats);
         assert_eq!(!run.internal_metrics.is_empty(), stats);
         for metric_name in [
-            "hot_index_build.completed_builds",
+            "hot_index_extraction.completed_builds",
             "create_index.completed_builds",
         ] {
             let metric = run

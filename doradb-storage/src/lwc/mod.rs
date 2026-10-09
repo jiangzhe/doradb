@@ -16,7 +16,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
 use crate::serde::{ForBitpackingSer, Ser, Serde};
-use crate::value::{MemVar, Val, ValKind};
+use crate::value::{MEM_VAR_LEN_INLINE, MemVar, Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::borrow::Cow;
 use std::mem;
@@ -393,6 +393,21 @@ impl<'a> LwcData<'a> {
                 LwcPrimitive::Bytes(b) => b.len(),
             },
             LwcData::Bytes(b) => b.len(),
+        }
+    }
+
+    /// Determine owned variable payload capacity from validated borrowed bytes.
+    #[inline]
+    pub(crate) fn owned_value_bytes(&self, idx: usize) -> Option<usize> {
+        match self {
+            Self::Bytes(b) | Self::Primitive(LwcPrimitive::Bytes(b)) => b.slice(idx).map(|bytes| {
+                if bytes.len() > MEM_VAR_LEN_INLINE {
+                    bytes.len()
+                } else {
+                    0
+                }
+            }),
+            Self::Primitive(_) => (idx < self.len()).then_some(0),
         }
     }
 

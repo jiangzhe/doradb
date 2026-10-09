@@ -3,11 +3,14 @@ use super::cold_validation::{
     ColdHotCompletion, ColdHotCursor, ColdHotDuplicate, ColdHotSummary, ColdValidation,
 };
 use super::merge::{
-    CompletedPartition, HotDuplicate, HotEntryRef, HotMergeCompletion, HotMergeConsumption,
-    HotPartitionConsumer, PartitionMergeStream, PreparedHotMerge, execution_error, observe_stop,
+    CompletedPartition, HotDuplicate, HotEntryRef, MergeCompletion, MergeConsumption,
+    PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error, observe_stop,
+};
+use super::packing::{
+    LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
 };
 use super::page_cleanup::{PageProducer, StagedPageOwner};
-use super::{BudgetedVec, MemoryBudget, SortedHotRuns};
+use super::{BudgetedVec, MemoryBudget, SortedRuns};
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::completion::Completion;
@@ -18,10 +21,9 @@ use crate::error::{
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
-    try_plan_sibling_node,
 };
 use crate::index::btree::{
-    BTREE_BYTE_ZERO, BTREE_NODE_USABLE_SIZE, BTreeByte, BTreeNode, BTreeSlot, BTreeU64, BTreeValue,
+    BTREE_BYTE_ZERO, BTREE_NODE_USABLE_SIZE, BTreeByte, BTreeNode, BTreeU64, BTreeValue,
     PackedNodeSpace,
 };
 use crate::index::mem_index::MemIndex;
@@ -30,8 +32,8 @@ use crate::latch::LatchFallbackMode;
 use crate::poison::EnginePoisoner;
 #[cfg(feature = "profiling")]
 use crate::profiling::{
-    ColdHotMeasurements, HotMergeMeasurements, HotPackedLevel, HotPackedMeasurements,
-    PageMeasurement, ParentPlanningProfile, clock::Instant,
+    ColdHotMeasurements, HotPackedLevel, HotPackedMeasurements, MergeMeasurements, PageMeasurement,
+    ParentPlanningProfile, clock::Instant,
 };
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{thread_pool::ThreadPool, yield_now};
@@ -53,7 +55,6 @@ pub(crate) use tests::{
     assert_recovery_root, gate_recovery_allocation, panic_install_transfer, panic_recovery_cleanup,
 };
 
-const INITIAL_CANDIDATES: usize = 64;
 const PARENT_WINDOW: usize = max_node_slots::<BTreeU64>() + 2;
 
 /// Page identity and borrowed fence coordinates; ownership lives only in the page tracker.
@@ -117,12 +118,12 @@ impl From<ColdHotDuplicate> for HotBuildDuplicate {
 
 struct Assembly {
     root: Option<ChildDescriptor>,
-    completion: HotMergeCompletion,
+    completion: MergeCompletion,
     cold_completion: ColdHotCompletion,
     #[cfg(feature = "profiling")]
     measurements: HotPackedMeasurements,
     #[cfg(feature = "profiling")]
-    merge: HotMergeMeasurements,
+    merge: MergeMeasurements,
 }
 
 type AssemblyResult = RuntimeOrFatalResult<HotPackedOutcome<Assembly>>;
@@ -144,14 +145,14 @@ pub(super) struct HotPackedBuild<P: BufferPool + 'static> {
     poisoner: QuiescentGuard<EnginePoisoner>,
     packing: Option<Arc<Packing<P>>>,
     // Present until leaf results are collected or accepted leaf jobs settle.
-    leaves: Option<HotMergeConsumption<PackedLeafConsumer<P>>>,
+    leaves: Option<MergeConsumption<PackedLeafConsumer<P>>>,
     // Keep the completed child level until all of its parents are collected.
     children: Option<Arc<BudgetedVec<ChildDescriptor>>>,
     parent_level: Option<ParentLevel>,
-    completion: Option<HotMergeCompletion>,
+    completion: Option<MergeCompletion>,
     cold_completion: Option<ColdHotCompletion>,
     cold_validation: ColdValidation,
-    plan: Arc<PreparedHotMerge>,
+    plan: Arc<PreparedMerge>,
     outcome: Option<AssemblyResult>,
     stop: Arc<AtomicBool>,
     max_workers: usize,
@@ -159,7 +160,7 @@ pub(super) struct HotPackedBuild<P: BufferPool + 'static> {
     #[cfg(feature = "profiling")]
     measurements: HotPackedMeasurements,
     #[cfg(feature = "profiling")]
-    merge: HotMergeMeasurements,
+    merge: MergeMeasurements,
 }
 
 impl<P: BufferPool + 'static> HotPackedBuild<P> {
@@ -167,7 +168,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
     pub(super) fn new(
         pool: QuiescentGuard<P>,
         guard: PoolGuard,
-        plan: Arc<PreparedHotMerge>,
+        plan: Arc<PreparedMerge>,
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         spec: HotPackedSpec,
@@ -186,7 +187,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             ts,
         });
         let max_workers = plan.workers();
-        let leaves = HotMergeConsumption::new(
+        let leaves = MergeConsumption::new(
             plan.clone(),
             thread_pool.clone(),
             PackedLeafConsumer {
@@ -215,7 +216,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             #[cfg(feature = "profiling")]
             measurements: HotPackedMeasurements::default(),
             #[cfg(feature = "profiling")]
-            merge: HotMergeMeasurements::default(),
+            merge: MergeMeasurements::default(),
         };
         (build, cleanup)
     }
@@ -624,7 +625,7 @@ impl<P: BufferPool + 'static> ReadyHotTree<P> {
     /// Borrow completed component measurements without exporting builder state.
     #[cfg(feature = "profiling")]
     #[inline]
-    pub(crate) fn measurements(&self) -> (&HotMergeMeasurements, &HotPackedMeasurements) {
+    pub(crate) fn measurements(&self) -> (&MergeMeasurements, &HotPackedMeasurements) {
         (&self.assembly.merge, &self.assembly.measurements)
     }
 
@@ -783,81 +784,8 @@ impl ParentLevel {
 
 struct Packing<P: 'static> {
     producer: PageProducer<P>,
-    runs: Arc<SortedHotRuns>,
+    runs: Arc<SortedRuns>,
     ts: TrxID,
-}
-
-// A fixed allocation retains lookahead; consuming a prefix only advances head.
-// Initialized slots are reused after wraparound, without moving live entries.
-struct LeafWindow {
-    entries: BudgetedVec<HotEntryRef>,
-    head: usize,
-    len: usize,
-    capacity: usize,
-}
-
-impl LeafWindow {
-    fn new(budget: &MemoryBudget, capacity: usize) -> RuntimeOrFatalResult<Self> {
-        let mut entries = BudgetedVec::new(budget);
-        entries
-            .ensure_capacity(capacity, "packing window")
-            .change_context(RuntimeError::IndexAccess)?;
-        Ok(Self {
-            entries,
-            head: 0,
-            len: 0,
-            capacity,
-        })
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn is_full(&self) -> bool {
-        self.len == self.capacity
-    }
-
-    #[inline]
-    fn get(&self, index: usize) -> Option<HotEntryRef> {
-        (index < self.len).then(|| self.entries[(self.head + index) % self.capacity])
-    }
-
-    #[inline]
-    fn push(&mut self, entry: HotEntryRef) {
-        assert!(
-            self.len < self.capacity,
-            "hot leaf window exceeds its admitted capacity"
-        );
-        let index = (self.head + self.len) % self.capacity;
-        if index == self.entries.len() {
-            self.entries.push_reserved(entry);
-        } else {
-            self.entries[index] = entry;
-        }
-        self.len += 1;
-    }
-
-    #[inline]
-    fn consume(&mut self, count: usize) {
-        assert!(
-            count <= self.len,
-            "hot leaf window consumption exceeds retained entries"
-        );
-        if count != 0 {
-            self.head = (self.head + count) % self.capacity;
-            self.len -= count;
-        }
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.entries.clear();
-        self.head = 0;
-        self.len = 0;
-    }
 }
 
 struct PackedLeaves {
@@ -872,7 +800,7 @@ struct PackedLeafConsumer<P: 'static> {
     cold_validation: ColdValidation,
 }
 
-impl<P: BufferPool + 'static> HotPartitionConsumer for PackedLeafConsumer<P> {
+impl<P: BufferPool + 'static> PartitionConsumer for PackedLeafConsumer<P> {
     type Output = PackedLeaves;
 
     async fn consume(
@@ -905,9 +833,9 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         value: fn(RowID) -> V,
         mut cold: Option<ColdHotCursor>,
     ) -> RuntimeOrFatalResult<CompletedPartition<PackedLeaves>> {
-        // Retain three maximal pages plus lookahead so the final two pages
-        // remain editable. Specialize the conservative bound for the value size.
-        let window_capacity = (3 * max_node_slots::<V>() + 1).min(stream.remaining_entries());
+        // Bound buffered coordinates independently of key widths, specializing
+        // the conservative slot bound for the leaf value size.
+        let window_capacity = max_leaf_window_entries::<V>().min(stream.remaining_entries());
         let mut window = LeafWindow::new(&self.packing.runs.budget, window_capacity)?;
         let mut entries = BudgetedVec::new(&self.packing.runs.budget);
         let mut leaves = BudgetedVec::new(&self.packing.runs.budget);
@@ -976,50 +904,15 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
     ) -> RuntimeOrFatalResult<usize> {
         #[cfg(feature = "profiling")]
         let started = Instant::now();
-        let mut count = plan_candidates(
+        let plan = plan_leaf(
+            &self.packing.runs,
+            window,
+            lower,
+            upper,
+            value,
             entries,
-            window.len(),
-            PackedNodePlanParams {
-                lower_fence: fence(&self.packing.runs, lower),
-                upper_fence: upper.map(|r| fence(&self.packing.runs, Some(r))),
-                min_slots: 1,
-            },
             "packing entries",
-            |index| {
-                let coordinate = window
-                    .get(index)
-                    .unwrap_or_else(|| unreachable!("bounded leaf candidate index"));
-                let entry = coordinate.resolve(&self.packing.runs);
-                PackedNodeEntry {
-                    key: entry.key.as_bytes(),
-                    value: value(entry.row_id),
-                }
-            },
         )?;
-        // A singleton final tail is legal, but repair it whenever the two final
-        // candidates can share their entries under the newly proposed fences.
-        if count + 1 == window.len() && count > 2 {
-            let cut = count - 1;
-            if fits::<V>(
-                fence(&self.packing.runs, lower),
-                entries[cut].key,
-                &entries[..cut],
-            ) && fits::<V>(
-                entries[cut].key,
-                fence(&self.packing.runs, upper),
-                &entries[cut..],
-            ) {
-                count = cut;
-            }
-        }
-        let high = window.get(count).or(upper);
-        if let Some(high) = high
-            && entries[count - 1].key >= fence(&self.packing.runs, Some(high))
-        {
-            return Err(execution_error(
-                "hot leaf contains a duplicate or excludes its last key",
-            ));
-        }
         leaves
             .reserve_one("leaf descriptors")
             .change_context(RuntimeError::IndexAccess)?;
@@ -1030,21 +923,14 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         let packing_started = Instant::now();
         pack_fixed_entries(
             page.page_mut(),
-            KnownFenceNodeParams {
-                height: 0,
-                ts: self.packing.ts,
-                lower_fence: fence(&self.packing.runs, lower),
-                lower_fence_value: BTreeU64::INVALID_VALUE,
-                upper_fence: high.map(|r| fence(&self.packing.runs, Some(r))),
-                hints_enabled: true,
-            },
-            &entries[..count],
+            plan.node_params(&self.packing.runs, self.packing.ts),
+            &entries[..plan.count],
         );
         leaves.push_reserved(ChildDescriptor {
             page_id: page.page_id(),
             height: 0,
-            lower,
-            upper: high,
+            lower: plan.lower,
+            upper: plan.upper,
             #[cfg(feature = "profiling")]
             measurement: PageMeasurement {
                 planning: allocation_started.duration_since(started).as_nanos() as u64,
@@ -1056,79 +942,17 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
             },
         });
         page.set_dirty();
-        Ok(count)
-    }
-}
-
-// Even zero-byte key suffixes need a slot and an encoded value. Ignoring the
-// header and fences gives a cheap upper bound independent of compression.
-const fn max_node_slots<V: BTreeValue>() -> usize {
-    BTREE_NODE_USABLE_SIZE / (size_of::<BTreeSlot>() + V::ENCODED_LEN)
-}
-
-fn plan_candidates<'a, V: BTreeValue + Copy>(
-    entries: &mut BudgetedVec<PackedNodeEntry<'a, V>>,
-    available: usize,
-    params: PackedNodePlanParams<'a>,
-    purpose: &'static str,
-    mut entry: impl FnMut(usize) -> PackedNodeEntry<'a, V>,
-) -> RuntimeOrFatalResult<usize> {
-    // One extra candidate supplies the upper fence even for a maximal node.
-    let limit = available.min(max_node_slots::<V>() + 1);
-    let mut count = limit.min(INITIAL_CANDIDATES);
-    entries.clear();
-    loop {
-        entries
-            .ensure_capacity(count, purpose)
-            .change_context(RuntimeError::IndexAccess)?;
-        for index in entries.len()..count {
-            entries.push_reserved(entry(index));
-        }
-        let plan = try_plan_sibling_node(params, entries);
-        if count < limit {
-            let reaches_end = plan.is_some_and(|plan| plan.packed + 1 >= count);
-            // The existing planner can stop at overflow once the prefix is inline.
-            // An outlined prefix may still shrink and free space at a later fence.
-            let prefix_can_shrink =
-                PackedNodeSpace::with_fences(params.lower_fence, entries[count - 1].key)
-                    .is_none_or(|space| !space.prefix_is_inline());
-            if reaches_end || prefix_can_shrink {
-                count = (count * 2).min(limit);
-                continue;
-            }
-        }
-        return plan
-            .map(|plan| plan.packed)
-            .ok_or_else(|| execution_error("hot node key/fences cannot fit a page"));
+        Ok(plan.count)
     }
 }
 
 #[inline]
-fn fence(runs: &SortedHotRuns, reference: Option<HotEntryRef>) -> &[u8] {
+fn fence(runs: &SortedRuns, reference: Option<HotEntryRef>) -> &[u8] {
     reference.map_or(&[], |r| r.resolve(runs).key.as_bytes())
 }
 
-fn fits<V: BTreeValue + Copy>(
-    lower: &[u8],
-    upper: &[u8],
-    entries: &[PackedNodeEntry<'_, V>],
-) -> bool {
-    let Some(mut space) = PackedNodeSpace::with_fences(lower, upper) else {
-        return false;
-    };
-    for entry in entries {
-        if space
-            .add_entry::<V>(entry.key)
-            .is_none_or(|size| size > BTREE_NODE_USABLE_SIZE)
-        {
-            return false;
-        }
-    }
-    space.total_space() <= BTREE_NODE_USABLE_SIZE
-}
-
 async fn root_fits(
-    runs: &SortedHotRuns,
+    runs: &SortedRuns,
     children: &[ChildDescriptor],
     #[cfg(feature = "profiling")] profile: &mut ParentPlanningProfile,
 ) -> bool {
@@ -1154,7 +978,7 @@ async fn root_fits(
 }
 
 async fn plan_groups(
-    runs: &SortedHotRuns,
+    runs: &SortedRuns,
     children: &[ChildDescriptor],
     #[cfg(feature = "profiling")] profile: &mut ParentPlanningProfile,
 ) -> RuntimeOrFatalResult<BudgetedVec<Range<usize>>> {
@@ -1201,7 +1025,7 @@ async fn plan_groups(
     Ok(groups)
 }
 
-fn branch_fits(runs: &SortedHotRuns, children: &[ChildDescriptor]) -> bool {
+fn branch_fits(runs: &SortedRuns, children: &[ChildDescriptor]) -> bool {
     let first = children[0];
     let Some(mut space) = PackedNodeSpace::with_fences(
         fence(runs, first.lower),
@@ -1333,6 +1157,7 @@ fn collect_level(measurements: &mut HotPackedMeasurements, children: &[ChildDesc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::btree::algo::try_plan_sibling_node;
 
     use crate::buffer::EvictableBufferPool;
     use crate::buffer::minimum_fixed_pool_bytes;
@@ -1433,12 +1258,7 @@ mod tests {
         BTreeKey::from(bytes.as_slice())
     }
 
-    fn input(
-        count: usize,
-        width: usize,
-        prefix: usize,
-        policy: DuplicateCheck,
-    ) -> Arc<SortedHotRuns> {
+    fn input(count: usize, width: usize, prefix: usize, policy: DuplicateCheck) -> Arc<SortedRuns> {
         let groups = if count == 0 {
             vec![]
         } else {
@@ -1454,7 +1274,7 @@ mod tests {
         test_runs(groups, policy, MemoryBudget::new(256 * 1024 * 1024))
     }
 
-    fn duplicate_input() -> Arc<SortedHotRuns> {
+    fn duplicate_input() -> Arc<SortedRuns> {
         test_runs(
             vec![
                 (0..3000).map(|i| key(i, 256, 0)).collect(),
@@ -1506,7 +1326,7 @@ mod tests {
 
     fn packed_build<P: BufferPool>(
         pool: QuiescentGuard<P>,
-        plan: Arc<PreparedHotMerge>,
+        plan: Arc<PreparedMerge>,
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         unique: bool,
@@ -1584,7 +1404,7 @@ mod tests {
         ids
     }
 
-    fn oracle(runs: &SortedHotRuns) -> BTreeMap<BTreeKey, RowID> {
+    fn oracle(runs: &SortedRuns) -> BTreeMap<BTreeKey, RowID> {
         runs.runs()
             .iter()
             .flat_map(|run| {
@@ -1593,6 +1413,25 @@ mod tests {
                     .map(|entry| (entry.key.clone(), entry.row_id))
             })
             .collect()
+    }
+
+    fn fits<V: BTreeValue + Copy>(
+        lower: &[u8],
+        upper: &[u8],
+        entries: &[PackedNodeEntry<'_, V>],
+    ) -> bool {
+        let Some(mut space) = PackedNodeSpace::with_fences(lower, upper) else {
+            return false;
+        };
+        for entry in entries {
+            if space
+                .add_entry::<V>(entry.key)
+                .is_none_or(|size| size > BTREE_NODE_USABLE_SIZE)
+            {
+                return false;
+            }
+        }
+        space.total_space() <= BTREE_NODE_USABLE_SIZE
     }
 
     fn assert_candidate_plans<V: BTreeValue + Copy>(keys: &[BTreeKey], value: V) {
@@ -1639,45 +1478,6 @@ mod tests {
                 );
                 assert!(entries.capacity() <= max_node_slots::<V>() + 1);
             }
-        }
-    }
-
-    /// Purpose: Protect retained leaf order and allocation reuse across circular-window wraparound and reset.
-    /// Expected: Consumed and refilled windows match a queue oracle without moving or reallocating backing storage.
-    #[test]
-    fn packed_leaf_window_wraparound() {
-        use std::collections::VecDeque;
-        let runs = input(100, 8, 0, DuplicateCheck::Skip);
-        for capacity in [0, 1, 7, 64] {
-            let budget = MemoryBudget::new(4096);
-            let mut window = LeafWindow::new(&budget, capacity).unwrap();
-            let allocation = window.entries.as_ptr();
-            let mut expected = VecDeque::new();
-            for round in 0..100 {
-                while !window.is_full() {
-                    let entry = HotEntryRef::new(&runs, round % 4, (round + window.len()) % 25);
-                    window.push(entry);
-                    expected.push_back(entry);
-                }
-                for (index, &entry) in expected.iter().enumerate() {
-                    assert_eq!(window.get(index), Some(entry));
-                }
-                assert_eq!(window.get(expected.len()), None);
-                assert_eq!(window.entries.as_ptr(), allocation);
-                assert_eq!(budget.used(), capacity * size_of::<HotEntryRef>());
-                let count = (round % 5 + 1).min(expected.len());
-                let retained = window.entries.to_vec();
-                window.consume(count);
-                assert_eq!(&*window.entries, retained.as_slice());
-                expected.drain(..count);
-                assert_eq!(window.len(), expected.len());
-                if round % 11 == 10 {
-                    window.clear();
-                    expected.clear();
-                }
-            }
-            drop(window);
-            assert_eq!(budget.used(), 0);
         }
     }
 
@@ -1837,7 +1637,14 @@ mod tests {
                 (600, 256, 0, true, 2, 31),
                 (64, 64, 800, false, 2, 23),
                 // One entry beyond the packing window forces wraparound within a batch.
-                (3 * max_node_slots::<BTreeU64>() + 2, 8, 0, true, 1, 32_768),
+                (
+                    max_leaf_window_entries::<BTreeU64>() + 1,
+                    8,
+                    0,
+                    true,
+                    1,
+                    32_768,
+                ),
             ] {
                 for policy in [DuplicateCheck::Collect, DuplicateCheck::Skip] {
                     let runs = input(count, width, prefix, policy);
@@ -3079,7 +2886,7 @@ mod tests {
             let (_scope, thread_pool, poisoner) = workers(2).await;
             let pool = pages(32 * 1024 * 1024);
             for (hot_duplicate, multiple_runs) in [(false, false), (false, true), (true, true)] {
-                let count = 3 * max_node_slots::<BTreeU64>() + 1025;
+                let count = max_leaf_window_entries::<BTreeU64>() + 1024;
                 let runs = if hot_duplicate {
                     duplicate_input()
                 } else {

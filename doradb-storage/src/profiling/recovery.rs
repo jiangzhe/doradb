@@ -401,7 +401,7 @@ fn validate_recovery_work(work: &RecoveryWorkCounts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiling::{HotBuildMeasurements, HotMergeMeasurements};
+    use crate::profiling::{HotExtractionMeasurements, MergeMeasurements};
 
     /// Purpose: Finalize nested recovery timings when measured components exceed their envelope.
     /// Expected: Valid residual intervals remain exact and negative residuals become zero.
@@ -444,15 +444,15 @@ mod tests {
     fn recovery_measurements_round_trip_with_strict_fields() {
         let storage = RecoveryReport {
             hot_indexes: RecoveryHotIndexMeasurements {
-                extraction: HotBuildMeasurements {
+                extraction: HotExtractionMeasurements {
                     entries: u64::MAX,
                     source_pages: 7,
-                    ..HotBuildMeasurements::default()
+                    ..HotExtractionMeasurements::default()
                 },
-                merge: HotMergeMeasurements {
+                merge: MergeMeasurements {
                     checked: true,
                     partitions: 3,
-                    ..HotMergeMeasurements::default()
+                    ..MergeMeasurements::default()
                 },
                 completed_builds: 2,
                 scratch_peak_bytes: 4096,

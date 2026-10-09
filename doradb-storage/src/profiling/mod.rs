@@ -15,7 +15,7 @@ mod buffer;
 mod checkpoint;
 mod cleanup;
 pub(crate) mod clock;
-mod hot_index_build;
+mod index_build;
 mod io;
 mod lock;
 mod metrics;
@@ -29,9 +29,9 @@ pub use checkpoint::{
     CatalogCheckpointReport, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
 };
 pub use cleanup::{MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats};
-pub use hot_index_build::{
-    CreateIndexMeasurements, HotBuildMeasurements, HotIndexBuildStats, HotIndexMeasurements,
-    HotMergeMeasurements, RecoveryHotIndexMeasurements,
+pub use index_build::{
+    ColdBuildMeasurements, CreateIndexMeasurements, HotExtractionMeasurements,
+    HotIndexMeasurements, IndexBuildStats, MergeMeasurements, RecoveryHotIndexMeasurements,
 };
 pub use io::{IoBackendStats, StorageIoStats};
 pub use lock::LogicalLockStats;
@@ -50,9 +50,9 @@ pub(crate) use buffer::{
 pub(crate) use checkpoint::{
     CatalogCheckpointMeasurement, CheckpointLwcProfile, MeasurableMutableCowFile,
 };
-pub(crate) use hot_index_build::{
-    ColdHotMeasurements, HotBuildProfile, HotBuildWorkerProfile, HotIndexBuildProfiler,
-    HotMergeWorkerProfile, HotPackedLevel, HotPackedMeasurements, PageMeasurement,
+pub(crate) use index_build::{
+    ColdHotMeasurements, HotExtractionProfile, HotExtractionWorkerProfile, HotPackedLevel,
+    HotPackedMeasurements, IndexBuildProfiler, MergeWorkerProfile, PageMeasurement,
     ParentPlanningProfile,
 };
 pub(crate) use io::{

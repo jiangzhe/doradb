@@ -305,6 +305,28 @@ impl LwcBlock {
         Ok(vals)
     }
 
+    /// Inspect variable allocation capacity before decoding an owned value.
+    #[inline]
+    pub(crate) fn owned_value_bytes(
+        &self,
+        col_layout: &TableColumnLayout,
+        row_idx: usize,
+        col_idx: usize,
+    ) -> DataIntegrityResult<usize> {
+        let column = self.column(col_layout, col_idx)?;
+        if row_idx >= self.row_count() {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach("LWC admission row is outside block"));
+        }
+        if column.is_null(row_idx) {
+            return Ok(0);
+        }
+        column.data()?.owned_value_bytes(row_idx).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .attach("LWC admission value is outside validated column")
+        })
+    }
+
     /// Decodes one value from a block row.
     #[inline]
     pub(crate) fn decode_value(

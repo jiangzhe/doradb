@@ -28,6 +28,7 @@ use crate::file::super_block::{
 };
 use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, FileID, RowID, TableID, TrxID};
+use crate::index::build::MemoryReservation;
 use crate::index::{ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex};
 use crate::io::{DirectBuf, IOBuf, IOClient};
 use crate::obs;
@@ -37,6 +38,7 @@ use crate::quiescent::QuiescentGuard;
 use crate::serde::{Deser, Ser};
 use crate::trx::MIN_SNAPSHOT_TS;
 use error_stack::{Report, ResultExt};
+use futures::future::BoxFuture;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -476,6 +478,36 @@ impl MutableTableFile {
                 Err(err)
             }
         }
+    }
+
+    /// Prepare one allocated DiskTree block for retained shared-storage ingress.
+    /// Allocation is recorded by the coordinator before this call; this method
+    /// grants no terminal-write or publication authority.
+    pub(crate) fn prepare_disk_tree_write(
+        &self,
+        block_id: BlockID,
+        buf: DirectBuf,
+        allocation: MemoryReservation,
+    ) -> RuntimeOrFatalResult<BoxFuture<'static, CompletionResult<Arc<Completion<()>>>>> {
+        let file = self.file.sparse_file();
+        let file_id = file.file_id();
+        let lease = self
+            .write_barrier
+            .as_cow_write_barrier()
+            .begin_write(file_id, block_id)
+            .change_context(RuntimeError::FileRootAccess)
+            .attach_with(|| {
+                format!("operation=prepare_disk_tree_write, file_id={file_id}, block_id={block_id}")
+            })?;
+        Ok(super::prepare_charged_write(
+            super::BlockKey::new(file_id, block_id),
+            file.clone(),
+            usize::from(block_id) * COW_FILE_PAGE_SIZE,
+            buf,
+            self.background_writes.clone(),
+            lease,
+            allocation,
+        ))
     }
 
     /// Allocate and submit one logically ordered LWC data-block write.

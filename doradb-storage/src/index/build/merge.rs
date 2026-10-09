@@ -1,20 +1,20 @@
 //! Retained boundary/consumer ledgers and the private streaming handoff.
-use super::co_rank::{self, HotMergeCut};
+use super::co_rank::{self, MergeCut};
 use super::loser_tree::LoserTree;
-use super::{BudgetedVec, DuplicateCheck, IndexBuildEntry, LocalDuplicates, SortedHotRuns};
+use super::{
+    BudgetedVec, DuplicateCheck, IndexBuildEntry, LocalDuplicates, MemoryReservation, SortedRuns,
+};
 use crate::completion::Completion;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::RowID;
 #[cfg(feature = "profiling")]
-use crate::profiling::{HotMergeMeasurements, HotMergeWorkerProfile, clock::Instant};
+use crate::profiling::{MergeMeasurements, MergeWorkerProfile, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
 use error_stack::{Report, ResultExt};
 use std::cmp::Ordering;
 use std::future::Future;
-#[cfg(feature = "profiling")]
-use std::mem::size_of;
-use std::mem::take;
+use std::mem::{replace, take};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -35,7 +35,7 @@ pub(crate) struct HotEntryRef {
 impl HotEntryRef {
     /// Establish coordinate bounds once before retaining a reference.
     #[inline]
-    pub(super) fn new(runs: &SortedHotRuns, run: usize, position: usize) -> Self {
+    pub(super) fn new(runs: &SortedRuns, run: usize, position: usize) -> Self {
         assert!(
             runs.entry(run, position).is_some(),
             "hot merge coordinate outside run: run={run}, position={position}"
@@ -45,13 +45,13 @@ impl HotEntryRef {
 
     /// Compare established coordinates using physical key and provenance.
     #[inline]
-    pub(super) fn compare(self, runs: &SortedHotRuns, other: Self) -> Ordering {
+    pub(super) fn compare(self, runs: &SortedRuns, other: Self) -> Ordering {
         runs.compare((self.run, self.position), (other.run, other.position))
             .unwrap_or_else(|| unreachable!("hot merge references belong to retained runs"))
     }
 
     #[inline]
-    pub(super) fn resolve(self, runs: &SortedHotRuns) -> &IndexBuildEntry {
+    pub(super) fn resolve(self, runs: &SortedRuns) -> &IndexBuildEntry {
         &runs.runs()[self.run].entries()[self.position]
     }
 }
@@ -67,12 +67,13 @@ pub(crate) struct HotDuplicate {
 
 /// Ordered immutable cuts, moved here only after the complete boundary barrier.
 struct HotMergeBoundaries {
-    cuts: Vec<HotMergeCut>,
+    cuts: Vec<MergeCut>,
+    _admission: MemoryReservation,
 }
 
 /// A prepared plan conveys ownership and fences, but no completed-validation authority.
-pub(crate) struct PreparedHotMerge {
-    runs: Arc<SortedHotRuns>,
+pub(crate) struct PreparedMerge {
+    runs: Arc<SortedRuns>,
     boundaries: HotMergeBoundaries,
     entries: usize,
     workers: usize,
@@ -80,13 +81,13 @@ pub(crate) struct PreparedHotMerge {
     boundary_duplicate: Option<HotDuplicate>,
     inhibited: AtomicBool,
     #[cfg(feature = "profiling")]
-    measurements: HotMergeMeasurements,
+    measurements: MergeMeasurements,
 }
 
-impl PreparedHotMerge {
+impl PreparedMerge {
     /// Retain immutable key and fence storage through page construction.
     #[inline]
-    pub(super) fn runs(&self) -> &Arc<SortedHotRuns> {
+    pub(super) fn runs(&self) -> &Arc<SortedRuns> {
         &self.runs
     }
 
@@ -121,11 +122,11 @@ impl PreparedHotMerge {
     }
 }
 
-type CutCompletion = Arc<Completion<RuntimeOrFatalResult<HotMergeCut>>>;
+type CutCompletion = Arc<Completion<RuntimeOrFatalResult<MergeCut>>>;
 
 /// Retains accepted cut jobs when the borrowed preparation future is cancelled.
-pub(crate) struct HotMergePreparation {
-    runs: Arc<SortedHotRuns>,
+pub(crate) struct MergePreparation {
+    runs: Arc<SortedRuns>,
     pool: QuiescentGuard<ThreadPool>,
     workers: usize,
     batch_entries: usize,
@@ -133,7 +134,9 @@ pub(crate) struct HotMergePreparation {
     partitions: usize,
     stop: Arc<AtomicBool>,
     jobs: Vec<Option<CutCompletion>>,
-    cuts: Vec<HotMergeCut>,
+    cuts: Vec<MergeCut>,
+    boundary_admission: MemoryReservation,
+    _job_admission: MemoryReservation,
     submitted: usize,
     collected: usize,
     failure: Option<RuntimeOrFatalError>,
@@ -144,26 +147,22 @@ pub(crate) struct HotMergePreparation {
     started: Option<Instant>,
 }
 
-impl HotMergePreparation {
+impl MergePreparation {
     /// Use the production four-leaf batch minimum and independently sized partitions.
     pub(crate) fn new(
-        runs: Arc<SortedHotRuns>,
+        runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
         workers: usize,
     ) -> RuntimeOrFatalResult<Self> {
         let entries = input_entries(&runs)?;
-        let partitions = if runs.runs().len() <= 1 {
-            usize::from(entries != 0)
-        } else {
-            entries
-                .min(workers.saturating_mul(4))
-                .min(entries.div_ceil(65_536).max(1))
-        };
+        let partitions = entries
+            .min(workers.saturating_mul(4))
+            .min(entries.div_ceil(65_536));
         Self::with_sizing(runs, pool, workers, partitions, DEFAULT_BATCH_ENTRIES)
     }
 
     fn with_sizing(
-        runs: Arc<SortedHotRuns>,
+        runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
         workers: usize,
         partitions: usize,
@@ -179,10 +178,6 @@ impl HotMergePreparation {
                 || (entries != 0 && (1..=entries).contains(&partitions)),
             "hot merge partition count outside input rank range"
         );
-        assert!(
-            runs.runs().len() != 1 || partitions == 1,
-            "hot merge single run must use direct bypass"
-        );
         for run in runs.runs() {
             assert!(!run.entries().is_empty(), "hot merge retained an empty run");
             assert!(
@@ -195,6 +190,25 @@ impl HotMergePreparation {
                 run.group_id
             );
         }
+        let boundary_admission = runs
+            .budget
+            .reserve(
+                (partitions + 1) * size_of::<MergeCut>(),
+                "merge boundary ledger",
+            )
+            .change_context(RuntimeError::IndexAccess)?;
+        let job_count = if runs.single_run().is_some() {
+            0
+        } else {
+            partitions.saturating_sub(1)
+        };
+        let job_admission = runs
+            .budget
+            .reserve(
+                job_count * size_of::<Option<CutCompletion>>(),
+                "merge cut jobs",
+            )
+            .change_context(RuntimeError::IndexAccess)?;
         Ok(Self {
             runs,
             pool,
@@ -203,7 +217,9 @@ impl HotMergePreparation {
             entries,
             partitions,
             stop: Arc::new(AtomicBool::new(false)),
-            jobs: (0..partitions.saturating_sub(1)).map(|_| None).collect(),
+            jobs: (0..job_count).map(|_| None).collect(),
+            boundary_admission,
+            _job_admission: job_admission,
             cuts: Vec::with_capacity(partitions + 1),
             submitted: 0,
             collected: 0,
@@ -217,7 +233,7 @@ impl HotMergePreparation {
     }
 
     /// Complete all cuts before exposing a plan; resumable after observer cancellation.
-    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<Arc<PreparedHotMerge>> {
+    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<Arc<PreparedMerge>> {
         assert!(
             !self.finished,
             "hot merge preparation reused after settlement"
@@ -229,6 +245,14 @@ impl HotMergePreparation {
                 Ok(cut) => self.cuts.push(cut),
                 Err(error) => self.record_failure(error),
             }
+        }
+        if self.runs.single_run().is_some() && self.failure.is_none() {
+            for cut in self.cuts.len()..self.partitions {
+                let rank =
+                    ((cut as u128 * self.entries as u128) / self.partitions as u128) as usize;
+                self.cuts.push(co_rank::direct(&self.runs, rank)?);
+            }
+            self.jobs.clear();
         }
         while self.failure.is_none() && self.collected < self.jobs.len() {
             while self.submitted < self.jobs.len() && self.submitted - self.collected < self.workers
@@ -264,6 +288,22 @@ impl HotMergePreparation {
         }
         co_rank::verify(&self.runs, &self.cuts)?;
         let mut conflict = None;
+        if self.runs.single_run().is_some()
+            && let LocalDuplicates::Checked {
+                first_duplicate_position: Some(position),
+            } = self.runs.runs()[0].duplicates
+        {
+            assert!(
+                position > 0 && position < self.entries,
+                "merge invalid single-run duplicate position={position}"
+            );
+            conflict = Some(duplicate(
+                &self.runs,
+                HotEntryRef::new(&self.runs, 0, position - 1),
+                HotEntryRef::new(&self.runs, 0, position),
+                position,
+            ));
+        }
         #[cfg(feature = "profiling")]
         let mut comparisons = 0u64;
         if self.runs.duplicates == DuplicateCheck::Collect {
@@ -291,7 +331,7 @@ impl HotMergePreparation {
             )
         });
         #[cfg(feature = "profiling")]
-        let measurements = HotMergeMeasurements {
+        let measurements = MergeMeasurements {
             entries: self.entries as u64,
             runs: self.runs.runs().len() as u64,
             workers: self.workers as u64,
@@ -312,10 +352,14 @@ impl HotMergePreparation {
             ..Default::default()
         };
         self.finished = true;
-        Ok(Arc::new(PreparedHotMerge {
+        Ok(Arc::new(PreparedMerge {
             runs: self.runs.clone(),
             boundaries: HotMergeBoundaries {
                 cuts: take(&mut self.cuts),
+                _admission: replace(
+                    &mut self.boundary_admission,
+                    MemoryReservation::new(&self.runs.budget),
+                ),
             },
             entries: self.entries,
             workers: self.workers,
@@ -336,7 +380,10 @@ impl HotMergePreparation {
         while self.collected < self.submitted {
             self.collect_next().await;
         }
-        self.cuts.clear();
+        self.cuts = Vec::new();
+        self.boundary_admission.release_all();
+        self.jobs = Vec::new();
+        self._job_admission.release_all();
         self.finished = true;
         match self.failure.take() {
             Some(error) => Err(error),
@@ -371,7 +418,7 @@ impl HotMergePreparation {
     }
 }
 
-impl Drop for HotMergePreparation {
+impl Drop for MergePreparation {
     fn drop(&mut self) {
         self.stop.store(true, AtomicOrdering::Release);
     }
@@ -395,7 +442,7 @@ enum BatchEntries<'a> {
 
 /// Borrowed bounded output; the next pull requires release of this view.
 pub(crate) struct HotBatch<'a> {
-    runs: &'a SortedHotRuns,
+    runs: &'a SortedRuns,
     data: BatchEntries<'a>,
     ranks: Range<usize>,
     inhibited: &'a AtomicBool,
@@ -442,7 +489,7 @@ impl HotBatch<'_> {
 
 /// A single partition's resumable merge and validation state.
 pub(crate) struct PartitionMergeStream {
-    plan: Arc<PreparedHotMerge>,
+    plan: Arc<PreparedMerge>,
     partition: usize,
     stop: Arc<AtomicBool>,
     next: usize,
@@ -452,13 +499,13 @@ pub(crate) struct PartitionMergeStream {
     validation: ValidationState,
     fill: fn(&mut Self, usize),
     #[cfg(feature = "profiling")]
-    profile: HotMergeWorkerProfile,
+    profile: MergeWorkerProfile,
 }
 
 impl PartitionMergeStream {
     /// Bind separate cold validation evidence to this stream's plan and partition.
     #[inline]
-    pub(super) fn identity(&self) -> (Arc<PreparedHotMerge>, usize) {
+    pub(super) fn identity(&self) -> (Arc<PreparedMerge>, usize) {
         (self.plan.clone(), self.partition)
     }
 
@@ -489,7 +536,7 @@ impl PartitionMergeStream {
     }
 
     fn new(
-        plan: Arc<PreparedHotMerge>,
+        plan: Arc<PreparedMerge>,
         partition: usize,
         stop: Arc<AtomicBool>,
     ) -> RuntimeOrFatalResult<Self> {
@@ -512,34 +559,13 @@ impl PartitionMergeStream {
                 .change_context(RuntimeError::IndexAccess)?,
             )
         };
-        let conflict = if tree.is_none() {
-            match plan.runs.runs()[0].duplicates {
-                LocalDuplicates::Checked {
-                    first_duplicate_position: Some(position),
-                } => {
-                    assert!(
-                        position > 0 && position < range.end,
-                        "hot merge invalid single-run duplicate position={position}"
-                    );
-                    Some(duplicate(
-                        &plan.runs,
-                        HotEntryRef::new(&plan.runs, 0, position - 1),
-                        HotEntryRef::new(&plan.runs, 0, position),
-                        position,
-                    ))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
         let fill = if plan.runs.duplicates == DuplicateCheck::Collect {
             Self::fill::<true>
         } else {
             Self::fill::<false>
         };
         #[cfg(feature = "profiling")]
-        let profile = HotMergeWorkerProfile {
+        let profile = MergeWorkerProfile {
             reference_bytes: (buffer.capacity() * size_of::<HotEntryRef>()) as u64,
             ..Default::default()
         };
@@ -551,10 +577,7 @@ impl PartitionMergeStream {
             end: range.end,
             tree,
             buffer,
-            validation: ValidationState {
-                conflict,
-                ..Default::default()
-            },
+            validation: ValidationState::default(),
             fill,
             #[cfg(feature = "profiling")]
             profile,
@@ -647,7 +670,7 @@ impl PartitionMergeStream {
             ));
         }
         #[cfg(feature = "profiling")]
-        let profile = HotMergeWorkerProfile {
+        let profile = MergeWorkerProfile {
             duplicate_comparisons: self.validation.comparisons,
             ..self.profile
         };
@@ -665,17 +688,17 @@ impl PartitionMergeStream {
 
 /// Private evidence minted only by exhaustive successful stream consumption.
 pub(crate) struct CompletedPartition<T> {
-    plan: Arc<PreparedHotMerge>,
+    plan: Arc<PreparedMerge>,
     partition: usize,
     entries: usize,
     conflict: Option<HotDuplicate>,
     output: T,
     #[cfg(feature = "profiling")]
-    profile: HotMergeWorkerProfile,
+    profile: MergeWorkerProfile,
 }
 
 /// Narrow engine-internal hook for the future private packing consumer.
-pub(crate) trait HotPartitionConsumer: Send + Sync + 'static {
+pub(crate) trait PartitionConsumer: Send + Sync + 'static {
     /// Per-partition ownership returned after successful consumption.
     type Output: Send + 'static;
 
@@ -688,11 +711,11 @@ pub(crate) trait HotPartitionConsumer: Send + Sync + 'static {
 }
 
 /// Successful hot distinctness authority; cold/hot checks require separate evidence.
-pub(crate) struct HotMergeCompletion {
-    plan: Arc<PreparedHotMerge>,
+pub(crate) struct MergeCompletion {
+    plan: Arc<PreparedMerge>,
 }
 
-impl HotMergeCompletion {
+impl MergeCompletion {
     /// Number of entries whose successful consumption this evidence certifies.
     #[inline]
     pub(crate) fn entries(&self) -> usize {
@@ -708,26 +731,27 @@ impl HotMergeCompletion {
 }
 
 /// Settled consumer outputs and either distinctness authority or deterministic conflict.
-pub(crate) struct HotMergeOutcome<T> {
+pub(crate) struct MergeOutcome<T> {
     /// Results in planned partition order, independent of execution order.
     pub(crate) outputs: Vec<T>,
     /// Duplicate evidence never supplies installation authority.
-    pub(crate) validation: Result<HotMergeCompletion, HotDuplicate>,
+    pub(crate) validation: Result<MergeCompletion, HotDuplicate>,
     /// Successful full-consumption sample, including fully checked duplicates.
     #[cfg(feature = "profiling")]
-    pub(crate) measurements: HotMergeMeasurements,
+    pub(crate) measurements: MergeMeasurements,
 }
 
 type PartitionCompletion<T> = Arc<Completion<RuntimeOrFatalResult<CompletedPartition<T>>>>;
 
 /// Retains consumer jobs and output ownership across cancellation of borrowed futures.
-pub(crate) struct HotMergeConsumption<C: HotPartitionConsumer> {
-    plan: Arc<PreparedHotMerge>,
+pub(crate) struct MergeConsumption<C: PartitionConsumer> {
+    plan: Arc<PreparedMerge>,
     pool: QuiescentGuard<ThreadPool>,
     consumer: Arc<C>,
     stop: Arc<AtomicBool>,
     jobs: Vec<Option<PartitionCompletion<C::Output>>>,
     results: Vec<CompletedPartition<C::Output>>,
+    _admission: Option<MemoryReservation>,
     submitted: usize,
     collected: usize,
     failure: Option<RuntimeOrFatalError>,
@@ -736,10 +760,10 @@ pub(crate) struct HotMergeConsumption<C: HotPartitionConsumer> {
     started: Option<Instant>,
 }
 
-impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
+impl<C: PartitionConsumer> MergeConsumption<C> {
     /// Prepare result slots before submitting any consumer job.
     pub(crate) fn new(
-        plan: Arc<PreparedHotMerge>,
+        plan: Arc<PreparedMerge>,
         pool: QuiescentGuard<ThreadPool>,
         consumer: C,
     ) -> Self {
@@ -748,16 +772,32 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
             "hot merge consumption pool is smaller than prepared worker budget"
         );
         let partitions = plan.partitions();
+        let admission = plan.runs.budget.reserve(
+            partitions
+                * (size_of::<Option<PartitionCompletion<C::Output>>>()
+                    + size_of::<CompletedPartition<C::Output>>()
+                    + size_of::<C::Output>()),
+            "merge consumer ledger",
+        );
+        let (admission, failure) = match admission {
+            Ok(admission) => (Some(admission), None),
+            Err(error) => (
+                None,
+                Some(error.change_context(RuntimeError::IndexAccess).into()),
+            ),
+        };
+        let capacity = if admission.is_some() { partitions } else { 0 };
         Self {
             plan,
             pool,
             consumer: Arc::new(consumer),
             stop: Arc::new(AtomicBool::new(false)),
-            jobs: (0..partitions).map(|_| None).collect(),
-            results: Vec::with_capacity(partitions),
+            jobs: (0..capacity).map(|_| None).collect(),
+            results: Vec::with_capacity(capacity),
+            _admission: admission,
             submitted: 0,
             collected: 0,
-            failure: None,
+            failure,
             finished: false,
             #[cfg(feature = "profiling")]
             started: None,
@@ -765,7 +805,7 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
     }
 
     /// Consume every required partition, retaining bounded admission through collection.
-    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<HotMergeOutcome<C::Output>> {
+    pub(crate) async fn execute(&mut self) -> RuntimeOrFatalResult<MergeOutcome<C::Output>> {
         assert!(
             !self.finished,
             "hot merge consumption reused after settlement"
@@ -791,7 +831,7 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
                     let stopped = Instant::now();
                     #[cfg(feature = "profiling")]
                     let result = CompletedPartition {
-                        profile: HotMergeWorkerProfile {
+                        profile: MergeWorkerProfile {
                             job_nanos: stopped.duration_since(started).as_nanos() as u64,
                             consumer_nanos: stopped.duration_since(consumer_started).as_nanos()
                                 as u64
@@ -867,14 +907,14 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
             measurements.scratch_peak_bytes = self.plan.runs.budget.peak() as u64;
         }
         self.finished = true;
-        Ok(HotMergeOutcome {
+        Ok(MergeOutcome {
             outputs: take(&mut self.results)
                 .into_iter()
                 .map(|result| result.output)
                 .collect(),
             validation: match conflict {
                 Some(conflict) => Err(conflict),
-                None => Ok(HotMergeCompletion {
+                None => Ok(MergeCompletion {
                     plan: self.plan.clone(),
                 }),
             },
@@ -938,7 +978,7 @@ impl<C: HotPartitionConsumer> HotMergeConsumption<C> {
     }
 }
 
-impl<C: HotPartitionConsumer> Drop for HotMergeConsumption<C> {
+impl<C: PartitionConsumer> Drop for MergeConsumption<C> {
     fn drop(&mut self) {
         self.stop.store(true, AtomicOrdering::Release);
     }
@@ -965,7 +1005,7 @@ pub(super) fn observe_stop(stop: &AtomicBool) -> RuntimeOrFatalResult<()> {
 
 #[cold]
 fn duplicate(
-    runs: &SortedHotRuns,
+    runs: &SortedRuns,
     left: HotEntryRef,
     right: HotEntryRef,
     rank: usize,
@@ -977,7 +1017,7 @@ fn duplicate(
 }
 
 #[inline]
-fn proven_distinct(runs: &SortedHotRuns, left: HotEntryRef, right: HotEntryRef) -> bool {
+fn proven_distinct(runs: &SortedRuns, left: HotEntryRef, right: HotEntryRef) -> bool {
     left.run == right.run
         && left.position + 1 == right.position
         && runs.runs()[left.run].duplicates
@@ -994,7 +1034,7 @@ fn earliest(left: Option<HotDuplicate>, right: Option<HotDuplicate>) -> Option<H
     }
 }
 
-fn input_entries(runs: &SortedHotRuns) -> RuntimeOrFatalResult<usize> {
+fn input_entries(runs: &SortedRuns) -> RuntimeOrFatalResult<usize> {
     runs.runs().iter().try_fold(0usize, |n, run| {
         n.checked_add(run.entries().len())
             .ok_or_else(|| execution_error("hot merge entry count overflow"))
@@ -1017,11 +1057,11 @@ mod tests {
     use crate::conf::ThreadPoolConfig;
     use crate::index::BTreeKey;
     use crate::index::btree::BTreeValue;
-    use crate::index::build::{HotSortedRun, MemoryBudget, MemoryReservation, budget, worker};
+    use crate::index::build::{MemoryBudget, MemoryReservation, SortedRun, budget, worker};
     use crate::memcmp::MEM_CMP_KEY_INLINE;
     use crate::poison::EnginePoisoner;
     #[cfg(feature = "profiling")]
-    use crate::profiling::{HotBuildMeasurements, HotBuildWorkerProfile};
+    use crate::profiling::{HotExtractionMeasurements, HotExtractionWorkerProfile};
     use crate::runtime::thread_pool::ThreadPoolWorkers;
     use crate::runtime::yield_now;
     use futures::FutureExt;
@@ -1121,7 +1161,7 @@ mod tests {
         capture: bool,
     }
 
-    impl HotPartitionConsumer for Drain {
+    impl PartitionConsumer for Drain {
         type Output = Drained;
 
         async fn consume(
@@ -1166,7 +1206,7 @@ mod tests {
 
     struct EarlyConsumer;
 
-    impl HotPartitionConsumer for EarlyConsumer {
+    impl PartitionConsumer for EarlyConsumer {
         type Output = ();
 
         async fn consume(
@@ -1180,7 +1220,7 @@ mod tests {
 
     struct ForeignConsumer(Mutex<Option<CompletedPartition<()>>>);
 
-    impl HotPartitionConsumer for ForeignConsumer {
+    impl PartitionConsumer for ForeignConsumer {
         type Output = ();
 
         async fn consume(
@@ -1193,7 +1233,7 @@ mod tests {
 
     struct FailAfterConsumption(Fault);
 
-    impl HotPartitionConsumer for FailAfterConsumption {
+    impl PartitionConsumer for FailAfterConsumption {
         type Output = Drained;
 
         async fn consume(
@@ -1217,7 +1257,7 @@ mod tests {
         groups: Vec<Vec<BTreeKey>>,
         policy: DuplicateCheck,
         budget: MemoryBudget,
-    ) -> Arc<SortedHotRuns> {
+    ) -> Arc<SortedRuns> {
         let mut runs = Vec::new();
         for (group, keys) in groups.into_iter().enumerate() {
             if keys.is_empty() {
@@ -1244,33 +1284,33 @@ mod tests {
             }
             entries.sort_by(|left, right| left.key.cmp(&right.key));
             let duplicates = worker::local_duplicates(&entries, policy, &AtomicBool::new(false));
-            runs.push(Arc::new(HotSortedRun {
+            runs.push(Arc::new(SortedRun {
                 group_id: group * 3 + 1,
                 entries,
                 duplicates,
                 payload,
                 #[cfg(feature = "profiling")]
-                profile: HotBuildWorkerProfile::default(),
+                profile: HotExtractionWorkerProfile::default(),
             }));
         }
-        Arc::new(SortedHotRuns {
+        Arc::new(SortedRuns {
             runs,
             duplicates: policy,
             budget,
             #[cfg(feature = "profiling")]
-            measurements: HotBuildMeasurements::default(),
+            measurements: HotExtractionMeasurements::default(),
         })
     }
 
     /// Prepare component fixtures with explicit partition and batch boundaries.
     pub(crate) async fn prepare_packed(
-        runs: Arc<SortedHotRuns>,
+        runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
         workers: usize,
         partitions: usize,
         batch: usize,
-    ) -> Arc<PreparedHotMerge> {
-        HotMergePreparation::with_sizing(runs, pool, workers, partitions, batch)
+    ) -> Arc<PreparedMerge> {
+        MergePreparation::with_sizing(runs, pool, workers, partitions, batch)
             .unwrap()
             .execute()
             .await
@@ -1290,11 +1330,11 @@ mod tests {
         (PoolScope(registry), pool)
     }
 
-    fn fixture(groups: Vec<Vec<BTreeKey>>, policy: DuplicateCheck) -> Arc<SortedHotRuns> {
+    fn fixture(groups: Vec<Vec<BTreeKey>>, policy: DuplicateCheck) -> Arc<SortedRuns> {
         fixture_in(groups, policy, MemoryBudget::new(usize::MAX))
     }
 
-    fn numbers(groups: &[&[u32]], policy: DuplicateCheck) -> Arc<SortedHotRuns> {
+    fn numbers(groups: &[&[u32]], policy: DuplicateCheck) -> Arc<SortedRuns> {
         fixture(
             groups
                 .iter()
@@ -1304,7 +1344,7 @@ mod tests {
         )
     }
 
-    fn oracle(runs: &SortedHotRuns) -> Vec<HotEntryRef> {
+    fn oracle(runs: &SortedRuns) -> Vec<HotEntryRef> {
         let mut entries: Vec<_> = runs
             .runs()
             .iter()
@@ -1324,7 +1364,7 @@ mod tests {
         entries
     }
 
-    fn oracle_conflict(runs: &SortedHotRuns, entries: &[HotEntryRef]) -> Option<HotDuplicate> {
+    fn oracle_conflict(runs: &SortedRuns, entries: &[HotEntryRef]) -> Option<HotDuplicate> {
         if runs.duplicates == DuplicateCheck::Skip {
             return None;
         }
@@ -1339,7 +1379,7 @@ mod tests {
     }
 
     async fn check_case(
-        runs: Arc<SortedHotRuns>,
+        runs: Arc<SortedRuns>,
         pool: &QuiescentGuard<ThreadPool>,
         workers: usize,
         partitions: usize,
@@ -1348,16 +1388,18 @@ mod tests {
         let expected = oracle(&runs);
         let conflict = oracle_conflict(&runs, &expected);
         let baseline = runs.budget.used();
-        let mut prepare = HotMergePreparation::with_sizing(
-            runs.clone(),
-            pool.clone(),
-            workers,
-            partitions,
-            batch,
-        )
-        .unwrap();
+        let mut prepare =
+            MergePreparation::with_sizing(runs.clone(), pool.clone(), workers, partitions, batch)
+                .unwrap();
         let plan = prepare.execute().await.unwrap();
-        assert_eq!(prepare.submitted, partitions.saturating_sub(1));
+        assert_eq!(
+            prepare.submitted,
+            if runs.single_run().is_some() {
+                0
+            } else {
+                partitions.saturating_sub(1)
+            }
+        );
         let mut prefix = vec![0usize; runs.runs().len()];
         let mut previous_rank = 0;
         for cut in &plan.boundaries.cuts {
@@ -1369,7 +1411,7 @@ mod tests {
             assert_eq!(cut.right, expected.get(cut.rank).copied());
             previous_rank = cut.rank;
         }
-        let mut consume = HotMergeConsumption::new(
+        let mut consume = MergeConsumption::new(
             plan.clone(),
             pool.clone(),
             Drain {
@@ -1415,7 +1457,9 @@ mod tests {
                 outcome.measurements.job_worker_nanos >= outcome.measurements.consumer_worker_nanos
             );
             assert_eq!(outcome.measurements.partitions, partitions as u64);
-            if runs.duplicates == DuplicateCheck::Skip || runs.runs().len() <= 1 {
+            if runs.duplicates == DuplicateCheck::Skip
+                || (runs.runs().len() <= 1 && conflict.is_none())
+            {
                 assert_eq!(outcome.measurements.duplicate_comparisons, 0);
             }
             assert!(
@@ -1456,6 +1500,73 @@ mod tests {
             remaining = &remaining[plan.packed..];
         }
         assert!(!remaining.is_empty());
+    }
+
+    /// Purpose: Partition one resident run directly while preserving earliest duplicate authority across cuts.
+    /// Expected: Every borrowed range has exact neighbors and no merge workspace; checked conflicts inhibit all partitions and trusted inputs retain full coverage.
+    #[test]
+    fn direct_partition_coverage_and_duplicate_ranks() {
+        smol::block_on(async {
+            let (_scope, pool) = pool(2).await;
+            for policy in [DuplicateCheck::Collect, DuplicateCheck::Skip] {
+                for conflict in [None, Some(1), Some(2), Some(3), Some(6), Some(7)] {
+                    let mut values: Vec<u32> = (0..8).collect();
+                    if let Some(position) = conflict {
+                        values[position] = values[position - 1];
+                    }
+                    let runs = numbers(&[&values], policy);
+                    check_case(runs.clone(), &pool, 2, 4, 2).await;
+                    let mut prepare =
+                        MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 4, 2).unwrap();
+                    let plan = prepare.execute().await.unwrap();
+                    assert_eq!(
+                        plan.boundary_duplicate.map(|d| d.right_rank),
+                        if policy == DuplicateCheck::Collect {
+                            conflict
+                        } else {
+                            None
+                        }
+                    );
+                    for partition in 0..4 {
+                        let before = runs.budget.used();
+                        let mut stream = PartitionMergeStream::new(
+                            plan.clone(),
+                            partition,
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                        .unwrap();
+                        assert!(stream.tree.is_none());
+                        assert_eq!(stream.buffer.capacity(), 0);
+                        assert_eq!(runs.budget.used(), before);
+                        let batch = stream.next_batch().unwrap().unwrap();
+                        assert!(ptr::eq(
+                            batch.entry(0).unwrap().1,
+                            &runs.single_run().unwrap()[partition * 2]
+                        ));
+                        assert_eq!(
+                            batch.construction_inhibited(),
+                            policy == DuplicateCheck::Collect && conflict.is_some()
+                        );
+                    }
+                }
+            }
+            let runs = fixture(
+                vec![(0..200_000u32).map(BTreeKey::from).collect()],
+                DuplicateCheck::Collect,
+            );
+            let plan = MergePreparation::new(runs, pool.clone(), 2)
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(plan.partitions(), 4);
+            for partition in 0..4 {
+                assert_eq!(
+                    plan.range(partition),
+                    partition * 50_000..(partition + 1) * 50_000
+                );
+            }
+        });
     }
 
     /// Purpose: Protect exact prefixes, neighbors, provenance order, and bounded pulls at deterministic edge cases.
@@ -1576,8 +1687,7 @@ mod tests {
                 for policy in [DuplicateCheck::Collect, DuplicateCheck::Skip] {
                     let runs = numbers(groups, policy);
                     let mut preparation =
-                        HotMergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 1, 2)
-                            .unwrap();
+                        MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 1, 2).unwrap();
                     let plan = preparation.execute().await.unwrap();
                     let mut stream =
                         PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)))
@@ -1626,9 +1736,9 @@ mod tests {
                 DuplicateCheck::Collect,
             );
             let mut preparation =
-                HotMergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
+                MergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
             let plan = preparation.execute().await.unwrap();
-            let mut consumption = HotMergeConsumption::new(plan, pool, Drain::default());
+            let mut consumption = MergeConsumption::new(plan, pool, Drain::default());
             let result = consumption.execute().await.unwrap();
             #[cfg(feature = "profiling")]
             assert_eq!(result.measurements.duplicate_comparisons, 1);
@@ -1646,7 +1756,7 @@ mod tests {
                 &[&[0, 2, 4, 6, 8], &[1, 3, 5, 7, 9]],
                 DuplicateCheck::Collect,
             );
-            let mut preparation = HotMergePreparation::with_sizing(runs, pool, 2, 5, 2).unwrap();
+            let mut preparation = MergePreparation::with_sizing(runs, pool, 2, 5, 2).unwrap();
             let (entered, release) = preparation.hook.gate(1, Fault::None);
             assert!(preparation.execute().now_or_never().is_none());
             entered.recv_async().await.unwrap();
@@ -1677,7 +1787,7 @@ mod tests {
             );
             let expected = oracle_conflict(&runs, &oracle(&runs)).unwrap();
             let mut preparation =
-                HotMergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
+                MergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
             let plan = preparation.execute().await.unwrap();
             let drain = Drain {
                 capture: true,
@@ -1685,7 +1795,7 @@ mod tests {
             };
             let hook = drain.hook.clone();
             let (entered, release) = hook.gate(0, Fault::None);
-            let mut consumption = HotMergeConsumption::new(plan, pool, drain);
+            let mut consumption = MergeConsumption::new(plan, pool, drain);
             assert!(consumption.execute().now_or_never().is_none());
             entered.recv_async().await.unwrap();
             while !consumption.jobs[1].as_ref().unwrap().is_completed() {
@@ -1716,7 +1826,7 @@ mod tests {
                     );
                     let budget = runs.budget.clone();
                     let mut preparation =
-                        HotMergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
+                        MergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
                     let hook = if boundary {
                         preparation.hook.clone()
                     } else {
@@ -1751,7 +1861,7 @@ mod tests {
                         assert_eq!(preparation.submitted, preparation.collected);
                     } else {
                         let plan = preparation.execute().await.unwrap();
-                        let mut consumption = HotMergeConsumption::new(
+                        let mut consumption = MergeConsumption::new(
                             plan,
                             pool,
                             Drain {
@@ -1791,17 +1901,17 @@ mod tests {
             let (_registry, pool) = pool(2).await;
             let runs = numbers(&[&[0, 2, 4, 6], &[1, 3, 5, 7]], DuplicateCheck::Collect);
             let mut prepare =
-                HotMergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 2, 1).unwrap();
+                MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 2, 1).unwrap();
             let plan = prepare.execute().await.unwrap();
             let stream =
                 PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)))
                     .unwrap();
             assert!(stream.finish(()).is_err());
-            let mut consume = HotMergeConsumption::new(plan.clone(), pool.clone(), EarlyConsumer);
+            let mut consume = MergeConsumption::new(plan.clone(), pool.clone(), EarlyConsumer);
             assert!(consume.execute().await.is_err());
             for foreign_plan in [true, false] {
                 let mut other =
-                    HotMergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 2, 1).unwrap();
+                    MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 2, 1).unwrap();
                 let owner = if foreign_plan {
                     other.execute().await.unwrap()
                 } else {
@@ -1815,7 +1925,7 @@ mod tests {
                 .unwrap();
                 while stream.next_batch().unwrap().is_some() {}
                 let completed = stream.finish(()).unwrap();
-                let mut consumption = HotMergeConsumption::new(
+                let mut consumption = MergeConsumption::new(
                     plan.clone(),
                     pool.clone(),
                     ForeignConsumer(Mutex::new(Some(completed))),
@@ -1849,7 +1959,7 @@ mod tests {
                 let weak = Arc::downgrade(&runs);
                 let budget = runs.budget.clone();
                 let mut prepare =
-                    HotMergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
+                    MergePreparation::with_sizing(runs, pool.clone(), 2, 4, 1).unwrap();
                 if boundary {
                     let (entered, release) = prepare.hook.gate(1, Fault::None);
                     assert!(prepare.execute().now_or_never().is_none());
@@ -1866,7 +1976,7 @@ mod tests {
                     drop(prepare);
                     let drain = Drain::default();
                     let (entered, release) = drain.hook.gate(0, Fault::None);
-                    let mut consume = HotMergeConsumption::new(plan, pool, drain);
+                    let mut consume = MergeConsumption::new(plan, pool, drain);
                     assert!(consume.execute().now_or_never().is_none());
                     entered.recv_async().await.unwrap();
                     let jobs: Vec<_> = consume.jobs.iter().flatten().cloned().collect();
@@ -1900,7 +2010,7 @@ mod tests {
                 let runs = numbers(&[&[0, 2, 4, 6], &[1, 3, 5, 7]], DuplicateCheck::Collect);
                 let budget = runs.budget.clone();
                 let mut prepare =
-                    HotMergePreparation::with_sizing(runs, pool.clone(), 2, 4, 2).unwrap();
+                    MergePreparation::with_sizing(runs, pool.clone(), 2, 4, 2).unwrap();
                 let error = if purpose == "merge boundary positions" {
                     budget::fail_at(&budget, purpose);
                     prepare.execute().await.err().unwrap()
@@ -1913,7 +2023,7 @@ mod tests {
                     } else {
                         budget::fail_at(&budget, purpose);
                     }
-                    let mut consume = HotMergeConsumption::new(plan, pool, Drain::default());
+                    let mut consume = MergeConsumption::new(plan, pool, Drain::default());
                     let error = consume.execute().await.err().unwrap();
                     assert_eq!(consume.submitted, consume.collected);
                     error
@@ -1950,7 +2060,7 @@ mod tests {
                     DuplicateCheck::Collect,
                 );
                 let baseline = runs.budget.used();
-                let mut prepare = HotMergePreparation::with_sizing(
+                let mut prepare = MergePreparation::with_sizing(
                     runs.clone(),
                     pool.clone(),
                     2,
@@ -1985,7 +2095,7 @@ mod tests {
             }
             assert_eq!(capacities[0], capacities[1]);
             let runs = numbers(&[&[1, 3], &[2, 4]], DuplicateCheck::Skip);
-            let mut prepare = HotMergePreparation::new(runs, pool.clone(), 2).unwrap();
+            let mut prepare = MergePreparation::new(runs, pool.clone(), 2).unwrap();
             let plan = prepare.execute().await.unwrap();
             let stream =
                 PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false))).unwrap();
@@ -2004,7 +2114,7 @@ mod tests {
                 budget.clone(),
             );
             let baseline = budget.used();
-            let mut prepare = HotMergePreparation::new(runs, pool, 2).unwrap();
+            let mut prepare = MergePreparation::new(runs, pool, 2).unwrap();
             let plan = prepare.execute().await.unwrap();
             let failed =
                 PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)));
@@ -2078,8 +2188,7 @@ mod tests {
                         })
                         .collect();
                     let runs = fixture(groups, DuplicateCheck::Collect);
-                    let mut prepare =
-                        HotMergePreparation::new(runs.clone(), pool.clone(), 2).unwrap();
+                    let mut prepare = MergePreparation::new(runs.clone(), pool.clone(), 2).unwrap();
                     let plan = prepare.execute().await.unwrap();
                     assert_eq!(plan.partitions(), 1);
                     let mut stream =
@@ -2178,8 +2287,7 @@ mod tests {
                 HotEntryRef::new(&runs, 0, 1)
             ));
             Arc::get_mut(&mut runs).unwrap().duplicates = DuplicateCheck::Collect;
-            let rejected =
-                catch_unwind(AssertUnwindSafe(|| HotMergePreparation::new(runs, pool, 1)));
+            let rejected = catch_unwind(AssertUnwindSafe(|| MergePreparation::new(runs, pool, 1)));
             assert!(rejected.is_err());
         });
     }
@@ -2193,7 +2301,7 @@ mod tests {
             let runs = numbers(&[&[0, 2, 4, 6], &[1, 3, 5, 7]], DuplicateCheck::Collect);
             let budget = runs.budget.clone();
             let baseline = budget.used();
-            let mut prepare = HotMergePreparation::with_sizing(runs, pool, 2, 4, 1).unwrap();
+            let mut prepare = MergePreparation::with_sizing(runs, pool, 2, 4, 1).unwrap();
             let (entered, release) = prepare.hook.gate(1, Fault::None);
             assert!(prepare.execute().now_or_never().is_none());
             entered.recv_async().await.unwrap();
@@ -2221,10 +2329,10 @@ mod tests {
                 let runs = numbers(&[&[0, 0, 2], &[1, 3, 4]], DuplicateCheck::Collect);
                 let budget = runs.budget.clone();
                 let mut prepare =
-                    HotMergePreparation::with_sizing(runs, pool.clone(), 2, 1, 2).unwrap();
+                    MergePreparation::with_sizing(runs, pool.clone(), 2, 1, 2).unwrap();
                 let plan = prepare.execute().await.unwrap();
                 let mut consumption =
-                    HotMergeConsumption::new(plan, pool, FailAfterConsumption(fault));
+                    MergeConsumption::new(plan, pool, FailAfterConsumption(fault));
                 let error = consumption.execute().await.err().unwrap();
                 assert_eq!(
                     matches!(error, RuntimeOrFatalError::Fatal(_)),
@@ -2246,10 +2354,9 @@ mod tests {
         smol::block_on(async {
             let (_registry, pool) = pool(2).await;
             let runs = numbers(&[&[0, 2], &[1, 3]], DuplicateCheck::Collect);
-            let mut prepare =
-                HotMergePreparation::with_sizing(runs, pool.clone(), 2, 2, 1).unwrap();
+            let mut prepare = MergePreparation::with_sizing(runs, pool.clone(), 2, 2, 1).unwrap();
             let plan = prepare.execute().await.unwrap();
-            let mut consumption = HotMergeConsumption::new(
+            let mut consumption = MergeConsumption::new(
                 plan.clone(),
                 pool.clone(),
                 ForeignConsumer(Mutex::new(None)),

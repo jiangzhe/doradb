@@ -1,5 +1,5 @@
 use super::merge::HotEntryRef;
-use super::{BudgetedVec, MemoryBudget, SortedHotRuns};
+use super::{BudgetedVec, MemoryBudget, SortedRuns};
 use crate::error::ResourceResult;
 use std::cmp::Ordering;
 
@@ -23,7 +23,7 @@ pub(super) struct LoserTree {
 impl LoserTree {
     /// Admit all cursor and tournament storage before advancing any entry.
     pub(super) fn new(
-        runs: &SortedHotRuns,
+        runs: &SortedRuns,
         start: &[usize],
         end: &[usize],
         budget: &MemoryBudget,
@@ -51,7 +51,7 @@ impl LoserTree {
         Ok(tree)
     }
 
-    fn build(&mut self, runs: &SortedHotRuns, node: usize) -> usize {
+    fn build(&mut self, runs: &SortedRuns, node: usize) -> usize {
         if node >= self.leaves {
             let run = node - self.leaves;
             return if run < self.cursors.len() && self.cursors[run].position < self.cursors[run].end
@@ -69,7 +69,7 @@ impl LoserTree {
     }
 
     #[inline]
-    fn match_pair(&self, runs: &SortedHotRuns, left: usize, right: usize) -> (usize, usize) {
+    fn match_pair(&self, runs: &SortedRuns, left: usize, right: usize) -> (usize, usize) {
         if right == EMPTY
             || (left != EMPTY
                 && runs.compare(
@@ -85,7 +85,7 @@ impl LoserTree {
 
     /// Advance exactly one head and replay its O(log K) tournament path.
     #[inline]
-    pub(super) fn pop(&mut self, runs: &SortedHotRuns) -> Option<HotEntryRef> {
+    pub(super) fn pop(&mut self, runs: &SortedRuns) -> Option<HotEntryRef> {
         let run = self.winner;
         if run == EMPTY {
             return None;

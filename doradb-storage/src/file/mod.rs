@@ -18,11 +18,13 @@ use crate::error::{
     SharedFatalError,
 };
 use crate::id::{BlockID, FileID};
+use crate::index::build::MemoryReservation;
 use crate::io::DirectBuf;
 use crate::io::{
     IOClient, IOKind, IOQueue, IOSubmission, Operation, StdIoResult, align_to_sector_size,
 };
 use error_stack::Report;
+use futures::future::BoxFuture;
 use libc::{O_CREAT, O_DIRECT, O_EXCL, O_RDWR, O_TRUNC, close, fstat, ftruncate, open, stat};
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
@@ -269,6 +271,7 @@ pub(crate) struct WriteSubmission {
     file: Arc<SparseFile>,
     offset: usize,
     buf: DirectBuf,
+    allocation: Option<MemoryReservation>,
     write_lease: Option<ReadonlyWriteLease>,
     completion: Arc<Completion<()>>,
 }
@@ -288,6 +291,7 @@ impl WriteSubmission {
             file,
             offset,
             buf,
+            allocation: None,
             write_lease,
             completion: Arc::clone(&completion),
         };
@@ -301,6 +305,7 @@ impl WriteSubmission {
             file,
             offset,
             buf,
+            allocation,
             write_lease,
             completion,
         } = self;
@@ -309,6 +314,7 @@ impl WriteSubmission {
             key,
             _file: file,
             operation,
+            allocation,
             write_lease,
             completion,
         }
@@ -318,6 +324,7 @@ impl WriteSubmission {
     #[inline]
     pub(crate) fn fail(mut self, err: &SharedFatalError) {
         drop(self.buf);
+        drop(self.allocation.take());
         drop(self.write_lease.take());
         self.completion
             .complete(Err(err.clone().into_completion_bridge()));
@@ -329,6 +336,7 @@ pub(crate) struct PreparedWriteSubmission {
     key: BlockKey,
     _file: Arc<SparseFile>,
     operation: Operation,
+    allocation: Option<MemoryReservation>,
     write_lease: Option<ReadonlyWriteLease>,
     completion: Arc<Completion<()>>,
 }
@@ -347,6 +355,7 @@ impl PreparedWriteSubmission {
                 .take_buf()
                 .expect("prepared table write must still own its direct buffer"),
         );
+        drop(self.allocation.take());
         self.release_write_lease();
         self.completion
             .complete(Err(err.clone().into_completion_bridge()));
@@ -588,6 +597,7 @@ impl TableFsStateMachine {
                 match res {
                     Ok(len) => {
                         drop(buf);
+                        drop(sub.allocation.take());
                         sub.release_write_lease();
                         let result = if len == expected_len {
                             Ok(())
@@ -605,6 +615,7 @@ impl TableFsStateMachine {
                     }
                     Err(err) => {
                         drop(buf);
+                        drop(sub.allocation.take());
                         sub.release_write_lease();
                         sub.completion.complete(Err(CompletionErrorBridge::capture(
                             Report::new(IoError::from(err.kind())).attach(format!(
@@ -657,6 +668,35 @@ pub(crate) fn sparse_file_size(fd: RawFd) -> IoResult<(usize, usize)> {
         let err = StdIoError::last_os_error();
         Err(Report::new(IoError::from(err.kind())).attach(format!("op=file_stat, {err}")))
     }
+}
+
+/// Prepare a charged write whose ingress future and completion remain caller-owned.
+/// The charge follows the submission, including backend Fatal retention.
+pub(crate) fn prepare_charged_write(
+    key: BlockKey,
+    file: Arc<SparseFile>,
+    offset: usize,
+    buf: DirectBuf,
+    background_writes: IOClient<BackgroundWriteRequest>,
+    write_lease: Option<ReadonlyWriteLease>,
+    allocation: MemoryReservation,
+) -> BoxFuture<'static, CompletionResult<Arc<Completion<()>>>> {
+    let (mut submission, completion) =
+        WriteSubmission::prepare(key, file, offset, buf, write_lease);
+    submission.allocation = Some(allocation);
+    Box::pin(async move {
+        if background_writes
+            .send_async(BackgroundWriteRequest::Table(submission))
+            .await
+            .is_err()
+        {
+            return Err(CompletionErrorBridge::capture(
+                Report::new(IoError::from(IoErrorKind::BrokenPipe))
+                    .attach(format!("charged table write ingress closed: key={key:?}")),
+            ));
+        }
+        Ok(completion)
+    })
 }
 
 /// Write one direct buffer via async direct IO.
@@ -996,6 +1036,40 @@ mod tests {
         let wrap_value = T::from(1);
         assert_eq!(wrap_value.sub_to_u64(wrap_min), 4);
         assert_eq!(wrap_min.add_from_u32(5), T::from(2));
+    }
+
+    /// Purpose: Keep output admission with backend-retained buffers after Fatal notification.
+    /// Expected: Ordinary completion releases the buffer charge; reported Fatal retains it until the prepared submission is actually destroyed.
+    #[test]
+    fn charged_write_reservation_follows_backend_ownership() {
+        use crate::index::build::MemoryBudget;
+        smol::block_on(async {
+            let (_temp, _fs, table) = committed_test_table_file().await;
+            for fatal in [false, true] {
+                let budget = MemoryBudget::new(STORAGE_SECTOR_SIZE);
+                let mut machine = TableFsStateMachine::new();
+                let (mut submission, waiter) = prepare_table_write_submission(&mut machine, &table);
+                submission.allocation = Some(
+                    budget
+                        .reserve(STORAGE_SECTOR_SIZE, "test storage buffer")
+                        .unwrap(),
+                );
+                if fatal {
+                    let failure = SharedFatalError::capture(Report::new(FatalError::StorageIo));
+                    submission.fail_backend_submitted(&failure);
+                    assert!(waiter.wait_result().await.is_err());
+                    assert_eq!(budget.used(), STORAGE_SECTOR_SIZE);
+                    drop(submission);
+                } else {
+                    machine.on_complete(
+                        TableFsSubmission::Write(submission),
+                        Ok(STORAGE_SECTOR_SIZE),
+                    );
+                    waiter.wait_result().await.unwrap();
+                }
+                assert_eq!(budget.used(), 0);
+            }
+        });
     }
 
     /// Purpose: Preserve block identifiers across integer accessors and conversions.

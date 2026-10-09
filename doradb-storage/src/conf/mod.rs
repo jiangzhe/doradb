@@ -21,7 +21,7 @@ pub use self::consts::{
 pub use self::engine::{EngineConfig, MandatoryRuntimeConfig, TableScanConfig, ThreadPoolConfig};
 pub use self::fs::FileSystemConfig;
 pub(crate) use self::fs::ValidatedFileSystemConfig;
-pub use self::index_build::HotIndexBuildConfig;
+pub use self::index_build::{ColdIndexBuildConfig, HotIndexBuildConfig};
 pub use self::recovery::RecoveryConfig;
 pub use self::trx::TrxSysConfig;
 pub(crate) use self::trx::ValidatedTrxSysConfig;
