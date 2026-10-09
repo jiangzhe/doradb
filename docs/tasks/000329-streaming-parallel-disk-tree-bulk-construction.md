@@ -11,11 +11,11 @@ github_issue: 1145
 
 ## Summary
 
-CREATE INDEX now constructs its cold DiskTree through bounded parallel leaf
-packing and retained asynchronous write coordination. Serial collection admits
-owned memory before allocation, finalizes one sorted resident run, and shares
-that run with the existing unique cold/hot validator. Both index modes use the
-new path; checkpoint mutation writers and persisted formats remain unchanged.
+CREATE INDEX constructs its cold DiskTree through bounded parallel leaf packing
+and retained asynchronous write coordination. Serial collection admits owned
+memory before allocation and finalizes one sorted resident run, shared with
+unique cold/hot validation. Both index modes use the new path while preserving
+persisted formats and existing publication, checkpoint, and recovery behavior.
 
 ## Context
 
@@ -36,154 +36,159 @@ Issue Labels:
 - priority:high
 - codex
 
-Design and measured baseline: `3291b6892a49e09eca674dd677ae64216134887f`.
-RFC 0032 supplies retained sorted runs, merge contracts, allocation-lifetime
-reservations, the existing ThreadPool, and hot/recovery integration. The old
-cold CREATE path copied retained keys into full mutation batches and operation
-maps, then materialized logical subtrees and awaited each node write.
+The measured baseline is `3291b6892a49e09eca674dd677ae64216134887f`.
+RFC 0032 supplied sorted runs, bounded merge, allocation-lifetime reservations,
+and the existing ThreadPool. Cold CREATE previously copied keys into mutation
+batches and operation maps, materialized logical subtrees, and awaited node
+writes serially. Construction dominated the cold CREATE baseline.
+
+The source backlogs cover the wider RFC program. Phase 1 delivers construction
+primitives and CREATE integration; their remaining acceptance criteria are
+tracked in later phases and remain open.
 
 ## Goals
 
-- Share resident-run, partition-stream, duplicate, and exact-consumption
-  contracts between hot and durable construction.
-- Admit collection, retained keys, bounded packing windows, descriptor and
-  allocation/write ledgers, queues, and output buffers under one disk budget.
-- Pack final checksummed images concurrently, with coordinator-owned allocation,
-  bounded ingress, out-of-order write observation, and retained settlement.
-- Complete a readable private root only after coverage, validation, structure,
-  and every required write succeed; preserve existing publication and restart.
-- Provide public CREATE measurements, observed packing concurrency, fault
-  regressions, and independent persisted-content verification.
+- Share resident input, exact partition consumption, duplicate evidence, and
+  synchronous leaf planning between hot and cold construction.
+- Bound admitted collection, retained keys, packing, bookkeeping, and output
+  memory while allowing concurrent packing and asynchronous storage progress.
+- Return a readable private root only after complete coverage, validation,
+  structural assembly, and successful settlement of every required write.
+- Preserve CREATE correctness and expose configuration, publication-only
+  measurements, fault coverage, and independently verified performance evidence.
 
 ## Non-Goals
 
-Parallel extraction, multiple cold source runs, sealed-root validation and early
-cold-key release, checkpoint reconciliation, subtree replacement forests,
-checkpoint root-promotion repair, external sorting/spill, format migrations,
-and new public DDL signatures remain outside Phase 1. Neither source backlog is
-closed by this task. No legacy-writer production switch or timeout-policy change
-was introduced.
+Parallel extraction, early cold-key release, completed-root cross-tier
+validation, checkpoint reconciliation, root-promotion repair in mutation writers,
+external sorting/spill, and global compaction remain later work. This task adds
+no production algorithm switch, persisted-format migration, public DDL signature
+change, or timeout-policy change.
 
 ## Rejected Alternatives
 
-- A complete backend-generic tree builder would couple established MemIndex
-  installation and cleanup to durable storage admission. Shared streams and
-  bounded packing primitives provide the needed reuse.
-- A streaming mode in mutation batch writers would mix complete-input
-  construction authority with ordered mutation and owner-replacement semantics.
+- A backend-generic tree builder would couple MemIndex installation and cleanup
+  to durable allocation and I/O. Shared synchronous planning and separate
+  caller-owned construction lifecycles preserve those boundaries.
+- Adding streaming to mutation batch writers would mix complete-input build
+  authority with ordered mutations and owner replacement.
 
 ## Plan
 
-### Resident input and admission
+### Input and resource contracts
 
-`SortedRun`, `SortedRuns`, `PreparedMerge`, `PartitionConsumer`, and
-`MergeCompletion` are source-independent. The internal finalizer consumes
-admitted entries and outlined-key admission, sorts in place, and establishes
-local evidence. `ColdUniqueKeys` retains that exact run owner without copying
-keys or releasing admission. Hot extraction and caller orchestration retain
-their existing specialized responsibilities.
+Source-independent sorted runs and partition streams carry exact coverage and
+local duplicate evidence. The cold collector sorts admitted entries in place;
+unique cross-tier validation retains the same run without copying keys or
+releasing its charge. Collection and sorting remain serial in this phase.
 
-`ColdIndexBuildConfig`, exposed through `EngineConfig::cold_index_build`, has
-256 MiB scratch, automatic pool-sized workers, eight queued leaf buffers, and
-32 unsettled writes by default. Invalid/overflowing limits return fieldless
-`InvalidColdIndexBuildLimit` with field/value attachments during pure validation.
-Benchmark overlays serialize every effective limit and the fixed sizing rules.
+`ColdIndexBuildConfig`, exposed through `EngineConfig::cold_index_build`, defaults
+to 256 MiB scratch, pool-sized workers, eight ready buffers, and 32 unsettled
+writes. Pure configuration validation checks the complete minimum progress
+reservation for both index modes against overflow, allocation limits, and the
+scratch ceiling. Additional workers are admitted against remaining headroom.
 
-Minimum leaf, parent, queue, and write-observation progress is earmarked before
-collection. Reservation subdivision/adoption transfers that capacity without a
-release/reacquire gap. Worker allowance is refined after resident input exists;
-impossible admission fails with an `InsufficientMemory` cause before output.
-Old and replacement vector storage overlap remains charged during growth.
+Collection, descriptors, projection payloads, keys, ledgers, queues, and output
+buffers retain admission through their actual allocation lifetimes, including
+old/replacement overlap. Pool pins and fixed control objects remain separate
+from scratch and RSS. Exhausted input-dependent admission returns a typed
+resource cause; construction does not spill or wait for its own retained input.
 
-Cold traversal charges its descriptor list and stack. Identity/deletion copies
-use a documented one-block conservative bound. Reused projection storage admits
-nested variable values from validated borrowed LWC lengths before decoding.
-Entry slots and encoded outlined keys are admitted before encoding. Existing
-binding/count/coverage, deletion filtering, selected-column, and uncommitted
-marker checks remain authoritative. Pool-owned serial pins and static control
-objects are reported separately from scratch and process RSS.
+### Parallel packing and durable ownership
 
-### Partitioning and node construction
+A single sorted run supports direct rank partitions and borrowed batches,
+without a loser tree or a full reference array. Nonempty input uses at most
+four partitions per worker, targeting 65,536 entries per partition; pulls are
+bounded to 32,768 entries. Duplicate evidence belongs to the complete plan,
+and execution/Fatal failures retain precedence over duplicate diagnostics.
 
-Nonempty input uses `min(N, 4 * W, ceil(N / 65536))` partitions and widened rank
-arithmetic. Single-run cuts are direct positions with exact neighbors; streams
-borrow array slices in batches of at most 32768 entries without loser trees or
-reference buffers. The earliest local duplicate belongs to the complete plan,
-combined with cut evidence; it is not attached to unrelated partition ranges.
-Execution/Fatal failures retain precedence over duplicate evidence.
+The hot and cold consumers share bounded lookahead, leaf plans, fence-aware
+candidate selection, and node parameters. Each consumer retains its allocation,
+async scheduling, and ownership policy. Leaf splits are used unchanged, including
+singleton tails; parent-group policies remain separate. Final disk capacity is
+checked using actual fences and value encoding before packing and checksumming.
+The root keeps a finite first-key lower fence and an open upper fence.
 
-`packing.rs` contains the bounded circular lookahead and fence-aware candidate
-planner shared with the hot builder. Disk leaf values are `BTreeU64` RowIDs or
-`BTreeNil` for exact non-unique keys. `DiskNodePlan`, `DiskNodeImage`, shallow
-`DiskChildDescriptor`, `pack_node`, and `pack_parent_node` provide reusable
-node/level contracts below whole-tree orchestration. Final capacity is checked
-under actual DiskTree fences and value encoding before packing and checksum.
-The root retains its finite first-key lower fence and open upper fence.
+CREATE progress retains the durable coordinator, mutable fork, and completion
+evidence. Workers pack buffers; the coordinator allocates blocks and submits
+writes. Each producer waits for explicit storage acceptance before another
+buffer. One write slot remains available for parent progress. Parents use
+accepted child identities and shallow descriptors without rereading children.
 
-### Retained ownership, writes, and publication
+The coordinator observes writes independently of key order and retains pending
+submissions across cancelled execution borrows. Cleanup rejects arriving packets
+while workers settle, then drops the receiver and drains storage obligations.
+Ordinary failure reclaims owned unpublished blocks; Fatal ownership is retained
+when safe reuse cannot be proved. Backend-owned buffers retain their charges
+until actual release, even after a Fatal notification.
 
-`CreateIndexProgress` retains `DiskBulkBuild`, the mutable fork, and completed
-input evidence. A compact build identity contains no run owner; successful
-completion from that same identity is required to transfer the private fork.
-Workers pack buffers but receive no allocator or mutable-file capability.
-
-Bounded handoff and explicit acknowledgements limit each producer to one
-unaccepted output. The coordinator accepts any ready partition, records every
-allocation before ingress, and retains pending submissions independently of
-borrowed execution futures. Leaf writes use at most the configured limit minus
-one. Parent assembly uses accepted child BlockIDs and shallow descriptors,
-without rereading children or requiring completed child I/O.
-
-Write observers are polled independently of key order. Buffer admission follows
-`WriteSubmission` and `PreparedWriteSubmission`, including kernel-facing Fatal
-retention, and releases after the buffer is freed. Ordinary failure closes and
-fails handoffs, drains CPU and storage obligations, and reclaims only owned
-unpublished blocks. Reclamation is marked before execution; unsafe/Fatal fork
-ownership is retained. Observer detachment leaves accepted CREATE under existing
-mandatory supervision and source exclusion.
-
-Completed private roots require exact partition packet/terminal coverage,
-required distinctness, coherent parent structure, and every required write.
-Empty input yields no root. Existing hot construction, retained-key cross-tier
-validation, catalog commit, table-root publication, and layout/history
-publication remain caller-owned stages. The wait contracts are documented in
-`docs/secondary-index.md` and at their code owners.
+Only complete input/output coverage, required validation, coherent structure,
+and successful writes produce private-root authority. Empty input yields no
+root. Existing hot construction, cross-tier checks, catalog commit, table-root
+publication, and layout/history publication remain caller-owned stages.
 
 ## Implementation Notes
 
-Delivered RFC 0033 Phase 1 for unique and non-unique CREATE, including admitted
-serial preparation, direct single-run partitions, bounded durable packing,
-retained write settlement, public configuration, and publication-only profiling.
+Delivered RFC 0033 Phase 1 for unique and non-unique CREATE INDEX.
+Admitted serial preparation feeds parallel durable packing with retained write
+settlement, public cold-build limits, and publication-only profiling.
 
-### Review findings and validation
+### Final review outcomes
 
-A full-suite run exposed an existing optimistic hinted-search assertion race
-in the random-delete CLI test. The affected lookup files were initially
-unchanged. A deterministic dispatch/threshold-change fixture reproduced the
-assertion on the baseline. The redundant eligibility assertion was removed:
-slot bounds and final latch validation remain authoritative. A regression
-covers empty, tiny, and just-below-threshold observations. The original failing
-test then passed 1000 stress iterations. This ancillary debug assertion fix
-changes neither release search semantics nor persisted layout.
+- Shared synchronous leaf planning replaced duplicated hot/cold planning without
+  combining their storage or cleanup lifecycles. The unsupported singleton-leaf
+  redistribution heuristic was removed; planner splits remain authoritative.
+- Configuration rejects insufficient minimum progress budgets before filesystem
+  effects. Runtime input growth can still fail through resource admission.
+- Settlement retains and drains the packet receiver until supervised workers
+  finish, including after cancellation of a borrowed cleanup future. The new
+  deterministic regression fails with the former receiver teardown and passed
+  100 stress iterations with the fix.
+- Cold pin measurements contribute zero when traversal is skipped, and one page
+  when traversal occurs even if every cold row is deleted. Lifetime-peak and
+  successful-publication semantics are preserved.
+- Configuration names use `cold`; shared profiling uses `index_build`, including
+  `Session::index_build_stats()`, `hot_index_extraction.*`, and
+  `create_index.cold.*`. The metric text baseline became a typed test contract.
+- Persisted corruption retains integrity errors. Conditions guaranteed by
+  admitted layout, occupied slots, branch height, and fixed-page loader contracts
+  remain assertions; the reviewed short-slice assertion was retained because
+  readonly loading rejects short I/O before validation.
 
-Validation completed with formatting, default workspace Clippy, profiling-disabled
-storage Clippy, 2311 workspace nextest tests, and 2047 profiling-disabled storage
-tests. Branch style audit checked 30 Rust files; all 382 selected test contracts
-passed. Semantic review retained distinct public/component and lifecycle
-coverage, moved the circular-window test with its implementation, and found no
-remaining changed-test assertion issue. No unsafe layout operations were added;
-the public-error disclosure inventory was refreshed.
+An initial full-suite run exposed an existing optimistic hinted-search assertion
+race. A baseline reproduction and deterministic threshold-crossing test justified
+removing the redundant eligibility assertion; slot bounds and final latch
+validation remain authoritative. The original random-delete lifecycle test
+passed 1,000 stress iterations. Persisted layout and release search semantics
+were unaffected.
 
-Focused production coverage: disk builder 92.23%, shared packing 99.02%, shared
-merge 97.73%, catalog index orchestration 86.35%, and B-tree nodes 94.35%.
-Artifacts: `target/task329-evidence/coverage.md`,
-`target/task329-evidence/review.md`, and `target/test-audit/`.
+### Verification and evidence
+
+Latest behavioral validation passed 2,325 workspace tests and 2,060
+profiling-disabled storage tests. The final branch style gate passed formatting,
+workspace Clippy, structural checks, and 600 test contracts across 38 Rust files.
+Changed-test semantic review retained distinct public/component, hot/cold,
+profiling, and cleanup coverage and found no outstanding assertion issue.
+Earlier profiling-disabled Clippy also passed. Public-error and unsafe inventories
+were refreshed; no new unsafe layout operations were introduced.
+
+Initial focused production coverage was 92.23% for the disk builder, 99.02% for
+shared packing, 97.73% for merge, 86.35% for catalog index orchestration, and
+94.35% for B-tree nodes. These percentages and the benchmark binaries below
+precede the subsequent review refinements; coverage and timing were not
+regenerated for the final source snapshot. The final test/style results above
+cover the reviewed implementation.
+
+Local evidence is under `target/task329-evidence/` and `target/test-audit/`;
+`settlement/previous-cleanup.log` records the negative regression control.
+The durable benchmark results and their limits follow.
 
 ### Matched public CREATE measurements
 
-Measured on Linux aarch64 (14 Apple CPU cores exposed), stable Rust 1.99,
-system glibc allocator, and io_uring. Engine pool size stayed at two; streaming
-scratch/output limits stayed at 256 MiB / 8 ready / 32 accepted writes.
+The initial implementation was measured on Linux aarch64 (14 Apple CPU cores
+exposed), stable Rust 1.99, system glibc allocator, and io_uring. Engine pool size
+stayed at two; streaming scratch/output limits stayed at 256 MiB / 8 ready /
+32 accepted writes.
 Fresh release processes and roots used warmed checkpoint/verification caches,
 without OS-cache flushing. Three samples per primary case rotated baseline,
 one-worker, and two-worker order. Four small controls received six additional
@@ -254,36 +259,36 @@ was added. Retain the raw three-sample ranges when comparing future tuning.
 
 ## Impacts
 
-- Storage configuration, serial LWC projection/column-index collection,
-  source-independent index construction, CREATE staging, and table-file ingress.
-- Storage submissions retain optional allocation admission through real backend
-  release, including Fatal retention.
-- Existing profiling and benchmark normalization expose durable construction
-  counters, wall/worker durations, peaks, and effective limits.
-- Persisted formats, physical key/value encodings, transaction signatures,
-  source exclusion, publication order, and checkpoint mutation APIs are unchanged.
+- Storage configuration and benchmark normalization expose cold-build limits;
+  profiling separates cold construction, hot extraction, and CREATE publication.
+- Shared run/merge/leaf-planning primitives support both builders, while CREATE
+  staging and storage ingress retain their existing publication authority.
+- Storage submissions carry optional allocation admission until backend release.
+- Persisted formats, physical encodings, source exclusion, transaction signatures,
+  checkpoint mutation APIs, and publication ordering remain unchanged.
 
 ## Test Cases
 
-- Direct ranges, exact neighbors/borrowing, earliest duplicate ranks across cuts,
-  trusted recovery, and foreign/missing/incomplete completion precedence.
-- Unique and skewed non-unique persisted scans for empty, tiny, multi-level, and
-  multi-partition inputs under one queued buffer and minimal write capacity.
-- Cold allocation failures before output and after partial collection, exact
-  retained-owner identity, unchanged publication, zero leaked charges, and retry.
-- Blocked earlier partition with later acceptance; detached execution borrow;
-  parent acceptance before delayed child failure; real backend EIO settlement;
-  rollback and backend-retained Fatal buffer admission.
-- Finite-fence capacity versus open-fence overflow for leaf and branch values,
-  checksums, pure configuration validation, strict normalized benchmark settings,
-  and publication-only counters with peak/delta distinctions.
-- Existing public CREATE/delete/replace/uniqueness/source-exclusion, recovery,
-  subsequent DML/checkpoint, and restart suites remain passing.
+- Direct partitions, exact neighbors and borrowing, earliest duplicates, trusted
+  recovery, and rejection of foreign or incomplete completion authority.
+- Unique and skewed non-unique persisted scans for empty, tiny, multi-level,
+  and multi-partition builds under minimal output capacities.
+- Collection and downstream admission failures, retained-owner identity,
+  unpublished-allocation rollback, zero leaked charges, and successful retry.
+- Later-partition progress, detached execution and cleanup, late packet rejection,
+  parent acceptance before child failure, backend EIO, and Fatal buffer retention.
+- Shared planning for all value formats, finite/open fences, singleton tails,
+  scratch reuse, invalid boundaries, and checksummed persisted corruption.
+- Configuration scratch boundaries and overflow, strict benchmark overlays,
+  publication-only counters, lifetime peaks, and skipped/deleted cold traversal.
+- Public CREATE, uniqueness, deletion/replacement, source exclusion, subsequent
+  DML/checkpoint, and restart regressions.
 
 ## Open Questions
 
-No blocking Phase 1 questions remain. RFC 0033 Phase 2 seals completed roots
-and releases indirect input ownership; Phase 3 parallelizes extraction; Phase 4
-adds checkpoint reconciliation and root-promotion repair. The two source
-backlogs remain open for those later phases. Resident-only admission remains an
-explicit limit; spill and global compaction are not implemented here.
+No blocking Phase 1 questions remain. RFC 0033 Phase 2 owns completed-root
+validation and release of indirect cold-input owners; Phase 3 owns parallel
+extraction; Phase 4 owns checkpoint reconciliation and root-promotion repair.
+Backlog 000104 remains open for validation, extraction, and eventual spill;
+backlog 000084 remains open for checkpoint integration and its acceptance proof.
+Global compaction is separately tracked by backlog 000083.
