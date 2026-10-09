@@ -143,11 +143,12 @@ impl DiskBuildAdmission {
     /// Protect one leaf worker, parent planning, and every bounded output stage.
     pub(crate) fn new(policy: ColdBuildPolicy, unique: bool) -> RuntimeOrFatalResult<Self> {
         let budget = MemoryBudget::new(policy.max_scratch_bytes);
-        let bytes = worker_bytes(unique)
-            + worker_bytes(true)
-            + (policy.max_ready_buffers + policy.max_in_flight_writes + 2) * DISK_TREE_BLOCK_SIZE
-            + policy.max_in_flight_writes * (size_of::<PendingWrite>() + 1024)
-            + handoff_bytes(policy.max_ready_buffers);
+        let bytes = minimum_progress_bytes(
+            unique,
+            policy.max_ready_buffers,
+            policy.max_in_flight_writes,
+        )
+        .unwrap_or_else(|| unreachable!("validated disk minimum progress capacity"));
         let spare = budget
             .reserve(bytes, "disk minimum progress")
             .change_context(RuntimeError::IndexAccess)?;
@@ -342,7 +343,8 @@ impl DiskBulkBuild {
             leaves: None,
             receiver: None,
             _handoff_admission: admission.take(
-                handoff_bytes(admission.policy.max_ready_buffers),
+                handoff_bytes(admission.policy.max_ready_buffers)
+                    .unwrap_or_else(|| unreachable!("validated disk handoff capacity")),
                 "disk handoff queue",
             )?,
             identity: Arc::new(()),
@@ -794,31 +796,47 @@ impl DiskBulkBuild {
         ))
     }
 
-    /// Stop forward admission and drain accepted CPU/storage obligations. Closing
-    /// the handoff fails blocked senders; queued and ingress packets receive a
-    /// negative acknowledgement. Accepted storage completions remain authoritative
-    /// during shutdown/poison. Cancellation retains all ledgers in this owner.
+    /// Stop forward admission and drain accepted CPU/storage obligations. Reject
+    /// handoff packets until supervised leaf completion permits receiver teardown.
+    /// Pending ingress and accepted storage completions remain authoritative during
+    /// shutdown/poison. Cancellation retains the receiver and ledgers in this owner.
     pub(crate) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
         if self.finished && !self.failed {
             return Ok(());
         }
         self.failed = true;
         let mut failure: Option<RuntimeOrFatalError> = None;
-        if let Some(receiver) = self.receiver.take() {
-            while let Ok(packet) = receiver.try_recv() {
-                packet.ack.complete(false);
-            }
-            drop(receiver);
-        }
         if self.submitting.is_some()
             && let Err(error) = self.accept_pending().await
         {
             merge_failure(&mut failure, error);
         }
-        if let Some(leaves) = &mut self.leaves
-            && let Err(error) = leaves.settle().await
-        {
-            merge_failure(&mut failure, error);
+        if let Some(leaves) = &mut self.leaves {
+            let settlement = leaves.settle().fuse();
+            futures::pin_mut!(settlement);
+            let result = if let Some(receiver) = &self.receiver {
+                loop {
+                    let delivery = receiver.recv_async().fuse();
+                    futures::pin_mut!(delivery);
+                    select_biased! {
+                        result = settlement => break result,
+                        packet = delivery => match packet {
+                            Ok(packet) => packet.ack.complete(false),
+                            Err(_) => break settlement.await,
+                        },
+                    }
+                }
+            } else {
+                settlement.await
+            };
+            if let Err(error) = result {
+                merge_failure(&mut failure, error);
+            }
+        }
+        if let Some(receiver) = self.receiver.take() {
+            while let Ok(packet) = receiver.try_recv() {
+                packet.ack.complete(false);
+            }
         }
         if let Err(error) = self.preparation.settle().await {
             merge_failure(&mut failure, error);
@@ -1045,6 +1063,8 @@ impl DiskLeafConsumer {
             image,
             ack: OutputAck(ack.clone()),
         };
+        #[cfg(test)]
+        self.admission.hooks.before_handoff(partition, &ack).await;
         // The retained coordinator is the progress producer and owns cancellation
         // cleanup. Queue delivery is not storage acceptance; only its explicit ack
         // permits another buffer. Poison/shutdown drain or fail this same handoff.
@@ -1061,6 +1081,20 @@ impl DiskLeafConsumer {
         }
         Ok(plan.count)
     }
+}
+
+/// Checked reservation for one leaf worker, parent scratch, and bounded output stages.
+pub(crate) fn minimum_progress_bytes(unique: bool, ready: usize, writes: usize) -> Option<usize> {
+    let buffers = ready
+        .checked_add(writes)?
+        .checked_add(2)?
+        .checked_mul(DISK_TREE_BLOCK_SIZE)?;
+    let observers = writes.checked_mul(size_of::<PendingWrite>() + 1024)?;
+    worker_bytes(unique)
+        .checked_add(worker_bytes(true))?
+        .checked_add(buffers)?
+        .checked_add(observers)?
+        .checked_add(handoff_bytes(ready)?)
 }
 
 /// Pack one bounded parent from ordered, contiguous descriptors with accepted
@@ -1177,8 +1211,11 @@ pub(super) fn pack_node<V: BTreeValue + Copy>(
 
 // Bounded flume delivery uses a growable deque. Earmark twice its rounded
 // capacity to cover old/replacement backing overlap without relying on queue timing.
-fn handoff_bytes(buffers: usize) -> usize {
-    2 * buffers.next_power_of_two() * size_of::<PackedDiskNode>()
+fn handoff_bytes(buffers: usize) -> Option<usize> {
+    buffers
+        .checked_next_power_of_two()?
+        .checked_mul(2)?
+        .checked_mul(size_of::<PackedDiskNode>())
 }
 
 fn worker_bytes(unique: bool) -> usize {
@@ -1243,16 +1280,21 @@ mod tests {
     };
     use crate::memcmp::MEM_CMP_KEY_INLINE;
     use error_stack::Report;
+    use std::array::from_fn;
     use std::io::ErrorKind;
     use std::io::{Error as StdIoError, Result as IoResult};
     use std::os::fd::RawFd;
     use std::sync::atomic::{AtomicBool, Ordering as TestOrdering};
+
+    type HandoffObservation = (usize, Arc<Completion<bool>>);
 
     #[derive(Default)]
     pub(super) struct Hooks {
         blocked_leaf: Mutex<Option<flume::Receiver<()>>>,
         leaf_entered: Mutex<Option<flume::Sender<()>>>,
         leaf_release: Mutex<Option<flume::Sender<()>>>,
+        blocked_handoffs: Mutex<[Option<flume::Receiver<()>>; 2]>,
+        handoff_entered: Mutex<Option<flume::Sender<HandoffObservation>>>,
         delayed_write: Mutex<Option<flume::Receiver<()>>>,
         write_release: Mutex<Option<flume::Sender<()>>>,
         later_partition_accepted: AtomicBool,
@@ -1269,6 +1311,20 @@ mod tests {
                     }
                     gate.recv_async().await.unwrap();
                 }
+            }
+        }
+
+        pub(super) async fn before_handoff(&self, partition: usize, ack: &Arc<Completion<bool>>) {
+            let gate = self
+                .blocked_handoffs
+                .lock()
+                .get_mut(partition)
+                .and_then(Option::take);
+            if let Some(gate) = gate {
+                if let Some(entered) = &*self.handoff_entered.lock() {
+                    entered.send((partition, ack.clone())).unwrap();
+                }
+                gate.recv_async().await.unwrap();
             }
         }
 
@@ -1336,6 +1392,47 @@ mod tests {
             .unwrap();
         registry.build::<ThreadPoolWorkers>(()).await.unwrap();
         PoolScope(registry.finish())
+    }
+
+    async fn settle_handoff(build: &mut DiskBulkBuild, detach: bool) -> RuntimeOrFatalError {
+        let hooks = build.admission.hooks.clone();
+        let (entered, reached) = flume::bounded(2);
+        *hooks.handoff_entered.lock() = Some(entered);
+        let releases: [_; 2] = from_fn(|partition| {
+            let (release, gate) = flume::bounded(1);
+            hooks.blocked_handoffs.lock()[partition] = Some(gate);
+            release
+        });
+        assert!(build.build().now_or_never().is_none());
+        let mut acks: [_; 2] = [None, None];
+        for _ in 0..2 {
+            let (partition, ack) = reached.recv_async().await.unwrap();
+            assert!(acks[partition].replace(ack).is_none());
+        }
+        let [late_ack, queued_ack] = acks.map(Option::unwrap);
+        releases[1].send(()).unwrap();
+        while !build.receiver.as_ref().unwrap().is_full() {
+            yield_now().await;
+        }
+        assert!(!queued_ack.is_completed());
+        let mut settlement = Box::pin(build.settle());
+        assert!(futures::poll!(settlement.as_mut()).is_pending());
+        assert!(!queued_ack.completed_result().unwrap().unwrap());
+        assert!(!late_ack.is_completed());
+        let result = if detach {
+            drop(settlement);
+            assert!(build.receiver.is_some());
+            assert!(!build.finished);
+            releases[0].send(()).unwrap();
+            build.settle().await
+        } else {
+            releases[0].send(()).unwrap();
+            settlement.await
+        };
+        assert!(!late_ack.completed_result().unwrap().unwrap());
+        assert!(build.receiver.is_none());
+        assert!(build.finished);
+        result.unwrap_err()
     }
 
     async fn roundtrip(unique: bool, count: u32, workers: usize, fail: Option<&'static str>) {
@@ -1458,7 +1555,7 @@ mod tests {
                 *hooks.blocked_leaf.lock() = Some(gate);
                 *hooks.leaf_release.lock() = Some(release);
             }
-            Some("backend") => (),
+            Some("backend" | "settle handoff" | "detach settle handoff") => (),
             Some(purpose) => fail_build_budget(&budget, purpose),
             None => (),
         }
@@ -1469,7 +1566,11 @@ mod tests {
             assert!(!build.finished);
             release.send(()).unwrap();
         }
-        let result = build.build().await;
+        let result = match fail {
+            Some("settle handoff") => Err(settle_handoff(&mut build, false).await),
+            Some("detach settle handoff") => Err(settle_handoff(&mut build, true).await),
+            _ => build.build().await,
+        };
         if let Some(purpose) =
             fail.filter(|purpose| !matches!(*purpose, "blocked partition" | "detach"))
         {
@@ -1479,7 +1580,18 @@ mod tests {
             let RuntimeOrFatalError::Runtime(error) = error else {
                 panic!("ordinary admission failure changed domain")
             };
-            if matches!(purpose, "delayed child" | "backend") {
+            if matches!(purpose, "settle handoff" | "detach settle handoff") {
+                assert!(build.allocations.is_empty());
+                let detail = format!("{error:?}");
+                assert!(
+                    detail.contains("disk coordinator rejected leaf output"),
+                    "{detail}"
+                );
+                assert!(
+                    !detail.contains("disk coordinator closed leaf handoff"),
+                    "{detail}"
+                );
+            } else if matches!(purpose, "delayed child" | "backend") {
                 assert!(error.downcast_ref::<IoError>().is_some(), "{error:?}");
                 if purpose == "delayed child" {
                     assert!(hooks.parent_before_child.load(TestOrdering::Acquire));
@@ -1595,6 +1707,17 @@ mod tests {
         });
     }
 
+    /// Purpose: Settle queued and late leaf packets, including after cancellation of a borrowed cleanup future.
+    /// Expected: Both packets receive rejection before receiver teardown, workers settle without allocating blocks, and all memory charges are released.
+    #[test]
+    fn disk_settlement_rejects_late_handoffs() {
+        smol::block_on(async {
+            for purpose in ["settle handoff", "detach settle handoff"] {
+                roundtrip(true, 140_000, 2, Some(purpose)).await;
+            }
+        });
+    }
+
     /// Purpose: Recheck durable leaf and branch plans when final open fences remove compression.
     /// Expected: The finite-fence fixture fits and checksums correctly; changing its upper fence rejects the oversized image before allocation or invariant packing.
     #[test]
@@ -1658,20 +1781,49 @@ mod tests {
         }
     }
 
-    /// Purpose: Protect minimum downstream progress capacity before input collection starts.
-    /// Expected: Inadequate scratch returns a typed resource error without allocating input or output.
+    /// Purpose: Admit either index kind with exactly the validated minimum progress budget.
+    /// Expected: Both initial reservations fit, the larger consumes the full bound, and dropping admission releases every charge.
     #[test]
     fn disk_minimum_progress_admission() {
-        let policy =
-            ColdBuildPolicy::new(ColdIndexBuildConfig::default().max_scratch_bytes(1), 2).unwrap();
-        let RuntimeOrFatalError::Runtime(error) =
-            DiskBuildAdmission::new(policy, true).err().unwrap()
-        else {
-            panic!("expected memory admission error")
-        };
-        assert_eq!(
-            error.downcast_ref::<crate::error::ResourceError>(),
-            Some(&crate::error::ResourceError::InsufficientMemory)
-        );
+        for (ready, writes) in [(1, 2), (3, 2), (8, 32)] {
+            let required = minimum_progress_bytes(true, ready, writes)
+                .unwrap()
+                .max(minimum_progress_bytes(false, ready, writes).unwrap());
+            let policy = ColdBuildPolicy::new(
+                ColdIndexBuildConfig::default()
+                    .max_ready_buffers(ready)
+                    .max_in_flight_writes(writes)
+                    .max_scratch_bytes(required),
+                2,
+            )
+            .unwrap();
+            let mut largest = 0;
+            for unique in [true, false] {
+                let admission = DiskBuildAdmission::new(policy, unique).unwrap();
+                let budget = admission.budget.clone();
+                assert!(budget.used() <= required);
+                largest = largest.max(budget.used());
+                drop(admission);
+                assert_eq!(budget.used(), 0);
+            }
+            assert_eq!(largest, required);
+        }
+    }
+
+    /// Purpose: Check overflow in progress output counts and rounded handoff capacities.
+    /// Expected: Unrepresentable counts or byte capacities return None without wrapping or panicking.
+    #[test]
+    fn disk_progress_capacity_overflow() {
+        for unique in [true, false] {
+            assert_eq!(minimum_progress_bytes(unique, usize::MAX, 2), None);
+            assert_eq!(minimum_progress_bytes(unique, 1, usize::MAX), None);
+            assert_eq!(
+                minimum_progress_bytes(unique, 1, usize::MAX / DISK_TREE_BLOCK_SIZE),
+                None
+            );
+        }
+        assert_eq!(handoff_bytes(usize::MAX), None);
+        assert_eq!(handoff_bytes(1 << (usize::BITS - 1)), None);
+        assert_eq!(handoff_bytes(1 << (usize::BITS - 2)), None);
     }
 }

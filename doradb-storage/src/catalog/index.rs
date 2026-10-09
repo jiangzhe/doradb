@@ -572,7 +572,14 @@ impl CreateIndexProgress {
             measurements.cold_build_nanos = disk_started.elapsed().as_nanos() as u64;
             measurements.cold_entries = completed.entries() as u64;
             measurements.cold = build.measurements();
-            measurements.cold.pool_pin_bytes = COW_FILE_PAGE_SIZE as u64;
+            measurements.cold.pool_pin_bytes = if create_index_cold_root_has_rows(
+                collector.column_block_index_root,
+                collector.pivot_row_id,
+            ) {
+                COW_FILE_PAGE_SIZE as u64
+            } else {
+                0
+            };
             measurements.retained_cold_bytes = cold_keys.retained_bytes();
         }
         #[cfg(test)]
@@ -3676,6 +3683,7 @@ pub(crate) mod tests {
 
     /// Purpose: Distinguish successful extraction from completed CREATE publication and rollback resource failures in the accepted owner.
     /// Expected: Empty and populated builds publish once; duplicates and packing-budget failures publish no CREATE sample, reclaim private roots, and preserve the table layout.
+    /// Builds without cold traversal report no pool pins.
     #[cfg(feature = "profiling")]
     #[test]
     fn create_completion_stats_require_successful_publication() {
@@ -3698,6 +3706,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let empty = session.index_build_stats().unwrap();
+            assert_eq!(empty.create.cold.pool_pin_bytes, 0);
             assert_eq!(
                 empty.create.hot.completed_builds,
                 initial.create.hot.completed_builds + 1
@@ -3747,6 +3756,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             let published = session.index_build_stats().unwrap();
+            assert_eq!(published.create.cold.pool_pin_bytes, 0);
             assert_eq!(
                 published.create.hot.completed_builds,
                 before.create.hot.completed_builds + 1
@@ -3797,6 +3807,57 @@ pub(crate) mod tests {
             assert_eq!(duplicate.create, before_duplicate.create);
             assert_index_ddl_snapshot_unchanged(&before_layout, &engine, table_id, &table);
             retention_trx.rollback().await.unwrap();
+        });
+    }
+
+    /// Purpose: Count cold traversal memory even when every persisted row is deleted.
+    /// Expected: CREATE publishes an empty index with no collected entries but reports one pinned page.
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn create_deleted_cold_rows_report_pool_pins() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "create_deleted_cold_stats").await;
+            let table_id = table2(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let mut session = engine.new_session().unwrap();
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::from("cold")],
+            )
+            .await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            expect_delete_committed(table_id, &mut session, &single_key(1)).await;
+            assert_ne!(
+                table.file().active_root_unchecked().column_block_index_root,
+                SUPER_BLOCK_ID
+            );
+            assert_eq!(
+                session
+                    .index_build_stats()
+                    .unwrap()
+                    .create
+                    .cold
+                    .pool_pin_bytes,
+                0
+            );
+
+            session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap();
+
+            let stats = session.index_build_stats().unwrap();
+            assert_eq!(stats.create.hot.completed_builds, 1);
+            assert_eq!(stats.create.hot.extraction.entries, 0);
+            assert_eq!(stats.create.cold_entries, 0);
+            assert_eq!(stats.create.cold.pool_pin_bytes, COW_FILE_PAGE_SIZE as u64);
+            assert!(active_secondary_root(&table, IndexSlot::new(1)).is_none());
         });
     }
 
@@ -4112,7 +4173,7 @@ pub(crate) mod tests {
 
     /// Purpose: Build a usable non-unique index over checkpointed rows.
     /// Expected: Disk lookup finds exactly the matching persisted rows and excludes absent
-    /// keys.
+    /// keys; profiling reports one page pinned by cold traversal.
     #[test]
     fn test_create_index_builds_non_unique_cold_disk_tree() {
         smol::block_on(async {
@@ -4152,6 +4213,16 @@ pub(crate) mod tests {
 
             assert_eq!(index_id, IndexID::new(1));
             assert!(active_secondary_root(&table, IndexSlot::new(1)).is_some());
+            #[cfg(feature = "profiling")]
+            assert_eq!(
+                session
+                    .index_build_stats()
+                    .unwrap()
+                    .create
+                    .cold
+                    .pool_pin_bytes,
+                COW_FILE_PAGE_SIZE as u64
+            );
             let mut rows =
                 non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key("cold"))
                     .await;

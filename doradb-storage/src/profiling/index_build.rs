@@ -136,6 +136,7 @@ pub struct ColdBuildMeasurements {
     /// Peak retained resident input capacity.
     pub input_bytes: u64,
     /// Maximum pool-owned bytes pinned by serial cold traversal.
+    /// Zero for builds that skip cold traversal.
     pub pool_pin_bytes: u64,
 }
 

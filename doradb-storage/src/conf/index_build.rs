@@ -1,4 +1,5 @@
 use crate::error::{ConfigError, ConfigResult};
+use crate::index::build::disk_builder::minimum_progress_bytes;
 use error_stack::Report;
 
 /// Immutable per-index scratch and parallel extraction limits.
@@ -153,14 +154,18 @@ impl ColdIndexBuildConfig {
                 return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field=cold_index_build.{field}, value={value}, pool_workers={pool_workers}")));
             }
         }
-        if self
-            .max_ready_buffers
-            .checked_add(self.max_in_flight_writes)
-            .and_then(|n| n.checked_add(4))
-            .and_then(|n| n.checked_mul(65536 + 4096))
-            .is_none_or(|bytes| bytes > isize::MAX as usize)
+        let required_bytes =
+            minimum_progress_bytes(true, self.max_ready_buffers, self.max_in_flight_writes)
+                .zip(minimum_progress_bytes(
+                    false,
+                    self.max_ready_buffers,
+                    self.max_in_flight_writes,
+                ))
+                .map(|(unique, non_unique)| unique.max(non_unique));
+        if required_bytes
+            .is_none_or(|bytes| bytes > isize::MAX as usize || bytes > self.max_scratch_bytes)
         {
-            return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field=cold_index_build.output_limits, max_ready_buffers={}, max_in_flight_writes={}", self.max_ready_buffers, self.max_in_flight_writes)));
+            return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field=cold_index_build.output_limits, max_ready_buffers={}, max_in_flight_writes={}, max_scratch_bytes={}, required_bytes={required_bytes:?}", self.max_ready_buffers, self.max_in_flight_writes, self.max_scratch_bytes)));
         }
         self.max_workers = Some(workers);
         Ok(())
@@ -193,6 +198,7 @@ mod tests {
         assert!(!root.exists());
         for invalid in [
             ColdIndexBuildConfig::default().max_scratch_bytes(0),
+            ColdIndexBuildConfig::default().max_scratch_bytes(1),
             ColdIndexBuildConfig::default().max_scratch_bytes(usize::MAX),
             ColdIndexBuildConfig::default().max_workers(Some(0)),
             ColdIndexBuildConfig::default().max_workers(Some(3)),
@@ -210,6 +216,75 @@ mod tests {
                 error.current_context(),
                 &ConfigError::InvalidColdIndexBuildLimit
             );
+            assert!(!root.exists());
+        }
+    }
+
+    /// Purpose: Validate the full cold progress reservation at the scratch boundary.
+    /// Expected: The exact bound passes, one byte less fails before filesystem effects, and the worker allowance is preserved.
+    #[test]
+    fn cold_minimum_progress_validation() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("uncreated");
+        for (ready, writes) in [(1, 2), (3, 2), (8, 32)] {
+            let required = minimum_progress_bytes(true, ready, writes)
+                .unwrap()
+                .max(minimum_progress_bytes(false, ready, writes).unwrap());
+            for scratch in [required - 1, required] {
+                let config = ColdIndexBuildConfig::default()
+                    .max_ready_buffers(ready)
+                    .max_in_flight_writes(writes)
+                    .max_scratch_bytes(scratch);
+                let result = EngineConfig::default()
+                    .storage_root(&root)
+                    .cold_index_build(config)
+                    .validate_inner();
+                if scratch == required {
+                    let validated = result.unwrap().cold_index_build;
+                    assert_eq!(validated.max_scratch_bytes, scratch);
+                    assert_eq!(validated.max_workers, Some(2));
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(
+                        error.current_context(),
+                        &ConfigError::InvalidColdIndexBuildLimit
+                    );
+                    assert!(format!("{error:?}").contains("cold_index_build.output_limits"));
+                }
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    /// Purpose: Reject cold output limits whose combined reservation exceeds allocation arithmetic limits.
+    /// Expected: Representable bounds above isize::MAX and overflowing bounds fail with the cold output-limit cause before filesystem effects.
+    #[test]
+    fn cold_output_limits_overflow() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("uncreated");
+        let limit = isize::MAX as usize / 65536;
+        for (writes, overflow) in [(2, false), (limit, true)] {
+            let required = minimum_progress_bytes(false, limit, writes);
+            if overflow {
+                assert_eq!(required, None);
+            } else {
+                assert!(required.unwrap() > isize::MAX as usize);
+            }
+            let error = EngineConfig::default()
+                .storage_root(&root)
+                .cold_index_build(
+                    ColdIndexBuildConfig::default()
+                        .max_scratch_bytes(isize::MAX as usize)
+                        .max_ready_buffers(limit)
+                        .max_in_flight_writes(writes),
+                )
+                .validate_inner()
+                .unwrap_err();
+            assert_eq!(
+                error.current_context(),
+                &ConfigError::InvalidColdIndexBuildLimit
+            );
+            assert!(format!("{error:?}").contains("cold_index_build.output_limits"));
             assert!(!root.exists());
         }
     }
