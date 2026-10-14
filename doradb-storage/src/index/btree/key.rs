@@ -7,10 +7,104 @@ use crate::memcmp::{
 use crate::value::{Val, ValKind, ValType};
 use error_stack::Report;
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::ops::{Bound, RangeBounds};
 
 /// Memory-comparable encoded key used by B-tree nodes.
 pub(crate) type BTreeKey = MemCmpKey;
+
+#[derive(Clone, Copy, Debug)]
+enum KeySuffix<'a> {
+    Inline { bytes: [u8; 4], len: u8 },
+    Borrowed(&'a [u8]),
+}
+
+/// Encoded key borrowing its common prefix and any outlined suffix.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BTreeKeyView<'a> {
+    prefix: &'a [u8],
+    suffix: KeySuffix<'a>,
+}
+
+impl<'a> BTreeKeyView<'a> {
+    /// Borrow a prefix and an outlined suffix in encoded byte order.
+    #[inline]
+    pub(super) fn borrowed(prefix: &'a [u8], suffix: &'a [u8]) -> Self {
+        Self {
+            prefix,
+            suffix: KeySuffix::Borrowed(suffix),
+        }
+    }
+
+    /// Decode a short slot head into an inline suffix without allocating.
+    #[inline]
+    pub(super) fn inline(prefix: &'a [u8], bytes: [u8; 4], len: u8) -> Self {
+        assert!(len <= 4, "B-tree inline key suffix length exceeds head");
+        Self {
+            prefix,
+            suffix: KeySuffix::Inline { bytes, len },
+        }
+    }
+
+    #[inline]
+    fn suffix(&self) -> &[u8] {
+        match &self.suffix {
+            KeySuffix::Inline { bytes, len } => &bytes[..usize::from(*len)],
+            KeySuffix::Borrowed(bytes) => bytes,
+        }
+    }
+
+    /// Full encoded length, including the common prefix.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.prefix.len() + self.suffix().len()
+    }
+
+    /// Compare the complete encoded key with a contiguous probe.
+    #[inline]
+    pub(crate) fn cmp_bytes(&self, other: &[u8]) -> Ordering {
+        let common = self.prefix.len().min(other.len());
+        let order = self.prefix[..common].cmp(&other[..common]);
+        if !order.is_eq() {
+            return order;
+        }
+        if common < self.prefix.len() {
+            return Ordering::Greater;
+        }
+        self.suffix().cmp(&other[common..])
+    }
+
+    /// Materialize a key only when it must outlive its page guard.
+    pub(crate) fn to_vec(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.len());
+        bytes.extend_from_slice(self.prefix);
+        bytes.extend_from_slice(self.suffix());
+        bytes
+    }
+
+    /// Materialize the owned key used by foreground candidate batches.
+    pub(crate) fn to_btree_key(self) -> BTreeKey {
+        let mut key = BTreeKey::arbitrary(self.len());
+        let mut bytes = key.modify_inplace();
+        bytes[..self.prefix.len()].copy_from_slice(self.prefix);
+        bytes[self.prefix.len()..].copy_from_slice(self.suffix());
+        drop(bytes);
+        key
+    }
+
+    /// Copy a fixed-width trailing scalar, including across the prefix boundary.
+    pub(crate) fn copy_tail(&self, dst: &mut [u8]) -> Option<()> {
+        if dst.len() > self.len() {
+            return None;
+        }
+        let suffix = self.suffix();
+        let suffix_len = dst.len().min(suffix.len());
+        let prefix_len = dst.len() - suffix_len;
+        dst[..prefix_len].copy_from_slice(&self.prefix[self.prefix.len() - prefix_len..]);
+        dst[prefix_len..].copy_from_slice(&suffix[suffix.len() - suffix_len..]);
+        Some(())
+    }
+}
 
 /// Owned encoded key range used by B-tree scan streams.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,6 +114,26 @@ pub(crate) struct KeyRange {
 }
 
 impl KeyRange {
+    /// Test a borrowed entry against the inclusive or exclusive lower bound.
+    #[inline]
+    pub(crate) fn lower_accepts_view(&self, key: BTreeKeyView<'_>) -> bool {
+        match &self.lower {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => !key.cmp_bytes(bound.as_bytes()).is_lt(),
+            Bound::Excluded(bound) => key.cmp_bytes(bound.as_bytes()).is_gt(),
+        }
+    }
+
+    /// Test a borrowed entry against the inclusive or exclusive upper bound.
+    #[inline]
+    pub(crate) fn upper_accepts_view(&self, key: BTreeKeyView<'_>) -> bool {
+        match &self.upper {
+            Bound::Unbounded => true,
+            Bound::Included(bound) => !key.cmp_bytes(bound.as_bytes()).is_gt(),
+            Bound::Excluded(bound) => key.cmp_bytes(bound.as_bytes()).is_lt(),
+        }
+    }
+
     /// Create an encoded range from owned lower and upper bounds.
     #[inline]
     pub(crate) fn new(lower: Bound<BTreeKey>, upper: Bound<BTreeKey>) -> Self {
@@ -599,6 +713,76 @@ mod tests {
     use crate::memcmp::{NON_NULL_FLAG, NULL_FLAG};
     use std::f64::consts::PI;
     use std::slice::from_ref;
+
+    /// Purpose: Compare borrowed compressed keys against complete byte-string oracles.
+    /// Expected: Every prefix split, inline suffix, and probe boundary preserves ordering and owned conversions.
+    #[test]
+    fn test_borrowed_key_comparison_and_materialization() {
+        let keys: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"abcd",
+            b"abcde",
+            b"abcdefghijklmnopqrstuvw",
+            &[0, 0, 255, 0, 9],
+        ];
+        for &bytes in keys {
+            for split in 0..=bytes.len() {
+                let prefix = &bytes[..split];
+                let suffix = &bytes[split..];
+                let mut views = vec![BTreeKeyView::borrowed(prefix, suffix)];
+                if suffix.len() <= 4 {
+                    let mut head = [0; 4];
+                    head[..suffix.len()].copy_from_slice(suffix);
+                    views.push(BTreeKeyView::inline(prefix, head, suffix.len() as u8));
+                }
+                for view in views {
+                    assert_eq!(view.len(), bytes.len());
+                    assert_eq!(view.to_vec(), bytes);
+                    assert_eq!(view.to_btree_key().as_bytes(), bytes);
+                    for &probe in keys {
+                        assert_eq!(
+                            view.cmp_bytes(probe),
+                            bytes.cmp(probe),
+                            "key={bytes:?}, split={split}, probe={probe:?}"
+                        );
+                    }
+                    for tail_len in 0..=bytes.len() + 1 {
+                        let mut tail = vec![0; tail_len];
+                        if tail_len <= bytes.len() {
+                            assert_eq!(view.copy_tail(&mut tail), Some(()));
+                            assert_eq!(tail, bytes[bytes.len() - tail_len..]);
+                        } else {
+                            assert_eq!(view.copy_tail(&mut tail), None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Purpose: Preserve inclusive and exclusive scan bounds for borrowed keys.
+    /// Expected: Borrowed keys and contiguous key oracles agree for all endpoint kinds and prefix splits.
+    #[test]
+    fn test_borrowed_key_range_endpoints() {
+        let endpoints = [
+            Bound::Unbounded,
+            Bound::Included(BTreeKey::from(b"abcd".as_slice())),
+            Bound::Excluded(BTreeKey::from(b"abcd".as_slice())),
+        ];
+        for lower in &endpoints {
+            for upper in &endpoints {
+                let range = KeyRange::new(lower.clone(), upper.clone());
+                for bytes in [b"abc".as_slice(), b"abcd", b"abcde"] {
+                    for split in 0..=bytes.len() {
+                        let key = BTreeKeyView::borrowed(&bytes[..split], &bytes[split..]);
+                        assert_eq!(range.lower_accepts_view(key), range.lower_accepts(bytes));
+                        assert_eq!(range.upper_accepts_view(key), range.upper_accepts(bytes));
+                    }
+                }
+            }
+        }
+    }
 
     /// Purpose: Protect float equality through scalar and composite index-key encoding.
     /// Expected: Signed zeros and NaN variants share canonical bytes in both nullability formats and key positions.

@@ -4,10 +4,10 @@
 use crate::buffer::page::{BufferPage, PAGE_SIZE, assert_buffer_page};
 use crate::file::block_integrity::{BLOCK_INTEGRITY_TRAILER_SIZE, BlockIntegrityTrailer};
 use crate::id::{PageID, TrxID};
-use crate::index::btree::BTreeKey;
 use crate::index::btree::{BTREE_HINTS_LEN, BTreeHints};
 use crate::index::btree::{BTREE_VALUE_PACK_MAX_LEN, BTreeU64, BTreeValue, BTreeValuePackable};
 use crate::index::btree::{BTreeDelete, BTreeUpdate};
+use crate::index::btree::{BTreeKey, BTreeKeyView};
 use crate::index::util::Maskable;
 use crate::layout;
 use crate::memcmp::BytesExtendable;
@@ -37,6 +37,18 @@ const _: () = assert!(mem::size_of::<BTreeHeader>().is_multiple_of(mem::align_of
 const _: () = assert!(mem::size_of::<BTreeNode>() == PAGE_SIZE);
 const _: () = assert!(mem::size_of::<BTreeSlot>() == 8);
 const _: () = assert_buffer_page::<BTreeNode>();
+
+/// Borrowed encoded entry with its decoded physical value, including any delete mask.
+///
+/// Memory readers retain a shared page latch; persisted readers retain an immutable
+/// page pin. Index-specific code interprets the value and materializes owned entries.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BTreeEntryView<'a, V: BTreeValue> {
+    /// Encoded key borrowing the node's prefix and any outlined suffix.
+    pub(crate) key: BTreeKeyView<'a>,
+    /// Decoded value in the node's physical representation.
+    pub(crate) value: V,
+}
 
 /// BTree header, in total 48 bytes.
 /// Memory layout as below:
@@ -954,12 +966,6 @@ impl BTreeNode {
         &self.slots_with_len(self.header.count() as usize)[idx]
     }
 
-    /// Return the full encoded key length for a slot, including common prefix.
-    #[inline]
-    pub(crate) fn slot_key_len(&self, slot: &BTreeSlot) -> usize {
-        self.header.prefix_len() as usize + slot.len() as usize
-    }
-
     #[inline]
     fn slot_mut(&mut self, idx: usize) -> &mut BTreeSlot {
         debug_assert!(idx < self.header.count() as usize);
@@ -1049,25 +1055,17 @@ impl BTreeNode {
         }
     }
 
-    /// Return the child-entry index that may contain `key` in a branch node.
-    ///
-    /// Child entry `0` is the lower-fence child, and later child entries map to
-    /// slot index `child_idx - 1`.
+    /// Compare one occupied full key without decoding or allocating a copy.
+    /// Probes may lie outside the node prefix, as with lower-bound searches.
     #[inline]
-    pub(crate) fn lower_bound_child_entry_idx(&self, key: &[u8]) -> Option<usize> {
-        debug_assert!(!self.is_leaf());
-        if self.header.lower_fence_value().is_deleted() {
-            return None;
+    pub(crate) fn compare_slot_key(&self, idx: usize, key: &[u8]) -> Ordering {
+        match self.key_suffix_for_probe(key) {
+            NodeProbe::Before => Ordering::Greater,
+            NodeProbe::Within(suffix) => self
+                .cmp_key_without_prefix(suffix, self.slot(idx))
+                .reverse(),
+            NodeProbe::After => Ordering::Less,
         }
-        let idx = match self.key_suffix_for_probe(key) {
-            NodeProbe::Before => 0,
-            NodeProbe::Within(k) => match self.search_key_suffix(k) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
-            },
-            NodeProbe::After => self.count(),
-        };
-        Some(idx)
     }
 
     #[inline]
@@ -1120,14 +1118,6 @@ impl BTreeNode {
         self.header.hints_enabled != 0
     }
 
-    /// Return a copied key at `idx` if the slot is currently valid.
-    #[inline]
-    pub(crate) fn key_checked(&self, idx: usize) -> Option<Vec<u8>> {
-        self.slots()
-            .get(idx)
-            .and_then(|slot| self.slot_key_checked(slot))
-    }
-
     /// Return a copied B-tree key at `idx` if the slot is currently valid.
     #[inline]
     pub(crate) fn btree_key_checked(&self, idx: usize) -> Option<BTreeKey> {
@@ -1136,8 +1126,8 @@ impl BTreeNode {
             .and_then(|slot| self.slot_btree_key_checked(slot))
     }
 
-    /// Validate persisted node offsets, ordering, fences, and payload ranges.
-    pub(crate) fn validate_persisted_layout<V: BTreeValue>(&self) -> bool {
+    /// Validate fixed metadata before reading persisted slots on demand.
+    pub(crate) fn validate_persisted_header(&self) -> bool {
         if self.header.initialized != 1 || self.header.hints_enabled > 1 {
             return false;
         }
@@ -1160,6 +1150,23 @@ impl BTreeNode {
             return false;
         }
 
+        if self.common_prefix_checked().is_none()
+            || self
+                .common_prefix_range()
+                .is_some_and(|range| range.start < end_offset)
+        {
+            return false;
+        }
+        self.fence_view_checked(false).is_some() && self.fence_view_checked(true).is_some()
+    }
+
+    /// Validate every persisted entry for construction assertions and integrity tests.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn validate_persisted_layout<V: BTreeValue>(&self) -> bool {
+        if !self.validate_persisted_header() {
+            return false;
+        }
+        let end_offset = self.header.end_offset() as usize;
         let mut ranges = Vec::new();
         let prefix = match self.common_prefix_checked() {
             Some(prefix) => prefix,
@@ -1219,6 +1226,113 @@ impl BTreeNode {
         true
     }
 
+    /// Borrow a key from a typed memory node or an admitted persisted header.
+    #[inline]
+    pub(crate) fn key_view_checked(&self, idx: usize) -> Option<BTreeKeyView<'_>> {
+        self.slot_key_view_checked(self.slots().get(idx)?)
+    }
+
+    /// Borrow an entry from a shared-latched memory node or an admitted persisted header.
+    #[inline]
+    pub(crate) fn entry_view_checked<V: BTreeValue>(
+        &self,
+        idx: usize,
+    ) -> Option<BTreeEntryView<'_, V>> {
+        let slot = self.slots().get(idx)?;
+        let payload = self.slot_payload_checked::<V>(slot)?;
+        let key = self.slot_key_view_checked(slot)?;
+        let value = V::decode_le(&payload[payload.len() - V::ENCODED_LEN..]);
+        Some(BTreeEntryView { key, value })
+    }
+
+    /// Compare an occupied persisted slot only after checking its payload range.
+    #[inline]
+    pub(crate) fn compare_persisted_key<V: BTreeValue>(
+        &self,
+        idx: usize,
+        key: &[u8],
+    ) -> Option<Ordering> {
+        let slot = self.slots().get(idx)?;
+        self.slot_payload_checked::<V>(slot)?;
+        Some(self.compare_slot_key(idx, key))
+    }
+
+    /// Search admitted persisted slots, preserving the prefix/head/hint fast paths.
+    pub(crate) fn persisted_lower_bound<V: BTreeValue>(
+        &self,
+        key: &[u8],
+        upper: bool,
+    ) -> Option<usize> {
+        let suffix = match self.key_suffix_for_probe(key) {
+            NodeProbe::Before => return Some(0),
+            NodeProbe::After => return Some(self.count()),
+            NodeProbe::Within(suffix) => suffix,
+        };
+        let (mut low, mut high) = (0, self.count());
+        if self.hints_enabled() {
+            let (lo, up) = self.header.hints.search(head_int(suffix));
+            let window = self.count() / (BTREE_HINTS_LEN + 1);
+            low = (lo * window).min(self.count());
+            high = if up >= BTREE_HINTS_LEN {
+                self.count()
+            } else {
+                ((up + 1) * window).min(self.count())
+            };
+            high = high.max(low);
+        }
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let order = self.compare_persisted_key::<V>(mid, key)?;
+            if order.is_lt() || (upper && order.is_eq()) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Some(low)
+    }
+
+    /// Borrow one fence after checking its referenced bytes.
+    #[inline]
+    pub(crate) fn fence_view_checked(&self, upper: bool) -> Option<BTreeKeyView<'_>> {
+        self.slot_key_view_checked(if upper {
+            &self.header.upper_fence
+        } else {
+            &self.header.lower_fence
+        })
+    }
+
+    #[inline]
+    fn slot_key_view_checked(&self, slot: &BTreeSlot) -> Option<BTreeKeyView<'_>> {
+        let prefix = self.common_prefix_checked()?;
+        let len = usize::from(slot.len());
+        if len <= KEY_HEAD_LEN {
+            return Some(BTreeKeyView::inline(prefix, slot.head_bytes(), len as u8));
+        }
+        let start = usize::from(slot.offset());
+        let end = start.checked_add(len)?;
+        if start < usize::from(self.header.end_offset()) || end > BTREE_BODY_USABLE_LEN {
+            return None;
+        }
+        Some(BTreeKeyView::borrowed(prefix, &self.body[start..end]))
+    }
+
+    #[inline]
+    fn slot_payload_checked<V: BTreeValue>(&self, slot: &BTreeSlot) -> Option<&[u8]> {
+        let start = usize::from(slot.offset());
+        let key_len = usize::from(slot.len());
+        let payload_len = if key_len <= KEY_HEAD_LEN {
+            V::ENCODED_LEN
+        } else {
+            key_len.checked_add(V::ENCODED_LEN)?
+        };
+        let end = start.checked_add(payload_len)?;
+        if start < usize::from(self.header.end_offset()) || end > BTREE_BODY_USABLE_LEN {
+            return None;
+        }
+        Some(&self.body[start..end])
+    }
+
     fn common_prefix_checked(&self) -> Option<&[u8]> {
         let len = self.header.prefix_len() as usize;
         if len == 0 {
@@ -1242,16 +1356,12 @@ impl BTreeNode {
         Some(BTREE_BODY_USABLE_LEN - len..BTREE_BODY_USABLE_LEN)
     }
 
-    fn slot_key_checked(&self, slot: &BTreeSlot) -> Option<Vec<u8>> {
-        let prefix = self.common_prefix_checked()?;
-        self.slot_key_checked_with_prefix(slot, prefix)
-    }
-
     fn slot_btree_key_checked(&self, slot: &BTreeSlot) -> Option<BTreeKey> {
         let prefix = self.common_prefix_checked()?;
         self.slot_btree_key_checked_with_prefix(slot, prefix)
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn slot_key_checked_with_prefix(&self, slot: &BTreeSlot, prefix: &[u8]) -> Option<Vec<u8>> {
         let len = slot.len() as usize;
         let mut key = Vec::with_capacity(prefix.len() + len);
@@ -1297,6 +1407,7 @@ impl BTreeNode {
         Some(key)
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn record_slot_long_key_range(&self, slot: &BTreeSlot, ranges: &mut Vec<Range<usize>>) -> bool {
         let len = slot.len() as usize;
         if len <= KEY_HEAD_LEN {
@@ -1313,6 +1424,7 @@ impl BTreeNode {
         true
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn entry_payload_range<V: BTreeValue>(
         &self,
         slot: &BTreeSlot,
@@ -1569,12 +1681,6 @@ impl BTreeNode {
             slot.offset() + slot.len()
         } as usize;
         self.read_value_le(offset)
-    }
-
-    /// Returns the value for a known-valid slot.
-    #[inline]
-    pub(crate) fn value_for_slot<V: BTreeValue>(&self, slot: &BTreeSlot) -> V {
-        self.slot_value(slot)
     }
 
     /// Replace the value at `idx` and return the previous value.
@@ -2453,8 +2559,8 @@ mod tests {
 
         assert_eq!(node.value::<BTreeNil>(0), BTreeNil);
         assert_eq!(node.value::<BTreeNil>(1), BTreeNil);
-        assert_eq!(node.key_checked(0).unwrap(), key1);
-        assert_eq!(node.key_checked(1).unwrap(), key2);
+        assert_eq!(node.key_view_checked(0).unwrap().to_vec(), key1);
+        assert_eq!(node.key_view_checked(1).unwrap().to_vec(), key2);
         assert!(node.validate_persisted_layout::<BTreeNil>());
     }
 
@@ -2572,13 +2678,31 @@ mod tests {
         }
 
         assert_eq!(node.common_prefix(), b"abc");
-        assert_eq!(node.lower_bound_child_entry_idx(b"abc1"), Some(0));
-        assert_eq!(node.lower_bound_child_entry_idx(b"abc3"), Some(1));
-        assert_eq!(node.lower_bound_child_entry_idx(b"abc4"), Some(1));
-        assert_eq!(node.lower_bound_child_entry_idx(b"abc5"), Some(2));
-        assert_eq!(node.lower_bound_child_entry_idx(b"ab"), Some(0));
-        assert_eq!(node.lower_bound_child_entry_idx(b"abbz"), Some(0));
-        assert_eq!(node.lower_bound_child_entry_idx(b"abd"), Some(node.count()));
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abc1", true),
+            Some(0)
+        );
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abc3", true),
+            Some(1)
+        );
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abc4", true),
+            Some(1)
+        );
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abc5", true),
+            Some(2)
+        );
+        assert_eq!(node.persisted_lower_bound::<BTreeU64>(b"ab", true), Some(0));
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abbz", true),
+            Some(0)
+        );
+        assert_eq!(
+            node.persisted_lower_bound::<BTreeU64>(b"abd", true),
+            Some(node.count())
+        );
     }
 
     /// Purpose: Protect the persisted byte order of B-tree header and slot fields.

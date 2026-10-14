@@ -109,6 +109,9 @@ Each candidate then goes through row-location routing, MVCC visibility, and
 the final key or range check. Deletion overlays affect candidate selection,
 not the reader's snapshot rules.
 
+Persistent reads verify page checksums and basic structure. Entries are checked
+as they are accessed; loading a page does not establish that every entry is valid.
+
 ### Write
 
 Inserts add entries for new hot rows. Updates change the affected mappings when
@@ -222,5 +225,8 @@ obligations. Supervision retains resources when safe reclamation cannot be
 established.
 
 Cold-index creation uses a separate memory budget and supports parallel tree
-construction. See the [cold-index build settings](benchmark-tool.md#cold-index-build-settings)
+construction. Cold construction releases its temporary inputs before hot
+construction. Unique builds check for duplicates across tiers using the completed
+cold index, choosing batched lookups or an ordered scan based on input sizes.
+See the [cold-index build settings](benchmark-tool.md#cold-index-build-settings)
 and [RFC 0033](rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md).

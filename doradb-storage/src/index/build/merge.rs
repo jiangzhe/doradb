@@ -73,6 +73,7 @@ struct HotMergeBoundaries {
 
 /// A prepared plan conveys ownership and fences, but no completed-validation authority.
 pub(crate) struct PreparedMerge {
+    identity: Arc<()>,
     runs: Arc<SortedRuns>,
     boundaries: HotMergeBoundaries,
     entries: usize,
@@ -85,22 +86,28 @@ pub(crate) struct PreparedMerge {
 }
 
 impl PreparedMerge {
+    /// Compact invocation identity without ownership of resident input.
+    #[inline]
+    pub(super) fn identity(&self) -> Arc<()> {
+        self.identity.clone()
+    }
+
+    /// Inhibit packing while preserving exhaustive merge and distinctness work.
+    #[inline]
+    pub(super) fn inhibit_construction(&self) {
+        self.inhibited.store(true, AtomicOrdering::Release);
+    }
+
+    /// Complete input cardinality, independent of profiling.
+    #[inline]
+    pub(super) fn entries(&self) -> usize {
+        self.entries
+    }
+
     /// Retain immutable key and fence storage through page construction.
     #[inline]
     pub(super) fn runs(&self) -> &Arc<SortedRuns> {
         &self.runs
-    }
-
-    /// Inclusive hot endpoints of a nonempty partition, from completed co-ranks.
-    #[inline]
-    pub(super) fn endpoints(&self, partition: usize) -> (&IndexBuildEntry, &IndexBuildEntry) {
-        let first = self.boundaries.cuts[partition]
-            .right
-            .unwrap_or_else(|| unreachable!("nonempty partition has a first entry"));
-        let last = self.boundaries.cuts[partition + 1]
-            .left
-            .unwrap_or_else(|| unreachable!("nonempty partition has a last entry"));
-        (first.resolve(&self.runs), last.resolve(&self.runs))
     }
 
     /// Maximum submitted but uncollected construction jobs.
@@ -161,7 +168,7 @@ impl MergePreparation {
         Self::with_sizing(runs, pool, workers, partitions, DEFAULT_BATCH_ENTRIES)
     }
 
-    fn with_sizing(
+    pub(super) fn with_sizing(
         runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
         workers: usize,
@@ -353,6 +360,7 @@ impl MergePreparation {
         };
         self.finished = true;
         Ok(Arc::new(PreparedMerge {
+            identity: Arc::new(()),
             runs: self.runs.clone(),
             boundaries: HotMergeBoundaries {
                 cuts: take(&mut self.cuts),
@@ -716,6 +724,12 @@ pub(crate) struct MergeCompletion {
 }
 
 impl MergeCompletion {
+    /// Bind downstream validation to this exact completed merge invocation.
+    #[inline]
+    pub(super) fn identity(&self) -> Arc<()> {
+        self.plan.identity()
+    }
+
     /// Number of entries whose successful consumption this evidence certifies.
     #[inline]
     pub(crate) fn entries(&self) -> usize {
@@ -724,7 +738,6 @@ impl MergeCompletion {
 
     /// Distinguish checked hot keys from the source's trusted contract.
     #[inline]
-    #[cfg(test)]
     pub(crate) fn checked(&self) -> bool {
         self.plan.runs.duplicates == DuplicateCheck::Collect
     }
@@ -985,7 +998,7 @@ impl<C: PartitionConsumer> Drop for MergeConsumption<C> {
 }
 
 /// Preserve execution-contract failures in the index-access domain.
-pub(super) fn execution_error(message: &'static str) -> RuntimeOrFatalError {
+pub(crate) fn execution_error(message: &'static str) -> RuntimeOrFatalError {
     Report::new(RuntimeError::IndexAccess)
         .attach(message)
         .into()

@@ -25,7 +25,7 @@ determine the concrete representations, selection policy and thresholds.
 Current implementation boundaries:
 
 - `CreateIndexCollector::collect_current_cold`, `prepare_cold`, and `CreateIndexProgress::build_cold` in `doradb-storage/src/catalog/index.rs`.
-- `ColdUniqueKeys`, `ColdValidation`, `ColdHotCursor`, and completion evidence in `doradb-storage/src/index/build/cold_validation.rs`; the checked leaf consumer in `doradb-storage/src/index/build/tree_builder.rs`.
+- `CrossTierSelection`, `CrossTierCursor`, and completion evidence in `doradb-storage/src/index/build/cross_tier.rs`; bounded reads in `cold_reader.rs`, sealed ownership in `sealed_cold.rs`, and the checked leaf consumer in `tree_builder.rs` under the same directory. Task 000330 replaces the earlier retained `ColdUniqueKeys` vector with completed-root reads; the pipeline supplies optional cold authority and packing receives a self-contained selection.
 - `DiskBulkBuild` in `doradb-storage/src/index/build/disk_builder.rs`; root-snapshot lookups/cursors and checkpoint mutation writers in `doradb-storage/src/index/disk_tree.rs`.
 
 ## Deferred From (Optional)

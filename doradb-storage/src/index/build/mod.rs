@@ -4,8 +4,10 @@
 //! coordinator owns every accepted completion independently of its borrowed execution future.
 mod budget;
 mod co_rank;
-/// Retained cold-key validation for unique CREATE builds.
-pub(crate) mod cold_validation;
+/// Bounded persisted traversal and admission for completed cold trees.
+pub(crate) mod cold_reader;
+/// Complete hot/cold uniqueness validation for unique CREATE builds.
+pub(crate) mod cross_tier;
 /// Streaming durable construction and invocation admission.
 pub(crate) mod disk_builder;
 mod loser_tree;
@@ -14,6 +16,8 @@ pub(crate) mod merge;
 mod packing;
 mod page_cleanup;
 mod pipeline;
+/// Completed cold artifacts and retained read-resource ownership.
+pub(crate) mod sealed_cold;
 mod source;
 /// Packed construction shared by bootstrap and private DDL staging targets.
 pub(crate) mod tree_builder;
@@ -702,7 +706,7 @@ mod tests {
                 self.engine.inner().thread_pool.clone(),
                 self.engine.inner().poisoner.clone(),
                 policy,
-                cold_validation::ColdValidation::NotRequired,
+                None,
             );
             (build, index)
         }

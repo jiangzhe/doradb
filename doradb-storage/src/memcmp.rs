@@ -7,6 +7,8 @@ use std::mem::size_of;
 use std::mem::{self, ManuallyDrop, replace};
 use std::ops::{Deref, DerefMut};
 use std::ptr::{copy_nonoverlapping, replace as replace_ptr, write_bytes};
+#[cfg(test)]
+pub(crate) use tests::track_heap_drop;
 
 /// Nullable memcmp encoding marker for null values.
 pub(crate) const NULL_FLAG: u8 = 0x01;
@@ -927,6 +929,8 @@ impl Drop for Inner {
         // SAFETY: when `len` exceeds the inline threshold, `u.h` is the active
         // union variant and owns the heap allocation to drop.
         unsafe {
+            #[cfg(test)]
+            tests::observe_heap_drop(self.u.h.data.as_ptr() as usize);
             ManuallyDrop::drop(&mut self.u.h);
         }
     }
@@ -1061,12 +1065,42 @@ fn heap_prefix(data: &[u8]) -> [u8; MEM_CMP_KEY_HEAP_PREFIX] {
 #[cfg(test)]
 mod tests {
     use ordered_float::OrderedFloat;
+    use parking_lot::Mutex;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
     use rand_distr::{Distribution, StandardUniform};
     use std::any::type_name;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::{Arc, OnceLock, Weak};
 
     use super::*;
+
+    static HEAP_PROBES: OnceLock<Mutex<HeapProbes>> = OnceLock::new();
+
+    type HeapProbes = HashMap<usize, Weak<AtomicBool>>;
+
+    /// Observe deallocation of this exact immutable outlined key without owning it.
+    pub(crate) fn track_heap_drop(key: &MemCmpKey) -> Arc<AtomicBool> {
+        assert!(key.as_bytes().len() > MEM_CMP_KEY_INLINE);
+        let probe = Arc::new(AtomicBool::new(false));
+        HEAP_PROBES
+            .get_or_init(Default::default)
+            .lock()
+            .insert(key.as_bytes().as_ptr() as usize, Arc::downgrade(&probe));
+        probe
+    }
+
+    pub(super) fn observe_heap_drop(address: usize) {
+        if let Some(probes) = HEAP_PROBES.get()
+            && let Some(probe) = probes
+                .lock()
+                .remove(&address)
+                .and_then(|probe| probe.upgrade())
+        {
+            probe.store(true, AtomicOrdering::Release);
+        }
+    }
 
     fn heap_capacity(key: &MemCmpKey) -> usize {
         assert!(key.0.len > MEM_CMP_KEY_INLINE);

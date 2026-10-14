@@ -1,6 +1,7 @@
 //! Caller-owned orchestration from captured rows to an uninstalled packed tree.
-use super::cold_validation::ColdValidation;
+use super::cross_tier::CrossTierSelection;
 use super::merge::MergePreparation;
+use super::sealed_cold::ColdReadAuthority;
 use super::tree_builder::{
     HotPackedBuild, HotPackedOutcome, HotPackedSpec, ReadyHotTree, StagedPageCleanup,
 };
@@ -49,7 +50,8 @@ pub(crate) struct HotIndexBuild<P: BufferPool + 'static> {
     thread_pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
     policy: HotBuildPolicy,
-    cold_validation: ColdValidation,
+    // None skips validation; an empty unique cold root still supplies authority.
+    cold_for_validation: Option<ColdReadAuthority>,
     phase: BuildPhase,
     sort: Option<HotLocalSort>,
     preparation: Option<MergePreparation>,
@@ -72,10 +74,10 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         thread_pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         policy: HotBuildPolicy,
-        cold_validation: ColdValidation,
+        cold_for_validation: Option<ColdReadAuthority>,
     ) -> Self {
         assert!(
-            !matches!(&cold_validation, ColdValidation::Required(_))
+            cold_for_validation.is_none()
                 || (source.key.unique && source.key.duplicates == super::DuplicateCheck::Collect),
             "required cold validation needs checked unique hot extraction"
         );
@@ -91,7 +93,7 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             thread_pool,
             poisoner,
             policy,
-            cold_validation,
+            cold_for_validation,
             phase: BuildPhase::New,
             sort,
             preparation: None,
@@ -172,11 +174,23 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
         }
         self.sort = None;
         self.phase = BuildPhase::MergePreparation;
-        self.preparation = Some(MergePreparation::new(
-            Arc::new(runs),
-            self.thread_pool.clone(),
-            self.policy.max_workers,
-        )?);
+        let selection = self
+            .cold_for_validation
+            .as_ref()
+            .map(|cold| CrossTierSelection::select(cold, &runs, self.policy.max_workers))
+            .transpose()?;
+        let runs = Arc::new(runs);
+        self.preparation = Some(if let Some(selection) = &selection {
+            MergePreparation::with_sizing(
+                runs,
+                self.thread_pool.clone(),
+                selection.workers,
+                selection.partitions,
+                32_768,
+            )?
+        } else {
+            MergePreparation::new(runs, self.thread_pool.clone(), self.policy.max_workers)?
+        });
         let plan = self
             .preparation
             .as_mut()
@@ -194,9 +208,9 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             HotPackedSpec {
                 unique: self.source.key.unique,
                 ts: self.source.key.build_ts,
-                cold_validation: self.cold_validation.clone(),
+                selection,
             },
-        );
+        )?;
         self.packing = Some(packing);
         self.cleanup = Some(cleanup);
         #[cfg(test)]
@@ -250,6 +264,9 @@ impl<P: BufferPool + 'static> HotIndexBuild<P> {
             self.hooks.at(tests::Point::Cleanup);
             result = merge_build_result(result, cleanup.run().await.map_err(Into::into));
         }
+        // Accepted jobs and page cleanup are drained. Compact ready-tree evidence
+        // and measurements do not need the cold read lease to remain alive.
+        self.cold_for_validation = None;
         #[cfg(feature = "profiling")]
         {
             self.cleanup_elapsed_nanos += started.elapsed().as_nanos() as u64;

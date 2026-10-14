@@ -26,15 +26,16 @@ use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
     plan_sibling_node,
 };
+use crate::index::btree::{BTreeEntryView, BTreeKeyView, BTreeNode};
 use crate::index::btree::{BTreeKeyEncoder, KeyRange};
 use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue, BTreeValuePackable};
-use crate::index::btree::{BTreeNode, LookupChild};
 use crate::index::util::Maskable;
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::quiescent::QuiescentGuard;
 use crate::value::Val;
 use error_stack::{Report, ResultExt};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -330,20 +331,14 @@ pub(crate) trait DiskTreeSpec: Copy + Send + Sync + 'static {
     /// zero-width `BTreeNil` because the row id is part of the exact key.
     type LeafValue: BTreeValue + Send;
 
-    /// Validate a full persisted block before publishing a readonly guard.
-    fn validate_persisted_block(
-        block: &[u8],
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> DataIntegrityResult<()>;
-
     /// Convert a normalized logical entry into the leaf value stored on disk.
     fn leaf_value(entry: &LogicalEntry) -> Self::LeafValue;
 
-    /// Decode one leaf slot after layout validation, validating its leaf value.
-    ///
-    /// Also called during block admission, before spec-specific values are trusted.
-    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry>;
+    /// Validate the durable meaning of an entry whose physical bounds were checked.
+    fn validate_leaf_entry(entry: &BTreeEntryView<'_, Self::LeafValue>) -> DataIntegrityResult<()>;
+
+    /// Materialize a validated entry for owned checkpoint rewrite state.
+    fn own_leaf_entry(entry: BTreeEntryView<'_, Self::LeafValue>) -> LogicalEntry;
 
     /// Apply encoded batch operations to a sorted entry set.
     ///
@@ -363,17 +358,6 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
     type LeafValue = BTreeU64;
 
     #[inline]
-    fn validate_persisted_block(
-        block: &[u8],
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> DataIntegrityResult<()> {
-        validate_disk_tree_block::<Self>(block).attach_with(|| {
-            format!("file={file_kind}, block=secondary_disk_tree, block_id={block_id}")
-        })
-    }
-
-    #[inline]
     fn leaf_value(entry: &LogicalEntry) -> Self::LeafValue {
         let Some(row_id) = entry.row_id else {
             panic!("DiskTree rewrite invariant violated: unique leaf entry is missing a row id");
@@ -386,13 +370,16 @@ impl DiskTreeSpec for UniqueDiskTreeSpec {
     }
 
     #[inline]
-    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
-        let key = validated_node_key(node, idx);
-        let row_id = node.value::<BTreeU64>(idx);
-        if row_id.is_deleted() {
+    fn validate_leaf_entry(entry: &BTreeEntryView<'_, BTreeU64>) -> DataIntegrityResult<()> {
+        if entry.value.is_deleted() {
             return Err(invalid_node_decode());
         }
-        Ok(LogicalEntry::unique(key, row_id.to_row_id()))
+        Ok(())
+    }
+
+    #[inline]
+    fn own_leaf_entry(entry: BTreeEntryView<'_, BTreeU64>) -> LogicalEntry {
+        LogicalEntry::unique(entry.key.to_vec(), entry.value.to_row_id())
     }
 
     fn apply_operations(
@@ -440,17 +427,6 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     type LeafValue = BTreeNil;
 
     #[inline]
-    fn validate_persisted_block(
-        block: &[u8],
-        file_kind: FileKind,
-        block_id: BlockID,
-    ) -> DataIntegrityResult<()> {
-        validate_disk_tree_block::<Self>(block).attach_with(|| {
-            format!("file={file_kind}, block=secondary_disk_tree, block_id={block_id}")
-        })
-    }
-
-    #[inline]
     fn leaf_value(entry: &LogicalEntry) -> Self::LeafValue {
         assert!(
             entry.row_id.is_none(),
@@ -460,9 +436,16 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     }
 
     #[inline]
-    fn leaf_entry(node: &BTreeNode, idx: usize) -> DataIntegrityResult<LogicalEntry> {
-        let key = validated_node_key(node, idx);
-        Ok(LogicalEntry::non_unique(key))
+    fn validate_leaf_entry(entry: &BTreeEntryView<'_, BTreeNil>) -> DataIntegrityResult<()> {
+        if entry.key.len() < ROW_ID_SIZE {
+            return Err(invalid_node_decode());
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn own_leaf_entry(entry: BTreeEntryView<'_, BTreeNil>) -> LogicalEntry {
+        LogicalEntry::non_unique(entry.key.to_vec())
     }
 
     fn apply_operations(
@@ -496,21 +479,213 @@ impl DiskTreeSpec for NonUniqueDiskTreeSpec {
     }
 }
 
-/// Readonly guard for a block after DiskTree-specific validation.
-///
-/// Keeping the guard alive keeps the block resident and immutable while callers
-/// read the no-copy `BTreeNode` view.
-pub(super) struct ValidatedDiskTreeNode<F: DiskTreeSpec> {
+/// Owns the page pin after checksum and fixed-header validation.
+pub(crate) struct DiskTreeNodeGuard<F: DiskTreeSpec> {
     guard: ReadonlyBlockGuard,
+    file_kind: FileKind,
+    block_id: BlockID,
     _marker: PhantomData<F>,
 }
 
-impl<F: DiskTreeSpec> ValidatedDiskTreeNode<F> {
+impl<F: DiskTreeSpec> DiskTreeNodeGuard<F> {
+    /// Retain a page returned by checksum/header admission.
+    fn new(guard: ReadonlyBlockGuard, file_kind: FileKind, block_id: BlockID) -> Self {
+        Self {
+            guard,
+            file_kind,
+            block_id,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Borrow checked entry access while retaining the immutable page pin.
     #[inline]
-    pub(super) fn node(&self) -> &BTreeNode {
-        // The readonly guard was admitted only after `validate_disk_tree_block`
-        // established the exact persisted node layout.
-        layout::ref_from_bytes(self.guard.page())
+    pub(crate) fn view(&self) -> DiskTreeNodeView<'_, F> {
+        DiskTreeNodeView {
+            // Admission establishes exact zerocopy layout and the fixed header.
+            node: layout::ref_from_bytes(self.guard.page()),
+            file_kind: self.file_kind,
+            block_id: self.block_id,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Checked persisted access; the underlying typed node is never exposed.
+#[derive(Clone, Copy)]
+pub(crate) struct DiskTreeNodeView<'a, F: DiskTreeSpec> {
+    node: &'a BTreeNode,
+    file_kind: FileKind,
+    block_id: BlockID,
+    _marker: PhantomData<F>,
+}
+
+impl<'a, F: DiskTreeSpec> DiskTreeNodeView<'a, F> {
+    #[inline]
+    fn result<T>(&self, result: DataIntegrityResult<T>, slot: Option<usize>) -> RuntimeResult<T> {
+        result
+            .change_context(RuntimeError::IndexAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=read_secondary_disk_tree_entry, file={}, block_id={}, slot={slot:?}",
+                    self.file_kind, self.block_id,
+                )
+            })
+    }
+
+    #[inline]
+    fn checked<T>(&self, value: Option<T>, slot: Option<usize>) -> RuntimeResult<T> {
+        self.result(value.ok_or_else(invalid_node_decode), slot)
+    }
+
+    /// Number of occupied slots established by header admission.
+    #[inline]
+    pub(crate) fn count(&self) -> usize {
+        self.node.count()
+    }
+
+    /// Persisted height, with zero identifying a leaf.
+    #[inline]
+    pub(crate) fn height(&self) -> usize {
+        self.node.height()
+    }
+
+    /// Whether this page stores leaf entries.
+    #[inline]
+    pub(crate) fn is_leaf(&self) -> bool {
+        self.node.is_leaf()
+    }
+
+    /// Borrow the prefix whose range was checked at admission.
+    #[inline]
+    pub(crate) fn common_prefix(&self) -> &'a [u8] {
+        self.node.common_prefix()
+    }
+
+    /// Whether this page's upper fence is unbounded.
+    #[inline]
+    pub(crate) fn has_no_upper_fence(&self) -> bool {
+        self.node.has_no_upper_fence()
+    }
+
+    /// Borrow one fence; admission checked these fixed header references.
+    #[inline]
+    pub(crate) fn fence_key(&self, upper: bool) -> BTreeKeyView<'a> {
+        self.node
+            .fence_view_checked(upper)
+            .expect("DiskTree admitted immutable fence range")
+    }
+
+    /// Test membership in this page's half-open fence interval.
+    #[inline]
+    pub(crate) fn within_boundary(&self, key: &[u8]) -> bool {
+        !self.fence_key(false).cmp_bytes(key).is_gt()
+            && (self.has_no_upper_fence() || self.fence_key(true).cmp_bytes(key).is_gt())
+    }
+
+    fn entry<V: BTreeValue>(&self, idx: usize) -> RuntimeResult<BTreeEntryView<'a, V>> {
+        self.checked(self.node.entry_view_checked::<V>(idx), Some(idx))
+    }
+
+    /// Borrow a selected key after checking its complete key/value payload range.
+    #[inline]
+    pub(crate) fn key(&self, idx: usize) -> RuntimeResult<BTreeKeyView<'a>> {
+        if self.is_leaf() {
+            self.entry::<F::LeafValue>(idx).map(|entry| entry.key)
+        } else {
+            self.entry::<BTreeU64>(idx).map(|entry| entry.key)
+        }
+    }
+
+    /// Decode a leaf value and borrow its key without allocating.
+    #[inline]
+    pub(crate) fn leaf_entry(&self, idx: usize) -> RuntimeResult<BTreeEntryView<'a, F::LeafValue>> {
+        if !self.is_leaf() {
+            return self.result(Err(invalid_node_decode()), Some(idx));
+        }
+        let entry = self.entry::<F::LeafValue>(idx)?;
+        self.result(F::validate_leaf_entry(&entry), Some(idx))?;
+        Ok(entry)
+    }
+
+    /// Decode a checked leaf value for point lookups that retain no key.
+    #[inline]
+    pub(crate) fn leaf_value(&self, idx: usize) -> RuntimeResult<F::LeafValue> {
+        self.leaf_entry(idx).map(|entry| entry.value)
+    }
+
+    /// Compare one checked slot with a contiguous encoded key.
+    #[inline]
+    pub(crate) fn compare_slot_key(&self, idx: usize, key: &[u8]) -> RuntimeResult<Ordering> {
+        let order = if self.is_leaf() {
+            self.node.compare_persisted_key::<F::LeafValue>(idx, key)
+        } else {
+            self.node.compare_persisted_key::<BTreeU64>(idx, key)
+        };
+        self.checked(order, Some(idx))
+    }
+
+    /// Find the first key at least as large as the probe, checking touched slots.
+    #[inline]
+    pub(crate) fn lower_bound_slot_idx(&self, key: &[u8]) -> RuntimeResult<usize> {
+        let idx = if self.is_leaf() {
+            self.node.persisted_lower_bound::<F::LeafValue>(key, false)
+        } else {
+            self.node.persisted_lower_bound::<BTreeU64>(key, false)
+        };
+        self.checked(idx, None)
+    }
+
+    /// Find the branch child whose lower fence includes the probe.
+    #[inline]
+    pub(crate) fn lower_bound_child_entry_idx(&self, key: &[u8]) -> RuntimeResult<usize> {
+        if self.is_leaf() {
+            return self.result(Err(invalid_node_decode()), None);
+        }
+        self.checked(self.node.persisted_lower_bound::<BTreeU64>(key, true), None)
+    }
+
+    /// Return an occupied slot matching the probe, or absence.
+    pub(crate) fn search_key(&self, key: &[u8]) -> RuntimeResult<Option<usize>> {
+        let idx = self.lower_bound_slot_idx(key)?;
+        if idx < self.count() && self.compare_slot_key(idx, key)?.is_eq() {
+            Ok(Some(idx))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Read one child pointer, rejecting missing, delete-marked, or superblock references.
+    pub(crate) fn child_block(&self, child: usize) -> RuntimeResult<BlockID> {
+        if self.is_leaf() || child > self.count() {
+            return self.result(Err(invalid_node_decode()), child.checked_sub(1));
+        }
+        let value = if child == 0 {
+            self.node.lower_fence_value()
+        } else {
+            self.entry::<BTreeU64>(child - 1)?.value
+        };
+        let block = BlockID::from(value.to_u64());
+        if value.is_deleted() || block == SUPER_BLOCK_ID {
+            return self.result(Err(invalid_node_decode()), child.checked_sub(1));
+        }
+        Ok(block)
+    }
+
+    /// Child height after checking that this node is a branch.
+    pub(crate) fn child_height(&self) -> RuntimeResult<u16> {
+        self.checked(
+            self.height().checked_sub(1).map(|height| height as u16),
+            None,
+        )
+    }
+}
+
+impl DiskTreeNodeView<'_, UniqueDiskTreeSpec> {
+    /// Decode one checked unique owner without copying its key.
+    #[inline]
+    pub(crate) fn row_id(&self, idx: usize) -> RuntimeResult<RowID> {
+        self.leaf_value(idx).map(BTreeU64::to_row_id)
     }
 }
 
@@ -528,6 +703,11 @@ pub(crate) struct DiskTreeRuntime<F: DiskTreeSpec> {
 }
 
 impl<F: DiskTreeSpec> DiskTreeRuntime<F> {
+    /// Check that a private root belongs to this exact open file incarnation.
+    pub(super) fn uses_file(&self, file: &Arc<SparseFile>) -> bool {
+        Arc::ptr_eq(&self.file, file)
+    }
+
     #[inline]
     fn from_shape(
         encoder: Arc<BTreeKeyEncoder>,
@@ -654,28 +834,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         self.runtime.file_kind
     }
 
-    #[inline]
-    fn node_result<T>(
-        &self,
-        block_id: BlockID,
-        result: DataIntegrityResult<T>,
-    ) -> RuntimeResult<T> {
-        result
-            .change_context(RuntimeError::IndexAccess)
-            .attach_with(|| {
-                format!(
-                    "file={}, block=secondary_disk_tree, block_id={block_id}",
-                    self.file_kind()
-                )
-            })
-    }
-
     /// Read and validate one persisted block as a DiskTree node.
     ///
     /// The returned guard owns the readonly-buffer reference, so callers can use
     /// the no-copy node view without copying entries out of the block.
     #[inline]
-    async fn read_node(&self, block_id: BlockID) -> RuntimeOrFatalResult<ValidatedDiskTreeNode<F>> {
+    pub(super) async fn read_node(
+        &self,
+        block_id: BlockID,
+    ) -> RuntimeOrFatalResult<DiskTreeNodeGuard<F>> {
         let guard = self
             .runtime
             .disk_pool
@@ -684,7 +851,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                 &self.runtime.file,
                 self.disk_pool_guard,
                 block_id,
-                F::validate_persisted_block,
+                validate_persisted_block,
             )
             .await
             .change_runtime_context(RuntimeError::IndexAccess)
@@ -694,10 +861,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
                     self.file_kind()
                 )
             })?;
-        Ok(ValidatedDiskTreeNode {
-            guard,
-            _marker: PhantomData,
-        })
+        Ok(DiskTreeNodeGuard::new(guard, self.file_kind(), block_id))
     }
 
     #[inline]
@@ -709,23 +873,23 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ///
     /// Branch traversal follows child block ids until a leaf is reached. Empty
     /// roots and leaf misses return `Ok(None)`.
-    async fn lookup_encoded_entry(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<LogicalEntry>> {
+    async fn lookup_encoded_value(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<F::LeafValue>> {
         let Some(mut block_id) = self.root_block_id else {
             return Ok(None);
         };
         loop {
             let guard = self.read_node(block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             if node.is_leaf() {
-                return match node.search_key(key) {
-                    Ok(idx) => Ok(Some(self.node_result(block_id, F::leaf_entry(node, idx))?)),
-                    Err(_) => Ok(None),
+                return match node.search_key(key)? {
+                    Some(idx) => Ok(Some(node.leaf_value(idx)?)),
+                    None => Ok(None),
                 };
             }
-            match lookup_child_block(node, key) {
-                Some(child_block_id) => block_id = child_block_id,
-                None => return Ok(None),
+            if !node.within_boundary(key) {
+                return Ok(None);
             }
+            block_id = node.child_block(node.lower_bound_child_entry_idx(key)?)?;
         }
     }
 
@@ -741,61 +905,18 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         while let Some(block_id) = stack.pop() {
             out.insert(block_id);
             let guard = self.read_node(block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             if node.is_leaf() {
                 continue;
             }
-            let child_height = branch_child_height(node);
-            if child_height == 0 {
-                for idx in (0..node.count()).rev() {
-                    let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
-                    if child_block_id == SUPER_BLOCK_ID {
-                        return Err(Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to the table-file super block",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
-                    }
-                    out.insert(child_block_id);
+            let child_height = node.child_height()?;
+            for child in (0..=node.count()).rev() {
+                let child_block = node.child_block(child)?;
+                if child_height == 0 {
+                    out.insert(child_block);
+                } else {
+                    stack.push(child_block);
                 }
-                let child_block_id = BlockID::from(node.lower_fence_value().to_u64());
-                if child_block_id == SUPER_BLOCK_ID {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to the table-file super block",
-                            self.file_kind()
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
-                }
-                out.insert(child_block_id);
-            } else {
-                for idx in (0..node.count()).rev() {
-                    let child_block_id = BlockID::from(node.value::<BTreeU64>(idx).to_u64());
-                    if child_block_id == SUPER_BLOCK_ID {
-                        return Err(Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, branch child points to the table-file super block",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
-                    }
-                    stack.push(child_block_id);
-                }
-                let child_block_id = BlockID::from(node.lower_fence_value().to_u64());
-                if child_block_id == SUPER_BLOCK_ID {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child points to the table-file super block",
-                            self.file_kind()
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_secondary_disk_tree_reachable_blocks").into());
-                }
-                stack.push(child_block_id);
             }
         }
         Ok(())
@@ -851,20 +972,19 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + Send + 'b>> {
         Box::pin(async move {
             let guard = self.read_node(block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             if node.is_leaf() {
-                // Leaves are already validated, so each slot can be decoded into
-                // the spec's logical entry form before applying batch semantics.
+                // Check each borrowed entry before materializing the owned rewrite input.
                 let mut entries = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
-                    entries.push(self.node_result(block_id, F::leaf_entry(node, idx))?);
+                    entries.push(F::own_leaf_entry(node.leaf_entry(idx)?));
                 }
                 let entries = F::apply_operations(&entries, operations);
                 return Ok(NodeRewriteResult {
                     entries: self.pack_leaf_rewrite_entries(&entries, range_upper_fence)?,
                 });
             }
-            let entries = branch_entries_from_node(node);
+            let entries = branch_entries_from_node(node)?;
             // Flatten the branch while the guard is alive, then release it before
             // recursive children perform mutable writes through the CoW fork.
             drop(guard);
@@ -1193,7 +1313,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         }
 
         let guard = self.read_node(entry.block_id).await?;
-        let node = guard.node();
+        let node = guard.view();
         if node.height() != usize::from(entry.height) {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
                 .attach(format!(
@@ -1209,11 +1329,11 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
         if node.is_leaf() {
             let mut entries = Vec::with_capacity(node.count());
             for idx in 0..node.count() {
-                entries.push(self.node_result(entry.block_id, F::leaf_entry(node, idx))?);
+                entries.push(F::own_leaf_entry(node.leaf_entry(idx)?));
             }
             Ok(BranchEntryPayload::Leaf(entries))
         } else {
-            Ok(BranchEntryPayload::Branch(branch_entries_from_node(node)))
+            Ok(BranchEntryPayload::Branch(branch_entries_from_node(node)?))
         }
     }
 
@@ -1557,6 +1677,15 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     ) -> RuntimeOrFatalResult<()> {
         // Compute integrity after all node bytes, fences, values, and hints have
         // reached their final persisted representation.
+        #[cfg(debug_assertions)]
+        {
+            let node: &BTreeNode = layout::ref_from_bytes(buf.data_mut());
+            debug_assert!(if node.is_leaf() {
+                node.validate_persisted_layout::<F::LeafValue>()
+            } else {
+                node.validate_persisted_layout::<BTreeU64>()
+            });
+        }
         write_block_checksum(buf.data_mut());
         mutable_file
             .write_block(block_id, buf)
@@ -1570,7 +1699,7 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
 pub(crate) struct DiskTreeLeaf<F: DiskTreeSpec> {
     pub(super) file_kind: FileKind,
     pub(super) block_id: BlockID,
-    pub(super) guard: ValidatedDiskTreeNode<F>,
+    pub(super) guard: DiskTreeNodeGuard<F>,
     pub(super) start_idx: usize,
 }
 
@@ -1622,11 +1751,11 @@ impl DiskTreeNodeCursorState {
     ) -> RuntimeOrFatalResult<Option<DiskTreeLeaf<F>>> {
         while let Some(block_id) = self.stack.pop() {
             let guard = Self::read_node(runtime, disk_pool_guard, block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             if node.is_leaf() {
                 let start_idx = if self.seek_pending {
                     self.seek_pending = false;
-                    node.lower_bound_slot_idx(&self.seek_key)
+                    node.lower_bound_slot_idx(&self.seek_key)?
                 } else {
                     0
                 };
@@ -1638,43 +1767,12 @@ impl DiskTreeNodeCursorState {
                 }));
             }
             let start_idx = if self.seek_pending {
-                node.lower_bound_child_entry_idx(&self.seek_key)
-                    .ok_or_else(|| {
-                        Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!(
-                                "file={}, block=secondary_disk_tree, block_id={block_id}, lower-bound child is missing",
-                                Self::file_kind(runtime)
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=scan_secondary_disk_tree_leaf")
-                    })?
+                node.lower_bound_child_entry_idx(&self.seek_key)?
             } else {
-                if node.lower_fence_value().is_deleted() {
-                    return Err(Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!(
-                            "file={}, block=secondary_disk_tree, block_id={block_id}, lower-fence child is delete-marked",
-                            Self::file_kind(runtime)
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=scan_secondary_disk_tree_leaf").into());
-                }
-                // After the first leaf, remaining stack entries are right
-                // sibling subtrees and can be scanned from their lower fence.
                 0
             };
-            let branch_entries = branch_entries_from_node(node);
-            if start_idx >= branch_entries.len() {
-                return Err(Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "file={}, block=secondary_disk_tree, block_id={block_id}, child index {start_idx} is out of bounds for {} branch entries",
-                        Self::file_kind(runtime),
-                        branch_entries.len()
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=scan_secondary_disk_tree_leaf").into());
-            }
-            for entry in branch_entries.into_iter().skip(start_idx).rev() {
-                self.stack.push(entry.block_id);
+            for child in (start_idx..=node.count()).rev() {
+                self.stack.push(node.child_block(child)?);
             }
         }
         Ok(None)
@@ -1685,7 +1783,7 @@ impl DiskTreeNodeCursorState {
         runtime: &DiskTreeRuntime<F>,
         disk_pool_guard: &PoolGuard,
         block_id: BlockID,
-    ) -> RuntimeOrFatalResult<ValidatedDiskTreeNode<F>> {
+    ) -> RuntimeOrFatalResult<DiskTreeNodeGuard<F>> {
         let guard = runtime
             .disk_pool
             .read_validated_block(
@@ -1693,13 +1791,10 @@ impl DiskTreeNodeCursorState {
                 &runtime.file,
                 disk_pool_guard,
                 block_id,
-                F::validate_persisted_block,
+                validate_persisted_block,
             )
             .await?;
-        Ok(ValidatedDiskTreeNode {
-            guard,
-            _marker: PhantomData,
-        })
+        Ok(DiskTreeNodeGuard::new(guard, runtime.file_kind, block_id))
     }
 }
 
@@ -1756,12 +1851,10 @@ impl<'a> UniqueDiskTree<'a> {
     /// Look up one already-encoded logical key.
     #[inline]
     pub(crate) async fn lookup_encoded(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<RowID>> {
-        match self.lookup_encoded_entry(key).await? {
-            Some(entry) => Ok(Some(entry.row_id.unwrap_or_else(|| {
-                panic!("DiskTree rewrite invariant violated: unique lookup entry has no row id")
-            }))),
-            None => Ok(None),
-        }
+        Ok(self
+            .lookup_encoded_value(key)
+            .await?
+            .map(BTreeU64::to_row_id))
     }
 
     /// Open a bounded lookup-candidate stream over this root snapshot.
@@ -1814,7 +1907,7 @@ impl<'a> NonUniqueDiskTree<'a> {
     /// exists in the current root snapshot.
     #[inline]
     pub(crate) async fn contains_exact_encoded(&self, key: &[u8]) -> RuntimeOrFatalResult<bool> {
-        Ok(self.lookup_encoded_entry(key).await?.is_some())
+        Ok(self.lookup_encoded_value(key).await?.is_some())
     }
 
     /// Open a bounded lookup-candidate stream over this root snapshot.
@@ -1990,7 +2083,6 @@ fn invalid_node_decode() -> Report<DataIntegrityError> {
     Report::new(DataIntegrityError::InvalidPayload)
 }
 
-/// View a validated block as an immutable B-tree node image.
 #[inline]
 fn persisted_disk_tree_node(block: &[u8]) -> DataIntegrityResult<&BTreeNode> {
     layout::try_ref_from_bytes::<BTreeNode>(block)
@@ -2000,8 +2092,6 @@ fn persisted_disk_tree_node(block: &[u8]) -> DataIntegrityResult<&BTreeNode> {
 
 #[inline]
 fn validate_checksum(block: &[u8]) -> DataIntegrityResult<()> {
-    // Readonly admission supplies one fixed-size Page and rejects short IO reads
-    // before invoking this validator, so the slice length is a caller contract.
     assert_eq!(
         block.len(),
         DISK_TREE_BLOCK_SIZE,
@@ -2010,60 +2100,23 @@ fn validate_checksum(block: &[u8]) -> DataIntegrityResult<()> {
     validate_block_checksum(block)
 }
 
-/// Validate one persisted DiskTree block before handing it to a reader.
-///
-/// Validation is intentionally layered: checksum first, then no-copy BTreeNode
-/// casting, then logical layout checks for branch pointers or spec-specific
-/// leaf values.
-fn validate_disk_tree_block<F: DiskTreeSpec>(block: &[u8]) -> DataIntegrityResult<()> {
+/// Admit bytes without visiting entries; readers check selected payloads on demand.
+fn validate_disk_tree_block(block: &[u8]) -> DataIntegrityResult<()> {
     validate_checksum(block)?;
-    let node = persisted_disk_tree_node(block)?;
-    let valid_layout = if node.is_leaf() {
-        node.validate_persisted_layout::<F::LeafValue>()
-    } else {
-        node.validate_persisted_layout::<BTreeU64>()
-    };
-    if !valid_layout {
+    if !persisted_disk_tree_node(block)?.validate_persisted_header() {
         return Err(invalid_node_decode());
-    }
-    if !node.is_leaf() {
-        validate_branch_children(node)?;
-    }
-    if node.is_leaf() {
-        for idx in 0..node.count() {
-            F::leaf_entry(node, idx)?;
-        }
     }
     Ok(())
 }
 
-/// Reject branch blocks that point at the table-file super block.
-///
-/// DiskTree roots represent absence with `None`, while every branch child must
-/// refer to a real persisted node block.
-fn validate_branch_children(node: &BTreeNode) -> DataIntegrityResult<()> {
-    if BlockID::from(node.lower_fence_value().to_u64()) == SUPER_BLOCK_ID {
-        return Err(invalid_node_decode());
-    }
-    for idx in 0..node.count() {
-        if BlockID::from(node.value::<BTreeU64>(idx).to_u64()) == SUPER_BLOCK_ID {
-            return Err(invalid_node_decode());
-        }
-    }
-    Ok(())
-}
-
-/// Copy an occupied key after persisted layout validation has succeeded.
-#[inline]
-fn validated_node_key(node: &BTreeNode, idx: usize) -> Vec<u8> {
-    // Layout validation checks every slot's key range. Callers use an occupied
-    // slot index and retain immutable node bytes through validation and decoding.
-    node.key_checked(idx).unwrap_or_else(|| {
-        panic!(
-            "DiskTree decode invariant violated: validated key is missing: slot_idx={idx}, count={}",
-            node.count()
-        )
-    })
+/// Attach persisted block identity at the readonly admission boundary.
+fn validate_persisted_block(
+    block: &[u8],
+    file: FileKind,
+    block_id: BlockID,
+) -> DataIntegrityResult<()> {
+    validate_disk_tree_block(block)
+        .attach_with(|| format!("file={file}, block=secondary_disk_tree, block_id={block_id}"))
 }
 
 /// Ensure caller-provided batches are already in strict durable key order.
@@ -2126,19 +2179,6 @@ fn validate_sorted_non_unique_exact_keys(entries: &[NonUniqueDiskTreeEncodedExac
         );
         prev = Some(entry.key);
     }
-}
-
-/// Return the child height after the caller has selected a branch node.
-#[inline]
-fn branch_child_height(node: &BTreeNode) -> u16 {
-    let height = node.height();
-    // Callers exclude leaves, and the node header stores height as u16, so a
-    // positive height can be decremented and converted without overflow.
-    assert!(
-        height > 0,
-        "DiskTree decode invariant violated: branch child height requested for leaf: height={height}"
-    );
-    (height - 1) as u16
 }
 
 /// Calculate a branch height from a homogeneous rewrite child-entry run.
@@ -2215,39 +2255,29 @@ fn validate_rewrite_entries_for_height(entries: &[RewriteEntry], height: u16) {
     }
 }
 
-/// Resolve the child block selected by a branch-node key lookup.
-#[inline]
-fn lookup_child_block(node: &BTreeNode, key: &[u8]) -> Option<BlockID> {
-    match node.lookup_child(key) {
-        LookupChild::Slot(_, block_id) | LookupChild::LowerFence(block_id) => {
-            Some(BlockID::from(u64::from(block_id)))
-        }
-        LookupChild::NotFound => None,
-    }
-}
-
 /// Decode a validated branch node into flattened lower-fence child entries.
 ///
 /// `BTreeNode` stores the first child in the lower fence and later children in
 /// slots. The rewrite path uses this normalized sequence when routing batch
 /// operations and rebuilding parent levels.
-fn branch_entries_from_node(node: &BTreeNode) -> Vec<BranchEntry> {
-    let child_height = branch_child_height(node);
+fn branch_entries_from_node<F: DiskTreeSpec>(
+    node: DiskTreeNodeView<'_, F>,
+) -> RuntimeResult<Vec<BranchEntry>> {
+    let child_height = node.child_height()?;
     let mut entries = Vec::with_capacity(node.count() + 1);
     entries.push(BranchEntry::persisted(
-        node.lower_fence_key().as_bytes().to_vec(),
-        BlockID::from(node.lower_fence_value().to_u64()),
+        node.fence_key(false).to_vec(),
+        node.child_block(0)?,
         child_height,
     ));
     for idx in 0..node.count() {
-        let key = validated_node_key(node, idx);
         entries.push(BranchEntry::persisted(
-            key,
-            BlockID::from(node.value::<BTreeU64>(idx).to_u64()),
+            node.key(idx)?.to_vec(),
+            node.child_block(idx + 1)?,
             child_height,
         ));
     }
-    entries
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -2264,7 +2294,7 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::fs::tests::TestFileSystem;
     use crate::file::table_file::{MutableTableFile, TableFile};
-    use crate::index::btree::{BTreeHeader, BTreeKey, KeyRange};
+    use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeHeader, BTreeKey, BTreeSlot, KeyRange};
     use crate::index::util::tests::{drain_candidates, drain_row_ids};
     use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
@@ -2277,6 +2307,19 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    impl<'a, F: DiskTreeSpec> DiskTreeNodeView<'a, F> {
+        /// Construct a test view after establishing fixed-header validity.
+        fn for_test(node: &'a BTreeNode) -> Self {
+            assert!(node.validate_persisted_header());
+            Self {
+                node,
+                file_kind: FileKind::TableFile,
+                block_id: BlockID::new(1),
+                _marker: PhantomData,
+            }
+        }
+    }
 
     macro_rules! unique_runtime {
         ($metadata:ident, $disk_pool:ident) => {
@@ -2719,11 +2762,11 @@ mod tests {
         let mut stack = vec![root_block_id];
         while let Some(block_id) = stack.pop() {
             let guard = tree.read_node(block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             let child_entries = if node.is_leaf() {
                 None
             } else {
-                Some(branch_entries_from_node(node))
+                Some(branch_entries_from_node(node)?)
             };
             summaries.push(NodeSummary {
                 is_leaf: node.is_leaf(),
@@ -2751,16 +2794,16 @@ mod tests {
         let mut stack = vec![root_block_id];
         while let Some(block_id) = stack.pop() {
             let guard = tree.read_node(block_id).await?;
-            let node = guard.node();
+            let node = guard.view();
             if node.is_leaf() {
                 let mut keys = Vec::with_capacity(node.count());
                 for idx in 0..node.count() {
-                    keys.push(tree.node_result(block_id, F::leaf_entry(node, idx))?.key);
+                    keys.push(node.leaf_entry(idx)?.key.to_vec());
                 }
                 let upper_fence = if node.has_no_upper_fence() {
                     None
                 } else {
-                    Some(node.upper_fence_key().as_bytes().to_vec())
+                    Some(node.fence_key(true).to_vec())
                 };
                 leaves.push(LeafBlock {
                     block_id,
@@ -2769,7 +2812,7 @@ mod tests {
                     keys,
                 });
             } else {
-                let branch_entries = branch_entries_from_node(node);
+                let branch_entries = branch_entries_from_node(node)?;
                 for entry in branch_entries.into_iter().rev() {
                     stack.push(entry.block_id);
                 }
@@ -2795,6 +2838,159 @@ mod tests {
         node.insert_at::<BTreeU64>(0, b"entry-key", value);
         write_block_checksum(buf.data_mut());
         buf
+    }
+
+    fn leaf_block() -> DirectBuf {
+        let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
+        let node = btree_node_from_block_mut(buf.data_mut());
+        node.init(0, TrxID::new(1), b"a", BTreeU64::INVALID_VALUE, b"z", false);
+        for (idx, key) in [b"entry-one".as_slice(), b"entry-two"]
+            .into_iter()
+            .enumerate()
+        {
+            node.insert_at::<BTreeU64>(idx, key, BTreeU64::from(7 + idx as u64));
+        }
+        write_block_checksum(buf.data_mut());
+        buf
+    }
+
+    /// Purpose: Distinguish fixed-header admission from selected payload validation.
+    /// Expected: An untouched corrupt slot is admitted; valid entries work and accessing the corrupt slot returns InvalidPayload.
+    #[test]
+    fn test_unvisited_bad_entry_is_not_eagerly_validated() {
+        let mut buf = leaf_block();
+        let offset =
+            mem::size_of::<BTreeHeader>() + mem::size_of::<BTreeSlot>() + mem::size_of::<u16>();
+        buf.data_mut()[offset..offset + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        write_block_checksum(buf.data_mut());
+        validate_disk_tree_block(buf.data()).unwrap();
+        let raw = persisted_disk_tree_node(buf.data()).unwrap();
+        assert!(!raw.validate_persisted_layout::<BTreeU64>());
+        let node = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(raw);
+        assert_eq!(node.row_id(0).unwrap(), RowID::new(7));
+        assert_eq!(node.key(0).unwrap().to_vec(), b"entry-one");
+        let err = node.key(1).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload)
+        );
+        assert!(format!("{err:?}").contains("slot=Some(1)"));
+        assert!(node.compare_slot_key(1, b"entry-two").is_err());
+        assert!(node.search_key(b"entry-two").is_err());
+    }
+
+    /// Purpose: Reject value payloads extending into the checksum trailer even when key bytes fit.
+    /// Expected: Admission succeeds but both selected key comparison and value decoding return InvalidPayload.
+    #[test]
+    fn test_selected_value_range_cannot_cross_footer() {
+        let mut buf = leaf_block();
+        let node = btree_node_from_block_mut(buf.data_mut());
+        node.init(0, TrxID::new(1), b"", BTreeU64::INVALID_VALUE, b"", false);
+        node.insert_at::<BTreeU64>(0, b"a", BTreeU64::from(7));
+        let offset = mem::size_of::<BTreeHeader>() + 2;
+        let body_end = BTREE_NODE_USABLE_SIZE - mem::size_of::<BTreeHeader>();
+        buf.data_mut()[offset..offset + 2].copy_from_slice(&((body_end - 1) as u16).to_le_bytes());
+        write_block_checksum(buf.data_mut());
+        validate_disk_tree_block(buf.data()).unwrap();
+        let view = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(
+            persisted_disk_tree_node(buf.data()).unwrap(),
+        );
+        assert_eq!(
+            view.key(0)
+                .unwrap_err()
+                .downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload)
+        );
+        assert!(view.compare_slot_key(0, b"a").is_err());
+        assert!(view.row_id(0).is_err());
+    }
+
+    /// Purpose: Verify header admission rejects self-checksummed invalid slot-array metadata.
+    /// Expected: An initialized page whose occupied count exceeds its slot array fails before any entry access.
+    #[test]
+    fn test_header_rejects_invalid_slot_count() {
+        let mut buf = leaf_block();
+        // Height and count are the first two little-endian u16 header fields.
+        buf.data_mut()[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        write_block_checksum(buf.data_mut());
+        let err = validate_disk_tree_block(buf.data()).unwrap_err();
+        assert_eq!(*err.current_context(), DataIntegrityError::InvalidPayload);
+    }
+
+    /// Purpose: Retain deep construction checks after removing eager entry validation.
+    /// Expected: Checksummed pages with bad key order, fence membership, or overlapping values pass admission but fail deep validation.
+    #[test]
+    fn test_deep_validation_retains_semantic_checks() {
+        for corruption in ["ordering", "fence", "overlap"] {
+            let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
+            let node = btree_node_from_block_mut(buf.data_mut());
+            node.init(0, TrxID::new(1), b"", BTreeU64::INVALID_VALUE, b"z", false);
+            node.insert_at::<BTreeU64>(0, b"a", BTreeU64::from(7));
+            node.insert_at::<BTreeU64>(1, b"b", BTreeU64::from(8));
+            assert!(node.validate_persisted_layout::<BTreeU64>());
+            let start = mem::size_of::<BTreeHeader>();
+            let slot_size = mem::size_of::<BTreeSlot>();
+            let bytes = buf.data_mut();
+            match corruption {
+                "ordering" => {
+                    let (left, right) = bytes[start..start + 2 * slot_size].split_at_mut(slot_size);
+                    left.swap_with_slice(right);
+                }
+                "fence" => {
+                    // The second inline key becomes the excluded upper fence.
+                    bytes[start + slot_size + 4..start + 2 * slot_size]
+                        .copy_from_slice(&(u32::from(b'z') << 24).to_le_bytes());
+                }
+                "overlap" => {
+                    // Distinct inline keys now share the same value payload.
+                    bytes.copy_within(start + 2..start + 4, start + slot_size + 2);
+                }
+                _ => unreachable!(),
+            }
+            write_block_checksum(buf.data_mut());
+            validate_disk_tree_block(buf.data()).unwrap();
+            let node = persisted_disk_tree_node(buf.data()).unwrap();
+            assert!(
+                !node.validate_persisted_layout::<BTreeU64>(),
+                "{corruption}"
+            );
+        }
+    }
+
+    /// Purpose: Preserve non-unique scalar decoding when the exact-key row id spans prefix and suffix.
+    /// Expected: Borrowed views reconstruct the encoded key and row id for every prefix split without an owned leaf entry.
+    #[test]
+    fn test_non_unique_view_with_split_row_id() {
+        let row = 0x0102030405060708u64;
+        let mut key = b"long-common-prefix-for-row-".to_vec();
+        key.extend_from_slice(&row.to_be_bytes());
+        for split in key.len() - 8..key.len() {
+            let mut upper = key[..split].to_vec();
+            upper.push(255);
+            let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
+            let node = btree_node_from_block_mut(buf.data_mut());
+            node.init(
+                0,
+                TrxID::new(1),
+                &key,
+                BTreeU64::INVALID_VALUE,
+                &upper,
+                false,
+            );
+            node.insert_at::<BTreeNil>(0, &key, BTreeNil);
+            assert_eq!(node.common_prefix().len(), split);
+            write_block_checksum(buf.data_mut());
+            validate_disk_tree_block(buf.data()).unwrap();
+            let view = DiskTreeNodeView::<NonUniqueDiskTreeSpec>::for_test(
+                persisted_disk_tree_node(buf.data()).unwrap(),
+            );
+            let entry = view.leaf_entry(0).unwrap();
+            let mut tail = [0; 8];
+            entry.key.copy_tail(&mut tail).unwrap();
+            assert_eq!(u64::from_be_bytes(tail), row);
+            assert_eq!(entry.key.to_vec(), key);
+            assert_eq!(entry.value, BTreeNil);
+        }
     }
 
     /// Purpose: Protect error adaptation for truncated persisted disk-tree nodes.
@@ -2837,33 +3033,38 @@ mod tests {
         expected = "DiskTree validation invariant violated: block length differs from readonly page size"
     )]
     fn test_disk_tree_block_length_asserts() {
-        let _ = validate_disk_tree_block::<UniqueDiskTreeSpec>(&[0u8; 1]);
+        let _ = validate_disk_tree_block(&[0u8; 1]);
     }
 
-    /// Purpose: Enforce occupied-slot access after DiskTree layout validation.
-    /// Expected: Decoding a missing slot reports the invariant with its index and node count.
+    /// Purpose: Reject missing slots through checked persisted access.
+    /// Expected: An admitted leaf returns InvalidPayload for an unoccupied slot without panicking.
     #[test]
-    #[should_panic(
-        expected = "DiskTree decode invariant violated: validated key is missing: slot_idx=1, count=1"
-    )]
-    fn test_disk_tree_missing_validated_key_asserts() {
+    fn test_disk_tree_missing_slot_returns_integrity_error() {
         let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
-        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
-        let node = persisted_disk_tree_node(buf.data()).unwrap();
-        let _ = UniqueDiskTreeSpec::leaf_entry(node, 1);
+        validate_disk_tree_block(buf.data()).unwrap();
+        let node = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(
+            persisted_disk_tree_node(buf.data()).unwrap(),
+        );
+        let err = node.key(1).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload)
+        );
     }
 
-    /// Purpose: Enforce branch selection before decoding DiskTree children.
-    /// Expected: Decoding a validated leaf as a branch triggers the child-height invariant.
+    /// Purpose: Reject leaf pages where a persisted branch is required.
+    /// Expected: Branch decoding returns InvalidPayload without relying on assertions.
     #[test]
-    #[should_panic(
-        expected = "DiskTree decode invariant violated: branch child height requested for leaf: height=0"
-    )]
     fn test_disk_tree_branch_decode_rejects_leaf() {
         let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
-        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
-        let node = persisted_disk_tree_node(buf.data()).unwrap();
-        let _ = branch_entries_from_node(node);
+        let node = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(
+            persisted_disk_tree_node(buf.data()).unwrap(),
+        );
+        let err = branch_entries_from_node(node).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<DataIntegrityError>(),
+            Some(&DataIntegrityError::InvalidPayload)
+        );
     }
 
     /// Purpose: Protect branch decoding at the limits of the persisted height representation.
@@ -2872,9 +3073,11 @@ mod tests {
     fn test_disk_tree_branch_decode_height_boundaries() {
         for (height, expected_child_height) in [(1, 0), (u16::MAX, 65534)] {
             let buf = disk_tree_test_block(height, BTreeU64::from(11), BTreeU64::from(7));
-            validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+            validate_disk_tree_block(buf.data()).unwrap();
             let node = persisted_disk_tree_node(buf.data()).unwrap();
-            let entries = branch_entries_from_node(node);
+            let entries =
+                branch_entries_from_node(DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(node))
+                    .unwrap();
             let decoded = entries
                 .iter()
                 .map(|entry| (entry.key.as_slice(), entry.block_id, entry.height))
@@ -3705,7 +3908,7 @@ mod tests {
 
             let tree = runtime.open(root, &guard);
             let root_guard = tree.read_node(root.unwrap()).await.unwrap();
-            assert!(!root_guard.node().is_leaf());
+            assert!(!root_guard.view().is_leaf());
             drop(root_guard);
 
             let allocated_before_delete = mutable.root().alloc_map.allocated();
@@ -3737,9 +3940,9 @@ mod tests {
                 .read_node(compacted_root.unwrap())
                 .await
                 .unwrap();
-            assert!(compacted_guard.node().is_leaf());
-            assert!(compacted_guard.node().has_no_upper_fence());
-            assert_eq!(compacted_guard.node().count(), expected_rows.len());
+            assert!(compacted_guard.view().is_leaf());
+            assert!(compacted_guard.view().has_no_upper_fence());
+            assert_eq!(compacted_guard.view().count(), expected_rows.len());
             drop(compacted_guard);
 
             let rows = unique_scan_entries(&compacted_tree)
@@ -3797,8 +4000,8 @@ mod tests {
             let inspect_tree = inspect_runtime.open(root, &inspect_guard);
             let root_block_id = root.unwrap();
             let root_guard = inspect_tree.read_node(root_block_id).await.unwrap();
-            assert_eq!(root_guard.node().height(), 1);
-            let leaf_entries = branch_entries_from_node(root_guard.node());
+            assert_eq!(root_guard.view().height(), 1);
+            let leaf_entries = branch_entries_from_node(root_guard.view()).unwrap();
             assert!(leaf_entries.iter().all(|entry| entry.height == 0));
             drop(root_guard);
 
@@ -3880,7 +4083,7 @@ mod tests {
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
             let root_guard = tree.read_node(root.unwrap()).await.unwrap();
-            assert_eq!(root_guard.node().height(), 1);
+            assert_eq!(root_guard.view().height(), 1);
             drop(root_guard);
 
             let leaves = collect_leaf_blocks(&tree).await.unwrap();
@@ -3989,7 +4192,7 @@ mod tests {
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
             let root_guard = tree.read_node(root.unwrap()).await.unwrap();
-            assert_eq!(root_guard.node().height(), 1);
+            assert_eq!(root_guard.view().height(), 1);
             drop(root_guard);
 
             let leaves = collect_leaf_blocks(&tree).await.unwrap();
@@ -4094,27 +4297,27 @@ mod tests {
     #[test]
     fn test_disk_tree_block_checksum_trailer_rejects_corruption() {
         let buf = disk_tree_test_block(0, BTreeU64::INVALID_VALUE, BTreeU64::from(7));
-        validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+        validate_disk_tree_block(buf.data()).unwrap();
 
         let mut payload_corrupted = buf.data().to_vec();
         payload_corrupted[0] ^= 0xff;
-        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(&payload_corrupted).unwrap_err();
+        let err = validate_disk_tree_block(&payload_corrupted).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
 
         let mut footer_corrupted = buf.data().to_vec();
         let checksum_idx = checksum_offset(footer_corrupted.len());
         footer_corrupted[checksum_idx] ^= 0xff;
-        let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(&footer_corrupted).unwrap_err();
+        let err = validate_disk_tree_block(&footer_corrupted).unwrap_err();
         assert_eq!(*err.current_context(), DataIntegrityError::ChecksumMismatch);
     }
 
-    /// Purpose: Reject malformed persisted keys before assertion-backed DiskTree decoding.
-    /// Expected: Checksum-valid leaf and branch blocks with invalid key offsets return InvalidPayload.
+    /// Purpose: Reject malformed persisted keys when their entries are accessed.
+    /// Expected: Admission accepts valid headers, then selected invalid key offsets return InvalidPayload.
     #[test]
     fn test_disk_tree_invalid_key_layout_returns_integrity_error() {
         for height in [0, 1] {
             let mut buf = disk_tree_test_block(height, BTreeU64::from(11), BTreeU64::from(7));
-            validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap();
+            validate_disk_tree_block(buf.data()).unwrap();
             // The first slot follows the header and stores its u16 offset after
             // its u16 length. Keep the long key length but move it past the body.
             let offset = mem::size_of::<BTreeHeader>() + mem::size_of::<u16>();
@@ -4123,10 +4326,14 @@ mod tests {
             write_block_checksum(buf.data_mut());
             validate_checksum(buf.data()).unwrap();
 
-            let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap_err();
+            validate_disk_tree_block(buf.data()).unwrap();
+            let node = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(
+                persisted_disk_tree_node(buf.data()).unwrap(),
+            );
+            let err = node.key(0).unwrap_err();
             assert_eq!(
-                *err.current_context(),
-                DataIntegrityError::InvalidPayload,
+                err.downcast_ref::<DataIntegrityError>(),
+                Some(&DataIntegrityError::InvalidPayload),
                 "node height={height}"
             );
         }
@@ -4162,10 +4369,17 @@ mod tests {
             let node = persisted_disk_tree_node(buf.data()).unwrap();
             assert!(node.validate_persisted_layout::<BTreeU64>(), "{name}");
 
-            let err = validate_disk_tree_block::<UniqueDiskTreeSpec>(buf.data()).unwrap_err();
+            validate_disk_tree_block(buf.data()).unwrap();
+            let node = DiskTreeNodeView::<UniqueDiskTreeSpec>::for_test(node);
+            let err = if height == 0 {
+                node.row_id(0).unwrap_err()
+            } else {
+                node.child_block(usize::from(lower_fence_value.to_u64() != 0))
+                    .unwrap_err()
+            };
             assert_eq!(
-                *err.current_context(),
-                DataIntegrityError::InvalidPayload,
+                err.downcast_ref::<DataIntegrityError>(),
+                Some(&DataIntegrityError::InvalidPayload),
                 "{name}"
             );
         }

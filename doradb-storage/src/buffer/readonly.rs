@@ -1119,7 +1119,10 @@ impl ReadonlyResidency {
         let mut g = self.free.lock();
         g.push(frame_id);
         drop(g);
-        self.free_ev.notify(1);
+        // Each returned frame is a separate permit. Coalescing notifications
+        // can leave another registered loader asleep after the notified loader
+        // consumes one frame, while remaining free frames stop the evictor.
+        self.free_ev.notify_additional(1);
     }
 
     #[inline]
@@ -1411,6 +1414,7 @@ pub(crate) mod tests {
     use crate::quiescent::{QuiescentBox, QuiescentGuard, test_with_before_drop_hook};
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
+    use futures::FutureExt;
     use smol::Timer;
     use std::io::Error as StdIoError;
     use std::ops::Deref;
@@ -2210,6 +2214,31 @@ pub(crate) mod tests {
             );
             assert_eq!(test_outstanding_base_guard_count(&global.arena), 1);
         });
+    }
+
+    /// Purpose: Wake independent readonly loaders when eviction returns several frames before any waiter is polled.
+    /// Expected: Every returned frame supplies a distinct wake so free capacity cannot strand a registered loader.
+    #[test]
+    fn readonly_batch_frame_returns_wake_each_waiter() {
+        let residency = ReadonlyResidency::new(2, EvictionArbiterBuilder::default().build(2));
+        let first_frame = residency.try_reserve_frame().unwrap();
+        let second_frame = residency.try_reserve_frame().unwrap();
+        assert!(residency.try_reserve_frame().is_none());
+        let first = residency.free_ev.listen();
+        let second = residency.free_ev.listen();
+        residency.release_free(first_frame);
+        residency.release_free(second_frame);
+        assert!(first.now_or_never().is_some());
+        assert!(
+            second.now_or_never().is_some(),
+            "a separate free frame must wake the second waiter"
+        );
+        let mut frames = [
+            residency.try_reserve_frame().unwrap(),
+            residency.try_reserve_frame().unwrap(),
+        ];
+        frames.sort_unstable();
+        assert_eq!(frames, [PageID::from(0usize), PageID::from(1usize)]);
     }
 
     /// Purpose: Retry reservation when a free frame is temporarily latched.
