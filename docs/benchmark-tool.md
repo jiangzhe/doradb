@@ -486,6 +486,10 @@ kind = "benchmark"
 workload = { type = "create-index", index = "unique", key = "composite", include_stats = true, fixture = { tables = 1, rows = 100000, indexes = 1, index = "unique", value_bytes = 512, cardinality = 31, cold_rows = 90000, mutate_every = 7 } }
 ```
 
+Set `fixture.interleaved = true` to spread checkpointed and hot keys throughout
+the same logical range. By default, checkpointed keys precede hot keys. This
+option also applies to recovery fixtures.
+
 The table and existing indexes are verified before timing; the new index is
 verified afterward, including row content and multiplicity. A unique
 payload-only build requires distinct payloads.
@@ -513,7 +517,8 @@ reported separately from process RSS.
 `hot_index_extraction.*` metrics describe successful hot-row extraction.
 `create_index.*` metrics describe successfully published index creation;
 `create_index.cold.*` reports its cold-build memory, concurrency, timing, and
-write statistics.
+write statistics. `create_index.validation.*` reports the selected cross-tier
+validation method, work counts, timing, and memory bounds.
 
 ### Maintenance controls and terminal policy
 

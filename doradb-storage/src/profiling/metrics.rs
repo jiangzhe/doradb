@@ -220,6 +220,24 @@ fn push_create_index_metrics(
             push_metric(metrics, concat!("create_index.", $name), after.$($field).+);
         };
     }
+    counter!("validation.forward", validation.forward);
+    counter!("validation.ordered", validation.ordered);
+    counter!("validation.reverse", validation.reverse);
+    counter!("validation.empty", validation.empty);
+    counter!("validation.probes", validation.probes);
+    counter!("validation.batches", validation.batches);
+    counter!("validation.node_reads", validation.node_reads);
+    counter!("validation.scanned", validation.scanned);
+    counter!("validation.comparisons", validation.comparisons);
+    counter!("validation.hot_entries", validation.hot_entries);
+    counter!("validation.cold_entries", validation.cold_entries);
+    counter!("validation.wall_nanos", validation.wall_nanos);
+    counter!("validation.worker_nanos", validation.worker_nanos);
+    counter!("validation.jobs", validation.jobs);
+    peak!("validation.workers", validation.workers);
+    peak!("validation.peak", validation.peak);
+    peak!("validation.scratch_bytes", validation.scratch_bytes);
+    peak!("validation.pool_pin_bytes", validation.pool_pin_bytes);
     peak!("cold.fixed_overhead_bytes", cold.fixed_overhead_bytes);
     peak!("cold.workers", cold.workers);
     counter!("cold.partitions", cold.partitions);
@@ -354,7 +372,11 @@ fn push_create_index_metrics(
 fn create_index_peak(name: &str) -> bool {
     matches!(
         name,
-        "create_index.cold.fixed_overhead_bytes"
+        "create_index.validation.workers"
+            | "create_index.validation.peak"
+            | "create_index.validation.scratch_bytes"
+            | "create_index.validation.pool_pin_bytes"
+            | "create_index.cold.fixed_overhead_bytes"
             | "create_index.cold.workers"
             | "create_index.cold.packing_peak"
             | "create_index.cold.buffer_peak"
@@ -1365,6 +1387,72 @@ mod tests {
             "hot_index_extraction.scratch_peak_bytes",
             809,
             809,
+            LifetimePeak,
+            Bytes,
+        ),
+        ("create_index.validation.forward", 0, 0, CounterDelta, Count),
+        ("create_index.validation.ordered", 0, 0, CounterDelta, Count),
+        ("create_index.validation.reverse", 0, 0, CounterDelta, Count),
+        ("create_index.validation.empty", 0, 0, CounterDelta, Count),
+        ("create_index.validation.probes", 0, 0, CounterDelta, Count),
+        ("create_index.validation.batches", 5, 7, CounterDelta, Count),
+        (
+            "create_index.validation.node_reads",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        ("create_index.validation.scanned", 0, 0, CounterDelta, Count),
+        (
+            "create_index.validation.comparisons",
+            0,
+            0,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.validation.hot_entries",
+            0,
+            0,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.validation.cold_entries",
+            0,
+            0,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.validation.wall_nanos",
+            0,
+            0,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.validation.worker_nanos",
+            0,
+            0,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        ("create_index.validation.jobs", 0, 0, CounterDelta, Count),
+        ("create_index.validation.workers", 0, 0, LifetimePeak, Count),
+        ("create_index.validation.peak", 0, 0, LifetimePeak, Count),
+        (
+            "create_index.validation.scratch_bytes",
+            0,
+            0,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.validation.pool_pin_bytes",
+            0,
+            0,
             LifetimePeak,
             Bytes,
         ),
@@ -2478,6 +2566,10 @@ mod tests {
         after.index_build.create.hot.max_job_nanos = 728;
         before.index_build.create.hot.scratch_peak_bytes = 277;
         after.index_build.create.hot.scratch_peak_bytes = 731;
+        before.index_build.create.validation.batches = 2;
+        after.index_build.create.validation.batches = 7;
+        before.index_build.create.validation.node_reads = 3;
+        after.index_build.create.validation.node_reads = 11;
         before.index_build.create.cold_entries = 278;
         after.index_build.create.cold_entries = 734;
         before.index_build.create.retained_cold_bytes = 279;

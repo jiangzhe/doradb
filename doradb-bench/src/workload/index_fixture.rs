@@ -70,7 +70,8 @@ pub(super) async fn prepare_index_fixture(
             ] {
                 for batch in (start..end).step_by(1000) {
                     let mut trx = session.begin_trx()?;
-                    for key in batch..batch.saturating_add(1000).min(end) {
+                    for ordinal in batch..batch.saturating_add(1000).min(end) {
+                        let key = fixture.key_at(ordinal);
                         let payload_key = if fixture.cardinality == 0 {
                             key
                         } else {
@@ -107,14 +108,14 @@ pub(super) async fn prepare_index_fixture(
                     })?;
                     if key % fixture.mutate_every == 0 {
                         deleted += 1;
-                        if key < fixture.cold_rows {
+                        if fixture.is_cold_key(key) {
                             placement.checkpointed_rows -= 1;
                         } else {
                             placement.hot_rows -= 1;
                         }
                         Ok(RowMutation::Delete)
                     } else if key % fixture.mutate_every == 1 {
-                        if key < fixture.cold_rows {
+                        if fixture.is_cold_key(key) {
                             placement.checkpointed_rows -= 1;
                             placement.hot_rows += 1;
                         }

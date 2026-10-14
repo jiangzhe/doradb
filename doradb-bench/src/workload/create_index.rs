@@ -371,6 +371,7 @@ mod tests {
                         cardinality: 3,
                         value_bytes: 512,
                         cold_rows: rows / 2,
+                        interleaved: true,
                         mutate_every: 7,
                     }),
                 };
@@ -468,6 +469,7 @@ mod tests {
                         cardinality: 0,
                         value_bytes: 8,
                         cold_rows: 8,
+                        interleaved: true,
                         mutate_every: 0,
                     }),
                 };

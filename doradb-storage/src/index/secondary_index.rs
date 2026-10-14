@@ -1,9 +1,9 @@
 //! Composite MemIndex/DiskTree secondary-index core.
 //!
 //! The composite types group the current in-memory BTree-backed secondary
-//! index with the current published secondary DiskTree root. Catalog tables use
-//! the catalog-only in-memory enum in this module because they do not have a
-//! cold DiskTree layer.
+//! index with the current published secondary DiskTree root. The memory-only
+//! enum serves catalog tables and private user-index staging before the final
+//! composite takes ownership of its completed disk runtime.
 
 use super::disk_tree::{
     NonUniqueDiskTree, NonUniqueDiskTreeRuntime, UniqueDiskTree, UniqueDiskTreeRuntime,
@@ -15,7 +15,7 @@ use super::index_stream::{
 use super::non_unique_index::{GuardedNonUniqueMemIndex, IndexMask, NonUniqueMemIndex};
 use super::unique_index::{GuardedUniqueMemIndex, UniqueLookupObservation, UniqueMemIndex};
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, TableIndexMetadata, TableMetadata};
+use crate::catalog::{IndexRef, IndexSlot, TableIndexMetadata, TableMetadata};
 use crate::error::{
     InternalError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
     SecondaryIndexBinding,
@@ -71,7 +71,7 @@ impl IndexCompareExchange {
     }
 }
 
-/// Catalog-table secondary-index variant over the mutable in-memory layer only.
+/// Memory-only secondary index for catalog tables and private user-index staging.
 pub(crate) enum InMemorySecondaryIndex<P: 'static> {
     /// Unique MemIndex backend.
     Unique(UniqueMemIndex<P>),
@@ -80,7 +80,7 @@ pub(crate) enum InMemorySecondaryIndex<P: 'static> {
 }
 
 impl<P: BufferPool> InMemorySecondaryIndex<P> {
-    /// Build an in-memory secondary index from catalog index metadata.
+    /// Build an in-memory secondary index from index metadata.
     #[inline]
     pub(crate) async fn new<F: Fn(usize) -> ValType>(
         index_pool: QuiescentGuard<P>,
@@ -141,7 +141,7 @@ impl<P: BufferPool> InMemorySecondaryIndex<P> {
 /// must pass a root id captured from a proof-gated table snapshot. Already
 /// opened readers keep their root snapshot.
 pub(crate) struct SecondaryDiskTreeRuntime {
-    index_slot: IndexSlot,
+    index: IndexRef,
     kind: SecondaryDiskTreeRuntimeKind,
 }
 
@@ -182,14 +182,35 @@ impl SecondaryDiskTreeRuntime {
                 disk_pool,
             ))
         };
-        let runtime = Self { index_slot, kind };
+        let runtime = Self {
+            index: index_spec.index,
+            kind,
+        };
         Ok(runtime)
     }
 
     /// Return the physical table-index slot represented by this context.
     #[inline]
     pub(crate) fn index_slot(&self) -> IndexSlot {
-        self.index_slot
+        self.index.slot()
+    }
+
+    /// Bind private reads to the exact file incarnation and index generation.
+    pub(crate) fn matches_build(
+        &self,
+        file: &Arc<TableFile>,
+        index: IndexRef,
+        unique: bool,
+    ) -> bool {
+        self.index == index
+            && match &self.kind {
+                SecondaryDiskTreeRuntimeKind::Unique(runtime) => {
+                    unique && runtime.uses_file(file.sparse_file())
+                }
+                SecondaryDiskTreeRuntimeKind::NonUnique(runtime) => {
+                    !unique && runtime.uses_file(file.sparse_file())
+                }
+            }
     }
 
     /// Returns a borrowed key encoder for operation-local use.

@@ -273,12 +273,39 @@ pub struct RecoveryFixture {
     /// Load and checkpoint this prefix before loading remaining hot rows.
     #[serde(default)]
     pub cold_rows: u64,
+    /// Distribute cold and hot keys throughout the same logical key range.
+    #[serde(default)]
+    pub interleaved: bool,
     /// Delete every nth row and change the following row's payload; zero disables mutation.
     #[serde(default)]
     pub mutate_every: u64,
 }
 
 impl RecoveryFixture {
+    /// Map insertion ordinal to a disjoint, uniformly interleaved logical key.
+    pub(crate) fn key_at(self, ordinal: u64) -> u64 {
+        if !self.interleaved {
+            return ordinal;
+        }
+        if ordinal < self.cold_rows {
+            ((u128::from(ordinal) * u128::from(self.rows)) / u128::from(self.cold_rows)) as u64
+        } else {
+            ((u128::from(ordinal - self.cold_rows + 1) * u128::from(self.rows))
+                .div_ceil(u128::from(self.rows - self.cold_rows))
+                - 1) as u64
+        }
+    }
+
+    /// Recover original storage placement from an immutable logical key.
+    pub(crate) fn is_cold_key(self, key: u64) -> bool {
+        if !self.interleaved {
+            return key < self.cold_rows;
+        }
+        let rows = u128::from(self.rows);
+        (u128::from(key + 1) * u128::from(self.cold_rows)).div_ceil(rows)
+            != (u128::from(key) * u128::from(self.cold_rows)).div_ceil(rows)
+    }
+
     fn validate(self) -> Result<()> {
         if self.tables == 0
             || self.indexes > u32::MAX as usize
@@ -3975,5 +4002,39 @@ workload = { type = "managed-bindings-prepare", tables = 1 }
         let mut expected = cases.map(|(file, _)| file.to_owned()).to_vec();
         expected.sort();
         assert_eq!(actual, expected);
+    }
+
+    /// Purpose: Keep interleaved fixture placement disjoint and complete across empty, extreme and balanced tiers.
+    /// Expected: Insertion keys form one exact permutation and inverse placement identifies the original cold rows without overflow.
+    #[test]
+    fn interleaved_fixture_keys_preserve_exact_placement() {
+        for rows in [1, 2, 31, 128] {
+            for cold_rows in [0, 1, rows / 2, rows - 1, rows] {
+                let fixture = RecoveryFixture {
+                    tables: 1,
+                    rows,
+                    indexes: 0,
+                    index: IndexMode::None,
+                    composite: false,
+                    cardinality: 0,
+                    value_bytes: 8,
+                    cold_rows,
+                    interleaved: true,
+                    mutate_every: 0,
+                };
+                let mut keys = Vec::new();
+                for ordinal in 0..rows {
+                    let key = fixture.key_at(ordinal);
+                    assert_eq!(
+                        fixture.is_cold_key(key),
+                        ordinal < cold_rows,
+                        "rows={rows}, cold={cold_rows}, ordinal={ordinal}"
+                    );
+                    keys.push(key);
+                }
+                keys.sort_unstable();
+                assert_eq!(keys, (0..rows).collect::<Vec<_>>());
+            }
+        }
     }
 }

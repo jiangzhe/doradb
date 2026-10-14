@@ -221,6 +221,7 @@ mod tests {
                         cardinality: 4,
                         value_bytes: 64,
                         cold_rows,
+                        interleaved: true,
                         mutate_every,
                     }),
                     || {

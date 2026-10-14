@@ -145,6 +145,8 @@ pub struct ColdBuildMeasurements {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexMeasurements {
+    /// Completed-root validation work and admitted resources.
+    pub validation: ColdHotMeasurements,
     /// Streaming cold construction measurements.
     pub cold: ColdBuildMeasurements,
     /// Shared installed-tree measurements; completed builds count published CREATEs.
@@ -163,7 +165,7 @@ pub struct CreateIndexMeasurements {
     pub cold_hot_comparisons: u64,
     /// Sum of cross-tier partition-boundary search and batch validation time.
     pub cold_hot_worker_nanos: u64,
-    /// Longest cross-tier partition-boundary search or full batch validation interval.
+    /// Longest measured synchronous cross-tier resident-run search interval.
     pub max_cold_hot_sync_nanos: u64,
     /// Sum of accepted CREATE wall durations through layout/history publication.
     pub total_elapsed_nanos: u64,
@@ -191,6 +193,7 @@ impl IndexBuildProfiler {
         let mut stats = self.0.lock();
         let create = &mut stats.create;
         create.hot.record(extraction, merge, packed, cleanup_nanos);
+        create.validation.record(sample.validation);
         create.cold.fixed_overhead_bytes = create
             .cold
             .fixed_overhead_bytes
@@ -664,14 +667,77 @@ impl ParentPlanningProfile {
 }
 
 /// Cross-tier worker sums and longest uninterrupted work interval.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ColdHotMeasurements {
-    /// Key comparisons, including partition-boundary searches.
-    pub(crate) comparisons: u64,
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdHotMeasurements {
+    /// Successful method selections, accumulated separately.
+    pub forward: u64,
+    /// Successful ordered cursor selections.
+    pub ordered: u64,
+    /// Successful cold-range selections.
+    pub reverse: u64,
+    /// Explicit empty-tier checks.
+    pub empty: u64,
+    /// Encoded disk probes or resident run searches.
+    pub probes: u64,
+    /// Completed Forward or Reverse lookup batches; Ordered does not batch probes.
+    pub batches: u64,
+    /// Validation-worker persisted node accesses, including cache hits; excludes range planning.
+    pub node_reads: u64,
+    /// Ordered scan steps or streamed reverse entries; intervals may revisit a boundary.
+    pub scanned: u64,
+    /// Effective admitted worker allowance.
+    pub workers: u64,
+    /// Actual nonempty validation jobs.
+    pub jobs: u64,
+    /// Peak simultaneous reader jobs, including asynchronous IO waits.
+    pub peak: u64,
+    /// Admitted reader, range and ledger scratch.
+    pub scratch_bytes: u64,
+    /// Pool-owned bytes bounded by one pin per active reader.
+    pub pool_pin_bytes: u64,
+    /// Exact hot input count certified by successful cross-tier validation.
+    pub hot_entries: u64,
+    /// Exact sealed cold input count bound to successful validation.
+    pub cold_entries: u64,
+    /// Span from the first validation batch to the final validation batch.
+    pub wall_nanos: u64,
+    /// Full-key comparisons in encoded searches and resident-run searches.
+    pub comparisons: u64,
     /// Sum of partition-boundary search and batch validation time.
-    pub(crate) worker_nanos: u64,
-    /// Longest partition-boundary search or full batch validation interval.
-    pub(crate) max_sync_nanos: u64,
+    pub worker_nanos: u64,
+    /// Longest measured synchronous segment of resident-run batch searches.
+    /// Asynchronous disk validation is accounted in worker and wall durations.
+    pub max_sync_nanos: u64,
+}
+
+impl ColdHotMeasurements {
+    fn record(&mut self, other: Self) {
+        self.add(other);
+        self.forward += other.forward;
+        self.ordered += other.ordered;
+        self.reverse += other.reverse;
+        self.empty += other.empty;
+        self.hot_entries += other.hot_entries;
+        self.cold_entries += other.cold_entries;
+        self.jobs += other.jobs;
+        self.wall_nanos += other.wall_nanos;
+        self.workers = self.workers.max(other.workers);
+        self.peak = self.peak.max(other.peak);
+        self.scratch_bytes = self.scratch_bytes.max(other.scratch_bytes);
+        self.pool_pin_bytes = self.pool_pin_bytes.max(other.pool_pin_bytes);
+    }
+
+    /// Combine worker work without treating overlapping durations as wall time.
+    pub(crate) fn add(&mut self, other: Self) {
+        self.comparisons += other.comparisons;
+        self.probes += other.probes;
+        self.batches += other.batches;
+        self.node_reads += other.node_reads;
+        self.scanned += other.scanned;
+        self.worker_nanos += other.worker_nanos;
+        self.max_sync_nanos = self.max_sync_nanos.max(other.max_sync_nanos);
+    }
 }
 
 #[cfg(test)]

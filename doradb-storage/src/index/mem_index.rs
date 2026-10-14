@@ -129,18 +129,22 @@ pub(crate) struct NonUniqueMemIndexCleanupSpec;
 impl MemIndexCleanupSpec for NonUniqueMemIndexCleanupSpec {
     #[inline]
     fn slot_state(node: &BTreeNode, slot_idx: usize) -> MemIndexCleanupSlot {
-        let slot = node.slot(slot_idx);
-        let key_len = node.slot_key_len(slot);
-        // Non-unique MemIndex insertion always appends the row id, so every
-        // occupied exact-key slot must contain that fixed-width suffix.
+        // Cleanup reads hold a shared leaf latch, so occupied entry bytes are stable.
+        let entry = node
+            .entry_view_checked::<BTreeByte>(slot_idx)
+            .unwrap_or_else(|| {
+                panic!("MemIndex cleanup entry missing from occupied slot: slot_idx={slot_idx}")
+            });
+        let mut row_id = [0; mem::size_of::<RowID>()];
+        // Insertion appends the row id before publishing the exact key.
         assert!(
-            key_len >= mem::size_of::<RowID>(),
-            "non-unique MemIndex key is missing its row-id suffix: slot_idx={slot_idx}, key_len={key_len}"
+            entry.key.copy_tail(&mut row_id).is_some(),
+            "non-unique MemIndex key is missing its row-id suffix: slot_idx={slot_idx}, key_len={}",
+            entry.key.len()
         );
-        let value = node.value_for_slot::<BTreeByte>(slot);
         MemIndexCleanupSlot {
-            row_id: node.unpack_value::<BTreeU64>(slot).to_row_id(),
-            deleted: value.is_deleted(),
+            row_id: RowID::new(u64::from_be_bytes(row_id)),
+            deleted: entry.value.is_deleted(),
         }
     }
 }

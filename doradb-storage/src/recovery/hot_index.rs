@@ -7,7 +7,6 @@ use crate::error::{
     RecoveryDuplicateKey, RuntimeError, RuntimeOrFatalResult,
 };
 use crate::id::{PageID, TableID};
-use crate::index::build::cold_validation::ColdValidation;
 use crate::index::build::tree_builder::HotPackedOutcome;
 use crate::index::build::{
     DuplicateCheck, HotBuildCapture, HotBuildPolicy, HotBuildTableSource, HotIndexBuild,
@@ -290,7 +289,7 @@ impl RecoveryHotIndexTask {
                     self.thread_pool.clone(),
                     self.poisoner.clone(),
                     self.policy,
-                    ColdValidation::NotRequired,
+                    None,
                 ));
                 let active = self
                     .active

@@ -1,5 +1,7 @@
 //! Retained streaming durable construction. Workers only pack; this coordinator
 //! owns allocation, ingress, write observation, and private-root completion.
+//! Successful sealing hands resource ownership to `sealed_cold` after releasing
+//! construction inputs; readers and cross-tier validation are separate modules.
 use super::merge::{
     CompletedPartition, HotEntryRef, MergeCompletion, MergeConsumption, MergePreparation,
     PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
@@ -7,7 +9,10 @@ use super::merge::{
 use super::packing::{
     LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
 };
+use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild, SealedColdMetadata};
 use super::{BudgetedVec, DuplicateCheck, MemoryBudget, MemoryReservation, SortedRun, SortedRuns};
+use crate::buffer::PoolGuard;
+use crate::catalog::IndexRef;
 use crate::completion::Completion;
 use crate::conf::ColdIndexBuildConfig;
 use crate::error::{
@@ -15,9 +20,10 @@ use crate::error::{
     RuntimeOrFatalResult,
 };
 use crate::file::block_integrity::write_block_checksum;
-use crate::file::cow_file::MutableCowFile;
+use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::table_file::MutableTableFile;
-use crate::id::{BlockID, RowID, TrxID};
+use crate::id::{BlockID, RowID, TableID, TrxID};
+use crate::index::SecondaryDiskTreeRuntime;
 use crate::index::btree::algo::{
     KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
 };
@@ -36,7 +42,7 @@ use futures::{
     select_biased,
 };
 use parking_lot::Mutex;
-use std::mem::{forget, swap};
+use std::mem::{forget, replace, swap};
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
@@ -257,6 +263,126 @@ impl CompletedDiskBuild {
     }
 }
 
+/// Retained cold lifecycle, from construction through private-fork transfer.
+/// Building and sealed ownership are exclusive; read leases can outlive a borrow.
+#[derive(Default)]
+pub(crate) enum ColdBuildProgress {
+    /// No cold builder has been admitted yet.
+    #[default]
+    NotStarted,
+    /// Accepted construction retains its cleanup and write obligations.
+    Building(Box<DiskBulkBuild>),
+    /// Construction inputs are released and the private root remains owned.
+    Sealed(SealedColdBuild),
+    /// Readers are settled and the runtime is owned by the final secondary index.
+    ReadyToPublish(Box<MutableTableFile>),
+    /// The private fork has left this owner; it cannot be transferred again.
+    Transferred,
+}
+
+impl ColdBuildProgress {
+    /// Retain a new builder before borrowing it for asynchronous construction.
+    pub(crate) fn start(&mut self, build: DiskBulkBuild) -> &mut DiskBulkBuild {
+        assert!(
+            matches!(self, Self::NotStarted),
+            "cold construction requires a fresh lifecycle owner"
+        );
+        *self = Self::Building(Box::new(build));
+        let Self::Building(build) = self else {
+            unreachable!("cold start retains its builder")
+        };
+        build
+    }
+
+    /// Consume settled construction and its retaining completion together.
+    /// Validation precedes taking the owner, so failure leaves resumable cleanup
+    /// in Building. No await or fallible work follows ownership transfer.
+    pub(crate) fn seal(
+        &mut self,
+        completed: CompletedDiskBuild,
+        table: TableID,
+        index: IndexRef,
+        runtime: SecondaryDiskTreeRuntime,
+        guard: PoolGuard,
+    ) -> RuntimeOrFatalResult<&mut SealedColdBuild> {
+        let Self::Building(build) = self else {
+            return Err(execution_error("cold seal requires retained construction"));
+        };
+        build.validate_seal(&completed, table, index, &runtime)?;
+        let metadata = SealedColdMetadata {
+            identity: ColdBuildIdentity::new(build.identity.clone(), table, index, build.ts),
+            root: completed.root,
+            height: build.children.first().map_or(0, |child| child.shape.height),
+            entries: completed.entries(),
+            unique: build.admission.unique,
+        };
+        let budget = build.admission.budget.clone();
+        let Self::Building(mut build) = replace(self, Self::Transferred) else {
+            unreachable!("validated cold owner")
+        };
+        let file = build
+            .file
+            .take()
+            .unwrap_or_else(|| unreachable!("validated cold seal owns its private fork"));
+        // Both references matter: MergeCompletion and the retained job/preparation
+        // ledgers each reach SortedRuns. Release all of them before hot admission.
+        drop(completed);
+        drop(build);
+        *self = Self::Sealed(SealedColdBuild::new(metadata, file, runtime, guard, budget));
+        let Self::Sealed(sealed) = self else {
+            unreachable!("cold seal retained before returning")
+        };
+        Ok(sealed)
+    }
+
+    /// Borrow the exact artifact retained after successful sealing.
+    pub(crate) fn sealed(&self) -> &SealedColdBuild {
+        let Self::Sealed(sealed) = self else {
+            unreachable!("cold read binding requires a sealed lifecycle")
+        };
+        sealed
+    }
+
+    /// Drain construction if needed, retaining its owner across cancellation.
+    /// Sealing already settles construction; accepted readers are drained by
+    /// the hot owner before rollback or private-fork publication.
+    pub(crate) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
+        match self {
+            Self::Building(build) => build.settle().await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Recover the owned runtime while retaining the fork for publication or cleanup.
+    /// A rejected transition leaves the sealed artifact and its readers untouched.
+    pub(crate) fn finish_reading(&mut self) -> RuntimeOrFatalResult<SecondaryDiskTreeRuntime> {
+        let Self::Sealed(sealed) = self else {
+            return Err(execution_error(
+                "cold finalization requires a sealed lifecycle",
+            ));
+        };
+        sealed.validate_finish_reading()?;
+        let Self::Sealed(sealed) = replace(self, Self::Transferred) else {
+            unreachable!("validated cold finalization retains its sealed artifact")
+        };
+        let (runtime, file) = sealed.into_parts();
+        *self = Self::ReadyToPublish(Box::new(file));
+        Ok(runtime)
+    }
+
+    /// Transfer the finalized fork once, after the runtime has been recovered.
+    pub(crate) fn take_file(&mut self) -> MutableTableFile {
+        assert!(
+            matches!(self, Self::ReadyToPublish(_)),
+            "cold file transfer requires a finalized lifecycle"
+        );
+        let Self::ReadyToPublish(file) = replace(self, Self::Transferred) else {
+            unreachable!("validated cold file transfer")
+        };
+        *file
+    }
+}
+
 /// Retains every accepted CPU/write obligation independently of execution borrows.
 pub(crate) struct DiskBulkBuild {
     file: Option<MutableTableFile>,
@@ -296,10 +422,37 @@ impl DiskBulkBuild {
         poisoner: QuiescentGuard<EnginePoisoner>,
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Self> {
+        let duplicates = if admission.unique {
+            DuplicateCheck::Collect
+        } else {
+            DuplicateCheck::Skip
+        };
+        let runs = Arc::new(SortedRuns::from_run(
+            run,
+            admission.budget.clone(),
+            duplicates,
+        ));
+        Self::from_runs(file, runs, admission, pool, poisoner, ts)
+    }
+
+    /// Construct from complete resident runs without imposing a flattening owner.
+    pub(super) fn from_runs(
+        file: MutableTableFile,
+        runs: Arc<SortedRuns>,
+        admission: DiskBuildAdmission,
+        pool: QuiescentGuard<ThreadPool>,
+        poisoner: QuiescentGuard<EnginePoisoner>,
+        ts: TrxID,
+    ) -> RuntimeOrFatalResult<Self> {
+        let entries = runs
+            .runs()
+            .iter()
+            .try_fold(0usize, |sum, run| sum.checked_add(run.entries().len()))
+            .ok_or_else(|| execution_error("disk input count overflow"))?;
+        #[cfg(feature = "profiling")]
+        let input_bytes = runs.runs().iter().map(|run| run.retained_bytes()).sum();
         let mut workers = 1;
-        while workers < admission.policy.max_workers
-            && workers < run.entries().len().div_ceil(65_536)
-        {
+        while workers < admission.policy.max_workers && workers < entries.div_ceil(65_536) {
             if admission
                 .spare
                 .lock()
@@ -313,18 +466,6 @@ impl DiskBulkBuild {
             }
             workers += 1;
         }
-        #[cfg(feature = "profiling")]
-        let input_bytes = run.retained_bytes();
-        let duplicates = if admission.unique {
-            DuplicateCheck::Collect
-        } else {
-            DuplicateCheck::Skip
-        };
-        let runs = Arc::new(SortedRuns::from_run(
-            run,
-            admission.budget.clone(),
-            duplicates,
-        ));
         let preparation = MergePreparation::new(runs, pool.clone(), workers)?;
         let budget = &admission.budget;
         let writes = BudgetedVec::from_reservation(
@@ -879,19 +1020,49 @@ impl DiskBulkBuild {
         }
     }
 
-    /// Transfer the settled private fork to the existing CREATE publication path.
-    pub(crate) fn take_file(&mut self, completed: &CompletedDiskBuild) -> MutableTableFile {
-        assert!(
-            Arc::ptr_eq(&self.identity, &completed.identity),
-            "disk fork transfer requires this build completion"
-        );
-        assert!(
-            self.finished && !self.failed,
-            "disk fork transfer before successful settlement"
-        );
-        self.file
-            .take()
-            .unwrap_or_else(|| unreachable!("disk fork transferred once"))
+    fn validate_seal(
+        &self,
+        completed: &CompletedDiskBuild,
+        table: TableID,
+        index: IndexRef,
+        runtime: &SecondaryDiskTreeRuntime,
+    ) -> RuntimeOrFatalResult<()> {
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| execution_error("missing cold plan"))?;
+        if !Arc::ptr_eq(&self.identity, &completed.identity)
+            || !Arc::ptr_eq(&plan.identity(), &completed.completion.identity())
+            || !self.finished
+            || self.failed
+            || self.fatal
+            || self.file.is_none()
+            || !self.writes.is_empty()
+            || self.submitting.is_some()
+            || self
+                .allocations
+                .iter()
+                .any(|record| !record.accepted || !record.completed || record.reclaim_attempted)
+            || completed.entries() != plan.entries()
+            || (self.admission.unique && !completed.completion.checked())
+            || runtime.index_slot() != index.slot()
+            || self.file.as_ref().is_some_and(|file| {
+                !runtime.matches_build(file.backing_file(), index, self.admission.unique)
+                    || file.backing_file().sparse_file().file_id().as_u64() != table.as_u64()
+            })
+            || completed.root != self.children.first().map(|child| child.block)
+            || completed.root == Some(SUPER_BLOCK_ID)
+            || completed.root.is_none() != (completed.entries() == 0)
+            || self.children.len() > 1
+            || self.children.first().is_some_and(|child| {
+                child.shape.coverage != (0..completed.entries()) || child.shape.upper.is_some()
+            })
+        {
+            return Err(execution_error(
+                "cold seal identity, coverage or settlement mismatch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1200,6 +1371,8 @@ pub(super) fn pack_node<V: BTreeValue + Copy>(
     let slot = BufferSlot::new(admission.profile.clone());
     let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
     pack_fixed_entries(btree_node_from_block_mut(buf.data_mut()), params, entries);
+    #[cfg(debug_assertions)]
+    debug_assert!(btree_node_from_block_mut(buf.data_mut()).validate_persisted_layout::<V>());
     write_block_checksum(buf.data_mut());
     Ok(DiskNodeImage {
         buf: Some(buf),
@@ -1257,6 +1430,7 @@ async fn wait_write(writes: &mut BudgetedVec<PendingWrite>) -> (usize, Completio
 mod tests {
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
+    use crate::catalog::IndexID;
     use crate::catalog::{
         IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, TableMetadata,
@@ -1265,6 +1439,7 @@ mod tests {
     use crate::conf::ThreadPoolConfig;
     use crate::file::build_test_fs;
     use crate::index::btree::KeyRange;
+    use crate::index::build::cold_reader::{ColdReadAdmission, ColdReader};
     use crate::index::build::{BuildEntries, IndexBuildEntry};
     use crate::index::util::tests::drain_candidates;
     use crate::index::{SecondaryDiskTreeRuntime, secondary_index_encoder};
@@ -1272,6 +1447,7 @@ mod tests {
     use crate::table::test_user_table_id;
     use crate::value::{Val, ValKind};
     use std::ops::Bound;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::error::{CompletionErrorBridge, IoError};
     use crate::index::build::fail_build_budget;
@@ -1555,7 +1731,7 @@ mod tests {
                 *hooks.blocked_leaf.lock() = Some(gate);
                 *hooks.leaf_release.lock() = Some(release);
             }
-            Some("backend" | "settle handoff" | "detach settle handoff") => (),
+            Some("backend" | "settle handoff" | "detach settle handoff" | "seal") => (),
             Some(purpose) => fail_build_budget(&budget, purpose),
             None => (),
         }
@@ -1572,7 +1748,7 @@ mod tests {
             _ => build.build().await,
         };
         if let Some(purpose) =
-            fail.filter(|purpose| !matches!(*purpose, "blocked partition" | "detach"))
+            fail.filter(|purpose| !matches!(*purpose, "blocked partition" | "detach" | "seal"))
         {
             let error = result
                 .err()
@@ -1635,12 +1811,163 @@ mod tests {
                 disk_pool.global_pool().clone(),
             )
             .unwrap();
+            if fail == Some("seal") {
+                let weak = Arc::downgrade(build.plan.as_ref().unwrap().runs());
+                let mut owner = ColdBuildProgress::default();
+                owner.start(build);
+                let error = owner
+                    .seal(
+                        completed,
+                        test_user_table_id(502),
+                        IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                        runtime,
+                        guard,
+                    )
+                    .err()
+                    .unwrap();
+                assert!(matches!(error, RuntimeOrFatalError::Runtime(_)));
+                let ColdBuildProgress::Building(build) = &owner else {
+                    panic!("rejected seal must retain the builder")
+                };
+                assert!(build.file.is_some());
+                assert!(weak.upgrade().is_some());
+                assert_eq!(
+                    table.active_root_unchecked().alloc_map.allocated(),
+                    allocated_before,
+                    "rejected seal cannot publish private allocations"
+                );
+                owner.settle().await.unwrap();
+                drop(owner);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(budget.used(), 0);
+                return;
+            }
+            let mut completed = completed;
+            let invocation = completed.identity.clone();
+            completed.identity = Arc::new(());
+            let binding = IndexRef::new(IndexID::new(0), IndexSlot::new(0));
+            assert!(
+                build
+                    .validate_seal(&completed, test_user_table_id(501), binding, &runtime)
+                    .is_err()
+            );
+            completed.identity = invocation;
+            build.finished = false;
+            assert!(
+                build
+                    .validate_seal(&completed, test_user_table_id(501), binding, &runtime)
+                    .is_err()
+            );
+            build.finished = true;
+            build.failed = true;
+            assert!(
+                build
+                    .validate_seal(&completed, test_user_table_id(501), binding, &runtime)
+                    .is_err()
+            );
+            build.failed = false;
+            let root = completed.root;
+            completed.root = Some(SUPER_BLOCK_ID);
+            assert!(
+                build
+                    .validate_seal(&completed, test_user_table_id(501), binding, &runtime)
+                    .is_err()
+            );
+            completed.root = root;
+            assert!(
+                build
+                    .validate_seal(&completed, test_user_table_id(502), binding, &runtime)
+                    .is_err()
+            );
+            assert!(
+                build
+                    .validate_seal(
+                        &completed,
+                        test_user_table_id(501),
+                        IndexRef::new(IndexID::new(1), IndexSlot::new(0)),
+                        &runtime
+                    )
+                    .is_err()
+            );
+            let root = completed.root;
+            let weak_plan = Arc::downgrade(build.plan.as_ref().unwrap());
+            let weak_runs = Arc::downgrade(build.plan.as_ref().unwrap().runs());
+            let weak_inputs: Vec<_> = build
+                .plan
+                .as_ref()
+                .unwrap()
+                .runs()
+                .runs()
+                .iter()
+                .map(Arc::downgrade)
+                .collect();
+            let mut owner = ColdBuildProgress::default();
+            owner.start(build);
+            owner
+                .seal(
+                    completed,
+                    test_user_table_id(501),
+                    IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                    runtime,
+                    guard.clone(),
+                )
+                .unwrap();
+            assert!(matches!(owner, ColdBuildProgress::Sealed(_)));
+            assert!(weak_plan.upgrade().is_none() && weak_runs.upgrade().is_none());
+            assert!(weak_inputs.iter().all(|input| input.upgrade().is_none()));
+            assert_eq!(budget.used(), 0, "seal releases every construction ledger");
+            assert!(catch_unwind(AssertUnwindSafe(|| { owner.take_file() })).is_err());
+            assert!(matches!(owner, ColdBuildProgress::Sealed(_)));
+            assert_eq!(owner.sealed().validation_binding().is_some(), unique);
+            let reader = owner.sealed().unique_reader();
+            assert_eq!(reader.is_some(), unique);
+            if let Some(reader) = reader {
+                let second = reader.clone();
+                assert!(
+                    owner.finish_reading().is_err(),
+                    "live read lease blocks finalization"
+                );
+                assert!(matches!(owner, ColdBuildProgress::Sealed(_)));
+                assert_eq!(reader.entries(), count as usize);
+                {
+                    let admission = ColdReadAdmission::new(&reader, 1, 1, 0).unwrap();
+                    let mut cursor = ColdReader::new(reader.clone(), admission);
+                    let expected = expected.first();
+                    let mut hits = [None];
+                    cursor
+                        .lookup_batch(
+                            &[expected.map_or(&[], |(key, _)| key.as_slice())],
+                            &mut hits,
+                            &AtomicBool::new(false),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        hits[0],
+                        expected.map(|(_, row)| *row),
+                        "rejected finalization preserves private-root reads"
+                    );
+                }
+                drop(reader);
+                assert!(
+                    owner.finish_reading().is_err(),
+                    "every read lease must be released"
+                );
+                drop(second);
+            }
+            assert_eq!(budget.used(), 0, "released readers return their admission");
+            let runtime = owner.finish_reading().unwrap();
+            assert!(matches!(owner, ColdBuildProgress::ReadyToPublish(_)));
+            assert!(
+                owner.finish_reading().is_err(),
+                "runtime transfers only once"
+            );
             let range = KeyRange::new(Bound::Unbounded, Bound::Unbounded);
             let actual = if unique {
-                let tree = runtime.open_unique_at(completed.root, &guard).unwrap();
+                let tree = runtime.open_unique_at(root, &guard).unwrap();
                 drain_candidates(&mut tree.scan_candidate_stream(&range)).await
             } else {
-                let tree = runtime.open_non_unique_at(completed.root, &guard).unwrap();
+                let tree = runtime.open_non_unique_at(root, &guard).unwrap();
                 drain_candidates(&mut tree.scan_candidate_stream(&range)).await
             };
             assert_eq!(
@@ -1658,6 +1985,13 @@ mod tests {
                     .block_id()
                     .is_none()
             );
+            owner.settle().await.unwrap();
+            let file = owner.take_file();
+            assert!(matches!(owner, ColdBuildProgress::Transferred));
+            assert!(catch_unwind(AssertUnwindSafe(|| { owner.take_file() })).is_err());
+            assert!(matches!(owner, ColdBuildProgress::Transferred));
+            drop(file);
+            return;
         }
         drop(build);
         assert_eq!(
@@ -1667,8 +2001,8 @@ mod tests {
         );
     }
 
-    /// Purpose: Stream unique and skewed exact non-unique keys through the smallest output queues.
-    /// Expected: Empty, leaf-only, and multi-level private roots scan exactly, all writes settle, and published roots remain unchanged.
+    /// Purpose: Seal unique and skewed exact non-unique cold builds through the smallest output queues, rejecting foreign and unsettled evidence.
+    /// Expected: Seals release construction inputs; only unique trees issue read leases, finalization waits for their release, and the owned runtime and fork each transfer once without publication.
     #[test]
     fn disk_roundtrip_bounded_output() {
         smol::block_on(async {
@@ -1676,6 +2010,17 @@ mod tests {
                 for (count, workers) in [(0, 1), (1, 1), (20_000, 1), (140_000, 2)] {
                     roundtrip(unique, count, workers, None).await;
                 }
+            }
+        });
+    }
+
+    /// Purpose: Preserve the retained cleanup owner when a completed build fails seal binding.
+    /// Expected: Rejection keeps construction and the private fork owned; settlement and drop release the input without publication.
+    #[test]
+    fn cold_seal_rejection_retains_construction() {
+        smol::block_on(async {
+            for unique in [true, false] {
+                roundtrip(unique, 4096, 1, Some("seal")).await;
             }
         });
     }

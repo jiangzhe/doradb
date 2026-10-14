@@ -5,7 +5,6 @@
 
 use super::disk_tree::{
     DiskTreeLeaf, DiskTreeNodeCursor, DiskTreeSpec, NonUniqueDiskTreeSpec, UniqueDiskTreeSpec,
-    unpack_row_id_from_exact_key,
 };
 use crate::buffer::BufferPool;
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
@@ -13,9 +12,11 @@ use crate::error::{
     DataIntegrityError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult,
 };
 use crate::id::RowID;
-use crate::index::btree::{BTreeKey, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange};
+use crate::index::btree::{
+    BTreeEntryView, BTreeKey, BTreeKeyView, BTreeNode, BTreeNodeCursor, BTreeU64, KeyRange,
+};
 use crate::index::util::Maskable;
-use error_stack::{Report, ResultExt};
+use error_stack::Report;
 use std::borrow::Borrow;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -39,20 +40,20 @@ pub(crate) struct IndexLookupCandidate {
 
 /// Leaf item returned by an index scan cursor.
 pub(crate) trait IndexScanLeaf {
-    /// Return the B-tree node carried by this leaf.
-    fn node(&self) -> &BTreeNode;
+    /// Return the number of occupied slots without exposing unchecked persisted access.
+    fn slot_count(&self) -> usize;
 
     /// Return the first slot that can match the scan lower bound.
     fn start_slot_idx(&self, lower_seek_key: &[u8]) -> usize;
 
-    /// Copy one slot key out of this leaf, preserving source-specific errors.
-    fn key_checked(&self, slot_idx: usize) -> RuntimeResult<BTreeKey>;
+    /// Borrow one checked key, preserving source-specific errors.
+    fn key_view(&self, slot_idx: usize) -> RuntimeResult<BTreeKeyView<'_>>;
 }
 
 impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
     #[inline]
-    fn node(&self) -> &BTreeNode {
-        self.page()
+    fn slot_count(&self) -> usize {
+        self.page().count()
     }
 
     #[inline]
@@ -61,10 +62,10 @@ impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
     }
 
     #[inline]
-    fn key_checked(&self, slot_idx: usize) -> RuntimeResult<BTreeKey> {
+    fn key_view(&self, slot_idx: usize) -> RuntimeResult<BTreeKeyView<'_>> {
         // MemIndex leaves are in-memory typed pages; an occupied slot is
         // published atomically with its key while this shared guard is held.
-        Ok(self.node().btree_key_checked(slot_idx).unwrap_or_else(|| {
+        Ok(self.page().key_view_checked(slot_idx).unwrap_or_else(|| {
             panic!("MemIndex key missing from occupied slot: slot_idx={slot_idx}")
         }))
     }
@@ -72,8 +73,8 @@ impl IndexScanLeaf for PageSharedGuard<BTreeNode> {
 
 impl<F: DiskTreeSpec> IndexScanLeaf for DiskTreeLeaf<F> {
     #[inline]
-    fn node(&self) -> &BTreeNode {
-        self.guard.node()
+    fn slot_count(&self) -> usize {
+        self.guard.view().count()
     }
 
     #[inline]
@@ -82,18 +83,8 @@ impl<F: DiskTreeSpec> IndexScanLeaf for DiskTreeLeaf<F> {
     }
 
     #[inline]
-    fn key_checked(&self, slot_idx: usize) -> RuntimeResult<BTreeKey> {
-        self.node()
-            .btree_key_checked(slot_idx)
-            .ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!(
-                        "file={}, block=secondary_disk_tree, block_id={}, slot_idx={slot_idx}, leaf key is missing",
-                        self.file_kind, self.block_id
-                    ))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=read_secondary_disk_tree_leaf_key")
-            })
+    fn key_view(&self, slot_idx: usize) -> RuntimeResult<BTreeKeyView<'_>> {
+        self.guard.view().key(slot_idx)
     }
 }
 
@@ -165,7 +156,7 @@ pub(crate) trait IndexScanProjector {
     fn project(
         leaf: &Self::Leaf,
         slot_idx: usize,
-        encoded_key: BTreeKey,
+        encoded_key: BTreeKeyView<'_>,
     ) -> RuntimeResult<Option<Self::Output>>;
 }
 
@@ -180,12 +171,15 @@ impl IndexScanProjector for UniqueMemIndexLookupCandidateProjector {
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        encoded_key: BTreeKey,
+        encoded_key: BTreeKeyView<'_>,
     ) -> RuntimeResult<Option<Self::Output>> {
-        let value = leaf.node().value::<BTreeU64>(slot_idx);
+        let entry = BTreeEntryView {
+            key: encoded_key,
+            value: leaf.page().value::<BTreeU64>(slot_idx),
+        };
         Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id: value.value().to_row_id(),
+            encoded_key: entry.key.to_btree_key(),
+            row_id: entry.value.value().to_row_id(),
         }))
     }
 }
@@ -201,13 +195,13 @@ impl IndexScanProjector for NonUniqueMemIndexLookupCandidateProjector {
     fn project(
         leaf: &PageSharedGuard<BTreeNode>,
         slot_idx: usize,
-        encoded_key: BTreeKey,
+        encoded_key: BTreeKeyView<'_>,
     ) -> RuntimeResult<Option<Self::Output>> {
-        validate_non_unique_exact_key(encoded_key.as_bytes(), slot_idx);
-        let node = leaf.node();
+        validate_non_unique_exact_key(encoded_key.len(), slot_idx);
+        let node = leaf.page();
         let slot = node.slot(slot_idx);
         Ok(Some(IndexLookupCandidate {
-            encoded_key,
+            encoded_key: encoded_key.to_btree_key(),
             row_id: node.unpack_value::<BTreeU64>(slot).to_row_id(),
         }))
     }
@@ -224,21 +218,12 @@ impl IndexScanProjector for UniqueDiskTreeCandidateProjector {
     fn project(
         leaf: &Self::Leaf,
         slot_idx: usize,
-        encoded_key: BTreeKey,
+        encoded_key: BTreeKeyView<'_>,
     ) -> RuntimeResult<Option<Self::Output>> {
-        let row_id = leaf.node().value::<BTreeU64>(slot_idx);
-        if row_id.is_deleted() {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "file={}, block=secondary_disk_tree, block_id={}, slot_idx={slot_idx}, unique row id is delete-marked",
-                    leaf.file_kind, leaf.block_id
-                ))
-                .change_context(RuntimeError::IndexAccess)
-                .attach("operation=project_secondary_disk_tree_lookup_candidate"));
-        }
+        let row_id = leaf.guard.view().row_id(slot_idx)?;
         Ok(Some(IndexLookupCandidate {
-            encoded_key,
-            row_id: row_id.to_row_id(),
+            encoded_key: encoded_key.to_btree_key(),
+            row_id,
         }))
     }
 }
@@ -254,16 +239,17 @@ impl IndexScanProjector for NonUniqueDiskTreeCandidateProjector {
     fn project(
         leaf: &Self::Leaf,
         slot_idx: usize,
-        encoded_key: BTreeKey,
+        encoded_key: BTreeKeyView<'_>,
     ) -> RuntimeResult<Option<Self::Output>> {
-        let row_id = unpack_row_id_from_exact_key(encoded_key.as_bytes())
-            .change_context(RuntimeError::IndexAccess)
-            .attach(format!(
-                "operation=project_secondary_disk_tree_lookup_candidate, file={}, block_id={}, slot_idx={slot_idx}",
-                leaf.file_kind, leaf.block_id
-            ))?;
+        let mut suffix = [0; mem::size_of::<RowID>()];
+        encoded_key.copy_tail(&mut suffix).ok_or_else(|| {
+            Report::new(DataIntegrityError::InvalidPayload)
+                .change_context(RuntimeError::IndexAccess)
+                .attach(format!("operation=project_secondary_disk_tree_lookup_candidate, file={}, block_id={}, slot_idx={slot_idx}, exact key has no row id", leaf.file_kind, leaf.block_id))
+        })?;
+        let row_id = RowID::new(u64::from_be_bytes(suffix));
         Ok(Some(IndexLookupCandidate {
-            encoded_key,
+            encoded_key: encoded_key.to_btree_key(),
             row_id,
         }))
     }
@@ -362,15 +348,14 @@ where
             .await
             .map_err(Into::<RuntimeOrFatalError>::into)?
         {
-            let node = leaf.node();
             let mut outputs = Vec::new();
             let range = self.range.borrow();
-            for idx in leaf.start_slot_idx(range.lower_seek_key())..node.count() {
-                let encoded_key = leaf.key_checked(idx)?;
-                if !range.lower_accepts(encoded_key.as_bytes()) {
+            for idx in leaf.start_slot_idx(range.lower_seek_key())..leaf.slot_count() {
+                let encoded_key = leaf.key_view(idx)?;
+                if !range.lower_accepts_view(encoded_key) {
                     continue;
                 }
-                if !range.upper_accepts(encoded_key.as_bytes()) {
+                if !range.upper_accepts_view(encoded_key) {
                     self.exhausted = true;
                     break;
                 }
@@ -419,12 +404,12 @@ pub(crate) type NonUniqueDiskTreeCandidateStream<'a, 'r> =
 
 /// Validate that an encoded non-unique key contains a trailing row id.
 #[inline]
-pub(crate) fn validate_non_unique_exact_key(encoded_key: &[u8], slot_idx: usize) {
+pub(crate) fn validate_non_unique_exact_key(key_len: usize, slot_idx: usize) {
     // Non-unique MemIndex keys are formed by appending the row id before the
     // slot is published, so every exact key must retain that suffix.
     assert!(
-        encoded_key.len() >= mem::size_of::<RowID>(),
+        key_len >= mem::size_of::<RowID>(),
         "non-unique MemIndex key is missing its row-id suffix: slot_idx={slot_idx}, key_len={}",
-        encoded_key.len()
+        key_len
     );
 }

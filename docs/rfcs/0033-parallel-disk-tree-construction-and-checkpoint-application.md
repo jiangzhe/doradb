@@ -139,10 +139,14 @@ Issue Labels:
   `BatchEntries::Direct` already borrows subranges of the retained run.
   `HotMergeCompletion` retains `PreparedHotMerge`, which retains `SortedHotRuns`;
   settled preparation/consumer objects can also retain these input owners.
-  `cold_validation.rs` separates input-retaining summaries from its compact
-  completed cross-tier evidence. `budget.rs` provides `BudgetedVec`, including
-  admission for overlapping old/replacement capacities, and `MemoryReservation`;
+  `cross_tier.rs` (originally `cold_validation.rs`) separates input-retaining
+  summaries from compact completed cross-tier evidence. `budget.rs` provides
+  `BudgetedVec`, including admission for overlapping old/replacement capacities,
+  and `MemoryReservation`;
   `worker.rs` admits outlined key payloads before `encode_with_len`.
+  Phase 2 places bounded traversal in `cold_reader.rs` and sealed resource/read
+  ownership in `sealed_cold.rs`; the disk builder retains construction and seal
+  validation, while the pipeline and tree builder integrate validation jobs.
 - [C3] `doradb-storage/src/index/btree/algo.rs` and
   `doradb-storage/src/index/btree/node.rs` — shared packed-node planning and
   exact space estimation, encoding, fences, prefixes and child representations.
@@ -860,10 +864,14 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     validation, typed coverage evidence and production unique-CREATE integration.
   - Prerequisites: Phase 1's readable private-root completion and retained write
     owner; hot input identity and distinctness contracts from RFC 0032.
-  - Phase-local Choices: Consuming seal API and compact build identity,
-    prepared-hot-input handoff, bounded cursor/read state, equivalent conflict
-    ranking across traversal directions and measured strategy thresholds.
-    None may weaken complete-input, input-lifetime or installation gates.
+  - Phase-local Choices: Sealing releases cold construction inputs before hot
+    extraction and retains the private root through validation and settlement.
+    Batched forward/reverse lookups and ordered cursors use checked borrowed
+    reads under a shared worker and memory allowance. Selection precedes one
+    hot-boundary preparation; exact identities and direction-specific coverage
+    authorize installation. Forward/ordered work shares hot consumers; reverse
+    work settles before packing. Conflict precedence and failure drains remain
+    unchanged. Selector weights were not retuned after read optimizations.
   - Goals: Release cold construction key allocations before hot extraction or
     construction; preserve hot/hot precedence and exhaustive cross-tier
     checking. Prove allocation release at the production handoff while the
@@ -875,12 +883,13 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     without a flattening adapter or a new validation ownership contract.
   - Non-goals: Parallel cold source collection, checkpoint eligibility changes
     or spill. Hot-only and recovery semantics remain covered by regressions.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000330-completed-root-cross-tier-validation.md`
+  - Task Issue: `#1147`
+  - Phase Status: done
+  - Implementation Summary: Delivered early cold-input release and bounded parallel cross-tier validation with batched lookups and checked borrowed reads. Final verification passed 2,350 workspace tests, 2,084 profiling-disabled storage tests, and the 26-file style gate. Six verified 1M/10M observations retained automatic strategy choices and exposed cold collection and resident scratch as the remaining scaling limits. Phase 3 can consume multiple resident cold runs directly; backlog 000104 stays open until that phase lands and its remaining scope is split. Backlog 000211 tracks the unresolved instrumented MVCC snapshot-read crash. [Task Resolve Sync: docs/tasks/000330-completed-root-cross-tier-validation.md @ 2026-10-14]
   - Related Backlogs:
     - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/000211-investigate-instrumented-mvcc-old-snapshot-read-crash.md`
 
 - **Phase 3: Parallel Cold Extraction and Direct Run Consumption**
   - Scope: Incremental bounded cold descriptor scheduling, parallel
@@ -896,6 +905,8 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     acceptance, stage attribution and worker-scaling measurements.
   - After This Phase: The complete resident cold CREATE pipeline uses parallel
     input preparation and streaming durable output without a full merged vector.
+    Reassess backlog 000104 and split its remaining scope after this phase;
+    larger-than-memory acceptance is not completed by the resident pipeline.
   - Non-goals: New external-memory formats or changes to checkpoint row selection.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`

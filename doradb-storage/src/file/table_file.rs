@@ -290,6 +290,11 @@ pub(crate) struct MutableTableFile {
 }
 
 impl MutableTableFile {
+    /// Borrow the backing file for exact private-build read-authority binding.
+    pub(crate) fn backing_file(&self) -> &Arc<TableFile> {
+        &self.file
+    }
+
     /// Create a mutable handle for first publication of a brand-new table file.
     ///
     /// The readonly write barrier is intentionally bypassed here because no

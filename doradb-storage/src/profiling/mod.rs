@@ -30,7 +30,7 @@ pub use checkpoint::{
 };
 pub use cleanup::{MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats};
 pub use index_build::{
-    ColdBuildMeasurements, CreateIndexMeasurements, HotExtractionMeasurements,
+    ColdBuildMeasurements, ColdHotMeasurements, CreateIndexMeasurements, HotExtractionMeasurements,
     HotIndexMeasurements, IndexBuildStats, MergeMeasurements, RecoveryHotIndexMeasurements,
 };
 pub use io::{IoBackendStats, StorageIoStats};
@@ -51,9 +51,8 @@ pub(crate) use checkpoint::{
     CatalogCheckpointMeasurement, CheckpointLwcProfile, MeasurableMutableCowFile,
 };
 pub(crate) use index_build::{
-    ColdHotMeasurements, HotExtractionProfile, HotExtractionWorkerProfile, HotPackedLevel,
-    HotPackedMeasurements, IndexBuildProfiler, MergeWorkerProfile, PageMeasurement,
-    ParentPlanningProfile,
+    HotExtractionProfile, HotExtractionWorkerProfile, HotPackedLevel, HotPackedMeasurements,
+    IndexBuildProfiler, MergeWorkerProfile, PageMeasurement, ParentPlanningProfile,
 };
 pub(crate) use io::{
     BackendStats, BackendStatsHandle, StorageServiceStats, StorageServiceStatsHandle,
