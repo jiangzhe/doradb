@@ -11,11 +11,10 @@ github_issue: 1147
 
 ## Summary
 
-CREATE INDEX seals cold construction before hot extraction, releasing cold runs,
-merge completions, construction ledgers, and original outlined keys in both modes.
-Unique CREATE validates complete hot input through bounded parallel forward
-probes, ordered cursors, or reverse searches over resident hot runs. Compact
-evidence binds installation to both exact inputs.
+CREATE INDEX now releases cold construction inputs before extracting hot rows.
+Unique indexes validate complete hot and cold inputs through batched forward
+lookups, ordered scans, or reverse searches. Completed validation is required
+before publication, with bounded reader memory and retained cleanup ownership.
 
 ## Context
 
@@ -35,375 +34,240 @@ Issue Labels:
 - priority:high
 - codex
 
-Design and performance baseline: `78c6c3dd55d83331498467e6a0b593715e8e6a6a`.
-Task 000329 supplied settled private DiskTree roots and parallel construction.
-Its cold runs remained reachable through the builder, prepared merge,
-completion, and retained-vector validator during hot construction. Removing
-only the validator's reference would not release their allocations.
+Task 000329 supplied parallel DiskTree construction and settled private roots.
+Its builder, merge completion, and validator still retained cold keys during
+hot construction. Removing only the validator's reference could not release
+those allocations. The design/performance baseline was
+`78c6c3dd55d83331498467e6a0b593715e8e6a6a`.
 
-RFC 0032 supplied complete resident hot runs, partition consumption, duplicate
-precedence, retained job settlement, and private installation. This phase keeps
-cold and hot preparation sequential and preserves those contracts. Backlog
-000104 remains open for parallel extraction and external-memory acceptance.
+RFC 0032 supplied complete resident hot runs, parallel merge consumption,
+duplicate precedence, and retained job settlement. This phase preserves those
+contracts. Backlog 000104 remains open by the user's resolve decision: RFC 0033
+Phase 3 will complete more of it before the remaining scope is split.
 
 ## Goals
 
-- Release all cold construction-input owners before hot admission while keeping
-  the exact completed root readable and its private allocations owned.
-- Provide three bounded parallel validation methods with deterministic conflict
-  ranking, direction-specific coverage, and exact installation bindings.
-- Preserve execution/Fatal precedence, hot/hot precedence, publication order,
-  observer-detachment behavior, and resumable failure settlement.
-- Calibrate a small deterministic selector and document memory, concurrency,
-  public CREATE latency, and regressions with independently checked fixtures.
+- Release cold construction inputs while retaining the exact private root and
+  the storage ownership needed to read or reclaim it safely.
+- Validate complete inputs in all three directions with deterministic conflict
+  ranking, explicit coverage, and exact installation bindings.
+- Preserve failure precedence, hot/hot duplicate precedence, publication order,
+  observer detachment, and resumable cleanup.
+- Measure validation and public CREATE latency separately, with checked contents
+  and explicit memory, concurrency, and measurement limits.
 
 ## Non-Goals
 
-Parallel cold extraction, concurrent hot/cold preparation, checkpoint delta
-reconciliation, external sorting/spill, foreground stream redesign, and live
-cache adaptation remain outside this task. There is no new public DDL strategy
-switch, persisted format, allocator, runtime backend, or timeout policy.
+Parallel cold extraction, overlapping hot/cold preparation, external sorting
+or spill, and checkpoint reconciliation remain separate work. There is no new
+public strategy switch, persisted format, allocator, or runtime timeout policy.
 
 ## Rejected Alternatives
 
-- Retaining a cold vector, including through compact-looking wrappers around a
-  prepared merge, fails the allocation-release contract and obstructs Phase 3.
-- Reusing foreground candidate batches without a separate byte allowance leaves
-  branch copies, decoded keys, and persisted-validation temporaries unbounded.
-  The build reader instead shares validated-node semantics with bounded state.
+- Retaining cold vectors through validation or completion wrappers violates
+  early release and prevents independent cold-run production in Phase 3.
+- Reusing owned foreground candidate batches adds unnecessary key copies and
+  requires allowances for their temporary storage; checked borrowed access
+  serves both ordinary reads and bounded build traversal.
 
 ## Plan
 
-### Sealed ownership and CREATE ordering
+### Construction and ownership
 
-`ColdBuildProgress::seal` validates its retained builder before consuming it
-and its completion together. It requires exact invocation/merge identity,
-complete input and output coverage, cold distinctness when required, valid
-root shape, and settled CPU/write/allocation ledgers. It also checks the exact
-file incarnation, table, index generation, and unique/non-unique runtime kind.
-Empty input has no root; the super block cannot become a tree root.
+The final sequence is cold collection/construction/settlement, sealing, complete
+hot extraction, strategy selection, hot-boundary preparation, validation and
+packing, private installation, then catalog/root/layout publication.
 
-`ColdBuildIdentity` contains only an invocation token and catalog/timestamp
-binding. `SealedColdBuild` owns a shared completed root for both index kinds.
-Only unique builds issue cloneable `ColdReadAuthority` leases, which retain the
-fork, runtime, readonly pool, and operation guard without retaining construction
-inputs. Metrics are copied before construction state is destroyed. CREATE retains
-the sealed artifact before any subsequent await.
+Sealing consumes construction state only after checking input identity,
+coverage, required distinctness, root shape, and settled work. Both unique and
+non-unique builds retain a sealed private root; only unique builds require
+cross-tier read authority. Empty unique input still requires checked evidence.
 
-Cold construction returns through its retained lifecycle; hot construction derives
-validation authority from that owner and stages only an `InMemorySecondaryIndex`.
-After hot installation and settlement release every reader, `finish_reading`
-requires exclusive, certain ownership and unwraps the disk runtime. Rejection
-retains the sealed artifact. Success retains the private fork in `ReadyToPublish`
-and assembles the final `SecondaryIndex` with its owned runtime before catalog
-commit. The fork transfers once at publication; runtime types need no `Clone`.
+CREATE stages the memory index during hot construction. Once accepted readers
+and workers settle, exclusive sealed ownership yields the owned disk runtime
+for the final SecondaryIndex. Failed handoffs retain their cleanup owner.
+Lifecycle states encode valid ownership and transfer conditions; cancellation
+can resume settlement, while uncertain destructive panics prevent unsafe retry.
 
-The production sequence is cold collection/build/settlement, sealing, complete
-hot extraction, strategy selection, one hot-boundary preparation, validation
-and packing, private installation, then existing catalog/root/layout publication.
-The seal accepts multiple resident cold runs without flattening. The pipeline
-uses optional cold authority: absence skips validation for non-unique CREATE
-and trusted recovery; empty unique roots retain required checked evidence.
-Selection owns the cold authority and admission. Packing consumes that single
-optional selection, binds it without reselection, and copies only the plan's
-expected cold identity into ready-tree evidence.
+The builder owns seal validation, the sealed artifact owns resources, and
+cold traversal and cross-tier validation have separate responsibilities.
+Multiple resident cold runs are accepted without flattening, preserving the
+handoff that RFC 0033 Phase 3 will consume.
 
-### Parallel validation and evidence
+### Validation, admission, and reads
 
-Forward batches and ordered cursors execute in asynchronous hot partition
-consumers. Forward groups at most 128 sorted borrowed keys by subtree, visits
-required nodes once per batch, and preserves output order without copying keys. They examine every assigned hot rank after conflicts and inhibit
-only packing; hot uniqueness checks still consume complete input. Ordered
-cursors reuse their current leaf, advance adjacent leaves, and reseek large
-key gaps. Encoded comparisons avoid hit-key and candidate-batch copies.
+Forward lookup shares subtree traversal across up to 128 sorted hot keys.
+Ordered validation advances cold cursors alongside hot partitions. Reverse
+validation scans disjoint cold ranges in borrowed leaf batches and searches
+every complete hot run, reusing monotonic lower-bound positions. Reverse work
+settles before packing; forward and ordered work share hot consumers.
 
-Reverse validation plans disjoint half-open cold intervals from a bounded
-structural frontier independently of hot cuts. Retained asynchronous jobs scan
-those intervals in borrowed views of at most 128 leaf slots and search every
-complete resident hot run before hot packing starts. Encoded cold keys are not
-copied. Per-run lower bounds persist across batches and leaves, using an initial
-binary search followed by galloping and binary search over later intervals. Summed lower bounds identify the earliest global hot rank;
-original run provenance breaks equal-key ties consistently with the hot merge.
-A reverse conflict inhibits packing while preserving hot/hot validation.
+Evidence binds the exact cold build, complete hot input, selected direction,
+and exhaustive partition or range coverage. Counts alone cannot authorize
+installation. Execution and coverage errors precede duplicate diagnostics;
+hot/hot conflicts precede hot/cold conflicts. A cross-tier conflict stops
+packing without skipping required hot uniqueness checks.
 
-Every summary binds both identities, method, assigned partition/range, and
-complete consumption. Reverse evidence checks ordered adjoining endpoints,
-open outer bounds, exhaustion, job settlement, and the sealed cold count.
-Counts alone cannot authorize installation. Compact completion retains the
-selected method and typed hot-partition, cold-range, or empty-tier coverage.
-Installation checks it against the actual hot completion and CREATE's sealed
-artifact. Coverage/execution failures precede duplicates; hot/hot wins over
-hot/cold when both complete checks report conflicts.
+Reader paths, boundaries, batch scratch, and job records use the released cold
+budget. Admission may reduce the common hot-build worker ceiling before cuts
+are prepared. Each reader pins at most one page. Accepted jobs retain their
+resources through completion; cleanup drains them before reclaiming the fork.
+Uncertain reads retain ownership rather than risk reusing active storage.
 
-### Admission, read lifetime, and settlement
+Persisted reads check checksums and fixed page metadata at admission, then
+validate accessed payloads and durable values. Unvisited malformed entries
+are not eagerly rejected. Writers establish ordering and non-overlap, with
+deep construction checks retained in debug builds and integrity tests.
+Shared borrowed key/entry views avoid allocating decoded leaf keys; memory
+consumers preserve delete masks until their own interpretation boundary.
 
-The released cold invocation budget admits readers, paths, selected boundary
-keys, lookup scratch, and job ledgers before submission.
-Checked bounds include retained boundary storage and a common per-worker allowance
-for the larger of the Forward frontier/results and Reverse positions/accumulators.
-Each production reader retains a height-bounded cursor path, a batch-bounded
-lookup frontier and at most one pinned block; readonly-pool pins and
-storage-owned buffers are reported separately from scratch and RSS.
+### Selection policy
 
-All methods share the hot-build worker ceiling. Admission can reduce workers
-before cuts are prepared; failure to fit one reader preserves a typed resource
-cause. Validation targets 32 entries per job and at most four jobs per worker.
-Empty tiers and unchecked builds retain the original construction sizing.
+For complete hot/cold counts H/C, resident hot runs R, hot partitions P, and
+cold tree levels L, scores are Forward `40*L*H`, Reverse `C+10*C*R`, and
+Ordered `40*L*P+C+2*(H+C)`. Saturating arithmetic handles large inputs; empty
+tiers are handled first and ties favor ordered, forward, then reverse.
 
-Reverse planner/completion slots and read leases belong to retained pipeline
-owners, so abandoning a borrowed execution future does not cancel accepted
-work. Cleanup stops admission and drains every accepted job before reclamation.
-A read interrupted by unwind or returning uncertain Fatal completion retains
-its private allocation map and reader allowance. Unrelated hot failures follow
-normal sealed-fork cleanup and do not unnecessarily retain its writer claim.
-
-### Measured selection policy
-
-Let H/C be complete hot/cold counts, R the resident hot run count, P the planned
-hot partition count, and L the sealed tree height plus one. Final relative
-weights are disk lookup `40 * L`, resident-run lookup `10`, scan `1`, comparison
-`2`. Scores use saturating `u128` arithmetic:
-
-- Forward: `40 * L * H`.
-- Reverse: `C + 10 * C * R`.
-- Ordered: `40 * L * P + C + 2 * (H + C)`.
-
-Empty tiers are handled first. Ties favor ordered, forward, then reverse.
-Selection works with profiling disabled. Height captures the measured disk
-lookup slope; the evidence did not justify run-length logarithms, overlap
-prediction, cache sampling, or additional workload-specific parameters.
+The height term reflects measured disk lookup costs. Validation targets 32
+entries per job with at most four jobs per worker. Hot runs also cap at four
+per worker. Selection is independent of profiling and remains unchanged after
+the batching and borrowed-read optimizations; its later crossover points have
+not been recalibrated.
 
 ## Implementation Notes
 
-Implemented sealed-root validation and early cold-input release for RFC 0033 Phase 2.
-Validation binds exact inputs, retains failed work, and records publication
-metrics. Phase 3 can change cold run production under the same contract.
+Delivered RFC 0033 Phase 2: cold-input release, bounded parallel cross-tier
+validation, exact completion checks, and safe publication/cleanup. Batched
+lookups and borrowed persisted reads reduce validation work without changing
+the public API or disk format. Phase 3 can replace cold extraction while
+retaining the completed-root handoff.
 
-`disk_builder` validates construction; `sealed_cold` owns completed resources.
-`cold_reader` admits reads/ranges; `cross_tier` owns selection and evidence.
-Read scopes share one reservation through settlement or uncertain IO.
-Checked invocation and root facts live in `SealedColdMetadata`, stored directly
-in the shared root. The sealed-build constructor accepts the file, runtime,
-guard, and budget separately, removing the mirrored `SealedColdParts` handoff
-payload while keeping seal validation in the builder and resource wrapping
-inside `sealed_cold`.
+### Review outcomes and deviations
 
-### Batched lookup follow-up
+- Lifecycle refactoring unified sealing for both index kinds and kept the final
+  disk runtime owned. Scoped states replace combinations of optional owners;
+  boxed hot owners keep the progress enum small without changing settlement.
+- A constrained-cache experiment exposed coalesced readonly free-frame wakes.
+  Each returned frame now wakes a separate waiter; a deterministic two-waiter
+  test failed before the fix and passes afterward.
+- Batched forward traversal and monotonic reverse search replaced scalar
+  lookup loops. A subsequent profile identified eager layout validation and
+  owned leaf decoding as the remaining forward-path costs, motivating checked
+  borrowed views and simpler page admission.
+- Disk read validation is colocated with DiskTree. The common B-tree entry view
+  carries a physical value; memory and persisted consumers interpret it locally.
+  Optimistic scalar lookup and key-only range filtering retain their access patterns.
+- General guides were kept to brief behavior and usage descriptions. Test-runner
+  default per-test/global timeouts changed from 10/120 to 15/150 seconds;
+  storage runtime timeout behavior is unchanged.
 
-Forward and Reverse now share work across internal 128-entry lookup batches.
-Ordered, method-selection scores, job ceilings, sealed-read settlement, and
-conflict/coverage precedence retain their existing contracts. Profiling separates
-logical probes, completed batches, and worker node accesses; cached accesses are
-included and range planning is excluded from the node-access count.
+### Performance evidence
 
-Independent map/rank oracles cover batch and leaf boundaries, prefix-compressed
-and wide keys, duplicate provenance, clipped ranges, and monotonic search gaps.
-Operation-count checks protect shared node traversal and reused search positions.
-Scalar reference code exists only in test helpers for release calibration.
+Initial calibration used Linux aarch64, io_uring, and the system allocator.
+A 567-invocation exploration and 357-invocation confirmation preceded the later
+refactors. The selected method matched the prior fastest forced method in 34
+of 35 mixed-tier cases; the remaining small case was effectively tied.
+Several public CREATE cases were slower than retained-vector validation:
+balanced 262k-row median latency changed from 14.372 to 21.119 ms. A wide-key
+case released 76 MiB of cold input but reduced sampled peak RSS by only 7.36
+MiB. These historical results establish a memory/latency tradeoff, not a claim
+that every completed-root build is faster.
 
-The reduced follow-up comparison verified 22 measured CREATE invocations and
-two warm-ups at one million total rows and four workers. Reverse validation
-was shorter in all three paired observations, while total CREATE results were
-mixed; single samples do not establish an end-to-end gain. Common admission
-increased by 8 KiB per worker. Reproduction scripts, source/binary provenance,
-raw samples and the full report are under
-`target/task-000330/batched-lookups/`. Selector weights were not retuned.
+Later batching measurements used 22 CREATE observations and two warm-ups.
+Reverse validation improved in paired samples, while total CREATE results
+were mixed. The selector was not retuned from these small samples.
 
-### Review discoveries and deviations
+The persisted-read optimization used one before/after observation per ordinary
+1M-row split with four workers. Forward validation fell from 38.202 to 11.185
+ms and ordered from 25.727 to 16.735 ms; reverse rose from 2.513 to 3.097 ms.
+Both forward observations used identical sampling settings. Admission profiles
+lost the per-entry layout and owned-decoding work. Reader scratch decreased
+by exactly 7 MiB across four workers. These are individual observations.
 
-- `CreateIndexProgress` groups cold and hot construction behind lifecycle
-  owners. The cold enum encodes NotStarted, Building, Sealed, ReadyToPublish, and
-  Transferred; a rejected seal preserves Building. The hot enum directly owns
-  the pipeline in Build and both pipeline and ready tree in Tree, with distinct
-  sub-state enums scoped to each payload. Both owners are boxed to keep the enum
-  small; the pipeline keeps one allocation across transitions, and the ready tree
-  is boxed before taking the retained pipeline for handoff. The enum-size lint
-  exception is removed; the profiling-enabled aarch64 test build measures 24
-  bytes for the enum, down from 3,272. Installation and settlement update
-  sub-states in place; only ready-tree handoff and discard move retained owners.
-  Typed installation rejection restores Ready; success advances to Installed.
-  Settlement resumes cancellation without repeating abort, while destructive
-  panic states forbid retries. Settled states make cleanup idempotent and retain
-  publication profiling until explicit discard.
-  Transaction, staged runtime, and layout remain separate transfer slots.
-- Constrained-cache experiments exposed an existing readonly free-frame wake
-  bug: consecutive `notify(1)` calls could coalesce before waiters polled,
-  leaving free capacity stranded. `notify_additional(1)` now wakes one waiter
-  per returned frame. A deterministic two-waiter regression failed on the old
-  implementation and passes with the fix.
-- Sealed-fork retention is scoped to uncertain persisted reads so unrelated
-  hot failures can cleanly shut down; lifecycle regressions pass.
-- Oracle review uses explicit key/provenance ordering. The public handoff test
-  reads the sealed unique root after original inputs disappear and verifies
-  published hot and cold lookups in both modes.
+The final reader refactoring was then measured at 1M and 10M total rows, four
+workers, uniformly interleaved keys, a unique integer index, 32-byte payloads,
+and the untuned glibc 2.39 allocator. Preparation and complete verification
+were untimed. Each case used fresh storage, no warm-up, no external profiler,
+and one observation; OS/device caches were not flushed.
 
-### Calibration and public measurements
+| Method; hot/cold at 10M | Validation ms, 1M → 10M | CREATE ms, 1M → 10M | CREATE scaling |
+| --- | ---: | ---: | ---: |
+| Forward; 100k/9.9M | 7.686 → 74.566 | 112.128 → 1,193.530 | 10.64× |
+| Ordered; 5M/5M | 15.732 → 139.186 | 58.969 → 733.922 | 12.45× |
+| Reverse; 9.9M/100k | 2.768 → 18.971 | 34.510 → 190.412 | 5.52× |
 
-Release experiments used Linux aarch64 with usable io_uring, Rust 1.98.1,
-standard release/debug-info settings, and the existing allocator. Fixtures and
-complete content/multiplicity verification stay outside CREATE timing. The
-baseline received only interleaved fixture support. Controlled private builds
-forced each method after selection; no runtime strategy switch was added.
+Automatic selection stayed unchanged. Ordered's extra total cost was dominated
+by cold collection, which rose from 23.392 to 480.719 ms. Reverse hot runs grew
+from 12 to the cap of 16. These observations do not prove optimal selection,
+statistical speedups, or sublinear algorithmic complexity.
 
-The first completed sweep measured 567 invocations across 42 scenarios, with
-three interleaved repetitions. It varied 32,768/262,144 rows, ratio extremes and
-1/5/10/25/75/90/95/99% hot input, one/two workers, run targets of one/64 pages,
-32/512-byte payloads, composite keys, skew, disjoint/interleaved placement, and
-32/128 MiB readonly caches. Empty, tiny, hot-only, cold-only, non-unique, and
-million-row cold controls were included.
+Both sizes used 2 GiB data memory, 512 MiB index memory, 1 GiB hot/cold scratch,
+and a 32 MiB readonly cache. An initial 10M cold build failed its 256 MiB scratch
+limit; that attempt and its 1M companion were excluded, and both sizes rerun.
+Cold scratch peaked at 963.72 MiB, hot scratch at 680.19 MiB, and sampled RSS
+at 1,386.43 MiB. Reader admission stayed at 2.05 MiB. Resident cold collection
+and external-memory acceptance remain unfinished under backlog 000104.
 
-The initial shared lookup weight chose forward at 25% hot input: at 262,144
-rows it took 39.531 ms versus ordered's 25.051 ms. Warm-path microbenchmarks
-measured disk probes around 0.20/0.38/0.62 microseconds for one/two/three tree
-levels. One resident-run search ranged around 0.04–0.15 microseconds; searching
-16 wide-key runs reached 1.48 microseconds. These results motivated the separate
-height-based disk weight. Reducing the initial 1,024-entry threshold to 32
-allows two active jobs even for 64 distributed hot probes.
+Local ignored evidence under `target/task-000330/` retains source/binary hashes,
+plans, commands, raw results, profiles, and interpretation:
 
-A final confirmation sweep measured another 357 invocations: baseline, final
-automatic selection, and the previously fastest forced method, three repeats
-per scenario. The selector matched that method in 34 of 35 mixed-tier cases;
-the remaining 1%-hot small case had effectively tied forced measurements.
-Representative median public CREATE times are below, in milliseconds.
+- `bench/`: original calibration and confirmation sweeps.
+- `batched-lookups/report.md`: scalar/batched and boundary comparisons.
+- `simplified-reads/report.md`: admission/decoding comparison and profiles.
+- `scaling-10m-20261014/report.md`: final six-run scaling results and capacity failure.
+- `resolve-20261014/`: the pre-compaction task record and final resolve review.
 
-| Scenario, two workers | Phase 1 | Automatic | Selected method | Forced comparison |
-| --- | ---: | ---: | --- | ---: |
-| 262,144 rows; 64 hot | 17.128 | 26.284 | Forward | 25.528 |
-| 262,144 rows; balanced | 14.372 | 21.119 | Ordered | 19.370 |
-| 262,144 rows; 64 cold | 6.942 | 9.558 | Reverse | 7.490 |
-| 262,144 rows; 25% hot | 16.335 | 24.304 | Ordered | 23.787 |
-| Balanced composite, 512 bytes, 32 MiB cache | 170.522 | 185.628 | Ordered | 194.572 |
-| Same fixture, 128 MiB cache | 114.985 | 125.042 | Ordered | 125.363 |
-| 1,000,000 cold, unique | 88.759 | 86.256 | Empty | — |
-| 1,000,000 cold, non-unique | 82.706 | 88.613 | Unchecked | — |
+### Verification and unresolved evidence
 
-Additional persisted reads make several cases materially slower than retained-vector
-validation. Same-method timings also vary between builds/repetitions. The
-forced snapshots precede final read-retention refinements; after final timing,
-only test refinements and compact completion method/coverage checking changed.
-The selector and traversal algorithms were unchanged after confirmation;
-timings also precede the later lifecycle refactor.
-
-The wide balanced 32 MiB case released 76 MiB of retained cold input, admitted
-4.51 MiB of validation scratch, and bounded two reader pins to 128 KiB. Median
-sampled peak RSS changed from 356.71 to 349.35 MiB, while table reads rose from
-1,069 to 1,329. RSS is sampled every millisecond and includes allocator/storage
-behavior; it is not allocation-release proof. The production weak/drop probes
-provide that proof. These runs did not flush OS/device caches.
-
-Forward's 64-hot case recorded two active jobs; balanced ordered recorded eight
-jobs with peak two. The tiny 64-cold reverse case had two jobs but peak one in
-final samples. Semantic gates separately prove that every method permits a
-second job to finish while the first remains paused, including reverse cold
-ranges entirely outside the hot interval.
-
-Raw plans, logs, verified result TOML, source/binary hashes, environment details,
-drivers, and summaries remain under `target/task-000330/bench/` (ignored).
-`run.py` produced `samples.json`; `run-calibrated.py` produced
-`samples-final.json` and `summary-final.json`. The internal release test is
-`index::build::cross_tier::tests::validation_microbench`; its consumed
-results and timings are in `target/task-000330/microbench.txt`.
-See `docs/benchmark-tool.md` for reproduction commands.
-
-### Final verification
-
-- Workspace nextest: 2,338 passed; profiling-disabled storage: 2,072 passed.
-  Both skip the release calibration test; recorded timings above predate refactors.
-- Formatting, strict Clippy in both feature configurations, and branch style
-  audit passed: 23 Rust files, 301 test contracts, zero violations. Semantic
-  review preserves distinct component/public ownership and publication checks.
-- Fresh default-feature coverage: 92.08% across the two Rust files changed by
-  sealed metadata consolidation: 91.24% in `sealed_cold` and 92.20% in
-  `disk_builder`, both above the 80% review bar.
-  Reports/review: `target/task-000330/sealed-metadata/`; contracts:
-  `target/test-audit/`. Earlier hot-owner boxing coverage was 86.69% in catalog
-  orchestration; hot-state coverage was 90.22% across two files and owned-runtime
-  coverage was 90.45% across seven. Those reports remain available.
-- Unsafe inventory was refreshed for the module layout; no new unsafe operation
-  was introduced. Allocation observation uses the outlined-key destruction boundary.
-- The hot sub-state coverage run exposed an intermittent SIGSEGV in
-  `test_unique_current_update_departures_forward_to_insert_and_update` during
-  its old-snapshot read. The core shows an atomic load from `0x17` through
-  `SharedTrxStatus::ts`, `UndoStatus::ts`, and
-  `RowReadAccess::read_row_mvcc_index_candidate`. Its fixture uses CREATE TABLE
-  and hot-row mutation, outside the changed CREATE INDEX lifecycle. All 100
-  isolated runs of the same instrumented binary and a subsequent full coverage
-  run passed; the root cause remains unresolved. Traces, original test output,
-  and reproduction results are retained
-  under `target/task-000330/hot-substates/`. No MVCC fix is claimed here.
+- The final Rust source passed 2,350 workspace tests and 2,084 storage tests
+  with profiling disabled; both suites skipped two release calibration tests.
+  Strict Clippy passed in both configurations. The fresh resolve style gate
+  passed 26 branch-diff Rust files and 318 test contracts with zero violations.
+- Semantic review retained independent membership/rank and byte-string oracles,
+  explicit completion gates, typed failure checks, and distinct component versus
+  public publication tests. Borrowed views preserve delete masks and guard lifetimes.
+- Earlier sealed-metadata coverage was 92.08% across its two changed modules.
+  This predates the batching/read changes and is not final-branch coverage.
+  Unsafe inventory reflects the new module count; no new unsafe operation was added.
+- One earlier instrumented run SIGSEGV'd during an old-snapshot read in
+  `test_unique_current_update_departures_forward_to_insert_and_update`.
+  The trace reads address `0x17` through `SharedTrxStatus::ts` and `UndoStatus::ts`.
+  Its fixture creates indexes through CREATE TABLE, outside the changed CREATE
+  lifecycle. All 100 isolated reruns and a full coverage rerun passed; the cause
+  remains unresolved and is deferred to
+  [backlog 000211](../backlogs/000211-investigate-instrumented-mvcc-old-snapshot-read-crash.md).
 
 ## Impacts
 
-CREATE ownership, reads, validation, and profiling changed; formats, public DDL,
-recovery trust, and checkpoint eligibility remain compatible. Fixtures preserve
-interleaved placement; the readonly wake fix also benefits other readers.
+CREATE ownership, cross-tier validation, persisted reads, and profiling changed.
+Public DDL, persisted formats, recovery trust, and checkpoint eligibility remain
+compatible. Benchmark fixtures support interleaved tier placement. The readonly
+wake fix also benefits ordinary readers. Build inputs remain resident, so large
+CREATE operations still require sufficient scratch capacity.
 
 ## Test Cases
 
-Acceptance includes empty/nonempty sealing in both modes; foreign/incomplete/
-failed evidence rejection; multiple resident cold runs; original allocation
-release before hot admission; independent membership/conflict oracles for all
-methods; equal keys across cuts; late conflict cleanup and hot/hot precedence;
-missing/foreign/repeated/partial/wrong-direction coverage; rejected-seal retention;
-exclusive finalization after reader release; memory-only/completed runtime cleanup;
-one-time runtime and fork transfer; and actual sealed binding at installation. Required-empty
-evidence stays distinct from skipped validation without admitting readers.
-
-Gated jobs cover parallel progress, detached execution, typed integrity failure,
-and cancelled partial reclamation. Hot lifecycle tests cover cleanup before
-construction, occupied-destination rejection with the original entry preserved,
-idempotent settlement/discard, and panic guards around transfer and reclamation.
-Admission tests cover reduced concurrency,
-minimal-reader failure, excess-worker binding rejection, final-reader release,
-unchanged publication, and retry. Integration suites cover deleted/replaced rows,
-non-unique multiplicity, trusted recovery, DML/checkpoint/restart, shutdown,
-poison, and cleanup panics. Fixture tests check the interleaving bijection and
-inverse placement through empty and extreme tiers.
+- Empty/nonempty sealing in both modes, multiple cold runs, rejected or foreign
+  completions, and actual destruction of original inputs before hot admission.
+- Independent all-method membership and earliest-conflict oracles, complete
+  empty-tier evidence, equal keys across cuts, wide/prefix-compressed keys,
+  batch/leaf boundaries, sparse gaps, and monotonic search operation counts.
+- Forged, repeated, missing, or overlapping coverage; execution/duplicate
+  precedence; actual cold binding at installation; occupied-destination rejection.
+- Gated parallel progress and observer detachment, reduced concurrency, minimal
+  admission failure, retained read errors, resumable reclamation, and panic guards.
+- Checksummed malformed headers/accessed entries, valid entries beside untouched
+  malformed slots, deep layout checks, and non-unique row-ID prefix splits.
+- Public unique/non-unique publication, deleted/replaced rows, multiplicity,
+  trusted recovery, DML/checkpoint/restart, shutdown/poison, and fixture placement.
 
 ## Open Questions
 
-No selector or phase-local architectural decision remains unresolved. Parallel
-cold extraction and spill remain outside this phase under backlog 000104;
-checkpoint integration remains RFC 0033 Phase 4. The measured read-latency/RSS
-tradeoff is recorded above and should inform later end-to-end program work.
-
-### Simplified persisted reads
-
-DiskTree admission now checks the checksum and fixed header/fence ranges only.
-The shared persisted-node guard exposes checked borrowed views to CREATE,
-foreground scans/lookups, and checkpoint rewrites. Selected entries validate
-complete key/value ranges on access; unique owners and branch pointers retain
-typed integrity errors. Writer ordering and payload separation are trusted in
-production and checked by the retained deep validator in debug construction
-and tests. Unvisited malformed entries are intentionally not detected eagerly.
-
-Keys borrow prefix/outlined suffix bytes, with up to four short suffix bytes
-held inline to preserve the existing little-endian head format. Leaf decoding
-allocates no key. Point lookup returns scalars; scans copy emitted candidates;
-rewrites explicitly materialize owned entries. Reverse lookup checks each cold
-entry once per hot-run search and reuses its borrowed key for all comparisons.
-The old per-worker 24-page validation scratch and two cursor-key allowance are
-removed; traversal, batch scratch, retained cuts, and job accounting remain.
-Persisted format, public interfaces, selection scores, and settlement policy
-are unchanged.
-
-The six-run simplification check used one before/after observation for each
-1-million-row split with four workers. Validation times were 38.202 -> 11.185 ms
-(Forward, 10k/990k, both profiled), 25.727 -> 16.735 ms (Ordered, 500k/500k), and
-2.513 -> 3.097 ms (Reverse, 990k/10k). CREATE times were respectively
-155.520 -> 113.230, 79.563 -> 74.190, and 34.331 -> 33.137 ms. Every run verified
-all table/index rows and matching content fingerprints. These are single
-observations; the Reverse phase increase is retained rather than treated as
-noise or an established regression. Reader scratch admission decreased by
-exactly 7 MiB across four workers. The Forward profiles no longer contain
-per-entry layout or owned leaf-decoding work in admission. Artifacts and
-sampling limitations are in `target/task-000330/simplified-reads/report.md`.
-Selection scores were not recalibrated from this small sample.
-
-The checked reader implementation is consolidated into `disk_tree.rs`.
-`BTreeEntryView<V>` in the common B-tree module replaces both the physical
-key/value tuple and DiskTree's former logical `LeafEntryView`. Physical values
-retain their original delete masks; memory candidate projection and cleanup
-interpret them locally, while DiskTree validates durable values and owns
-conversion to rewrite `LogicalEntry`. Key-only range filtering and scalar
-optimistic lookups retain their existing access patterns.
+- Backlog 000104 retains parallel cold extraction, cold-collection scaling,
+  external-memory acceptance, and later selector calibration. Keep it open
+  through RFC 0033 Phase 3, then split any remaining scope.
+- [Backlog 000211](../backlogs/000211-investigate-instrumented-mvcc-old-snapshot-read-crash.md)
+  tracks the instrumented MVCC old-snapshot crash; passing reruns do not establish
+  that it is fixed.
+- RFC 0033 Phase 4 retains checkpoint integration; no checkpoint reconciliation
+  performance claim is made by this task.

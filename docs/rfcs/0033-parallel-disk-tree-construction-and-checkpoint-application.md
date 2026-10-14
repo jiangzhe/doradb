@@ -864,16 +864,14 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     validation, typed coverage evidence and production unique-CREATE integration.
   - Prerequisites: Phase 1's readable private-root completion and retained write
     owner; hot input identity and distinctness contracts from RFC 0032.
-  - Phase-local Choices: A consuming seal releases construction owners and
-    transfers private-fork ownership before hot extraction. Selection precedes
-    one prepared-hot-input handoff; compact identities and direction-specific
-    coverage bind installation to both inputs. Bounded readers share the hot
-    worker ceiling with at most four jobs per worker and a 32-entry target;
-    admission can reduce concurrency. Measured scores use disk lookup cost
-    40 times tree levels, resident-run lookup 10, scan 1, and comparison 2.
-    Forward/ordered jobs share hot consumers; retained reverse jobs settle
-    before packing. Equivalent conflict ranking and failure drains preserve
-    complete-input, input-lifetime, and installation gates.
+  - Phase-local Choices: Sealing releases cold construction inputs before hot
+    extraction and retains the private root through validation and settlement.
+    Batched forward/reverse lookups and ordered cursors use checked borrowed
+    reads under a shared worker and memory allowance. Selection precedes one
+    hot-boundary preparation; exact identities and direction-specific coverage
+    authorize installation. Forward/ordered work shares hot consumers; reverse
+    work settles before packing. Conflict precedence and failure drains remain
+    unchanged. Selector weights were not retuned after read optimizations.
   - Goals: Release cold construction key allocations before hot extraction or
     construction; preserve hot/hot precedence and exhaustive cross-tier
     checking. Prove allocation release at the production handoff while the
@@ -888,9 +886,10 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - Task Doc: `docs/tasks/000330-completed-root-cross-tier-validation.md`
   - Task Issue: `#1147`
   - Phase Status: done
-  - Implementation Summary: Implemented a consuming cold-build seal, three bounded parallel validators, exact input/coverage bindings, retained reader settlement, and publication-only profiling. CREATE now groups exclusive cold states and hot ownership in lifecycle enums; hot Build and Tree variants carry distinct scoped sub-states and boxed owners, with resumable settlement and explicit destructive panic guards. Boxing preserves ownership transitions while reducing the profiling-enabled aarch64 test enum from 3,272 to 24 bytes. The sealed root directly embeds checked identity/root metadata, replacing the mirrored handoff payload while preserving builder validation and resource ownership. Build modules separate sealed resource ownership, bounded cold reads, and cross-tier validation; shared reservations preserve read lifetime independently of reader types. The pipeline chooses optional cold authority; a self-contained selection carries that authority and admission into packing, with no separate contract or binding-time reselection. CREATE stages memory only, releases read leases after settlement, then unwraps the owned disk runtime into the final SecondaryIndex while retaining the fork in ReadyToPublish. Calibration selected a height-based disk lookup cost and a 32-entry job target; its recorded memory/latency tradeoffs predate the lifecycle, module, and selection refactors. Final validation passed 2,338 workspace tests, 2,072 profiling-disabled storage tests, and the 23-file style gate; fresh sealed-metadata production coverage is 92.08% across the two changed build modules (91.24% in sealed_cold and 92.20% in disk_builder); earlier hot-owner boxing coverage was 86.69% in catalog orchestration, hot-state coverage was 90.22% across two files, and owned-runtime coverage was 90.45% across seven. An intermittent MVCC snapshot-read SIGSEGV occurred in one instrumented run; 100 isolated runs and the full coverage rerun passed, but the task records the unresolved failure. Phase 3 can consume multiple resident cold runs directly; backlog 000104 remains open. [Task Resolve Sync: docs/tasks/000330-completed-root-cross-tier-validation.md @ 2026-10-12]
+  - Implementation Summary: Delivered early cold-input release and bounded parallel cross-tier validation with batched lookups and checked borrowed reads. Final verification passed 2,350 workspace tests, 2,084 profiling-disabled storage tests, and the 26-file style gate. Six verified 1M/10M observations retained automatic strategy choices and exposed cold collection and resident scratch as the remaining scaling limits. Phase 3 can consume multiple resident cold runs directly; backlog 000104 stays open until that phase lands and its remaining scope is split. Backlog 000211 tracks the unresolved instrumented MVCC snapshot-read crash. [Task Resolve Sync: docs/tasks/000330-completed-root-cross-tier-validation.md @ 2026-10-14]
   - Related Backlogs:
     - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/000211-investigate-instrumented-mvcc-old-snapshot-read-crash.md`
 
 - **Phase 3: Parallel Cold Extraction and Direct Run Consumption**
   - Scope: Incremental bounded cold descriptor scheduling, parallel
@@ -906,6 +905,8 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     acceptance, stage attribution and worker-scaling measurements.
   - After This Phase: The complete resident cold CREATE pipeline uses parallel
     input preparation and streaming durable output without a full merged vector.
+    Reassess backlog 000104 and split its remaining scope after this phase;
+    larger-than-memory acceptance is not completed by the resident pipeline.
   - Non-goals: New external-memory formats or changes to checkpoint row selection.
   - Task Doc: `docs/tasks/TBD.md`
   - Task Issue: `#0`
