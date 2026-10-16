@@ -73,8 +73,10 @@ impl HotIndexBuildConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColdIndexBuildConfig {
     /// Maximum admitted scratch, including retained input and storage-owned buffers.
+    /// Per-row decoded payloads are temporary and excluded from this limit.
     pub max_scratch_bytes: usize,
-    /// Maximum leaf workers; `None` selects the engine pool size.
+    /// Maximum cold extraction, local-sort and construction workers.
+    /// `None` selects the engine pool size; admission may reduce effective concurrency.
     pub max_workers: Option<usize>,
     /// Maximum queued leaf buffers, excluding worker-held buffers.
     pub max_ready_buffers: usize,
@@ -101,7 +103,7 @@ impl ColdIndexBuildConfig {
         self
     }
 
-    /// Set the construction worker allowance.
+    /// Set the cold extraction and construction worker allowance.
     #[inline]
     pub fn max_workers(mut self, workers: Option<usize>) -> Self {
         self.max_workers = workers;

@@ -43,7 +43,7 @@ pub struct InternalMetric {
 }
 
 /// Independently sampled component diagnostics; capture is not an atomic engine snapshot.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InternalStatsSnapshot {
     trx: TransactionSystemStats,
     storage: StorageIoStats,
@@ -94,6 +94,7 @@ fn plan_internal_metrics(
                 || metric.name.ends_with(".allocated")
                 || metric.name.ends_with(".active_count")
                 || metric.name.starts_with("logical_lock.current_")
+                || metric.name.starts_with("create_index.cold_source.run.")
             {
                 InternalMetricKind::EndGauge
             } else if metric.name.starts_with("logical_lock.peak_")
@@ -220,6 +221,66 @@ fn push_create_index_metrics(
             push_metric(metrics, concat!("create_index.", $name), after.$($field).+);
         };
     }
+    peak!("cold_source.source_height", cold_source.source_height);
+    peak!(
+        "cold_source.configured_workers",
+        cold_source.configured_workers
+    );
+    peak!("cold_source.workers", cold_source.workers);
+    peak!("cold_source.concurrency_peak", cold_source.concurrency_peak);
+    peak!("cold_source.pool_pin_bytes", cold_source.pool_pin_bytes);
+    peak!("cold_source.descriptor_peak", cold_source.descriptor_peak);
+    counter!("cold_source.source_entries", cold_source.source_entries);
+    counter!(
+        "cold_source.requested_partitions",
+        cold_source.requested_partitions
+    );
+    counter!("cold_source.partitions", cold_source.partitions);
+    counter!("cold_source.nonempty_runs", cold_source.nonempty_runs);
+    counter!("cold_source.planning_nanos", cold_source.planning_nanos);
+    counter!(
+        "cold_source.preparation_nanos",
+        cold_source.preparation_nanos
+    );
+    counter!(
+        "cold_source.extraction_worker_nanos",
+        cold_source.extraction_worker_nanos
+    );
+    counter!(
+        "cold_source.sort_worker_nanos",
+        cold_source.sort_worker_nanos
+    );
+    counter!(
+        "cold_source.extraction_wall_nanos",
+        cold_source.extraction_wall_nanos
+    );
+    counter!("cold_source.sort_wall_nanos", cold_source.sort_wall_nanos);
+    counter!("cold_source.descriptors", cold_source.descriptors);
+    counter!("cold_source.physical_rows", cold_source.physical_rows);
+    counter!("cold_source.live_rows", cold_source.live_rows);
+    counter!("cold_source.encoded_bytes", cold_source.encoded_bytes);
+    counter!("cold_source.node_reads", cold_source.node_reads);
+    counter!("cold_source.lwc_reads", cold_source.lwc_reads);
+    for run in &after.cold_source.runs {
+        for (field, value) in [
+            ("start_row_id", run.start_row_id),
+            ("end_row_id", run.end_row_id),
+            ("descriptors", run.descriptors),
+            ("physical_rows", run.physical_rows),
+            ("live_rows", run.live_rows),
+            ("encoded_bytes", run.encoded_bytes),
+            ("retained_bytes", run.retained_bytes),
+            ("extraction_nanos", run.extraction_nanos),
+            ("sort_nanos", run.sort_nanos),
+            ("elapsed_nanos", run.elapsed_nanos),
+        ] {
+            push_metric(
+                metrics,
+                &format!("create_index.cold_source.run.{}.{field}", run.partition),
+                value,
+            );
+        }
+    }
     counter!("validation.forward", validation.forward);
     counter!("validation.ordered", validation.ordered);
     counter!("validation.reverse", validation.reverse);
@@ -334,6 +395,48 @@ fn push_create_index_metrics(
     );
     peak!("extraction.workers", hot.extraction.workers);
     peak!("extraction.page_target", hot.extraction.page_target);
+    counter!("cold.merge.entries", cold.merge.entries);
+    counter!("cold.merge.runs", cold.merge.runs);
+    counter!("cold.merge.partitions", cold.merge.partitions);
+    counter!(
+        "cold.merge.boundary_wall_nanos",
+        cold.merge.boundary_wall_nanos
+    );
+    counter!("cold.merge.cut_worker_nanos", cold.merge.cut_worker_nanos);
+    counter!(
+        "cold.merge.consumption_wall_nanos",
+        cold.merge.consumption_wall_nanos
+    );
+    counter!("cold.merge.merge_check_nanos", cold.merge.merge_check_nanos);
+    counter!("cold.merge.job_worker_nanos", cold.merge.job_worker_nanos);
+    counter!(
+        "cold.merge.consumer_worker_nanos",
+        cold.merge.consumer_worker_nanos
+    );
+    counter!(
+        "cold.merge.duplicate_comparisons",
+        cold.merge.duplicate_comparisons
+    );
+    peak!("cold.merge.workers", cold.merge.workers);
+    peak!("cold.merge.batch_entries", cold.merge.batch_entries);
+    peak!("cold.merge.max_cut_nanos", cold.merge.max_cut_nanos);
+    peak!("cold.merge.first_batch_nanos", cold.merge.first_batch_nanos);
+    peak!("cold.merge.max_batch_nanos", cold.merge.max_batch_nanos);
+    peak!("cold.merge.max_job_nanos", cold.merge.max_job_nanos);
+    peak!("cold.merge.boundary_bytes", cold.merge.boundary_bytes);
+    peak!(
+        "cold.merge.max_reference_bytes",
+        cold.merge.max_reference_bytes
+    );
+    peak!(
+        "cold.merge.active_reference_bytes",
+        cold.merge.active_reference_bytes
+    );
+    peak!("cold.merge.validation_bytes", cold.merge.validation_bytes);
+    peak!(
+        "cold.merge.scratch_peak_bytes",
+        cold.merge.scratch_peak_bytes
+    );
     counter!("merge.entries", hot.merge.entries);
     counter!("merge.runs", hot.merge.runs);
     counter!("merge.partitions", hot.merge.partitions);
@@ -373,6 +476,23 @@ fn create_index_peak(name: &str) -> bool {
     matches!(
         name,
         "create_index.validation.workers"
+            | "create_index.cold_source.source_height"
+            | "create_index.cold_source.configured_workers"
+            | "create_index.cold_source.workers"
+            | "create_index.cold_source.concurrency_peak"
+            | "create_index.cold_source.pool_pin_bytes"
+            | "create_index.cold_source.descriptor_peak"
+            | "create_index.cold.merge.workers"
+            | "create_index.cold.merge.batch_entries"
+            | "create_index.cold.merge.max_cut_nanos"
+            | "create_index.cold.merge.first_batch_nanos"
+            | "create_index.cold.merge.max_batch_nanos"
+            | "create_index.cold.merge.max_job_nanos"
+            | "create_index.cold.merge.boundary_bytes"
+            | "create_index.cold.merge.max_reference_bytes"
+            | "create_index.cold.merge.active_reference_bytes"
+            | "create_index.cold.merge.validation_bytes"
+            | "create_index.cold.merge.scratch_peak_bytes"
             | "create_index.validation.peak"
             | "create_index.validation.scratch_bytes"
             | "create_index.validation.pool_pin_bytes"
@@ -768,7 +888,7 @@ mod tests {
     use super::InternalMetricUnit::{Bytes, Count, Frames, Nanoseconds};
     use super::{InternalMetricKind, InternalMetricUnit};
     use super::{InternalStatsSnapshot, cumulative_internal_metrics, plan_internal_metrics};
-    use crate::profiling::{CreateIndexMeasurements, IndexBuildStats};
+    use crate::profiling::{ColdRunMeasurements, CreateIndexMeasurements, IndexBuildStats};
 
     // Each row fixes the name, delta value, cumulative value, delta kind, and unit.
     const EXPECTED_METRICS: &[(&str, u64, u64, InternalMetricKind, InternalMetricUnit)] = &[
@@ -1390,6 +1510,160 @@ mod tests {
             LifetimePeak,
             Bytes,
         ),
+        (
+            "create_index.cold_source.source_height",
+            11,
+            11,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold_source.configured_workers",
+            11,
+            11,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold_source.workers",
+            11,
+            11,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold_source.concurrency_peak",
+            11,
+            11,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold_source.pool_pin_bytes",
+            11,
+            11,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.cold_source.descriptor_peak",
+            11,
+            11,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold_source.source_entries",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.requested_partitions",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.partitions",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.nonempty_runs",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.planning_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.preparation_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.extraction_worker_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.sort_worker_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.extraction_wall_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.sort_wall_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold_source.descriptors",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.physical_rows",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.live_rows",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.encoded_bytes",
+            8,
+            11,
+            CounterDelta,
+            Bytes,
+        ),
+        (
+            "create_index.cold_source.node_reads",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold_source.lwc_reads",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
         ("create_index.validation.forward", 0, 0, CounterDelta, Count),
         ("create_index.validation.ordered", 0, 0, CounterDelta, Count),
         ("create_index.validation.reverse", 0, 0, CounterDelta, Count),
@@ -1804,6 +2078,147 @@ mod tests {
             LifetimePeak,
             Count,
         ),
+        (
+            "create_index.cold.merge.entries",
+            12,
+            17,
+            CounterDelta,
+            Count,
+        ),
+        ("create_index.cold.merge.runs", 12, 17, CounterDelta, Count),
+        (
+            "create_index.cold.merge.partitions",
+            12,
+            17,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold.merge.boundary_wall_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.cut_worker_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.consumption_wall_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.merge_check_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.job_worker_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.consumer_worker_nanos",
+            12,
+            17,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.duplicate_comparisons",
+            12,
+            17,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "create_index.cold.merge.workers",
+            17,
+            17,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold.merge.batch_entries",
+            17,
+            17,
+            LifetimePeak,
+            Count,
+        ),
+        (
+            "create_index.cold.merge.max_cut_nanos",
+            17,
+            17,
+            LifetimePeak,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.first_batch_nanos",
+            17,
+            17,
+            LifetimePeak,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.max_batch_nanos",
+            17,
+            17,
+            LifetimePeak,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.max_job_nanos",
+            17,
+            17,
+            LifetimePeak,
+            Nanoseconds,
+        ),
+        (
+            "create_index.cold.merge.boundary_bytes",
+            17,
+            17,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.cold.merge.max_reference_bytes",
+            17,
+            17,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.cold.merge.active_reference_bytes",
+            17,
+            17,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.cold.merge.validation_bytes",
+            17,
+            17,
+            LifetimePeak,
+            Bytes,
+        ),
+        (
+            "create_index.cold.merge.scratch_peak_bytes",
+            17,
+            17,
+            LifetimePeak,
+            Bytes,
+        ),
         ("create_index.merge.entries", 380, 620, CounterDelta, Count),
         ("create_index.merge.runs", 382, 623, CounterDelta, Count),
         (
@@ -1936,7 +2351,7 @@ mod tests {
     ];
 
     /// Purpose: Report successful CREATE intervals independently of extraction and preserve cold profiling names across serialization.
-    /// Expected: Idle publication intervals omit metrics; completed intervals retain correct deltas, peaks, and units, and the cold measurements round-trip under the cold field.
+    /// Expected: Idle publication omits metrics; completed intervals preserve deltas, peaks, units and cold serialization without the retired temporary-memory field.
     #[test]
     fn create_metrics_require_publication_and_distinguish_peaks() {
         let mut before = InternalStatsSnapshot::default();
@@ -1946,7 +2361,7 @@ mod tests {
         before.index_build.create.cold.packing_peak = 2;
         before.index_build.create.cold.write_bytes = 65536;
         before.index_build.create.hot.extraction.workers = 8;
-        let mut after = before;
+        let mut after = before.clone();
         after.index_build.completed_builds = 1;
         assert!(
             plan_internal_metrics(&before, &after)
@@ -1956,15 +2371,36 @@ mod tests {
         after.index_build.create.hot.completed_builds = 3;
         after.index_build.create.cold_hot_worker_nanos = 95;
         after.index_build.create.cold.write_bytes += 131072;
+        after.index_build.create.cold_source.runs = vec![ColdRunMeasurements {
+            partition: 3,
+            live_rows: 17,
+            encoded_bytes: 200,
+            retained_bytes: 512,
+            elapsed_nanos: 900,
+            ..Default::default()
+        }];
         let encoded = toml::to_string(&after.index_build.create).unwrap();
         let fields: toml::Value = toml::from_str(&encoded).unwrap();
         assert!(fields.get("cold").is_some());
         assert!(fields.get("disk").is_none());
+        assert!(fields["cold_source"].get("temporary_peak_bytes").is_none());
         assert_eq!(
             toml::from_str::<CreateIndexMeasurements>(&encoded).unwrap(),
             after.index_build.create
         );
         let metrics = plan_internal_metrics(&before, &after);
+        for (field, value, unit) in [
+            ("live_rows", 17, Count),
+            ("encoded_bytes", 200, Bytes),
+            ("elapsed_nanos", 900, Nanoseconds),
+        ] {
+            let name = format!("create_index.cold_source.run.3.{field}");
+            let metric = metrics.iter().find(|metric| metric.name == name).unwrap();
+            assert_eq!(
+                (metric.value, metric.kind, metric.unit),
+                (value, EndGauge, unit)
+            );
+        }
         for (name, value, kind, unit) in [
             (
                 "cold.write_bytes",
@@ -2622,6 +3058,96 @@ mod tests {
         after.index_build.max_sort_elapsed_nanos = 806;
         before.index_build.scratch_peak_bytes = 303;
         after.index_build.scratch_peak_bytes = 809;
+        before.index_build.create.cold_source.source_height = 3;
+        after.index_build.create.cold_source.source_height = 11;
+        before.index_build.create.cold_source.configured_workers = 3;
+        after.index_build.create.cold_source.configured_workers = 11;
+        before.index_build.create.cold_source.workers = 3;
+        after.index_build.create.cold_source.workers = 11;
+        before.index_build.create.cold_source.concurrency_peak = 3;
+        after.index_build.create.cold_source.concurrency_peak = 11;
+        before.index_build.create.cold_source.pool_pin_bytes = 3;
+        after.index_build.create.cold_source.pool_pin_bytes = 11;
+        before.index_build.create.cold_source.descriptor_peak = 3;
+        after.index_build.create.cold_source.descriptor_peak = 11;
+        before.index_build.create.cold_source.source_entries = 3;
+        after.index_build.create.cold_source.source_entries = 11;
+        before.index_build.create.cold_source.requested_partitions = 3;
+        after.index_build.create.cold_source.requested_partitions = 11;
+        before.index_build.create.cold_source.partitions = 3;
+        after.index_build.create.cold_source.partitions = 11;
+        before.index_build.create.cold_source.nonempty_runs = 3;
+        after.index_build.create.cold_source.nonempty_runs = 11;
+        before.index_build.create.cold_source.planning_nanos = 3;
+        after.index_build.create.cold_source.planning_nanos = 11;
+        before.index_build.create.cold_source.preparation_nanos = 3;
+        after.index_build.create.cold_source.preparation_nanos = 11;
+        before
+            .index_build
+            .create
+            .cold_source
+            .extraction_worker_nanos = 3;
+        after.index_build.create.cold_source.extraction_worker_nanos = 11;
+        before.index_build.create.cold_source.sort_worker_nanos = 3;
+        after.index_build.create.cold_source.sort_worker_nanos = 11;
+        before.index_build.create.cold_source.extraction_wall_nanos = 3;
+        after.index_build.create.cold_source.extraction_wall_nanos = 11;
+        before.index_build.create.cold_source.sort_wall_nanos = 3;
+        after.index_build.create.cold_source.sort_wall_nanos = 11;
+        before.index_build.create.cold_source.descriptors = 3;
+        after.index_build.create.cold_source.descriptors = 11;
+        before.index_build.create.cold_source.physical_rows = 3;
+        after.index_build.create.cold_source.physical_rows = 11;
+        before.index_build.create.cold_source.live_rows = 3;
+        after.index_build.create.cold_source.live_rows = 11;
+        before.index_build.create.cold_source.encoded_bytes = 3;
+        after.index_build.create.cold_source.encoded_bytes = 11;
+        before.index_build.create.cold_source.node_reads = 3;
+        after.index_build.create.cold_source.node_reads = 11;
+        before.index_build.create.cold_source.lwc_reads = 3;
+        after.index_build.create.cold_source.lwc_reads = 11;
+        before.index_build.create.cold.merge.entries = 5;
+        after.index_build.create.cold.merge.entries = 17;
+        before.index_build.create.cold.merge.runs = 5;
+        after.index_build.create.cold.merge.runs = 17;
+        before.index_build.create.cold.merge.partitions = 5;
+        after.index_build.create.cold.merge.partitions = 17;
+        before.index_build.create.cold.merge.boundary_wall_nanos = 5;
+        after.index_build.create.cold.merge.boundary_wall_nanos = 17;
+        before.index_build.create.cold.merge.cut_worker_nanos = 5;
+        after.index_build.create.cold.merge.cut_worker_nanos = 17;
+        before.index_build.create.cold.merge.consumption_wall_nanos = 5;
+        after.index_build.create.cold.merge.consumption_wall_nanos = 17;
+        before.index_build.create.cold.merge.merge_check_nanos = 5;
+        after.index_build.create.cold.merge.merge_check_nanos = 17;
+        before.index_build.create.cold.merge.job_worker_nanos = 5;
+        after.index_build.create.cold.merge.job_worker_nanos = 17;
+        before.index_build.create.cold.merge.consumer_worker_nanos = 5;
+        after.index_build.create.cold.merge.consumer_worker_nanos = 17;
+        before.index_build.create.cold.merge.duplicate_comparisons = 5;
+        after.index_build.create.cold.merge.duplicate_comparisons = 17;
+        before.index_build.create.cold.merge.workers = 5;
+        after.index_build.create.cold.merge.workers = 17;
+        before.index_build.create.cold.merge.batch_entries = 5;
+        after.index_build.create.cold.merge.batch_entries = 17;
+        before.index_build.create.cold.merge.max_cut_nanos = 5;
+        after.index_build.create.cold.merge.max_cut_nanos = 17;
+        before.index_build.create.cold.merge.first_batch_nanos = 5;
+        after.index_build.create.cold.merge.first_batch_nanos = 17;
+        before.index_build.create.cold.merge.max_batch_nanos = 5;
+        after.index_build.create.cold.merge.max_batch_nanos = 17;
+        before.index_build.create.cold.merge.max_job_nanos = 5;
+        after.index_build.create.cold.merge.max_job_nanos = 17;
+        before.index_build.create.cold.merge.boundary_bytes = 5;
+        after.index_build.create.cold.merge.boundary_bytes = 17;
+        before.index_build.create.cold.merge.max_reference_bytes = 5;
+        after.index_build.create.cold.merge.max_reference_bytes = 17;
+        before.index_build.create.cold.merge.active_reference_bytes = 5;
+        after.index_build.create.cold.merge.active_reference_bytes = 17;
+        before.index_build.create.cold.merge.validation_bytes = 5;
+        after.index_build.create.cold.merge.validation_bytes = 17;
+        before.index_build.create.cold.merge.scratch_peak_bytes = 5;
+        after.index_build.create.cold.merge.scratch_peak_bytes = 17;
         let delta = plan_internal_metrics(&before, &after);
         let cumulative = cumulative_internal_metrics(&after);
         for (mode, metrics, is_cumulative) in

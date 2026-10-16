@@ -39,6 +39,7 @@ impl MemoryBudget {
     }
 
     /// Reserve bytes before their allocation; release follows allocation ownership.
+    #[inline]
     pub(crate) fn reserve(
         &self,
         bytes: usize,
@@ -51,6 +52,7 @@ impl MemoryBudget {
         })
     }
 
+    #[inline]
     fn admit(&self, bytes: usize, purpose: &'static str) -> ResourceResult<()> {
         #[cfg(test)]
         if self.0.test.rejects(purpose) {
@@ -85,6 +87,7 @@ impl MemoryBudget {
     }
 
     /// Return admitted bulk allocation bytes.
+    #[inline]
     pub(crate) fn used(&self) -> usize {
         self.0.used.load(Ordering::Acquire)
     }
@@ -102,6 +105,7 @@ impl MemoryBudget {
 
     /// Return the highest simultaneous bulk allocation capacity admitted.
     #[cfg(feature = "profiling")]
+    #[inline]
     pub(crate) fn peak(&self) -> usize {
         self.0.peak.load(Ordering::Acquire)
     }
@@ -145,6 +149,7 @@ impl MemoryReservation {
     }
 
     /// Construct an empty reservation without admitting any bytes.
+    #[inline]
     pub(crate) fn new(budget: &MemoryBudget) -> Self {
         Self {
             budget: budget.clone(),
@@ -153,6 +158,7 @@ impl MemoryReservation {
     }
 
     /// Add admission before extending an allocation owned by this reservation.
+    #[inline]
     pub(crate) fn grow(&mut self, bytes: usize, purpose: &'static str) -> ResourceResult<()> {
         if bytes == 0 {
             return Ok(());
@@ -166,6 +172,7 @@ impl MemoryReservation {
     }
 
     /// Release a freed payload while retaining the reservation's budget owner.
+    #[inline]
     pub(crate) fn release(&mut self, bytes: usize) {
         if bytes == 0 {
             return;
@@ -179,12 +186,14 @@ impl MemoryReservation {
     }
 
     /// Release all admission after the associated allocations have been freed.
+    #[inline]
     pub(crate) fn release_all(&mut self) {
         self.release(self.bytes);
     }
 }
 
 impl Drop for MemoryReservation {
+    #[inline]
     fn drop(&mut self) {
         self.release_all();
     }
@@ -198,6 +207,12 @@ pub(crate) struct BudgetedVec<T> {
 }
 
 impl<T> BudgetedVec<T> {
+    /// Move allocation and admission together into a downstream lifetime owner.
+    #[inline]
+    pub(super) fn into_parts(self) -> (Vec<T>, MemoryReservation) {
+        (self.values, self.reservation)
+    }
+
     /// Allocate exact element capacity from an existing earmark.
     pub(crate) fn from_reservation(mut reservation: MemoryReservation, capacity: usize) -> Self {
         let bytes = Layout::array::<T>(capacity)

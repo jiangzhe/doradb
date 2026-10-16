@@ -1,11 +1,11 @@
-use super::merge::{HotEntryRef, execution_error, observe_stop};
-use super::{BudgetedVec, SortedRuns};
+use super::merge::{HotEntryRef, execution_error};
+use super::{BudgetedVec, BuildOutcome, SortedRuns};
 use crate::error::{RuntimeError, RuntimeOrFatalResult};
 #[cfg(feature = "profiling")]
 use crate::profiling::clock::Instant;
 use error_stack::ResultExt;
 use std::cmp::Ordering;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// A rank's exact prefixes and immediate total-order neighbors.
 pub(super) struct MergeCut {
@@ -47,11 +47,15 @@ pub(super) fn direct(runs: &SortedRuns, rank: usize) -> RuntimeOrFatalResult<Mer
 }
 
 /// Independently select a prefix from zero in one finite synchronous search.
+/// Observe cooperative stop only before and after the complete search.
 pub(super) fn co_rank(
     runs: &SortedRuns,
     rank: usize,
     stop: &AtomicBool,
-) -> RuntimeOrFatalResult<MergeCut> {
+) -> RuntimeOrFatalResult<BuildOutcome<MergeCut>> {
+    if stop.load(AtomicOrdering::Acquire) {
+        return Ok(BuildOutcome::Stopped);
+    }
     #[cfg(feature = "profiling")]
     let started = Instant::now();
     let mut positions = BudgetedVec::new(&runs.budget);
@@ -65,7 +69,6 @@ pub(super) fn co_rank(
     }
     let mut remaining = rank;
     while remaining != 0 {
-        observe_stop(stop)?;
         let active = runs
             .runs()
             .iter()
@@ -94,14 +97,17 @@ pub(super) fn co_rank(
         remaining -= count;
     }
     let (left, right) = neighbors(runs, &positions);
-    Ok(MergeCut {
+    if stop.load(AtomicOrdering::Acquire) {
+        return Ok(BuildOutcome::Stopped);
+    }
+    Ok(BuildOutcome::Complete(MergeCut {
         rank,
         positions,
         left,
         right,
         #[cfg(feature = "profiling")]
         elapsed_nanos: started.elapsed().as_nanos() as u64,
-    })
+    }))
 }
 
 /// Construct a global endpoint in O(K), without searching or submitting a job.

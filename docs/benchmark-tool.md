@@ -143,7 +143,8 @@ auxiliary overhead and does not represent total process memory.
 `max_workers` (omitted selects the engine pool size), `max_ready_buffers`
 (default 8, positive), and `max_in_flight_writes` (default 32, at least 2).
 Scratch and worker limits must be positive, and workers cannot exceed the pool
-size. These settings control cold-index construction during index creation.
+size. These settings control cold extraction, sorting and tree construction
+during index creation. The scratch budget can reduce effective concurrency.
 
 The benchmark uses io_uring and always collects profiling data. `include_stats`
 controls whether general engine statistics appear in the output. Recovery's
@@ -512,13 +513,21 @@ a failed build can contribute extraction work without counting as a completed
 CREATE. Worker durations can overlap, so their sum may exceed elapsed time.
 Counter differences describe the measured interval, while peak values describe
 lifetime maxima. Cold preparation memory and hot construction memory are
-reported separately from process RSS.
+reported separately from process RSS. Scratch metrics exclude temporary decoded
+row payloads and runtime overhead; they do not bound total process memory.
 
 `hot_index_extraction.*` metrics describe successful hot-row extraction.
 `create_index.*` metrics describe successfully published index creation;
 `create_index.cold.*` reports its cold-build memory, concurrency, timing, and
 write statistics. `create_index.validation.*` reports the selected cross-tier
 validation method, work counts, timing, and memory bounds.
+
+`create_index.cold_source.*` reports cold preparation work, timing, concurrency
+and memory. Its `run.<partition>.*` samples describe the latest successful CREATE
+and are replaced on the next success. `create_index.cold.merge.*` reports cold
+merging. `cold_collect_nanos` covers all cold preparation, including sorting;
+`cold_sort_nanos` sums worker time for sorting and duplicate checks. These
+durations overlap and must not be added.
 
 ### Maintenance controls and terminal policy
 

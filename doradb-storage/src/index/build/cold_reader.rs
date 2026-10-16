@@ -1,9 +1,9 @@
 //! Bounded persisted reads for completed cold trees. Traversal and admission
 //! live here; cross-tier strategy selection and coverage live in `cross_tier`.
 //! Lookup batches borrow keys or leaf slots; branch keys are never flattened.
-use super::MemoryReservation;
-use super::merge::{execution_error, observe_stop};
+use super::merge::execution_error;
 use super::sealed_cold::ColdReadAuthority;
+use super::{BuildOutcome, MemoryReservation};
 use crate::error::{RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeResult};
 use crate::id::{BlockID, RowID};
 use crate::index::btree::{BTreeEntryView, BTreeU64};
@@ -193,12 +193,13 @@ impl ColdReader {
 
     /// Resolve sorted borrowed keys with one visit per required subtree.
     /// Results retain input order, including repeated keys and misses.
+    /// Yield after traversal, then observe cooperative stop at the batch boundary.
     pub(super) async fn lookup_batch(
         &mut self,
         keys: &[&[u8]],
         hits: &mut [Option<RowID>],
         stop: &AtomicBool,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<()>> {
         assert!(
             keys.len() <= LOOKUP_BATCH_ENTRIES,
             "cold lookup batch capacity"
@@ -206,16 +207,18 @@ impl ColdReader {
         assert_eq!(keys.len(), hits.len(), "cold lookup result length");
         // The merge establishes sorted input; tests may also supply sorted slices.
         debug_assert!(keys.is_sorted());
-        observe_stop(stop)?;
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
         hits.fill(None);
         self.leaf = None;
         self.path.clear();
         self.pending.clear();
         if keys.is_empty() {
-            return Ok(());
+            return Ok(BuildOutcome::Complete(()));
         }
         let Some(block) = self.cold.root() else {
-            return Ok(());
+            return Ok(BuildOutcome::Complete(()));
         };
         if self.pending.capacity() == 0 {
             self.pending = Vec::with_capacity(LOOKUP_BATCH_ENTRIES);
@@ -225,9 +228,7 @@ impl ColdReader {
             height: self.cold.height(),
             keys: 0..keys.len(),
         });
-        let mut visited = 0usize;
         while let Some(span) = self.pending.pop() {
-            observe_stop(stop)?;
             let guard = self.read(span.block, span.height).await?;
             let node = guard.view();
             if node.is_leaf() {
@@ -279,12 +280,13 @@ impl ColdReader {
                 self.pending[pending_start..].reverse();
             }
             drop(guard);
-            visited += 1;
-            if visited.is_multiple_of(32) {
-                yield_now().await;
-            }
         }
-        observe_stop(stop)
+        yield_now().await;
+        Ok(if stop.load(AtomicOrdering::Acquire) {
+            BuildOutcome::Stopped
+        } else {
+            BuildOutcome::Complete(())
+        })
     }
 
     /// Seek from the exact sealed root, retaining only child coordinates.
@@ -451,7 +453,7 @@ pub(crate) async fn plan_ranges(
     admission: ColdReadAdmission,
     count: usize,
     stop: Arc<AtomicBool>,
-) -> RuntimeOrFatalResult<Vec<ColdRange>> {
+) -> RuntimeOrFatalResult<BuildOutcome<Vec<ColdRange>>> {
     let mut spans = Vec::with_capacity(count);
     if let Some(block) = cold.root() {
         spans.push(Span {
@@ -469,7 +471,7 @@ pub(crate) async fn plan_ranges(
     let mut reader = ColdReader::new(cold.clone(), admission);
     while spans.len() < count {
         if stop.load(AtomicOrdering::Acquire) {
-            return Err(execution_error("cold range planning stopped"));
+            return Ok(BuildOutcome::Stopped);
         }
         let Some(index) = spans
             .iter()
@@ -522,7 +524,9 @@ pub(crate) async fn plan_ranges(
         yield_now().await;
     }
     spans.sort_unstable_by(|left, right| left.range.lower.cmp(&right.range.lower));
-    Ok(spans.into_iter().map(|span| span.range).collect())
+    Ok(BuildOutcome::Complete(
+        spans.into_iter().map(|span| span.range).collect(),
+    ))
 }
 
 fn lower_bound(
@@ -566,6 +570,7 @@ fn decode_key(
 
 #[cfg(test)]
 mod tests {
+    use super::super::complete_work;
     use super::*;
     use crate::index::BTreeKey;
     use crate::index::build::IndexBuildEntry;
@@ -672,7 +677,9 @@ mod tests {
                         for chunk in queries.chunks(count) {
                             let keys: Vec<_> = chunk.iter().map(Vec::as_slice).collect();
                             let mut hits = vec![None; keys.len()];
-                            reader.lookup_batch(&keys, &mut hits, &stop).await.unwrap();
+                            complete_work(
+                                reader.lookup_batch(&keys, &mut hits, &stop).await.unwrap(),
+                            );
                             for (key, hit) in keys.iter().zip(hits) {
                                 assert_eq!(
                                     hit,
@@ -684,7 +691,7 @@ mod tests {
                             assert!(reader.leaf.is_none());
                         }
                     }
-                    reader.lookup_batch(&[], &mut [], &stop).await.unwrap();
+                    complete_work(reader.lookup_batch(&[], &mut [], &stop).await.unwrap());
                     reader.seek(&[]).await.unwrap();
                     let upper = fixture_key(513, width);
                     let mut actual = Vec::new();
@@ -714,11 +721,12 @@ mod tests {
                     );
                     stop.store(true, AtomicOrdering::Release);
                     let reads = reader.node_reads;
-                    assert!(
+                    assert_eq!(
                         reader
                             .lookup_batch(&[&queries[0]], &mut [None], &stop)
                             .await
-                            .is_err()
+                            .unwrap(),
+                        BuildOutcome::Stopped
                     );
                     assert_eq!(reader.node_reads, reads, "stop precedes additional reads");
                 })
@@ -750,10 +758,12 @@ mod tests {
                     expected.push(scalar_lookup(&mut scalar, key).await.unwrap());
                 }
                 let mut hits = vec![None; borrowed.len()];
-                batch
-                    .lookup_batch(&borrowed, &mut hits, &AtomicBool::new(false))
-                    .await
-                    .unwrap();
+                complete_work(
+                    batch
+                        .lookup_batch(&borrowed, &mut hits, &AtomicBool::new(false))
+                        .await
+                        .unwrap(),
+                );
                 assert_eq!(hits, expected);
                 assert_eq!(scalar.node_reads, 128);
                 assert_eq!(batch.node_reads, 1);
@@ -807,10 +817,12 @@ mod tests {
                 assert_eq!(budget.used(), charged, "readers retain planner admission");
                 let (key, row) = &expected[expected.len() / 2];
                 let mut hit = [None];
-                probe
-                    .lookup_batch(&[key], &mut hit, &AtomicBool::new(false))
-                    .await
-                    .unwrap();
+                complete_work(
+                    probe
+                        .lookup_batch(&[key], &mut hit, &AtomicBool::new(false))
+                        .await
+                        .unwrap(),
+                );
                 assert_eq!(hit, [Some(*row)]);
                 drop(probe);
                 assert_eq!(

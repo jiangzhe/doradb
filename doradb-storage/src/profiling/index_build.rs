@@ -58,7 +58,7 @@ pub struct HotExtractionMeasurements {
 /// Maxima are lifetime high-water marks and must not be subtracted. Failed or
 /// cancelled extractions publish no extraction sample. A completed extraction is
 /// not a published index; `create` records only completed CREATE publication.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexBuildStats {
     /// Completed CREATE publications, separate from successful extraction.
     pub create: CreateIndexMeasurements,
@@ -99,11 +99,136 @@ pub struct IndexBuildStats {
     pub scratch_peak_bytes: u64,
 }
 
+/// One completed cold source range, including ranges with no live rows.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdRunMeasurements {
+    /// Stable source partition identity.
+    pub partition: u64,
+    /// Inclusive assigned RowID boundary.
+    pub start_row_id: u64,
+    /// Exclusive assigned RowID boundary.
+    pub end_row_id: u64,
+    /// Visited LWC descriptors, including all-deleted blocks.
+    pub descriptors: u64,
+    /// Physical row membership before deletion filtering.
+    pub physical_rows: u64,
+    /// Encoded live rows.
+    pub live_rows: u64,
+    /// Logical encoded bytes, including inline keys.
+    pub encoded_bytes: u64,
+    /// Retained entry capacity plus outlined key allocations.
+    pub retained_bytes: u64,
+    /// Worker extraction and source-wait duration.
+    pub extraction_nanos: u64,
+    /// Synchronous sorting and local duplicate-check duration.
+    pub sort_nanos: u64,
+    /// Complete worker duration, including cooperative yields.
+    pub elapsed_nanos: u64,
+}
+
+/// Successful cold source work; stage spans may overlap and must not be added.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdExtractionMeasurements {
+    /// Last published CREATE's per-partition samples in source order.
+    pub runs: Vec<ColdRunMeasurements>,
+    /// Maximum selected source node height.
+    pub source_height: u64,
+    /// Sum of chosen-level entry counts.
+    pub source_entries: u64,
+    /// Sum of requested source partitions after workspace admission.
+    pub requested_partitions: u64,
+    /// Sum of actual partitions, including empty results.
+    pub partitions: u64,
+    /// Sum of retained nonempty runs.
+    pub nonempty_runs: u64,
+    /// Maximum normalized configured worker allowance.
+    pub configured_workers: u64,
+    /// Maximum effective admitted worker allowance.
+    pub workers: u64,
+    /// Maximum active source jobs, including their source-read and cooperative awaits.
+    pub concurrency_peak: u64,
+    /// Sum of source planning durations.
+    pub planning_nanos: u64,
+    /// Sum of preparation wall durations through final source collection.
+    pub preparation_nanos: u64,
+    /// Sum of extraction worker durations.
+    pub extraction_worker_nanos: u64,
+    /// Sum of local sorting/checking worker durations.
+    pub sort_worker_nanos: u64,
+    /// Sum of first-extraction-start to last-extraction-end spans.
+    pub extraction_wall_nanos: u64,
+    /// Sum of first-sort-start to last-sort-end spans.
+    pub sort_wall_nanos: u64,
+    /// Sum of visited LWC descriptors.
+    pub descriptors: u64,
+    /// Sum of physical membership before deletion filtering.
+    pub physical_rows: u64,
+    /// Sum of emitted live rows.
+    pub live_rows: u64,
+    /// Sum of encoded key bytes, including inline keys.
+    pub encoded_bytes: u64,
+    /// Sum of logical metadata reads, including planning and root-path rereads.
+    pub node_reads: u64,
+    /// Sum of logical LWC reads.
+    pub lwc_reads: u64,
+    /// Maximum simultaneous acquired metadata/LWC guard bytes.
+    pub pool_pin_bytes: u64,
+    /// Largest descriptor batch occupancy per worker.
+    pub descriptor_peak: u64,
+}
+
+impl ColdExtractionMeasurements {
+    fn record(&mut self, sample: &Self) {
+        self.runs.clone_from(&sample.runs);
+        for (target, value) in [
+            (&mut self.source_height, sample.source_height),
+            (&mut self.configured_workers, sample.configured_workers),
+            (&mut self.workers, sample.workers),
+            (&mut self.concurrency_peak, sample.concurrency_peak),
+            (&mut self.pool_pin_bytes, sample.pool_pin_bytes),
+            (&mut self.descriptor_peak, sample.descriptor_peak),
+        ] {
+            *target = (*target).max(value);
+        }
+        for (target, value) in [
+            (&mut self.source_entries, sample.source_entries),
+            (&mut self.requested_partitions, sample.requested_partitions),
+            (&mut self.partitions, sample.partitions),
+            (&mut self.nonempty_runs, sample.nonempty_runs),
+            (&mut self.planning_nanos, sample.planning_nanos),
+            (&mut self.preparation_nanos, sample.preparation_nanos),
+            (
+                &mut self.extraction_worker_nanos,
+                sample.extraction_worker_nanos,
+            ),
+            (&mut self.sort_worker_nanos, sample.sort_worker_nanos),
+            (
+                &mut self.extraction_wall_nanos,
+                sample.extraction_wall_nanos,
+            ),
+            (&mut self.sort_wall_nanos, sample.sort_wall_nanos),
+            (&mut self.descriptors, sample.descriptors),
+            (&mut self.physical_rows, sample.physical_rows),
+            (&mut self.live_rows, sample.live_rows),
+            (&mut self.encoded_bytes, sample.encoded_bytes),
+            (&mut self.node_reads, sample.node_reads),
+            (&mut self.lwc_reads, sample.lwc_reads),
+        ] {
+            *target += value;
+        }
+    }
+}
+
 /// Cold index construction counters; scratch is admitted capacity, not process RSS.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColdBuildMeasurements {
-    /// Static construction control-object sizes, separate from admitted scratch.
+    /// Full cold merge attribution, including direct single-run borrowing.
+    pub merge: MergeMeasurements,
+    /// Maximum known source/construction control-object footprint, separate from admitted scratch.
+    /// Excludes executor internals and allocator metadata.
     pub fixed_overhead_bytes: u64,
     /// Effective packing worker allowance.
     pub workers: u64,
@@ -135,16 +260,18 @@ pub struct ColdBuildMeasurements {
     pub scratch_peak_bytes: u64,
     /// Peak retained resident input capacity.
     pub input_bytes: u64,
-    /// Maximum pool-owned bytes pinned by serial cold traversal.
+    /// Maximum pool-owned bytes pinned by parallel cold traversal.
     /// Zero for builds that skip cold traversal.
     pub pool_pin_bytes: u64,
 }
 
 /// Successful CREATE publications, with worker sums distinct from wall durations.
 /// Byte capacities, settings and longest intervals are engine-lifetime maxima.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndexMeasurements {
+    /// Parallel cold source extraction and latest per-run balance.
+    pub cold_source: ColdExtractionMeasurements,
     /// Completed-root validation work and admitted resources.
     pub validation: ColdHotMeasurements,
     /// Streaming cold construction measurements.
@@ -155,9 +282,9 @@ pub struct CreateIndexMeasurements {
     pub cold_entries: u64,
     /// Largest retained cold vector capacity plus outlined keys; excludes allocator overhead.
     pub retained_cold_bytes: u64,
-    /// Sum of cold collection wall durations.
+    /// Sum of cold planning/extraction preparation wall durations, including overlapped local sorts.
     pub cold_collect_nanos: u64,
-    /// Sum of cold sorting and cold/cold validation wall durations.
+    /// Sum of local cold sort/check worker durations; overlaps extraction and excludes global merge validation.
     pub cold_sort_nanos: u64,
     /// Sum of unpublished DiskTree construction wall durations.
     pub cold_build_nanos: u64,
@@ -178,7 +305,7 @@ pub(crate) struct IndexBuildProfiler(Mutex<IndexBuildStats>);
 impl IndexBuildProfiler {
     /// Read a coherent snapshot without resetting counters or maxima.
     pub(crate) fn snapshot(&self) -> IndexBuildStats {
-        *self.0.lock()
+        self.0.lock().clone()
     }
 
     /// Record only after installation, cleanup and layout/history publication succeed.
@@ -194,6 +321,8 @@ impl IndexBuildProfiler {
         let create = &mut stats.create;
         create.hot.record(extraction, merge, packed, cleanup_nanos);
         create.validation.record(sample.validation);
+        create.cold_source.record(&sample.cold_source);
+        create.cold.merge.record(&sample.cold.merge);
         create.cold.fixed_overhead_bytes = create
             .cold
             .fixed_overhead_bytes
@@ -403,12 +532,42 @@ pub struct MergeMeasurements {
     pub boundary_bytes: u64,
     /// Maximum reference allocation capacity in any one partition.
     pub max_reference_bytes: u64,
-    /// Upper bound on simultaneous reference capacity at the admitted worker limit.
+    /// Upper bound on simultaneously retained reference capacity, including preadmitted cold streams.
     pub active_reference_bytes: u64,
     /// Incremental validation fields in the retained plan, streams and completions.
     pub validation_bytes: u64,
     /// Shared admission high-water, including resident source storage.
     pub scratch_peak_bytes: u64,
+}
+
+impl MergeMeasurements {
+    /// Aggregate complete merges, keeping sums and lifetime maxima distinct.
+    pub(crate) fn record(&mut self, merge: &Self) {
+        self.entries += merge.entries;
+        self.runs += merge.runs;
+        self.workers = self.workers.max(merge.workers);
+        self.partitions += merge.partitions;
+        self.batch_entries = self.batch_entries.max(merge.batch_entries);
+        self.boundary_wall_nanos += merge.boundary_wall_nanos;
+        self.cut_worker_nanos += merge.cut_worker_nanos;
+        self.max_cut_nanos = self.max_cut_nanos.max(merge.max_cut_nanos);
+        self.consumption_wall_nanos += merge.consumption_wall_nanos;
+        self.first_batch_nanos = self.first_batch_nanos.max(merge.first_batch_nanos);
+        self.merge_check_nanos += merge.merge_check_nanos;
+        self.max_batch_nanos = self.max_batch_nanos.max(merge.max_batch_nanos);
+        self.max_job_nanos = self.max_job_nanos.max(merge.max_job_nanos);
+        self.job_worker_nanos += merge.job_worker_nanos;
+        self.consumer_worker_nanos += merge.consumer_worker_nanos;
+        self.duplicate_comparisons += merge.duplicate_comparisons;
+        self.boundary_bytes = self.boundary_bytes.max(merge.boundary_bytes);
+        self.max_reference_bytes = self.max_reference_bytes.max(merge.max_reference_bytes);
+        self.active_reference_bytes = self
+            .active_reference_bytes
+            .max(merge.active_reference_bytes);
+        self.validation_bytes = self.validation_bytes.max(merge.validation_bytes);
+        self.scratch_peak_bytes = self.scratch_peak_bytes.max(merge.scratch_peak_bytes);
+        self.checked |= merge.checked;
+    }
 }
 
 /// Local batch counters; no per-entry clocks or shared writes.
@@ -559,34 +718,7 @@ impl HotIndexMeasurements {
         self.extraction.page_target = self.extraction.page_target.max(extraction.page_target);
         self.extraction.planned_groups += extraction.planned_groups;
         self.extraction.nonempty_runs += extraction.nonempty_runs;
-        self.merge.entries += merge.entries;
-        self.merge.runs += merge.runs;
-        self.merge.workers = self.merge.workers.max(merge.workers);
-        self.merge.partitions += merge.partitions;
-        self.merge.batch_entries = self.merge.batch_entries.max(merge.batch_entries);
-        self.merge.boundary_wall_nanos += merge.boundary_wall_nanos;
-        self.merge.cut_worker_nanos += merge.cut_worker_nanos;
-        self.merge.max_cut_nanos = self.merge.max_cut_nanos.max(merge.max_cut_nanos);
-        self.merge.consumption_wall_nanos += merge.consumption_wall_nanos;
-        self.merge.first_batch_nanos = self.merge.first_batch_nanos.max(merge.first_batch_nanos);
-        self.merge.merge_check_nanos += merge.merge_check_nanos;
-        self.merge.max_batch_nanos = self.merge.max_batch_nanos.max(merge.max_batch_nanos);
-        self.merge.max_job_nanos = self.merge.max_job_nanos.max(merge.max_job_nanos);
-        self.merge.job_worker_nanos += merge.job_worker_nanos;
-        self.merge.consumer_worker_nanos += merge.consumer_worker_nanos;
-        self.merge.duplicate_comparisons += merge.duplicate_comparisons;
-        self.merge.boundary_bytes = self.merge.boundary_bytes.max(merge.boundary_bytes);
-        self.merge.max_reference_bytes = self
-            .merge
-            .max_reference_bytes
-            .max(merge.max_reference_bytes);
-        self.merge.active_reference_bytes = self
-            .merge
-            .active_reference_bytes
-            .max(merge.active_reference_bytes);
-        self.merge.validation_bytes = self.merge.validation_bytes.max(merge.validation_bytes);
-        self.merge.scratch_peak_bytes = self.merge.scratch_peak_bytes.max(merge.scratch_peak_bytes);
-        self.merge.checked |= merge.checked;
+        self.merge.record(merge);
         self.leaf_planning_nanos += packed.leaf_planning_nanos;
         self.parent_planning_nanos += packed.parent_planning_nanos;
         self.direct_parent_nanos += packed.direct_parent_nanos;

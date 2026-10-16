@@ -23,6 +23,13 @@ We rely on tooling to enforce style.
 *   **Public API Documentation**: Every public `struct`, `trait`, `enum`, `const`, and `method/function` **MUST** have a descriptive `///` doc comment.
 *   **Doc Placement**: Documentation comments (`///` or `//!`) must always be placed **above** any attributes (e.g., `#[derive(...)]`, `#[must_use]`).
 
+### Inlining
+
+Add `#[inline]` when it may improve performance, especially for small or frequently
+called helpers. A measured speedup is not required; keep the hint even when the
+compiler already inlines the function. Avoid blanket annotations. Reserve
+`#[inline(always)]` for cases supported by profiling or code-generation evidence.
+
 ## 3. Architecture & Patterns
 
 ### Module Organization & Visibility
@@ -50,6 +57,7 @@ We rely on tooling to enforce style.
     *   **Rule**: Blocking locks must only be used for **very small and fast** operations (e.g., updating a counter, small state change).
 *   **Async Locks**: Use `crate::latch::Mutex` (which supports `lock_async()`) or `async_lock::RwLock` for operations that may involve async waiting.
 *   **Avoid Blocking**: In async contexts, never block the thread for long periods.
+*   **Cooperative Stop Boundaries**: Check stop between work units, not inside row/key loops. Let started units finish and drain accepted jobs during cleanup.
 
 ### I/O Abstraction
 *   **Use `crate::io`**: All file I/O must go through the `crate::io` module.

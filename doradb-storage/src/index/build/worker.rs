@@ -1,6 +1,6 @@
 use super::{
-    BudgetedVec, DuplicateCheck, HotBuildSource, IndexBuildEntry, JobCompletion, LocalDuplicates,
-    MemoryReservation, SortedRun,
+    BudgetedVec, BuildOutcome, DuplicateCheck, HotBuildSource, IndexBuildEntry, JobCompletion,
+    LocalDuplicates, MemoryReservation, SortedRun,
 };
 use crate::buffer::guard::PageGuard;
 use crate::error::{
@@ -40,10 +40,11 @@ pub(super) fn submit(
 }
 
 /// Collect first adjacent equality only when the invocation requires checking.
+/// Callers observe cooperative stop before and after this synchronous scan.
+#[inline]
 pub(super) fn local_duplicates(
     entries: &[IndexBuildEntry],
     policy: DuplicateCheck,
-    stop: &AtomicBool,
 ) -> LocalDuplicates {
     if policy == DuplicateCheck::Skip {
         return LocalDuplicates::Unchecked;
@@ -53,9 +54,6 @@ pub(super) fn local_duplicates(
             return LocalDuplicates::Checked {
                 first_duplicate_position: Some(position),
             };
-        }
-        if position % 256 == 0 && stop.load(Ordering::Acquire) {
-            return LocalDuplicates::Unchecked;
         }
     }
     LocalDuplicates::Checked {
@@ -68,13 +66,13 @@ async fn extract_group(
     stop: &AtomicBool,
     group: usize,
     pages: Range<usize>,
-) -> RuntimeOrFatalResult<Option<Arc<SortedRun>>> {
+) -> RuntimeOrFatalResult<BuildOutcome<Arc<SortedRun>>> {
     #[cfg(feature = "profiling")]
     let started = Instant::now();
     #[cfg(test)]
     source.test.before(group).await?;
     if stop.load(Ordering::Acquire) {
-        return Ok(None);
+        return Ok(BuildOutcome::Stopped);
     }
     let budget = &source.budget;
     let mut run = SortedRun {
@@ -85,8 +83,8 @@ async fn extract_group(
         #[cfg(feature = "profiling")]
         profile: HotExtractionWorkerProfile::default(),
     };
-    if !extract_rows(source, stop, pages, &mut run).await? {
-        return Ok(None);
+    if let BuildOutcome::Stopped = extract_rows(source, stop, pages, &mut run).await? {
+        return Ok(BuildOutcome::Stopped);
     }
     #[cfg(feature = "profiling")]
     let sort_started = Instant::now();
@@ -95,13 +93,13 @@ async fn extract_group(
             .sort_unstable_by(|left, right| left.key.cmp(&right.key));
     }
     if stop.load(Ordering::Acquire) {
-        return Ok(None);
+        return Ok(BuildOutcome::Stopped);
     }
     #[cfg(feature = "profiling")]
     let duplicate_started = Instant::now();
-    run.duplicates = local_duplicates(&run.entries, source.key.duplicates, stop);
+    run.duplicates = local_duplicates(&run.entries, source.key.duplicates);
     if stop.load(Ordering::Acquire) {
-        return Ok(None);
+        return Ok(BuildOutcome::Stopped);
     }
     #[cfg(feature = "profiling")]
     {
@@ -113,7 +111,7 @@ async fn extract_group(
             source.key.duplicates == DuplicateCheck::Collect,
         );
     }
-    Ok(Some(Arc::new(run)))
+    Ok(BuildOutcome::Complete(Arc::new(run)))
 }
 
 async fn extract_rows(
@@ -121,14 +119,11 @@ async fn extract_rows(
     stop: &AtomicBool,
     pages: Range<usize>,
     run: &mut SortedRun,
-) -> RuntimeOrFatalResult<bool> {
+) -> RuntimeOrFatalResult<BuildOutcome<()>> {
     let group = run.group_id;
     let mut projection =
         Vec::with_capacity(source.key.columns.len() + usize::from(!source.key.unique));
     for (seq, page_idx) in pages.enumerate() {
-        if stop.load(Ordering::Acquire) {
-            return Ok(false);
-        }
         let descriptor = source.pages[page_idx];
         let guard = source
             .table
@@ -170,12 +165,19 @@ async fn extract_rows(
             projection.clear();
         }
         drop(guard);
-        // Process whole pages and release their guards before each 16-page yield.
+        // Release page guards, then yield and observe stop after each 16-page batch.
         if seq % 16 == 15 {
             yield_now().await;
+            if stop.load(Ordering::Acquire) {
+                return Ok(BuildOutcome::Stopped);
+            }
         }
     }
-    Ok(!stop.load(Ordering::Acquire))
+    Ok(if stop.load(Ordering::Acquire) {
+        BuildOutcome::Stopped
+    } else {
+        BuildOutcome::Complete(())
+    })
 }
 
 fn project(source: &HotBuildSource, row: &impl RowRead, projection: &mut Vec<Val>) {

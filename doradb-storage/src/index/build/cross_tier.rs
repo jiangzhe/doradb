@@ -3,12 +3,12 @@
 //! Owns strategy selection, jobs, conflict evidence and coverage verification.
 //! Cold traversal lives in `cold_reader` and resource lifetimes in `sealed_cold`.
 //! Hot-driven checks share packing jobs; cold-driven jobs settle before packing.
-use super::SortedRuns;
 use super::cold_reader::{
     ColdBatch, ColdRange, ColdReadAdmission, ColdReader, LOOKUP_BATCH_ENTRIES, plan_ranges,
 };
-use super::merge::{HotBatch, MergeCompletion, PreparedMerge, execution_error, observe_stop};
+use super::merge::{HotBatch, MergeCompletion, PreparedMerge, execution_error};
 use super::sealed_cold::{ColdBuildIdentity, ColdReadAuthority};
+use super::{BuildOutcome, SortedRuns};
 use crate::completion::Completion;
 use crate::error::{ResourceError, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::RowID;
@@ -373,13 +373,15 @@ impl CrossTierCursor {
         &mut self,
         batch: &HotBatch<'_>,
         stop: &AtomicBool,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<()>> {
         let range = self.plan.hot.range(self.summary.partition);
         let ranks = batch.ranks();
         if ranks.start != range.start + self.summary.consumed || ranks.end > range.end {
             return Err(execution_error("cross-tier batch rank mismatch"));
         }
-        observe_stop(stop)?;
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
         #[cfg(test)]
         if self.summary.consumed == 0 {
             self.plan.hooks.before(self.summary.partition).await?;
@@ -401,9 +403,12 @@ impl CrossTierCursor {
                             .key
                             .as_bytes();
                     }
-                    reader
+                    if let BuildOutcome::Stopped = reader
                         .lookup_batch(&keys[..count], &mut hits[..count], stop)
-                        .await?;
+                        .await?
+                    {
+                        return Ok(BuildOutcome::Stopped);
+                    }
                     #[cfg(feature = "profiling")]
                     {
                         self.summary.measurements.probes += count as u64;
@@ -431,8 +436,8 @@ impl CrossTierCursor {
                         batch.inhibit_construction();
                     }
                 }
-                if forward || (start + count).is_multiple_of(256) {
-                    observe_stop(stop)?;
+                // Forward lookup already yields after each lookup batch.
+                if !forward && (start + count).is_multiple_of(256) {
                     yield_now().await;
                 }
             }
@@ -443,9 +448,11 @@ impl CrossTierCursor {
             self.summary.measurements.worker_nanos += (end - started).as_nanos() as u64;
             extend_span(&mut self.summary.span, Some((started, end)));
         }
-        observe_stop(stop)?;
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
         self.summary.consumed += ranks.len();
-        Ok(())
+        Ok(BuildOutcome::Complete(()))
     }
 
     /// Transfer compact evidence after the stream's final consumption check.
@@ -474,8 +481,8 @@ struct ReverseSummary {
     exhausted: bool,
 }
 
-type RangeResult = RuntimeOrFatalResult<Vec<ColdRange>>;
-type RangeJob = Arc<Completion<RuntimeOrFatalResult<ReverseSummary>>>;
+type RangeResult = RuntimeOrFatalResult<BuildOutcome<Vec<ColdRange>>>;
+type RangeJob = Arc<Completion<RuntimeOrFatalResult<BuildOutcome<ReverseSummary>>>>;
 
 /// Retained planner and cold-range job ledger, independent of borrowed execution.
 pub(super) struct ReverseValidation {
@@ -524,11 +531,10 @@ impl ReverseValidation {
     /// Pool reservation accepts each finite job. Completion slots are the
     /// authoritative result through poison/shutdown; the parent retains this
     /// ledger, root leases and admission until every accepted read settles.
-    pub(super) async fn execute(&mut self) -> RuntimeOrFatalResult<()> {
+    pub(super) async fn execute(&mut self) -> RuntimeOrFatalResult<BuildOutcome<()>> {
         #[cfg(feature = "profiling")]
         self.started.get_or_insert_with(Instant::now);
-        if self.ranges.is_none() {
-            observe_stop(&self.stop)?;
+        if self.ranges.is_none() && !self.stop.load(AtomicOrdering::Acquire) {
             if self.planner.is_none() {
                 self.planner = Some(self.pool.submit_async(plan_ranges(
                     self.plan.selection.cold.clone(),
@@ -540,9 +546,9 @@ impl ReverseValidation {
             self.collect_planner().await;
         }
         while self.failure.is_none()
+            && !self.stop.load(AtomicOrdering::Acquire)
             && self.collected < self.ranges.as_ref().map_or(0, |ranges| ranges.len())
         {
-            observe_stop(&self.stop)?;
             let ranges = self.ranges.as_ref().unwrap();
             while self.submitted < ranges.len() && self.submitted - self.collected < self.jobs.len()
             {
@@ -558,8 +564,9 @@ impl ReverseValidation {
             }
             self.collect_next().await;
         }
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.stop.load(AtomicOrdering::Acquire) {
             self.settle().await?;
+            return Ok(BuildOutcome::Stopped);
         }
         if self
             .outputs
@@ -574,7 +581,7 @@ impl ReverseValidation {
                 .started
                 .map_or(0, |started| started.elapsed().as_nanos() as u64);
         }
-        Ok(())
+        Ok(BuildOutcome::Complete(()))
     }
 
     async fn collect_planner(&mut self) {
@@ -584,7 +591,11 @@ impl ReverseValidation {
             .map_err(|e| e.into_runtime_or_fatal(RuntimeError::IndexAccess))
             .and_then(|r| r)
         {
-            Ok(ranges) => self.ranges = Some(Arc::new(ranges)),
+            Ok(BuildOutcome::Complete(ranges)) => self.ranges = Some(Arc::new(ranges)),
+            Ok(BuildOutcome::Stopped) => debug_assert!(
+                self.stop.load(AtomicOrdering::Acquire),
+                "cold range planner returned Stopped without a stop request"
+            ),
             Err(error) => self.record(error),
         }
     }
@@ -598,12 +609,17 @@ impl ReverseValidation {
             .map_err(|e| e.into_runtime_or_fatal(RuntimeError::IndexAccess))
             .and_then(|r| r)
         {
-            Ok(summary) => self.outputs.push(summary),
+            Ok(BuildOutcome::Complete(summary)) => self.outputs.push(summary),
+            Ok(BuildOutcome::Stopped) => debug_assert!(
+                self.stop.load(AtomicOrdering::Acquire),
+                "reverse validation worker returned Stopped without a stop request"
+            ),
             Err(error) => self.record(error),
         }
     }
 
     fn record(&mut self, error: RuntimeOrFatalError) {
+        self.stop.store(true, AtomicOrdering::Release);
         self.failure = Some(match self.failure.take() {
             Some(old) => old.merge_cleanup(error),
             None => error,
@@ -631,7 +647,8 @@ impl ReverseValidation {
             .ranges
             .as_ref()
             .ok_or_else(|| execution_error("reverse ranges missing"))?;
-        if !Arc::ptr_eq(&self.plan, plan)
+        if self.stop.load(AtomicOrdering::Acquire)
+            || !Arc::ptr_eq(&self.plan, plan)
             || self.planner.is_some()
             || self.failure.is_some()
             || self.outputs.len() != ranges.len()
@@ -703,22 +720,25 @@ impl ReverseProbe {
         }
     }
 
+    /// Finish one borrowed batch between cooperative stop checks, yielding
+    /// between pairs of runs to bound each synchronous interval to 256 probes.
     async fn probe(
         &mut self,
         runs: &SortedRuns,
         batch: &ColdBatch<'_>,
         stop: &AtomicBool,
-    ) -> RuntimeOrFatalResult<u64> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<u64>> {
         assert!(
             batch.len() <= LOOKUP_BATCH_ENTRIES,
             "reverse lookup batch capacity"
         );
         self.matches[..batch.len()].fill(HotProbe::default());
         let mut comparisons = 0;
-        let mut probes = 0usize;
         #[cfg(feature = "profiling")]
         let mut started = Instant::now();
-        observe_stop(stop)?;
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
         for (run_index, run) in runs.runs().iter().enumerate() {
             for (index, found) in self.matches[..batch.len()].iter_mut().enumerate() {
                 let entries = run.entries();
@@ -747,19 +767,17 @@ impl ReverseProbe {
                         }
                     }
                 }
-                probes += 1;
-                if probes.is_multiple_of(256) {
-                    observe_stop(stop)?;
-                    #[cfg(feature = "profiling")]
-                    {
-                        self.max_sync_nanos =
-                            self.max_sync_nanos.max(started.elapsed().as_nanos() as u64);
-                    }
-                    yield_now().await;
-                    #[cfg(feature = "profiling")]
-                    {
-                        started = Instant::now();
-                    }
+            }
+            if run_index % 2 == 1 && run_index + 1 < runs.runs().len() {
+                #[cfg(feature = "profiling")]
+                {
+                    self.max_sync_nanos =
+                        self.max_sync_nanos.max(started.elapsed().as_nanos() as u64);
+                }
+                yield_now().await;
+                #[cfg(feature = "profiling")]
+                {
+                    started = Instant::now();
                 }
             }
         }
@@ -768,8 +786,10 @@ impl ReverseProbe {
         {
             self.max_sync_nanos = self.max_sync_nanos.max(started.elapsed().as_nanos() as u64);
         }
-        observe_stop(stop)?;
-        Ok(comparisons)
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
+        Ok(BuildOutcome::Complete(comparisons))
     }
 }
 
@@ -972,7 +992,7 @@ async fn run_reverse(
     ranges: Arc<Vec<ColdRange>>,
     part: usize,
     stop: Arc<AtomicBool>,
-) -> RuntimeOrFatalResult<ReverseSummary> {
+) -> RuntimeOrFatalResult<BuildOutcome<ReverseSummary>> {
     #[cfg(feature = "profiling")]
     let (_active, started) = (ActiveReader::new(plan.clone()), Instant::now());
     #[cfg(test)]
@@ -985,7 +1005,9 @@ async fn run_reverse(
     let mut probe = ReverseProbe::new(plan.hot.runs().runs().len());
     let mut summary = plan.summary(part);
     while let Some(batch) = reader.next_batch().await? {
-        observe_stop(&stop)?;
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
         let available = batch.len();
         let batch = batch.before(range.upper.as_ref().map(|key| key.as_slice()))?;
         if batch.len() == 0 {
@@ -996,7 +1018,11 @@ async fn run_reverse(
         {
             return Err(execution_error("reverse cursor precedes assigned range"));
         }
-        let comparisons = probe.probe(plan.hot.runs(), &batch, &stop).await?;
+        let BuildOutcome::Complete(comparisons) =
+            probe.probe(plan.hot.runs(), &batch, &stop).await?
+        else {
+            return Ok(BuildOutcome::Stopped);
+        };
         #[cfg(not(feature = "profiling"))]
         let _ = comparisons;
         #[cfg(feature = "profiling")]
@@ -1034,12 +1060,12 @@ async fn run_reverse(
     }
     #[cfg(test)]
     plan.hooks.after(part);
-    Ok(ReverseSummary {
+    Ok(BuildOutcome::Complete(ReverseSummary {
         summary,
         lower: range.lower.clone(),
         upper: range.upper.clone(),
         exhausted: true,
-    })
+    }))
 }
 
 #[cfg(feature = "profiling")]
@@ -1054,6 +1080,7 @@ fn extend_span(span: &mut Option<(Instant, Instant)>, next: Option<(Instant, Ins
 #[cfg(test)]
 mod tests {
     use super::super::cold_reader::{scalar_lookup, test_collect};
+    use super::super::complete_work;
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::{
@@ -1137,15 +1164,23 @@ mod tests {
         async fn consume(
             &self,
             mut stream: PartitionMergeStream,
-        ) -> RuntimeOrFatalResult<CompletedPartition<Self::Output>> {
+        ) -> RuntimeOrFatalResult<BuildOutcome<CompletedPartition<Self::Output>>> {
             let (_, part) = stream.identity();
             let mut cursor = self
                 .0
                 .as_ref()
                 .and_then(|cross| CrossTierCursor::new(cross.clone(), part));
-            while let Some(batch) = stream.next_batch()? {
-                if let Some(cursor) = &mut cursor {
-                    cursor.validate(&batch, &AtomicBool::new(false)).await?;
+            loop {
+                let batch = match stream.next_batch()? {
+                    BuildOutcome::Complete(Some(batch)) => batch,
+                    BuildOutcome::Complete(None) => break,
+                    BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
+                };
+                if let Some(cursor) = &mut cursor
+                    && let BuildOutcome::Stopped =
+                        cursor.validate(&batch, &AtomicBool::new(false)).await?
+                {
+                    return Ok(BuildOutcome::Stopped);
                 }
                 yield_now().await;
             }
@@ -1240,9 +1275,13 @@ mod tests {
                 if input.entries.is_empty() {
                     return None;
                 }
-                let mut run =
-                    SortedRun::finish(input.entries, input.payload, DuplicateCheck::Collect);
-                run.group_id = group;
+                let run = complete_work(SortedRun::finish_group(
+                    input.entries,
+                    input.payload,
+                    DuplicateCheck::Collect,
+                    group,
+                    &AtomicBool::new(false),
+                ));
                 Some(Arc::new(run))
             })
             .collect();
@@ -1254,6 +1293,7 @@ mod tests {
             .map(|entry| track_heap_drop(&entry.key))
             .collect();
         let runs = Arc::new(SortedRuns {
+            _run_admission: None,
             runs,
             duplicates: DuplicateCheck::Collect,
             budget: budget.clone(),
@@ -1356,6 +1396,27 @@ mod tests {
         BTreeKey::from(bytes.as_slice())
     }
 
+    async fn parallel_validation(
+        cold: &ColdReadAuthority,
+        pool: &QuiescentGuard<ThreadPool>,
+        method: ValidationMethod,
+        budget: MemoryBudget,
+    ) -> (MergePreparation, Arc<CrossTierPlan>) {
+        let runs = test_runs(
+            vec![(0..8192).map(|n| key(100_001 + n, 32)).collect()],
+            DuplicateCheck::Collect,
+            budget,
+        );
+        let mut selection = CrossTierSelection::select(cold, &runs, 2).unwrap();
+        selection.method = method;
+        assert!(selection.partitions > 1 && selection.ranges > 1);
+        let mut preparation =
+            MergePreparation::with_sizing(runs, pool.clone(), 2, selection.partitions, 128)
+                .unwrap();
+        let plan = preparation.execute().await.unwrap();
+        (preparation, CrossTierPlan::bind(plan, selection).unwrap())
+    }
+
     async fn check_method(
         cold: ColdReadAuthority,
         groups: Vec<Vec<BTreeKey>>,
@@ -1418,7 +1479,7 @@ mod tests {
             )
         });
         if let Some(reverse) = &mut reverse {
-            reverse.execute().await.unwrap();
+            complete_work(reverse.execute().await.unwrap());
         }
         let mut merge = MergeConsumption::new(plan.clone(), pool, Check(Some(cross.clone())));
         let result = merge.execute().await.unwrap();
@@ -1513,10 +1574,12 @@ mod tests {
                             if batch.len() == 0 {
                                 break;
                             }
-                            probe
-                                .probe(&runs, &batch, &AtomicBool::new(false))
-                                .await
-                                .unwrap();
+                            complete_work(
+                                probe
+                                    .probe(&runs, &batch, &AtomicBool::new(false))
+                                    .await
+                                    .unwrap(),
+                            );
                             for (index, found) in probe.matches[..batch.len()].iter().enumerate() {
                                 let query = key(expected_keys[seen], width);
                                 assert!(
@@ -1547,11 +1610,12 @@ mod tests {
                     let mut reader = ColdReader::new(cold, admission);
                     reader.seek(&[]).await.unwrap();
                     let batch = reader.next_batch().await.unwrap().unwrap();
-                    assert!(
+                    assert_eq!(
                         ReverseProbe::new(runs.runs().len())
                             .probe(&runs, &batch, &AtomicBool::new(true))
                             .await
-                            .is_err()
+                            .unwrap(),
+                        BuildOutcome::Stopped
                     );
                 })
                 .await;
@@ -1758,6 +1822,72 @@ mod tests {
         );
     }
 
+    /// Purpose: Drain reverse-validation workers after cancellation while preserving a late source failure.
+    /// Expected: Stop-only settlement succeeds, a gated integrity failure retains its cause, and stopped validation never certifies coverage.
+    #[test]
+    fn reverse_cancellation_preserves_source_failures() {
+        use futures::FutureExt;
+        use futures::future::{Either, select};
+        smol::block_on(async {
+            with_cold(entries((0..8192).step_by(2), 32), async |cold| {
+                for fail in [false, true] {
+                    let scope = pool().await;
+                    let pool = scope.0.dependency::<ThreadPool>();
+                    let budget = MemoryBudget::new(16 * 1024 * 1024);
+                    let (preparation, cross) = parallel_validation(
+                        &cold,
+                        &pool,
+                        ValidationMethod::Reverse,
+                        budget.clone(),
+                    )
+                    .await;
+                    let (entered, entering) = flume::unbounded();
+                    let (release, gate) = flume::bounded(1);
+                    *cross.hooks.entered.lock() = Some(entered);
+                    *cross.hooks.gate.lock() = Some(gate);
+                    cross.hooks.fail.store(fail, AtomicOrdering::Release);
+                    let mut reverse = ReverseValidation::new(
+                        cross.clone(),
+                        pool,
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    let mut execute = Box::pin(reverse.execute());
+                    let admitted = Box::pin(async {
+                        let mut parts = [
+                            entering.recv_async().await.unwrap(),
+                            entering.recv_async().await.unwrap(),
+                        ];
+                        parts.sort_unstable();
+                        assert_eq!(parts, [0, 1]);
+                    });
+                    assert!(matches!(
+                        select(execute.as_mut(), admitted).await,
+                        Either::Right(((), _))
+                    ));
+                    drop(execute);
+                    assert!(reverse.settle().now_or_never().is_none());
+                    release.send(()).unwrap();
+                    match reverse.settle().await {
+                        Ok(()) => assert!(!fail),
+                        Err(RuntimeOrFatalError::Runtime(error)) if fail => {
+                            assert!(error.contains::<DataIntegrityError>());
+                            assert!(!format!("{error:?}").contains("secondary cleanup failure"));
+                        }
+                        result => panic!("unexpected reverse settlement: {result:?}"),
+                    }
+                    assert_eq!((reverse.submitted, reverse.collected), (2, 2));
+                    assert!(reverse.jobs.iter().all(Option::is_none));
+                    assert!(reverse.verify(&cross).is_err());
+                    drop(reverse);
+                    drop(cross);
+                    drop(preparation);
+                    assert_eq!(budget.used(), 0);
+                }
+            })
+            .await;
+        });
+    }
+
     /// Purpose: Keep all methods parallel below the construction partition target, including cold keys outside the hot interval.
     /// Expected: A second job completes while the first is gated, accepted work survives observer loss, and integrity errors retain their typed cause after drain.
     #[test]
@@ -1773,24 +1903,14 @@ mod tests {
                     for fail in [false, true] {
                         let scope = pool().await;
                         let pool = scope.0.dependency::<ThreadPool>();
-                        let runs = test_runs(
-                            vec![(0..8192).map(|n| key(100_001 + n, 32)).collect()],
-                            DuplicateCheck::Collect,
+                        let (_preparation, cross) = parallel_validation(
+                            &cold,
+                            &pool,
+                            method,
                             MemoryBudget::new(16 * 1024 * 1024),
-                        );
-                        let mut selection = CrossTierSelection::select(&cold, &runs, 2).unwrap();
-                        selection.method = method;
-                        assert!(selection.partitions > 1 && selection.ranges > 1);
-                        let mut preparation = MergePreparation::with_sizing(
-                            runs,
-                            pool.clone(),
-                            2,
-                            selection.partitions,
-                            128,
                         )
-                        .unwrap();
-                        let plan = preparation.execute().await.unwrap();
-                        let cross = CrossTierPlan::bind(plan.clone(), selection).unwrap();
+                        .await;
+                        let plan = cross.hot.clone();
                         let (entered, entering) = flume::unbounded();
                         let (finished, finishing) = flume::unbounded();
                         let (release, gate) = flume::bounded(1);
@@ -1827,7 +1947,7 @@ mod tests {
                                 };
                                 assert!(error.contains::<DataIntegrityError>());
                             } else {
-                                result.unwrap();
+                                complete_work(result.unwrap());
                                 assert_eq!(reverse.verify(&cross).unwrap(), None);
                             }
                             assert!(reverse.jobs.iter().all(Option::is_none));
@@ -1887,7 +2007,7 @@ mod tests {
                 let cross = CrossTierPlan::bind(plan, selection).unwrap();
                 let mut reverse =
                     ReverseValidation::new(cross.clone(), pool, Arc::new(AtomicBool::new(false)));
-                reverse.execute().await.unwrap();
+                complete_work(reverse.execute().await.unwrap());
                 assert_eq!(reverse.verify(&cross).unwrap().unwrap().hot_rank, 0);
                 let saved = reverse.outputs[0].summary.hot.clone();
                 reverse.outputs[0].summary.hot = Arc::new(());
@@ -1986,7 +2106,7 @@ mod tests {
                             )
                         });
                         if let Some(reverse) = &mut reverse {
-                            reverse.execute().await.unwrap();
+                            complete_work(reverse.execute().await.unwrap());
                         }
                         let mut merge = MergeConsumption::new(
                             plan.clone(),
@@ -2165,7 +2285,7 @@ mod tests {
                                     let mut output = [None; LOOKUP_BATCH_ENTRIES];
                                     for chunk in keys.chunks(LOOKUP_BATCH_ENTRIES) {
                                         for (target, key) in borrowed.iter_mut().zip(chunk) { *target = key.as_bytes(); }
-                                        reader.lookup_batch(&borrowed[..chunk.len()], &mut output[..chunk.len()], &stop).await.unwrap();
+                                        complete_work(reader.lookup_batch(&borrowed[..chunk.len()], &mut output[..chunk.len()], &stop).await.unwrap());
                                         hits += black_box(&output[..chunk.len()]).iter().filter(|row| row.is_some()).count();
                                         batches += 1;
                                     }
@@ -2193,7 +2313,7 @@ mod tests {
                                     let start = Instant::now();
                                     if batched {
                                         while let Some(batch) = reader.next_batch().await.unwrap() {
-                                            comparisons += probe.probe(&runs, &batch, &AtomicBool::new(false)).await.unwrap();
+                                            comparisons += complete_work(probe.probe(&runs, &batch, &AtomicBool::new(false)).await.unwrap());
                                             for found in black_box(&probe.matches[..batch.len()]) {
                                                 if found.first.is_some() { hits += 1; ranks += found.rank; }
                                             }
