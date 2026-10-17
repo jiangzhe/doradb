@@ -903,8 +903,9 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     indivisible and planning proportional to P. Single-run construction borrows
     input directly, without co-rank jobs or reference buffers; construction
     concurrency remains independent and scratch admission stays fail-fast.
-    Incremental batches hold at most 64 descriptors and no metadata pin across
-    LWC access. Exact plan/partition/exhaustion certificates include empty ranges;
+    Incremental batches hold at most 64 descriptors. Traversal releases metadata
+    guards before further metadata or LWC loads, preserving readonly-pool progress.
+    Exact plan/partition/exhaustion certificates include empty ranges;
     Operation/Runtime/Fatal transport preserves source causes. Complete resident
     runs enter construction directly after the capture-to-merge barrier.
   - Goals: Feed resident runs directly into durable construction. Include
@@ -922,7 +923,7 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - Task Doc: `docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md`
   - Task Issue: `#1149`
   - Phase Status: done
-  - Implementation Summary: Delivered bounded resident cold extraction with a common 4W source-partition policy, exact completion and direct durable construction. Actual single-run input retains the merge bypass; settled duplicates and sealed key destruction preserve publication authority. Validation passed 2,363 workspace tests, 2,097 profiling-disabled storage tests and the 19-file style gate. Initial parallel measurements improved four-worker cold latency with higher CPU/RSS. The forced single-run policy for one worker was withdrawn after workload-dependent results and larger entry-buffer growth peaks; backlog 000212 now includes unified memory-bounded run formation and shared merge improvements. Variable redo fsync waits explain the apparent four-worker regression observed during that experiment. Backlogs 000104/000214 remain archived, 000213 retains selector calibration, and Phase 4 is unchanged. [Task Resolve Sync: docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md @ 2026-10-16]
+  - Implementation Summary: Delivered bounded resident cold extraction with the common 4W policy and direct durable construction. Coordinate-based traversal prevents readonly-pool exhaustion; typed cooperative stop preserves exact completion, cleanup and late failure causes. Cold pin-byte accounting was removed while validation profiling remains. Verification passed 2,364 workspace tests, 2,098 profiling-disabled storage tests and the 19-file/208-test style gate. Historical benchmarks improved four-worker cold latency with higher CPU/RSS; the forced single-worker single-run policy was withdrawn after workload-dependent results. Redo fsync variability explained the apparent four-worker regression. Backlogs 000212/000213 retain external sorting, unified run sizing and selector calibration; 000104/000214 remain archived. Phase 4 prerequisites are unchanged. [Task Resolve Sync: docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md @ 2026-10-17]
   - Related Backlogs:
     - `docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md`
     - `docs/backlogs/000212-external-memory-create-index-cold-runs.md`
