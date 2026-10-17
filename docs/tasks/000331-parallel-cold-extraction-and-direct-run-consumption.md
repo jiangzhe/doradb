@@ -94,12 +94,11 @@ routing structure after normal page-load validation.
 
 ### Incremental extraction and exact completion
 
-Each worker binary-searches its lower bound and retains a stack of loaded nodes,
-one per tree level. Ancestors and partial leaves survive batch boundaries, so a
-range reads each visited metadata node once. Reusable batches copy at most 64
-descriptors with compact identity and deletion payloads. Traversal trusts the
-captured tree without extra route validation. Metadata pins remain accounted
-alongside LWC pins and are released on exhaustion, failure or cursor drop.
+Each worker binary-searches its lower bound and resumes traversal without
+retaining metadata guards across reads or batch consumption. This prevents pool
+exhaustion at high worker counts. Reusable batches copy at most 64 descriptors
+with compact identity and deletion payloads. Traversal trusts the captured tree
+without extra route validation.
 
 Every LWC binding and physical row count is checked, including all-deleted
 blocks. Extraction follows sparse physical membership, durable ordinal deletes
@@ -154,7 +153,7 @@ ordering and ownership rules.
 ### Measurements
 
 Successful CREATE reports requested partitions (4W after workspace admission),
-actual ranges, concurrency, rows/bytes, reads and pin peaks.
+actual ranges, concurrency, rows/bytes and reads.
 Latest-success per-run gauges retain bounds, rows, bytes, capacity and timing;
 cold construction reports co-rank and streaming merge measurements.
 
@@ -163,7 +162,7 @@ sums. First-start/last-end spans overlap and must not be added. Legacy
 `cold_collect_nanos` covers complete preparation, including overlapping sorts;
 `cold_sort_nanos` reports local sort/check worker time. Scratch excludes pool
 frames, allocator/executor internals and retained reporting copies; known
-control-object footprint and pool pins are reported separately.
+control-object footprint is reported separately.
 
 ## Implementation Notes
 
@@ -213,9 +212,9 @@ measurements do not establish device-cold or larger-than-memory performance.
 
 ### Verification
 
-- Workspace nextest: 2,363 passed, two skipped; profiling-disabled storage:
-  2,097 passed, two skipped. Strict Clippy passes in both configurations.
-- Branch style gate: 19 Rust files, 207 selected tests, zero violations;
+- Workspace nextest: 2,364 passed, two skipped; profiling-disabled storage:
+  2,098 passed, two skipped. Strict Clippy passes in both configurations.
+- Branch style gate: 19 Rust files, 208 selected tests, zero violations;
   formatting and semantic assertion/overlap review completed.
 - Before the lifecycle refactor, instrumented workspace passed with 90.77%
   combined extraction/catalog/merge coverage (1,977/2,178 lines). Fault tests cover
@@ -235,8 +234,8 @@ profiling snapshots are Clone rather than Copy; persisted formats are unchanged.
 - Empty, small and large leaf roots; branch/taller roots; threshold neighbors;
   sparse gaps, noncontiguous blocks, uneven subtrees and exact rank cuts.
   Concatenated traversal matches an independent descriptor/identity/delete oracle.
-- Retained leaf/ancestor frames across batches, one metadata read per visited
-  node, and pin/admission release on exhaustion and early drop.
+- Exact traversal resumption, pin/admission release, and LWC read progress with
+  many suspended cursors sharing the minimum readonly pool.
 - Actual checksummed LWC binding/count corruption, including all-deleted ranges.
 - Indexed projection, outlined/composite keys, both index modes, durable/current
   deletion filtering, cold-to-hot replacement and native WriteConflict transport.

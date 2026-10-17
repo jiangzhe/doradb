@@ -173,8 +173,6 @@ pub struct ColdExtractionMeasurements {
     pub node_reads: u64,
     /// Sum of logical LWC reads.
     pub lwc_reads: u64,
-    /// Maximum simultaneous acquired metadata/LWC guard bytes.
-    pub pool_pin_bytes: u64,
     /// Largest descriptor batch occupancy per worker.
     pub descriptor_peak: u64,
 }
@@ -187,7 +185,6 @@ impl ColdExtractionMeasurements {
             (&mut self.configured_workers, sample.configured_workers),
             (&mut self.workers, sample.workers),
             (&mut self.concurrency_peak, sample.concurrency_peak),
-            (&mut self.pool_pin_bytes, sample.pool_pin_bytes),
             (&mut self.descriptor_peak, sample.descriptor_peak),
         ] {
             *target = (*target).max(value);
@@ -260,9 +257,6 @@ pub struct ColdBuildMeasurements {
     pub scratch_peak_bytes: u64,
     /// Peak retained resident input capacity.
     pub input_bytes: u64,
-    /// Maximum pool-owned bytes pinned by parallel cold traversal.
-    /// Zero for builds that skip cold traversal.
-    pub pool_pin_bytes: u64,
 }
 
 /// Successful CREATE publications, with worker sums distinct from wall durations.
@@ -345,7 +339,6 @@ impl IndexBuildProfiler {
             .scratch_peak_bytes
             .max(sample.cold.scratch_peak_bytes);
         create.cold.input_bytes = create.cold.input_bytes.max(sample.cold.input_bytes);
-        create.cold.pool_pin_bytes = create.cold.pool_pin_bytes.max(sample.cold.pool_pin_bytes);
         create.cold_entries += sample.cold_entries;
         create.retained_cold_bytes = create.retained_cold_bytes.max(sample.retained_cold_bytes);
         create.cold_collect_nanos += sample.cold_collect_nanos;

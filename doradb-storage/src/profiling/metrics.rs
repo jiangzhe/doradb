@@ -228,7 +228,6 @@ fn push_create_index_metrics(
     );
     peak!("cold_source.workers", cold_source.workers);
     peak!("cold_source.concurrency_peak", cold_source.concurrency_peak);
-    peak!("cold_source.pool_pin_bytes", cold_source.pool_pin_bytes);
     peak!("cold_source.descriptor_peak", cold_source.descriptor_peak);
     counter!("cold_source.source_entries", cold_source.source_entries);
     counter!(
@@ -315,7 +314,6 @@ fn push_create_index_metrics(
     counter!("cold.completion_nanos", cold.completion_nanos);
     peak!("cold.scratch_peak_bytes", cold.scratch_peak_bytes);
     peak!("cold.input_bytes", cold.input_bytes);
-    peak!("cold.pool_pin_bytes", cold.pool_pin_bytes);
     counter!("cold_entries", cold_entries);
     counter!("cold_collect_nanos", cold_collect_nanos);
     counter!("cold_sort_nanos", cold_sort_nanos);
@@ -480,7 +478,6 @@ fn create_index_peak(name: &str) -> bool {
             | "create_index.cold_source.configured_workers"
             | "create_index.cold_source.workers"
             | "create_index.cold_source.concurrency_peak"
-            | "create_index.cold_source.pool_pin_bytes"
             | "create_index.cold_source.descriptor_peak"
             | "create_index.cold.merge.workers"
             | "create_index.cold.merge.batch_entries"
@@ -504,7 +501,6 @@ fn create_index_peak(name: &str) -> bool {
             | "create_index.cold.write_peak"
             | "create_index.cold.scratch_peak_bytes"
             | "create_index.cold.input_bytes"
-            | "create_index.cold.pool_pin_bytes"
             | "create_index.retained_cold_bytes"
             | "create_index.max_cold_hot_sync_nanos"
             | "create_index.max_sync_nanos"
@@ -1539,13 +1535,6 @@ mod tests {
             Count,
         ),
         (
-            "create_index.cold_source.pool_pin_bytes",
-            11,
-            11,
-            LifetimePeak,
-            Bytes,
-        ),
-        (
             "create_index.cold_source.descriptor_peak",
             11,
             11,
@@ -1788,13 +1777,6 @@ mod tests {
             Bytes,
         ),
         ("create_index.cold.input_bytes", 0, 0, LifetimePeak, Bytes),
-        (
-            "create_index.cold.pool_pin_bytes",
-            0,
-            0,
-            LifetimePeak,
-            Bytes,
-        ),
         ("create_index.cold_entries", 456, 734, CounterDelta, Count),
         (
             "create_index.cold_collect_nanos",
@@ -2351,7 +2333,7 @@ mod tests {
     ];
 
     /// Purpose: Report successful CREATE intervals independently of extraction and preserve cold profiling names across serialization.
-    /// Expected: Idle publication omits metrics; completed intervals preserve deltas, peaks, units and cold serialization without the retired temporary-memory field.
+    /// Expected: Idle publication omits metrics; completed intervals preserve deltas, peaks, units and validation pin bytes while omitting retired cold-source memory fields.
     #[test]
     fn create_metrics_require_publication_and_distinguish_peaks() {
         let mut before = InternalStatsSnapshot::default();
@@ -2371,6 +2353,7 @@ mod tests {
         after.index_build.create.hot.completed_builds = 3;
         after.index_build.create.cold_hot_worker_nanos = 95;
         after.index_build.create.cold.write_bytes += 131072;
+        after.index_build.create.validation.pool_pin_bytes = 8192;
         after.index_build.create.cold_source.runs = vec![ColdRunMeasurements {
             partition: 3,
             live_rows: 17,
@@ -2384,11 +2367,24 @@ mod tests {
         assert!(fields.get("cold").is_some());
         assert!(fields.get("disk").is_none());
         assert!(fields["cold_source"].get("temporary_peak_bytes").is_none());
+        for group in ["cold_source", "cold"] {
+            assert!(fields[group].get("pool_pin_bytes").is_none(), "{group}");
+        }
+        assert_eq!(
+            fields["validation"]["pool_pin_bytes"].as_integer(),
+            Some(8192)
+        );
         assert_eq!(
             toml::from_str::<CreateIndexMeasurements>(&encoded).unwrap(),
             after.index_build.create
         );
         let metrics = plan_internal_metrics(&before, &after);
+        for name in [
+            "create_index.cold_source.pool_pin_bytes",
+            "create_index.cold.pool_pin_bytes",
+        ] {
+            assert!(metrics.iter().all(|metric| metric.name != name), "{name}");
+        }
         for (field, value, unit) in [
             ("live_rows", 17, Count),
             ("encoded_bytes", 200, Bytes),
@@ -2402,6 +2398,12 @@ mod tests {
             );
         }
         for (name, value, kind, unit) in [
+            (
+                "validation.pool_pin_bytes",
+                8192,
+                InternalMetricKind::LifetimePeak,
+                InternalMetricUnit::Bytes,
+            ),
             (
                 "cold.write_bytes",
                 131072,
@@ -3066,8 +3068,6 @@ mod tests {
         after.index_build.create.cold_source.workers = 11;
         before.index_build.create.cold_source.concurrency_peak = 3;
         after.index_build.create.cold_source.concurrency_peak = 11;
-        before.index_build.create.cold_source.pool_pin_bytes = 3;
-        after.index_build.create.cold_source.pool_pin_bytes = 11;
         before.index_build.create.cold_source.descriptor_peak = 3;
         after.index_build.create.cold_source.descriptor_peak = 11;
         before.index_build.create.cold_source.source_entries = 3;

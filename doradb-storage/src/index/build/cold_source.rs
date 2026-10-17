@@ -55,7 +55,7 @@ pub(crate) struct ColdBuildSource {
     /// Component scheduling controls for accepted-worker tests.
     #[cfg(test)]
     pub(super) test: Hooks,
-    /// Source-scoped pin and read observations, never published on failure.
+    /// Source-scoped read and concurrency observations, never published on failure.
     #[cfg(feature = "profiling")]
     pub(super) profile: Arc<ColdReadProfile>,
 }
@@ -174,8 +174,6 @@ impl ColdBuildSource {
                 let block_id = entry.block_id;
                 let persisted = table.storage.load_lwc_block(disk_guard, block_id).await?;
                 #[cfg(feature = "profiling")]
-                let pin = self.profile.pin();
-                #[cfg(feature = "profiling")]
                 {
                     self.profile.lwc_reads.fetch_add(1, Ordering::Relaxed);
                     projection.sample.descriptors += 1;
@@ -213,8 +211,6 @@ impl ColdBuildSource {
                     self.encode_row(block, row_idx, row_id, projection, &mut rows).attach_with(|| format!("operation=create_index, phase=encode_cold_row, file={file_kind}, block_id={block_id}, row_id={row_id}"))?;
                 }
                 drop(persisted);
-                #[cfg(feature = "profiling")]
-                drop(pin);
             }
             yield_now().await;
             if stop.load(Ordering::Acquire) {

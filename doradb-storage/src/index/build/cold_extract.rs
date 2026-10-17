@@ -7,8 +7,6 @@ use crate::error::{
     MultiDomainResultExt, QuadError, QuadResult, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
 };
-#[cfg(feature = "profiling")]
-use crate::file::cow_file::COW_FILE_PAGE_SIZE;
 use crate::index::column_block_index::{ColdPartition, ColumnBlockRangeCursor, ColumnSourcePlan};
 #[cfg(feature = "profiling")]
 use crate::profiling::{ColdExtractionMeasurements, ColdRunMeasurements, clock::Instant};
@@ -280,7 +278,6 @@ impl ColdLocalSort {
                 .sum(),
             node_reads: source.node_reads.load(Ordering::Relaxed) as u64,
             lwc_reads: source.lwc_reads.load(Ordering::Relaxed) as u64,
-            pool_pin_bytes: (source.pin_peak.load(Ordering::Relaxed) * COW_FILE_PAGE_SIZE) as u64,
             descriptor_peak: source.descriptor_peak.load(Ordering::Relaxed) as u64,
         }
     }
@@ -818,8 +815,6 @@ pub(super) mod tests {
                         assert!(run.retained_bytes >= run.encoded_bytes);
                         assert_eq!(run.elapsed_nanos, run.extraction_nanos + run.sort_nanos);
                     }
-                    assert!(profile.pool_pin_bytes > 0);
-                    assert!(profile.pool_pin_bytes <= 2 * COW_FILE_PAGE_SIZE as u64);
                 }
                 drop(runs);
                 drop(sort);
