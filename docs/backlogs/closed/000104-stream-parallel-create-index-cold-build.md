@@ -2,27 +2,28 @@
 
 ## Summary
 
-Tasks 000329 and 000330 delivered bounded parallel DiskTree construction and
-completed-root cross-tier validation. Cold construction inputs are released
-before hot extraction; forward, ordered, and reverse validation use bounded
-readers. Cold collection and sorting still retain their complete resident input.
+Tasks 000329–000331 completed bounded parallel resident cold CREATE, sealed
+input release and completed-root cross-tier validation. Task 000331 closes the
+serial producer gap with incremental source traversal and direct resident-run
+consumption. All encoded input still must fit the configured scratch budget.
 
-Parallel cold extraction remains RFC 0033 Phase 3. Larger-than-memory builds
-remain outside that RFC's resident-only scope. Keep this umbrella backlog open
-through Phase 3, then split any remaining work, as requested during task 000330
-resolution. Revisit selector calibration using the optimized read paths when
-performing subsequent end-to-end measurements.
+At Phase 3 resolution, backlog 000212 retained external-memory cold runs and
+000213 retained completed-root selector calibration. The proposed broad
+performance deferral in 000214 was withdrawn. Task 000331 evaluated and removed
+a forced single-run policy; 000212 now includes unified run sizing and shared
+merge improvements. Other measured costs remain in the task. Backlog 000214 is archived as replaced. This resident pipeline does not
+claim external-memory acceptance.
 
 ## Reference
 
-- [Task 000149: CREATE INDEX storage API](../tasks/000149-implement-create-index-storage-api.md), from RFC 0018 Phase 4.
-- [Task 000236: non-unique CREATE completeness](../tasks/000236-non-unique-create-index-mvcc-candidate-complete.md).
-- [Task 000306: recovery profiling](../tasks/000306-recovery-benchmark-and-startup-metrics.md).
-- [Task 000319: CREATE hot-build integration](../tasks/000319-create-index-hot-build-integration.md) and [RFC 0032](../rfcs/0032-in-memory-parallel-hot-index-build.md), which deliberately retained the cold vector and deferred disk-backed validation here.
-- [Task 000329: streaming parallel DiskTree construction](../tasks/000329-streaming-parallel-disk-tree-bulk-construction.md) implements [RFC 0033](../rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md) Phase 1.
-- [Task 000330: completed-root validation](../tasks/000330-completed-root-cross-tier-validation.md) implements Phase 2; Phase 3 owns parallel cold extraction.
+- [Task 000149: CREATE INDEX storage API](../../tasks/000149-implement-create-index-storage-api.md), from RFC 0018 Phase 4.
+- [Task 000236: non-unique CREATE completeness](../../tasks/000236-non-unique-create-index-mvcc-candidate-complete.md).
+- [Task 000306: recovery profiling](../../tasks/000306-recovery-benchmark-and-startup-metrics.md).
+- [Task 000319: CREATE hot-build integration](../../tasks/000319-create-index-hot-build-integration.md) and [RFC 0032](../../rfcs/0032-in-memory-parallel-hot-index-build.md), which deliberately retained the cold vector and deferred disk-backed validation here.
+- [Task 000329: streaming parallel DiskTree construction](../../tasks/000329-streaming-parallel-disk-tree-bulk-construction.md) implements [RFC 0033](../../rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md) Phase 1.
+- [Task 000330: completed-root validation](../../tasks/000330-completed-root-cross-tier-validation.md) implements Phase 2; Phase 3 owns parallel cold extraction.
 
-Current implementation boundaries:
+Implementation boundaries recorded before task 000331:
 
 - `CreateIndexCollector::collect_current_cold`, `prepare_cold`, and `CreateIndexProgress::build_cold` in `doradb-storage/src/catalog/index.rs`.
 - `CrossTierSelection`, `CrossTierCursor`, and completion evidence in `doradb-storage/src/index/build/cross_tier.rs`; bounded reads in `cold_reader.rs`, sealed ownership in `sealed_cold.rs`, and the checked leaf consumer in `tree_builder.rs` under the same directory. Task 000330 replaces the earlier retained `ColdUniqueKeys` vector with completed-root reads; the pipeline supplies optional cold authority and packing receives a self-contained selection.
@@ -78,22 +79,18 @@ production and any later spill design; do not publish partially validated roots.
 
 ## Notes (Optional)
 
-Phases 1 and 2 are implemented. Parallel extraction and external-memory
-acceptance remain open. The user explicitly chose to keep this backlog intact
-until Phase 3 lands, then split the remaining scope.
+Phases 1–3 are implemented. External-memory acceptance and selector calibration
+remain open in 000212/000213. The forced single-run experiment was withdrawn;
+000212 retains its run-sizing findings. Backlog 000214 remains archived, with
+other measured limits retained in the task.
 
-Reuse the mechanisms delivered by [closed backlog 000110](closed/000110-unify-hot-row-mem-scan-index-build-recovery.md) and RFC 0032 where appropriate: encoded-key partitioning, sorted runs/merging, bounded scheduling and backpressure, duplicate-boundary checks and packed node construction. Keep LWC decoding, delete filtering, durable allocation/writes and root publication in the cold adapter; preserve the hot builder's recovery behavior and caller-owned installation/settlement. The completed hybrid validation and reverse-lookup evidence must remain valid as cold input production changes.
+Reuse the mechanisms delivered by [closed backlog 000110](000110-unify-hot-row-mem-scan-index-build-recovery.md) and RFC 0032 where appropriate: encoded-key partitioning, sorted runs/merging, bounded scheduling and backpressure, duplicate-boundary checks and packed node construction. Keep LWC decoding, delete filtering, durable allocation/writes and root publication in the cold adapter; preserve the hot builder's recovery behavior and caller-owned installation/settlement. The completed hybrid validation and reverse-lookup evidence must remain valid as cold input production changes.
 
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
 ## Close Reason
 
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+- Type: implemented
+- Detail: Implemented the resident parallel producer and direct-run handoff via docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md. Remaining external-memory acceptance and selector calibration are preserved in backlogs 000212 and 000213. The single-worker experiment was subsequently evaluated and withdrawn in task 000331, with future unified run-sizing work included in 000212 and backlog 000214 remaining archived; other measured CPU/RSS, sort and publication costs remain task observations. This closure does not claim larger-than-memory acceptance.
+- Closed By: backlog close
+- Reference: docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md; docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 3; docs/backlogs/000212-external-memory-create-index-cold-runs.md; docs/backlogs/000213-calibrate-completed-root-cross-tier-validation-selection.md; docs/backlogs/closed/000214-reduce-resident-cold-build-cpu-small-worker-overhead.md
+
+- Closed At: 2026-10-16

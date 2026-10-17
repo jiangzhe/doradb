@@ -231,7 +231,7 @@ Issue Labels:
 
 ### Source Backlogs
 
-- [B1] `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+- [B1] `docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md`
   — cold construction and hybrid cross-tier validation. Its external-memory
   acceptance is explicitly deferred by [U1], so this RFC covers a subset.
 - [B2] `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
@@ -855,7 +855,7 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - Phase Status: done
   - Implementation Summary: Delivered bounded parallel cold CREATE for both index modes with admitted serial input, shared leaf planning, retained write settlement, public limits, and profiling. Final validation passed 2,325 workspace tests, 2,060 profiling-disabled storage tests, and the branch style gate. Earlier matched benchmarks covered 171 invocations and showed 76.6% unique and 72.5% non-unique improvements for million-row checkpointed CREATE; timing was not rerun after review refinements. Completed-root validation, parallel extraction, and checkpoint integration remain in Phases 2–4; both source backlogs stay open. [Task Resolve Sync: docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md @ 2026-10-09]
   - Related Backlogs:
-    - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md`
     - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
 
 - **Phase 2: Completed-Root Cross-Tier Validation**
@@ -888,7 +888,7 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - Phase Status: done
   - Implementation Summary: Delivered early cold-input release and bounded parallel cross-tier validation with batched lookups and checked borrowed reads. Final verification passed 2,350 workspace tests, 2,084 profiling-disabled storage tests, and the 26-file style gate. Six verified 1M/10M observations retained automatic strategy choices and exposed cold collection and resident scratch as the remaining scaling limits. Phase 3 can consume multiple resident cold runs directly; backlog 000104 stays open until that phase lands and its remaining scope is split. Backlog 000211 tracks the unresolved instrumented MVCC snapshot-read crash. [Task Resolve Sync: docs/tasks/000330-completed-root-cross-tier-validation.md @ 2026-10-14]
   - Related Backlogs:
-    - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md`
     - `docs/backlogs/000211-investigate-instrumented-mvcc-old-snapshot-read-crash.md`
 
 - **Phase 3: Parallel Cold Extraction and Direct Run Consumption**
@@ -897,23 +897,38 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     shared global merge, and production CREATE integration.
   - Prerequisites: Phase 1's partition consumer and Phase 2's removal of flat
     cold-vector validation ownership through the sealed completion handoff.
-  - Phase-local Choices: Cold descriptor grouping, incremental dispatch and
-    coverage accounting; source-specific error transport; run sizing within the
-    shared scratch budget. Preserve the capture-to-merge completeness barrier.
+  - Phase-local Choices: After minimum-workspace admission determines W, request
+    checked P = 4 * W for every worker count. Select the first level with
+    at least 8 * P entries; at leaves use min(P, N) partitions. Keep blocks
+    indivisible and planning proportional to P. Single-run construction borrows
+    input directly, without co-rank jobs or reference buffers; construction
+    concurrency remains independent and scratch admission stays fail-fast.
+    Incremental batches hold at most 64 descriptors. Traversal releases metadata
+    guards before further metadata or LWC loads, preserving readonly-pool progress.
+    Exact plan/partition/exhaustion certificates include empty ranges;
+    Operation/Runtime/Fatal transport preserves source causes. Complete resident
+    runs enter construction directly after the capture-to-merge barrier.
   - Goals: Feed resident runs directly into durable construction. Include
     deletion/binding/coverage and budget-failure tests, cold/mixed/hot CREATE
     acceptance, stage attribution and worker-scaling measurements.
   - After This Phase: The complete resident cold CREATE pipeline uses parallel
     input preparation and streaming durable output without a full merged vector.
-    Reassess backlog 000104 and split its remaining scope after this phase;
-    larger-than-memory acceptance is not completed by the resident pipeline.
+    Backlog 000104 is archived; 000212/000213 retain external-memory acceptance
+    and selector calibration. The forced single-run policy was withdrawn after
+    workload-dependent results; 000212 includes unified run sizing and shared
+    merge improvements. Backlog 000214 remains archived as a withdrawn broad
+    deferral. Other measured costs stay in the task.
+    Larger-than-memory acceptance is not completed by the resident pipeline.
   - Non-goals: New external-memory formats or changes to checkpoint row selection.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md`
+  - Task Issue: `#1149`
+  - Phase Status: done
+  - Implementation Summary: Delivered bounded resident cold extraction with the common 4W policy and direct durable construction. Coordinate-based traversal prevents readonly-pool exhaustion; typed cooperative stop preserves exact completion, cleanup and late failure causes. Cold pin-byte accounting was removed while validation profiling remains. Verification passed 2,364 workspace tests, 2,098 profiling-disabled storage tests and the 19-file/208-test style gate. Historical benchmarks improved four-worker cold latency with higher CPU/RSS; the forced single-worker single-run policy was withdrawn after workload-dependent results. Redo fsync variability explained the apparent four-worker regression. Backlogs 000212/000213 retain external sorting, unified run sizing and selector calibration; 000104/000214 remain archived. Phase 4 prerequisites are unchanged. [Task Resolve Sync: docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md @ 2026-10-17]
   - Related Backlogs:
-    - `docs/backlogs/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md`
+    - `docs/backlogs/000212-external-memory-create-index-cold-runs.md`
+    - `docs/backlogs/000213-calibrate-completed-root-cross-tier-validation-selection.md`
+    - `docs/backlogs/closed/000214-reduce-resident-cold-build-cpu-small-worker-overhead.md`
 
 - **Phase 4: Parallel DiskTree Checkpoint Reconciliation**
   - Scope: Admission from sidecar production/normalization, fallible collection,

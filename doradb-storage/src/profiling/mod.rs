@@ -30,8 +30,9 @@ pub use checkpoint::{
 };
 pub use cleanup::{MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats};
 pub use index_build::{
-    ColdBuildMeasurements, ColdHotMeasurements, CreateIndexMeasurements, HotExtractionMeasurements,
-    HotIndexMeasurements, IndexBuildStats, MergeMeasurements, RecoveryHotIndexMeasurements,
+    ColdBuildMeasurements, ColdExtractionMeasurements, ColdHotMeasurements, ColdRunMeasurements,
+    CreateIndexMeasurements, HotExtractionMeasurements, HotIndexMeasurements, IndexBuildStats,
+    MergeMeasurements, RecoveryHotIndexMeasurements,
 };
 pub use io::{IoBackendStats, StorageIoStats};
 pub use lock::LogicalLockStats;

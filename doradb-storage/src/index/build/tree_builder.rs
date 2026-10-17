@@ -5,14 +5,14 @@ use super::cross_tier::{
 };
 use super::merge::{
     CompletedPartition, HotDuplicate, HotEntryRef, MergeCompletion, MergeConsumption,
-    PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error, observe_stop,
+    PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
 };
 use super::packing::{
     LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
 };
 use super::page_cleanup::{PageProducer, StagedPageOwner};
 use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild};
-use super::{BudgetedVec, MemoryBudget, SortedRuns};
+use super::{BudgetedVec, BuildOutcome, MemoryBudget, SortedRuns};
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard};
 use crate::completion::Completion;
@@ -129,7 +129,7 @@ struct Assembly {
     merge: MergeMeasurements,
 }
 
-type AssemblyResult = RuntimeOrFatalResult<HotPackedOutcome<Assembly>>;
+type AssemblyResult = RuntimeOrFatalResult<BuildOutcome<HotPackedOutcome<Assembly>>>;
 
 /// Physical shape and caller-required validation for one private tree.
 pub(super) struct HotPackedSpec {
@@ -243,14 +243,22 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             self.run_build().await;
         }
         // Retain the outcome across draining so cancellation cannot lose it.
-        if !matches!(&self.outcome, Some(Ok(HotPackedOutcome::Complete(_)))) {
+        if !matches!(
+            &self.outcome,
+            Some(Ok(BuildOutcome::Complete(HotPackedOutcome::Complete(_))))
+        ) {
             self.stop_and_drain().await;
         }
         self.finished = true;
-        let outcome = self
+        let BuildOutcome::Complete(outcome) = self
             .outcome
             .take()
-            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))?;
+            .unwrap_or_else(|| unreachable!("finished build retains its outcome"))?
+        else {
+            return Err(execution_error(
+                "hot packing stopped without an execution failure",
+            ));
+        };
         Ok(self.ready(outcome))
     }
 
@@ -278,16 +286,12 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
     /// cleanup object reclaims only after those jobs and our leases settle.
     pub(super) async fn settle(&mut self) -> RuntimeOrFatalResult<()> {
         assert!(!self.finished, "packed build reused after settlement");
-        self.stop.store(true, Ordering::Release);
-        if self.outcome.is_none() {
-            self.record_failure(execution_error("hot packed build cancelled"));
-        }
         self.stop_and_drain().await;
         self.finished = true;
-        self.outcome
-            .take()
-            .unwrap_or_else(|| unreachable!("settled build retains its outcome"))
-            .map(|_| ())
+        match self.outcome.take() {
+            Some(Err(error)) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     async fn run_build(&mut self) {
@@ -308,14 +312,20 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         if let Some(error) = self.poisoner.poison_error() {
             return Err(error.into());
         }
-        observe_stop(&self.stop)?;
-        if let Some(reverse) = &mut self.reverse {
-            reverse.execute().await?;
+        if self.stop.load(Ordering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
+        if let Some(reverse) = &mut self.reverse
+            && let BuildOutcome::Stopped = reverse.execute().await?
+        {
+            return Ok(BuildOutcome::Stopped);
         }
         match self.build_leaves().await? {
             HotPackedOutcome::Complete(()) => (),
             HotPackedOutcome::Duplicate(conflict) => {
-                return Ok(HotPackedOutcome::Duplicate(conflict));
+                return Ok(BuildOutcome::Complete(HotPackedOutcome::Duplicate(
+                    conflict,
+                )));
             }
         }
         while self
@@ -325,13 +335,19 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             .len()
             > 1
         {
-            observe_stop(&self.stop)?;
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(BuildOutcome::Stopped);
+            }
             if self.parent_level.is_none() {
                 self.plan_parent_level().await?;
             }
-            self.build_parent_level().await?;
+            if let BuildOutcome::Stopped = self.build_parent_level().await? {
+                return Ok(BuildOutcome::Stopped);
+            }
         }
-        Ok(HotPackedOutcome::Complete(self.finish_build()))
+        Ok(BuildOutcome::Complete(HotPackedOutcome::Complete(
+            self.finish_build(),
+        )))
     }
 
     async fn build_leaves(&mut self) -> RuntimeOrFatalResult<HotPackedOutcome<()>> {
@@ -442,7 +458,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         Ok(())
     }
 
-    async fn build_parent_level(&mut self) -> RuntimeOrFatalResult<()> {
+    async fn build_parent_level(&mut self) -> RuntimeOrFatalResult<BuildOutcome<()>> {
         let level = self
             .parent_level
             .as_mut()
@@ -451,9 +467,12 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             .packing
             .as_ref()
             .unwrap_or_else(|| unreachable!("parent construction owns packing resources"));
-        level
+        if let BuildOutcome::Stopped = level
             .execute(&self.thread_pool, packing, &self.stop)
-            .await?;
+            .await?
+        {
+            return Ok(BuildOutcome::Stopped);
+        }
         let level = self
             .parent_level
             .take()
@@ -469,7 +488,7 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             collect_level(&mut self.measurements, &level.parents);
         }
         self.children = Some(Arc::new(level.parents));
-        Ok(())
+        Ok(BuildOutcome::Complete(()))
     }
 
     fn finish_build(&mut self) -> Assembly {
@@ -516,21 +535,21 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
             let result = reverse.settle().await;
             self.reverse = None;
             if let Err(error) = result {
-                self.record_failure(error);
+                self.record_cleanup_failure(error);
             }
         }
         if let Some(leaves) = self.leaves.as_mut() {
             let result = leaves.settle().await;
             self.leaves = None;
             if let Err(error) = result {
-                self.record_failure(error);
+                self.record_cleanup_failure(error);
             }
         }
         if let Some(level) = self.parent_level.as_mut() {
             let result = level.settle().await;
             self.parent_level = None;
             if let Err(error) = result {
-                self.record_failure(error);
+                self.record_cleanup_failure(error);
             }
         }
         self.children = None;
@@ -543,8 +562,11 @@ impl<P: BufferPool + 'static> HotPackedBuild<P> {
         owner.abort();
     }
 
-    fn record_failure(&mut self, error: RuntimeOrFatalError) {
-        self.stop.store(true, Ordering::Release);
+    fn record_cleanup_failure(&mut self, error: RuntimeOrFatalError) {
+        debug_assert!(
+            self.stop.load(Ordering::Acquire),
+            "hot packing cleanup failure recorded before stop"
+        );
         self.outcome = Some(Err(match self.outcome.take() {
             Some(Err(old)) => old.merge_cleanup(error),
             // Execution failures take precedence over a duplicate rejection.
@@ -749,21 +771,22 @@ impl ParentLevel {
         pool: &ThreadPool,
         packing: &Arc<Packing<P>>,
         stop: &AtomicBool,
-    ) -> RuntimeOrFatalResult<()> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<()>> {
         while self.collected < self.groups.len() {
             if self.collected == self.submitted {
                 if self.failure.is_some() {
                     break;
                 }
-                if let Err(error) = observe_stop(stop) {
-                    self.record_failure(error);
-                    break;
+                if stop.load(Ordering::Acquire) {
+                    return Ok(BuildOutcome::Stopped);
                 }
                 self.submit_jobs(pool, packing);
             }
             self.collect_next().await;
         }
-        self.failure.take().map_or(Ok(()), Err)
+        self.failure
+            .take()
+            .map_or(Ok(BuildOutcome::Complete(())), Err)
     }
 
     fn submit_jobs<P: BufferPool + 'static>(
@@ -844,7 +867,7 @@ impl<P: BufferPool + 'static> PartitionConsumer for PackedLeafConsumer<P> {
     async fn consume(
         &self,
         stream: PartitionMergeStream,
-    ) -> RuntimeOrFatalResult<CompletedPartition<Self::Output>> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<CompletedPartition<Self::Output>>> {
         let (plan, partition) = stream.identity();
         debug_assert!(self.cross_tier.as_ref().is_none_or(|_| self.unique));
         let cold = self
@@ -867,7 +890,7 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         mut stream: PartitionMergeStream,
         value: fn(RowID) -> V,
         mut cold: Option<CrossTierCursor>,
-    ) -> RuntimeOrFatalResult<CompletedPartition<PackedLeaves>> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<CompletedPartition<PackedLeaves>>> {
         // Bound buffered coordinates independently of key widths, specializing
         // the conservative slot bound for the leaf value size.
         let window_capacity = max_leaf_window_entries::<V>().min(stream.remaining_entries());
@@ -878,10 +901,19 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
         let mut lower = None;
         let mut first = true;
         let mut inhibited = false;
-        while let Some(batch) = stream.next_batch()? {
-            observe_stop(&self.stop)?;
-            if let Some(cold) = &mut cold {
-                cold.validate(&batch, &self.stop).await?;
+        loop {
+            let batch = match stream.next_batch()? {
+                BuildOutcome::Complete(Some(batch)) => batch,
+                BuildOutcome::Complete(None) => break,
+                BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
+            };
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(BuildOutcome::Stopped);
+            }
+            if let Some(cold) = &mut cold
+                && let BuildOutcome::Stopped = cold.validate(&batch, &self.stop).await?
+            {
+                return Ok(BuildOutcome::Stopped);
             }
             if batch.construction_inhibited() {
                 inhibited = true;
@@ -904,15 +936,14 @@ impl<P: BufferPool + 'static> PackedLeafConsumer<P> {
                         lower = window.get(count);
                         window.consume(count);
                     }
-                    if index % 1024 == 1023 {
-                        yield_now().await;
-                    }
                 }
             }
             yield_now().await;
         }
         while window.len() != 0 {
-            observe_stop(&self.stop)?;
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(BuildOutcome::Stopped);
+            }
             let count = self
                 .leaf::<V>(&window, lower, upper, value, &mut entries, &mut leaves)
                 .await?;
@@ -2202,7 +2233,7 @@ mod tests {
                             assert!(futures::poll!(settle.as_mut()).is_pending());
                             drop(settle);
                             release.send(()).unwrap();
-                            assert!(build.settle().await.is_err());
+                            build.settle().await.unwrap();
                             drop(build);
                             cleanup.run().await.unwrap();
                             assert_eq!(pool.allocated(), 1, "{stage:?}");
@@ -2333,6 +2364,59 @@ mod tests {
                 test_recover(&cleanup).await;
                 drop(ready);
                 drop(build);
+                index.destroy(&pool.create_base_guard()).await.unwrap();
+                assert_eq!(pool.allocated(), 0);
+            }
+        });
+    }
+
+    /// Purpose: Preserve an allocation-stage Runtime failure discovered after hot packing cancellation begins.
+    /// Expected: Settlement reports the actual worker failure without a synthetic cancellation error, drains leaf or parent producers, and reclaims detached pages.
+    #[test]
+    fn packed_settlement_preserves_late_runtime_failure() {
+        use super::super::page_cleanup::{TestFault, TestPoint, test_gate};
+        smol::block_on(async {
+            for (height, count, width) in [(0, 16, 256), (1, 128, 8192)] {
+                let (_scope, workers, poisoner) = workers(2).await;
+                let pool = pages(16 * 1024 * 1024);
+                let plan = test_prepare_packed(
+                    input(count, width, 0, DuplicateCheck::Collect),
+                    workers.clone(),
+                    2,
+                    4,
+                    27,
+                )
+                .await;
+                let index = empty_index(pool.guard(), true).await;
+                let (mut build, mut cleanup) =
+                    packed_build(pool.guard(), plan, workers, poisoner, true);
+                let (entered, release) = test_gate(
+                    &cleanup,
+                    TestPoint::Allocated(height),
+                    1,
+                    TestFault::Runtime,
+                );
+                let mut execute = Box::pin(build.execute());
+                let waiting = entered.recv_async();
+                futures::pin_mut!(waiting);
+                assert!(matches!(
+                    select(execute.as_mut(), waiting).await,
+                    Either::Right((Ok(()), _))
+                ));
+                drop(execute);
+                let mut settlement = Box::pin(build.settle());
+                assert!(futures::poll!(settlement.as_mut()).is_pending());
+                drop(settlement);
+                release.send(()).unwrap();
+                let RuntimeOrFatalError::Runtime(error) = build.settle().await.unwrap_err() else {
+                    panic!("late allocation failure changed domain")
+                };
+                let detail = format!("{error:?}");
+                assert!(detail.contains("injected staged failure"), "{detail}");
+                assert!(!detail.contains("secondary cleanup failure"), "{detail}");
+                drop(build);
+                cleanup.run().await.unwrap();
+                assert_eq!(pool.allocated(), 1);
                 index.destroy(&pool.create_base_guard()).await.unwrap();
                 assert_eq!(pool.allocated(), 0);
             }

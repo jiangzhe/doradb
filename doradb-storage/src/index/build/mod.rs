@@ -4,8 +4,12 @@
 //! coordinator owns every accepted completion independently of its borrowed execution future.
 mod budget;
 mod co_rank;
+/// Retained cold source jobs and exact partition completion.
+pub(crate) mod cold_extract;
 /// Bounded persisted traversal and admission for completed cold trees.
 pub(crate) mod cold_reader;
+/// Captured column-index source and bounded cold extraction.
+pub(crate) mod cold_source;
 /// Complete hot/cold uniqueness validation for unique CREATE builds.
 pub(crate) mod cross_tier;
 /// Streaming durable construction and invocation admission.
@@ -31,7 +35,7 @@ pub(crate) use pipeline::{HotIndexBuild, merge_build_result};
 pub(crate) use pipeline::{TestPoint as HotBuildTestPoint, test_observe as observe_hot_build};
 pub(crate) use source::{HotBuildCapture, HotBuildSource, HotBuildTableSource};
 #[cfg(test)]
-pub(crate) use tests::gate_extraction;
+pub(crate) use tests::{complete_work, gate_extraction};
 
 use crate::completion::Completion;
 use crate::conf::HotIndexBuildConfig;
@@ -50,6 +54,17 @@ use std::mem::take;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// A finite build unit either completed or observed cooperative stop.
+/// Stopped work supplies no coverage authority and is not an execution failure.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub(crate) enum BuildOutcome<T> {
+    /// Complete output, including successful empty input or stream exhaustion.
+    Complete(T),
+    /// Incomplete work abandoned at a cooperative boundary.
+    Stopped,
+}
 
 /// Validated immutable limits used identically during bootstrap and runtime.
 #[derive(Clone, Copy, Debug)]
@@ -135,7 +150,7 @@ pub(crate) struct BuildEntries {
 }
 
 impl BuildEntries {
-    /// Start serial collection without allocating input storage.
+    /// Start admitted collection without allocating input storage.
     pub(crate) fn new(budget: &MemoryBudget) -> Self {
         Self {
             entries: BudgetedVec::new(budget),
@@ -158,22 +173,30 @@ pub(crate) struct SortedRun {
 }
 
 impl SortedRun {
-    /// Sort admitted entries in place and establish duplicate evidence before sharing.
-    pub(crate) fn finish(
+    /// Sort one source partition and retain stable provenance unless cooperatively stopped.
+    pub(super) fn finish_group(
         mut entries: BudgetedVec<IndexBuildEntry>,
         payload: MemoryReservation,
         duplicates: DuplicateCheck,
-    ) -> Self {
+        group_id: usize,
+        stop: &AtomicBool,
+    ) -> BuildOutcome<Self> {
         entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-        let evidence = worker::local_duplicates(&entries, duplicates, &AtomicBool::new(false));
-        Self {
-            group_id: 0,
+        if stop.load(AtomicOrdering::Acquire) {
+            return BuildOutcome::Stopped;
+        }
+        let evidence = worker::local_duplicates(&entries, duplicates);
+        if stop.load(AtomicOrdering::Acquire) {
+            return BuildOutcome::Stopped;
+        }
+        BuildOutcome::Complete(Self {
+            group_id,
             entries,
             payload,
             duplicates: evidence,
             #[cfg(feature = "profiling")]
             profile: HotExtractionWorkerProfile::default(),
-        }
+        })
     }
 
     /// Accounted capacity retained by entries and outlined keys.
@@ -193,6 +216,7 @@ impl SortedRun {
 /// Shared immutable run owners in planned order with checked coordinate access.
 pub(crate) struct SortedRuns {
     runs: Vec<Arc<SortedRun>>,
+    _run_admission: Option<MemoryReservation>,
     // Source-selected policy survives even an empty extraction.
     duplicates: DuplicateCheck,
     /// Shared admission retained for run ownership and downstream phases.
@@ -203,20 +227,18 @@ pub(crate) struct SortedRuns {
 }
 
 impl SortedRuns {
-    /// Retain one finalized resident run and its caller-selected evidence policy.
-    pub(crate) fn from_run(
-        run: Arc<SortedRun>,
+    /// Transfer an admitted container without flattening entries or cloning keys.
+    pub(super) fn from_admitted(
+        runs: BudgetedVec<Arc<SortedRun>>,
         budget: MemoryBudget,
         duplicates: DuplicateCheck,
     ) -> Self {
+        let (runs, admission) = runs.into_parts();
         Self {
-            runs: if run.entries().is_empty() {
-                Vec::new()
-            } else {
-                vec![run]
-            },
-            duplicates,
+            runs,
+            _run_admission: Some(admission),
             budget,
+            duplicates,
             #[cfg(feature = "profiling")]
             measurements: HotExtractionMeasurements::default(),
         }
@@ -255,7 +277,7 @@ impl SortedRuns {
     }
 }
 
-type JobResult = RuntimeOrFatalResult<Option<Arc<SortedRun>>>;
+type JobResult = RuntimeOrFatalResult<BuildOutcome<Arc<SortedRun>>>;
 type JobCompletion = Arc<Completion<JobResult>>;
 
 /// Planned page range and its completion retained until collection.
@@ -333,7 +355,7 @@ impl HotLocalSort {
         );
         #[cfg(feature = "profiling")]
         self.profile.start();
-        while self.collected < self.jobs.len() {
+        while self.collected < self.jobs.len() && !self.stop.load(AtomicOrdering::Acquire) {
             while self.failure.is_none()
                 && self.submitted < self.jobs.len()
                 && self.submitted - self.collected < self.max_workers
@@ -354,9 +376,11 @@ impl HotLocalSort {
             }
             self.collect_next().await;
         }
-        if self.failure.is_some() {
+        if self.failure.is_some() || self.stop.load(AtomicOrdering::Acquire) {
             self.settle().await?;
-            unreachable!("failed hot local sort settlement returns its failure");
+            return Err(merge::execution_error(
+                "hot extraction stopped without an execution failure",
+            ));
         }
         self.finished = true;
         let runs = take(&mut self.runs);
@@ -366,6 +390,7 @@ impl HotLocalSort {
         self.source.profiler.record_hot_extraction(measurements);
         Ok(SortedRuns {
             runs,
+            _run_admission: None,
             duplicates: self.source.key.duplicates,
             budget: self.source.budget.clone(),
             #[cfg(feature = "profiling")]
@@ -415,7 +440,7 @@ impl HotLocalSort {
             )
         });
         match result {
-            Ok(Some(run)) => {
+            Ok(BuildOutcome::Complete(run)) => {
                 #[cfg(feature = "profiling")]
                 self.profile.collect(&run.profile, run.entries.len());
                 // All result slots were allocated before submission.
@@ -424,7 +449,10 @@ impl HotLocalSort {
                 }
                 self.runs.push(run);
             }
-            Ok(None) => {}
+            Ok(BuildOutcome::Stopped) => debug_assert!(
+                self.stop.load(AtomicOrdering::Acquire),
+                "hot extraction returned Stopped without a stop request"
+            ),
             Err(error) => self.record_failure(error),
         }
     }
@@ -777,6 +805,14 @@ mod tests {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Require completed work in a test that does not request stop.
+    pub(crate) fn complete_work<T>(outcome: BuildOutcome<T>) -> T {
+        match outcome {
+            BuildOutcome::Complete(value) => value,
+            BuildOutcome::Stopped => panic!("expected completed index build work"),
         }
     }
 
@@ -1208,12 +1244,7 @@ mod tests {
                 let mut settlement = Box::pin(build.settle());
                 assert!(futures::poll!(settlement.as_mut()).is_pending());
                 release.send(()).unwrap();
-                let result = settlement.await;
-                if packing {
-                    assert!(matches!(result, Err(RuntimeOrFatalError::Runtime(_))));
-                } else {
-                    result.unwrap();
-                }
+                settlement.await.unwrap();
                 drop(build);
                 assert_eq!(budget.used(), 0, "packing={packing}");
                 assert_eq!(index_pool.allocated(), 1);
@@ -1591,30 +1622,37 @@ mod tests {
     }
 
     /// Purpose: Distinguish unchecked input, first local duplicates, and cross-run-only conflicts.
-    /// Expected: Local evidence preserves every entry and total ordering uses run/position rather than unique RowID.
+    /// Expected: Checking reaches late duplicates or the end of the run, preserves every entry, and total ordering uses run/position rather than unique RowID.
     #[test]
     fn local_duplicates_and_provenance() {
         smol::block_on(async {
-            let stop = AtomicBool::new(false);
             assert_eq!(
-                worker::local_duplicates(&[], DuplicateCheck::Collect, &stop),
+                worker::local_duplicates(&[], DuplicateCheck::Collect),
                 LocalDuplicates::Checked {
                     first_duplicate_position: None
                 }
             );
-            let long_unique: Vec<_> = (0..1024u32)
+            let mut long_unique: Vec<_> = (0..1024u32)
                 .map(|value| IndexBuildEntry {
                     key: BTreeKey::from(value),
                     row_id: RowID::new(u64::from(value)),
                 })
                 .collect();
             assert_eq!(
-                worker::local_duplicates(
-                    &long_unique,
-                    DuplicateCheck::Collect,
-                    &AtomicBool::new(true)
-                ),
-                LocalDuplicates::Unchecked
+                worker::local_duplicates(&long_unique, DuplicateCheck::Collect),
+                LocalDuplicates::Checked {
+                    first_duplicate_position: None
+                }
+            );
+            long_unique.push(IndexBuildEntry {
+                key: BTreeKey::from(1023u32),
+                row_id: RowID::new(1024),
+            });
+            assert_eq!(
+                worker::local_duplicates(&long_unique, DuplicateCheck::Collect),
+                LocalDuplicates::Checked {
+                    first_duplicate_position: Some(1024)
+                }
             );
             let entries = vec![
                 IndexBuildEntry {
@@ -1631,17 +1669,17 @@ mod tests {
                 },
             ];
             assert_eq!(
-                worker::local_duplicates(&entries, DuplicateCheck::Skip, &stop),
+                worker::local_duplicates(&entries, DuplicateCheck::Skip),
                 LocalDuplicates::Unchecked
             );
             assert_eq!(
-                worker::local_duplicates(&entries, DuplicateCheck::Collect, &stop),
+                worker::local_duplicates(&entries, DuplicateCheck::Collect),
                 LocalDuplicates::Checked {
                     first_duplicate_position: Some(1)
                 }
             );
             assert_eq!(
-                worker::local_duplicates(&entries[1..], DuplicateCheck::Collect, &stop),
+                worker::local_duplicates(&entries[1..], DuplicateCheck::Collect),
                 LocalDuplicates::Checked {
                     first_duplicate_position: None
                 }

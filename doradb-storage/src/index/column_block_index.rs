@@ -11,7 +11,7 @@ use crate::file::block_integrity::{
 use crate::file::cow_file::{COW_FILE_PAGE_SIZE, MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::{FileKind, SparseFile};
 use crate::id::{BlockID, RowID, TableID, TrxID};
-use crate::index::build::{BudgetedVec, MemoryBudget};
+use crate::index::build::{BudgetedVec, MemoryBudget, MemoryReservation};
 use crate::index::identity_set::{EncodedRowSet, IdentitySetSeed, RowSetRef};
 use crate::index::ordinal_deletion_set::{
     OrdinalDeletionSet, OrdinalDeletionSetRef, deletion_body_bound,
@@ -24,6 +24,7 @@ use error_stack::{Report, ResultExt};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::mem;
+use std::ops::Range;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -46,6 +47,8 @@ pub(crate) const COLUMN_BRANCH_ENTRY_SIZE: usize = mem::size_of::<ColumnBlockBra
 /// Bytes occupied by the shared node header plus the leaf-only header extension.
 pub(crate) const COLUMN_BLOCK_LEAF_HEADER_SIZE: usize =
     COLUMN_BLOCK_HEADER_SIZE + mem::size_of::<ColumnBlockLeafHeaderExt>();
+
+const COLUMN_BUILD_BATCH_ENTRIES: usize = 64;
 
 const COLUMN_BLOCK_LEAF_HEADER_EXT_SIZE: usize = mem::size_of::<ColumnBlockLeafHeaderExt>();
 const COLUMN_BLOCK_LEAF_DATA_SIZE: usize =
@@ -573,6 +576,232 @@ pub(crate) struct ColumnBlockScanEntry {
     pub(crate) identity: EncodedRowSet,
     /// Persisted visibility base for the block.
     pub(crate) deletes: OrdinalDeletionSet,
+}
+
+/// Shared source read counts, job concurrency and descriptor occupancy.
+#[cfg(feature = "profiling")]
+#[derive(Default)]
+pub(crate) struct ColdReadProfile {
+    /// Successful logical metadata reads, including planning and repeated root paths.
+    pub(crate) node_reads: AtomicUsize,
+    /// Successful logical LWC reads.
+    pub(crate) lwc_reads: AtomicUsize,
+    /// Current executing source jobs, used only for observed concurrency.
+    pub(crate) jobs: AtomicUsize,
+    /// Peak executing source jobs.
+    pub(crate) job_peak: AtomicUsize,
+    /// Largest descriptor batch actually populated.
+    pub(crate) descriptor_peak: AtomicUsize,
+}
+
+/// Ordered whole-block partition, including any gaps in its half-open range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdPartition {
+    /// Stable source-order identity.
+    pub(crate) id: usize,
+    /// Adjacent coverage within the captured pivot.
+    pub(crate) range: Range<RowID>,
+}
+
+/// Admitted partition list and selected-level evidence.
+pub(crate) struct ColumnSourcePlan {
+    /// Ordered disjoint source ranges.
+    pub(crate) partitions: BudgetedVec<ColdPartition>,
+    /// Height of the first level satisfying oversampling, or zero at fallback.
+    pub(crate) height: u32,
+    /// Number of entries at the selected level.
+    pub(crate) entries: usize,
+}
+
+struct CountedNode {
+    block: BlockID,
+    count: usize,
+}
+
+struct Frame {
+    block: BlockID,
+    next: usize,
+}
+
+/// Descriptor batch whose compact payload admission outlives every decoded entry.
+pub(crate) struct ColumnBuildBatch {
+    /// At most 64 descriptors, ordered by physical source range.
+    pub(crate) entries: BudgetedVec<ColumnBlockScanEntry>,
+    payload: MemoryReservation,
+    payload_used: usize,
+}
+
+/// Reusable minimum traversal capacity admitted before source dispatch.
+pub(crate) struct ColumnBuildWorkspace {
+    stack: BudgetedVec<Frame>,
+    batch: ColumnBuildBatch,
+}
+
+impl ColumnBuildWorkspace {
+    /// Reserve stack, descriptor storage and compact-payload headroom before allocation.
+    pub(crate) fn new(budget: &MemoryBudget) -> RuntimeOrFatalResult<Self> {
+        let mut stack = BudgetedVec::new(budget);
+        stack
+            .ensure_capacity(8, "cold traversal stack")
+            .change_context(RuntimeError::IndexAccess)?;
+        let mut entries = BudgetedVec::new(budget);
+        entries
+            .ensure_capacity(COLUMN_BUILD_BATCH_ENTRIES, "cold descriptor batch")
+            .change_context(RuntimeError::IndexAccess)?;
+        let payload = budget
+            .reserve(COW_FILE_PAGE_SIZE, "cold identity and deletions")
+            .change_context(RuntimeError::IndexAccess)?;
+        Ok(Self {
+            stack,
+            batch: ColumnBuildBatch {
+                entries,
+                payload,
+                payload_used: 0,
+            },
+        })
+    }
+}
+
+/// Incremental lower-bound traversal retaining coordinates for each tree level.
+/// Page guards never outlive one node's work or cross another page load.
+pub(crate) struct ColumnBlockRangeCursor {
+    range: Range<RowID>,
+    workspace: ColumnBuildWorkspace,
+    pending: Option<BlockID>,
+}
+
+impl ColumnBlockRangeCursor {
+    /// Start at the captured root with reusable admitted traversal storage.
+    #[inline]
+    pub(crate) fn new(
+        index: &ColumnBlockIndex<'_>,
+        range: Range<RowID>,
+        mut workspace: ColumnBuildWorkspace,
+    ) -> Self {
+        workspace.stack.clear();
+        let pending = (index.root_block_id != SUPER_BLOCK_ID && !range.is_empty())
+            .then_some(index.root_block_id);
+        Self {
+            range,
+            workspace,
+            pending,
+        }
+    }
+
+    /// Return reusable storage only after this cursor's terminal result is captured.
+    #[inline]
+    pub(crate) fn into_workspace(mut self) -> ColumnBuildWorkspace {
+        self.workspace.stack.clear();
+        self.workspace.batch.entries.clear();
+        self.workspace
+    }
+
+    /// Whether the assigned range has no remaining nodes or entries.
+    #[inline]
+    pub(crate) fn exhausted(&self) -> bool {
+        self.pending.is_none() && self.workspace.stack.is_empty()
+    }
+
+    /// Copy one bounded batch without retaining metadata guards during consumption.
+    pub(crate) async fn next_batch(
+        &mut self,
+        index: &ColumnBlockIndex<'_>,
+    ) -> RuntimeOrFatalResult<&ColumnBuildBatch> {
+        let batch = &mut self.workspace.batch;
+        batch.entries.clear();
+        batch.payload_used = 0;
+        'traverse: loop {
+            let node = if let Some(block) = self.pending {
+                self.workspace
+                    .stack
+                    .reserve_one("cold traversal stack")
+                    .change_context(RuntimeError::IndexAccess)?;
+                // Keep only coordinates across reads so metadata cannot pin
+                // every readonly frame while workers await another block.
+                let node = index.read_node(block).await?;
+                let next = if node.is_leaf() {
+                    node.leaf_prefix_plane()
+                        .change_context(RuntimeError::IndexAccess)?
+                        .search(self.range.start)
+                        .change_context(RuntimeError::IndexAccess)?
+                        .unwrap_or(0)
+                } else {
+                    search_branch_entry(node.branch_entries(), self.range.start).unwrap_or(0)
+                };
+                self.workspace.stack.push_reserved(Frame { block, next });
+                self.pending = None;
+                node
+            } else if let Some(frame) = self.workspace.stack.last() {
+                index.read_node(frame.block).await?
+            } else {
+                break;
+            };
+            // A pending node installs its coordinates before reaching here;
+            // a resumed node was loaded from the existing top frame.
+            let frame = self.workspace.stack.last_mut().unwrap_or_else(|| {
+                unreachable!("cold traversal loaded a node without a stack frame")
+            });
+            if node.is_leaf() {
+                let prefixes = node
+                    .leaf_prefix_plane()
+                    .change_context(RuntimeError::IndexAccess)?;
+                while frame.next < prefixes.count()
+                    && batch.entries.len() < COLUMN_BUILD_BATCH_ENTRIES
+                {
+                    let view = node
+                        .leaf_entry_view_with_prefixes(&prefixes, frame.next)
+                        .change_context(RuntimeError::IndexAccess)?;
+                    if view.start_row_id >= self.range.end {
+                        self.workspace.stack.clear();
+                        break 'traverse;
+                    }
+                    frame.next += 1;
+                    if view
+                        .entry_header
+                        .end_row_id(view.start_row_id)
+                        .change_context(RuntimeError::IndexAccess)?
+                        <= self.range.start
+                    {
+                        continue;
+                    }
+                    // Cache admission validates each page. Source partitions
+                    // come from this captured tree's whole-block boundaries.
+                    // Admit compact bodies and Arc headers before copying them.
+                    batch.payload_used +=
+                        view.row_section.len() + view.delete_section.map_or(0, <[u8]>::len) + 64;
+                    batch
+                        .payload
+                        .grow(
+                            batch.payload_used.saturating_sub(batch.payload.bytes()),
+                            "cold identity and deletions",
+                        )
+                        .change_context(RuntimeError::IndexAccess)?;
+                    let entry =
+                        build_scan_entry(&view).change_context(RuntimeError::IndexAccess)?;
+                    batch.entries.push_reserved(entry);
+                }
+                if frame.next == prefixes.count() {
+                    self.workspace.stack.pop();
+                }
+                if batch.entries.len() == COLUMN_BUILD_BATCH_ENTRIES {
+                    break;
+                }
+            } else {
+                let entries = node.branch_entries();
+                let Some(child) = entries.get(frame.next) else {
+                    self.workspace.stack.pop();
+                    continue;
+                };
+                if child.start_row_id() >= self.range.end {
+                    self.workspace.stack.clear();
+                    break;
+                }
+                frame.next += 1;
+                self.pending = Some(child.block_id());
+            }
+        }
+        Ok(batch)
+    }
 }
 
 /// Runtime row resolution result for one persisted columnar row lookup.
@@ -1126,6 +1355,8 @@ pub(crate) struct ColumnBlockIndex<'a> {
     end_row_id: RowID,
     #[cfg(feature = "profiling")]
     logical_read_counter: Option<&'a AtomicUsize>,
+    #[cfg(feature = "profiling")]
+    source_profile: Option<Arc<ColdReadProfile>>,
 }
 
 impl<'a> ColumnBlockIndex<'a> {
@@ -1148,6 +1379,8 @@ impl<'a> ColumnBlockIndex<'a> {
             end_row_id,
             #[cfg(feature = "profiling")]
             logical_read_counter: None,
+            #[cfg(feature = "profiling")]
+            source_profile: None,
         }
     }
 
@@ -1156,6 +1389,14 @@ impl<'a> ColumnBlockIndex<'a> {
     #[cfg(feature = "profiling")]
     pub(crate) fn with_logical_read_counter(mut self, counter: &'a AtomicUsize) -> Self {
         self.logical_read_counter = Some(counter);
+        self
+    }
+
+    /// Track CREATE source reads across workers.
+    #[cfg(feature = "profiling")]
+    #[inline]
+    pub(crate) fn with_source_profile(mut self, profile: Arc<ColdReadProfile>) -> Self {
+        self.source_profile = Some(profile);
         self
     }
 
@@ -1187,6 +1428,10 @@ impl<'a> ColumnBlockIndex<'a> {
         #[cfg(feature = "profiling")]
         if let Some(counter) = self.logical_read_counter {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "profiling")]
+        if let Some(profile) = &self.source_profile {
+            profile.node_reads.fetch_add(1, Ordering::Relaxed);
         }
         Ok(ValidatedColumnBlockNode::from_validated_guard(g))
     }
@@ -1483,74 +1728,114 @@ impl<'a> ColumnBlockIndex<'a> {
         Ok(entries)
     }
 
-    /// Collects all leaf entries in ascending `start_row_id` order.
-    pub(crate) async fn collect_leaf_entries_budgeted(
+    /// Choose source boundaries from the first level with eight entries per requested partition.
+    /// Frontiers remain below the threshold; chosen-level entries are never materialized.
+    pub(crate) async fn plan_build_ranges(
         &self,
+        requested: usize,
         budget: &MemoryBudget,
-    ) -> RuntimeOrFatalResult<BudgetedVec<ColumnLeafEntry>> {
-        if self.root_block_id == SUPER_BLOCK_ID {
-            return Ok(BudgetedVec::new(budget));
-        }
-        let mut stack = BudgetedVec::new(budget);
-        stack
-            .push(self.root_block_id, "cold traversal stack")
-            .change_context(RuntimeError::IndexAccess)?;
-        let mut entries = BudgetedVec::new(budget);
-        let mut last_end = None;
-        while let Some(block_id) = stack.pop() {
-            let node = self.read_node(block_id).await?;
-            if node.is_leaf() {
-                let prefixes = self
-                    .node_result(block_id, node.leaf_prefix_plane())
+    ) -> RuntimeOrFatalResult<ColumnSourcePlan> {
+        let threshold = requested
+            .checked_mul(8)
+            .filter(|&count| count != 0)
+            .ok_or_else(|| {
+                invalid_node_payload()
+                    .attach("cold partition sizing overflow")
                     .change_context(RuntimeError::IndexAccess)
-                    .attach("operation=collect_column_leaf_entries")?;
-                for idx in 0..prefixes.count() {
-                    let view = self
-                        .node_result(block_id, node.leaf_entry_view_with_prefixes(&prefixes, idx))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_leaf_entries")?;
-                    let entry = self
-                        .node_result(block_id, build_leaf_entry(block_id, &view))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_leaf_entries")?;
-                    if let Some(prev_end) = last_end
-                        && entry.start_row_id < prev_end
-                    {
-                        return Err(invalid_node_payload()
-                            .attach(format!(
-                                "file={}, block=column_block_index, block_id={block_id}",
-                                self.file_kind()
-                            ))
-                            .change_context(RuntimeError::IndexAccess)
-                            .attach("operation=collect_column_leaf_entries")
-                            .into());
-                    }
-                    last_end = Some(entry.end_row_id());
-                    entries
-                        .push(entry, "cold descriptors")
-                        .change_context(RuntimeError::IndexAccess)?;
-                }
-                continue;
-            }
-            let branch_entries = node.branch_entries();
-            for entry in branch_entries.iter().rev() {
-                let child_block_id = entry.block_id();
-                if child_block_id == SUPER_BLOCK_ID {
-                    return Err(invalid_node_payload()
-                        .attach(format!(
-                            "file={}, block=column_block_index, block_id={block_id}",
-                            self.file_kind()
-                        ))
-                        .change_context(RuntimeError::IndexAccess)
-                        .attach("operation=collect_column_leaf_entries")
-                        .into());
-                }
-                stack
-                    .push(child_block_id, "cold traversal stack")
-                    .change_context(RuntimeError::IndexAccess)?;
-            }
+            })?;
+        let mut partitions = BudgetedVec::new(budget);
+        if self.root_block_id == SUPER_BLOCK_ID {
+            return Ok(ColumnSourcePlan {
+                partitions,
+                height: 0,
+                entries: 0,
+            });
         }
-        Ok(entries)
+        let mut frontier = BudgetedVec::new(budget);
+        frontier
+            .push(
+                CountedNode {
+                    block: self.root_block_id,
+                    count: 0,
+                },
+                "cold planning frontier",
+            )
+            .change_context(RuntimeError::IndexAccess)?;
+        loop {
+            let mut entries = 0usize;
+            let mut height = None;
+            for item in &mut *frontier {
+                let node = self.read_node(item.block).await?;
+                height = Some(node.header_ref().height());
+                item.count = node.header_ref().count() as usize;
+                entries = entries.checked_add(item.count).ok_or_else(|| {
+                    invalid_node_payload().change_context(RuntimeError::IndexAccess)
+                })?;
+            }
+            let height = height.unwrap_or_else(|| unreachable!("nonempty cold planning frontier"));
+            if entries >= threshold || height == 0 {
+                let count = requested.min(entries);
+                partitions
+                    .ensure_capacity(count, "cold partitions")
+                    .change_context(RuntimeError::IndexAccess)?;
+                let mut start = RowID::new(0);
+                let mut node_rank = 0;
+                let mut cut = 1;
+                for item in &*frontier {
+                    if cut == count {
+                        break;
+                    }
+                    if cold_partition_rank(entries, cut, count) >= node_rank + item.count {
+                        node_rank += item.count;
+                        continue;
+                    }
+                    let node = self.read_node(item.block).await?;
+                    while cut < count
+                        && cold_partition_rank(entries, cut, count) < node_rank + item.count
+                    {
+                        let ordinal = cold_partition_rank(entries, cut, count) - node_rank;
+                        let end = if node.is_leaf() {
+                            node.leaf_entry_view(ordinal)
+                                .change_context(RuntimeError::IndexAccess)?
+                                .start_row_id
+                        } else {
+                            node.branch_entries()[ordinal].start_row_id()
+                        };
+                        partitions.push_reserved(ColdPartition {
+                            id: cut - 1,
+                            range: start..end,
+                        });
+                        start = end;
+                        cut += 1;
+                    }
+                    node_rank += item.count;
+                }
+                partitions.push_reserved(ColdPartition {
+                    id: count - 1,
+                    range: start..self.end_row_id,
+                });
+                return Ok(ColumnSourcePlan {
+                    partitions,
+                    height,
+                    entries,
+                });
+            }
+            // Only a level below 8*P can expand. Old and replacement buffers
+            // overlap under admission until the complete next frontier is ready.
+            let mut next = BudgetedVec::new(budget);
+            next.ensure_capacity(entries, "cold planning frontier")
+                .change_context(RuntimeError::IndexAccess)?;
+            for item in &*frontier {
+                let node = self.read_node(item.block).await?;
+                for ordinal in 0..item.count {
+                    next.push_reserved(CountedNode {
+                        block: node.branch_entries()[ordinal].block_id(),
+                        count: 0,
+                    });
+                }
+            }
+            frontier = next;
+        }
     }
 
     /// Collects scan-ready cold-block metadata in ascending row-id order.
@@ -2161,6 +2446,12 @@ pub(crate) fn validate_persisted_column_block_index_page(
     validate_node_payload(page)
         .attach_with(|| format!("file={file_kind}, block=column_block_index, block_id={block_id}"))
         .map(|_| ())
+}
+
+#[inline]
+fn cold_partition_rank(entries: usize, cut: usize, partitions: usize) -> usize {
+    // usize products fit in u128 on all supported platforms.
+    ((entries as u128 * cut as u128) / partitions as u128) as usize
 }
 
 #[inline]
@@ -2829,26 +3120,35 @@ fn search_branch_entry(entries: &[ColumnBlockBranchEntry], row_id: RowID) -> Opt
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
+    use crate::Engine;
+    use crate::buffer::{
+        global_readonly_pool_scope, minimum_readonly_pool_bytes, table_readonly_pool,
+    };
     use crate::catalog::{
         StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec, TableMetadata,
     };
+    use crate::conf::{ColdIndexBuildConfig, ThreadPoolConfig};
     // Tests below inspect the existing ColumnBlockIndex public orchestration
     // boundary over persisted DataIntegrity, buffer/file IO, and rewrite Internal.
     use crate::error::{DataIntegrityError, DiscloseError, Error};
+    use crate::file::block_integrity::LWC_BLOCK_SPEC;
     use crate::file::cow_file::SUPER_BLOCK_ID;
     use crate::file::cow_file::tests::rewrite_page_with_checksum;
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
     use crate::file::{FileKind, build_test_fs};
+    use crate::io::IOBuf;
     use crate::layout::LayoutError;
+    use crate::lwc::{LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, PersistedLwcBlock};
     use crate::table::test_user_table_id;
+    use crate::table::tests::lightweight_test_engine_config;
     use crate::value::ValKind;
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::slice;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     const COLUMN_ROW_CODEC_DENSE: u8 = 1;
 
@@ -3144,6 +3444,227 @@ pub(super) mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    async fn write_cold_source_tree(
+        index: &ColumnBlockIndex<'_>,
+        file: &mut MutableTableFile,
+        leaf_counts: &[usize],
+        tall: bool,
+    ) -> (BlockID, Vec<ColumnBlockEntryInput>, Vec<usize>) {
+        let mut oracle = Vec::new();
+        let mut leaf_starts = Vec::new();
+        let mut children = Vec::new();
+        for &count in leaf_counts {
+            leaf_starts.push(oracle.len());
+            let mut entries = Vec::new();
+            for _ in 0..count {
+                let ordinal = oracle.len();
+                let start = 7 + ordinal as u64 * 11;
+                let input = ColumnBlockEntryShape::new(
+                    test_user_table_id(1),
+                    RowID::new(start),
+                    RowID::new(start + 5),
+                    &test_row_ids([start + 1, start + 3]),
+                    &[],
+                )
+                .unwrap()
+                .with_block_id(BlockID::new(1_000_000 - ordinal as u64 * 3));
+                let mut input = input;
+                if ordinal % 3 == 0 {
+                    input.deletions = OrdinalDeletionSet::from_ordinals(2, &[1]).unwrap();
+                }
+                entries.push(build_logical_entry_from_input(&input));
+                oracle.push(input);
+            }
+            let leaf = index
+                .write_leaf_pages_from_logical_entries(file, &entries, TrxID::new(2))
+                .await
+                .unwrap();
+            assert_eq!(leaf.len(), 1);
+            children.extend(leaf);
+        }
+        let root = if children.is_empty() {
+            SUPER_BLOCK_ID
+        } else if children.len() == 1 {
+            children[0].block_id()
+        } else if tall {
+            let mut parents = Vec::new();
+            for chunk in children.chunks(3) {
+                parents.extend(
+                    index
+                        .write_branch_pages(file, chunk, 1, TrxID::new(2))
+                        .await
+                        .unwrap(),
+                );
+            }
+            index
+                .write_branch_pages(file, &parents, 2, TrxID::new(2))
+                .await
+                .unwrap()[0]
+                .block_id()
+        } else {
+            index
+                .write_branch_pages(file, &children, 1, TrxID::new(2))
+                .await
+                .unwrap()[0]
+                .block_id()
+        };
+        (root, oracle, leaf_starts)
+    }
+
+    async fn assert_cold_source_ranges(leaf_counts: &[usize], tall: bool, verify_cursor: bool) {
+        let (_temp, fs) = build_test_fs();
+        let table = fs
+            .create_table_file(test_user_table_id(1), metadata(), false)
+            .unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let pool = table_readonly_pool(&global, test_user_table_id(1), &table);
+        let guard = pool.create_base_guard();
+        let empty = ColumnBlockIndex::new(
+            SUPER_BLOCK_ID,
+            RowID::new(0),
+            pool.file_kind(),
+            pool.sparse_file(),
+            pool.global_pool(),
+            &guard,
+        );
+        let mut file = MutableTableFile::fork(
+            &table,
+            fs.background_writes(),
+            pool.global_pool().clone(),
+            guard.clone(),
+        );
+        let (root, oracle, leaf_starts) =
+            write_cold_source_tree(&empty, &mut file, leaf_counts, tall).await;
+        let (_file, _old) = file.commit(TrxID::new(2), false).await.unwrap();
+        let pivot = oracle
+            .last()
+            .map_or(RowID::new(0), |entry| entry.end_row_id + 7);
+        let index = ColumnBlockIndex::new(
+            root,
+            pivot,
+            pool.file_kind(),
+            pool.sparse_file(),
+            pool.global_pool(),
+            &guard,
+        );
+        #[cfg(feature = "profiling")]
+        let reads = Arc::new(ColdReadProfile::default());
+        #[cfg(feature = "profiling")]
+        let index = index.with_source_profile(reads.clone());
+        let budget = MemoryBudget::new(512 * 1024);
+        let plan = index.plan_build_ranges(8, &budget).await.unwrap();
+        let selected: Vec<_> = if leaf_counts.len() >= 64 {
+            leaf_starts
+        } else {
+            (0..oracle.len()).collect()
+        };
+        let expected_height = u32::from(leaf_counts.len() >= 64);
+        assert_eq!(
+            plan.height, expected_height,
+            "leaf_counts={leaf_counts:?}, tall={tall}"
+        );
+        assert_eq!(plan.entries, selected.len());
+        assert_eq!(plan.partitions.len(), selected.len().min(8));
+        #[cfg(feature = "profiling")]
+        if expected_height > 0 {
+            assert!(
+                reads.node_reads.load(Ordering::Relaxed) < leaf_counts.len(),
+                "planner descended into the selected level's children"
+            );
+        }
+        let mut actual = Vec::new();
+        for (id, partition) in plan.partitions.iter().enumerate() {
+            let rank_start = id * selected.len() / plan.partitions.len();
+            let rank_end = (id + 1) * selected.len() / plan.partitions.len();
+            let start = if id == 0 {
+                RowID::new(0)
+            } else {
+                oracle[selected[rank_start]].start_row_id
+            };
+            let end = if id + 1 == plan.partitions.len() {
+                pivot
+            } else {
+                oracle[selected[rank_end]].start_row_id
+            };
+            assert_eq!(partition.id, id);
+            assert_eq!(partition.range, start..end);
+            let workspace = ColumnBuildWorkspace::new(&budget).unwrap();
+            let mut cursor =
+                ColumnBlockRangeCursor::new(&index, partition.range.clone(), workspace);
+            while !cursor.exhausted() {
+                let batch = cursor.next_batch(&index).await.unwrap();
+                assert!(batch.entries.len() <= 64);
+                for entry in &*batch.entries {
+                    actual.push((
+                        entry.start_row_id,
+                        entry.end_row_id,
+                        entry.block_id,
+                        entry.identity.clone(),
+                        entry.deletes.clone(),
+                    ));
+                }
+            }
+            assert!(cursor.next_batch(&index).await.unwrap().entries.is_empty());
+        }
+        let expected: Vec<_> = oracle
+            .iter()
+            .map(|entry| {
+                (
+                    entry.start_row_id,
+                    entry.end_row_id,
+                    entry.block_id,
+                    entry.row_set.clone(),
+                    entry.deletions.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        if oracle.len() > 1 {
+            // The lower bound is in a gap and locate_block cannot find it.
+            let start = oracle[0].end_row_id;
+            assert!(index.locate_block(start).await.unwrap().is_none());
+            let mut cursor = ColumnBlockRangeCursor::new(
+                &index,
+                start..oracle[1].start_row_id,
+                ColumnBuildWorkspace::new(&budget).unwrap(),
+            );
+            assert!(cursor.next_batch(&index).await.unwrap().entries.is_empty());
+            assert!(cursor.exhausted());
+        }
+        if verify_cursor {
+            let baseline = budget.used();
+            let mut cursor = ColumnBlockRangeCursor::new(
+                &index,
+                RowID::new(0)..pivot,
+                ColumnBuildWorkspace::new(&budget).unwrap(),
+            );
+            let mut scanned = Vec::new();
+            while !cursor.exhausted() {
+                let batch = cursor.next_batch(&index).await.unwrap();
+                scanned.extend(batch.entries.iter().map(|entry| entry.block_id));
+            }
+            assert_eq!(
+                scanned,
+                oracle
+                    .iter()
+                    .map(|entry| entry.block_id)
+                    .collect::<Vec<_>>()
+            );
+            // Reuse the admitted stack and batch, then abandon a partial scan.
+            let workspace = cursor.into_workspace();
+            let mut cursor = ColumnBlockRangeCursor::new(&index, RowID::new(0)..pivot, workspace);
+            assert_eq!(cursor.next_batch(&index).await.unwrap().entries.len(), 64);
+            assert!(!cursor.exhausted());
+            drop(cursor);
+            assert_eq!(budget.used(), baseline);
+        }
+        drop(plan);
+        assert_eq!(budget.used(), 0);
+        assert!(index.plan_build_ranges(usize::MAX, &budget).await.is_err());
     }
 
     /// Purpose: Repack growing middle entries, propagate leaf splits through a full branch, and retain old-root visibility.
@@ -4702,5 +5223,142 @@ pub(super) mod tests {
                 }
             }
         }
+    }
+
+    /// Purpose: Select exact oversampled cuts and leaf fallback across sparse leaf, branch and taller cold trees.
+    /// Expected: Threshold neighbors select the first eligible level, range traversal covers every descriptor once, and gaps exhaust without physical membership lookups.
+    #[test]
+    fn cold_source_level_selection_and_exact_range_coverage() {
+        smol::block_on(async {
+            assert_cold_source_ranges(&[], false, false).await;
+            for count in [1, 3, 9, 63, 64, 65, 72, 513] {
+                assert_cold_source_ranges(&[count], false, false).await;
+            }
+            for count in [9, 63, 64, 65, 72] {
+                let leaves: Vec<_> = (0..count).map(|id| 1 + id % 5).collect();
+                for tall in [false, true] {
+                    assert_cold_source_ranges(&leaves, tall, false).await;
+                }
+            }
+        });
+    }
+
+    /// Purpose: Preserve cold-read progress when a valid worker wave could otherwise pin the entire readonly pool.
+    /// Expected: Suspended cursors leave capacity for LWC reads and resume exact descriptor coverage under eviction pressure without releasing the cursors first.
+    #[test]
+    fn cold_range_cursors_leave_pool_capacity_for_lwc_reads() {
+        smol::block_on(async {
+            const WORKERS: usize = 255;
+            const PARTITIONS: usize = WORKERS * 4;
+            const ENTRIES: usize = 128;
+            let temp = TempDir::new().unwrap();
+            let mut config = lightweight_test_engine_config(temp.path(), "cold_cursor_pool");
+            config.file = config
+                .file
+                .readonly_buffer_size(minimum_readonly_pool_bytes());
+            config
+                .clone()
+                .thread_pool(ThreadPoolConfig::default().worker_threads(WORKERS))
+                .cold_index_build(ColdIndexBuildConfig::default().max_workers(Some(WORKERS)))
+                .validate()
+                .unwrap();
+            // Control the first worker wave at descriptor boundaries directly,
+            // without needing hundreds of OS threads to arrange the same state.
+            let engine = Engine::bootstrap(config).await.unwrap();
+            let fs = &engine.inner().table_fs;
+            let table = fs
+                .create_table_file(test_user_table_id(103), metadata(), false)
+                .unwrap();
+            let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+            drop(old_root);
+            let pool = engine.inner().pools.disk.clone();
+            assert_eq!(pool.capacity(), WORKERS + 1);
+            let guard = pool.create_base_guard();
+            let empty = ColumnBlockIndex::new(
+                SUPER_BLOCK_ID,
+                RowID::new(0),
+                table.file_kind(),
+                table.sparse_file(),
+                &pool,
+                &guard,
+            );
+            let mut file =
+                MutableTableFile::fork(&table, fs.background_writes(), pool.clone(), guard.clone());
+            let (root, oracle, _) =
+                write_cold_source_tree(&empty, &mut file, &[ENTRIES; PARTITIONS], false).await;
+            let lwc_id = file.allocate_block().unwrap();
+            let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
+            let bytes = buf.as_bytes_mut();
+            let start = write_block_header(bytes, LWC_BLOCK_SPEC);
+            let block = LwcBlock::from_bytes_mut(&mut bytes[start..start + LWC_BLOCK_PAYLOAD_SIZE]);
+            block.header = LwcBlockHeader::new(1, 0, 0, 0);
+            write_block_checksum(bytes);
+            file.write_block(lwc_id, buf).await.unwrap();
+            let (_file, _old_root) = file.commit(TrxID::new(2), false).await.unwrap();
+            let index = ColumnBlockIndex::new(
+                root,
+                oracle.last().unwrap().end_row_id + 7,
+                table.file_kind(),
+                table.sparse_file(),
+                &pool,
+                &guard,
+            );
+            let budget = MemoryBudget::new(256 * 1024 * 1024);
+            let plan = index.plan_build_ranges(PARTITIONS, &budget).await.unwrap();
+            assert_eq!(plan.height, 0);
+            assert_eq!(plan.partitions.len(), PARTITIONS);
+            let mut cursors = Vec::new();
+            for partition in plan.partitions.iter().take(WORKERS) {
+                let mut cursor = ColumnBlockRangeCursor::new(
+                    &index,
+                    partition.range.clone(),
+                    ColumnBuildWorkspace::new(&budget).unwrap(),
+                );
+                let batch = cursor.next_batch(&index).await.unwrap();
+                assert_eq!(batch.entries.len(), 64);
+                let scanned: Vec<_> = batch.entries.iter().map(|entry| entry.block_id).collect();
+                assert!(!cursor.exhausted());
+                cursors.push((cursor, scanned));
+            }
+            // A guarded root plus one distinct guarded leaf per cursor would
+            // occupy all frames and strand this load. The test-runner timeout
+            // is the hang watchdog; cursor progress must not unblock the read.
+            let loaded = PersistedLwcBlock::load(
+                table.file_kind(),
+                table.sparse_file(),
+                &pool,
+                &guard,
+                lwc_id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(loaded.block().row_count(), 0);
+            assert_eq!(loaded.block().block_binding_value(), 1);
+            drop(loaded);
+            for (id, (mut cursor, mut scanned)) in cursors.into_iter().enumerate() {
+                while !cursor.exhausted() {
+                    let batch = cursor.next_batch(&index).await.unwrap();
+                    scanned.extend(batch.entries.iter().map(|entry| entry.block_id));
+                }
+                let expected: Vec<_> = oracle[id * ENTRIES..(id + 1) * ENTRIES]
+                    .iter()
+                    .map(|entry| entry.block_id)
+                    .collect();
+                assert_eq!(scanned, expected, "partition {id} resumed incorrectly");
+            }
+            drop(plan);
+            assert_eq!(budget.used(), 0);
+        });
+    }
+
+    /// Purpose: Resume leaf and ancestor coordinates across batches and reuse admitted traversal storage.
+    /// Expected: Full scans match independent block order, and workspace reuse and early drop release all reservations.
+    #[test]
+    fn cold_range_cursor_resumes_and_releases_workspace() {
+        smol::block_on(async {
+            assert_cold_source_ranges(&[129], false, true).await;
+            assert_cold_source_ranges(&[70; 4], false, true).await;
+            assert_cold_source_ranges(&[70; 7], true, true).await;
+        });
     }
 }

@@ -2,15 +2,17 @@
 //! owns allocation, ingress, write observation, and private-root completion.
 //! Successful sealing hands resource ownership to `sealed_cold` after releasing
 //! construction inputs; readers and cross-tier validation are separate modules.
+#[cfg(any(test, feature = "profiling"))]
+use super::SortedRun;
 use super::merge::{
-    CompletedPartition, HotEntryRef, MergeCompletion, MergeConsumption, MergePreparation,
-    PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
+    CompletedPartition, HotDuplicate, HotEntryRef, MergeCompletion, MergeConsumption,
+    MergePreparation, PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
 };
 use super::packing::{
     LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
 };
 use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild, SealedColdMetadata};
-use super::{BudgetedVec, DuplicateCheck, MemoryBudget, MemoryReservation, SortedRun, SortedRuns};
+use super::{BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation, SortedRuns};
 use crate::buffer::PoolGuard;
 use crate::catalog::IndexRef;
 use crate::completion::Completion;
@@ -114,7 +116,8 @@ impl Drop for BufferSlot {
 pub(crate) struct ColdBuildPolicy {
     /// Total admitted scratch ceiling for the invocation.
     pub(crate) max_scratch_bytes: usize,
-    max_workers: usize,
+    /// Maximum accepted extraction or construction jobs awaiting collection.
+    pub(crate) max_workers: usize,
     max_ready_buffers: usize,
     max_in_flight_writes: usize,
 }
@@ -205,17 +208,25 @@ struct PackedDiskNode {
     ack: OutputAck,
 }
 
-struct OutputAck(Arc<Completion<bool>>);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputStatus {
+    Accepted,
+    Stopped,
+    Rejected,
+}
+
+struct OutputAck(Arc<Completion<OutputStatus>>);
 
 impl OutputAck {
-    fn complete(&self, accepted: bool) {
-        self.0.complete(Ok(accepted));
+    #[inline]
+    fn complete(&self, status: OutputStatus) {
+        self.0.complete(Ok(status));
     }
 }
 
 impl Drop for OutputAck {
     fn drop(&mut self) {
-        self.complete(false);
+        self.complete(OutputStatus::Rejected);
     }
 }
 
@@ -245,6 +256,14 @@ struct Submitting {
     parent: bool,
     observer_admission: MemoryReservation,
     ingress: BoxFuture<'static, CompletionResult<Arc<Completion<()>>>>,
+}
+
+/// Settled cold construction; duplicate evidence carries no root authority.
+pub(crate) enum ColdBuildOutcome {
+    /// Complete input and all durable writes have settled successfully.
+    Complete(CompletedDiskBuild),
+    /// Exhaustive validation selected the earliest global equality.
+    Duplicate(HotDuplicate),
 }
 
 /// Successfully settled private-root evidence. Publication remains caller-owned.
@@ -413,30 +432,8 @@ pub(crate) struct DiskBulkBuild {
 }
 
 impl DiskBulkBuild {
-    /// Refine concurrency against resident input before the first output write.
-    pub(crate) fn new(
-        file: MutableTableFile,
-        run: Arc<SortedRun>,
-        admission: DiskBuildAdmission,
-        pool: QuiescentGuard<ThreadPool>,
-        poisoner: QuiescentGuard<EnginePoisoner>,
-        ts: TrxID,
-    ) -> RuntimeOrFatalResult<Self> {
-        let duplicates = if admission.unique {
-            DuplicateCheck::Collect
-        } else {
-            DuplicateCheck::Skip
-        };
-        let runs = Arc::new(SortedRuns::from_run(
-            run,
-            admission.budget.clone(),
-            duplicates,
-        ));
-        Self::from_runs(file, runs, admission, pool, poisoner, ts)
-    }
-
     /// Construct from complete resident runs without imposing a flattening owner.
-    pub(super) fn from_runs(
+    pub(crate) fn from_runs(
         file: MutableTableFile,
         runs: Arc<SortedRuns>,
         admission: DiskBuildAdmission,
@@ -513,7 +510,7 @@ impl DiskBulkBuild {
     }
 
     /// Construct a readable private root only after every child and parent write succeeds.
-    pub(crate) async fn build(&mut self) -> RuntimeOrFatalResult<CompletedDiskBuild> {
+    pub(crate) async fn build_outcome(&mut self) -> RuntimeOrFatalResult<ColdBuildOutcome> {
         let result = self.build_inner().await;
         if let Err(error) = result {
             self.fatal |= matches!(error, RuntimeOrFatalError::Fatal(_));
@@ -523,10 +520,26 @@ impl DiskBulkBuild {
                 Err(cleanup) => error.merge_cleanup(cleanup),
             });
         }
+        if matches!(result, Ok(ColdBuildOutcome::Duplicate(_))) {
+            // Even an equality discovered after output acceptance must drain
+            // consumers and writes, then reclaim safely owned private allocations.
+            self.settle().await?;
+        }
         result
     }
 
-    async fn build_inner(&mut self) -> RuntimeOrFatalResult<CompletedDiskBuild> {
+    /// Convenience adapter for component fixtures whose inputs must be distinct.
+    #[cfg(test)]
+    pub(crate) async fn build(&mut self) -> RuntimeOrFatalResult<CompletedDiskBuild> {
+        match self.build_outcome().await? {
+            ColdBuildOutcome::Complete(completed) => Ok(completed),
+            ColdBuildOutcome::Duplicate(_) => Err(execution_error(
+                "disk checked input contains duplicate keys",
+            )),
+        }
+    }
+
+    async fn build_inner(&mut self) -> RuntimeOrFatalResult<ColdBuildOutcome> {
         assert!(
             !self.finished && !self.failed,
             "disk build reused after terminal transition"
@@ -545,7 +558,7 @@ impl DiskBulkBuild {
                     .push((0, plan.range(partition).start), "disk partition coverage")
                     .change_context(RuntimeError::IndexAccess)?;
             }
-            self.leaves = Some(MergeConsumption::new(
+            self.leaves = Some(MergeConsumption::new_admitted(
                 plan.clone(),
                 self.pool.clone(),
                 DiskLeafConsumer {
@@ -554,7 +567,7 @@ impl DiskBulkBuild {
                     sender,
                     ts: self.ts,
                 },
-            ));
+            )?);
             self.receiver = Some(receiver);
             self.plan = Some(plan);
         }
@@ -616,9 +629,18 @@ impl DiskBulkBuild {
                 }
                 Progress::Leaves(result) => {
                     let outcome = result?;
-                    let completion = outcome.validation.map_err(|_| {
-                        execution_error("disk checked input contains duplicate keys")
-                    })?;
+                    #[cfg(feature = "profiling")]
+                    {
+                        self.measurements.merge = outcome.measurements;
+                    }
+                    let completion = match outcome.validation {
+                        Ok(completion) => completion,
+                        Err(duplicate) => {
+                            #[cfg(test)]
+                            self.admission.hooks.duplicate();
+                            return Ok(ColdBuildOutcome::Duplicate(duplicate));
+                        }
+                    };
                     for (partition, count) in outcome.outputs.into_iter().enumerate() {
                         let plan = self
                             .plan
@@ -685,17 +707,17 @@ impl DiskBulkBuild {
                 self.started.map_or(0, |t| t.elapsed().as_nanos() as u64);
         }
         self.finished = true;
-        Ok(CompletedDiskBuild {
+        Ok(ColdBuildOutcome::Complete(CompletedDiskBuild {
             identity: self.identity.clone(),
             root,
             completion,
-        })
+        }))
     }
 
     fn prepare_packet(&mut self, packet: PackedDiskNode) -> RuntimeOrFatalResult<()> {
         if !Arc::ptr_eq(&packet.identity, &self.identity) || packet.partition >= self.expected.len()
         {
-            packet.ack.complete(false);
+            packet.ack.complete(OutputStatus::Stopped);
             return Err(execution_error("foreign disk leaf packet"));
         }
         let expected = self.expected[packet.partition];
@@ -708,7 +730,7 @@ impl DiskBulkBuild {
             || packet.shape.coverage.end > plan.range(packet.partition).end
             || packet.shape.coverage.is_empty()
         {
-            packet.ack.complete(false);
+            packet.ack.complete(OutputStatus::Stopped);
             return Err(execution_error("repeated or overlapping disk leaf packet"));
         }
         self.start_write(packet, false)
@@ -775,7 +797,7 @@ impl DiskBulkBuild {
                 .unwrap_or_else(|| unreachable!("prepared ingress retained"))
                 .packet = Some(packet);
         } else {
-            packet.ack.complete(false);
+            packet.ack.complete(OutputStatus::Stopped);
         }
         result
     }
@@ -845,11 +867,11 @@ impl DiskBulkBuild {
                         (packet.ordinal + 1, packet.shape.coverage.end);
                     self.children.push_reserved(descriptor);
                 }
-                packet.ack.complete(true);
+                packet.ack.complete(OutputStatus::Accepted);
                 Ok(())
             }
             Err(bridge) => {
-                packet.ack.complete(false);
+                packet.ack.complete(OutputStatus::Stopped);
                 Err(bridge
                     .into_runtime_or_fatal(RuntimeError::IndexAccess)
                     .attach("operation=disk_bulk_build, phase=write_ingress"))
@@ -962,7 +984,7 @@ impl DiskBulkBuild {
                     select_biased! {
                         result = settlement => break result,
                         packet = delivery => match packet {
-                            Ok(packet) => packet.ack.complete(false),
+                            Ok(packet) => packet.ack.complete(OutputStatus::Stopped),
                             Err(_) => break settlement.await,
                         },
                     }
@@ -976,7 +998,7 @@ impl DiskBulkBuild {
         }
         if let Some(receiver) = self.receiver.take() {
             while let Ok(packet) = receiver.try_recv() {
-                packet.ack.complete(false);
+                packet.ack.complete(OutputStatus::Stopped);
             }
         }
         if let Err(error) = self.preparation.settle().await {
@@ -1090,7 +1112,7 @@ impl PartitionConsumer for DiskLeafConsumer {
     async fn consume(
         &self,
         stream: PartitionMergeStream,
-    ) -> RuntimeOrFatalResult<CompletedPartition<usize>> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<CompletedPartition<usize>>> {
         if self.admission.unique {
             self.pack(stream, BTreeU64::from).await
         } else {
@@ -1104,7 +1126,7 @@ impl DiskLeafConsumer {
         &self,
         mut stream: PartitionMergeStream,
         value: fn(RowID) -> V,
-    ) -> RuntimeOrFatalResult<CompletedPartition<usize>> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<CompletedPartition<usize>>> {
         let (plan, partition) = stream.identity();
         #[cfg(test)]
         self.admission.hooks.before_leaf(partition).await;
@@ -1128,7 +1150,12 @@ impl DiskLeafConsumer {
         let mut rank = plan.range(partition).start;
         let mut ordinal = 0;
         let mut inhibited = false;
-        while let Some(batch) = stream.next_batch()? {
+        loop {
+            let batch = match stream.next_batch()? {
+                BuildOutcome::Complete(Some(batch)) => batch,
+                BuildOutcome::Complete(None) => break,
+                BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
+            };
             if batch.construction_inhibited() {
                 inhibited = true;
                 window.clear();
@@ -1142,7 +1169,7 @@ impl DiskLeafConsumer {
                             .0,
                     );
                     if window.is_full() {
-                        let count = self
+                        let BuildOutcome::Complete(count) = self
                             .emit(
                                 runs,
                                 &window,
@@ -1153,7 +1180,10 @@ impl DiskLeafConsumer {
                                 ordinal,
                                 rank,
                             )
-                            .await?;
+                            .await?
+                        else {
+                            return Ok(BuildOutcome::Stopped);
+                        };
                         rank += count;
                         ordinal += 1;
                         window.consume(count);
@@ -1163,7 +1193,7 @@ impl DiskLeafConsumer {
             yield_now().await;
         }
         while window.len() != 0 {
-            let count = self
+            let BuildOutcome::Complete(count) = self
                 .emit(
                     runs,
                     &window,
@@ -1174,7 +1204,10 @@ impl DiskLeafConsumer {
                     ordinal,
                     rank,
                 )
-                .await?;
+                .await?
+            else {
+                return Ok(BuildOutcome::Stopped);
+            };
             rank += count;
             ordinal += 1;
             window.consume(count);
@@ -1197,7 +1230,7 @@ impl DiskLeafConsumer {
         partition: usize,
         ordinal: usize,
         rank: usize,
-    ) -> RuntimeOrFatalResult<usize> {
+    ) -> RuntimeOrFatalResult<BuildOutcome<usize>> {
         #[cfg(feature = "profiling")]
         let timer = PackingTimer::new(&self.admission.profile);
         let lower = window
@@ -1243,14 +1276,15 @@ impl DiskLeafConsumer {
             .send_async(packet)
             .await
             .map_err(|_| execution_error("disk coordinator closed leaf handoff"))?;
-        if !ack
+        match ack
             .wait_result()
             .await
             .map_err(|e| e.into_runtime_or_fatal(RuntimeError::IndexAccess))?
         {
-            return Err(execution_error("disk coordinator rejected leaf output"));
+            OutputStatus::Accepted => Ok(BuildOutcome::Complete(plan.count)),
+            OutputStatus::Stopped => Ok(BuildOutcome::Stopped),
+            OutputStatus::Rejected => Err(execution_error("disk coordinator lost leaf output")),
         }
-        Ok(plan.count)
     }
 }
 
@@ -1428,6 +1462,8 @@ async fn wait_write(writes: &mut BudgetedVec<PendingWrite>) -> (usize, Completio
 
 #[cfg(test)]
 mod tests {
+    use super::super::DuplicateCheck;
+    use super::super::complete_work;
     use super::*;
     use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
     use crate::catalog::IndexID;
@@ -1462,7 +1498,7 @@ mod tests {
     use std::os::fd::RawFd;
     use std::sync::atomic::{AtomicBool, Ordering as TestOrdering};
 
-    type HandoffObservation = (usize, Arc<Completion<bool>>);
+    type HandoffObservation = (usize, Arc<Completion<OutputStatus>>);
 
     #[derive(Default)]
     pub(super) struct Hooks {
@@ -1471,6 +1507,7 @@ mod tests {
         leaf_release: Mutex<Option<flume::Sender<()>>>,
         blocked_handoffs: Mutex<[Option<flume::Receiver<()>>; 2]>,
         handoff_entered: Mutex<Option<flume::Sender<HandoffObservation>>>,
+        duplicate_entered: Mutex<Option<flume::Sender<()>>>,
         delayed_write: Mutex<Option<flume::Receiver<()>>>,
         write_release: Mutex<Option<flume::Sender<()>>>,
         later_partition_accepted: AtomicBool,
@@ -1478,6 +1515,12 @@ mod tests {
     }
 
     impl Hooks {
+        pub(super) fn duplicate(&self) {
+            if let Some(entered) = self.duplicate_entered.lock().take() {
+                entered.send(()).unwrap();
+            }
+        }
+
         pub(super) async fn before_leaf(&self, partition: usize) {
             if partition == 0 {
                 let gate = self.blocked_leaf.lock().take();
@@ -1490,7 +1533,11 @@ mod tests {
             }
         }
 
-        pub(super) async fn before_handoff(&self, partition: usize, ack: &Arc<Completion<bool>>) {
+        pub(super) async fn before_handoff(
+            &self,
+            partition: usize,
+            ack: &Arc<Completion<OutputStatus>>,
+        ) {
             let gate = self
                 .blocked_handoffs
                 .lock()
@@ -1570,7 +1617,7 @@ mod tests {
         PoolScope(registry.finish())
     }
 
-    async fn settle_handoff(build: &mut DiskBulkBuild, detach: bool) -> RuntimeOrFatalError {
+    async fn settle_handoff(build: &mut DiskBulkBuild, detach: bool) {
         let hooks = build.admission.hooks.clone();
         let (entered, reached) = flume::bounded(2);
         *hooks.handoff_entered.lock() = Some(entered);
@@ -1593,7 +1640,10 @@ mod tests {
         assert!(!queued_ack.is_completed());
         let mut settlement = Box::pin(build.settle());
         assert!(futures::poll!(settlement.as_mut()).is_pending());
-        assert!(!queued_ack.completed_result().unwrap().unwrap());
+        assert_eq!(
+            queued_ack.completed_result().unwrap().unwrap(),
+            OutputStatus::Stopped
+        );
         assert!(!late_ack.is_completed());
         let result = if detach {
             drop(settlement);
@@ -1605,10 +1655,13 @@ mod tests {
             releases[0].send(()).unwrap();
             settlement.await
         };
-        assert!(!late_ack.completed_result().unwrap().unwrap());
+        assert_eq!(
+            late_ack.completed_result().unwrap().unwrap(),
+            OutputStatus::Stopped
+        );
         assert!(build.receiver.is_none());
         assert!(build.finished);
-        result.unwrap_err()
+        result.unwrap();
     }
 
     async fn roundtrip(unique: bool, count: u32, workers: usize, fail: Option<&'static str>) {
@@ -1650,7 +1703,11 @@ mod tests {
             ColdIndexBuildConfig::default()
                 .max_workers(Some(workers))
                 .max_ready_buffers(1)
-                .max_in_flight_writes(if fail == Some("delayed child") { 4 } else { 2 }),
+                .max_in_flight_writes(match fail {
+                    Some("delayed child") => 4,
+                    Some("late duplicate write") => 32,
+                    _ => 2,
+                }),
             2,
         )
         .unwrap();
@@ -1661,11 +1718,20 @@ mod tests {
             &metadata.idx.index_specs()[IndexSlot::new(0)],
             !unique,
         );
-        let mut input = BuildEntries::new(&budget);
+        let duplicate = matches!(fail, Some("late duplicate" | "late duplicate write"));
+        let multiple = duplicate || fail == Some("merge batch");
+        let mut inputs = [BuildEntries::new(&budget), BuildEntries::new(&budget)];
         let mut expected = Vec::new();
         for number in (0..count).rev() {
             let row_id = RowID::from(number as usize + 10);
-            let value = Val::from(if unique { number } else { number % 7 });
+            let value = Val::from(if duplicate && number == count - 1 {
+                number - 1
+            } else if unique {
+                number
+            } else {
+                number % 7
+            });
+            let input = &mut inputs[if multiple { number as usize % 2 } else { 0 }];
             let key = if unique {
                 encoder.encode(&[value])
             } else {
@@ -1686,18 +1752,44 @@ mod tests {
                 .unwrap();
         }
         expected.sort_unstable();
-        let run = Arc::new(SortedRun::finish(
-            input.entries,
-            input.payload,
+        let mut runs = BudgetedVec::new(&budget);
+        for (group, input) in inputs.into_iter().enumerate() {
+            if input.entries.is_empty() {
+                continue;
+            }
+            let run = Arc::new(complete_work(SortedRun::finish_group(
+                input.entries,
+                input.payload,
+                if unique {
+                    DuplicateCheck::Collect
+                } else {
+                    DuplicateCheck::Skip
+                },
+                group,
+                &AtomicBool::new(false),
+            )));
+            if duplicate {
+                assert_eq!(
+                    run.duplicates,
+                    super::super::LocalDuplicates::Checked {
+                        first_duplicate_position: None
+                    }
+                );
+            }
+            runs.push(run, "test disk runs").unwrap();
+        }
+        let runs = Arc::new(SortedRuns::from_admitted(
+            runs,
+            budget.clone(),
             if unique {
                 DuplicateCheck::Collect
             } else {
                 DuplicateCheck::Skip
             },
         ));
-        let mut build = DiskBulkBuild::new(
+        let mut build = DiskBulkBuild::from_runs(
             file,
-            run,
+            runs,
             admission,
             scope.0.dependency::<ThreadPool>(),
             scope.0.dependency::<EnginePoisoner>(),
@@ -1713,6 +1805,7 @@ mod tests {
             }))
         });
         let mut detached = None;
+        let mut duplicate_failure = None;
         match fail {
             Some("detach") => {
                 let (release, gate) = flume::bounded(1);
@@ -1720,6 +1813,13 @@ mod tests {
                 *hooks.blocked_leaf.lock() = Some(gate);
                 *hooks.leaf_entered.lock() = Some(entered);
                 detached = Some((release, reached));
+            }
+            Some("late duplicate write") => {
+                let (release, gate) = flume::bounded(1);
+                let (entered, reached) = flume::bounded(1);
+                *hooks.delayed_write.lock() = Some(gate);
+                *hooks.duplicate_entered.lock() = Some(entered);
+                duplicate_failure = Some((reached, release));
             }
             Some("delayed child") => {
                 let (release, gate) = flume::bounded(1);
@@ -1731,7 +1831,9 @@ mod tests {
                 *hooks.blocked_leaf.lock() = Some(gate);
                 *hooks.leaf_release.lock() = Some(release);
             }
-            Some("backend" | "settle handoff" | "detach settle handoff" | "seal") => (),
+            Some(
+                "backend" | "settle handoff" | "detach settle handoff" | "seal" | "late duplicate",
+            ) => (),
             Some(purpose) => fail_build_budget(&budget, purpose),
             None => (),
         }
@@ -1742,11 +1844,80 @@ mod tests {
             assert!(!build.finished);
             release.send(()).unwrap();
         }
-        let result = match fail {
-            Some("settle handoff") => Err(settle_handoff(&mut build, false).await),
-            Some("detach settle handoff") => Err(settle_handoff(&mut build, true).await),
-            _ => build.build().await,
-        };
+        if duplicate {
+            let outcome = if let Some((reached, release)) = duplicate_failure {
+                let observer = async {
+                    reached.recv_async().await.unwrap();
+                    release.send(()).unwrap();
+                };
+                futures::join!(build.build_outcome(), observer).0
+            } else {
+                build.build_outcome().await
+            };
+            if fail == Some("late duplicate write") {
+                let RuntimeOrFatalError::Runtime(error) = outcome.err().unwrap() else {
+                    panic!("write execution failure must outrank duplicate evidence");
+                };
+                assert!(error.contains::<IoError>(), "{error:?}");
+            } else {
+                let ColdBuildOutcome::Duplicate(conflict) = outcome.unwrap() else {
+                    panic!("duplicate cannot mint completed-root authority");
+                };
+                assert_eq!(conflict.right_rank, count as usize - 1);
+                assert_eq!(
+                    conflict.rows,
+                    [
+                        RowID::new(u64::from(count) + 8),
+                        RowID::new(u64::from(count) + 9)
+                    ]
+                );
+            }
+            assert!(
+                !build.allocations.is_empty(),
+                "duplicate must be discovered after output acceptance"
+            );
+            assert!(
+                build
+                    .allocations
+                    .iter()
+                    .all(|record| record.accepted && record.reclaim_attempted)
+            );
+            assert_eq!(
+                build.allocations.iter().all(|record| record.completed),
+                fail != Some("late duplicate write"),
+                "completed records certify successful writes, while a failed settled write must remain unsuccessful"
+            );
+            assert!(build.writes.is_empty());
+            assert!(build.submitting.is_none());
+            assert!(build.completion.is_none());
+            assert_eq!(
+                build.file.as_ref().unwrap().root().alloc_map.allocated(),
+                allocated_before
+            );
+            assert_eq!(
+                table.active_root_unchecked().alloc_map.allocated(),
+                allocated_before
+            );
+            build.settle().await.unwrap();
+            drop(build);
+            assert_eq!(budget.used(), 0);
+            return;
+        }
+        if matches!(fail, Some("settle handoff" | "detach settle handoff")) {
+            settle_handoff(&mut build, fail == Some("detach settle handoff")).await;
+            assert!(build.allocations.is_empty());
+            assert!(build.writes.is_empty());
+            assert!(build.submitting.is_none());
+            assert!(build.completion.is_none());
+            assert_eq!(
+                build.file.as_ref().unwrap().root().alloc_map.allocated(),
+                allocated_before
+            );
+            drop(build);
+            assert_eq!(budget.used(), 0);
+            return;
+        }
+        let result = build.build().await;
         if let Some(purpose) =
             fail.filter(|purpose| !matches!(*purpose, "blocked partition" | "detach" | "seal"))
         {
@@ -1756,18 +1927,7 @@ mod tests {
             let RuntimeOrFatalError::Runtime(error) = error else {
                 panic!("ordinary admission failure changed domain")
             };
-            if matches!(purpose, "settle handoff" | "detach settle handoff") {
-                assert!(build.allocations.is_empty());
-                let detail = format!("{error:?}");
-                assert!(
-                    detail.contains("disk coordinator rejected leaf output"),
-                    "{detail}"
-                );
-                assert!(
-                    !detail.contains("disk coordinator closed leaf handoff"),
-                    "{detail}"
-                );
-            } else if matches!(purpose, "delayed child" | "backend") {
+            if matches!(purpose, "delayed child" | "backend") {
                 assert!(error.downcast_ref::<IoError>().is_some(), "{error:?}");
                 if purpose == "delayed child" {
                     assert!(hooks.parent_before_child.load(TestOrdering::Acquire));
@@ -1779,6 +1939,12 @@ mod tests {
                         .downcast_ref::<crate::error::ResourceError>()
                         .is_some(),
                     "{error:?}"
+                );
+            }
+            if purpose == "merge batch" {
+                assert!(
+                    build.allocations.is_empty(),
+                    "all bounded merge capacity must be admitted before the first output"
                 );
             }
             assert!(build.writes.is_empty());
@@ -1934,14 +2100,16 @@ mod tests {
                     let mut cursor = ColdReader::new(reader.clone(), admission);
                     let expected = expected.first();
                     let mut hits = [None];
-                    cursor
-                        .lookup_batch(
-                            &[expected.map_or(&[], |(key, _)| key.as_slice())],
-                            &mut hits,
-                            &AtomicBool::new(false),
-                        )
-                        .await
-                        .unwrap();
+                    complete_work(
+                        cursor
+                            .lookup_batch(
+                                &[expected.map_or(&[], |(key, _)| key.as_slice())],
+                                &mut hits,
+                                &AtomicBool::new(false),
+                            )
+                            .await
+                            .unwrap(),
+                    );
                     assert_eq!(
                         hits[0],
                         expected.map(|(_, row)| *row),
@@ -2040,6 +2208,17 @@ mod tests {
         });
     }
 
+    /// Purpose: Settle a cross-run duplicate discovered after durable output admission and fail unaffordable multi-run merge workspaces before output.
+    /// Expected: Earliest duplicate evidence carries no completed root, accepted writes drain and reclaim safely, and merge admission errors allocate no output blocks.
+    #[test]
+    fn cold_multi_run_duplicate_and_prewrite_admission() {
+        smol::block_on(async {
+            roundtrip(true, 140_000, 2, Some("late duplicate")).await;
+            roundtrip(true, 140_000, 2, Some("late duplicate write")).await;
+            roundtrip(true, 140_000, 2, Some("merge batch")).await;
+        });
+    }
+
     /// Purpose: Preserve out-of-order partition progress and child-write failure authority after parent acceptance.
     /// Expected: Later partitions reach storage while an earlier packer is gated; a delayed failing child prevents private completion and all blocks are reclaimed.
     #[test]
@@ -2087,12 +2266,17 @@ mod tests {
                 )
                 .unwrap();
         }
-        let run = Arc::new(SortedRun::finish(
+        let run = Arc::new(complete_work(SortedRun::finish_group(
             input.entries,
             input.payload,
             DuplicateCheck::Collect,
-        ));
-        let runs = SortedRuns::from_run(run, admission.budget.clone(), DuplicateCheck::Collect);
+            0,
+            &AtomicBool::new(false),
+        )));
+        let mut owners = BudgetedVec::new(&admission.budget);
+        owners.push(run, "fixture runs").unwrap();
+        let runs =
+            SortedRuns::from_admitted(owners, admission.budget.clone(), DuplicateCheck::Collect);
         let entries: Vec<_> = runs.single_run().unwrap()[..100]
             .iter()
             .map(|entry| PackedNodeEntry {
