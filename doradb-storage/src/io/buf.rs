@@ -111,7 +111,6 @@ impl DirectBuf {
 
     /// Returns reference of data slice.
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved data"))]
     pub(crate) fn data(&self) -> &[u8] {
         &self.full_slice()[..self.len]
     }

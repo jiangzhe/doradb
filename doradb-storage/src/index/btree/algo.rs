@@ -116,6 +116,7 @@ pub(crate) enum MemTreeSiblingMergePlan {
 /// fence is the caller-supplied run fence; for split nodes it is the first
 /// unpacked entry. The returned fence is later used by `pack_fixed_entries`, so
 /// planning and materialization run against the same lower/upper fence pair.
+#[cfg(test)]
 pub(crate) fn plan_sibling_node<'a, V>(
     params: PackedNodePlanParams<'a>,
     entries: &'a [PackedNodeEntry<'a, V>],

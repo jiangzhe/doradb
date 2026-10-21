@@ -185,7 +185,7 @@ row and its secondary-index entries.
 
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
-complete block input, checkpoint submits only LWC serialization, compression,
+complete block input, checkpoint submits LWC serialization, compression,
 and checksum generation to the engine thread pool. One checkpoint-local
 state list retains blocks in logical RowID order and moves each block
 monotonically from `Encoding` to `Writing` to `Written`. The number of blocks
@@ -213,10 +213,10 @@ cannot be represented, checkpoint stops production, drains accepted writes, and
 publishes no partial root. Failures after the irreversible transition retain the
 existing fatal checkpoint policy.
 
-For every row accepted into an LWC block, checkpoint sends the identical
-visible value and RowID to the secondary-index sidecar. This produces companion
-`DiskTree` entries from exactly the rows represented by the new cold data.
-There is no later scan of arbitrary `MemIndex` state.
+Secondary-index construction uses the same immutable row values, RowIDs, and
+prepared visibility as LWC construction. This produces companion `DiskTree`
+entries from exactly the rows represented by the new cold data. There is no
+later scan of arbitrary `MemIndex` state.
 
 The frozen prefix determines the next `pivot_row_id`. The next surviving hot
 page determines `heap_redo_start_ts` when one was observed. If no successor was

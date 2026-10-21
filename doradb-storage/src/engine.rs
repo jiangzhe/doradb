@@ -542,6 +542,8 @@ pub(crate) struct EngineCore {
     pub(crate) hot_build_policy: HotBuildPolicy,
     /// Validated cold index construction limits.
     pub(crate) cold_build_policy: ColdBuildPolicy,
+    /// Independent per-checkpoint index reconciliation admission policy.
+    pub(crate) checkpoint_build_policy: ColdBuildPolicy,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned executor for finite synchronous and asynchronous jobs.
@@ -819,6 +821,11 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         table_scan_config,
         cold_build_policy: ColdBuildPolicy::new(
             config.cold_index_build,
+            config.thread_pool.worker_threads,
+        )
+        .disclose()?,
+        checkpoint_build_policy: ColdBuildPolicy::new(
+            config.checkpoint_index_build,
             config.thread_pool.worker_threads,
         )
         .disclose()?,

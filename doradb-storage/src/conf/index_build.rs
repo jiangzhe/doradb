@@ -73,7 +73,8 @@ impl HotIndexBuildConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ColdIndexBuildConfig {
     /// Maximum admitted scratch, including retained input and storage-owned buffers.
-    /// Per-row decoded payloads are temporary and excluded from this limit.
+    /// CREATE excludes temporary per-row decoded payloads. Checkpoint reconciliation
+    /// admits projection and decode temporaries under its own invocation budget.
     pub max_scratch_bytes: usize,
     /// Maximum cold extraction, local-sort and construction workers.
     /// `None` selects the engine pool size; admission may reduce effective concurrency.
@@ -126,6 +127,11 @@ impl ColdIndexBuildConfig {
 
     /// Normalize limits before any engine filesystem effect.
     pub(crate) fn validate(&mut self, pool_workers: usize) -> ConfigResult<()> {
+        self.validate_named(pool_workers, "cold_index_build")
+    }
+
+    /// Validate a caller-owned policy with its configuration field prefix.
+    pub(crate) fn validate_named(&mut self, pool_workers: usize, name: &str) -> ConfigResult<()> {
         let workers = self.max_workers.unwrap_or(pool_workers);
         for (field, value, valid) in [
             (
@@ -153,7 +159,11 @@ impl ColdIndexBuildConfig {
             ),
         ] {
             if !valid {
-                return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field=cold_index_build.{field}, value={value}, pool_workers={pool_workers}")));
+                return Err(
+                    Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!(
+                        "config_field={name}.{field}, value={value}, pool_workers={pool_workers}"
+                    )),
+                );
             }
         }
         let required_bytes =
@@ -167,7 +177,7 @@ impl ColdIndexBuildConfig {
         if required_bytes
             .is_none_or(|bytes| bytes > isize::MAX as usize || bytes > self.max_scratch_bytes)
         {
-            return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field=cold_index_build.output_limits, max_ready_buffers={}, max_in_flight_writes={}, max_scratch_bytes={}, required_bytes={required_bytes:?}", self.max_ready_buffers, self.max_in_flight_writes, self.max_scratch_bytes)));
+            return Err(Report::new(ConfigError::InvalidColdIndexBuildLimit).attach(format!("config_field={name}.output_limits, max_ready_buffers={}, max_in_flight_writes={}, max_scratch_bytes={}, required_bytes={required_bytes:?}", self.max_ready_buffers, self.max_in_flight_writes, self.max_scratch_bytes)));
         }
         self.max_workers = Some(workers);
         Ok(())
@@ -179,6 +189,45 @@ mod tests {
     use super::*;
     use crate::conf::EngineConfig;
     use tempfile::TempDir;
+
+    /// Purpose: Keep checkpoint configuration independent from CREATE and validate before filesystem effects.
+    /// Expected: Each policy retains its own limits and invalid checkpoint diagnostics name the checkpoint field.
+    #[test]
+    fn checkpoint_limits_are_independent() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("uncreated");
+        let checkpoint = ColdIndexBuildConfig::default()
+            .max_workers(Some(1))
+            .max_ready_buffers(2);
+        let config = EngineConfig::default()
+            .storage_root(&root)
+            .checkpoint_index_build(checkpoint)
+            .validate_inner()
+            .unwrap();
+        assert_eq!(config.checkpoint_index_build, checkpoint);
+        assert_eq!(config.cold_index_build.max_workers, Some(2));
+        assert_eq!(config.cold_index_build.max_ready_buffers, 8);
+        for invalid in [
+            checkpoint.max_workers(Some(0)),
+            checkpoint.max_workers(Some(3)),
+            checkpoint.max_ready_buffers(0),
+            checkpoint.max_in_flight_writes(1),
+            checkpoint.max_scratch_bytes(1),
+            checkpoint.max_scratch_bytes(usize::MAX),
+        ] {
+            let error = EngineConfig::default()
+                .storage_root(&root)
+                .checkpoint_index_build(invalid)
+                .validate_inner()
+                .unwrap_err();
+            assert_eq!(
+                error.current_context(),
+                &ConfigError::InvalidColdIndexBuildLimit
+            );
+            assert!(format!("{error:?}").contains("config_field=checkpoint_index_build."));
+            assert!(!root.exists());
+        }
+    }
 
     /// Purpose: Reject invalid cold build limits before engine filesystem effects.
     /// Expected: All effective defaults survive validation and invalid fields retain the cold-specific typed cause.

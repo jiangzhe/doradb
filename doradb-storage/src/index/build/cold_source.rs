@@ -243,27 +243,26 @@ impl ColdBuildSource {
         if !index_spec.unique() {
             projection.values.push_reserved(Val::from(row_id));
         }
-        rows.entries
-            .reserve_one("cold run entries")
-            .change_context(RuntimeError::CatalogAccess)?;
         let len = self
             .encoder
             .encoded_len(&projection.values)
             .change_context(RuntimeError::CatalogAccess)?;
-        rows.payload
-            .grow(
-                if len > MEM_CMP_KEY_INLINE { len } else { 0 },
-                "cold outlined key",
-            )
-            .change_context(RuntimeError::CatalogAccess)?;
+        rows.push_with(
+            if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+            "cold run entries",
+            "cold outlined key",
+            || IndexBuildEntry {
+                key: self.encoder.encode_with_len(&projection.values, len),
+                row_id,
+            },
+        )
+        .change_context(RuntimeError::CatalogAccess)?;
         #[cfg(feature = "profiling")]
         {
             projection.sample.live_rows += 1;
             projection.sample.encoded_bytes += len as u64;
         }
-        let key = self.encoder.encode_with_len(&projection.values, len);
         projection.values.clear();
-        rows.entries.push_reserved(IndexBuildEntry { key, row_id });
         Ok(())
     }
 }

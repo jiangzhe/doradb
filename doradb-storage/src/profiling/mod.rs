@@ -27,6 +27,7 @@ mod transaction;
 pub use buffer::{BufferPoolCounters, BufferPoolRuntimeStats, BufferPoolStats};
 pub use checkpoint::{
     CatalogCheckpointReport, CatalogTableCheckpointChange, CatalogTableCheckpointIoStats,
+    CheckpointIndexMeasurements,
 };
 pub use cleanup::{MemIndexCleanupStats, SecondaryMemIndexCleanupIndexStats};
 pub use index_build::{
@@ -53,7 +54,7 @@ pub(crate) use checkpoint::{
 };
 pub(crate) use index_build::{
     HotExtractionProfile, HotExtractionWorkerProfile, HotPackedLevel, HotPackedMeasurements,
-    IndexBuildProfiler, MergeWorkerProfile, PageMeasurement, ParentPlanningProfile,
+    IndexBuildProfiler, MergeWorkerProfile, PackingProfile, PageMeasurement, ParentPlanningProfile,
 };
 pub(crate) use io::{
     BackendStats, BackendStatsHandle, StorageServiceStats, StorageServiceStatsHandle,

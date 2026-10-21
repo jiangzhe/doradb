@@ -9,7 +9,8 @@ use super::merge::{
     MergePreparation, PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
 };
 use super::packing::{
-    LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
+    LeafWindow, fill_final_node, max_leaf_window_entries, max_node_slots, plan_leaf, plan_parent,
+    validate_final_node,
 };
 use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild, SealedColdMetadata};
 use super::{BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation, SortedRuns};
@@ -21,18 +22,13 @@ use crate::error::{
     CompletionResult, ConfigResult, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
 };
-use crate::file::block_integrity::write_block_checksum;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::table_file::MutableTableFile;
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::SecondaryDiskTreeRuntime;
-use crate::index::btree::algo::{
-    KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
-};
-use crate::index::btree::{
-    BTREE_NODE_USABLE_SIZE, BTreeNil, BTreeU64, BTreeValue, PackedNodeSpace,
-};
-use crate::index::disk_tree::{DISK_TREE_BLOCK_SIZE, btree_node_from_block_mut};
+use crate::index::btree::algo::{KnownFenceNodeParams, PackedNodeEntry};
+use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue};
+use crate::index::disk_tree::DISK_TREE_BLOCK_SIZE;
 use crate::io::DirectBuf;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
@@ -50,54 +46,24 @@ use std::sync::Arc;
 use std::task::Poll;
 
 #[cfg(feature = "profiling")]
-use crate::profiling::{ColdBuildMeasurements, clock::Instant};
+use crate::profiling::{ColdBuildMeasurements, PackingProfile, clock::Instant};
 #[cfg(feature = "profiling")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "profiling")]
 #[derive(Default)]
-struct PackingProfile {
-    active: AtomicU64,
-    peak: AtomicU64,
-    nanos: AtomicU64,
+struct DiskPackingProfile {
+    packing: PackingProfile,
     buffers: AtomicU64,
     buffer_peak: AtomicU64,
 }
 
 #[cfg(feature = "profiling")]
-struct PackingTimer<'a> {
-    profile: &'a PackingProfile,
-    started: Instant,
-}
-
-#[cfg(feature = "profiling")]
-impl<'a> PackingTimer<'a> {
-    fn new(profile: &'a PackingProfile) -> Self {
-        let active = profile.active.fetch_add(1, Ordering::AcqRel) + 1;
-        profile.peak.fetch_max(active, Ordering::Relaxed);
-        Self {
-            profile,
-            started: Instant::now(),
-        }
-    }
-}
-
-#[cfg(feature = "profiling")]
-impl Drop for PackingTimer<'_> {
-    fn drop(&mut self) {
-        self.profile
-            .nanos
-            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.profile.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(feature = "profiling")]
-struct BufferSlot(Arc<PackingProfile>);
+struct BufferSlot(Arc<DiskPackingProfile>);
 
 #[cfg(feature = "profiling")]
 impl BufferSlot {
-    fn new(profile: Arc<PackingProfile>) -> Self {
+    fn new(profile: Arc<DiskPackingProfile>) -> Self {
         let count = profile.buffers.fetch_add(1, Ordering::AcqRel) + 1;
         profile.buffer_peak.fetch_max(count, Ordering::Relaxed);
         Self(profile)
@@ -118,8 +84,10 @@ pub(crate) struct ColdBuildPolicy {
     pub(crate) max_scratch_bytes: usize,
     /// Maximum accepted extraction or construction jobs awaiting collection.
     pub(crate) max_workers: usize,
-    max_ready_buffers: usize,
-    max_in_flight_writes: usize,
+    /// Maximum queued output buffers awaiting coordinator acceptance.
+    pub(crate) max_ready_buffers: usize,
+    /// Maximum accepted writes, including reserved parent progress.
+    pub(crate) max_in_flight_writes: usize,
 }
 
 impl ColdBuildPolicy {
@@ -145,7 +113,7 @@ pub(crate) struct DiskBuildAdmission {
     #[cfg(test)]
     hooks: Arc<tests::Hooks>,
     #[cfg(feature = "profiling")]
-    profile: Arc<PackingProfile>,
+    profile: Arc<DiskPackingProfile>,
 }
 
 impl DiskBuildAdmission {
@@ -169,7 +137,7 @@ impl DiskBuildAdmission {
             #[cfg(test)]
             hooks: Arc::new(tests::Hooks::default()),
             #[cfg(feature = "profiling")]
-            profile: Arc::new(PackingProfile::default()),
+            profile: Arc::new(DiskPackingProfile::default()),
         })
     }
 
@@ -932,7 +900,7 @@ impl DiskBulkBuild {
 
     fn pack_parent(&self, start: usize) -> RuntimeOrFatalResult<(PackedDiskNode, usize)> {
         #[cfg(feature = "profiling")]
-        let _timer = PackingTimer::new(&self.admission.profile);
+        let _timer = self.admission.profile.packing.start();
         let plan = self
             .plan
             .as_ref()
@@ -975,32 +943,22 @@ impl DiskBulkBuild {
             merge_failure(&mut failure, error);
         }
         if let Some(leaves) = &mut self.leaves {
-            let settlement = leaves.settle().fuse();
-            futures::pin_mut!(settlement);
             let result = if let Some(receiver) = &self.receiver {
-                loop {
-                    let delivery = receiver.recv_async().fuse();
-                    futures::pin_mut!(delivery);
-                    select_biased! {
-                        result = settlement => break result,
-                        packet = delivery => match packet {
-                            Ok(packet) => packet.ack.complete(OutputStatus::Stopped),
-                            Err(_) => break settlement.await,
-                        },
-                    }
-                }
+                leaves
+                    .settle_rejecting(receiver, |packet| {
+                        packet.ack.complete(OutputStatus::Stopped)
+                    })
+                    .await
             } else {
-                settlement.await
+                leaves.settle().await
             };
             if let Err(error) = result {
                 merge_failure(&mut failure, error);
             }
         }
-        if let Some(receiver) = self.receiver.take() {
-            while let Ok(packet) = receiver.try_recv() {
-                packet.ack.complete(OutputStatus::Stopped);
-            }
-        }
+        // A receiver is installed only with its merge consumer. Shared
+        // settlement has rejected every packet before channel teardown.
+        self.receiver = None;
         if let Err(error) = self.preparation.settle().await {
             merge_failure(&mut failure, error);
         }
@@ -1034,8 +992,8 @@ impl DiskBulkBuild {
                 + size_of::<PreparedMerge>()
                 + size_of::<SortedRuns>()
                 + size_of::<SortedRun>()) as u64,
-            packing_peak: self.admission.profile.peak.load(Ordering::Acquire),
-            packing_worker_nanos: self.admission.profile.nanos.load(Ordering::Acquire),
+            packing_peak: self.admission.profile.packing.peak(),
+            packing_worker_nanos: self.admission.profile.packing.worker_nanos(),
             buffer_peak: self.admission.profile.buffer_peak.load(Ordering::Acquire),
             scratch_peak_bytes: self.admission.budget.peak() as u64,
             ..self.measurements
@@ -1232,7 +1190,7 @@ impl DiskLeafConsumer {
         rank: usize,
     ) -> RuntimeOrFatalResult<BuildOutcome<usize>> {
         #[cfg(feature = "profiling")]
-        let timer = PackingTimer::new(&self.admission.profile);
+        let timer = self.admission.profile.packing.start();
         let lower = window
             .get(0)
             .unwrap_or_else(|| unreachable!("nonempty disk packing window"));
@@ -1312,38 +1270,26 @@ pub(super) fn pack_parent_node(
     ts: TrxID,
 ) -> RuntimeOrFatalResult<(DiskNodePlan, DiskNodeImage, usize)> {
     let first = &children[start];
-    let lower = first.shape.lower.resolve(runs).key.as_bytes();
     let available = (children.len() - start - 1).min(max_node_slots::<BTreeU64>() + 1);
     let reservation = admission.take(
         (available.max(1)) * size_of::<PackedNodeEntry<'_, BTreeU64>>(),
         "disk parent window",
     )?;
     let mut entries = BudgetedVec::from_reservation(reservation, available.max(1));
-    let packed = if available == 0 {
-        0
-    } else {
-        plan_candidates(
-            &mut entries,
-            available,
-            PackedNodePlanParams {
-                lower_fence: lower,
-                upper_fence: children
-                    .last()
-                    .and_then(|c| c.shape.upper)
-                    .map(|r| r.resolve(runs).key.as_bytes()),
-                min_slots: 1,
-            },
-            "disk parent entries",
-            |offset| {
-                let child = &children[start + 1 + offset];
-                PackedNodeEntry {
-                    key: child.shape.lower.resolve(runs).key.as_bytes(),
-                    value: BTreeU64::from(child.block.as_u64()),
-                }
-            },
-        )?
-    };
-    let count = packed + 1;
+    let plan = plan_parent(
+        &mut entries,
+        children.len() - start,
+        children
+            .last()
+            .and_then(|c| c.shape.upper)
+            .map(|r| r.resolve(runs).key.as_bytes()),
+        "disk parent entries",
+        |offset| {
+            let child = &children[start + offset];
+            (child.shape.lower.resolve(runs).key.as_bytes(), child.block)
+        },
+    )?;
+    let count = plan.count;
     let last = &children[start + count - 1];
     for pair in children[start..start + count].windows(2) {
         if pair[0].shape.coverage.end != pair[1].shape.coverage.start
@@ -1367,15 +1313,12 @@ pub(super) fn pack_parent_node(
     };
     let image = pack_node(
         admission,
-        KnownFenceNodeParams {
-            height: shape.height,
+        plan.node_params(
+            shape.height,
             ts,
-            lower_fence: lower,
-            upper_fence: shape.upper.map(|r| r.resolve(runs).key.as_bytes()),
-            lower_fence_value: BTreeU64::from(first.block.as_u64()),
-            hints_enabled: true,
-        },
-        &entries[..packed],
+            shape.upper.map(|r| r.resolve(runs).key.as_bytes()),
+        ),
+        &entries[..count - 1],
     )?;
     Ok((shape, image, count))
 }
@@ -1386,28 +1329,11 @@ pub(super) fn pack_node<V: BTreeValue + Copy>(
     params: KnownFenceNodeParams<'_>,
     entries: &[PackedNodeEntry<'_, V>],
 ) -> RuntimeOrFatalResult<DiskNodeImage> {
-    let mut space =
-        PackedNodeSpace::with_fences(params.lower_fence, params.upper_fence.unwrap_or(&[]))
-            .ok_or_else(|| execution_error("disk final fences exceed node capacity"))?;
-    for entry in entries {
-        if space
-            .add_entry::<V>(entry.key)
-            .is_none_or(|bytes| bytes > BTREE_NODE_USABLE_SIZE)
-        {
-            return Err(execution_error("disk final node shape exceeds capacity"));
-        }
-    }
-    if space.total_space() > BTREE_NODE_USABLE_SIZE {
-        return Err(execution_error("disk final fence storage exceeds capacity"));
-    }
+    validate_final_node(params, entries)?;
     let allocation = admission.take(DISK_TREE_BLOCK_SIZE, "disk output buffer")?;
     #[cfg(feature = "profiling")]
     let slot = BufferSlot::new(admission.profile.clone());
-    let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-    pack_fixed_entries(btree_node_from_block_mut(buf.data_mut()), params, entries);
-    #[cfg(debug_assertions)]
-    debug_assert!(btree_node_from_block_mut(buf.data_mut()).validate_persisted_layout::<V>());
-    write_block_checksum(buf.data_mut());
+    let buf = fill_final_node(params, entries);
     Ok(DiskNodeImage {
         buf: Some(buf),
         allocation: Some(allocation),
@@ -1474,6 +1400,7 @@ mod tests {
     use crate::component::{ComponentRegistry, RegistryBuilder};
     use crate::conf::ThreadPoolConfig;
     use crate::file::build_test_fs;
+    use crate::index::btree::BTREE_NODE_USABLE_SIZE;
     use crate::index::btree::KeyRange;
     use crate::index::build::cold_reader::{ColdReadAdmission, ColdReader};
     use crate::index::build::{BuildEntries, IndexBuildEntry};
@@ -1738,28 +1665,24 @@ mod tests {
                 encoder.encode_pair(&[value], Val::from(row_id))
             };
             let len = key.as_bytes().len();
-            input
-                .payload
-                .grow(
-                    if len > MEM_CMP_KEY_INLINE { len } else { 0 },
-                    "test disk key",
-                )
-                .unwrap();
             expected.push((key.as_bytes().to_vec(), row_id));
             input
-                .entries
-                .push(IndexBuildEntry { key, row_id }, "test disk entries")
+                .push_with(
+                    if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+                    "test disk entries",
+                    "test disk key",
+                    || IndexBuildEntry { key, row_id },
+                )
                 .unwrap();
         }
         expected.sort_unstable();
         let mut runs = BudgetedVec::new(&budget);
         for (group, input) in inputs.into_iter().enumerate() {
-            if input.entries.is_empty() {
+            if input.is_empty() {
                 continue;
             }
             let run = Arc::new(complete_work(SortedRun::finish_group(
-                input.entries,
-                input.payload,
+                input,
                 if unique {
                     DuplicateCheck::Collect
                 } else {
@@ -2254,21 +2177,17 @@ mod tests {
         for number in 0..101u32 {
             let mut key = vec![b'p'; 1024];
             key[1020..].copy_from_slice(&number.to_be_bytes());
-            input.payload.grow(key.len(), "fixture key").unwrap();
             input
-                .entries
-                .push(
+                .push_with(key.len(), "fixture input", "fixture key", || {
                     IndexBuildEntry {
                         key: BTreeKey::from(key.as_slice()),
                         row_id: RowID::from(number as usize),
-                    },
-                    "fixture input",
-                )
+                    }
+                })
                 .unwrap();
         }
         let run = Arc::new(complete_work(SortedRun::finish_group(
-            input.entries,
-            input.payload,
+            input,
             DuplicateCheck::Collect,
             0,
             &AtomicBool::new(false),

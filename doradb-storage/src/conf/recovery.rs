@@ -171,6 +171,7 @@ mod tests {
                 // build's checked 4P calculation has separate rejection tests.
                 .hot_index_build(HotIndexBuildConfig::default().max_workers(Some(1)))
                 .cold_index_build(ColdIndexBuildConfig::default().max_workers(Some(1)))
+                .checkpoint_index_build(ColdIndexBuildConfig::default().max_workers(Some(1)))
                 .recovery(
                     default
                         .clone()

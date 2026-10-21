@@ -83,21 +83,22 @@ One checkpoint attempt follows these conceptual phases:
    visible to an active snapshot before forking a mutable CoW root.
 3. Use the purge-published GC horizon as the exclusive cutoff for both frozen
    row images and cold-row delete selection, then allocate `checkpoint_ts`.
-4. Convert a ready frozen-page prefix into LWC blocks and collect matching
-   secondary-index entries from the same visible rows. Owned LWC encoding and
+4. Convert a ready frozen-page prefix into LWC blocks and retain the matching
+   row selection for secondary-index updates. Owned LWC encoding and
    checksum work runs on the engine thread pool. One checkpoint-local
    logical-order list moves each block from encoding to accepted shared-storage
    write to written, so CPU work overlaps CoW data writes. Page access,
-   logical CoW allocation, write submission, and sidecar collection remain on
-   the mandatory runtime.
+   logical CoW allocation, write submission, and source capture remain on the
+   mandatory runtime.
 5. Drain every accepted LWC data write, then build the `ColumnBlockIndex` and
    update the mutable root's pivot and heap replay floor. Shared storage
    ingress and backend depth, rather than a checkpoint-local write limit,
    provide write backpressure.
-6. Merge eligible cold-row deletes into persistent delete metadata and collect
-   matching secondary-index deletes.
-7. Apply all accumulated secondary-index companion work to the same mutable
-   table-file fork.
+6. Merge eligible cold-row deletes into persistent delete metadata and record
+   the rows needing companion secondary-index deletes.
+7. Apply secondary-index updates from these fixed selections to the same mutable
+   table-file fork. Indexes are processed sequentially, with bounded parallel work
+   within each index controlled by `EngineConfig::checkpoint_index_build`.
 8. Rebuild the mutable root's allocation map from blocks reachable through the
    protected active root and the root about to be published.
 9. Publish either the changed user-table root or, when only replay bounds

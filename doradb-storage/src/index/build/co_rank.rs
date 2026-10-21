@@ -155,6 +155,23 @@ fn neighbors(runs: &SortedRuns, positions: &[usize]) -> (Option<HotEntryRef>, Op
     (left, right)
 }
 
+/// Move a mutation cut to the beginning of its complete physical-key group.
+/// Source provenance orders equal entries but must never divide their reducer.
+pub(super) fn align_mutation(runs: &SortedRuns, cut: &mut MergeCut) {
+    let Some(right) = cut.right else {
+        return;
+    };
+    let key = right.resolve(runs).key.as_bytes();
+    cut.rank = 0;
+    for (run, position) in runs.runs().iter().zip(cut.positions.iter_mut()) {
+        *position = run
+            .entries()
+            .partition_point(|entry| entry.key.as_bytes() < key);
+        cut.rank += *position;
+    }
+    (cut.left, cut.right) = neighbors(runs, &cut.positions);
+}
+
 /// Check coverage and monotonicity before any partition consumer is admitted.
 pub(super) fn verify(runs: &SortedRuns, cuts: &[MergeCut]) -> RuntimeOrFatalResult<()> {
     for (index, cut) in cuts.iter().enumerate() {

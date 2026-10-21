@@ -4,13 +4,16 @@
 
 Task 000331 completes bounded parallel extraction and direct consumption of resident cold runs. All encoded cold keys still remain resident until durable construction seals. CREATE therefore rejects inputs whose admitted keys and progress capacity exceed the cold scratch budget. Design one bounded run-generation and consumption framework for resident and external sorting, including single-worker builds, without weakening completed-root authority or accepted-work cleanup.
 
+Include DiskTree checkpoint reconstruction from task 000332 as a use case for
+the shared sorted-input and bulk-construction interfaces.
+
 ## Reference
 
-docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md; docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 3; docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md; docs/tasks/000330-completed-root-cross-tier-validation.md
+docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md; docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 3; docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md; docs/tasks/000330-completed-root-cross-tier-validation.md; docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md
 
 ## Deferred From (Optional)
 
-docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md; docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 3; docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md
+docs/tasks/000331-parallel-cold-extraction-and-direct-run-consumption.md; docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 3; docs/backlogs/closed/000104-stream-parallel-create-index-cold-build.md; docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md
 
 ## Deferral Context (Optional)
 
@@ -39,6 +42,15 @@ when the actual nonempty run count is one. This is an interim resident policy,
 not an external-sort design. The figures above describe the withdrawn experiment,
 not performance claims for a new run-sizing policy.
 
+### Checkpoint findings from task 000332
+
+Reconstruction already streams the old DiskTree through a bounded reader, merges
+resident PUT/DELETE runs, and packs surviving entries without retaining the whole
+result. Its construction pipeline is separate from CREATE's DiskBulkBuild, whose
+key references, fences and output coverage depend on resident input coordinates.
+External sorting remains deferred; this shared-interface opportunity should be
+considered before extending either builder independently.
+
 ## Scope Hint
 
 Design a bounded representation for cold keys exceeding scratch and readonly-cache capacity, including run creation, spill storage, bounded merge fan-in, duplicate checking, durable construction and cancellation/cleanup. Account for descriptors, decoded values, queued work, merge references, pinned frames, write buffers, allocation ledgers and temporary files. Keep final index size distinct from build scratch.
@@ -49,8 +61,10 @@ Design a bounded representation for cold keys exceeding scratch and readonly-cac
   Workers bound concurrency; admitted bytes and a measured run-size target bound
   each run. One source range may emit many runs, even with one worker.
 - Reuse the local comparator/sorter and a common sorted-input interface for
-  resident and spilled runs. Preserve the no-merge path when input naturally
-  produces one run; avoid a separate single-worker sorting algorithm.
+  resident runs, spilled runs and DiskTree scans. Preserve the no-merge path when
+  input naturally produces one run; avoid a separate single-worker sorting algorithm.
+- Bound merge fan-in by admitted read buffers and progress capacity. Support
+  intermediate spill passes and direct final-merge consumption by tree construction.
 - Budget spill/read buffers, run metadata, merge progress and output capacity
   together. Under memory pressure, spill or release completed run storage before
   accepting more input; bounded descriptor queues alone do not bound retained keys.
@@ -62,6 +76,27 @@ Design a bounded representation for cold keys exceeding scratch and readonly-cac
   duplicate checks and completion authority. These are future candidates, not
   implemented or measured improvements.
 
+### Shared construction with checkpoint reconstruction
+
+- Design around bounded sorted cursors or batches: refill may await I/O, while
+  comparisons within loaded buffers remain synchronous. Make borrowed-key
+  lifetimes explicit and retain only bounded lookahead and owned fences across
+  refills; avoid requiring permanent references into resident runs.
+- Separate ordering from CREATE uniqueness validation and checkpoint mutation
+  reduction. Both should feed sorted final entries into common bulk construction,
+  without materializing all checkpoint survivors into resident runs. Preserve
+  deterministic provenance and equal-key handling across batch and run boundaries.
+- Distinguish exact source/mutation consumption from output cardinality: checkpoint
+  reduction can remove entries or replace owners. Preserve owner-sensitive unique
+  DELETE handling, exact nonunique deletion and complete mutation groups.
+- Keep CREATE sealing and checkpoint root publication with their callers. Retain
+  successful write settlement, failure cleanup, empty-result handling and the
+  checkpoint's unchanged-root behavior. Keep partial rewrite's subtree-reuse events
+  as a specialized extension of the entry-stream design.
+- Review size-dependent construction metadata as well as key storage, including
+  parent descriptors and allocation ledgers. Spilling keys alone must not move
+  unbounded retention into the shared builder.
+
 ## Acceptance Hint
 
 Demonstrate complete unique/non-unique CREATE with input larger than configured scratch and cache; record end-to-end latency, CPU, I/O, scratch and sampled RSS. Verify exact contents and multiplicity outside timing. Cover duplicates across spill/merge boundaries, durable/current deletes, source corruption, admission and I/O failures, observer detachment, poison/shutdown and retained cleanup. No partial catalog/root/layout publication or temporary-file/allocation leaks are allowed.
@@ -70,6 +105,12 @@ Compare workers 1/2/4 across ordered and shuffled input, narrow and outlined key
 low/high prefix repetition, and resident/spilling sizes. Include tight budgets
 and replacement-growth peaks. Attribute local sorting, merging, packing and
 publication separately; verify complete contents and multiplicity after timing.
+
+Validate the shared interfaces against checkpoint reconstruction with an old tree
+larger than scratch/cache, PUT/DELETE groups crossing batch boundaries, empty and
+unchanged results, and matching unique/nonunique contents. The design must support
+resident and spilled mutation inputs without retaining the reconstructed index,
+while preserving old-root readability and atomic table-checkpoint publication.
 
 ## Notes (Optional)
 

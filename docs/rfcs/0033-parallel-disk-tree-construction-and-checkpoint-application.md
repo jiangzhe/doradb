@@ -530,25 +530,30 @@ and persistent deletion metadata publish together. [U5] [D3] [C5] [C8]
 
 ### Checkpoint operation merge and structural merge
 
-Phase 4 creates one secondary-index invocation budget before constructing
-`SecondaryCheckpointSidecar` or invoking visible-row and old-key collection.
-Admit active-index descriptors, every put/delete vector and key payload,
-sidecar projection/encoding temporaries, and normalization workspace as they
-are produced. Reuse `BudgetedVec` for containers and payload reservations for
-owned keys; when encoding still uses a temporary key and a copied final buffer,
-admit their overlapping lifetimes or eliminate the copy. Stable last-put
-semantics remain required even when changing normalization storage. Sidecar
-buffers and reservations transfer through normalization into reconciliation
-under the same invocation budget across all indexes; index application must
-not first encounter their cost after collection has finished. [U12] [C2] [C5]
+Phase 4 creates one secondary-index invocation budget before source capture.
+Capture the exact prepared Transition page identities and bitmaps used by LWC
+production, and selected old-LWC physical ordinals after deletion binding and
+row-count validation. Workers decode and encode these immutable selections;
+they never reselect visibility. Reuse the local-sort scheduling and resident-run
+machinery from Phase 3. Homogeneous put/delete run metadata retains stable
+source ordering without tagging or copying each key. Process active indexes
+sequentially and release their key inputs between indexes. [U12] [C2] [C5]
 
-Make sidecar collection callbacks fallible so admission errors propagate
-through checkpoint's existing settlement and rollback path. LWC work may
-already have been accepted when a sidecar allocation fails: settle those
-writes and preserve the published roots, cutoff and retryable source state.
-The budget covers secondary-index input/work/output storage; existing LWC
-production and deletion-marker selection retain their own caller accounting.
-This does not introduce a general checkpoint memory framework. [U12] [C5] [C6]
+Admit source descriptors, bitmaps, ordinals, entry capacity, outlined keys,
+projection/decode temporaries and stable-sort workspace before allocation.
+Shared source ownership lasts through the final index consumer. Keep one
+coordinator for allocation, write submission and private root staging. The
+checkpoint policy is independently configured through
+`EngineConfig::checkpoint_index_build(ColdIndexBuildConfig)`; CREATE keeps its
+existing per-row decode exclusion. [U12] [C5] [C6]
+
+Capture and collection are fallible. Settle every accepted CPU job and storage
+write on failure. Before an existing irreversible boundary, preserve reusable
+source state where the checkpoint workflow permits retry. Once
+`TableCheckpointer::begin_transition` has admitted Transition, errors retain the
+existing fatal/poison contract; accepted LWC work does not imply rollback or
+in-process retryability. Before durable publication, roots and cutoff remain
+unchanged. [U12] [C5] [C6]
 
 Preserve checkpoint normalization before dispatch. For unique indexes, stable
 original input order selects the latest put for an encoded logical key,
@@ -565,8 +570,11 @@ both modes. Unique put/conditional-delete owner reconciliation stays together.
 For non-unique indexes, `(K, row1)` and `(K, row2)` are independent identities
 and may belong to separate disjoint jobs; a shared logical-key prefix must not
 force them into one group. Inserts and deletes for the same exact entry remain
-together so that delete precedence is preserved. Checkpoint owner replacement
-is valid and must not use CREATE duplicate rejection. [U13] [D9] [C4] [C5]
+together so that synthetic overlapping input retains delete-wins compatibility.
+Valid checkpoint producers select disjoint non-unique put/delete identities:
+transitioning eligible deletes are absent from the put bitmap, later deletes
+fall outside the cutoff, and previously cold rows are not transitioning puts.
+Checkpoint owner replacement is valid and must not use CREATE duplicate rejection. [U13] [D9] [C4] [C5]
 
 | Operation | Result |
 | --- | --- |
@@ -610,9 +618,10 @@ invalidates the affected worker's previous packing plan; recheck or replan
 before packing the final node. The following worker contract bounds the state
 retained for these decisions. [U8] [U10] [C3] [C4]
 
-Parallelize independent indexes and disjoint rewrite ranges under one shared
-invocation budget, avoiding an index-count times worker-count admission
-multiplier. Bind work and completion evidence to the normalized sidecar owner,
+Process indexes sequentially in slot order and parallelize disjoint rewrite
+ranges within one index under the shared invocation budget. Cross-index
+scheduling remains explicitly deferred in backlog 000084; there is no
+index-count times worker-count admission multiplier. Bind work and completion evidence to the normalized sidecar owner,
 fixed cutoff, index generation, base root and planned rewrite range. Reject
 missing, repeated, overlapping or foreign results and require exact operation
 coverage before assembly; carry untouched child references in their original
@@ -624,23 +633,23 @@ retain their identity and existing silent-progress behavior. [C5] [C6] [D3]
 
 ### Checkpoint rewrite results and bounded reconciliation
 
-A rewrite job is bound to the work identity and exact input/operation range
-above, plus the height `h` of the replaced subtree that its parent expects.
-Its result describes an ordered replacement forest with two output parts:
+A rewrite job is bound to the captured root, work identity and complete
+input/operation key range. Reconstruction ranges may split an old leaf and are
+not anchored to its old height. Partial rewrite retains subtree heights at
+attachment boundaries; the coordinator assembles balanced forests and adds
+necessary unary wrappers below retained attachments. Results have two parts:
 
 | Part | Contract |
 | --- | --- |
 | Finalized interior output | Shallow ordered descriptors for reused blocks or write-accepted new blocks, with stable BlockID, height, final fences and allocation/write state. Geometry is final; pending writes remain owned by the coordinator until settlement. Stream descriptors and release logical payloads without retaining a nested copy of the rewritten interior. |
 | Provisional boundary state | Ordered handles and the leaf payloads or shallow child-descriptor windows needed to reconcile exposed edges, including affected left/right edge paths at every height. Retain their backing storage and reservations until assembly fixes their fences and contents. |
 
-After reconciliation, every nonempty forest element has height `h`; an empty
-forest explicitly certifies removal of the range. Preserve single-child branch
-wrappers as needed for attachment. Workers must not use whole-tree root
-finalization to return a shorter or taller subtree. Splits return multiple
-elements at height `h`, and the parent handles the resulting fanout. Only the
-final root owner may collapse levels after checking the final fences. Phase 1
-must expose node/level packing and ordered descriptors below its root-building
-entry point so Phase 4 can reuse them. [U10] [C3] [C4]
+At a retained parent attachment of height `h`, every nonempty forest element
+has height `h`; an empty forest certifies range removal. Splits change fanout
+without mixing child heights. Only the final root owner may collapse levels
+after checking final fences. Unanchored reconstruction can produce the height
+required by all final entries, including no root or one open leaf. Phase 4
+uses Phase 1 node/level packing below whole-root finalization. [U10] [C3] [C4]
 
 Interior output becomes final only when remaining neighbor or ancestor
 decisions cannot change its contents, height or fences. Boundary nodes remain
@@ -680,10 +689,14 @@ required neighbor and pack the result at the limit. If that minimum cannot be
 admitted, return a typed resource failure with settled cleanup rather than
 waiting on output that needs the same credits to drain. [U10] [C2] [C6]
 
-Reuse retained completion mechanics, but adapt checkpoint result collection:
-`HotMergeConsumption` currently accumulates collected outputs until the whole
-plan completes. Checkpoint needs incremental assembly and boundary-credit
-release under the contract above. [U10] [C2]
+`MergeConsumption` retains whole-plan output collection for CREATE and exposes
+incremental validated delivery plus explicit assembly acknowledgement for
+checkpoint. Completed but unassembled jobs retain their admission slots.
+Task 000332 fixes B=4 MiB, A=12 MiB and R=A+J×B before output; minimum progress
+is reserved before source capture. Partial rewrite absorbs at most eight
+candidates per optional window. Required fence repair and reconstruction
+range-boundary combination preserve final geometry independently of that
+optional limit. [U10] [C2]
 
 Preserve optional sibling absorption's locality and no-extra-output-write
 eligibility within an explicitly bounded window. The current loop clones and
@@ -931,22 +944,28 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     - `docs/backlogs/closed/000214-reduce-resident-cold-build-cpu-small-worker-overhead.md`
 
 - **Phase 4: Parallel DiskTree Checkpoint Reconciliation**
-  - Scope: Admission from sidecar production/normalization, fallible collection,
-    normalized sidecar/base merge, disjoint subtree and index scheduling,
-    parent-compatible forests with bounded provisional boundaries, conditional
-    root promotion and bounded sibling reconciliation, and production
-    table-checkpoint integration.
+  - Scope: Admitted immutable checkpoint source capture, shared parallel
+    extraction/local sorting, group-aligned streaming mutation reduction, and
+    adaptive reconstruction or partial rewrite within one index. Indexes remain
+    sequential under one invocation budget. Leaf-slice jobs, bounded provisional
+    frontiers, safe final-fence packing and settled completion evidence preserve
+    atomic table-root publication. Task 000332 defines the bounded selector,
+    fixed frontier limits, calibrated conservative selection and matched public
+    performance evidence.
   - Prerequisites: Phase 1's node/level packing, ordered-descriptor and
     write-settlement interfaces; the existing fixed-cutoff sidecar and
     table-root publication contracts.
-    Phases 2 and 3 are not algorithmic prerequisites for checkpoint application.
-  - Phase-local Choices: Mutation identity boundaries, dense-window selection,
-    boundary representation, `J/B/A/R/W` limits, assembly progress reservations
-    and shared multi-index admission. Preserve sparse reuse and choose
-    thresholds from measured memory, CPU work, reads, writes and elapsed time.
+    Phase 3 supplies the shared extraction scheduler and resident-run handoff;
+    its CREATE row-selection policy is not checkpoint deletion authority.
+  - Phase-local Choices: Complete physical-key groups; adaptive base/delta
+    probes capped at 64 paths each and 4,096 identities; READ/PACK/WRITE weights
+    1/2/4 with a 10% retention margin; B=4 MiB, A=12 MiB and optional W=8.
+    Incremental packet/assembly acknowledgements preserve progress. Exact node
+    counts reuse existing reachability traversal, and success-only measurements
+    report actual synchronous packing overlap and last-checkpoint peaks.
   - Goals: Preserve every normalized put/delete rule and atomic root/cutoff
     publication. Test shared-budget sidecar collection/normalization failure,
-    accepted-write settlement and subsequent checkpoint usability. Fix promotion
+    accepted-write settlement and reversible deletion-only retry. Fix promotion
     overflow through Phase 1's final packing-plan contract; include the
     finite-to-open fence deletion regression with exact contents, old-root reads
     and restart, plus branch/boundary variants. Include
@@ -955,16 +974,18 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     partitions within one dominant logical key while preserving exact-entry
     membership and delete precedence. Include MVCC, multi-index, structural and
     fault tests; add checkpoint fixtures/metrics and compare sparse/dense,
-    insert/delete, owner-replacement and worker/index-count cases in this phase.
+    insert/delete, owner-replacement and worker-count cases. Multi-index atomicity
+    is covered here; cross-index scaling remains deferred.
   - After This Phase: Checkpoint applies eligible secondary-index deltas in
-    parallel through the shared durable machinery, with measured locality and
-    deletion safety. Backlog 000084 can be evaluated for completion.
+    parallel within each index through the shared durable machinery, with
+    measured locality and deletion safety. Backlog 000084 retains cross-index
+    parallelism and must not be closed wholesale.
   - Non-goals: New MVCC/GC rules, current-state deletion inference, parallel
     catalog checkpoint or independent global compaction.
-  - Task Doc: `docs/tasks/TBD.md`
-  - Task Issue: `#0`
-  - Phase Status: `pending`
-  - Implementation Summary: `pending`
+  - Task Doc: `docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md`
+  - Task Issue: `#1151`
+  - Phase Status: done
+  - Implementation Summary: Delivered parallel captured-source extraction, complete-key reconciliation, adaptive reconstruction/partial rewrite and bounded incremental assembly within each secondary index. Indexes remain sequential under one budget with atomic root/cutoff publication and settled failure cleanup; backlog 000084 now retains only cross-index scheduling. Seven fresh interleaved runs per variant across eleven public fixtures passed content/restart checks: median large inserts improved 2474 ms to 49 ms and dense deletes 710 ms to 36 ms versus serial 2976ed05, with measured CPU packing overlap and documented memory/write/selector tradeoffs. Validation passed 2380 workspace tests, 2111 profiling-disabled tests, strict Clippy, the 32-file/329-contract style gate, and 93.37% focused production coverage. No following phase exists. [Task Resolve Sync: docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md @ 2026-10-17]
   - Related Backlogs:
     - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
 
@@ -1045,8 +1066,10 @@ failure schedules with semantic gates, not sleeps. [U3] [D6] [C10]
 - Sidecar-admission regressions: fail data-key collection, old-key deletion
   collection and normalization with multiple indexes sharing one budget.
   Include failure after LWC writes have been accepted; require settled cleanup,
-  unchanged published roots/cutoff, released sidecar storage/reservations and
-  successful subsequent checkpoint and reads. Check temporary/final encoding
+  unchanged published roots/cutoff and released source/run reservations.
+  Reversible deletion-only failures permit a subsequent checkpoint; failures
+  after Transition retain fatal/poison behavior and require durable-recovery
+  verification. Check temporary/final encoding
   overlap and normalization replacement capacity where those allocations
   remain. [U12] [C2] [C5] [C6]
 - Provisional-output regressions: adjacent jobs where one range empties, one
@@ -1127,7 +1150,8 @@ authorities; no runner-policy changes are proposed. [D6]
 - Removes redundant cold materialization and shares proven merge/packing code.
 - Preserves explicit caller, source, validation and durable-write authority.
 - Makes early construction gains available before source parallelization.
-- Keeps checkpoint locality while enabling both index and subtree parallelism.
+- Keeps checkpoint locality while enabling parallel work within one index;
+  cross-index scheduling remains a separate follow-up.
 
 ### Negative
 
@@ -1146,12 +1170,10 @@ authorities; no runner-policy changes are proposed. [D6]
 The direction and phase dependencies above define this proposal. Coordinator
 allocation/write submission and the progress model are settled above for
 Phase 1; a worker-owned mutable-file write interface is not required. Phase 1
-selected `ColdIndexBuildConfig` for CREATE. Phase 4 retains one configuration
-choice within these contracts:
-
-- Should the public cold-build policy also configure checkpoint,
-  with invocation-wide checkpoint admission, or should callers expose separate
-  controls backed by the same internal limits? Budget ownership is fixed either way.
+selected `ColdIndexBuildConfig` for CREATE. Task 000332 selects independent
+`checkpoint_index_build` controls backed by the same validated limits, with
+invocation-wide admission and sequential index application. Cross-index
+parallelism remains deferred in backlog 000084.
 
 Validation crossover values, dense rewrite-window thresholds, run sizes,
 provisional-state/window limits and output queue sizing require implementation

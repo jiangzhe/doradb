@@ -1,6 +1,6 @@
 use super::{
-    BudgetedVec, BuildOutcome, DuplicateCheck, HotBuildSource, IndexBuildEntry, JobCompletion,
-    LocalDuplicates, MemoryReservation, SortedRun,
+    BuildEntries, BuildOutcome, DuplicateCheck, HotBuildSource, IndexBuildEntry, JobCompletion,
+    LocalDuplicates, SortedRun,
 };
 use crate::buffer::guard::PageGuard;
 use crate::error::{
@@ -77,9 +77,9 @@ async fn extract_group(
     let budget = &source.budget;
     let mut run = SortedRun {
         group_id: group,
-        entries: BudgetedVec::new(budget),
+        kind: super::RunKind::Create,
+        entries: BuildEntries::new(budget),
         duplicates: LocalDuplicates::Unchecked,
-        payload: MemoryReservation::new(budget),
         #[cfg(feature = "profiling")]
         profile: HotExtractionWorkerProfile::default(),
     };
@@ -149,18 +149,11 @@ async fn extract_rows(
                 .encoded_len(&projection)
                 .change_context(RuntimeError::IndexAccess)?;
             let bytes = if len > MEM_CMP_KEY_INLINE { len } else { 0 };
-            run.payload
-                .grow(bytes, "outlined key")
-                .change_context(RuntimeError::IndexAccess)?;
-            let key = source.key.encoder.encode_with_len(&projection, len);
             run.entries
-                .push(
-                    IndexBuildEntry {
-                        key,
-                        row_id: row.row_id(),
-                    },
-                    "run entries",
-                )
+                .push_with(bytes, "run entries", "outlined key", || IndexBuildEntry {
+                    key: source.key.encoder.encode_with_len(&projection, len),
+                    row_id: row.row_id(),
+                })
                 .change_context(RuntimeError::IndexAccess)?;
             projection.clear();
         }

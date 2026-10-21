@@ -116,7 +116,7 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
 `mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `hot_index_build`,
-`cold_index_build`, `index_buffer`, `data_buffer`, and `file`;
+`cold_index_build`, `checkpoint_index_build`, `index_buffer`, `data_buffer`, and `file`;
 `meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
 `concurrency_limit` because orchestration always uses one runner.
@@ -156,6 +156,17 @@ Recovery counters accumulate over startup; its scratch peak is the maximum
 across builds. Build page counts and occupancy describe construction work and
 can exceed final resident size. Stage timings may overlap, and worker-time sums
 are not additive with elapsed wall time.
+
+### Checkpoint-index build settings
+
+`[engine.checkpoint_index_build]` accepts the same four limits and defaults as
+`cold_index_build`. It controls secondary-index work during table checkpoints,
+independently of CREATE. Indexes are processed sequentially; memory limits can
+reduce parallelism within each index.
+
+`checkpoint_index.*` counters report successful checkpoints; `max_*` gauges
+report the last successful checkpoint. Phase timings can overlap, and peak
+scratch usage does not represent total process memory.
 
 ### Recovery settings
 

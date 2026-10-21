@@ -5907,12 +5907,11 @@ pub(crate) mod tests {
             let (purge_tx, purge_rx) = flume::unbounded();
             engine.inner().trx_sys.set_purge_test_observer(purge_tx);
             engine.inner().trx_sys.request_retired_index_runtime_retry();
-            let mut cleanup_started = false;
-            loop {
-                match purge_rx.recv_async().await.unwrap() {
-                    PurgeTestEvent::RetiredIndexRuntimeStarted => cleanup_started = true,
-                    PurgeTestEvent::CycleCompleted if cleanup_started => break,
-                    _ => {}
+            // A cycle may finish while another cleanup attempt still owns the
+            // candidate. Observe removal itself before testing durable retirement.
+            while table.has_retired_secondary_indexes() {
+                if purge_rx.recv_async().await.unwrap() == PurgeTestEvent::CycleCompleted {
+                    engine.inner().trx_sys.request_retired_index_runtime_retry();
                 }
             }
             assert!(!table.has_retired_secondary_indexes());

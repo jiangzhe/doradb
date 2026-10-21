@@ -3,7 +3,7 @@ use super::co_rank::{self, MergeCut};
 use super::loser_tree::LoserTree;
 use super::{
     BudgetedVec, BuildOutcome, DuplicateCheck, IndexBuildEntry, LocalDuplicates, MemoryReservation,
-    SortedRuns,
+    RunKind, SortedRuns,
 };
 use crate::completion::Completion;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
@@ -13,6 +13,7 @@ use crate::profiling::{MergeMeasurements, MergeWorkerProfile, clock::Instant};
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
 use error_stack::{Report, ResultExt};
+use futures::FutureExt;
 use std::cmp::Ordering;
 use std::future::Future;
 use std::mem::{replace, take};
@@ -20,6 +21,8 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
+#[cfg(test)]
+pub(crate) use tests::pool as test_pool;
 #[cfg(test)]
 pub(super) use tests::{fixture_in as test_runs, prepare_packed as test_prepare_packed};
 
@@ -42,6 +45,12 @@ impl HotEntryRef {
             "hot merge coordinate outside run: run={run}, position={position}"
         );
         Self { run, position }
+    }
+
+    /// Read the homogeneous source operation without tagging individual entries.
+    #[inline]
+    pub(super) fn kind(self, runs: &SortedRuns) -> super::RunKind {
+        runs.runs()[self.run].kind
     }
 
     /// Compare established coordinates using physical key and provenance.
@@ -127,6 +136,16 @@ impl PreparedMerge {
     #[inline]
     pub(super) fn range(&self, partition: usize) -> Range<usize> {
         self.boundaries.cuts[partition].rank..self.boundaries.cuts[partition + 1].rank
+    }
+
+    /// Complete physical-key interval, including base-only gaps and global ends.
+    pub(super) fn key_range(&self, partition: usize) -> (Option<HotEntryRef>, Option<HotEntryRef>) {
+        (
+            (partition != 0)
+                .then(|| self.boundaries.cuts[partition].right)
+                .flatten(),
+            self.boundaries.cuts[partition + 1].right,
+        )
     }
 }
 
@@ -301,6 +320,26 @@ impl MergePreparation {
                     self.settle().await?;
                 }
             }
+        }
+        if self
+            .runs
+            .runs()
+            .iter()
+            .any(|run| run.kind != RunKind::Create)
+        {
+            if self
+                .runs
+                .runs()
+                .iter()
+                .any(|run| run.kind == RunKind::Create)
+            {
+                return Err(execution_error("merge mixed CREATE and checkpoint sources"));
+            }
+            for cut in &mut self.cuts {
+                co_rank::align_mutation(&self.runs, cut);
+            }
+            self.cuts.dedup_by_key(|cut| cut.rank);
+            self.partitions = self.cuts.len().saturating_sub(1);
         }
         co_rank::verify(&self.runs, &self.cuts)?;
         let mut conflict = None;
@@ -515,6 +554,7 @@ pub(crate) struct PartitionMergeStream {
     stop: Arc<AtomicBool>,
     next: usize,
     end: usize,
+    pending_entries: usize,
     tree: Option<LoserTree>,
     buffer: BudgetedVec<HotEntryRef>,
     validation: ValidationState,
@@ -598,6 +638,7 @@ impl PartitionMergeStream {
             stop,
             next: range.start,
             end: range.end,
+            pending_entries: 0,
             tree,
             buffer,
             validation: ValidationState::default(),
@@ -611,6 +652,11 @@ impl PartitionMergeStream {
     pub(crate) fn next_batch(
         &mut self,
     ) -> RuntimeOrFatalResult<BuildOutcome<Option<HotBatch<'_>>>> {
+        if self.pending_entries != 0 {
+            return Err(execution_error(
+                "merge batch requested during entry consumption",
+            ));
+        }
         if self.stop.load(AtomicOrdering::Acquire) {
             return Ok(BuildOutcome::Stopped);
         }
@@ -648,6 +694,31 @@ impl PartitionMergeStream {
             ranks: start..self.next,
             inhibited: &self.plan.inhibited,
         })))
+    }
+
+    /// Pull one borrowed coordinate while reusing the ordinary bounded batch.
+    /// Mutation reducers can carry a group across batches without copying keys
+    /// or allocating a second reference buffer.
+    #[inline]
+    pub(super) fn next_entry(&mut self) -> RuntimeOrFatalResult<BuildOutcome<Option<HotEntryRef>>> {
+        if self.pending_entries == 0 {
+            let batch = match self.next_batch()? {
+                BuildOutcome::Complete(Some(batch)) => batch,
+                BuildOutcome::Complete(None) => return Ok(BuildOutcome::Complete(None)),
+                BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
+            };
+            let count = batch.ranks().len();
+            let first = batch.entry(0).map(|(reference, _)| reference);
+            self.pending_entries = count - 1;
+            return Ok(BuildOutcome::Complete(first));
+        }
+        let reference = if self.tree.is_some() {
+            self.buffer[self.buffer.len() - self.pending_entries]
+        } else {
+            HotEntryRef::new(&self.plan.runs, 0, self.next - self.pending_entries)
+        };
+        self.pending_entries -= 1;
+        Ok(BuildOutcome::Complete(Some(reference)))
     }
 
     fn fill<const CHECK: bool>(&mut self, count: usize) {
@@ -693,7 +764,7 @@ impl PartitionMergeStream {
         if self.stop.load(AtomicOrdering::Acquire) {
             return Ok(BuildOutcome::Stopped);
         }
-        if self.next != self.end {
+        if self.next != self.end || self.pending_entries != 0 {
             return Err(execution_error(
                 "partition consumer returned before exhausting its stream",
             ));
@@ -708,7 +779,7 @@ impl PartitionMergeStream {
             partition: self.partition,
             entries: self.next,
             conflict: self.validation.conflict,
-            output,
+            output: Some(output),
             #[cfg(feature = "profiling")]
             profile,
         }))
@@ -721,9 +792,16 @@ pub(crate) struct CompletedPartition<T> {
     partition: usize,
     entries: usize,
     conflict: Option<HotDuplicate>,
-    output: T,
+    output: Option<T>,
     #[cfg(feature = "profiling")]
     profile: MergeWorkerProfile,
+}
+
+/// Identity returned with an incrementally delivered payload. Assembly returns
+/// this token only after consuming the payload or transferring its admission.
+pub(crate) struct MergeAcknowledgement {
+    plan: Arc<PreparedMerge>,
+    partition: usize,
 }
 
 /// Narrow engine-internal hook for the future private packing consumer.
@@ -790,6 +868,9 @@ pub(crate) struct MergeConsumption<C: PartitionConsumer> {
     stop: Arc<AtomicBool>,
     jobs: Vec<Option<PartitionCompletion<C::Output>>>,
     results: Vec<CompletedPartition<C::Output>>,
+    incremental: bool,
+    acknowledged: usize,
+    delivered: bool,
     _admission: Option<MemoryReservation>,
     submitted: usize,
     collected: usize,
@@ -836,6 +917,9 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             stop: Arc::new(AtomicBool::new(false)),
             jobs: (0..capacity).map(|_| None).collect(),
             results: Vec::with_capacity(capacity),
+            incremental: false,
+            acknowledged: 0,
+            delivered: false,
             _admission: admission,
             submitted: 0,
             collected: 0,
@@ -891,55 +975,18 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             !self.finished,
             "hot merge consumption reused after settlement"
         );
+        if self.incremental && self.acknowledged != self.plan.partitions() {
+            return Err(execution_error(
+                "merge completion precedes assembly acknowledgement",
+            ));
+        }
         #[cfg(feature = "profiling")]
         self.started.get_or_insert_with(Instant::now);
         while self.failure.is_none()
             && !self.stop.load(AtomicOrdering::Acquire)
             && self.collected < self.jobs.len()
         {
-            while self.submitted < self.jobs.len()
-                && self.submitted - self.collected < self.plan.workers
-            {
-                let plan = self.plan.clone();
-                let stop = self.stop.clone();
-                let consumer = self.consumer.clone();
-                let partition = self.submitted;
-                let admitted_stream = self
-                    .streams
-                    .as_mut()
-                    .and_then(|streams| streams[partition].take());
-                self.jobs[partition] = Some(self.pool.submit_async(async move {
-                    #[cfg(feature = "profiling")]
-                    let started = Instant::now();
-                    let stream = match admitted_stream {
-                        Some(stream) => stream,
-                        None => match PartitionMergeStream::new(plan, partition, stop)? {
-                            BuildOutcome::Complete(stream) => stream,
-                            BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
-                        },
-                    };
-                    #[cfg(feature = "profiling")]
-                    let consumer_started = Instant::now();
-                    let BuildOutcome::Complete(result) = consumer.consume(stream).await? else {
-                        return Ok(BuildOutcome::Stopped);
-                    };
-                    #[cfg(feature = "profiling")]
-                    let stopped = Instant::now();
-                    #[cfg(feature = "profiling")]
-                    let result = CompletedPartition {
-                        profile: MergeWorkerProfile {
-                            job_nanos: stopped.duration_since(started).as_nanos() as u64,
-                            consumer_nanos: stopped.duration_since(consumer_started).as_nanos()
-                                as u64
-                                - result.profile.merge_check_nanos,
-                            ..result.profile
-                        },
-                        ..result
-                    };
-                    Ok(BuildOutcome::Complete(result))
-                }));
-                self.submitted += 1;
-            }
+            self.submit_available(self.collected);
             self.collect_next().await;
         }
         if self.failure.is_some() || self.stop.load(AtomicOrdering::Acquire) {
@@ -1011,7 +1058,7 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
         Ok(MergeOutcome {
             outputs: take(&mut self.results)
                 .into_iter()
-                .map(|result| result.output)
+                .filter_map(|result| result.output)
                 .collect(),
             validation: match conflict {
                 Some(conflict) => Err(conflict),
@@ -1022,6 +1069,106 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             #[cfg(feature = "profiling")]
             measurements,
         })
+    }
+
+    /// Deliver the next validated result in key order without retaining its payload.
+    /// At most `workers` jobs may be running or awaiting assembly. A cancelled
+    /// wait retains its completion slot; only explicit acknowledgement admits a
+    /// replacement job. The retained owner drains accepted jobs on failure.
+    pub(crate) async fn next_output(
+        &mut self,
+    ) -> RuntimeOrFatalResult<Option<(C::Output, MergeAcknowledgement)>> {
+        if self.finished || self.delivered || (!self.incremental && self.collected != 0) {
+            return Err(execution_error(
+                "merge incremental delivery lifecycle mismatch",
+            ));
+        }
+        self.incremental = true;
+        #[cfg(feature = "profiling")]
+        self.started.get_or_insert_with(Instant::now);
+        if self.acknowledged == self.plan.partitions() {
+            return Ok(None);
+        }
+        self.submit_available(self.acknowledged);
+        if self.failure.is_none() && !self.stop.load(AtomicOrdering::Acquire) {
+            self.collect_next().await;
+        }
+        if self.failure.is_some() || self.stop.load(AtomicOrdering::Acquire) {
+            // The assembly owner must first reject its output handoffs. Draining
+            // here could wait for a sibling whose output needs that same owner.
+            return Err(self.failure.take().unwrap_or_else(|| {
+                execution_error("incremental merge stopped without an execution failure")
+            }));
+        }
+        let result = &mut self.results[self.acknowledged];
+        let output = result
+            .output
+            .take()
+            .ok_or_else(|| execution_error("merge output was already delivered"))?;
+        self.delivered = true;
+        Ok(Some((
+            output,
+            MergeAcknowledgement {
+                plan: self.plan.clone(),
+                partition: self.acknowledged,
+            },
+        )))
+    }
+
+    /// Release a completed job slot only after ordered assembly has consumed it.
+    pub(crate) fn acknowledge(&mut self, ack: MergeAcknowledgement) -> RuntimeOrFatalResult<()> {
+        if !self.delivered
+            || !Arc::ptr_eq(&self.plan, &ack.plan)
+            || ack.partition != self.acknowledged
+        {
+            return Err(execution_error("foreign or repeated merge acknowledgement"));
+        }
+        self.acknowledged += 1;
+        self.delivered = false;
+        Ok(())
+    }
+
+    fn submit_available(&mut self, released: usize) {
+        while self.submitted < self.jobs.len() && self.submitted - released < self.plan.workers {
+            let plan = self.plan.clone();
+            let stop = self.stop.clone();
+            let consumer = self.consumer.clone();
+            let partition = self.submitted;
+            let admitted_stream = self
+                .streams
+                .as_mut()
+                .and_then(|streams| streams[partition].take());
+            self.jobs[partition] = Some(self.pool.submit_async(async move {
+                #[cfg(feature = "profiling")]
+                let started = Instant::now();
+                let stream = match admitted_stream {
+                    Some(stream) => stream,
+                    None => match PartitionMergeStream::new(plan, partition, stop)? {
+                        BuildOutcome::Complete(stream) => stream,
+                        BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
+                    },
+                };
+                #[cfg(feature = "profiling")]
+                let consumer_started = Instant::now();
+                let BuildOutcome::Complete(result) = consumer.consume(stream).await? else {
+                    return Ok(BuildOutcome::Stopped);
+                };
+                #[cfg(feature = "profiling")]
+                let stopped = Instant::now();
+                #[cfg(feature = "profiling")]
+                let result = CompletedPartition {
+                    profile: MergeWorkerProfile {
+                        job_nanos: stopped.duration_since(started).as_nanos() as u64,
+                        consumer_nanos: stopped.duration_since(consumer_started).as_nanos() as u64
+                            - result.profile.merge_check_nanos,
+                        ..result.profile
+                    },
+                    ..result
+                };
+                Ok(BuildOutcome::Complete(result))
+            }));
+            self.submitted += 1;
+        }
     }
 
     /// Stop admission and drain accepted jobs before dropping outputs. Pool
@@ -1039,6 +1186,36 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Settle accepted workers while rejecting the handoffs that may block them.
+    /// Pool completions remain authoritative during poison/shutdown; the caller's
+    /// rejection releases each producer's acknowledgement wait. After workers
+    /// settle, drain remaining packets before the caller releases the receiver.
+    /// Cancellation leaves the job ledger here and the channel with the caller,
+    /// so the retained owner can resume cleanup through this same method.
+    pub(super) async fn settle_rejecting<T>(
+        &mut self,
+        receiver: &flume::Receiver<T>,
+        mut reject: impl FnMut(T),
+    ) -> RuntimeOrFatalResult<()> {
+        let settlement = self.settle().fuse();
+        futures::pin_mut!(settlement);
+        let result = loop {
+            let delivery = receiver.recv_async().fuse();
+            futures::pin_mut!(delivery);
+            futures::select_biased! {
+                result = settlement => break result,
+                packet = delivery => match packet {
+                    Ok(packet) => reject(packet),
+                    Err(_) => break settlement.await,
+                },
+            }
+        };
+        while let Ok(packet) = receiver.try_recv() {
+            reject(packet);
+        }
+        result
     }
 
     async fn collect_next(&mut self) {
@@ -1150,7 +1327,8 @@ mod tests {
     use crate::conf::ThreadPoolConfig;
     use crate::index::BTreeKey;
     use crate::index::btree::BTreeValue;
-    use crate::index::build::{MemoryBudget, MemoryReservation, SortedRun, budget, worker};
+    use crate::index::build::checkpoint::mutation_runs;
+    use crate::index::build::{BuildEntries, MemoryBudget, RunKind, SortedRun, budget, worker};
     use crate::memcmp::MEM_CMP_KEY_INLINE;
     use crate::poison::EnginePoisoner;
     #[cfg(feature = "profiling")]
@@ -1223,7 +1401,8 @@ mod tests {
         }
     }
 
-    struct PoolScope(ComponentRegistry);
+    /// Retain the fixture pool registry through accepted worker settlement.
+    pub(crate) struct PoolScope(ComponentRegistry);
 
     impl Deref for PoolScope {
         type Target = ComponentRegistry;
@@ -1363,32 +1542,38 @@ mod tests {
             if keys.is_empty() {
                 continue;
             }
-            let mut entries = BudgetedVec::new(&budget);
+            // Sort fixture source values before admission: callers size this budget
+            // for retained runs and the merge under test, not extraction workspace.
+            let mut keys: Vec<_> = keys
+                .into_iter()
+                .enumerate()
+                .map(|(position, key)| IndexBuildEntry {
+                    key,
+                    row_id: RowID::new(1_000_000_000 - (group * 100_000 + position) as u64),
+                })
+                .collect();
+            keys.sort_by(|left, right| left.key.cmp(&right.key));
+            let mut entries = BuildEntries::new(&budget);
             entries
                 .ensure_capacity(keys.len(), "fixture entries")
                 .unwrap();
-            let mut payload = MemoryReservation::new(&budget);
-            for (position, key) in keys.into_iter().enumerate() {
-                if key.as_bytes().len() > MEM_CMP_KEY_INLINE {
-                    payload.grow(key.as_bytes().len(), "fixture keys").unwrap();
-                }
+            for entry in keys {
+                let len = entry.key.as_bytes().len();
                 entries
-                    .push(
-                        IndexBuildEntry {
-                            key,
-                            row_id: RowID::new(1_000_000_000 - (group * 100_000 + position) as u64),
-                        },
+                    .push_with(
+                        if len > MEM_CMP_KEY_INLINE { len } else { 0 },
                         "fixture entries",
+                        "fixture keys",
+                        || entry,
                     )
                     .unwrap();
             }
-            entries.sort_by(|left, right| left.key.cmp(&right.key));
             let duplicates = worker::local_duplicates(&entries, policy);
             runs.push(Arc::new(SortedRun {
+                kind: RunKind::Create,
                 group_id: group * 3 + 1,
                 entries,
                 duplicates,
-                payload,
                 #[cfg(feature = "profiling")]
                 profile: HotExtractionWorkerProfile::default(),
             }));
@@ -1418,7 +1603,8 @@ mod tests {
             .unwrap()
     }
 
-    async fn pool(workers: usize) -> (PoolScope, QuiescentGuard<ThreadPool>) {
+    /// Create a bounded real pool with deterministic fixture-owned shutdown.
+    pub(crate) async fn pool(workers: usize) -> (PoolScope, QuiescentGuard<ThreadPool>) {
         let mut builder = RegistryBuilder::new();
         builder.build::<EnginePoisoner>(()).await.unwrap();
         builder
@@ -1601,6 +1787,118 @@ mod tests {
             remaining = &remaining[plan.packed..];
         }
         assert!(!remaining.is_empty());
+    }
+
+    /// Purpose: Keep complete mutation identities together under direct and multi-run rank cuts.
+    /// Expected: Aligned cuts coalesce duplicate boundaries and every key occurs in exactly one partition with complete ordered input coverage.
+    #[test]
+    fn mutation_cuts_preserve_complete_groups() {
+        smol::block_on(async {
+            let (_scope, pool) = pool(4).await;
+            for groups in [1, 4] {
+                let runs = Arc::new(mutation_runs(
+                    (0..groups)
+                        .map(|group| {
+                            (
+                                if group % 2 == 0 {
+                                    RunKind::Put
+                                } else {
+                                    RunKind::Delete
+                                },
+                                (0..37)
+                                    .map(|row| (BTreeKey::from((row / 13) as u32), RowID::new(row)))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    true,
+                ));
+                let expected = oracle(&runs);
+                let plan = prepare_packed(runs.clone(), pool.clone(), 4, 12, 3).await;
+                assert_eq!(plan.partitions(), 3);
+                for cut in &plan.boundaries.cuts {
+                    if let (Some(left), Some(right)) = (cut.left, cut.right) {
+                        assert!(left.resolve(&runs).key < right.resolve(&runs).key);
+                    }
+                }
+                let mut owner = MergeConsumption::new(
+                    plan.clone(),
+                    pool.clone(),
+                    Drain {
+                        capture: true,
+                        ..Default::default()
+                    },
+                );
+                let outcome = owner.execute().await.unwrap();
+                let actual: Vec<_> = outcome
+                    .outputs
+                    .into_iter()
+                    .flat_map(|output| output.entries)
+                    .collect();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    outcome
+                        .validation
+                        .unwrap_or_else(|_| panic!("checkpoint is unchecked"))
+                        .entries(),
+                    expected.len()
+                );
+            }
+        });
+    }
+
+    /// Purpose: Bound completed but unassembled outputs and preserve incremental delivery across observer cancellation.
+    /// Expected: Admission never exceeds acknowledged slots plus workers, output order is exact, premature and foreign acknowledgements fail, and final authority follows every acknowledgement.
+    #[test]
+    fn incremental_outputs_require_assembly_acknowledgement() {
+        smol::block_on(async {
+            let (_scope, pool) = pool(2).await;
+            let runs = numbers(&[&[0, 2, 4, 6], &[1, 3, 5, 7]], DuplicateCheck::Skip);
+            let plan = prepare_packed(runs.clone(), pool.clone(), 2, 4, 1).await;
+            let hook = CutHook::default();
+            let (entered, release) = hook.gate(0, Fault::None);
+            let mut owner = MergeConsumption::new(
+                plan.clone(),
+                pool.clone(),
+                Drain {
+                    capture: true,
+                    hook,
+                },
+            );
+            let mut wait = Box::pin(owner.next_output());
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+            entered.recv_async().await.unwrap();
+            drop(wait);
+            assert_eq!(owner.submitted, 2);
+            release.send(()).unwrap();
+            let mut actual = Vec::new();
+            for partition in 0..4 {
+                let (output, ack) = owner.next_output().await.unwrap().unwrap();
+                assert_eq!(ack.partition, partition);
+                assert!(owner.submitted <= partition + 2);
+                assert!(owner.next_output().await.is_err());
+                assert!(owner.execute().await.is_err());
+                let foreign = MergeAcknowledgement {
+                    plan: prepare_packed(runs.clone(), pool.clone(), 2, 4, 1).await,
+                    partition,
+                };
+                assert!(owner.acknowledge(foreign).is_err());
+                actual.extend(output.entries);
+                owner.acknowledge(ack).unwrap();
+                assert!(owner.results.iter().all(|result| result.output.is_none()));
+            }
+            assert_eq!(actual, oracle(&runs));
+            assert!(owner.next_output().await.unwrap().is_none());
+            let outcome = owner.execute().await.unwrap();
+            assert!(outcome.outputs.is_empty());
+            assert_eq!(
+                outcome
+                    .validation
+                    .unwrap_or_else(|_| panic!("unchecked merge"))
+                    .entries(),
+                8
+            );
+        });
     }
 
     /// Purpose: Partition one resident run directly while preserving earliest duplicate authority across cuts.

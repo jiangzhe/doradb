@@ -141,9 +141,8 @@ affected block, checkpoint:
 
 1. Resolves selected RowIDs to physical row positions.
 2. Excludes rows already marked deleted in persistent state.
-3. Reads the old values of the newly deleted rows.
-4. Derives the corresponding secondary-index changes.
-5. Merges the new deletions with the persistent set.
+3. Merges the new deletions with the persistent set and retains the selected rows
+   for secondary-index reconstruction.
 
 A selected RowID inside a block's covered range but absent from its physical
 membership is an integrity failure.
@@ -155,16 +154,16 @@ secondary-index work.
 
 ## Companion Secondary-Index Deletes
 
-The reconstructed old key determines the exact `DiskTree` change:
+The old values of the selected rows determine the exact `DiskTree` change:
 
 - a unique index removes or replaces the mapping only when the stored owner
   still matches the deleted old RowID
 - a non-unique index removes the exact logical-key and old-RowID entry
 
-The changes accumulate in the same secondary-index sidecar used by data
-checkpoint. They are applied to the same mutable table-file fork after all data
-and deletion work has been collected. No `DiskTree` root can be published on
-its own.
+The fixed row selection is retained for secondary-index reconstruction alongside
+new data-checkpoint rows. All companion changes are applied to the same mutable
+table-file fork after data and deletion work has been collected. No `DiskTree`
+root can be published on its own.
 
 ## CoW Persistence and Cutoff Advancement
 

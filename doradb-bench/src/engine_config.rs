@@ -14,6 +14,8 @@ pub struct EngineConfigOverlay {
     pub hot_index_build: HotIndexBuildOverlay,
     /// Cold index construction admission and output limits.
     pub cold_index_build: ColdIndexBuildOverlay,
+    /// Checkpoint secondary-index reconciliation limits.
+    pub checkpoint_index_build: ColdIndexBuildOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Deterministic table-scan planning overrides.
@@ -39,6 +41,8 @@ impl EngineConfigOverlay {
         self.thread_pool.merge(other.thread_pool);
         self.hot_index_build.merge(other.hot_index_build);
         self.cold_index_build.merge(other.cold_index_build);
+        self.checkpoint_index_build
+            .merge(other.checkpoint_index_build);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
@@ -347,6 +351,8 @@ pub struct ResolvedEngineConfig {
     pub hot_index_build: ResolvedHotIndexBuildConfig,
     /// Normalized cold index construction limits.
     pub cold_index_build: ResolvedColdIndexBuildConfig,
+    /// Normalized checkpoint secondary-index reconciliation limits.
+    pub checkpoint_index_build: ResolvedCheckpointIndexBuildConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
     /// Startup recovery settings with automatic limits resolved.
@@ -388,6 +394,15 @@ impl ResolvedEngineConfig {
                 partition_entries: 65_536,
                 batch_entries: 32_768,
                 partitions_per_worker: 4,
+            },
+            checkpoint_index_build: ResolvedCheckpointIndexBuildConfig {
+                max_scratch_bytes: config.checkpoint_index_build.max_scratch_bytes,
+                max_workers: config
+                    .checkpoint_index_build
+                    .max_workers
+                    .expect("validated checkpoint build workers"),
+                max_ready_buffers: config.checkpoint_index_build.max_ready_buffers,
+                max_in_flight_writes: config.checkpoint_index_build.max_in_flight_writes,
             },
             thread_pool: ResolvedThreadPoolConfig {
                 worker_threads: config.thread_pool.worker_threads,
@@ -448,6 +463,20 @@ pub struct ResolvedTableScanConfig {
     pub lwc_blocks_per_partition: usize,
     /// Hot row pages per homogeneous partition.
     pub row_pages_per_partition: usize,
+}
+
+/// Serializable checkpoint limits independent of CREATE's partition sizing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedCheckpointIndexBuildConfig {
+    /// Invocation-wide admitted scratch ceiling.
+    pub max_scratch_bytes: usize,
+    /// Configured worker allowance within one index.
+    pub max_workers: usize,
+    /// Configured ready-output buffer limit.
+    pub max_ready_buffers: usize,
+    /// Configured accepted-write limit.
+    pub max_in_flight_writes: usize,
 }
 
 /// Serializable normalized finite sync/async thread-pool configuration.
@@ -627,6 +656,22 @@ pub fn resolve_engine_config(
         cold_index_build.max_in_flight_writes = value;
     }
 
+    let mut checkpoint_index_build = default.checkpoint_index_build;
+    if let Some(value) = overlay.checkpoint_index_build.max_scratch_bytes {
+        checkpoint_index_build.max_scratch_bytes =
+            byte_usize(value, "checkpoint_index_build.max_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.checkpoint_index_build.max_workers {
+        checkpoint_index_build.max_workers = Some(value);
+    }
+    if let Some(value) = overlay.checkpoint_index_build.max_ready_buffers {
+        checkpoint_index_build.max_ready_buffers = value;
+    }
+
+    if let Some(value) = overlay.checkpoint_index_build.max_in_flight_writes {
+        checkpoint_index_build.max_in_flight_writes = value;
+    }
+
     let mut recovery = default.recovery;
     if let Some(value) = overlay.recovery.io_depth {
         recovery = recovery.io_depth(value);
@@ -684,6 +729,7 @@ pub fn resolve_engine_config(
         .thread_pool(thread_pool)
         .hot_index_build(hot_index_build)
         .cold_index_build(cold_index_build)
+        .checkpoint_index_build(checkpoint_index_build)
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
         .trx(transaction)
@@ -1148,6 +1194,30 @@ mod tests {
                 .hot_index_build
                 .max_workers,
             3
+        );
+    }
+
+    /// Purpose: Normalize checkpoint overrides independently of CREATE configuration.
+    /// Expected: Merged checkpoint values survive serialization without changing CREATE defaults.
+    #[test]
+    fn checkpoint_build_overlay_roundtrip() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[checkpoint_index_build]\nmax_workers = 1\nmax_ready_buffers = 2\n").unwrap();
+        overlay.merge(
+            toml::from_str("[checkpoint_index_build]\nmax_scratch_bytes = '32 MiB'\n").unwrap(),
+        );
+        let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(config.checkpoint_index_build.max_workers, Some(1));
+        assert_eq!(resolved.checkpoint_index_build.max_ready_buffers, 2);
+        assert_eq!(
+            resolved.checkpoint_index_build.max_scratch_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(resolved.cold_index_build.max_workers, 4);
+        assert_eq!(resolved.cold_index_build.max_ready_buffers, 8);
+        assert_resolved_round_trip(&resolved);
+        assert!(
+            toml::from_str::<EngineConfigOverlay>("[checkpoint_index_build]\nunknown = 1").is_err()
         );
     }
 

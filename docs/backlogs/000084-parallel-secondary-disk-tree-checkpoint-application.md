@@ -2,54 +2,59 @@
 
 ## Summary
 
-Design and implement parallel application of secondary DiskTree checkpoint sidecar work.
+Schedule multiple active secondary indexes concurrently during table checkpoint.
+Task 000332 delivered parallel extraction, reconciliation and packing within each
+index; cross-index execution remains the unimplemented portion of this backlog.
 
 ## Reference
 
-docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md; docs/rfcs/0014-dual-tree-secondary-index.md
-
-[Task 000329](../tasks/000329-streaming-parallel-disk-tree-bulk-construction.md)
-delivered the durable packing and write-settlement foundation in
-[RFC 0033](../rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md)
-Phase 1. Phase 4 owns checkpoint integration and this backlog's acceptance proof.
+- docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md
+- docs/rfcs/0014-dual-tree-secondary-index.md
+- docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md
+- docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md
+- docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md
 
 ## Deferred From (Optional)
 
-docs/tasks/000118-disk-tree-checkpoint-sidecar-publication.md; docs/rfcs/0014-dual-tree-secondary-index.md Phase 2; docs/tasks/000329-streaming-parallel-disk-tree-bulk-construction.md / docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md Phase 1
+Task 000118 / RFC 0014 Phase 2; task 000329 / RFC 0033 Phase 1;
+task 000332 / RFC 0033 Phase 4.
 
 ## Deferral Context (Optional)
 
-- Defer Reason: Parallel application needs mutable-file allocation, write staging, and deterministic root installation design beyond this local sidecar optimization pass.
-- Findings: Current sidecar application is sequential across secondary indexes because each writer borrows one MutableTableFile. DiskTree subtree rewrite is also sequential inside each root. Parallelism is plausible both across independent secondary indexes and across disjoint DiskTree subtrees.
-- Direction Hint: Design staged per-index and per-subtree rewrite outputs, then serialize root installation into MutableTableFile. Account for DiskTree's no-per-rewrite-GC policy and old-root readability.
-- Defer Reason: Phase 1 replaced complete-input CREATE construction, leaving checkpoint's mutation, eligibility, subtree-reuse, and publication contracts to RFC 0033 Phase 4.
-- Findings: Shared leaf planning, final-fence capacity checks, shallow child descriptors, and retained write settlement are available. Parent policies and storage allocation remain caller-owned; CREATE's whole-tree completion is not authority for checkpoint mutation results.
-- Direction Hint: Reuse node/level primitives under one checkpoint admission budget. Add disjoint subtree reconciliation, conditional root promotion, old-root/restart proof, and checkpoint-specific performance evidence before closing this item.
+- Defer Reason: Task 000332 explicitly narrowed Phase 4 to within-index work.
+  Indexes remain sequential so one coordinator and one invocation budget own
+  mutable-file allocation, accepted writes and deterministic root staging.
+- Findings: The shared pipeline now accepts immutable checkpoint sources,
+  homogeneous resident runs, complete mutation groups and bounded incremental
+  output. Both reconstruction and partial rewrite use the same reducer. Active
+  or unassembled jobs retain 4 MiB credits; assembly/probing reserves 12 MiB;
+  optional partial absorption is capped at eight candidates. One successful
+  index still cannot authorize publication when a later index fails.
+- Findings: Seven-run public-checkpoint comparisons show within-index improvement
+  and actual packing overlap; they do not establish cross-index scaling. The
+  full measurements, restart proof and conservative selector tradeoffs are
+  recorded in task 000332.
+- Direction Hint: Reuse the existing source/run and result-acknowledgement paths,
+  retain one mutable-file coordinator, and share credits globally across active
+  indexes. Avoid multiplying per-index worker and frontier allowances. Consider
+  fairness when small indexes cannot use the full pool individually.
 
 ## Scope Hint
 
-Support parallelism across independent secondary indexes and, where feasible, across disjoint DiskTree subtree rewrites while preserving copy-on-write root publication semantics.
+Parallel scheduling across independent secondary indexes, with deterministic
+slot-order root staging, shared admission and existing atomic table publication.
+Within-index parallelism and its completed acceptance tests are prerequisites,
+not remaining implementation in this backlog.
 
 ## Acceptance Hint
 
-A future task proves parallel index-level and subtree-level DiskTree checkpoint application correctness, keeps old roots readable, preserves deterministic table-root publication, and includes performance evidence.
+Demonstrate concurrent work across at least two active indexes, bounded aggregate
+memory and accepted I/O, old-root readability, exact contents after restart, and
+atomic root/cutoff publication when a later index fails. Include matched public
+checkpoint measurements that distinguish cross-index benefit from existing
+within-index scaling. Preserve the irreversible Transition/poison contract.
 
 ## Notes (Optional)
 
-This backlog remains open: checkpoint application is still sequential. The
-CREATE improvements in Task 000329 do not establish checkpoint speedup or
-complete the required mutation and publication coverage.
-
-## Close Reason (Added When Closed)
-
-When a backlog item is moved to `docs/backlogs/closed/`, append:
-
-```md
-## Close Reason
-
-- Type: <implemented|stale|replaced|duplicate|wontfix|already-implemented|other>
-- Detail: <reason detail>
-- Closed By: <backlog close>
-- Reference: <task/issue/pr reference>
-- Closed At: <YYYY-MM-DD>
-```
+Keep this backlog open until its cross-index scope is implemented. Task 000332
+and RFC 0033 Phase 4 are complete within their explicitly narrowed scope.
