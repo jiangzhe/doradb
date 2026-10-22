@@ -10,14 +10,11 @@ github_issue: 1154
 
 ## Summary
 
-Published secondary DiskTree roots now require exact entry count, full encoded
+Published secondary DiskTree roots now carry exact entry count, full encoded
 leaf-key bytes, reachable leaf and branch counts, and height. CREATE and
-checkpoint construction produce these facts without a statistics traversal.
-Checkpoint planning uses the captured descriptor directly and performs no tree
-reads or probe-cache allocation for PUT-only input.
-
-Table metadata is version 10. Version 9 and older storage are unsupported;
-there is no compatibility reader, optional statistics, or backfill path.
+checkpoint construction maintain these statistics without a statistics traversal.
+Checkpoint planning reuses the captured root facts and performs no tree reads
+or probe-cache allocation for PUT-only input.
 
 ## Context
 
@@ -32,278 +29,207 @@ Issue Labels:
 - codex
 
 This standalone follow-up builds on task 000332 and completed RFC 0033 Phase 4
-at `c2c1f06f`. It preserves fixed-cutoff capture, complete-key reconciliation,
-bounded construction, settled writes, and atomic table publication. It has no
-parent RFC phase to synchronize.
+at `c2c1f06f`. It has no parent RFC phase to synchronize. The original planner
+repeatedly sampled the existing tree to estimate facts that construction could
+retain exactly, adding work and uncertainty to checkpoint selection.
 
-The approved design requires persistent statistics, discards old storage
-compatibility, and derives geometry from construction changes. It supersedes
-the source backlog's optional-statistics and reachability-collection proposals.
+The delivered design preserves fixed-cutoff capture, complete-key reconciliation,
+bounded construction, settled writes, and atomic table publication. Required
+persistent statistics supersede the source backlog's optional-statistics and
+reachability-collection proposals.
 
 ## Goals
 
-- Exact required root facts across CREATE, checkpoint, metadata changes and reopen.
-- Exact logical changes independent of packing, worker completion, and profiling.
-- Exact structural accounting across reuse, parallel cuts, repair and promotion.
+- Exact root statistics across CREATE, checkpoint, metadata changes and reopen.
+- Logical and structural accounting independent of profiling and worker order.
 - Zero-read PUT-only planning and bounded deletion-side mutation probes.
 - Preserve owner rules, no-effect identity, admission, settlement and publication.
-- Measure total checkpoint costs and accounting overhead, not only probe counts.
+- Verify total checkpoint cost and accounting overhead alongside planning work.
 
 ## Non-Goals
 
 - Old-format migration, optional statistics, or production backfill scans.
 - Persistent subtree aggregates, per-subtree selection, or cross-index scheduling.
-- Removing allocation reachability or changing MVCC, redo, cleanup or publication.
+- Changing allocation reachability, MVCC, redo, cleanup or publication protocols.
 - Expanding ordinary benchmark workload admission or changing nextest policy.
 
 ## Rejected Alternatives
 
-- Optional/runtime-only summaries would add fallback states and lose facts at restart.
-- Reachability-derived geometry would obscure construction ownership and add work.
-- Persistent per-node aggregates would expand the node format and subtree contract.
-- Fully probe-free deletion planning cannot determine conditional owner effects.
+- Optional/runtime-only summaries add fallback states and lose facts at restart.
+- Reachability-derived geometry obscures construction ownership and adds work.
+- Persistent per-node aggregates expand the node format and subtree contract.
+- Probe-free deletion planning cannot determine conditional owner effects.
 
 ## Plan
 
-The final architecture keeps statistics in `SecondaryIndexRoot::Present` beside
-its nonzero block. Empty roots imply all-zero statistics. The existing active
-slot retains the exact `IndexID`; no parallel statistics map or block cache exists.
+Root statistics are part of the published secondary root descriptor and its
+existing index-generation binding. Empty roots imply zero statistics. Capture,
+construction and staging retain the same generation and root; mismatched tree
+and descriptor inputs fail before planning or output.
 
-The present-root codec stores the block followed by four little-endian `u64`s
-(entries, encoded bytes, leaves, branches) and a `u16` height. Its mandatory
-34-byte addition participates in metadata capacity and allocation growth checks.
-Local geometry, checked node totals and allocation capacity are validated during
-recovery. Existing generation, root-id and allocation checks remain in place.
-DiskTree pages, catalog metadata and redo encodings are unchanged.
+Table metadata version 10 adds 34 required bytes per present secondary root:
+four unsigned 64-bit totals and a 16-bit height. Geometry and allocation capacity
+are validated on recovery. Version 9 and older storage are unsupported, with no
+compatibility reader or backfill. DiskTree pages, catalog metadata and redo
+encodings retain their existing formats.
 
-`IndexCheckpoint` requires the complete captured descriptor and rejects a tree
-block mismatch before planning or output. Mutable staging captures and installs
-roots through the pinned `IndexRef`, preventing slot-only generation rebinding.
-Results remain private until the enclosing table checkpoint publishes them.
+Complete-key reconciliation counts logical changes once. Owner replacement
+leaves entry and key-byte totals unchanged. Partial rewrite applies deltas to
+the captured totals; reconstruction counts all resolved output. CREATE verifies
+completed entry counts against merge-consumption evidence.
 
-Complete-key reconciliation counts insertion/removal bytes and entries once,
-before packing can revisit an entry. Owner replacement changes neither count.
-Partial rewrite applies checked removal/insertion deltas to the old totals;
-reconstruction counts all resolved output, including base-only entries.
+Structural accounting follows construction ownership. Disjoint key ranges own
+old-node retirement; reused subtrees remain intact. Repair and root promotion
+account for displaced or bypassed ancestors separately from physical writes.
+The completed root determines height. Statistics publish only with successfully
+settled table state; no-effect work returns the original descriptor exactly.
 
-Structural ownership follows the ordered traversal. Only the half-open range
-containing an old node's lower fence counts its retirement; resumed ancestor
-frames do not count again. Whole reused subtrees remain uncharged. Fence repair
-retires the reused nodes it expands. Writer counts accepted images by height,
-then final promotion subtracts bypassed new unary ancestors and separately
-retires bypassed old ancestors. The final assembler choice supplies height.
-Counters are published only after every accepted write settles successfully.
+The planner aggregates mutation summaries retained during extraction. Empty
+input selects no work; empty and leaf trees select reconstruction. Branch
+PUT-only selection compares raw input count and uncompressed entry mass with
+required root totals, without probing the tree. This measures input volume,
+including repeated and replacement PUTs, rather than claiming distinct inserts.
 
-CREATE records key bytes during leaf packing and counts constructed nodes.
-Completed counts must match merge-consumption evidence. Sealed cold authority
-carries the descriptor and derives its count/height from it, while retaining
-separate duplicate, source-binding, settlement and read-lifetime evidence.
-No-effect work settles and rolls back private work and returns the original
-descriptor exactly. Empty results require all-zero counters.
-
-Mutation-key bytes are collected during encoding; planning aggregates run counts
-and bytes in O(number of runs). Empty input selects NoWork. Empty/leaf roots
-select reconstruction. Branch PUT-only input uses a calibrated 16x raw volume
-threshold for either entry count or uncompressed slot/value/key mass; smaller
-input selects partial rewrite. This remains a volume heuristic, not evidence
-of distinct inserts. The threshold division avoids multiplication overflow.
-
-Deletion-bearing branch batches below 128 mutations select partial rewrite.
-Larger batches retain nested 16/64 mutation quantiles and the 4,096 inspected
-identity limit. Cached complete-key results preserve repeated observation weights.
-Every historical unique DELETE owner consumes the identity allowance. Insert and
-removal estimates are clamped to required base and input totals.
-
-For locality, final calibration uses
-`T = min(L, max(u, min(estimated_changes, L) * u / c))` for nonzero distinct
-changed-key count `c` and observed distinct leaf count `u`. Zero or incomplete
-observations retain partial rewrite. Cost weights remain READ/PACK/WRITE=1/2/4;
-reconstruction requires a partial/full ratio above 0.99. Ratios outside
-0.75–1.35 settle at 16 observations, otherwise selection refines to 64.
-These are deterministic heuristics without statistical confidence claims.
+Deletion-bearing input can use bounded complete-key probes to estimate effective
+changes and locality. Cached observations preserve multiplicity weights, and
+historical owners consume the inspection allowance. Small batches, incomplete
+probes and sampled zero changes retain partial rewrite. Calibration changed the
+selection constants while preserving the bounded deterministic approach.
 
 ## Implementation Notes
 
-Required root statistics, construction ownership, descriptor publication and
-zero-read PUT-only planning are implemented and validated in both feature modes.
-No production statistics traversal or legacy planner remains. Allocation
-reachability is still an independent consumer and is measured separately.
+Required root statistics and zero-read PUT-only planning are implemented and
+validated with profiling enabled and disabled. Construction maintains the facts;
+no production statistics traversal, optional fallback or legacy planner remains.
+Allocation reachability continues as an independent publication check.
 
-Extraction key-byte sums, planned-leaf sums, planner input totals and candidate-local
-statistics use ordinary arithmetic under their memory-admission, packing or file
-bounds. Entry/node increments and disjoint statistics accumulation are infallible.
-Persisted statistics validation, mass calculation, final deltas and promotion
-subtraction retain checked arithmetic. Release assembly inspection found that the
-original generic `checked_delta` calls survived even for `(0, 0, 1)`; local
-counting no longer routes through that helper. The optimized AArch64 benchmark
-build now inlines local statistics as scalar/vector additions without overflow
-branches or helper calls. Assembly excerpts and provenance are local artifacts
-under `target/assembly/000333/`.
+Review simplified bounded local entry/node increments, key-byte sums and disjoint
+accumulation to ordinary arithmetic. Persisted-data validation, final deltas,
+mass calculations and promotion subtraction retain checks. Release assembly on
+AArch64 showed that the old generic helper survived even with constant arguments;
+the final local operations inline as scalar/vector additions without helper calls
+or overflow branches. Inspection artifacts remain local under
+`target/assembly/000333/`.
 
-### Calibration and matched measurements
+### Calibration and performance
 
-The final volume threshold, diversity cap and retention ratio differ from the
-initial 1x/uncapped/1.10 proposal, as explicitly permitted by its calibration step.
-Initial wide-key reconstruction was slower end to end. A seven-run alternating
-sweep at 1x/3x/7x/15x growth showed full reconstruction slower than the old
-partial choice at 3x, 7x and 15x; reconstruction medians were 29.18/52.48/97.24 ms
-versus 25.73/46.18/89.45 ms for the accounting control. The 16x threshold retains
-partial work through those measured ranges. Adjacent 1x and narrow branch-growth
-cases were then included in final acceptance. The diversity cap avoids treating
-concentrated deletion as touching every leaf; the 0.99 ratio restores broad
-removal reconstruction when modeled costs are nearly equal.
+The initial 1x PUT threshold, uncapped locality estimate and 1.10 retention ratio
+were revised after matched measurements. Wide-key reconstruction was slower
+than partial rewrite at 3x, 7x and 15x growth: seven-run reconstruction medians
+were 29.18/52.48/97.24 ms versus 25.73/46.18/89.45 ms for the accounting control.
+The final 16x threshold retains partial work through those measured ranges.
 
-Final acceptance comprises 462 fresh invocations: 11 cases, live and reopened,
-three variants, seven rotating invocations each. Another 189 invocations cover
-three small-case follow-ups at 21 observations per variant. Every invocation
-passes generated-content table/index oracles before/after checkpoint and restart.
-The history case supplies nonempty mismatched-owner deletion input and preserves
-the secondary root; the noop case has no mutation input.
+Locality now caps estimated changes by base leaves before applying observed leaf
+diversity. The partial/full cost threshold is 0.99, with read/pack/write weights
+1/2/4. Deletion sampling retains the 16/64 observation stages and 4,096 identity
+limit. These calibrated heuristics do not claim statistical confidence or
+optimality for all workloads.
 
-Fixtures use 100k cold rows for sparse/broad/contiguous/replacement/history/noop;
-sparse selects 16 rows, broad retains every fourth row, contiguous deletes
-[20k,60k), and replacement changes every second row. Skew inserts 40k rows into
-100k cold nonunique rows with 16 payload values. Growth inserts to 140k total
-from 1k or 10k cold rows. Wide cases use 512-byte composite keys, 10k cold rows,
-and either 20k or 40k total rows. All selections and normalized settings are in
-the local measurement archive at `target/measurements/000333/README.md`.
-Raw measurements and the harness are ignored local artifacts, not committed files.
+Acceptance measurements used 462 fresh invocations: 11 cases, live and reopened,
+three variants, seven rotating runs each. Another 189 invocations repeated three
+small cases 21 times per variant. The variants were unchanged baseline
+`c2c1f06f`, candidate accounting with the original planner, and the full candidate.
+Every invocation verified generated table/index contents before and after
+checkpoint and again after restart.
 
-Runs used Linux 7.2.9-orbstack aarch64, an Apple CPU with 14 visible cores,
-io_uring, system allocation, fsync, four workers, 256 MiB input, 4 MiB per worker,
-12 MiB assembler, eight queued outputs and 32 in-flight writes. Setup, GC
-readiness, freeze and verification are untimed; the complete public checkpoint
-call and retries are timed. Both live and reopened variants use warm preverification.
+Runs used AArch64 Linux, io_uring, fsync and four workers with identical budgets.
+Timing covered the public checkpoint call and retries; setup, purge readiness,
+freeze and verification were outside timing. Both live and reopened cases used
+warm preverification. These are checkpoint measurements, not cold-cache or
+whole-database throughput results.
 
-`base` is unchanged `c2c1f06f`; `book` includes all accounting/metadata changes but
-uses its selector; `full` uses the final selector. Temporary controls and read
-traces exist only in the retained measurement patch. They are absent from
-production. These controls separate accounting from selection but do not isolate
-individual counter instructions or eliminate scheduler noise.
+Median wall times below are milliseconds, baseline to full candidate. Fixtures
+include 100k-row deletion/replacement cases, growth from 1k or 10k rows to 140k,
+skewed nonunique keys, and 512-byte keys growing from 10k to 20k or 40k rows.
 
-Median wall and process CPU times are milliseconds. Control CPU, individual
-samples, MAD inputs, phase timings and admitted memory are retained locally in CSV.
+| Workload | Live baseline → full | Reopened baseline → full |
+| --- | ---: | ---: |
+| Broad deletion | 7.55 → 7.85 | 6.24 → 6.28 |
+| Contiguous deletion | 4.22 → 4.07 | 4.41 → 4.09 |
+| Growth from branch tree | 14.13 → 12.41 | 12.03 → 10.41 |
+| Growth from leaf tree | 12.93 → 12.46 | 10.57 → 9.84 |
+| Historical no-effect deletion | 10.68 → 7.20 | 10.55 → 6.32 |
+| No mutation input | 0.17 → 0.18 | 0.17 → 0.17 |
+| Owner replacement | 11.66 → 11.08 | 11.82 → 11.11 |
+| Skewed inserts | 10.39 → 9.71 | 9.84 → 8.50 |
+| Sparse deletion | 2.66 → 2.84 | 3.43 → 2.89 |
+| Wide-key 1x growth | 14.49 → 10.12 | 14.84 → 12.58 |
+| Wide-key 3x growth | 25.43 → 20.91 | 26.60 → 23.54 |
 
-| Case | Base wall | Book wall | Full wall | Base CPU | Full CPU |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| broad-live | 7.55 | 7.22 | 7.85 | 9.59 | 9.37 |
-| broad-reopen | 6.24 | 6.21 | 6.28 | 10.00 | 9.67 |
-| contiguous-live | 4.22 | 4.03 | 4.07 | 4.71 | 4.28 |
-| contiguous-reopen | 4.41 | 4.26 | 4.09 | 5.20 | 4.61 |
-| growth-branch-live | 14.13 | 13.43 | 12.41 | 18.11 | 16.14 |
-| growth-branch-reopen | 12.03 | 10.83 | 10.41 | 19.67 | 17.92 |
-| growth-live | 12.93 | 13.25 | 12.46 | 18.34 | 18.05 |
-| growth-reopen | 10.57 | 10.59 | 9.84 | 21.30 | 19.39 |
-| history-live | 10.68 | 9.78 | 7.20 | 13.74 | 9.10 |
-| history-reopen | 10.55 | 10.21 | 6.32 | 13.48 | 8.85 |
-| noop-live | 0.17 | 0.16 | 0.18 | 0.15 | 0.16 |
-| noop-reopen | 0.17 | 0.17 | 0.17 | 0.14 | 0.14 |
-| replace-live | 11.66 | 11.83 | 11.08 | 15.34 | 13.17 |
-| replace-reopen | 11.82 | 12.07 | 11.11 | 15.90 | 14.00 |
-| skew-live | 10.39 | 10.61 | 9.71 | 13.60 | 12.30 |
-| skew-reopen | 9.84 | 10.84 | 8.50 | 12.92 | 12.16 |
-| sparse-live | 2.66 | 3.07 | 2.84 | 2.95 | 3.11 |
-| sparse-reopen | 3.43 | 2.91 | 2.89 | 3.58 | 3.31 |
-| wide-equal-live | 14.49 | 14.37 | 10.12 | 19.38 | 14.95 |
-| wide-equal-reopen | 14.84 | 14.27 | 12.58 | 21.55 | 17.84 |
-| wide-live | 25.43 | 26.53 | 20.91 | 38.61 | 34.94 |
-| wide-reopen | 26.60 | 27.46 | 23.54 | 39.38 | 36.69 |
+Wide-key PUT planning fell from 257 logical node reads to zero, with 3x-growth
+probe time falling from about 1,946 to 7.4 microseconds. Historical no-effect
+input changed from reconstruction with 36 temporary writes to partial processing
+with zero writes. Wide-key 1x growth became faster but wrote 222 rather than 185
+nodes; that write tradeoff remains explicit.
 
-Live-case selector work and physical writes are below; reopened samples retain
-the same decisions and bounds. Probe durations are microseconds.
+Small-case results are mixed. The 21-run follow-up measured live sparse deletion
+at 2.80/2.82/2.77 ms for baseline/accounting/full; reopened sparse deletion was
+2.84/2.91/3.09 ms, with full-candidate MAD 0.27 ms. Broad live deletion measured
+7.66/7.29/7.43 ms, while its selector reads increased from 65 to 128. These cases
+do not establish a universal speedup. Broad live CPU was 9.55/9.60/9.89 ms;
+wide and historical-deletion cases reduced CPU as well as wall time.
 
-| Case | Reads base → full | Probe µs base → full | Strategy base → full | Writes base → full |
-| --- | ---: | ---: | --- | ---: |
-| broad | 65 → 128 | 276.5 → 297.6 | Reconstruct → Reconstruct | 9 → 9 |
-| contiguous | 65 → 32 | 227.2 → 82.9 | PartialRewrite → PartialRewrite | 3 → 3 |
-| growth-branch | 257 → 0 | 953.8 → 8.3 | Reconstruct → PartialRewrite | 37 → 37 |
-| growth | 18 → 0 | 733.4 → 6.6 | Reconstruct → Reconstruct | 37 → 37 |
-| history | 257 → 32 | 1941.8 → 221.6 | Reconstruct → PartialRewrite | 36 → 0 |
-| noop | 0 → 0 | 0.0 → 0.0 | NoWork → NoWork | 0 → 0 |
-| replace | 257 → 128 | 2144.2 → 951.6 | Reconstruct → Reconstruct | 27 → 27 |
-| skew | 257 → 0 | 1616.1 → 7.9 | PartialRewrite → PartialRewrite | 33 → 33 |
-| sparse | 1 → 0 | 6.7 → 6.7 | PartialRewrite → PartialRewrite | 18 → 18 |
-| wide-equal | 257 → 0 | 1345.0 → 8.2 | Reconstruct → PartialRewrite | 185 → 222 |
-| wide | 257 → 0 | 1946.3 → 7.4 | PartialRewrite → PartialRewrite | 389 → 389 |
+Accounting uses fixed counters and a per-run key-byte summary. Matched
+sparse/contiguous/skew accounting controls added 160 bytes of admitted peak
+storage; other peaks varied with scheduling. Persisted overhead is 34 bytes per
+present root. Reachability and publication medians remained within the observed
+0.017–0.351 ms and 0.039–0.116 ms ranges across controls.
 
-The larger wins include 18%/11% lower wide 3x wall time live/reopened, 30%/15%
-lower wide 1x wall time, and 33%/40% lower historical no-effect wall time.
-Wide 1x partial construction writes 222 nodes versus 185, despite lower wall/CPU;
-this space/write tradeoff is visible rather than attributed solely to planning.
+Raw measurements, configurations and the temporary harness remain ignored local
+artifacts under `target/measurements/000333/`. Measurements preceded the later
+arithmetic simplification; final code was revalidated through assembly, tests
+and lint checks without claiming an additional measured speedup.
 
-Small sparse cases do not establish repeatable speedup. In the independent
-21-run follow-up, base/book/full live sparse medians were 2.80/2.82/2.77 ms;
-reopened sparse was 2.84/2.91/3.09 ms (full MAD 0.27 ms). Broad live medians
-were 7.66/7.29/7.43 ms, with CPU 9.55/9.60/9.89 ms. Its selector reads increase
-65→128 because mutation-only estimation refines to 64 observations. The initial
-broad regression did not persist after calibration; small scheduling-sensitive
-cases remain a limitation, not a claimed universal improvement.
+### Verification and follow-up
 
-Accounting has fixed per-root/per-range counters and one key-byte summary per
-run, with no retained per-entry statistics or tree-sized retirement set. The
-bookkeeping control's sparse/contiguous/skew admitted peaks increased by only
-160 bytes in matched cases; other peak differences reflect concurrent buffer
-occupancy. Required serialized overhead is exactly 34 bytes per present root.
-Across final cases, median reachability spans 0.017–0.351 ms and publication
-0.039–0.116 ms across all controls; the full candidate's ranges remain within
-those bounds. Raw phase/CPU/memory evidence includes these costs.
+- Workspace tests: 2,419 passed; two intentionally ignored.
+- Storage without default features: 2,151 passed; two intentionally ignored.
+- Formatting and strict Clippy passed in both configurations.
+- Final branch style/test-contract gate: 19 Rust files, 367 tests, no violations.
+- Production coverage before arithmetic simplification was 91.86% across eight
+  focused files, each above 80%; it was not recollected after simplification.
+- Review retained independent physical-tree and content oracles. Codec, recovery,
+  construction and lifecycle tests protect distinct contracts; shared verification
+  helpers avoid repeating the statistics assertions.
+- No unsafe code or nextest policy changed. Architecture documentation retains
+  only behavior, persisted statistics and format compatibility.
 
-### Validation and review
-
-- Workspace nextest: 2,419 passed, two intentionally ignored.
-- Storage without default features: 2,151 passed, two intentionally ignored.
-- Formatting and strict Clippy pass for default workspace and profiling-disabled storage.
-- Branch style/test-contract gate: 18 tracked Rust files, 366 tests, no violations;
-  the new statistics module separately passes the same gate (one file/one test).
-- Production coverage before arithmetic simplification: 91.86% across eight
-  focused files; planner 93.56%,
-  checkpoint builder 94.18%, CREATE builder 93.04%, statistics 96.61%, codec 82.48%,
-  table file 93.07%, meta block 84.91%, extraction 96.02%. Additional affected
-  catalog/publication/sealed consumers each exceed 86%.
-- Semantic review preserves independent content and structural oracles. Metadata
-  tests protect byte order, truncation, capacity and reopen; builder tests protect
-  concurrent ownership and lifecycle/settlement. Their overlap is intentional.
-  Shared traversal/verification helpers avoid duplicating statistics assertions.
-- Dedicated unary fixtures cover old root promotion and recursive finite-to-open
-  repair whose four successful writes leave one reachable leaf. Mismatched-root
-  requests fail before output; no-effect and failure fixtures preserve descriptors.
-- No unsafe code or nextest configuration changed. No commit or push was performed.
-
-The historical-delete measurement exposed an independent stale purge identity
-race, reproduced on unchanged baseline and candidate. It is recorded with a
-concrete reproduction and backtrace boundary in backlog
-[000216](../backlogs/000216-stale-nonunique-gc-identity-retirement.md). The fixture
-waits for deletion purge before DROP, outside timing in every control. Changing
-DDL/purge lifetime coordination is intentionally outside this task.
+Historical-delete measurements exposed a pre-existing stale purge identity race,
+reproduced on unchanged baseline and candidate. Follow-up
+[000216](../backlogs/000216-stale-nonunique-gc-identity-retirement.md) records the
+reproduction, backtrace boundary and direction for a deterministic regression.
+The fixture waits for deletion purge before DROP outside timing in all variants.
+Changing DDL/purge lifetime coordination is outside this task.
 
 ## Impacts
 
-- Required table metadata version 10; existing version-9 storage cannot reopen.
-- Secondary root representation, serialization, capture and generation-safe staging.
-- CREATE/sealed cold handoff, checkpoint logical/structural accounting and planning.
-- Reduced metadata capacity by the actual required serialized root payload.
-- Updated table-file, secondary-index and checkpoint architecture documentation.
-- Source backlog 000215 is implemented; completed RFC 0033 Phase 4 is unchanged.
+- Required table metadata version 10; version-9 storage cannot reopen.
+- Root statistics remain bound to their index generation through CREATE,
+  checkpoint publication, metadata changes and recovery.
+- Planning avoids base-tree estimation; execution and publication retain their
+  existing ownership, resource and visibility contracts.
+- Source backlog 000215 is implemented. RFC 0033 remains completed; its deferred
+  statistics follow-up now points to this task's outcome.
 
 ## Test Cases
 
-- Empty/present codecs, exact required bytes, truncation, version rejection,
-  impossible geometry, arithmetic overflow and metadata/allocation capacity.
+- Required codec bytes, truncation, version rejection, geometry, final arithmetic
+  errors and metadata/allocation capacity boundaries.
 - Unique/nonunique CREATE, empty input, merge coverage, duplicate rejection,
-  sealed ownership, failures and exact independent physical statistics.
-- Insert/replace/delete reduction, repeated keys and historical owners, nonunique
-  precedence, no-effect identity and complete removal under both physical strategies.
-- Parallel cuts, reused subtrees, empty/split leaves, ancestor retirement,
+  sealed ownership and independently verified physical statistics.
+- Insert/replace/delete reduction, repeated keys, historical owners, nonunique
+  precedence, no-effect identity and complete removal under both strategies.
+- Parallel cuts, subtree reuse, empty/split leaves, ancestor retirement,
   finite/open fence repair and old/new unary promotion.
-- Candidate/descriptor mismatch, admission/write failures, later-index failure,
-  unchanged publication, silent checkpoint behavior, DDL generation and reopen.
-- Zero-read PUT-only count/mass thresholds, explicit leaf shape, bounded deletion
-  probes, cached multiplicity weights and conservative identity-cap fallback.
-- Existing resource/backpressure contracts and both profiling configurations.
+- Root mismatch, admission/write failures, later-index failure, unchanged
+  publication, silent checkpoints, DDL generation binding and reopen.
+- Zero-read PUT thresholds, explicit leaf shape, bounded deletion probes,
+  cached multiplicity and conservative identity-cap fallback.
+- Existing resource, backpressure and settlement behavior in both feature modes.
 
 ## Open Questions
 
-No task-blocking questions remain. Per-subtree statistics/selection and a general
-adaptive planner remain outside scope. The calibrated heuristic is validated for
-the recorded workloads, not asserted optimal for all distributions. The unrelated
-DDL/purge failure remains actionable in backlog 000216.
+No task-blocking questions remain. The heuristic is validated for the recorded
+workloads, not proven optimal for all distributions. Per-subtree selection and
+an adaptive planner remain outside scope. The unrelated DDL/purge race remains
+tracked by backlog 000216.
