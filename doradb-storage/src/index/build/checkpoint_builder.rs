@@ -3,6 +3,7 @@
 //! and settles every accepted worker and write before returning a candidate root.
 #[cfg(any(test, feature = "profiling"))]
 use super::MemoryUsage;
+use super::budget::handoff_bytes;
 use super::checkpoint::IndexCheckpoint;
 use super::merge::{
     CompletedPartition, DEFAULT_BATCH_ENTRIES, HotEntryRef, MergeAcknowledgement, MergeConsumption,
@@ -133,7 +134,7 @@ impl CheckpointAdmission {
     /// Ordered queues can retain up to each worker's pending-output quota, in
     /// addition to its staged image and pending handoff. Assembly
     /// needs at most eight overlapping boundary/packing images; accepted writes
-    /// retain their own buffers, with a coarse allowance for completion bookkeeping.
+    /// retain their own buffers, with separate allowances for queue storage and completion bookkeeping.
     pub(crate) fn output_bytes(
         workers: usize,
         worker_bytes: usize,
@@ -147,6 +148,7 @@ impl CheckpointAdmission {
             .checked_add(8)?
             .checked_mul(DISK_TREE_BLOCK_SIZE)?
             .checked_add(completion_bytes(writes)?)?
+            .checked_add(handoff_bytes::<Packet>(ready)?)?
             .checked_add(workers.checked_mul(worker_bytes)?)
     }
 
@@ -1915,13 +1917,12 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         admission.measure(|m| {
             m.max_workers = m.max_workers.max(workers.min(plan.partitions()) as u64);
         });
+        let queue_admission = admission.output(
+            handoff_bytes::<Packet>(policy.max_ready_buffers)
+                .unwrap_or_else(|| unreachable!("validated checkpoint handoff capacity")),
+            "checkpoint handoff queue",
+        )?;
         let (output, input) = flume::bounded(policy.max_ready_buffers);
-        let queue_admission = budget
-            .reserve(
-                policy.max_ready_buffers.next_power_of_two() * 2 * size_of::<Packet>(),
-                "checkpoint handoff queue",
-            )
-            .change_context(RuntimeError::CheckpointExecution)?;
         let mut jobs = BudgetedVec::new(&budget);
         let mut queues = BudgetedVec::new(&budget);
         for _ in 0..plan.partitions() {

@@ -1256,7 +1256,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let budget = admission.budget.clone();
+        let budget = admission.input.clone();
         let mut inputs: Vec<_> = (0..groups).map(|_| BuildEntries::new(&budget)).collect();
         for (ordinal, entry) in entries.into_iter().enumerate() {
             let input = &mut inputs[ordinal % groups];
@@ -2212,7 +2212,7 @@ mod tests {
                 let occupied = cold
                     .budget()
                     .reserve(
-                        ColdIndexBuildConfig::default().max_scratch_bytes - bytes,
+                        ColdIndexBuildConfig::default().assembler_scratch_bytes - bytes,
                         "other retained scratch",
                     )
                     .unwrap();
@@ -2225,7 +2225,7 @@ mod tests {
                 assert_eq!(selection.workers, 1);
                 assert_eq!(
                     cold.budget().used(),
-                    ColdIndexBuildConfig::default().max_scratch_bytes
+                    ColdIndexBuildConfig::default().assembler_scratch_bytes
                 );
                 let scope = pool().await;
                 let pool = scope.0.dependency::<ThreadPool>();

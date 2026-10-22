@@ -978,7 +978,7 @@ mod tests {
     #[test]
     fn grouping_boundaries() {
         for workers in [1, 2, 4] {
-            for target in [1, 128, usize::MAX] {
+            for target in [1, 128, 8192] {
                 let policy = HotBuildPolicy::new(
                     HotIndexBuildConfig::default()
                         .max_workers(Some(workers))
@@ -986,7 +986,7 @@ mod tests {
                     4,
                 )
                 .unwrap();
-                for pages in [0, 1, 127, 128, 129, 2049, usize::MAX] {
+                for pages in [0, 1, 127, 128, 129, 2049, 65_536] {
                     let ranges = policy.plan_groups(pages);
                     let groups = ranges.len();
                     assert_eq!(groups, pages.div_ceil(target).min(workers * 4));

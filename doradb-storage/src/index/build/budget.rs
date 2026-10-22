@@ -610,6 +610,15 @@ impl<T> Deref for BudgetedEntries<T> {
     }
 }
 
+/// Conservative bounded-channel storage, including overlapping deque growth.
+#[inline]
+pub(super) fn handoff_bytes<T>(capacity: usize) -> Option<usize> {
+    capacity
+        .checked_next_power_of_two()?
+        .checked_mul(2)?
+        .checked_mul(size_of::<T>())
+}
+
 fn memory_error(
     requested: usize,
     used: usize,

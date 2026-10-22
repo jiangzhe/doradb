@@ -90,8 +90,12 @@ pub struct ResolvedHotIndexBuildConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ColdIndexBuildOverlay {
-    /// Scratch limit with byte units.
-    pub max_scratch_bytes: Option<Byte>,
+    /// Resident input and run-planning limit with byte units.
+    pub max_input_bytes: Option<Byte>,
+    /// Per-worker extraction and construction limit with byte units.
+    pub worker_scratch_bytes: Option<Byte>,
+    /// Shared coordinator and assembly limit with byte units.
+    pub assembler_scratch_bytes: Option<Byte>,
     /// Explicit maximum workers.
     pub max_workers: Option<usize>,
     /// Queued leaf-buffer limit.
@@ -102,7 +106,12 @@ pub struct ColdIndexBuildOverlay {
 
 impl ColdIndexBuildOverlay {
     fn merge(&mut self, other: Self) {
-        replace(&mut self.max_scratch_bytes, other.max_scratch_bytes);
+        replace(&mut self.max_input_bytes, other.max_input_bytes);
+        replace(&mut self.worker_scratch_bytes, other.worker_scratch_bytes);
+        replace(
+            &mut self.assembler_scratch_bytes,
+            other.assembler_scratch_bytes,
+        );
         replace(&mut self.max_workers, other.max_workers);
         replace(&mut self.max_ready_buffers, other.max_ready_buffers);
         replace(&mut self.max_in_flight_writes, other.max_in_flight_writes);
@@ -145,8 +154,14 @@ impl CheckpointIndexBuildOverlay {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedColdIndexBuildConfig {
-    /// Accounted scratch ceiling in bytes.
-    pub max_scratch_bytes: usize,
+    /// Resident input and run-planning allowance.
+    pub max_input_bytes: usize,
+    /// Extraction and construction scratch per worker slot.
+    pub worker_scratch_bytes: usize,
+    /// Shared coordination, assembly and sealed-reader allowance.
+    pub assembler_scratch_bytes: usize,
+    /// Aggregate configured allowance including independent output capacity.
+    pub total_memory_bytes: usize,
     /// Effective worker limit.
     pub max_workers: usize,
     /// Queued leaf-buffer limit.
@@ -416,7 +431,13 @@ impl ResolvedEngineConfig {
                 target_pages_per_run: config.hot_index_build.target_pages_per_run,
             },
             cold_index_build: ResolvedColdIndexBuildConfig {
-                max_scratch_bytes: config.cold_index_build.max_scratch_bytes,
+                max_input_bytes: config.cold_index_build.max_input_bytes,
+                worker_scratch_bytes: config.cold_index_build.worker_scratch_bytes,
+                assembler_scratch_bytes: config.cold_index_build.assembler_scratch_bytes,
+                total_memory_bytes: config
+                    .cold_index_build
+                    .total_memory_bytes(config.thread_pool.worker_threads)
+                    .expect("validated cold aggregate capacity"),
                 max_workers: config
                     .cold_index_build
                     .max_workers
@@ -685,9 +706,16 @@ pub fn resolve_engine_config(
     }
 
     let mut cold_index_build = default.cold_index_build;
-    if let Some(value) = overlay.cold_index_build.max_scratch_bytes {
-        cold_index_build.max_scratch_bytes =
-            byte_usize(value, "cold_index_build.max_scratch_bytes")?;
+    if let Some(value) = overlay.cold_index_build.max_input_bytes {
+        cold_index_build.max_input_bytes = byte_usize(value, "cold_index_build.max_input_bytes")?;
+    }
+    if let Some(value) = overlay.cold_index_build.worker_scratch_bytes {
+        cold_index_build.worker_scratch_bytes =
+            byte_usize(value, "cold_index_build.worker_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.cold_index_build.assembler_scratch_bytes {
+        cold_index_build.assembler_scratch_bytes =
+            byte_usize(value, "cold_index_build.assembler_scratch_bytes")?;
     }
     if let Some(value) = overlay.cold_index_build.max_workers {
         cold_index_build.max_workers = Some(value);
@@ -1312,14 +1340,17 @@ mod tests {
     #[test]
     fn cold_build_overlay_roundtrip_and_validation() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[cold_index_build]\nmax_scratch_bytes = '64 MiB'\nmax_ready_buffers = 3\nmax_in_flight_writes = 7\n").unwrap();
-        overlay.merge(toml::from_str("[cold_index_build]\nmax_workers = 2\n").unwrap());
+        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[cold_index_build]\nmax_input_bytes = '64 MiB'\nmax_ready_buffers = 3\nmax_in_flight_writes = 7\n").unwrap();
+        overlay.merge(toml::from_str("[cold_index_build]\nmax_workers = 2\nworker_scratch_bytes = '8 MiB'\nassembler_scratch_bytes = '16 MiB'\n").unwrap());
         let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
         assert_eq!(config.cold_index_build.max_workers, Some(2));
         assert_eq!(
             resolved.cold_index_build,
             ResolvedColdIndexBuildConfig {
-                max_scratch_bytes: 64 * 1024 * 1024,
+                max_input_bytes: 64 * 1024 * 1024,
+                worker_scratch_bytes: 8 * 1024 * 1024,
+                assembler_scratch_bytes: 16 * 1024 * 1024,
+                total_memory_bytes: config.cold_index_build.total_memory_bytes(2).unwrap(),
                 max_workers: 2,
                 max_ready_buffers: 3,
                 max_in_flight_writes: 7,
@@ -1337,7 +1368,9 @@ mod tests {
             "max_workers = 5",
             "max_ready_buffers = 0",
             "max_in_flight_writes = 1",
-            "max_scratch_bytes = '0 B'",
+            "max_input_bytes = '0 B'",
+            "worker_scratch_bytes = '1 B'",
+            "assembler_scratch_bytes = '1 B'",
         ] {
             let mut changed = overlay.clone();
             changed.merge(toml::from_str(&format!("[cold_index_build]\n{field}")).unwrap());
@@ -1346,6 +1379,12 @@ mod tests {
                 "{field}"
             );
         }
-        assert!(toml::from_str::<EngineConfigOverlay>("[cold_index_build]\nunknown = 1").is_err());
+        for field in ["unknown = 1", "max_scratch_bytes = '64 MiB'"] {
+            assert!(
+                toml::from_str::<EngineConfigOverlay>(&format!("[cold_index_build]\n{field}"))
+                    .is_err(),
+                "{field}"
+            );
+        }
     }
 }

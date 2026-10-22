@@ -1,3 +1,7 @@
+use super::index_build::{
+    MAX_BUILD_WORKERS, MAX_IN_FLIGHT_WRITES, MAX_INPUT_BYTES, MAX_LOCAL_SCRATCH_BYTES,
+    MAX_READY_BUFFERS,
+};
 use crate::error::{ConfigError, ConfigResult};
 use crate::index::build::checkpoint::CheckpointAdmission;
 use error_stack::Report;
@@ -5,17 +9,17 @@ use error_stack::Report;
 /// Independent memory and concurrency limits for secondary-index checkpointing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointIndexBuildConfig {
-    /// Captured sources, resident runs, extraction/sorting and run-planning metadata.
+    /// Captured sources, resident runs, extraction/sorting and run-planning metadata, up to 64 GiB.
     pub max_input_bytes: usize,
-    /// Scratch and pending-output quota for each active or unassembled worker.
+    /// Scratch and pending-output quota for each active or unassembled worker, up to 1 GiB.
     pub worker_scratch_bytes: usize,
-    /// Shared planner, assembler, retained fences and construction bookkeeping.
+    /// Shared planner, assembler, retained fences and construction bookkeeping, up to 1 GiB.
     pub assembler_scratch_bytes: usize,
-    /// Maximum active or unassembled workers; `None` selects the engine pool size.
+    /// Maximum active or unassembled workers, up to 256; `None` selects the pool size capped at 256.
     pub max_workers: Option<usize>,
-    /// Maximum queued output buffers.
+    /// Maximum queued output buffers, from 1 to 256.
     pub max_ready_buffers: usize,
-    /// Maximum accepted unsettled writes, including parent progress.
+    /// Maximum accepted unsettled writes, from 2 to 256, including parent progress.
     pub max_in_flight_writes: usize,
 }
 
@@ -78,7 +82,9 @@ impl CheckpointIndexBuildConfig {
     /// Return the checked aggregate allowance, including derived output capacity.
     /// This is a bound on accounted allocations, not process memory or an extra quota.
     pub fn total_memory_bytes(&self, pool_workers: usize) -> Option<usize> {
-        let workers = self.max_workers.unwrap_or(pool_workers);
+        let workers = self
+            .max_workers
+            .unwrap_or(pool_workers.min(MAX_BUILD_WORKERS));
         self.worker_scratch_bytes
             .checked_mul(workers)?
             .checked_add(self.assembler_scratch_bytes)?
@@ -93,59 +99,47 @@ impl CheckpointIndexBuildConfig {
 
     /// Validate independent component limits and normalize workers before filesystem effects.
     pub(crate) fn validate(&mut self, pool_workers: usize) -> ConfigResult<()> {
-        let workers = self.max_workers.unwrap_or(pool_workers);
-        for (field, value, minimum, valid) in [
-            (
-                "max_input_bytes",
-                self.max_input_bytes,
-                1,
-                self.max_input_bytes > 0,
-            ),
+        let workers = self
+            .max_workers
+            .unwrap_or(pool_workers.min(MAX_BUILD_WORKERS));
+        for (field, value, minimum, maximum) in [
+            ("max_input_bytes", self.max_input_bytes, 1, MAX_INPUT_BYTES),
             (
                 "worker_scratch_bytes",
                 self.worker_scratch_bytes,
                 CheckpointAdmission::minimum_worker_bytes(),
-                self.worker_scratch_bytes >= CheckpointAdmission::minimum_worker_bytes(),
+                MAX_LOCAL_SCRATCH_BYTES,
             ),
             (
                 "assembler_scratch_bytes",
                 self.assembler_scratch_bytes,
                 CheckpointAdmission::minimum_assembler_bytes(),
-                self.assembler_scratch_bytes >= CheckpointAdmission::minimum_assembler_bytes(),
+                MAX_LOCAL_SCRATCH_BYTES,
             ),
             (
                 "max_workers",
                 workers,
                 1,
-                workers > 0
-                    && workers <= pool_workers
-                    && workers <= isize::MAX as usize / (4 * 65536),
+                pool_workers.min(MAX_BUILD_WORKERS),
             ),
             (
                 "max_ready_buffers",
                 self.max_ready_buffers,
                 1,
-                self.max_ready_buffers > 0,
+                MAX_READY_BUFFERS,
             ),
             (
                 "max_in_flight_writes",
                 self.max_in_flight_writes,
                 2,
-                self.max_in_flight_writes >= 2,
+                MAX_IN_FLIGHT_WRITES,
             ),
         ] {
-            if !valid || value > isize::MAX as usize {
+            if !(minimum..=maximum).contains(&value) {
                 return Err(Report::new(ConfigError::InvalidCheckpointIndexBuildLimit).attach(format!(
-                    "config_field=checkpoint_index_build.{field}, value={value}, minimum={minimum}, pool_workers={pool_workers}"
+                    "config_field=checkpoint_index_build.{field}, value={value}, supported={minimum}..={maximum}, pool_workers={pool_workers}"
                 )));
             }
-        }
-        if self
-            .total_memory_bytes(pool_workers)
-            .is_none_or(|bytes| bytes > isize::MAX as usize)
-        {
-            return Err(Report::new(ConfigError::InvalidCheckpointIndexBuildLimit)
-                .attach("config_field=checkpoint_index_build.total_memory_bytes, aggregate capacity overflow"));
         }
         self.max_workers = Some(workers);
         Ok(())
@@ -166,7 +160,11 @@ mod tests {
         let root = temp.path().join("uncreated");
         let worker = CheckpointAdmission::minimum_worker_bytes();
         let assembler = CheckpointAdmission::minimum_assembler_bytes();
-        for (workers, ready, writes) in [(1, 1, 2), (2, 8, 32)] {
+        for (workers, ready, writes) in [
+            (1, 1, 2),
+            (2, 8, 32),
+            (2, MAX_READY_BUFFERS, MAX_IN_FLIGHT_WRITES),
+        ] {
             let config = CheckpointIndexBuildConfig::default()
                 .max_input_bytes(1)
                 .worker_scratch_bytes(worker)
@@ -181,7 +179,7 @@ mod tests {
                 .unwrap();
             assert_eq!(validated.checkpoint_index_build, config);
             assert_eq!(
-                validated.cold_index_build.max_scratch_bytes,
+                validated.cold_index_build.max_input_bytes,
                 256 * 1024 * 1024
             );
             assert_eq!(validated.cold_index_build.max_workers, Some(2));
@@ -234,15 +232,17 @@ mod tests {
             ),
             (
                 "max_input_bytes",
-                CheckpointIndexBuildConfig::default().max_input_bytes(usize::MAX),
+                CheckpointIndexBuildConfig::default().max_input_bytes(MAX_INPUT_BYTES + 1),
             ),
             (
                 "worker_scratch_bytes",
-                CheckpointIndexBuildConfig::default().worker_scratch_bytes(usize::MAX),
+                CheckpointIndexBuildConfig::default()
+                    .worker_scratch_bytes(MAX_LOCAL_SCRATCH_BYTES + 1),
             ),
             (
                 "assembler_scratch_bytes",
-                CheckpointIndexBuildConfig::default().assembler_scratch_bytes(usize::MAX),
+                CheckpointIndexBuildConfig::default()
+                    .assembler_scratch_bytes(MAX_LOCAL_SCRATCH_BYTES + 1),
             ),
             (
                 "max_workers",
@@ -258,7 +258,7 @@ mod tests {
             ),
             (
                 "max_ready_buffers",
-                CheckpointIndexBuildConfig::default().max_ready_buffers(usize::MAX),
+                CheckpointIndexBuildConfig::default().max_ready_buffers(MAX_READY_BUFFERS + 1),
             ),
             (
                 "max_in_flight_writes",
@@ -266,7 +266,8 @@ mod tests {
             ),
             (
                 "max_in_flight_writes",
-                CheckpointIndexBuildConfig::default().max_in_flight_writes(usize::MAX),
+                CheckpointIndexBuildConfig::default()
+                    .max_in_flight_writes(MAX_IN_FLIGHT_WRITES + 1),
             ),
         ] {
             let error = EngineConfig::default()
@@ -283,37 +284,40 @@ mod tests {
         }
     }
 
-    /// Purpose: Report aggregate checkpoint capacity without an extra admission ceiling and reject arithmetic overflow.
-    /// Expected: Each independent allowance contributes to the report, while oversized sums and derived output capacities fail pure validation.
+    /// Purpose: Report independent checkpoint allowances and validate their supported upper bounds.
+    /// Expected: Component maxima validate and contribute to the total, while automatic and explicit workers respect the build limit.
     #[test]
-    fn aggregate_capacity_and_overflow() {
+    fn aggregate_capacity_and_upper_bounds() {
         let mut config = CheckpointIndexBuildConfig::default();
-        // Two worker scratch allowances plus their possible retained output,
-        // 52 image slots and 32 completion observers are included in the total.
+        let total = config.total_memory_bytes(2).unwrap();
+        assert!(total > (256 + 16 + 12) * 1024 * 1024 + 52 * 65536 + 32 * 1024);
         assert_eq!(
-            config.total_memory_bytes(2),
-            Some((256 + 16 + 12) * 1024 * 1024 + 52 * 65536 + 32 * 1024)
+            config
+                .max_input_bytes(config.max_input_bytes + 7)
+                .total_memory_bytes(2),
+            Some(total + 7)
+        );
+        assert_eq!(
+            config
+                .assembler_scratch_bytes(config.assembler_scratch_bytes + 11)
+                .total_memory_bytes(2),
+            Some(total + 11)
         );
         config.validate(2).unwrap();
         assert_eq!(config.total_memory_bytes(8), config.total_memory_bytes(2));
-        for mut invalid in [
-            config.max_input_bytes(isize::MAX as usize),
-            config.worker_scratch_bytes(isize::MAX as usize),
-            config.assembler_scratch_bytes(isize::MAX as usize),
-            config.max_ready_buffers(isize::MAX as usize),
-            config.max_in_flight_writes(isize::MAX as usize),
-        ] {
-            assert!(
-                invalid
-                    .total_memory_bytes(2)
-                    .is_none_or(|total| total > isize::MAX as usize)
-            );
-            let error = invalid.validate(2).unwrap_err();
-            assert_eq!(
-                error.current_context(),
-                &ConfigError::InvalidCheckpointIndexBuildLimit
-            );
-            assert!(format!("{error:?}").contains("checkpoint_index_build.total_memory_bytes"));
-        }
+        let mut maximum = CheckpointIndexBuildConfig::default()
+            .max_input_bytes(MAX_INPUT_BYTES)
+            .worker_scratch_bytes(MAX_LOCAL_SCRATCH_BYTES)
+            .assembler_scratch_bytes(MAX_LOCAL_SCRATCH_BYTES)
+            .max_ready_buffers(MAX_READY_BUFFERS)
+            .max_in_flight_writes(MAX_IN_FLIGHT_WRITES);
+        maximum.validate(MAX_BUILD_WORKERS + 1).unwrap();
+        assert_eq!(maximum.max_workers, Some(MAX_BUILD_WORKERS));
+        assert!(maximum.total_memory_bytes(MAX_BUILD_WORKERS).is_some());
+        let error = maximum
+            .max_workers(Some(MAX_BUILD_WORKERS + 1))
+            .validate(MAX_BUILD_WORKERS + 1)
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("checkpoint_index_build.max_workers"));
     }
 }
