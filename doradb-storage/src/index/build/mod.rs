@@ -3,6 +3,9 @@
 //! Factories in catalog/recovery establish source stability. A retained local-sort
 //! coordinator owns every accepted completion independently of its borrowed execution future.
 mod budget;
+/// Checkpoint strategy selection and application.
+pub(crate) mod checkpoint;
+mod checkpoint_builder;
 mod co_rank;
 /// Retained cold source jobs and exact partition completion.
 pub(crate) mod cold_extract;
@@ -14,6 +17,8 @@ pub(crate) mod cold_source;
 pub(crate) mod cross_tier;
 /// Streaming durable construction and invocation admission.
 pub(crate) mod disk_builder;
+/// Bounded local-sort acceptance shared by CREATE and checkpoint sources.
+pub(crate) mod local_sort;
 mod loser_tree;
 /// Bounded partition streaming and separately settled completion authority.
 pub(crate) mod merge;
@@ -26,10 +31,18 @@ mod source;
 /// Packed construction shared by bootstrap and private DDL staging targets.
 pub(crate) mod tree_builder;
 mod worker;
+mod write;
 
-pub(crate) use budget::{BudgetedVec, MemoryBudget, MemoryReservation};
+#[cfg(any(test, feature = "profiling"))]
+pub(crate) use budget::MemoryUsage;
+pub(crate) use budget::{
+    BudgetedEntries, BudgetedVec, MemoryBudget, MemoryReservation, PAYLOAD_CREDIT_BYTES,
+    PayloadSize,
+};
 #[cfg(test)]
-pub(crate) use budget::{fail_after as fail_build_budget_after, fail_at as fail_build_budget};
+pub(crate) use budget::{
+    fail_after as fail_build_budget_after, fail_at as fail_build_budget, payload_accounting,
+};
 pub(crate) use pipeline::{HotIndexBuild, merge_build_result};
 #[cfg(test)]
 pub(crate) use pipeline::{TestPoint as HotBuildTestPoint, test_observe as observe_hot_build};
@@ -43,12 +56,14 @@ use crate::error::ConfigResult;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::id::RowID;
 use crate::index::BTreeKey;
+use crate::memcmp::MEM_CMP_KEY_INLINE;
 #[cfg(feature = "profiling")]
 use crate::profiling::{
     HotExtractionMeasurements, HotExtractionProfile, HotExtractionWorkerProfile,
 };
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::thread_pool::ThreadPool;
+use error_stack::ResultExt;
 use std::cmp::Ordering;
 use std::mem::take;
 use std::ops::Range;
@@ -141,33 +156,37 @@ pub(crate) struct IndexBuildEntry {
     pub(crate) row_id: RowID,
 }
 
-/// Mutable admitted input; owned keys always drop before their payload charge.
-pub(crate) struct BuildEntries {
-    /// Encoded physical keys in admitted element storage.
-    pub(crate) entries: BudgetedVec<IndexBuildEntry>,
-    /// Outlined-key capacity, released after entries are destroyed.
-    pub(crate) payload: MemoryReservation,
+impl PayloadSize for IndexBuildEntry {
+    #[inline]
+    fn payload_bytes(&self) -> usize {
+        let len = self.key.as_bytes().len();
+        if len > MEM_CMP_KEY_INLINE { len } else { 0 }
+    }
 }
 
-impl BuildEntries {
-    /// Start admitted collection without allocating input storage.
-    pub(crate) fn new(budget: &MemoryBudget) -> Self {
-        Self {
-            entries: BudgetedVec::new(budget),
-            payload: MemoryReservation::new(budget),
-        }
-    }
+/// Mutable encoded input with aggregate owned-key admission.
+pub(crate) type BuildEntries = BudgetedEntries<IndexBuildEntry>;
+
+/// Homogeneous source policy carried once per run, never once per entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunKind {
+    /// CREATE input retains the caller's duplicate validation policy.
+    Create,
+    /// Checkpoint insert or unique-owner replacement.
+    Put,
+    /// Checkpoint exact or owner-conditional removal.
+    Delete,
 }
 
 /// Immutable sorted entries and their allocation-lifetime reservations.
 pub(crate) struct SortedRun {
     /// Original deterministic group identity, independent of completion order.
     pub(crate) group_id: usize,
-    entries: BudgetedVec<IndexBuildEntry>,
+    /// Caller-selected operation for every entry in this run.
+    pub(crate) kind: RunKind,
+    entries: BuildEntries,
     /// Local evidence selected by the invocation duplicate policy.
     pub(crate) duplicates: LocalDuplicates,
-    // Entries (including keys) are destroyed before their payload admission.
-    payload: MemoryReservation,
     #[cfg(feature = "profiling")]
     profile: HotExtractionWorkerProfile,
 }
@@ -175,8 +194,7 @@ pub(crate) struct SortedRun {
 impl SortedRun {
     /// Sort one source partition and retain stable provenance unless cooperatively stopped.
     pub(super) fn finish_group(
-        mut entries: BudgetedVec<IndexBuildEntry>,
-        payload: MemoryReservation,
+        mut entries: BuildEntries,
         duplicates: DuplicateCheck,
         group_id: usize,
         stop: &AtomicBool,
@@ -191,25 +209,81 @@ impl SortedRun {
         }
         BuildOutcome::Complete(Self {
             group_id,
+            kind: RunKind::Create,
             entries,
-            payload,
             duplicates: evidence,
             #[cfg(feature = "profiling")]
             profile: HotExtractionWorkerProfile::default(),
         })
     }
 
+    /// Sort checkpoint input with stable source order for equal-key unique puts.
+    pub(crate) fn finish_mutations(
+        mut rows: BuildEntries,
+        group_id: usize,
+        kind: RunKind,
+        unique: bool,
+        stop: &AtomicBool,
+    ) -> RuntimeOrFatalResult<BuildOutcome<Self>> {
+        assert!(
+            kind != RunKind::Create,
+            "checkpoint run requires mutation metadata"
+        );
+        if unique && kind == RunKind::Put {
+            rows.sort_by(
+                |left, right| left.key.cmp(&right.key),
+                "checkpoint stable sort",
+            )
+            .change_context(RuntimeError::IndexAccess)?;
+        } else {
+            rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        }
+        if stop.load(AtomicOrdering::Acquire) {
+            return Ok(BuildOutcome::Stopped);
+        }
+        Ok(BuildOutcome::Complete(Self {
+            group_id,
+            kind,
+            entries: rows,
+            duplicates: LocalDuplicates::Unchecked,
+            #[cfg(feature = "profiling")]
+            profile: HotExtractionWorkerProfile::default(),
+        }))
+    }
+
     /// Accounted capacity retained by entries and outlined keys.
     #[cfg(feature = "profiling")]
     #[inline]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        (self.entries.capacity() * size_of::<IndexBuildEntry>() + self.payload.bytes()) as u64
+        self.entries.retained_bytes()
     }
 
     /// Borrow sorted owned entries without cloning keys or building references.
     #[inline]
     pub(crate) fn entries(&self) -> &[IndexBuildEntry] {
         &self.entries
+    }
+
+    /// Borrow every equal-key entry, searching the upper bound only for repeated keys.
+    #[inline]
+    fn matching_entries(&self, key: &[u8]) -> &[IndexBuildEntry] {
+        let entries = self.entries();
+        let start = entries.partition_point(|entry| entry.key.as_bytes() < key);
+        if entries
+            .get(start)
+            .is_none_or(|entry| entry.key.as_bytes() != key)
+        {
+            return &entries[start..start];
+        }
+        let mut end = start + 1;
+        if entries
+            .get(end)
+            .is_some_and(|entry| entry.key.as_bytes() == key)
+        {
+            end += 1;
+            end += entries[end..].partition_point(|entry| entry.key.as_bytes() <= key);
+        }
+        &entries[start..end]
     }
 }
 
@@ -228,7 +302,7 @@ pub(crate) struct SortedRuns {
 
 impl SortedRuns {
     /// Transfer an admitted container without flattening entries or cloning keys.
-    pub(super) fn from_admitted(
+    pub(crate) fn from_admitted(
         runs: BudgetedVec<Arc<SortedRun>>,
         budget: MemoryBudget,
         duplicates: DuplicateCheck,
@@ -904,7 +978,7 @@ mod tests {
     #[test]
     fn grouping_boundaries() {
         for workers in [1, 2, 4] {
-            for target in [1, 128, usize::MAX] {
+            for target in [1, 128, 8192] {
                 let policy = HotBuildPolicy::new(
                     HotIndexBuildConfig::default()
                         .max_workers(Some(workers))
@@ -912,7 +986,7 @@ mod tests {
                     4,
                 )
                 .unwrap();
-                for pages in [0, 1, 127, 128, 129, 2049, usize::MAX] {
+                for pages in [0, 1, 127, 128, 129, 2049, 65_536] {
                     let ranges = policy.plan_groups(pages);
                     let groups = ranges.len();
                     assert_eq!(groups, pages.div_ceil(target).min(workers * 4));
@@ -1704,8 +1778,23 @@ mod tests {
             assert_eq!(runs.entry(0, 0).unwrap().key, runs.entry(1, 0).unwrap().key);
             // Reverse RowIDs relative to run order: a RowID tie-breaker would
             // now give the opposite answer for these equal unique keys.
-            Arc::get_mut(&mut runs.runs[0]).unwrap().entries[0].row_id = RowID::new(900);
-            Arc::get_mut(&mut runs.runs[1]).unwrap().entries[0].row_id = RowID::new(1);
+            for (index, row_id) in [RowID::new(900), RowID::new(1)].into_iter().enumerate() {
+                let run = Arc::get_mut(&mut runs.runs[index]).unwrap();
+                assert_eq!(run.entries.len(), 1);
+                let mut entries = BuildEntries::new(&runs.budget);
+                entries
+                    .push_with(
+                        run.entries[0].payload_bytes(),
+                        "fixture entries",
+                        "fixture key",
+                        || IndexBuildEntry {
+                            key: run.entries[0].key.clone(),
+                            row_id,
+                        },
+                    )
+                    .unwrap();
+                run.entries = entries;
+            }
             assert_eq!(runs.compare((0, 0), (1, 0)), Some(Ordering::Less));
             assert_eq!(runs.compare((1, 0), (0, 0)), Some(Ordering::Greater));
             assert_eq!(runs.compare((1, 0), (1, 0)), Some(Ordering::Equal));

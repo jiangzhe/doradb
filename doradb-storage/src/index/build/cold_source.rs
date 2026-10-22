@@ -1,9 +1,8 @@
 //! Captured CREATE authority and physical cold-row decoding.
 #[cfg(test)]
 use super::cold_extract::tests::Hooks;
-use super::{
-    BudgetedVec, BuildEntries, BuildOutcome, DuplicateCheck, IndexBuildEntry, MemoryBudget,
-};
+use super::disk_builder::DiskBuildAdmission;
+use super::{BudgetedVec, BuildEntries, BuildOutcome, DuplicateCheck, IndexBuildEntry};
 use crate::buffer::PoolGuards;
 use crate::catalog::TableIndexMetadata;
 use crate::catalog::index::IndexDdlGateScope;
@@ -47,8 +46,8 @@ pub(crate) struct ColdBuildSource {
     encoder: BTreeKeyEncoder,
     root: BlockID,
     pivot: RowID,
-    /// Invocation scratch shared with durable construction.
-    pub(super) budget: MemoryBudget,
+    /// Independent input, worker and coordinator admission retained through extraction.
+    pub(super) admission: Arc<DiskBuildAdmission>,
     /// Timestamp captured by the accepted CREATE owner.
     pub(super) build_ts: TrxID,
     _ddl: Arc<IndexDdlGateScope>,
@@ -67,7 +66,7 @@ impl ColdBuildSource {
         guards: PoolGuards,
         ddl: Arc<IndexDdlGateScope>,
         build_ts: TrxID,
-        budget: MemoryBudget,
+        admission: Arc<DiskBuildAdmission>,
     ) -> Self {
         let root = plan.active_root();
         assert_eq!(
@@ -88,7 +87,7 @@ impl ColdBuildSource {
             encoder: secondary_index_encoder(plan.old_layout().metadata(), spec, !spec.unique()),
             root: root.column_block_index_root,
             pivot: root.pivot_row_id,
-            budget,
+            admission,
             build_ts,
             _ddl: ddl,
             #[cfg(test)]
@@ -131,9 +130,10 @@ impl ColdBuildSource {
     }
 
     /// Admit one minimum extraction workspace before fixing the source plan.
-    pub(super) fn workspace(&self) -> QuadResult<ColdWorkspace> {
-        let scan = ColumnBuildWorkspace::new(&self.budget)?;
-        let mut values = BudgetedVec::new(&self.budget);
+    pub(super) fn workspace(&self, slot: usize) -> QuadResult<ColdWorkspace> {
+        let budget = self.admission.worker_budget(slot);
+        let scan = ColumnBuildWorkspace::new(&budget)?;
+        let mut values = BudgetedVec::new(&budget);
         values
             .ensure_capacity(
                 self.spec.keys.len() + usize::from(!self.spec.unique()),
@@ -156,7 +156,7 @@ impl ColdBuildSource {
         projection: &mut ColdWorkspace,
         stop: &AtomicBool,
     ) -> QuadResult<BuildOutcome<BuildEntries>> {
-        let budget = &self.budget;
+        let budget = &self.admission.input;
         let table = &self.table;
         let disk_guard = self.guards.disk_guard();
         let column_index = self.column_index();
@@ -243,27 +243,26 @@ impl ColdBuildSource {
         if !index_spec.unique() {
             projection.values.push_reserved(Val::from(row_id));
         }
-        rows.entries
-            .reserve_one("cold run entries")
-            .change_context(RuntimeError::CatalogAccess)?;
         let len = self
             .encoder
             .encoded_len(&projection.values)
             .change_context(RuntimeError::CatalogAccess)?;
-        rows.payload
-            .grow(
-                if len > MEM_CMP_KEY_INLINE { len } else { 0 },
-                "cold outlined key",
-            )
-            .change_context(RuntimeError::CatalogAccess)?;
+        rows.push_with(
+            if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+            "cold run entries",
+            "cold outlined key",
+            || IndexBuildEntry {
+                key: self.encoder.encode_with_len(&projection.values, len),
+                row_id,
+            },
+        )
+        .change_context(RuntimeError::CatalogAccess)?;
         #[cfg(feature = "profiling")]
         {
             projection.sample.live_rows += 1;
             projection.sample.encoded_bytes += len as u64;
         }
-        let key = self.encoder.encode_with_len(&projection.values, len);
         projection.values.clear();
-        rows.entries.push_reserved(IndexBuildEntry { key, row_id });
         Ok(())
     }
 }

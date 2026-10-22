@@ -1,4 +1,5 @@
 mod access;
+mod checkpoint_index;
 mod checkpoint_workflow;
 mod deletion_buffer;
 mod dml_validator;
@@ -1377,6 +1378,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct MaintenanceTestState {
         force_secondary_sidecar_error: AtomicBool,
+        secondary_failure_slot: AtomicUsize,
         force_post_publish_checkpoint_error: AtomicBool,
         force_checkpoint_commit_error: AtomicBool,
         freeze_after_loading_hook: parking_lot::Mutex<Option<MaintenanceAsyncHook>>,
@@ -1420,6 +1422,18 @@ pub(crate) mod tests {
             self.state
                 .force_secondary_sidecar_error
                 .load(Ordering::Relaxed)
+        }
+
+        /// Fail before one selected index slot after earlier roots have been staged.
+        pub(crate) fn set_secondary_failure_slot(&self, slot: Option<usize>) {
+            self.state
+                .secondary_failure_slot
+                .store(slot.map_or(0, |slot| slot + 1), Ordering::Relaxed);
+        }
+
+        /// Whether this slot is the selected deterministic failure boundary.
+        pub(crate) fn secondary_failure_slot(&self, slot: usize) -> bool {
+            self.state.secondary_failure_slot.load(Ordering::Relaxed) == slot + 1
         }
 
         /// Controls whether post publish checkpoint error is forced in tests.

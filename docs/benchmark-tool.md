@@ -116,7 +116,7 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
 `mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `hot_index_build`,
-`cold_index_build`, `index_buffer`, `data_buffer`, and `file`;
+`cold_index_build`, `checkpoint_index_build`, `index_buffer`, `data_buffer`, and `file`;
 `meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
 `concurrency_limit` because orchestration always uses one runner.
@@ -130,21 +130,29 @@ effective table-scan counts. Normalized result documents must include the
 ### Hot-index build settings
 
 `[engine.hot_index_build]` accepts `max_scratch_bytes` (default `"256 MiB"`),
-`max_workers` (default: the configured thread-pool size), and
-`target_pages_per_run` (default 128). Limits must be positive, and explicit
-workers cannot exceed the pool size. These settings control recovery index builds.
+`max_workers` (default: the configured thread-pool size, capped at 256), and
+`target_pages_per_run` (default 128). Limits must be positive: scratch is capped
+at 64 GiB, workers at 256 and the pool size, and pages per run at 8,192.
+These settings control recovery index builds.
 
 The scratch limit bounds bulk-build working memory. Its reported peak excludes
 auxiliary overhead and does not represent total process memory.
 
 ### Cold-index build settings
 
-`[engine.cold_index_build]` accepts `max_scratch_bytes` (default `"256 MiB"`),
-`max_workers` (omitted selects the engine pool size), `max_ready_buffers`
-(default 8, positive), and `max_in_flight_writes` (default 32, at least 2).
-Scratch and worker limits must be positive, and workers cannot exceed the pool
-size. These settings control cold extraction, sorting and tree construction
-during index creation. The scratch budget can reduce effective concurrency.
+`[engine.cold_index_build]` controls cold extraction, sorting and tree construction
+during index creation. Its independent byte limits are `max_input_bytes`
+(default `"256 MiB"`), `worker_scratch_bytes` (default `"4 MiB"` per worker), and
+`assembler_scratch_bytes` (default `"12 MiB"`). They replace `max_scratch_bytes`;
+the input default is no longer an overall memory ceiling.
+
+`max_workers` defaults to the engine pool size, capped at 256;
+`max_ready_buffers` defaults to 8 (range 1–256), and `max_in_flight_writes` to 32
+(range 2–256). Input is capped at 64 GiB and each scratch allowance at 1 GiB.
+Output capacity, including queue storage and write bookkeeping, is derived
+separately from these limits. Resolved settings report
+`total_memory_bytes` as a conservative aggregate allowance, not another quota.
+Component minima and upper bounds are validated before startup.
 
 The benchmark uses io_uring and always collects profiling data. `include_stats`
 controls whether general engine statistics appear in the output. Recovery's
@@ -156,6 +164,34 @@ Recovery counters accumulate over startup; its scratch peak is the maximum
 across builds. Build page counts and occupancy describe construction work and
 can exceed final resident size. Stage timings may overlap, and worker-time sums
 are not additive with elapsed wall time.
+
+### Checkpoint-index build settings
+
+`[engine.checkpoint_index_build]` controls secondary-index work during table
+checkpoints, independently of CREATE. Indexes are processed sequentially.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_input_bytes` | `"256 MiB"` | Captured sources, resident runs and extraction/sort/merge-planning workspace. |
+| `worker_scratch_bytes` | `"4 MiB"` | Scratch and pending-output quota per active or unassembled worker. |
+| `assembler_scratch_bytes` | `"12 MiB"` | Shared planning, assembly, retained fences and bookkeeping. |
+| `max_workers` | Pool worker count, capped at 256 | Maximum active or unassembled workers. |
+| `max_ready_buffers` | 8 | Queued output buffers. |
+| `max_in_flight_writes` | 32 | Accepted unsettled writes. |
+
+These settings use the same upper bounds as cold-index builds. The budgets are
+independent. Output capacity is derived from the worker, queue and write limits,
+including queue storage and write bookkeeping. Resolved settings include
+`total_memory_bytes`, a conservative aggregate allowance, not another admission
+limit. The former
+checkpoint `max_scratch_bytes` setting is replaced by the three byte limits above.
+
+`checkpoint_index.*` counters report successful checkpoints; `max_*` gauges
+report the last successful checkpoint and are omitted from intervals without a
+newly completed checkpoint. Phase timings can overlap, and peak
+scratch usage counts simultaneous admitted memory across these budgets, including
+the conservative completion bookkeeping allowance and excluding duplicate
+pending-output quota charges; it is not total process memory.
 
 ### Recovery settings
 

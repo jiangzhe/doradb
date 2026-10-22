@@ -557,6 +557,19 @@ impl ColumnLeafEntry {
     }
 }
 
+/// Owned metadata and the first resolved ordinal for one deletion checkpoint block.
+/// No readonly page guard survives the lookup.
+pub(crate) struct ColumnDeletionContext {
+    /// Persisted entry owning the selected physical rows.
+    pub(crate) entry: ColumnLeafEntry,
+    /// Compact physical identity, including durably deleted rows.
+    pub(crate) identity: EncodedRowSet,
+    /// Existing durable deletion membership.
+    pub(crate) deletions: OrdinalDeletionSet,
+    /// Physical ordinal of the RowID used to locate this block.
+    pub(crate) ordinal: u16,
+}
+
 /// Scan-ready metadata decoded while its owning column-index leaf is resident.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColumnBlockScanEntry {
@@ -887,23 +900,6 @@ impl LogicalLeafEntry {
             delete_set,
             block_binding_value,
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedLeafPatch {
-    start_row_id: RowID,
-    delete_set: OrdinalDeletionSet,
-}
-
-impl ResolvedLeafPatch {
-    #[inline]
-    fn start_row_id(&self) -> RowID {
-        self.start_row_id
-    }
-
-    fn apply(&self, entry: &mut LogicalLeafEntry) {
-        entry.delete_set = self.delete_set.clone();
     }
 }
 
@@ -1491,11 +1487,38 @@ impl<'a> ColumnBlockIndex<'a> {
             })
     }
 
-    /// Finds the persisted leaf entry whose coverage contains `row_id`.
+    /// Finds the persisted leaf entry containing the physical `row_id`.
+    #[cfg(test)]
     pub(crate) async fn locate_block(
         &self,
         row_id: RowID,
     ) -> RuntimeOrFatalResult<Option<ColumnLeafEntry>> {
+        self.locate_row_with(row_id, |block_id, view, _| build_leaf_entry(block_id, view))
+            .await
+    }
+
+    /// Resolves a selected row and copies its block metadata during one tree descent.
+    pub(crate) async fn locate_deletion_context(
+        &self,
+        row_id: RowID,
+    ) -> RuntimeOrFatalResult<Option<ColumnDeletionContext>> {
+        self.locate_row_with(row_id, |block_id, view, ordinal| {
+            let identity = row_set_in_view(view);
+            Ok(ColumnDeletionContext {
+                entry: build_leaf_entry(block_id, view)?,
+                identity: identity.to_owned(),
+                deletions: deletions_in_view(view, identity.row_count()).to_owned(),
+                ordinal,
+            })
+        })
+        .await
+    }
+
+    async fn locate_row_with<T>(
+        &self,
+        row_id: RowID,
+        resolve: impl FnOnce(BlockID, &LeafEntryView<'_>, u16) -> DataIntegrityResult<T>,
+    ) -> RuntimeOrFatalResult<Option<T>> {
         if self.root_block_id == SUPER_BLOCK_ID || row_id >= self.end_row_id {
             return Ok(None);
         }
@@ -1518,15 +1541,15 @@ impl<'a> ColumnBlockIndex<'a> {
                     .node_result(block_id, node.leaf_entry_view(idx))
                     .change_context(RuntimeError::IndexAccess)
                     .attach_with(|| format!("operation=locate_column_block, row_id={row_id}"))?;
-                if !self
-                    .node_result(block_id, entry_contains_row_id(&view, row_id))
+                let Some(ordinal) = self
+                    .node_result(block_id, resolve_row_idx_in_view(&view, row_id))
                     .change_context(RuntimeError::IndexAccess)
                     .attach_with(|| format!("operation=locate_column_block, row_id={row_id}"))?
-                {
+                else {
                     return Ok(None);
-                }
+                };
                 return Ok(Some(
-                    self.node_result(block_id, build_leaf_entry(block_id, &view))
+                    self.node_result(block_id, resolve(block_id, &view, ordinal as u16))
                         .change_context(RuntimeError::IndexAccess)
                         .attach_with(|| {
                             format!("operation=locate_column_block, row_id={row_id}")
@@ -1610,62 +1633,6 @@ impl<'a> ColumnBlockIndex<'a> {
         let identity = row_set_in_view(&view);
         let deletions = deletions_in_view(&view, identity.row_count());
         Ok((identity.to_owned(), deletions.to_owned()))
-    }
-
-    async fn load_rewrite_context(
-        &self,
-        start_row_id: RowID,
-    ) -> RuntimeOrFatalResult<LogicalRowSet> {
-        assert_ne!(
-            self.root_block_id, SUPER_BLOCK_ID,
-            "column block-index invariant violated: rewrite context requested from empty root, start_row_id={start_row_id}"
-        );
-        let mut block_id = self.root_block_id;
-        loop {
-            let node = self.read_node(block_id).await?;
-            if node.is_leaf() {
-                let prefixes = self
-                    .node_result(block_id, node.leaf_prefix_plane())
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                        )
-                    })?;
-                let idx = prefixes
-                    .search_exact(start_row_id)
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                        )
-                    })?;
-                let view = self
-                    .node_result(block_id, node.leaf_entry_view(idx))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                        )
-                    })?;
-                let row_set = self
-                    .node_result(block_id, decode_logical_row_set(&view))
-                    .change_context(RuntimeError::IndexAccess)
-                    .attach_with(|| {
-                        format!(
-                            "operation=load_column_rewrite_context, start_row_id={start_row_id}"
-                        )
-                    })?;
-                return Ok(row_set);
-            }
-            let entries = node.branch_entries();
-            let idx = search_branch_entry(entries, start_row_id).unwrap_or_else(|| {
-                panic!(
-                    "column block-index invariant violated: branch cannot route start_row_id={start_row_id}, block_id={block_id}"
-                )
-            });
-            block_id = entries[idx].block_id();
-        }
     }
 
     /// Collects all leaf entries in ascending `start_row_id` order.
@@ -1968,30 +1935,15 @@ impl<'a> ColumnBlockIndex<'a> {
             patches.len()
         );
 
-        let mut resolved = Vec::with_capacity(patches.len());
-        for patch in patches {
-            let row_set = self.load_rewrite_context(patch.start_row_id).await?;
-            assert_eq!(
-                usize::from(patch.deletions.row_count()),
-                row_set.row_count(),
-                "column deletion replacement physical count: start_row_id={}",
-                patch.start_row_id
-            );
-            resolved.push(ResolvedLeafPatch {
-                start_row_id: patch.start_row_id,
-                delete_set: patch.deletions.clone(),
-            });
-        }
-
         let root_height = self
             .read_node(self.root_block_id)
             .await?
             .header_ref()
             .height();
         let res = self
-            .rewrite_subtree_with_patches(mutable_file, self.root_block_id, &resolved, create_ts)
+            .rewrite_subtree_with_patches(mutable_file, self.root_block_id, patches, create_ts)
             .await?;
-        // Every validated patch resolves through this root before rewriting,
+        // Each patch is checked against its owning leaf during rewriting,
         // so a non-empty patch set must touch at least one descendant leaf.
         assert!(
             res.touched,
@@ -2049,7 +2001,7 @@ impl<'a> ColumnBlockIndex<'a> {
         &'b self,
         mutable_file: &'b mut M,
         block_id: BlockID,
-        patches: &'b [ResolvedLeafPatch],
+        patches: &'b [ColumnDeletionPatch<'b>],
         create_ts: TrxID,
     ) -> Pin<Box<dyn Future<Output = RuntimeOrFatalResult<NodeRewriteResult>> + Send + 'b>> {
         Box::pin(async move {
@@ -2075,23 +2027,28 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         block_id: BlockID,
         node: &ValidatedColumnBlockNode,
-        patches: &[ResolvedLeafPatch],
+        patches: &[ColumnDeletionPatch<'_>],
         create_ts: TrxID,
     ) -> RuntimeOrFatalResult<NodeRewriteResult> {
         let mut entries = self.decode_logical_leaf_entries(node, block_id)?;
-        let start_row_ids: Vec<RowID> = entries.iter().map(|entry| entry.start_row_id).collect();
         for patch in patches {
-            let idx = start_row_ids
-                .binary_search(&patch.start_row_id())
+            let idx = entries
+                .binary_search_by_key(&patch.start_row_id, |entry| entry.start_row_id)
                 .unwrap_or_else(|_| {
                     panic!(
                         "column block-index invariant violated: patch missed leaf, block_id={block_id}, start_row_id={}",
-                        patch.start_row_id()
+                        patch.start_row_id
                     )
                 });
-            let mut replacement = entries[idx].clone();
-            patch.apply(&mut replacement);
-            entries[idx] = replacement;
+            // Patches are internal sorted replacements, but must still match
+            // the physical universe of the exact entry reached by this root.
+            assert_eq!(
+                usize::from(patch.deletions.row_count()),
+                entries[idx].row_set.row_count(),
+                "column deletion replacement physical count: start_row_id={}",
+                patch.start_row_id
+            );
+            entries[idx].delete_set = patch.deletions.clone();
         }
         let new_entries = self
             .write_leaf_pages_from_logical_entries(mutable_file, &entries, create_ts)
@@ -2107,7 +2064,7 @@ impl<'a> ColumnBlockIndex<'a> {
         mutable_file: &mut M,
         _block_id: BlockID,
         node: &ValidatedColumnBlockNode,
-        patches: &[ResolvedLeafPatch],
+        patches: &[ColumnDeletionPatch<'_>],
         create_ts: TrxID,
     ) -> RuntimeOrFatalResult<NodeRewriteResult> {
         let old_entries = node.branch_entries();
@@ -2120,7 +2077,7 @@ impl<'a> ColumnBlockIndex<'a> {
                 .map(|next| next.start_row_id())
                 .unwrap_or(RowID::MAX);
             let start_idx = patch_idx;
-            while patch_idx < patches.len() && patches[patch_idx].start_row_id() < next_start {
+            while patch_idx < patches.len() && patches[patch_idx].start_row_id < next_start {
                 patch_idx += 1;
             }
             if start_idx == patch_idx {
@@ -2708,11 +2665,6 @@ fn validate_leaf_prefixes(prefixes: &LeafPrefixPlane<'_>, data: &[u8]) -> DataIn
         return Err(invalid_node_payload());
     }
     Ok(())
-}
-
-#[inline]
-fn entry_contains_row_id(view: &LeafEntryView<'_>, row_id: RowID) -> DataIntegrityResult<bool> {
-    Ok(resolve_row_idx_in_view(view, row_id)?.is_some())
 }
 
 #[inline]
@@ -4618,6 +4570,36 @@ pub(super) mod tests {
                 disk_pool.global_pool(),
                 &disk_pool_guard,
             );
+            #[cfg(feature = "profiling")]
+            let reads = AtomicUsize::new(0);
+            #[cfg(feature = "profiling")]
+            let index = index.with_logical_read_counter(&reads);
+            for id in 0..=20 {
+                #[cfg(feature = "profiling")]
+                reads.store(0, Ordering::Relaxed);
+                let context = index.locate_deletion_context(RowID::new(id)).await.unwrap();
+                let expected = match id {
+                    0..=3 => Some((0, id as u16, vec![0, 1, 2, 3])),
+                    12 => Some((10, 0, vec![2, 5, 8])),
+                    15 => Some((10, 1, vec![2, 5, 8])),
+                    18 => Some((10, 2, vec![2, 5, 8])),
+                    _ => None,
+                };
+                if let Some((start, ordinal, deltas)) = expected {
+                    let context = context.unwrap();
+                    assert_eq!(context.entry.start_row_id, RowID::new(start));
+                    assert_eq!(context.ordinal, ordinal);
+                    assert_eq!(
+                        context.identity.as_ref().iter_deltas().collect::<Vec<_>>(),
+                        deltas
+                    );
+                    assert!(context.deletions.is_empty());
+                } else {
+                    assert!(context.is_none(), "gap {id} resolved");
+                }
+                #[cfg(feature = "profiling")]
+                assert_eq!(reads.load(Ordering::Relaxed), usize::from(id < 20));
+            }
             let dense_entry = index.locate_block(RowID::new(2)).await.unwrap().unwrap();
             let dense_resolved = index
                 .locate_and_resolve_row(RowID::new(2))
@@ -4719,24 +4701,35 @@ pub(super) mod tests {
                 disk_pool.global_pool().clone(),
                 disk_pool_guard.clone(),
             );
-            let root_v2 = ColumnBlockIndex::new(
+            #[cfg(feature = "profiling")]
+            let reads = AtomicUsize::new(0);
+            let rewrite = ColumnBlockIndex::new(
                 root_v1,
                 RowID::new(8),
                 disk_pool.file_kind(),
                 disk_pool.sparse_file(),
                 disk_pool.global_pool(),
                 &disk_pool_guard,
-            )
-            .batch_replace_deletions(
-                &mut mutable,
-                &[ColumnDeletionPatch {
-                    start_row_id: RowID::new(0),
-                    deletions: &OrdinalDeletionSet::from_ordinals(8, &[1, 3, 6]).unwrap(),
-                }],
-                TrxID::new(3),
-            )
-            .await
-            .unwrap();
+            );
+            #[cfg(feature = "profiling")]
+            let rewrite = rewrite.with_logical_read_counter(&reads);
+            let root_v2 = rewrite
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: RowID::new(0),
+                        deletions: &OrdinalDeletionSet::from_ordinals(8, &[1, 3, 6]).unwrap(),
+                    }],
+                    TrxID::new(3),
+                )
+                .await
+                .unwrap();
+            #[cfg(feature = "profiling")]
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                2,
+                "height read plus rewrite, without a patch preflight"
+            );
             let (_table, _old_root) = mutable.commit(TrxID::new(3), false).await.unwrap();
 
             let index = ColumnBlockIndex::new(
@@ -4751,6 +4744,14 @@ pub(super) mod tests {
             assert_eq!(entry.block_id(), 1001);
             assert_eq!(entry.row_count(), 8);
             assert_eq!(entry.del_count(), 3);
+            let context = index
+                .locate_deletion_context(RowID::new(3))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.ordinal, 3);
+            assert_eq!(context.identity.row_count(), 8);
+            assert_eq!(context.deletions.iter().collect::<Vec<_>>(), [1, 3, 6]);
             let (_, deletions) = index
                 .load_entry_identity_and_deletions(&entry)
                 .await

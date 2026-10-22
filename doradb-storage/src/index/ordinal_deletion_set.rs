@@ -1,7 +1,6 @@
 //! Compact durable deletion membership in physical LWC ordinals.
 
 use crate::error::{DataIntegrityError, DataIntegrityResult, ResourceResult};
-use crate::id::RowID;
 use crate::index::identity_set::{EncodedIdentitySet, IdentitySetRef};
 use crate::lwc::MAX_LWC_ROWS;
 use error_stack::Report;
@@ -27,16 +26,13 @@ impl OrdinalDeletionSet {
     }
 
     /// Encodes sorted unique physical ordinals, retaining the whole-bitmap bound.
+    #[inline]
     pub(crate) fn from_ordinals(row_count: u16, ordinals: &[u16]) -> ResourceResult<Self> {
         let mut result = Self::empty(row_count);
         if !ordinals.is_empty() {
-            // The generic integer codec accepts RowIDs; this adaptation stays private.
-            let rows: Vec<_> = ordinals.iter().map(|n| RowID::new(u64::from(*n))).collect();
-            result.encoded = Some(EncodedIdentitySet::plan(
-                RowID::new(0),
-                RowID::new(u64::from(row_count)),
-                &rows,
-                &[],
+            result.encoded = Some(EncodedIdentitySet::plan_ordinals(
+                row_count,
+                ordinals,
                 deletion_body_bound(usize::from(row_count)),
             )?);
         }
@@ -141,6 +137,7 @@ impl<'a> OrdinalDeletionSetRef<'a> {
     }
 
     /// Tests physical ordinal membership without allocating or decoding a list.
+    #[inline]
     pub(crate) fn contains(self, ordinal: u16) -> bool {
         self.encoded
             .is_some_and(|set| set.ordinal_for_delta(u32::from(ordinal)).is_some())
@@ -172,6 +169,7 @@ pub(crate) const fn deletion_body_bound(row_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::RowID;
 
     fn assert_set(row_count: u16, ordinals: &[u16]) {
         let set = OrdinalDeletionSet::from_ordinals(row_count, ordinals).unwrap();
@@ -183,6 +181,24 @@ mod tests {
         let clone = set.clone();
         assert_eq!(clone.body().as_ptr(), set.body().as_ptr());
         let view = if let Some(codec) = set.codec() {
+            let rows: Vec<_> = ordinals
+                .iter()
+                .map(|&ordinal| RowID::new(u64::from(ordinal)))
+                .collect();
+            let reference = EncodedIdentitySet::plan(
+                RowID::new(0),
+                RowID::new(u64::from(row_count)),
+                &rows,
+                &[],
+                deletion_body_bound(usize::from(row_count)),
+            )
+            .unwrap();
+            assert_eq!(codec, reference.codec());
+            assert_eq!(
+                set.body(),
+                reference.body(),
+                "direct ordinal bytes differ from RowID encoding"
+            );
             OrdinalDeletionSetRef::validate(row_count, ordinals.len() as u16, codec, set.body())
                 .unwrap()
         } else {
@@ -206,7 +222,7 @@ mod tests {
     }
 
     /// Purpose: Protect empty, dense, sparse, run, bitmap, and missing ordinal deletion shapes.
-    /// Expected: Owned and validated borrowed membership and iteration match independent sorted ordinal lists.
+    /// Expected: Direct ordinal bytes match RowID encoding; owned and validated borrowed membership and iteration match independent sorted lists.
     #[test]
     fn ordinal_deletion_shapes_match_oracle() {
         for count in [1, 2, 63, 64, 65, 255, 256, 257, MAX_LWC_ROWS as u16] {

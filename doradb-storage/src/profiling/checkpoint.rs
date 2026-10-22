@@ -11,6 +11,101 @@ use crate::io::DirectBuf;
 use crate::obs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Outcomes, work, phase durations and resource peaks of successful table checkpoints.
+/// Durations may overlap; the total also includes work outside secondary indexes.
+/// Failure or cancellation publishes none of the owning checkpoint sample.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointIndexMeasurements {
+    /// Successfully published public table checkpoints.
+    pub completed_checkpoints: u64,
+    /// Indexes proven to require no physical change.
+    pub no_work: u64,
+    /// Indexes selected for full reconstruction.
+    pub reconstruct: u64,
+    /// Indexes selected for subtree reuse.
+    pub partial: u64,
+    /// Captured put entries before complete-key reduction.
+    pub put_entries: u64,
+    /// Captured conditional or exact deletes before reduction.
+    pub delete_entries: u64,
+    /// Logical old-node reads, including cache hits and fence repair.
+    pub base_nodes_read: u64,
+    /// Whole old subtrees retained by range traversal.
+    pub reused_subtrees: u64,
+    /// Successfully settled replacement node writes.
+    pub written_nodes: u64,
+    /// Cold-delete selection, identity resolution and column-index rewrite wall time.
+    pub deletion_checkpoint_nanos: u64,
+    /// Per-index extraction wall time.
+    pub extraction_nanos: u64,
+    /// Bounded strategy selection wall time.
+    pub probe_nanos: u64,
+    /// Partition planning, reconciliation, assembly and output settlement wall time.
+    pub reconcile_nanos: u64,
+    /// Existing allocation reachability validation wall time.
+    pub reachability_nanos: u64,
+    /// Final root and system-redo publication wall time.
+    pub publication_nanos: u64,
+    /// Successful public checkpoint attempt wall time.
+    pub total_nanos: u64,
+    /// Largest effective concurrent range-job bound.
+    pub max_workers: u64,
+    /// Largest invocation scratch admission, excluding pool-owned pins.
+    pub max_scratch_bytes: u64,
+}
+
+impl CheckpointIndexMeasurements {
+    /// Accumulate a completed checkpoint without subtracting lifetime peaks.
+    pub(crate) fn record(&mut self, sample: &Self) {
+        self.completed_checkpoints += sample.completed_checkpoints;
+        self.no_work += sample.no_work;
+        self.reconstruct += sample.reconstruct;
+        self.partial += sample.partial;
+        self.put_entries += sample.put_entries;
+        self.delete_entries += sample.delete_entries;
+        self.base_nodes_read += sample.base_nodes_read;
+        self.reused_subtrees += sample.reused_subtrees;
+        self.written_nodes += sample.written_nodes;
+        self.deletion_checkpoint_nanos += sample.deletion_checkpoint_nanos;
+        self.extraction_nanos += sample.extraction_nanos;
+        self.probe_nanos += sample.probe_nanos;
+        self.reconcile_nanos += sample.reconcile_nanos;
+        self.reachability_nanos += sample.reachability_nanos;
+        self.publication_nanos += sample.publication_nanos;
+        self.total_nanos += sample.total_nanos;
+        self.max_workers = self.max_workers.max(sample.max_workers);
+        self.max_scratch_bytes = self.max_scratch_bytes.max(sample.max_scratch_bytes);
+    }
+
+    pub(super) fn metrics(&self) -> [(&'static str, u64, bool); 18] {
+        [
+            ("completed_checkpoints", self.completed_checkpoints, false),
+            ("no_work", self.no_work, false),
+            ("reconstruct", self.reconstruct, false),
+            ("partial", self.partial, false),
+            ("put_entries", self.put_entries, false),
+            ("delete_entries", self.delete_entries, false),
+            ("base_nodes_read", self.base_nodes_read, false),
+            ("reused_subtrees", self.reused_subtrees, false),
+            ("written_nodes", self.written_nodes, false),
+            (
+                "deletion_checkpoint_nanos",
+                self.deletion_checkpoint_nanos,
+                false,
+            ),
+            ("extraction_nanos", self.extraction_nanos, false),
+            ("probe_nanos", self.probe_nanos, false),
+            ("reconcile_nanos", self.reconcile_nanos, false),
+            ("reachability_nanos", self.reachability_nanos, false),
+            ("publication_nanos", self.publication_nanos, false),
+            ("total_nanos", self.total_nanos, false),
+            ("max_workers", self.max_workers, true),
+            ("max_scratch_bytes", self.max_scratch_bytes, true),
+        ]
+    }
+}
+
 /// Successful catalog checkpoint measurement returned by the public operation.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(deny_unknown_fields)]

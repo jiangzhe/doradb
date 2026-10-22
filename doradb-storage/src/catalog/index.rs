@@ -449,7 +449,7 @@ enum CreateIndexBuildPhase {
 
 struct CreateColdPreparation {
     file: MutableTableFile,
-    admission: DiskBuildAdmission,
+    admission: Arc<DiskBuildAdmission>,
 }
 
 // Preparation and accepted extraction remain owned across borrowed awaits.
@@ -471,7 +471,7 @@ impl CreateColdProgress {
         Self::NotStarted
     }
 
-    fn start(&mut self, file: MutableTableFile, admission: DiskBuildAdmission) {
+    fn start(&mut self, file: MutableTableFile, admission: Arc<DiskBuildAdmission>) {
         assert!(
             matches!(self, Self::NotStarted),
             "CREATE cold preparation requires a fresh lifecycle owner"
@@ -525,6 +525,8 @@ impl CreateColdProgress {
             unreachable!("validated CREATE cold construction handoff")
         };
         let CreateColdPreparation { file, admission } = *preparation;
+        // Extraction has settled; release its worker scratch before reserving packing.
+        drop(sort);
         let build = DiskBulkBuild::from_runs(
             file,
             runs,
@@ -533,12 +535,9 @@ impl CreateColdProgress {
             engine.poisoner.clone(),
             ts,
         )?;
-        // Preserve source admission during construction of the disk owner, then
-        // release the source plan and ledgers before any durable build work.
         let mut disk = ColdBuildProgress::default();
         disk.start(build);
         *self = Self::Disk(disk);
-        drop(sort);
         let Self::Disk(ColdBuildProgress::Building(build)) = self else {
             unreachable!("CREATE cold construction retains its disk lifecycle")
         };
@@ -656,15 +655,13 @@ impl CreateIndexProgress {
         let admission =
             DiskBuildAdmission::new(engine.cold_build_policy, plan.new_index_spec().unique())?;
         #[cfg(test)]
-        engine
-            .index_ddl_test
-            .configure_cold_budget(&admission.budget);
+        engine.index_ddl_test.configure_cold_budget(&admission);
         let source = Arc::new(ColdBuildSource::capture(
             plan,
             guards.clone(),
             gates,
             self.build_ts(),
-            admission.budget.clone(),
+            admission.clone(),
         ));
         self.cold.start(
             MutableTableFile::fork(
@@ -2173,8 +2170,9 @@ pub(crate) mod tests {
     use crate::file::cow_file::tests::old_root_drop_count;
     use crate::file::table_file::ActiveRoot;
     use crate::index::build::IndexBuildEntry;
+    use crate::index::build::SortedRun;
+    use crate::index::build::disk_builder::cold_budgets;
     use crate::index::build::tree_builder::panic_install_transfer;
-    use crate::index::build::{MemoryBudget, SortedRun};
     use crate::index::{BTreeKey, IndexBatchStream};
     use crate::index::{BTreeKeyEncoder, secondary_index_encoder};
     use crate::row::ops::{SelectKey, UniqueMutationOutcome, UpdateCol};
@@ -2246,7 +2244,7 @@ pub(crate) mod tests {
         release: flume::Receiver<()>,
     }
 
-    type ColdBudgetHook = Arc<dyn Fn(&MemoryBudget) + Send + Sync>;
+    type ColdBudgetHook = Arc<dyn Fn(&DiskBuildAdmission) + Send + Sync>;
 
     type ColdInputHook = Arc<dyn Fn(&Arc<SortedRun>) + Send + Sync>;
 
@@ -2287,9 +2285,9 @@ pub(crate) mod tests {
             }
         }
 
-        pub(super) fn configure_cold_budget(&self, budget: &MemoryBudget) {
+        pub(super) fn configure_cold_budget(&self, admission: &DiskBuildAdmission) {
             if let Some(hook) = self.state.cold_budget.lock().take() {
-                hook(budget);
+                hook(admission);
             }
         }
 
@@ -3588,14 +3586,14 @@ pub(crate) mod tests {
                 let mut progress = CreateIndexProgress::new(table_id, plan.index(), trx);
                 let snapshot = index_ddl_snapshot(&engine, table_id, &table);
                 let admission = DiskBuildAdmission::new(core.cold_build_policy, false).unwrap();
-                let budget = admission.budget.clone();
+                let budget = admission.input.clone();
                 let reserved = budget.used();
                 let source = Arc::new(ColdBuildSource::capture(
                     &plan,
                     guards.clone(),
                     gates,
                     progress.build_ts(),
-                    budget.clone(),
+                    admission.clone(),
                 ));
                 let source_owner = Arc::downgrade(&source);
                 progress.cold.start(
@@ -4898,9 +4896,9 @@ pub(crate) mod tests {
             let captured = Arc::new(parking_lot::Mutex::new(None));
             let inspect = captured.clone();
             *engine.inner().index_ddl_test.state.cold_budget.lock() =
-                Some(Arc::new(move |budget| {
-                    *inspect.lock() = Some(budget.clone());
-                    fail_build_budget(budget, "cross-tier readers and jobs");
+                Some(Arc::new(move |admission| {
+                    *inspect.lock() = Some(admission.assembler.clone());
+                    fail_build_budget(&admission.assembler, "cross-tier readers and jobs");
                 }));
             let spec = StorageIndexSpec::new(
                 vec![StorageIndexKey::new(1), StorageIndexKey::new(0)],
@@ -4952,9 +4950,12 @@ pub(crate) mod tests {
                 let captured = Arc::new(parking_lot::Mutex::new(None));
                 let inspect = captured.clone();
                 *engine.inner().index_ddl_test.state.cold_budget.lock() =
-                    Some(Arc::new(move |budget| {
-                        *inspect.lock() = Some(budget.clone());
-                        fail_build_budget_after(budget, purpose, successful);
+                    Some(Arc::new(move |admission| {
+                        let budgets = cold_budgets(admission);
+                        for budget in &budgets {
+                            fail_build_budget_after(budget, purpose, successful);
+                        }
+                        *inspect.lock() = Some(budgets);
                     }));
                 let error = session
                     .create_index(
@@ -4970,7 +4971,15 @@ pub(crate) mod tests {
                     error.report().contains::<crate::error::ResourceError>(),
                     "{purpose}: {error:?}"
                 );
-                assert_eq!(captured.lock().as_ref().unwrap().used(), 0, "{purpose}");
+                assert!(
+                    captured
+                        .lock()
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .all(|budget| budget.used() == 0),
+                    "{purpose}"
+                );
                 assert_index_ddl_snapshot_unchanged(&before, &engine, table_id, &table);
             }
             let id = session
@@ -5907,12 +5916,11 @@ pub(crate) mod tests {
             let (purge_tx, purge_rx) = flume::unbounded();
             engine.inner().trx_sys.set_purge_test_observer(purge_tx);
             engine.inner().trx_sys.request_retired_index_runtime_retry();
-            let mut cleanup_started = false;
-            loop {
-                match purge_rx.recv_async().await.unwrap() {
-                    PurgeTestEvent::RetiredIndexRuntimeStarted => cleanup_started = true,
-                    PurgeTestEvent::CycleCompleted if cleanup_started => break,
-                    _ => {}
+            // A cycle may finish while another cleanup attempt still owns the
+            // candidate. Observe removal itself before testing durable retirement.
+            while table.has_retired_secondary_indexes() {
+                if purge_rx.recv_async().await.unwrap() == PurgeTestEvent::CycleCompleted {
+                    engine.inner().trx_sys.request_retired_index_runtime_retry();
                 }
             }
             assert!(!table.has_retired_secondary_indexes());

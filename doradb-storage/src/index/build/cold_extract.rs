@@ -1,7 +1,9 @@
 //! Bounded cold jobs whose accepted completions survive cancellation of execution borrows.
 use super::cold_source::{ColdBuildSource, ColdWorkspace};
+use super::local_sort::LocalSortJobs;
 use super::merge::execution_error;
 use super::{BudgetedVec, BuildOutcome, SortedRun, SortedRuns};
+#[cfg(feature = "profiling")]
 use crate::completion::Completion;
 use crate::error::{
     MultiDomainResultExt, QuadError, QuadResult, RuntimeError, RuntimeOrFatalError,
@@ -55,19 +57,15 @@ struct ColdResult {
     profile: WorkerProfile,
 }
 
-type ColdCompletion = Arc<Completion<QuadResult<BuildOutcome<ColdResult>>>>;
-
 /// Retains every accepted extraction result until exact coverage or settled failure.
 pub(crate) struct ColdLocalSort {
     plan: Arc<ColdSourcePlan>,
     pool: QuiescentGuard<ThreadPool>,
     workers: usize,
     workspaces: BudgetedVec<Option<ColdWorkspace>>,
-    jobs: BudgetedVec<Option<ColdCompletion>>,
+    jobs: LocalSortJobs<QuadResult<BuildOutcome<ColdResult>>>,
     runs: BudgetedVec<Arc<SortedRun>>,
     stop: Arc<AtomicBool>,
-    submitted: usize,
-    collected: usize,
     failure: Option<QuadError>,
     finished: bool,
     #[cfg(feature = "profiling")]
@@ -91,23 +89,13 @@ impl ColdLocalSort {
         let started = Instant::now();
         #[cfg(feature = "profiling")]
         let configured_workers = workers;
-        let mut workspaces = BudgetedVec::new(&source.budget);
-        // A failed additional minimum workspace lowers W before P and the cuts
-        // are fixed. Resident input growth never waits for another run to retire.
+        let mut workspaces = BudgetedVec::new(&source.admission.assembler);
         if !source.is_empty() {
-            for _ in 0..workers {
-                if let Err(error) = workspaces.reserve_one("cold workspace owners") {
-                    if workspaces.is_empty() {
-                        return Err(error.change_context(RuntimeError::IndexAccess).into());
-                    }
-                    break;
-                }
-                match source.workspace() {
-                    Ok(workspace) => workspaces.push_reserved(Some(workspace)),
-                    Err(error) if workspaces.is_empty() => return Err(error),
-                    Err(QuadError::Runtime(_)) => break,
-                    Err(error) => return Err(error),
-                }
+            for slot in 0..workers {
+                workspaces
+                    .reserve_one("cold workspace owners")
+                    .change_context(RuntimeError::IndexAccess)?;
+                workspaces.push_reserved(Some(source.workspace(slot)?));
             }
         }
         let workers = workspaces.len().max(1);
@@ -118,7 +106,7 @@ impl ColdLocalSort {
         })?;
         let ranges = source
             .column_index()
-            .plan_build_ranges(requested, &source.budget)
+            .plan_build_ranges(requested, &source.admission.input)
             .await?;
         assert!(
             ranges.partitions.len() <= ranges.entries
@@ -127,17 +115,18 @@ impl ColdLocalSort {
             ranges.height,
             ranges.entries
         );
-        let mut jobs = BudgetedVec::new(&source.budget);
-        jobs.ensure_capacity(ranges.partitions.len(), "cold completion ledger")
-            .change_context(RuntimeError::IndexAccess)?;
-        for _ in &*ranges.partitions {
-            jobs.push_reserved(None);
-        }
-        let mut runs = BudgetedVec::new(&source.budget);
+        let jobs = LocalSortJobs::new(
+            &source.admission.assembler,
+            ranges.partitions.len(),
+            workers,
+            "cold completion ledger",
+        )
+        .change_context(RuntimeError::IndexAccess)?;
+        let mut runs = BudgetedVec::new(&source.admission.input);
         runs.ensure_capacity(ranges.partitions.len(), "cold run owners")
             .change_context(RuntimeError::IndexAccess)?;
         #[cfg(feature = "profiling")]
-        let mut samples = BudgetedVec::new(&source.budget);
+        let mut samples = BudgetedVec::new(&source.admission.assembler);
         #[cfg(feature = "profiling")]
         samples
             .ensure_capacity(ranges.partitions.len(), "cold profiling ledger")
@@ -164,8 +153,6 @@ impl ColdLocalSort {
             jobs,
             runs,
             stop: Arc::new(AtomicBool::new(false)),
-            submitted: 0,
-            collected: 0,
             failure: None,
             finished: false,
         })
@@ -174,25 +161,21 @@ impl ColdLocalSort {
     /// Extract complete resident runs; every empty range still requires a terminal certificate.
     pub(crate) async fn execute(&mut self) -> QuadResult<SortedRuns> {
         assert!(!self.finished, "cold extraction reused after settlement");
-        while self.collected < self.jobs.len() && self.failure.is_none() {
-            while self.submitted < self.jobs.len()
-                && self.submitted - self.collected < self.workers
-                && !self.stop.load(Ordering::Acquire)
-            {
-                let partition = self.submitted;
+        while self.jobs.collected < self.jobs.len() && self.failure.is_none() {
+            while self.jobs.can_submit() && !self.stop.load(Ordering::Acquire) {
+                let partition = self.jobs.submitted;
                 let plan = self.plan.clone();
                 let stop = self.stop.clone();
                 let workspace = self.workspaces[partition % self.workers]
                     .take()
                     .unwrap_or_else(|| unreachable!("cold worker slot released before reuse"));
-                self.jobs[partition] = Some(self.pool.submit_async(async move {
+                self.jobs.submit(&self.pool, async move {
                     let result = extract(plan, stop.clone(), partition, workspace).await;
                     if result.is_err() {
                         stop.store(true, Ordering::Release);
                     }
                     result
-                }));
-                self.submitted += 1;
+                });
             }
             if self.stop.load(Ordering::Acquire) {
                 break;
@@ -206,10 +189,13 @@ impl ColdLocalSort {
             }));
         }
         self.finished = true;
-        let runs = replace(&mut self.runs, BudgetedVec::new(&self.plan.source.budget));
+        let runs = replace(
+            &mut self.runs,
+            BudgetedVec::new(&self.plan.source.admission.input),
+        );
         Ok(SortedRuns::from_admitted(
             runs,
-            self.plan.source.budget.clone(),
+            self.plan.source.admission.input.clone(),
             self.plan.source.duplicates(),
         ))
     }
@@ -305,7 +291,7 @@ impl ColdLocalSort {
 
     async fn drain(&mut self) {
         self.stop.store(true, Ordering::Release);
-        while self.collected < self.submitted {
+        while self.jobs.collected < self.jobs.submitted {
             self.collect_next().await;
         }
         self.runs.clear();
@@ -313,13 +299,8 @@ impl ColdLocalSort {
     }
 
     async fn collect_next(&mut self) {
-        let id = self.collected;
-        let completion = self.jobs[id]
-            .as_ref()
-            .unwrap_or_else(|| unreachable!("accepted cold job owns a ledger slot"));
-        let result = completion.wait_take_result().await;
-        self.jobs[id] = None;
-        self.collected += 1;
+        let id = self.jobs.collected;
+        let result = self.jobs.collect().await;
         let result = result.map_err(|bridge| bridge.into_quad(RuntimeError::IndexAccess))
             .and_then(|result| result)
             .attach_with(|| format!("operation=create_index, phase=cold_extract, table_id={}, partition={id}, range={:?}, build_ts={}", self.plan.source.table.table_id(), self.plan.ranges.partitions[id].range, self.plan.source.build_ts));
@@ -429,13 +410,9 @@ async fn extract(
     }
     #[cfg(feature = "profiling")]
     let sort_started = Instant::now();
-    let BuildOutcome::Complete(run) = SortedRun::finish_group(
-        entries.entries,
-        entries.payload,
-        plan.source.duplicates(),
-        id,
-        &stop,
-    ) else {
+    let BuildOutcome::Complete(run) =
+        SortedRun::finish_group(entries, plan.source.duplicates(), id, &stop)
+    else {
         return Ok(BuildOutcome::Stopped);
     };
     let run = Arc::new(run);
@@ -478,9 +455,12 @@ pub(super) mod tests {
     use crate::Engine;
     use crate::catalog::index::IndexDdlGateScope;
     use crate::catalog::{StorageIndexFlags, StorageIndexKey, StorageIndexSpec, tests::table2};
+    use crate::completion::Completion;
+    use crate::conf::ColdIndexBuildConfig;
     use crate::error::{DataIntegrityError, OperationError};
     use crate::id::{RowID, TrxID};
-    use crate::index::build::{MemoryBudget, fail_build_budget_after};
+    use crate::index::build::disk_builder::{ColdBuildPolicy, DiskBuildAdmission, cold_budgets};
+    use crate::index::build::{MemoryBudget, fail_build_budget, payload_accounting};
     use crate::index::secondary_index_encoder;
     use crate::runtime::yield_now;
     use crate::session::tests::{SessionTestExt, assert_checkpoint_published};
@@ -612,7 +592,15 @@ pub(super) mod tests {
                 session.pool_guards(),
                 gates,
                 TrxID::new(1000),
-                MemoryBudget::new(16 * 1024 * 1024),
+                DiskBuildAdmission::new(
+                    ColdBuildPolicy::new(
+                        ColdIndexBuildConfig::default().max_input_bytes(16 * 1024 * 1024),
+                        2,
+                    )
+                    .unwrap(),
+                    unique,
+                )
+                .unwrap(),
             ));
             drop(session);
             Self {
@@ -620,6 +608,12 @@ pub(super) mod tests {
                 expected,
                 engine,
                 _temp: temp,
+            }
+        }
+
+        fn assert_released(&self) {
+            for (component, budget) in cold_budgets(&self.source.admission).iter().enumerate() {
+                assert_eq!(budget.used(), 0, "cold component {component}");
             }
         }
 
@@ -686,13 +680,13 @@ pub(super) mod tests {
                         let (entered, release) = fixture.source.test.gate(0, Fault::None);
                         assert!(sort.execute().now_or_never().is_none());
                         entered.recv_async().await.unwrap();
-                        assert_eq!((sort.submitted, sort.collected), (1, 0));
+                        assert_eq!((sort.jobs.submitted, sort.jobs.collected), (1, 0));
                         release.send(()).unwrap();
                     }
                     let runs = sort.execute().await.unwrap();
                     assert_eq!(runs.runs().len(), groups as usize);
                     assert_eq!(contents(&runs), fixture.expected);
-                    assert_eq!(sort.collected, sort.jobs.len());
+                    assert_eq!(sort.jobs.collected, sort.jobs.len());
                     #[cfg(feature = "profiling")]
                     {
                         let profile = sort.measurements();
@@ -705,7 +699,7 @@ pub(super) mod tests {
                     }
                     drop(runs);
                     drop(sort);
-                    assert_eq!(fixture.source.budget.used(), 0);
+                    fixture.assert_released();
                     fixture.source.test.0.lock().clear();
                     for (_, row_id) in &fixture.expected {
                         fixture
@@ -719,10 +713,10 @@ pub(super) mod tests {
                     let runs = sort.execute().await.unwrap();
                     assert!(runs.runs().is_empty());
                     assert_eq!(runs.duplicates, fixture.source.duplicates());
-                    assert_eq!(sort.collected, groups as usize);
+                    assert_eq!(sort.jobs.collected, groups as usize);
                     drop(runs);
                     drop(sort);
-                    assert_eq!(fixture.source.budget.used(), 0);
+                    fixture.assert_released();
                 }
             }
         });
@@ -740,7 +734,7 @@ pub(super) mod tests {
                 assert!(sort.execute().now_or_never().is_none());
                 entered.recv_async().await.unwrap();
                 assert!(sort.settle().now_or_never().is_none());
-                assert_eq!((sort.submitted, sort.collected), (1, 0));
+                assert_eq!((sort.jobs.submitted, sort.jobs.collected), (1, 0));
                 release.send(()).unwrap();
                 match (fault, sort.settle().await) {
                     (Fault::None, Ok(())) => (),
@@ -750,10 +744,10 @@ pub(super) mod tests {
                     (Fault::Panic, Err(RuntimeOrFatalError::Fatal(_))) => (),
                     (_, result) => panic!("unexpected single-worker settlement: {result:?}"),
                 }
-                assert_eq!(sort.collected, 1);
+                assert_eq!(sort.jobs.collected, 1);
                 assert!(sort.runs.is_empty());
                 drop(sort);
-                assert_eq!(fixture.source.budget.used(), 0);
+                fixture.assert_released();
             }
         });
     }
@@ -771,16 +765,16 @@ pub(super) mod tests {
                 assert!(sort.execute().now_or_never().is_none());
                 first.recv_async().await.unwrap();
                 second.recv_async().await.unwrap();
-                assert_eq!(sort.submitted, 2);
-                assert_eq!(sort.collected, 0);
+                assert_eq!(sort.jobs.submitted, 2);
+                assert_eq!(sort.jobs.collected, 0);
                 release_second.send(()).unwrap();
-                while !sort.jobs[1].as_ref().unwrap().is_completed() {
+                while !sort.jobs.slots[1].as_ref().unwrap().is_completed() {
                     yield_now().await;
                 }
-                assert!(!sort.jobs[0].as_ref().unwrap().is_completed());
+                assert!(!sort.jobs.slots[0].as_ref().unwrap().is_completed());
                 release_first.send(()).unwrap();
                 let runs = sort.execute().await.unwrap();
-                assert_eq!(sort.collected, sort.plan.ranges.partitions.len());
+                assert_eq!(sort.jobs.collected, sort.plan.ranges.partitions.len());
                 assert!(runs.runs().len() > 1);
                 assert!(
                     runs.runs()
@@ -793,7 +787,7 @@ pub(super) mod tests {
                     let profile = sort.measurements();
                     assert_eq!(profile.concurrency_peak, 2);
                     assert_eq!(profile.live_rows, 32);
-                    assert_eq!(profile.runs.len(), sort.collected);
+                    assert_eq!(profile.runs.len(), sort.jobs.collected);
                     assert_eq!(profile.descriptors, 4);
                     assert_eq!(profile.physical_rows, 32);
                     assert_eq!(profile.lwc_reads, 4);
@@ -818,7 +812,7 @@ pub(super) mod tests {
                 }
                 drop(runs);
                 drop(sort);
-                assert_eq!(fixture.source.budget.used(), 0);
+                fixture.assert_released();
             }
         });
     }
@@ -840,7 +834,7 @@ pub(super) mod tests {
                 sort.collect_next().await;
                 assert!(sort.failure.is_some());
                 assert!(sort.settle().now_or_never().is_none());
-                assert_eq!(sort.submitted, 2);
+                assert_eq!(sort.jobs.submitted, 2);
                 release_second.send(()).unwrap();
                 let error = sort.settle().await.unwrap_err();
                 assert_eq!(
@@ -849,7 +843,7 @@ pub(super) mod tests {
                 );
                 assert!(format!("{error:?}").contains("injected cold extraction failure"));
                 drop(sort);
-                assert_eq!(fixture.source.budget.used(), 0);
+                fixture.assert_released();
             }
         });
     }
@@ -867,21 +861,21 @@ pub(super) mod tests {
             first.recv_async().await.unwrap();
             second.recv_async().await.unwrap();
             release_second.send(()).unwrap();
-            while !sort.jobs[1].as_ref().unwrap().is_completed() {
+            while !sort.jobs.slots[1].as_ref().unwrap().is_completed() {
                 yield_now().await;
             }
             assert!(sort.stop.load(Ordering::Acquire));
             assert!(sort.execute().now_or_never().is_none());
-            assert_eq!(sort.submitted, 2);
+            assert_eq!(sort.jobs.submitted, 2);
             release_first.send(()).unwrap();
             let error = sort.execute().await.err().unwrap();
             assert!(matches!(&error, QuadError::Runtime(_)), "{error:?}");
             assert!(format!("{error:?}").contains("injected cold extraction failure"));
-            assert_eq!(sort.submitted, 2);
-            assert_eq!(sort.collected, 2);
+            assert_eq!(sort.jobs.submitted, 2);
+            assert_eq!(sort.jobs.collected, 2);
             assert!(sort.runs.is_empty());
             drop(sort);
-            assert_eq!(fixture.source.budget.used(), 0);
+            fixture.assert_released();
         });
     }
 
@@ -902,7 +896,7 @@ pub(super) mod tests {
             let mut sort = fixture.sort(2).await;
             let runs = sort.execute().await.unwrap();
             assert!(runs.runs().is_empty());
-            assert_eq!(sort.collected, sort.jobs.len());
+            assert_eq!(sort.jobs.collected, sort.jobs.len());
             assert_eq!(runs.duplicates, super::super::DuplicateCheck::Skip);
             drop(runs);
             drop(sort);
@@ -923,13 +917,13 @@ pub(super) mod tests {
                 }
                 let completion = Arc::new(Completion::new());
                 completion.complete(Ok(Ok(BuildOutcome::Complete(result))));
-                sort.jobs[0] = Some(completion);
-                sort.submitted = 1;
+                sort.jobs.slots[0] = Some(completion);
+                sort.jobs.submitted = 1;
                 sort.collect_next().await;
                 assert!(sort.settle().await.is_err(), "{invalid}");
                 assert!(sort.runs.is_empty(), "{invalid}");
                 drop(sort);
-                assert_eq!(fixture.source.budget.used(), 0, "{invalid}");
+                assert_eq!(fixture.source.admission.input.used(), 0, "{invalid}");
             }
         });
     }
@@ -955,7 +949,7 @@ pub(super) mod tests {
                 "{error:?}"
             );
             drop(sort);
-            assert_eq!(fixture.source.budget.used(), 0);
+            fixture.assert_released();
             assert!(deletes.remove_ref_if_owned(row_id, &status));
             let committed = Arc::new(shared_trx_status(TrxID::new(1)));
             deletes
@@ -966,34 +960,49 @@ pub(super) mod tests {
             assert_eq!(contents(&runs), fixture.expected[1..]);
             drop(runs);
             drop(sort);
-            assert_eq!(fixture.source.budget.used(), 0);
+            fixture.assert_released();
             assert!(
                 matches!(deletes.get(row_id), Some(crate::table::DeleteMarker::Ref(status)) if Arc::ptr_eq(&status, &committed))
             );
         });
     }
 
-    /// Purpose: Reduce cold extraction concurrency when only one minimum reusable workspace is admitted.
-    /// Expected: Partition planning uses the reduced allowance, extraction still matches the full source oracle, and no workspace is charged twice or retained after settlement.
+    /// Purpose: Isolate extraction worker scratch from retained input and other worker slots.
+    /// Expected: Full input and a full sibling budget leave another workspace usable; a failed worker admission releases earlier workspaces before dispatch.
     #[test]
-    fn cold_workspace_admission_reduces_workers_before_planning() {
+    fn cold_workspace_budgets_are_independent() {
         smol::block_on(async {
             let fixture = Fixture::new(false).await;
-            fail_build_budget_after(&fixture.source.budget, "cold identity and deletions", 1);
-            let mut sort = fixture.sort(2).await;
-            assert_eq!(sort.workers, 1);
-            assert_eq!(sort.jobs.len(), 4);
-            #[cfg(feature = "profiling")]
-            {
-                assert_eq!(sort.measurements().configured_workers, 2);
-                assert_eq!(sort.measurements().requested_partitions, 4);
-            }
-            let runs = sort.execute().await.unwrap();
-            assert_eq!(runs.runs().len(), 4);
-            assert_eq!(contents(&runs), fixture.expected);
-            drop(runs);
-            drop(sort);
-            assert_eq!(fixture.source.budget.used(), 0);
+            let admission = &fixture.source.admission;
+            let input = admission
+                .input
+                .reserve(16 * 1024 * 1024, "test retained input")
+                .unwrap();
+            let first = admission
+                .worker_budget(0)
+                .reserve(4 * 1024 * 1024, "test occupied worker")
+                .unwrap();
+            let second = fixture.source.workspace(1).unwrap();
+            assert!(fixture.source.workspace(0).is_err());
+            drop((input, first, second));
+            assert!(
+                cold_budgets(admission)
+                    .iter()
+                    .all(|budget| budget.used() == 0)
+            );
+            fail_build_budget(&admission.worker_budget(1), "cold identity and deletions");
+            let result = ColdLocalSort::new(
+                fixture.source.clone(),
+                fixture.engine.inner().core.thread_pool.clone(),
+                2,
+            )
+            .await;
+            assert!(matches!(result, Err(QuadError::Runtime(_))));
+            assert!(
+                cold_budgets(admission)
+                    .iter()
+                    .all(|budget| budget.used() == 0)
+            );
         });
     }
 
@@ -1006,10 +1015,12 @@ pub(super) mod tests {
             const LIMIT: usize = 1024 * 1024;
             for unique in [false, true] {
                 let mut fixture = Fixture::with_groups(unique, 1).await;
-                Arc::get_mut(&mut fixture.source).unwrap().budget = MemoryBudget::new(LIMIT);
+                Arc::get_mut(&mut Arc::get_mut(&mut fixture.source).unwrap().admission)
+                    .unwrap()
+                    .input = MemoryBudget::new(LIMIT);
                 let source = &fixture.source;
-                let budget = &source.budget;
-                let mut workspace = source.workspace().unwrap();
+                let budget = &source.admission.input;
+                let mut workspace = source.workspace(0).unwrap();
                 // Eight rows fill the initial entry buffer without replacement.
                 assert_eq!(fixture.expected.len(), 8);
                 let payload_bytes = fixture
@@ -1039,13 +1050,12 @@ pub(super) mod tests {
                 );
                 assert!(cursor.exhausted());
                 let mut actual: Vec<_> = rows
-                    .entries
                     .iter()
                     .map(|entry| (entry.key.as_bytes().to_vec(), entry.row_id))
                     .collect();
                 actual.sort_unstable();
                 assert_eq!(actual, fixture.expected, "unique={unique}");
-                assert_eq!(rows.payload.bytes(), payload_bytes);
+                assert_eq!(payload_accounting(&rows).1, payload_bytes);
                 assert_eq!(budget.used(), LIMIT);
                 drop(rows);
                 assert_eq!(budget.used(), baseline);
@@ -1117,7 +1127,7 @@ pub(super) mod tests {
                         "{corruption}, deleted={all_deleted}: {diagnostic}"
                     );
                     drop(sort);
-                    assert_eq!(fixture.source.budget.used(), 0);
+                    fixture.assert_released();
                 }
             }
         });

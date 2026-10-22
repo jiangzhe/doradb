@@ -2,14 +2,18 @@
 use super::merge::{HotEntryRef, execution_error};
 use super::{BudgetedVec, MemoryBudget, SortedRuns};
 use crate::error::{RuntimeError, RuntimeOrFatalResult};
-use crate::id::{RowID, TrxID};
+use crate::file::block_integrity::write_block_checksum;
+use crate::id::{BlockID, RowID, TrxID};
 use crate::index::btree::algo::{
-    KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, try_plan_sibling_node,
+    KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
+    try_plan_sibling_node,
 };
 use crate::index::btree::{
     BTREE_NODE_USABLE_SIZE, BTreeSlot, BTreeU64, BTreeValue, PackedNodeSpace,
 };
+use crate::index::disk_tree::{DISK_TREE_BLOCK_SIZE, btree_node_from_block_mut};
 use crate::index::util::Maskable;
+use crate::io::DirectBuf;
 use error_stack::ResultExt;
 
 const INITIAL_CANDIDATES: usize = 64;
@@ -39,6 +43,35 @@ impl LeafPlan {
             lower_fence: self.lower.map_or(&[], |r| r.resolve(runs).key.as_bytes()),
             lower_fence_value: BTreeU64::INVALID_VALUE,
             upper_fence: self.upper.map(|r| r.resolve(runs).key.as_bytes()),
+            hints_enabled: true,
+        }
+    }
+}
+
+/// A parent prefix with borrowed lower fence and its first child in the header.
+/// Coverage, promotion metadata and final upper-fence ownership stay with callers.
+pub(super) struct ParentPlan<'a> {
+    /// Number of children consumed; the parent has one fewer separator slots.
+    pub(super) count: usize,
+    lower: &'a [u8],
+    first: BlockID,
+}
+
+impl ParentPlan<'_> {
+    /// Apply the caller's validated height and final upper fence to this prefix.
+    #[inline]
+    pub(super) fn node_params<'a>(
+        &'a self,
+        height: u16,
+        ts: TrxID,
+        upper: Option<&'a [u8]>,
+    ) -> KnownFenceNodeParams<'a> {
+        KnownFenceNodeParams {
+            height,
+            ts,
+            lower_fence: self.lower,
+            lower_fence_value: BTreeU64::from(self.first.as_u64()),
+            upper_fence: upper,
             hints_enabled: true,
         }
     }
@@ -132,6 +165,46 @@ impl LeafWindow {
         self.head = 0;
         self.len = 0;
     }
+}
+
+/// Plan a parent prefix from borrowed child lower fences and stable block IDs.
+/// Callers validate child continuity and retain admission before materialization.
+pub(super) fn plan_parent<'a>(
+    entries: &mut BudgetedVec<PackedNodeEntry<'a, BTreeU64>>,
+    children: usize,
+    upper: Option<&'a [u8]>,
+    purpose: &'static str,
+    mut child: impl FnMut(usize) -> (&'a [u8], BlockID),
+) -> RuntimeOrFatalResult<ParentPlan<'a>> {
+    assert!(children != 0, "parent planning requires nonempty children");
+    let (lower, first) = child(0);
+    let packed = if children == 1 {
+        entries.clear();
+        0
+    } else {
+        plan_candidates(
+            entries,
+            children - 1,
+            PackedNodePlanParams {
+                lower_fence: lower,
+                upper_fence: upper,
+                min_slots: 1,
+            },
+            purpose,
+            |index| {
+                let (key, block) = child(index + 1);
+                PackedNodeEntry {
+                    key,
+                    value: BTreeU64::from(block.as_u64()),
+                }
+            },
+        )?
+    };
+    Ok(ParentPlan {
+        count: packed + 1,
+        lower,
+        first,
+    })
 }
 
 /// Bound node slot count using mandatory slot/value bytes alone.
@@ -229,6 +302,52 @@ pub(super) fn plan_candidates<'a, V: BTreeValue + Copy>(
             .map(|plan| plan.packed)
             .ok_or_else(|| execution_error("hot node key/fences cannot fit a page"));
     }
+}
+
+/// Validate final fences and capacity, fill the admitted image, then checksum it.
+/// The caller must retain one block's reservation through write settlement.
+pub(super) fn pack_admitted_node<V: BTreeValue + Copy>(
+    params: KnownFenceNodeParams<'_>,
+    entries: &[PackedNodeEntry<'_, V>],
+) -> RuntimeOrFatalResult<DirectBuf> {
+    validate_final_node(params, entries)?;
+    Ok(fill_final_node(params, entries))
+}
+
+/// Recheck capacity under the actual final fences before allocating an image.
+pub(super) fn validate_final_node<V: BTreeValue + Copy>(
+    params: KnownFenceNodeParams<'_>,
+    entries: &[PackedNodeEntry<'_, V>],
+) -> RuntimeOrFatalResult<()> {
+    let mut space =
+        PackedNodeSpace::with_fences(params.lower_fence, params.upper_fence.unwrap_or(&[]))
+            .ok_or_else(|| execution_error("disk final fences exceed node capacity"))?;
+    for entry in entries {
+        if space
+            .add_entry::<V>(entry.key)
+            .is_none_or(|bytes| bytes > BTREE_NODE_USABLE_SIZE)
+        {
+            return Err(execution_error("disk final node shape exceeds capacity"));
+        }
+    }
+    if space.total_space() > BTREE_NODE_USABLE_SIZE {
+        return Err(execution_error("disk final fence storage exceeds capacity"));
+    }
+    Ok(())
+}
+
+/// Encode and checksum a shape already checked by `validate_final_node`.
+/// The caller retains the output allocation's admission through write settlement.
+pub(super) fn fill_final_node<V: BTreeValue + Copy>(
+    params: KnownFenceNodeParams<'_>,
+    entries: &[PackedNodeEntry<'_, V>],
+) -> DirectBuf {
+    let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
+    pack_fixed_entries(btree_node_from_block_mut(buf.data_mut()), params, entries);
+    #[cfg(debug_assertions)]
+    debug_assert!(btree_node_from_block_mut(buf.data_mut()).validate_persisted_layout::<V>());
+    write_block_checksum(buf.data_mut());
+    buf
 }
 
 #[cfg(test)]
@@ -356,6 +475,83 @@ mod tests {
                 assert_leaf_plan(&runs, count + 1, lower, upper, value),
                 count
             );
+        }
+    }
+
+    /// Purpose: Preserve parent pointer placement across unary, compressed and split prefixes.
+    /// Expected: Persisted parents retain the first child in the header, ordered separator children, final fences and valid checksums without allocating unbounded candidate storage.
+    #[test]
+    fn parent_plans_preserve_child_pointers_and_fences() {
+        use crate::file::block_integrity::validate_block_checksum;
+        for (case, count, width, prefix, finite) in [
+            ("unary", 1, 8, 0, false),
+            ("open", 32, 8, 0, false),
+            ("compressed", 64, 8, 1000, true),
+            ("split", 64, 1024, 0, false),
+        ] {
+            let runs = leaf_runs(count + 1, width, prefix);
+            let source = runs.runs()[0].entries();
+            let key = |index: usize| source[index].key.as_bytes();
+            let block = |index: usize| BlockID::from(index + 1000);
+            let upper = finite.then(|| key(count));
+            let budget = MemoryBudget::new(1024 * 1024);
+            let mut entries = BudgetedVec::new(&budget);
+            // Unary planning must also discard scratch from an earlier plan.
+            entries
+                .push(
+                    PackedNodeEntry {
+                        key: key(0),
+                        value: BTreeU64::from(0),
+                    },
+                    "test parent scratch",
+                )
+                .unwrap();
+            let plan = plan_parent(&mut entries, count, upper, "test parent entries", |index| {
+                (key(index), block(index))
+            })
+            .unwrap();
+            if case == "split" {
+                assert!(plan.count > 1 && plan.count < count);
+            } else {
+                assert_eq!(plan.count, count, "{case}");
+            }
+            if count == 1 {
+                assert!(entries.is_empty());
+            }
+            assert!(entries.capacity() <= max_node_slots::<BTreeU64>() + 1);
+            let final_upper = if plan.count < count {
+                Some(key(plan.count))
+            } else {
+                upper
+            };
+            let _image_admission = budget
+                .reserve(DISK_TREE_BLOCK_SIZE, "test parent output")
+                .unwrap();
+            let mut image = pack_admitted_node(
+                plan.node_params(2, TrxID::new(42), final_upper),
+                &entries[..plan.count - 1],
+            )
+            .unwrap();
+            validate_block_checksum(image.data()).unwrap();
+            let node = btree_node_from_block_mut(image.data_mut());
+            assert!(node.validate_persisted_layout::<BTreeU64>(), "{case}");
+            assert_eq!(node.height(), 2);
+            assert_eq!(node.ts(), TrxID::new(42));
+            assert_eq!(node.count() + 1, plan.count);
+            assert_eq!(node.lower_fence_key().as_bytes(), key(0));
+            assert_eq!(node.lower_fence_value(), BTreeU64::from(block(0).as_u64()));
+            assert_eq!(node.has_no_upper_fence(), final_upper.is_none());
+            assert_eq!(
+                node.upper_fence_key().as_bytes(),
+                final_upper.unwrap_or(&[])
+            );
+            for index in 1..plan.count {
+                assert_eq!(node.key(index - 1).as_bytes(), key(index));
+                assert_eq!(
+                    node.value::<BTreeU64>(index - 1),
+                    BTreeU64::from(block(index).as_u64())
+                );
+            }
         }
     }
 

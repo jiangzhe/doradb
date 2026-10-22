@@ -1256,28 +1256,29 @@ mod tests {
             true,
         )
         .unwrap();
-        let budget = admission.budget.clone();
+        let budget = admission.input.clone();
         let mut inputs: Vec<_> = (0..groups).map(|_| BuildEntries::new(&budget)).collect();
         for (ordinal, entry) in entries.into_iter().enumerate() {
             let input = &mut inputs[ordinal % groups];
-            if entry.key.as_bytes().len() > MEM_CMP_KEY_INLINE {
-                input
-                    .payload
-                    .grow(entry.key.as_bytes().len(), "test cold key")
-                    .unwrap();
-            }
-            input.entries.push(entry, "test cold input").unwrap();
+            let len = entry.key.as_bytes().len();
+            input
+                .push_with(
+                    if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+                    "test cold input",
+                    "test cold key",
+                    || entry,
+                )
+                .unwrap();
         }
         let runs: Vec<_> = inputs
             .into_iter()
             .enumerate()
             .filter_map(|(group, input)| {
-                if input.entries.is_empty() {
+                if input.is_empty() {
                     return None;
                 }
                 let run = complete_work(SortedRun::finish_group(
-                    input.entries,
-                    input.payload,
+                    input,
                     DuplicateCheck::Collect,
                     group,
                     &AtomicBool::new(false),
@@ -2211,7 +2212,7 @@ mod tests {
                 let occupied = cold
                     .budget()
                     .reserve(
-                        ColdIndexBuildConfig::default().max_scratch_bytes - bytes,
+                        ColdIndexBuildConfig::default().assembler_scratch_bytes - bytes,
                         "other retained scratch",
                     )
                     .unwrap();
@@ -2224,7 +2225,7 @@ mod tests {
                 assert_eq!(selection.workers, 1);
                 assert_eq!(
                     cold.budget().used(),
-                    ColdIndexBuildConfig::default().max_scratch_bytes
+                    ColdIndexBuildConfig::default().assembler_scratch_bytes
                 );
                 let scope = pool().await;
                 let pool = scope.0.dependency::<ThreadPool>();

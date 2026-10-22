@@ -14,6 +14,8 @@ pub struct EngineConfigOverlay {
     pub hot_index_build: HotIndexBuildOverlay,
     /// Cold index construction admission and output limits.
     pub cold_index_build: ColdIndexBuildOverlay,
+    /// Checkpoint secondary-index reconciliation limits.
+    pub checkpoint_index_build: CheckpointIndexBuildOverlay,
     /// Mandatory runtime sizing overrides.
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Deterministic table-scan planning overrides.
@@ -39,6 +41,8 @@ impl EngineConfigOverlay {
         self.thread_pool.merge(other.thread_pool);
         self.hot_index_build.merge(other.hot_index_build);
         self.cold_index_build.merge(other.cold_index_build);
+        self.checkpoint_index_build
+            .merge(other.checkpoint_index_build);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
         self.transaction.merge(other.transaction);
@@ -86,8 +90,12 @@ pub struct ResolvedHotIndexBuildConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ColdIndexBuildOverlay {
-    /// Scratch limit with byte units.
-    pub max_scratch_bytes: Option<Byte>,
+    /// Resident input and run-planning limit with byte units.
+    pub max_input_bytes: Option<Byte>,
+    /// Per-worker extraction and construction limit with byte units.
+    pub worker_scratch_bytes: Option<Byte>,
+    /// Shared coordinator and assembly limit with byte units.
+    pub assembler_scratch_bytes: Option<Byte>,
     /// Explicit maximum workers.
     pub max_workers: Option<usize>,
     /// Queued leaf-buffer limit.
@@ -98,7 +106,44 @@ pub struct ColdIndexBuildOverlay {
 
 impl ColdIndexBuildOverlay {
     fn merge(&mut self, other: Self) {
-        replace(&mut self.max_scratch_bytes, other.max_scratch_bytes);
+        replace(&mut self.max_input_bytes, other.max_input_bytes);
+        replace(&mut self.worker_scratch_bytes, other.worker_scratch_bytes);
+        replace(
+            &mut self.assembler_scratch_bytes,
+            other.assembler_scratch_bytes,
+        );
+        replace(&mut self.max_workers, other.max_workers);
+        replace(&mut self.max_ready_buffers, other.max_ready_buffers);
+        replace(&mut self.max_in_flight_writes, other.max_in_flight_writes);
+    }
+}
+
+/// Independent checkpoint budget overrides; omitted values retain engine defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckpointIndexBuildOverlay {
+    /// Resident input and run-planning limit with byte units.
+    pub max_input_bytes: Option<Byte>,
+    /// Per-worker scratch limit with byte units.
+    pub worker_scratch_bytes: Option<Byte>,
+    /// Shared assembly limit with byte units.
+    pub assembler_scratch_bytes: Option<Byte>,
+    /// Explicit maximum workers.
+    pub max_workers: Option<usize>,
+    /// Queued output limit.
+    pub max_ready_buffers: Option<usize>,
+    /// Accepted-write limit.
+    pub max_in_flight_writes: Option<usize>,
+}
+
+impl CheckpointIndexBuildOverlay {
+    fn merge(&mut self, other: Self) {
+        replace(&mut self.max_input_bytes, other.max_input_bytes);
+        replace(&mut self.worker_scratch_bytes, other.worker_scratch_bytes);
+        replace(
+            &mut self.assembler_scratch_bytes,
+            other.assembler_scratch_bytes,
+        );
         replace(&mut self.max_workers, other.max_workers);
         replace(&mut self.max_ready_buffers, other.max_ready_buffers);
         replace(&mut self.max_in_flight_writes, other.max_in_flight_writes);
@@ -109,8 +154,14 @@ impl ColdIndexBuildOverlay {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedColdIndexBuildConfig {
-    /// Accounted scratch ceiling in bytes.
-    pub max_scratch_bytes: usize,
+    /// Resident input and run-planning allowance.
+    pub max_input_bytes: usize,
+    /// Extraction and construction scratch per worker slot.
+    pub worker_scratch_bytes: usize,
+    /// Shared coordination, assembly and sealed-reader allowance.
+    pub assembler_scratch_bytes: usize,
+    /// Aggregate configured allowance including independent output capacity.
+    pub total_memory_bytes: usize,
     /// Effective worker limit.
     pub max_workers: usize,
     /// Queued leaf-buffer limit.
@@ -347,6 +398,8 @@ pub struct ResolvedEngineConfig {
     pub hot_index_build: ResolvedHotIndexBuildConfig,
     /// Normalized cold index construction limits.
     pub cold_index_build: ResolvedColdIndexBuildConfig,
+    /// Normalized checkpoint secondary-index reconciliation limits.
+    pub checkpoint_index_build: ResolvedCheckpointIndexBuildConfig,
     /// Transaction-system settings.
     pub transaction: ResolvedTransactionConfig,
     /// Startup recovery settings with automatic limits resolved.
@@ -378,7 +431,13 @@ impl ResolvedEngineConfig {
                 target_pages_per_run: config.hot_index_build.target_pages_per_run,
             },
             cold_index_build: ResolvedColdIndexBuildConfig {
-                max_scratch_bytes: config.cold_index_build.max_scratch_bytes,
+                max_input_bytes: config.cold_index_build.max_input_bytes,
+                worker_scratch_bytes: config.cold_index_build.worker_scratch_bytes,
+                assembler_scratch_bytes: config.cold_index_build.assembler_scratch_bytes,
+                total_memory_bytes: config
+                    .cold_index_build
+                    .total_memory_bytes(config.thread_pool.worker_threads)
+                    .expect("validated cold aggregate capacity"),
                 max_workers: config
                     .cold_index_build
                     .max_workers
@@ -388,6 +447,21 @@ impl ResolvedEngineConfig {
                 partition_entries: 65_536,
                 batch_entries: 32_768,
                 partitions_per_worker: 4,
+            },
+            checkpoint_index_build: ResolvedCheckpointIndexBuildConfig {
+                max_input_bytes: config.checkpoint_index_build.max_input_bytes,
+                worker_scratch_bytes: config.checkpoint_index_build.worker_scratch_bytes,
+                assembler_scratch_bytes: config.checkpoint_index_build.assembler_scratch_bytes,
+                total_memory_bytes: config
+                    .checkpoint_index_build
+                    .total_memory_bytes(config.thread_pool.worker_threads)
+                    .expect("validated checkpoint aggregate capacity"),
+                max_workers: config
+                    .checkpoint_index_build
+                    .max_workers
+                    .expect("validated checkpoint build workers"),
+                max_ready_buffers: config.checkpoint_index_build.max_ready_buffers,
+                max_in_flight_writes: config.checkpoint_index_build.max_in_flight_writes,
             },
             thread_pool: ResolvedThreadPoolConfig {
                 worker_threads: config.thread_pool.worker_threads,
@@ -448,6 +522,26 @@ pub struct ResolvedTableScanConfig {
     pub lwc_blocks_per_partition: usize,
     /// Hot row pages per homogeneous partition.
     pub row_pages_per_partition: usize,
+}
+
+/// Serializable checkpoint limits independent of CREATE's partition sizing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedCheckpointIndexBuildConfig {
+    /// Resident input and run-planning allowance.
+    pub max_input_bytes: usize,
+    /// Per-worker scratch and pending-output allowance.
+    pub worker_scratch_bytes: usize,
+    /// Shared planner and assembler allowance.
+    pub assembler_scratch_bytes: usize,
+    /// Aggregate configured allowance including independently bounded output.
+    pub total_memory_bytes: usize,
+    /// Configured worker allowance within one index.
+    pub max_workers: usize,
+    /// Configured ready-output buffer limit.
+    pub max_ready_buffers: usize,
+    /// Configured accepted-write limit.
+    pub max_in_flight_writes: usize,
 }
 
 /// Serializable normalized finite sync/async thread-pool configuration.
@@ -612,9 +706,16 @@ pub fn resolve_engine_config(
     }
 
     let mut cold_index_build = default.cold_index_build;
-    if let Some(value) = overlay.cold_index_build.max_scratch_bytes {
-        cold_index_build.max_scratch_bytes =
-            byte_usize(value, "cold_index_build.max_scratch_bytes")?;
+    if let Some(value) = overlay.cold_index_build.max_input_bytes {
+        cold_index_build.max_input_bytes = byte_usize(value, "cold_index_build.max_input_bytes")?;
+    }
+    if let Some(value) = overlay.cold_index_build.worker_scratch_bytes {
+        cold_index_build.worker_scratch_bytes =
+            byte_usize(value, "cold_index_build.worker_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.cold_index_build.assembler_scratch_bytes {
+        cold_index_build.assembler_scratch_bytes =
+            byte_usize(value, "cold_index_build.assembler_scratch_bytes")?;
     }
     if let Some(value) = overlay.cold_index_build.max_workers {
         cold_index_build.max_workers = Some(value);
@@ -625,6 +726,30 @@ pub fn resolve_engine_config(
 
     if let Some(value) = overlay.cold_index_build.max_in_flight_writes {
         cold_index_build.max_in_flight_writes = value;
+    }
+
+    let mut checkpoint_index_build = default.checkpoint_index_build;
+    if let Some(value) = overlay.checkpoint_index_build.max_input_bytes {
+        checkpoint_index_build.max_input_bytes =
+            byte_usize(value, "checkpoint_index_build.max_input_bytes")?;
+    }
+    if let Some(value) = overlay.checkpoint_index_build.worker_scratch_bytes {
+        checkpoint_index_build.worker_scratch_bytes =
+            byte_usize(value, "checkpoint_index_build.worker_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.checkpoint_index_build.assembler_scratch_bytes {
+        checkpoint_index_build.assembler_scratch_bytes =
+            byte_usize(value, "checkpoint_index_build.assembler_scratch_bytes")?;
+    }
+    if let Some(value) = overlay.checkpoint_index_build.max_workers {
+        checkpoint_index_build.max_workers = Some(value);
+    }
+    if let Some(value) = overlay.checkpoint_index_build.max_ready_buffers {
+        checkpoint_index_build.max_ready_buffers = value;
+    }
+
+    if let Some(value) = overlay.checkpoint_index_build.max_in_flight_writes {
+        checkpoint_index_build.max_in_flight_writes = value;
     }
 
     let mut recovery = default.recovery;
@@ -684,6 +809,7 @@ pub fn resolve_engine_config(
         .thread_pool(thread_pool)
         .hot_index_build(hot_index_build)
         .cold_index_build(cold_index_build)
+        .checkpoint_index_build(checkpoint_index_build)
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
         .trx(transaction)
@@ -1151,19 +1277,80 @@ mod tests {
         );
     }
 
+    /// Purpose: Normalize checkpoint overrides independently of CREATE configuration.
+    /// Expected: Independent budgets and aggregate capacity survive serialization, invalid overrides are rejected, and CREATE defaults remain unchanged.
+    #[test]
+    fn checkpoint_build_overlay_roundtrip() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[checkpoint_index_build]\nmax_workers = 1\nmax_ready_buffers = 2\n").unwrap();
+        overlay.merge(
+            toml::from_str("[checkpoint_index_build]\nmax_input_bytes = '32 MiB'\nworker_scratch_bytes = '8 MiB'\nassembler_scratch_bytes = '16 MiB'\n").unwrap(),
+        );
+        let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
+        assert_eq!(config.checkpoint_index_build.max_workers, Some(1));
+        assert_eq!(resolved.checkpoint_index_build.max_ready_buffers, 2);
+        assert_eq!(
+            resolved.checkpoint_index_build.max_input_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(resolved.cold_index_build.max_workers, 4);
+        assert_eq!(resolved.cold_index_build.max_ready_buffers, 8);
+        assert_eq!(
+            resolved.checkpoint_index_build.worker_scratch_bytes,
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            resolved.checkpoint_index_build.assembler_scratch_bytes,
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            resolved.checkpoint_index_build.total_memory_bytes,
+            config.checkpoint_index_build.total_memory_bytes(4).unwrap()
+        );
+        assert_resolved_round_trip(&resolved);
+        for field in ["unknown = 1", "max_scratch_bytes = '32 MiB'"] {
+            assert!(
+                toml::from_str::<EngineConfigOverlay>(&format!(
+                    "[checkpoint_index_build]\n{field}"
+                ))
+                .is_err(),
+                "{field}"
+            );
+        }
+        for field in [
+            "max_input_bytes = '0 B'",
+            "worker_scratch_bytes = '1 B'",
+            "assembler_scratch_bytes = '1 B'",
+            "max_workers = 0",
+            "max_workers = 5",
+            "max_ready_buffers = 0",
+            "max_in_flight_writes = 1",
+        ] {
+            let mut changed = overlay.clone();
+            changed.merge(toml::from_str(&format!("[checkpoint_index_build]\n{field}")).unwrap());
+            assert!(
+                resolve_engine_config(temp.path(), &changed).is_err(),
+                "{field}"
+            );
+        }
+    }
+
     /// Purpose: Preserve every cold construction limit through strict benchmark overlays and normalized result serialization.
     /// Expected: Partial overrides merge independently, normalized values survive serialization, and invalid or unknown limits fail validation.
     #[test]
     fn cold_build_overlay_roundtrip_and_validation() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[cold_index_build]\nmax_scratch_bytes = '64 MiB'\nmax_ready_buffers = 3\nmax_in_flight_writes = 7\n").unwrap();
-        overlay.merge(toml::from_str("[cold_index_build]\nmax_workers = 2\n").unwrap());
+        let mut overlay: EngineConfigOverlay = toml::from_str("[thread_pool]\nworker_threads = 4\n[cold_index_build]\nmax_input_bytes = '64 MiB'\nmax_ready_buffers = 3\nmax_in_flight_writes = 7\n").unwrap();
+        overlay.merge(toml::from_str("[cold_index_build]\nmax_workers = 2\nworker_scratch_bytes = '8 MiB'\nassembler_scratch_bytes = '16 MiB'\n").unwrap());
         let (config, resolved) = resolve_engine_config(temp.path(), &overlay).unwrap();
         assert_eq!(config.cold_index_build.max_workers, Some(2));
         assert_eq!(
             resolved.cold_index_build,
             ResolvedColdIndexBuildConfig {
-                max_scratch_bytes: 64 * 1024 * 1024,
+                max_input_bytes: 64 * 1024 * 1024,
+                worker_scratch_bytes: 8 * 1024 * 1024,
+                assembler_scratch_bytes: 16 * 1024 * 1024,
+                total_memory_bytes: config.cold_index_build.total_memory_bytes(2).unwrap(),
                 max_workers: 2,
                 max_ready_buffers: 3,
                 max_in_flight_writes: 7,
@@ -1181,7 +1368,9 @@ mod tests {
             "max_workers = 5",
             "max_ready_buffers = 0",
             "max_in_flight_writes = 1",
-            "max_scratch_bytes = '0 B'",
+            "max_input_bytes = '0 B'",
+            "worker_scratch_bytes = '1 B'",
+            "assembler_scratch_bytes = '1 B'",
         ] {
             let mut changed = overlay.clone();
             changed.merge(toml::from_str(&format!("[cold_index_build]\n{field}")).unwrap());
@@ -1190,6 +1379,12 @@ mod tests {
                 "{field}"
             );
         }
-        assert!(toml::from_str::<EngineConfigOverlay>("[cold_index_build]\nunknown = 1").is_err());
+        for field in ["unknown = 1", "max_scratch_bytes = '64 MiB'"] {
+            assert!(
+                toml::from_str::<EngineConfigOverlay>(&format!("[cold_index_build]\n{field}"))
+                    .is_err(),
+                "{field}"
+            );
+        }
     }
 }

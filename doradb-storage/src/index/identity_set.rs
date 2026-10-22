@@ -32,23 +32,23 @@ pub(crate) struct IdentitySetStats {
 
 impl IdentitySetStats {
     #[inline]
-    fn from_rows(rows: &[RowID]) -> Self {
+    fn from_rows<T: Copy + Into<u64>>(rows: &[T]) -> Self {
         let mut stats = Self {
-            first: rows[0].as_u64(),
-            last: rows[0].as_u64(),
+            first: rows[0].into(),
+            last: rows[0].into(),
             count: 1,
             runs: 1,
         };
         for row in &rows[1..] {
-            stats.push(*row);
+            stats.push((*row).into());
         }
         stats
     }
 
     #[inline]
-    fn push(&mut self, row: RowID) {
-        self.runs += usize::from(row.as_u64() - self.last != 1);
-        self.last = row.as_u64();
+    fn push(&mut self, row: u64) {
+        self.runs += usize::from(row - self.last != 1);
+        self.last = row;
         self.count += 1;
     }
 
@@ -99,9 +99,14 @@ impl IdentitySetSeed {
     /// Records a direct-row append in its deterministic logical window.
     #[inline]
     pub(crate) fn append_window(seeds: &mut Vec<Self>, row: RowID, ordinal: usize) {
+        Self::append_value(seeds, row.as_u64(), ordinal);
+    }
+
+    #[inline]
+    fn append_value(seeds: &mut Vec<Self>, row: u64, ordinal: usize) {
         if let Some(last) = seeds.last_mut()
             && last.end == ordinal
-            && last.stats.first / WINDOW == row.as_u64() / WINDOW
+            && last.stats.first / WINDOW == row / WINDOW
         {
             last.end += 1;
             last.stats.push(row);
@@ -156,7 +161,12 @@ struct IdentitySetPlan {
 }
 
 impl IdentitySetPlan {
-    fn new(rows: &[RowID], base: u64, span: u32, seeds: &[IdentitySetSeed]) -> Self {
+    fn new<T: Copy + Into<u64>>(
+        rows: &[T],
+        base: u64,
+        span: u32,
+        seeds: &[IdentitySetSeed],
+    ) -> Self {
         // Keep the cheapest whole-entry codec as a fallback. Counts, endpoints,
         // and run counts give exact byte costs without encoding each candidate.
         let stats = IdentitySetStats::from_rows(rows);
@@ -166,7 +176,7 @@ impl IdentitySetPlan {
         // group present rows into 4,096-position windows, skipping empty windows.
         let seeds = if seeds.is_empty() {
             for (idx, row) in rows.iter().enumerate() {
-                IdentitySetSeed::append_window(&mut generated, *row, idx);
+                IdentitySetSeed::append_value(&mut generated, (*row).into(), idx);
             }
             &generated
         } else {
@@ -275,7 +285,7 @@ impl IdentitySetPlan {
         }
     }
 
-    fn encode(&self, rows: &[RowID], base: u64, span: u32) -> Vec<u8> {
+    fn encode<T: Copy + Into<u64>>(&self, rows: &[T], base: u64, span: u32) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.len);
         if self.segmented {
             put16(&mut out, rows.len());
@@ -355,10 +365,31 @@ pub(crate) struct EncodedIdentitySet {
 
 impl EncodedIdentitySet {
     /// Plans and encodes exactly once, checking capacity before allocating bytes.
+    #[inline]
     pub(crate) fn plan(
         start: RowID,
         end: RowID,
         rows: &[RowID],
+        seeds: &[IdentitySetSeed],
+        body_limit: usize,
+    ) -> ResourceResult<Self> {
+        Self::plan_values(start.as_u64(), end.as_u64(), rows, seeds, body_limit)
+    }
+
+    /// Plans physical ordinals directly without allocating widened row identifiers.
+    #[inline]
+    pub(crate) fn plan_ordinals(
+        row_count: u16,
+        ordinals: &[u16],
+        body_limit: usize,
+    ) -> ResourceResult<Self> {
+        Self::plan_values(0, u64::from(row_count), ordinals, &[], body_limit)
+    }
+
+    fn plan_values<T: Copy + Into<u64>>(
+        start: u64,
+        end: u64,
+        rows: &[T],
         seeds: &[IdentitySetSeed],
         body_limit: usize,
     ) -> ResourceResult<Self> {
@@ -372,10 +403,12 @@ impl EncodedIdentitySet {
         }
         // Ordering and containment are caller contracts; capacity is a runtime outcome.
         assert!(
-            rows[0] >= start && rows[rows.len() - 1] < end && rows.windows(2).all(|p| p[0] < p[1]),
+            rows[0].into() >= start
+                && rows[rows.len() - 1].into() < end
+                && rows.windows(2).all(|p| p[0].into() < p[1].into()),
             "column row-set input must be ordered within coverage"
         );
-        let plan = IdentitySetPlan::new(rows, start.as_u64(), span, seeds);
+        let plan = IdentitySetPlan::new(rows, start, span, seeds);
         if plan.len > body_limit || plan.len > u16::MAX as usize {
             return Err(Report::new(ResourceError::ColumnBlockEntryCapacityExceeded));
         }
@@ -384,7 +417,7 @@ impl EncodedIdentitySet {
         } else {
             plan.whole.codec
         };
-        let body = (plan.len != 0).then(|| Arc::from(plan.encode(rows, start.as_u64(), span)));
+        let body = (plan.len != 0).then(|| Arc::from(plan.encode(rows, start, span)));
         Ok(Self { codec, span, body })
     }
 
@@ -1158,12 +1191,12 @@ fn offer_pair(segments: &[Segment], left: usize, heap: &mut MergeHeap) {
     }
 }
 
-fn emit_local(out: &mut Vec<u8>, codec: u8, rows: &[RowID], base: u64, span: u32) {
+fn emit_local<T: Copy + Into<u64>>(out: &mut Vec<u8>, codec: u8, rows: &[T], base: u64, span: u32) {
     match codec {
         DENSE => {}
         LIST16 | LIST32 => {
             for row in rows {
-                let delta = (row.as_u64() - base) as u32;
+                let delta = ((*row).into() - base) as u32;
                 if codec == LIST16 {
                     put16(out, delta as usize);
                 } else {
@@ -1174,7 +1207,7 @@ fn emit_local(out: &mut Vec<u8>, codec: u8, rows: &[RowID], base: u64, span: u32
         MISSING | TRIMMED_MISSING => {
             let mut next = 0;
             for row in rows {
-                let delta = (row.as_u64() - base) as u32;
+                let delta = ((*row).into() - base) as u32;
                 for hole in next..delta {
                     put16(out, hole as usize);
                 }
@@ -1189,10 +1222,10 @@ fn emit_local(out: &mut Vec<u8>, codec: u8, rows: &[RowID], base: u64, span: u32
             while idx < rows.len() {
                 let start = idx;
                 idx += 1;
-                while idx < rows.len() && rows[idx].as_u64() - rows[idx - 1].as_u64() == 1 {
+                while idx < rows.len() && rows[idx].into() - rows[idx - 1].into() == 1 {
                     idx += 1;
                 }
-                let delta = (rows[start].as_u64() - base) as u32;
+                let delta = (rows[start].into() - base) as u32;
                 if codec == RUNS16 {
                     put16(out, delta as usize);
                 } else {
@@ -1209,7 +1242,7 @@ fn emit_local(out: &mut Vec<u8>, codec: u8, rows: &[RowID], base: u64, span: u32
             out.resize(begin + bitmap_len(u64::from(span)), 0);
             let word_start = begin + groups * 2;
             for row in rows {
-                let delta = (row.as_u64() - base) as usize;
+                let delta = ((*row).into() - base) as usize;
                 out[word_start + delta / 8] |= 1 << (delta % 8);
             }
             let mut count = 0u16;

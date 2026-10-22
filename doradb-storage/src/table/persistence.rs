@@ -1,3 +1,4 @@
+use super::checkpoint_index::CheckpointIndexSources;
 use super::checkpoint_workflow::{
     CheckpointAttempt, FrozenPageBatch, FrozenPageValidationState, PreparedCheckpointAttempt,
     PreparedFreezeAttempt, PreparedTransitionPage,
@@ -7,10 +8,7 @@ use crate::buffer::guard::PageGuard;
 use crate::buffer::{PoolGuard, PoolGuards};
 #[cfg(test)]
 use crate::catalog::SecondaryIndexSlot;
-use crate::catalog::{
-    IndexRef, IndexSlot, SilentWatermarkObject, TableColumnLayout, TableIndexMetadata,
-    TableMetadata,
-};
+use crate::catalog::{IndexSlot, SilentWatermarkObject, TableMetadata};
 use crate::completion::{Completion, CompletionTake};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
@@ -21,14 +19,11 @@ use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
 use crate::id::{BlockID, PageID, RowID, TableID, TrxID};
 use crate::index::OrdinalDeletionSet;
-use crate::index::disk_tree::{
-    NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedDelete, UniqueDiskTreeEncodedPut,
-};
-use crate::index::identity_set::EncodedRowSet;
-use crate::index::{BTreeKeyEncoder, secondary_index_encoder};
+#[cfg(feature = "profiling")]
+use crate::index::build::checkpoint::CheckpointAdmission;
+use crate::index::build::checkpoint::IndexCheckpoint;
 use crate::index::{
     ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeletionPatch,
-    ColumnLeafEntry,
 };
 use crate::io::DirectBuf;
 use crate::lwc::LwcBuilder;
@@ -51,7 +46,6 @@ use crate::table::{
     TableRuntimeLayout,
 };
 use crate::trx::RetiredRowPageBatch;
-use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use event_listener::EventListener;
 use futures::future::select_all;
@@ -564,12 +558,16 @@ impl MaintenanceExecution for CheckpointTableExecution {
 
 /// Owns one table checkpoint attempt and its reversible-to-fatal boundary.
 struct TableCheckpointer<'table, 'session, S: SessionRuntimeAccess + ?Sized> {
-    table: &'table Table,
+    table: &'table Arc<Table>,
     session: &'session S,
     // Declaration order preserves publication -> attempt release ordering.
     publish_lease: Option<CheckpointPublishLease<'table>>,
     attempt: PreparedCheckpointAttempt,
     irreversible: Option<FatalError>,
+    #[cfg(feature = "profiling")]
+    profile: Option<Arc<CheckpointAdmission>>,
+    #[cfg(feature = "profiling")]
+    started: Instant,
 }
 
 impl<'table, 'session, S> TableCheckpointer<'table, 'session, S>
@@ -577,13 +575,21 @@ where
     S: SessionRuntimeAccess + ?Sized,
 {
     #[inline]
-    fn new(table: &'table Table, session: &'session S, attempt: PreparedCheckpointAttempt) -> Self {
+    fn new(
+        table: &'table Arc<Table>,
+        session: &'session S,
+        attempt: PreparedCheckpointAttempt,
+    ) -> Self {
         Self {
             table,
             session,
             publish_lease: None,
             attempt,
             irreversible: None,
+            #[cfg(feature = "profiling")]
+            profile: None,
+            #[cfg(feature = "profiling")]
+            started: Instant::now(),
         }
     }
 
@@ -613,7 +619,6 @@ where
             disk_guard.clone(),
         );
         let pivot_row_id = mutable_file.root().pivot_row_id;
-        let mut secondary_sidecar = SecondaryCheckpointSidecar::new(&layout);
 
         // Step 2: derive replay and data cutoffs from the explicit batch. The
         // purge-published horizon is the exclusive cutoff for both frozen row
@@ -624,6 +629,12 @@ where
             .map(|batch| (batch.pages.clone(), batch.heap_redo_start_ts))
             .unwrap_or_default();
         let cutoff_ts = trx_sys.published_gc_horizon();
+        let mut secondary_sources =
+            CheckpointIndexSources::new(session.engine().checkpoint_build_policy, cutoff_ts)?;
+        #[cfg(feature = "profiling")]
+        {
+            self.profile = Some(secondary_sources.admission.clone());
+        }
 
         // Step 3: allocate a construction/publication timestamp without
         // registering an active transaction STS. Ordered system redo receives a
@@ -708,6 +719,17 @@ where
                 #[cfg(test)]
                 &session.engine().maintenance_test,
             );
+            // Only the state-locked transition establishes the final bitmap;
+            // optimistic preparation may legitimately leave a plan invalidated.
+            if layout.active_secondary_indexes().next().is_some() {
+                secondary_sources.capture_puts(
+                    &self
+                        .attempt
+                        .batch()
+                        .unwrap_or_else(|| unreachable!("prepared checkpoint batch"))
+                        .prepared,
+                )?;
+            }
         }
         #[cfg(test)]
         if !pages.is_empty() {
@@ -717,21 +739,12 @@ where
             .await;
         }
 
-        // Step 4: build LWC blocks from transition pages using the cutoff
-        // snapshot. The sidecar callback observes the same committed-visible
-        // rows accepted by the LWC builder, independent of later block splits.
+        // Step 4: build LWC blocks from the same prepared visibility bitmap
+        // captured for subsequent per-index key extraction.
         let new_pivot_row_id = pages
             .last()
             .map(|page| page.end_row_id)
             .unwrap_or(pivot_row_id);
-        let collect_visible_row = if secondary_sidecar.indexes.is_empty() {
-            None
-        } else {
-            let col_layout = metadata.col.as_ref();
-            Some(|page: &RowPage, row_idx: usize, row_id: RowID| {
-                secondary_sidecar.add_data_row(col_layout, page, row_idx, row_id)
-            })
-        };
         let lwc_entries = table
             .build_and_write_lwc_blocks(
                 metadata,
@@ -746,7 +759,7 @@ where
                         .map(|batch| batch.prepared.as_slice())
                         .unwrap_or_default(),
                 },
-                collect_visible_row,
+                None::<fn(&RowPage, usize, RowID)>,
                 #[cfg(test)]
                 &session.engine().maintenance_test,
             )
@@ -785,11 +798,13 @@ where
         // Step 7: merge committed cold-row deletions into column index payloads,
         // collect matching secondary-index delete sidecar work, and publish the
         // durable cold-delete replay watermark.
+        #[cfg(feature = "profiling")]
+        let deletion_started = Instant::now();
         table
             .apply_deletion_checkpoint(
                 &mut mutable_file,
                 metadata,
-                &mut secondary_sidecar,
+                &mut secondary_sources,
                 cutoff_ts,
                 checkpoint_ts,
                 disk_guard,
@@ -801,6 +816,10 @@ where
                     "operation=checkpoint_table, phase=apply_deletion_checkpoint, table_id={table_id}"
                 )
             })?;
+        #[cfg(feature = "profiling")]
+        secondary_sources.admission.measure(|m| {
+            m.deletion_checkpoint_nanos += deletion_started.elapsed().as_nanos() as u64;
+        });
 
         // Step 8: apply accumulated secondary-index sidecar work to DiskTree
         // roots on the same mutable file fork. Root publication remains atomic
@@ -809,9 +828,9 @@ where
             .apply_secondary_checkpoint_sidecar(
                 &mut mutable_file,
                 &layout,
-                &mut secondary_sidecar,
+                Arc::new(secondary_sources),
                 checkpoint_ts,
-                disk_guard,
+                session,
                 #[cfg(test)]
                 &session.engine().maintenance_test,
             )
@@ -826,6 +845,8 @@ where
         // Step 9: after all checkpoint CoW writes are represented in the
         // mutable root, rebuild its allocation map from the current active root
         // and the mutable root that will be published.
+        #[cfg(feature = "profiling")]
+        let validated = Instant::now();
         table
             .rebuild_reachable_alloc_map(&mut mutable_file, &layout, disk_guard)
             .await
@@ -833,6 +854,13 @@ where
             .attach_with(|| {
                 format!("operation=checkpoint_table, phase=rebuild_alloc_map, table_id={table_id}")
             })?;
+
+        #[cfg(feature = "profiling")]
+        if let Some(profile) = &self.profile {
+            profile.measure(|m| m.reachability_nanos += validated.elapsed().as_nanos() as u64);
+        }
+        #[cfg(feature = "profiling")]
+        let published = Instant::now();
 
         if let Some(requested_floor) =
             silent_watermark_floor(table_file.active_root_unchecked(), mutable_file.root())
@@ -886,6 +914,10 @@ where
                         "operation=checkpoint_table, phase=commit_silent_redo, table_id={table_id}"
                     )
                 })?;
+            #[cfg(feature = "profiling")]
+            if let Some(profile) = &self.profile {
+                profile.measure(|m| m.publication_nanos += published.elapsed().as_nanos() as u64);
+            }
             return Ok(CheckpointOutcome::Published {
                 checkpoint_ts,
                 redo_cts,
@@ -953,6 +985,10 @@ where
                     "operation=checkpoint_table, phase=commit_checkpoint_redo, table_id={table_id}"
                 )
             })?;
+        #[cfg(feature = "profiling")]
+        if let Some(profile) = &self.profile {
+            profile.measure(|m| m.publication_nanos += published.elapsed().as_nanos() as u64);
+        }
         Ok(CheckpointOutcome::Published {
             checkpoint_ts,
             redo_cts,
@@ -1013,6 +1049,17 @@ where
                             self.publish_lease.is_some() && self.irreversible.is_some(),
                             "published checkpoint must cross an irreversible admission"
                         );
+                        #[cfg(feature = "profiling")]
+                        if let Some(profile) = self.profile.take() {
+                            let mut sample = profile.measurements();
+                            sample.completed_checkpoints = 1;
+                            sample.total_nanos = self.started.elapsed().as_nanos() as u64;
+                            self.session
+                                .engine()
+                                .trx_sys
+                                .index_build_profiler
+                                .record_checkpoint(&sample);
+                        }
                         self.table.checkpoint_workflow.finish_publication();
                         self.irreversible = None;
                         drop(self.publish_lease.take());
@@ -1061,232 +1108,6 @@ impl<S: SessionRuntimeAccess + ?Sized> Drop for TableCheckpointer<'_, '_, S> {
         } else {
             self.table.checkpoint_workflow.finish_publication();
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct BlockPatchGroup {
-    entry: ColumnLeafEntry,
-    pending_start: usize,
-    pending_end: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct EncodedRowEntry {
-    key: Vec<u8>,
-    row_id: RowID,
-}
-
-// Checkpoint-local accumulator for one secondary index. Batches are appended
-// while scanning checkpoint inputs, then sorted and coalesced once before the
-// DiskTree writer runs.
-enum SecondaryIndexSidecar {
-    Unique {
-        encoder: BTreeKeyEncoder,
-        puts: Vec<EncodedRowEntry>,
-        deletes: Vec<EncodedRowEntry>,
-    },
-    NonUnique {
-        encoder: BTreeKeyEncoder,
-        inserts: Vec<Vec<u8>>,
-        deletes: Vec<Vec<u8>>,
-    },
-}
-
-impl SecondaryIndexSidecar {
-    #[inline]
-    fn new(metadata: &TableMetadata, index_spec: &TableIndexMetadata) -> Self {
-        if index_spec.unique() {
-            Self::Unique {
-                encoder: secondary_index_encoder(metadata, index_spec, false),
-                puts: Vec::new(),
-                deletes: Vec::new(),
-            }
-        } else {
-            Self::NonUnique {
-                encoder: secondary_index_encoder(metadata, index_spec, true),
-                inserts: Vec::new(),
-                deletes: Vec::new(),
-            }
-        }
-    }
-
-    #[inline]
-    fn has_work(&self) -> bool {
-        match self {
-            Self::Unique { puts, deletes, .. } => !puts.is_empty() || !deletes.is_empty(),
-            Self::NonUnique {
-                inserts, deletes, ..
-            } => !inserts.is_empty() || !deletes.is_empty(),
-        }
-    }
-
-    fn add_data(&mut self, key: Vec<Val>, row_id: RowID) {
-        match self {
-            Self::Unique { encoder, puts, .. } => {
-                let encoded = encoder.encode(&key).as_bytes().to_vec();
-                puts.push(EncodedRowEntry {
-                    key: encoded,
-                    row_id,
-                });
-                // Same-run delete suppression is applied once, after all data
-                // and deletion sidecar inputs are sorted.
-            }
-            Self::NonUnique {
-                encoder, inserts, ..
-            } => {
-                // Non-unique DiskTree stores exact (logical_key, row_id)
-                // membership; there is no durable delete-mask value.
-                let encoded = encoder
-                    .encode_pair(&key, Val::from(row_id))
-                    .as_bytes()
-                    .to_vec();
-                inserts.push(encoded);
-            }
-        }
-    }
-
-    fn add_delete(&mut self, key: Vec<Val>, row_id: RowID) {
-        match self {
-            Self::Unique {
-                encoder, deletes, ..
-            } => {
-                let encoded = encoder.encode(&key).as_bytes().to_vec();
-                // Unique deletes are conditional on the old owner. They are
-                // suppressed during normalization if this checkpoint also
-                // publishes a new owner for the same key.
-                deletes.push(EncodedRowEntry {
-                    key: encoded,
-                    row_id,
-                });
-            }
-            Self::NonUnique {
-                encoder, deletes, ..
-            } => {
-                let encoded = encoder
-                    .encode_pair(&key, Val::from(row_id))
-                    .as_bytes()
-                    .to_vec();
-                deletes.push(encoded);
-            }
-        }
-    }
-
-    fn normalize(&mut self) {
-        match self {
-            Self::Unique { puts, deletes, .. } => {
-                normalize_unique_puts(puts);
-                normalize_unique_deletes(deletes, puts);
-            }
-            Self::NonUnique {
-                inserts, deletes, ..
-            } => {
-                normalize_encoded_keys(inserts);
-                normalize_encoded_keys(deletes);
-                inserts.retain(|key| deletes.binary_search(key).is_err());
-            }
-        }
-    }
-}
-
-struct ActiveSecondaryIndexSidecar {
-    index: IndexRef,
-    key_cols: Box<[usize]>,
-    sidecar: SecondaryIndexSidecar,
-}
-
-struct SecondaryCheckpointSidecar {
-    indexes: Vec<ActiveSecondaryIndexSidecar>,
-}
-
-impl SecondaryCheckpointSidecar {
-    fn new(layout: &TableRuntimeLayout) -> Self {
-        let metadata = layout.metadata();
-        // Active-index iteration and every sidecar shape come from the same
-        // validated immutable metadata snapshot, so construction cannot fail.
-        let indexes = layout
-            .active_secondary_indexes()
-            .map(|(index, _)| {
-                let index_spec = metadata.idx.expect_index_spec(index);
-                ActiveSecondaryIndexSidecar {
-                    index,
-                    key_cols: index_spec
-                        .keys
-                        .iter()
-                        .map(|index_key| index_key.column_ordinal.as_usize())
-                        .collect(),
-                    sidecar: SecondaryIndexSidecar::new(metadata, index_spec),
-                }
-            })
-            .collect();
-        let sidecar = Self { indexes };
-        sidecar.assert_matches_layout(layout);
-        sidecar
-    }
-
-    #[inline]
-    fn assert_matches_layout(&self, layout: &TableRuntimeLayout) {
-        let expected = layout
-            .active_secondary_indexes()
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let actual = self
-            .indexes
-            .iter()
-            .map(|active| active.index)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            actual, expected,
-            "secondary checkpoint sidecar invariant violated: active identities differ from pinned metadata"
-        );
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.indexes.iter().all(|index| !index.sidecar.has_work())
-    }
-
-    fn add_data_row(
-        &mut self,
-        col_layout: &TableColumnLayout,
-        page: &RowPage,
-        row_idx: usize,
-        row_id: RowID,
-    ) {
-        // The page and column layout were validated together before the LWC
-        // callback runs, and active key columns come from that same metadata.
-        for active in &mut self.indexes {
-            let key = active
-                .key_cols
-                .iter()
-                .map(|col_idx| page.val(col_layout, row_idx, *col_idx))
-                .collect();
-            active.sidecar.add_data(key, row_id);
-        }
-    }
-
-    fn add_deleted_key_at(
-        &mut self,
-        sidecar_pos: usize,
-        index: IndexRef,
-        row_id: RowID,
-        key: Vec<Val>,
-    ) {
-        // `sidecar_pos` is produced by iterating this same active-index vector,
-        // so it must still address the corresponding entry.
-        let active = self
-            .indexes
-            .get_mut(sidecar_pos)
-            .unwrap_or_else(|| {
-                panic!(
-                    "secondary checkpoint sidecar position missing: sidecar_pos={sidecar_pos}, index={index}, row_id={row_id}"
-                )
-            });
-        assert_eq!(
-            active.index, index,
-            "secondary checkpoint sidecar identity changed: sidecar_pos={sidecar_pos}, index={index}, row_id={row_id}"
-        );
-        active.sidecar.add_delete(key, row_id);
     }
 }
 
@@ -1341,53 +1162,17 @@ pub(crate) fn prepare_checkpoint_table_operation(
     )
 }
 
-#[inline]
-fn normalize_unique_puts(puts: &mut Vec<EncodedRowEntry>) {
-    puts.sort_by(|left, right| left.key.cmp(&right.key));
-    let mut normalized: Vec<EncodedRowEntry> = Vec::with_capacity(puts.len());
-    for entry in puts.drain(..) {
-        if let Some(last) = normalized.last_mut()
-            && last.key == entry.key
-        {
-            last.row_id = entry.row_id;
-            continue;
-        }
-        normalized.push(entry);
-    }
-    *puts = normalized;
-}
-
-fn normalize_unique_deletes(deletes: &mut Vec<EncodedRowEntry>, puts: &[EncodedRowEntry]) {
-    deletes.sort_by(|left, right| {
-        left.key
-            .cmp(&right.key)
-            .then(left.row_id.cmp(&right.row_id))
-    });
-    deletes.dedup();
-    deletes.retain(|delete| {
-        puts.binary_search_by(|put| put.key.as_slice().cmp(delete.key.as_slice()))
-            .is_err()
-    });
-}
-
-fn normalize_encoded_keys(keys: &mut Vec<Vec<u8>>) {
-    keys.sort();
-    keys.dedup();
-}
-
 fn validate_reachable_block(root: &ActiveRoot, block_id: BlockID) -> DataIntegrityResult<()> {
     let idx = usize::from(block_id);
     if idx >= root.alloc_map.len() {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
             "invalid table-root reachable block: root_ts={}, block_id={block_id}, alloc_map_len={}",
-            root.root_ts,
-            root.alloc_map.len()
+            root.root_ts, root.alloc_map.len()
         )));
     }
     if !root.alloc_map.is_allocated(idx) {
         return Err(Report::new(DataIntegrityError::InvalidRootInvariant).attach(format!(
-            "invalid table-root reachable block: root_ts={}, block_id={block_id}, allocation bit is not set",
-            root.root_ts
+            "invalid table-root reachable block: root_ts={}, block_id={block_id}, allocation bit is not set", root.root_ts
         )));
     }
     Ok(())
@@ -1503,7 +1288,7 @@ impl Table {
         &self,
         mutable_file: &mut MutableTableFile,
         metadata: &TableMetadata,
-        secondary_sidecar: &mut SecondaryCheckpointSidecar,
+        secondary_sidecar: &mut CheckpointIndexSources,
         cutoff_ts: TrxID,
         checkpoint_ts: TrxID,
         disk_guard: &PoolGuard,
@@ -1564,7 +1349,7 @@ impl Table {
                 .into());
         }
 
-        // Step 3: group selected logical RowIDs by their persisted block.
+        // Step 3: resolve and process each contiguous block slice once.
         let column_index = ColumnBlockIndex::new(
             column_block_index_root,
             pivot_row_id,
@@ -1574,137 +1359,74 @@ impl Table {
             disk_guard,
         );
 
-        let mut groups: Vec<BlockPatchGroup> = Vec::new();
-        let mut pending_deltas = Vec::new();
-        let mut cached_entry: Option<ColumnLeafEntry> = None;
-        for row_id in selected_row_ids {
-            let entry = if let Some(entry) = cached_entry
-                && row_id >= entry.start_row_id
-                && row_id < entry.end_row_id()
-            {
-                entry
-            } else {
-                let Some(entry) = column_index.locate_block(row_id).await? else {
-                    // The marker is in [previous_cutoff, current_cutoff), so it is
-                    // eligible now. A missing locate_block result means we cannot
-                    // prove the delete is already durable; do not advance the cutoff.
-                    return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                        .attach(format!(
-                            "eligible delete marker cannot be located: row_id={row_id}"
-                        ))
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!(
-                            "operation=apply_deletion_checkpoint, phase=locate_delete_marker, table_id={}, row_id={row_id}",
-                            self.table_id()
-                        ))
-                        .into());
-                };
-                cached_entry = Some(entry);
-                entry
-            };
-            let delta_u64 = row_id
-                .checked_sub(entry.start_row_id)
-                .ok_or_else(|| Report::new(DataIntegrityError::InvalidRootInvariant))
-                .attach_with(|| {
-                    format!(
-                        "delete marker precedes block start: row_id={row_id}, start_row_id={}",
-                        entry.start_row_id
-                    )
-                })
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach_with(|| {
-                    format!(
-                        "operation=apply_deletion_checkpoint, phase=calculate_delete_delta, table_id={}, row_id={row_id}",
-                        self.table_id()
-                    )
-                })?;
-            if delta_u64 > u32::MAX as u64 {
-                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                    .attach(format!(
-                        "delete marker delta exceeds u32: delta={delta_u64}, row_id={row_id}, start_row_id={}",
-                        entry.start_row_id
-                    ))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach(format!(
-                        "operation=apply_deletion_checkpoint, phase=validate_delete_delta, table_id={}, row_id={row_id}",
-                        self.table_id()
-                    ))
-                    .into());
-            }
-            let delta = delta_u64 as u32;
-            if let Some(group) = groups
-                .last_mut()
-                .filter(|group| group.entry.start_row_id == entry.start_row_id)
-            {
-                pending_deltas.push(delta);
-                group.pending_end = pending_deltas.len();
-            } else {
-                let pending_start = pending_deltas.len();
-                pending_deltas.push(delta);
-                groups.push(BlockPatchGroup {
-                    entry,
-                    pending_start,
-                    pending_end: pending_deltas.len(),
-                });
-            }
-        }
-        // A selected marker either failed validation above or contributed one
-        // delta to a patch group, so a successful non-empty selection cannot
-        // produce an empty rewrite batch.
-        assert!(
-            !groups.is_empty(),
-            "delete marker selection produced no column-index patch groups: table_id={}",
-            self.table_id()
-        );
-
-        // Step 4: translate markers once and merge compact physical ordinals.
+        let capture_secondary = metadata.idx.active_index_count() != 0;
         let mut patch_storage: Vec<(RowID, OrdinalDeletionSet)> = Vec::new();
-        for group in groups {
-            let pending = &pending_deltas[group.pending_start..group.pending_end];
-            let (identity, base) = column_index
-                .load_entry_identity_and_deletions(&group.entry)
-                .await?;
-            let mut new_ordinals = Vec::with_capacity(pending.len());
-            for delta in pending {
-                let ordinal = identity.as_ref().ordinal_for_delta(*delta).ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidPayload)
-                        .attach(format!("delete marker is absent from physical identity: start_row_id={}, delta={delta}", group.entry.start_row_id))
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!("operation=apply_deletion_checkpoint, table_id={}", self.table_id()))
-                })?;
-                if !base.contains(ordinal) {
-                    new_ordinals.push(ordinal);
+        let mut selected = selected_row_ids.as_slice();
+        // Scratch is bounded by one block's physical row count and reused.
+        // Only captured descriptors retain pairs across blocks, under admission.
+        let mut new_rows = Vec::new();
+        let mut merged = Vec::new();
+        while let Some(&first_row_id) = selected.first() {
+            let Some(context) = column_index.locate_deletion_context(first_row_id).await? else {
+                // An eligible marker must resolve even if it falls inside a
+                // sparse coverage range. Otherwise its redo cannot be skipped.
+                return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
+                    .attach(format!("eligible delete marker cannot be located: row_id={first_row_id}"))
+                    .change_context(RuntimeError::CheckpointExecution)
+                    .attach(format!("operation=apply_deletion_checkpoint, phase=locate_delete_marker, table_id={}", self.table_id()))
+                    .into());
+            };
+            let entry = context.entry;
+            let mut end = 1;
+            while end < selected.len() && selected[end] < entry.end_row_id() {
+                end += 1;
+            }
+            let (pending, remaining) = selected.split_at(end);
+            selected = remaining;
+            new_rows.clear();
+            for (position, &row_id) in pending.iter().enumerate() {
+                let ordinal = if position == 0 {
+                    context.ordinal
+                } else {
+                    let delta = row_id
+                        .checked_sub(entry.start_row_id)
+                        .and_then(|delta| u32::try_from(delta).ok());
+                    delta.and_then(|delta| context.identity.as_ref().ordinal_for_delta(delta))
+                        .ok_or_else(|| {
+                            Report::new(DataIntegrityError::InvalidPayload)
+                                .attach(format!("delete marker is absent from physical identity: start_row_id={}, row_id={row_id}", entry.start_row_id))
+                                .change_context(RuntimeError::CheckpointExecution)
+                                .attach(format!("operation=apply_deletion_checkpoint, table_id={}", self.table_id()))
+                        })?
+                };
+                if !context.deletions.contains(ordinal) {
+                    new_rows.push((ordinal, row_id));
                 }
             }
-            if new_ordinals.is_empty() {
+            if new_rows.is_empty() {
                 continue;
             }
-            self.collect_deleted_secondary_sidecar(
-                &group.entry,
-                &identity,
-                &new_ordinals,
-                metadata,
-                secondary_sidecar,
-                disk_guard,
-            )
-            .await?;
-            let mut merged = Vec::with_capacity(base.len() + new_ordinals.len());
-            let mut previous = base.iter().peekable();
-            for ordinal in new_ordinals {
+            if capture_secondary {
+                secondary_sidecar.capture_deletes(entry, &new_rows)?;
+            }
+            merged.clear();
+            merged.reserve(context.deletions.len() + new_rows.len());
+            let mut previous = context.deletions.iter().peekable();
+            for &(ordinal, _) in &new_rows {
                 while previous.peek().is_some_and(|old| *old < ordinal) {
                     merged.extend(previous.next());
                 }
                 merged.push(ordinal);
             }
             merged.extend(previous);
-            let deletions = OrdinalDeletionSet::from_ordinals(group.entry.row_count(), &merged)
+            let deletions = OrdinalDeletionSet::from_ordinals(entry.row_count(), &merged)
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach(format!(
                     "operation=encode_checkpoint_deletions, table_id={}, start_row_id={}",
                     self.table_id(),
-                    group.entry.start_row_id
+                    entry.start_row_id
                 ))?;
-            patch_storage.push((group.entry.start_row_id, deletions));
+            patch_storage.push((entry.start_row_id, deletions));
         }
         if patch_storage.is_empty() {
             if cutoff_advanced {
@@ -1714,7 +1436,7 @@ impl Table {
             return Ok(());
         }
 
-        // Step 5: apply typed delete rewrites and advance the index root in the mutable file.
+        // Step 4: apply typed delete rewrites and advance the index root in the mutable file.
         let patches: Vec<ColumnDeletionPatch<'_>> = patch_storage
             .iter()
             .map(|(start_row_id, deletions)| ColumnDeletionPatch {
@@ -1730,184 +1452,85 @@ impl Table {
         Ok(())
     }
 
-    async fn apply_secondary_checkpoint_sidecar(
-        &self,
+    async fn apply_secondary_checkpoint_sidecar<S: SessionRuntimeAccess + ?Sized>(
+        self: &Arc<Self>,
         mutable_file: &mut MutableTableFile,
-        layout: &TableRuntimeLayout,
-        sidecar: &mut SecondaryCheckpointSidecar,
+        layout: &Arc<TableRuntimeLayout>,
+        sources: Arc<CheckpointIndexSources>,
         checkpoint_ts: TrxID,
-        disk_guard: &PoolGuard,
+        session: &S,
         #[cfg(test)] maintenance_test: &MaintenanceTestController,
     ) -> RuntimeOrFatalResult<()> {
-        let metadata = layout.metadata();
-        sidecar.assert_matches_layout(layout);
-        if sidecar.is_empty() {
+        if sources.is_empty() || layout.active_secondary_indexes().next().is_none() {
+            #[cfg(feature = "profiling")]
+            sources.admission.measure(|m| {
+                let count = layout.active_secondary_indexes().count() as u64;
+                m.no_work += count;
+            });
             return Ok(());
         }
-        // Apply secondary-index checkpoint work against the same mutable table
-        // file fork as LWC and delete metadata. A later error abandons the
-        // fork, so no secondary root can be published on its own.
         #[cfg(test)]
         test_hooks::maybe_force_secondary_sidecar_error(maintenance_test)?;
-
-        if mutable_file.secondary_index_slots().len() != metadata.idx.index_slot_count() {
+        if mutable_file.secondary_index_slots().len() != layout.metadata().idx.index_slot_count() {
             return Err(Report::new(DataIntegrityError::InvalidRootInvariant)
-                .attach(format!(
-                    "secondary root count mismatch: root_count={}, index_slot_count={}",
-                    mutable_file.secondary_index_slots().len(),
-                    metadata.idx.index_slot_count()
-                ))
+                .attach("checkpoint secondary root count differs from pinned layout")
                 .change_context(RuntimeError::CheckpointExecution)
-                .attach(format!(
-                    "operation=apply_secondary_checkpoint_sidecar, table_id={}",
-                    self.table_id()
-                ))
                 .into());
         }
-
-        for active in &mut sidecar.indexes {
-            let index = active.index;
-            // The sidecar is built directly from this immutable metadata
-            // snapshot, so each recorded active index must still exist.
-            metadata.idx.expect_index_spec(index);
-            let index_sidecar = &mut active.sidecar;
-            index_sidecar.normalize();
-            if !index_sidecar.has_work() {
+        for (index, secondary) in layout.active_secondary_indexes() {
+            #[cfg(test)]
+            if maintenance_test.secondary_failure_slot(index.slot().as_usize()) {
+                return Err(Report::new(RuntimeError::CheckpointExecution)
+                    .attach("injected later secondary-index failure")
+                    .into());
+            }
+            let runs = sources
+                .extract(
+                    self.clone(),
+                    layout.clone(),
+                    session.pool_guards().clone(),
+                    index,
+                    &session.engine().thread_pool,
+                    session.engine().checkpoint_build_policy.max_workers,
+                )
+                .await?;
+            if runs.runs().is_empty() {
+                #[cfg(feature = "profiling")]
+                sources.admission.measure(|m| {
+                    m.no_work += 1;
+                });
                 continue;
             }
             let old_root = mutable_file.secondary_index_root(index.slot());
-            let runtime = layout.expect_secondary_index(index).disk_runtime();
-            let new_root = match index_sidecar {
-                SecondaryIndexSidecar::Unique { puts, deletes, .. } => {
-                    // Use one writer per affected index so same-run puts and
-                    // conditional deletes produce a single new DiskTree root.
-                    let tree = runtime.open_unique_at(old_root, disk_guard)?;
-                    let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
-                    let put_entries = puts
-                        .iter()
-                        .map(|entry| UniqueDiskTreeEncodedPut {
-                            key: &entry.key,
-                            row_id: entry.row_id,
-                        })
-                        .collect::<Vec<_>>();
-                    writer.batch_put_encoded(&put_entries);
-                    // Deletes for keys with same-run puts were filtered during
-                    // accumulation; remaining deletes must still match the old
-                    // checkpointed owner before removing the key.
-                    let delete_entries = deletes
-                        .iter()
-                        .map(|entry| UniqueDiskTreeEncodedDelete {
-                            key: &entry.key,
-                            expected_old_row_id: entry.row_id,
-                        })
-                        .collect::<Vec<_>>();
-                    writer.batch_conditional_delete_encoded(&delete_entries);
-                    writer.finish().await?
-                }
-                SecondaryIndexSidecar::NonUnique {
-                    inserts, deletes, ..
-                } => {
-                    // Non-unique roots are exact-entry sets. Inserts and
-                    // deletes are independent facts keyed by (key, row_id).
-                    let tree = runtime.open_non_unique_at(old_root, disk_guard)?;
-                    let mut writer = tree.batch_writer(mutable_file, checkpoint_ts);
-                    let insert_entries = inserts
-                        .iter()
-                        .map(|key| NonUniqueDiskTreeEncodedExact { key })
-                        .collect::<Vec<_>>();
-                    let delete_entries = deletes
-                        .iter()
-                        .map(|key| NonUniqueDiskTreeEncodedExact { key })
-                        .collect::<Vec<_>>();
-                    writer.batch_insert_encoded(&insert_entries)?;
-                    writer.batch_exact_delete_encoded(&delete_entries)?;
-                    writer.finish().await?
-                }
+            let runtime = secondary.disk_runtime();
+            let disk_guard = session.pool_guards().disk_guard();
+            let new_root = if layout.metadata().idx.expect_index_spec(index).unique() {
+                IndexCheckpoint::new(
+                    &runtime.open_unique_at(old_root, disk_guard)?,
+                    mutable_file,
+                    Arc::new(runs),
+                    checkpoint_ts,
+                    session.engine().thread_pool.clone(),
+                    sources.admission.clone(),
+                )
+                .apply()
+                .await?
+            } else {
+                IndexCheckpoint::new(
+                    &runtime.open_non_unique_at(old_root, disk_guard)?,
+                    mutable_file,
+                    Arc::new(runs),
+                    checkpoint_ts,
+                    session.engine().thread_pool.clone(),
+                    sources.admission.clone(),
+                )
+                .apply()
+                .await?
             };
+            // Every index remains private until the enclosing checkpoint commits.
+            // Dropping runs here releases keys before extracting the next index.
             if new_root != old_root {
-                // The root update stays private to mutable_file until the
-                // final table-file commit publishes every checkpoint change.
                 mutable_file.set_secondary_index_root(index.slot(), new_root);
-            }
-        }
-        Ok(())
-    }
-
-    async fn collect_deleted_secondary_sidecar(
-        &self,
-        entry: &ColumnLeafEntry,
-        identity: &EncodedRowSet,
-        ordinals: &[u16],
-        metadata: &TableMetadata,
-        secondary_sidecar: &mut SecondaryCheckpointSidecar,
-        disk_guard: &PoolGuard,
-    ) -> RuntimeOrFatalResult<()> {
-        if secondary_sidecar.indexes.is_empty() || ordinals.is_empty() {
-            return Ok(());
-        }
-
-        if identity.row_count() != usize::from(entry.row_count()) {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach("deletion identity physical count mismatch")
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach(format!(
-                    "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={}",
-                    self.table_id(),
-                    entry.block_id()
-                ))
-                .into());
-        }
-
-        // Decode the persisted LWC block once for this block group, then derive
-        // all secondary delete keys from the selected row indexes.
-        let file_kind = self.file().file_kind();
-        let block_id = entry.block_id();
-        let persisted = self.storage.load_lwc_block(disk_guard, block_id).await?;
-        let block = persisted.block();
-        if block.row_count() != identity.row_count()
-            || block.block_binding_value() != entry.block_binding_value()
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!(
-                    "LWC block metadata mismatch: block_id={}, block_row_count={}, expected_row_count={}, block_binding_value={}, expected_binding_value={}",
-                    entry.block_id(),
-                    block.row_count(),
-                    identity.row_count(),
-                    block.block_binding_value(),
-                    entry.block_binding_value()
-                ))
-                .change_context(RuntimeError::CheckpointExecution)
-                .attach(format!(
-                    "operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}",
-                    self.table_id()
-                )).into());
-        }
-
-        for ordinal in ordinals {
-            let delta = identity.as_ref().delta_for_ordinal(*ordinal).ok_or_else(|| {
-                Report::new(DataIntegrityError::InvalidPayload)
-                    .attach(format!("deletion ordinal {ordinal} exceeds physical identity"))
-                    .change_context(RuntimeError::CheckpointExecution)
-                    .attach(format!("operation=collect_deleted_secondary_sidecar, table_id={}, block_id={block_id}", self.table_id()))
-            })?;
-            // Validated identity coverage cannot overflow its original RowID bounds.
-            let row_id = entry.start_row_id + u64::from(delta);
-            let row_idx = usize::from(*ordinal);
-            for sidecar_pos in 0..secondary_sidecar.indexes.len() {
-                let (index, key) = {
-                    let active = &secondary_sidecar.indexes[sidecar_pos];
-                    let key = block
-                        .decode_row_values(metadata.col.as_ref(), row_idx, active.key_cols.as_ref())
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach_with(|| {
-                            format!(
-                                "operation=collect_deleted_secondary_sidecar, table_id={}, file={file_kind}, block=lwc_block, block_id={block_id}, row_idx={row_idx}",
-                                self.table_id()
-                            )
-                        })?;
-                    (active.index, key)
-                };
-                secondary_sidecar.add_deleted_key_at(sidecar_pos, index, row_id, key);
             }
         }
         Ok(())
@@ -2368,7 +1991,7 @@ impl Table {
 
     /// Execute one checkpoint with caller-prepared workflow/root authority.
     async fn checkpoint_prepared<S>(
-        &self,
+        self: &Arc<Self>,
         session: &S,
         attempt: PreparedCheckpointAttempt,
     ) -> RuntimeOrFatalResult<CheckpointOutcome>
@@ -2478,7 +2101,7 @@ mod tests {
         StorageColumnSpec, StorageTableSpec, TableCache,
     };
     use crate::completion::{Completion, CompletionTake};
-    use crate::conf::{RecoveryConfig, TrxSysConfig};
+    use crate::conf::{CheckpointIndexBuildConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
         Error, FatalError, IoError, LifecycleError, ResourceError, RuntimeError,
@@ -2540,7 +2163,7 @@ mod tests {
         NON_FOREGROUND_STMT_NO, PrepareListenerResult, SessionOperationEntry,
         SessionOperationState,
     };
-    use crate::value::{ValKind, ValType};
+    use crate::value::{Val, ValKind};
     use futures::FutureExt;
     use smol::future::yield_now;
     use std::cmp::Ordering;
@@ -3436,88 +3059,6 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect normalization of overlapping unique-index checkpoint changes.
-    /// Expected: The latest put wins per key and suppresses conflicting deletes while output
-    /// stays ordered.
-    #[test]
-    fn test_unique_sidecar_normalize_keeps_latest_put_and_suppresses_delete() {
-        let mut puts = vec![
-            EncodedRowEntry {
-                key: b"b".to_vec(),
-                row_id: RowID::new(20),
-            },
-            EncodedRowEntry {
-                key: b"a".to_vec(),
-                row_id: RowID::new(10),
-            },
-            EncodedRowEntry {
-                key: b"a".to_vec(),
-                row_id: RowID::new(11),
-            },
-        ];
-        let mut deletes = vec![
-            EncodedRowEntry {
-                key: b"a".to_vec(),
-                row_id: RowID::new(9),
-            },
-            EncodedRowEntry {
-                key: b"c".to_vec(),
-                row_id: RowID::new(30),
-            },
-            EncodedRowEntry {
-                key: b"c".to_vec(),
-                row_id: RowID::new(30),
-            },
-        ];
-
-        normalize_unique_puts(&mut puts);
-        normalize_unique_deletes(&mut deletes, &puts);
-
-        assert_eq!(
-            puts,
-            vec![
-                EncodedRowEntry {
-                    key: b"a".to_vec(),
-                    row_id: RowID::new(11),
-                },
-                EncodedRowEntry {
-                    key: b"b".to_vec(),
-                    row_id: RowID::new(20),
-                },
-            ]
-        );
-        assert_eq!(
-            deletes,
-            vec![EncodedRowEntry {
-                key: b"c".to_vec(),
-                row_id: RowID::new(30),
-            }]
-        );
-    }
-
-    /// Purpose: Protect normalization of duplicate nonunique-index checkpoint changes.
-    /// Expected: Exact-key deletes override inserts and normalized entries are sorted and
-    /// deduplicated.
-    #[test]
-    fn test_non_unique_sidecar_normalize_delete_wins_exact_key() {
-        let mut sidecar = SecondaryIndexSidecar::NonUnique {
-            encoder: BTreeKeyEncoder::new(vec![ValType::new(ValKind::U8, false)]),
-            inserts: vec![b"b".to_vec(), b"a".to_vec(), b"b".to_vec()],
-            deletes: vec![b"c".to_vec(), b"b".to_vec(), b"b".to_vec()],
-        };
-
-        sidecar.normalize();
-
-        let SecondaryIndexSidecar::NonUnique {
-            inserts, deletes, ..
-        } = sidecar
-        else {
-            panic!("expected non-unique sidecar");
-        };
-        assert_eq!(inserts, vec![b"a".to_vec()]);
-        assert_eq!(deletes, vec![b"b".to_vec(), b"c".to_vec()]);
-    }
-
     /// Purpose: Protect durable checkpointing of committed cold deletion markers.
     /// Expected: The deletion cutoff advances and the affected block records the delete
     /// without changing row coverage.
@@ -4366,14 +3907,19 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect prepared deletion bitmaps for tables without secondary indexes.
-    /// Expected: Checkpoint publishes surviving cold rows and omits deleted rows without
-    /// requiring index sidecars.
+    /// Purpose: Protect prepared deletion bitmaps for indexless tables with no room for input allocation.
+    /// Expected: Independent construction budgets permit publication of surviving cold rows while omitting deleted rows without requiring index sidecars.
     #[test]
     fn test_checkpoint_prepared_bitmap_without_secondary_indexes() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "checkpoint-no-index").await;
+            let checkpoint = CheckpointIndexBuildConfig::default().max_input_bytes(1);
+            let engine = Engine::bootstrap(
+                lightweight_test_engine_config(temp_dir.path(), "checkpoint-no-index")
+                    .checkpoint_index_build(checkpoint),
+            )
+            .await
+            .unwrap();
             let mut ddl_session = engine.new_session().unwrap();
             let table_id = ddl_session
                 .create_table(
@@ -4460,6 +4006,337 @@ mod tests {
         });
     }
 
+    /// Purpose: Skip secondary-delete capture after all indexes are dropped while allocated slots remain.
+    /// Expected: Descriptor admission is never attempted, durable deletions advance, and restart retains the deleted row and inactive slots.
+    #[test]
+    fn deletion_checkpoint_skips_retired_index_slots() {
+        use crate::index::build::fail_build_budget;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "delete_retired").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            insert_rows(table_id, &mut session, 0, 8, "name").await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            expect_delete_committed(table_id, &mut session, &single_key(0i32)).await;
+            session
+                .drop_index(table_id, crate::IndexID::new(0))
+                .await
+                .unwrap();
+            session
+                .wait_for_gc_horizon_after(session.last_cts())
+                .await
+                .unwrap();
+            wait_for_checkpoint_root_ready(&mut session, table_id).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            assert_eq!(layout.metadata().idx.index_slot_count(), 1);
+            assert_eq!(layout.metadata().idx.active_index_count(), 0);
+            let guards = session.pool_guards();
+            let cutoff = TrxID::new(session.last_cts().as_u64() + 1);
+            let mut sources =
+                CheckpointIndexSources::new(engine.inner().checkpoint_build_policy, cutoff)
+                    .unwrap();
+            let retained = sources.budget.used();
+            fail_build_budget(&sources.budget, "checkpoint delete descriptors");
+            let mut mutable = test_mutable_table_file(&engine, &table, &guards);
+            table
+                .apply_deletion_checkpoint(
+                    &mut mutable,
+                    layout.metadata(),
+                    &mut sources,
+                    cutoff,
+                    cutoff,
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap();
+            assert!(sources.is_empty());
+            assert_eq!(sources.budget.used(), retained);
+            assert_eq!(mutable.root().deletion_cutoff_ts, cutoff);
+            drop(mutable);
+            drop(sources);
+            assert_checkpoint_published(&mut session, table_id).await;
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_i32s(&mut reader, table_id).await,
+                (1..8).collect::<Vec<_>>()
+            );
+            reader.commit().await.unwrap();
+            drop(layout);
+            drop(table);
+            drop(guards);
+            drop(session);
+            engine.shutdown();
+            let recovered = Engine::bootstrap(lightweight_test_engine_config(
+                temp.path(),
+                "delete_retired",
+            ))
+            .await
+            .unwrap();
+            let mut session = recovered.new_session().unwrap();
+            let table = table_for_internal_assertion(&recovered, table_id);
+            assert_eq!(table.metadata().idx.index_slot_count(), 1);
+            assert_eq!(table.metadata().idx.active_index_count(), 0);
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(
+                scan_table_i32s(&mut reader, table_id).await,
+                (1..8).collect::<Vec<_>>()
+            );
+            reader.commit().await.unwrap();
+        });
+    }
+
+    /// Purpose: Process sparse block slices without losing durable ordinals or accepting covered gaps.
+    /// Expected: Existing deletes are retained, both blocks can become fully deleted without renumbering, and a later gap leaves the staged root and cutoff unchanged.
+    #[test]
+    fn deletion_checkpoint_streams_sparse_block_slices() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "delete_slices").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            session
+                .drop_index(table_id, crate::IndexID::new(0))
+                .await
+                .unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let guards = session.pool_guards();
+            let mut mutable = test_mutable_table_file(&engine, &table, &guards);
+            // This metadata-only fixture deliberately has no backing LWC data:
+            // with no active index, deletion application must not read values.
+            let entries: Vec<_> = [(10, [11, 14, 18]), (20, [20, 24, 29])]
+                .into_iter()
+                .map(|(start, rows)| {
+                    let rows = rows.map(RowID::new);
+                    ColumnBlockEntryShape::new(
+                        table_id,
+                        RowID::new(start),
+                        RowID::new(start + 10),
+                        &rows,
+                        &[],
+                    )
+                    .unwrap()
+                    .with_block_id(BlockID::new(1000 + start))
+                })
+                .collect();
+            let empty = ColumnBlockIndex::new(
+                SUPER_BLOCK_ID,
+                RowID::new(0),
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                guards.disk_guard(),
+            );
+            let root = empty
+                .batch_insert(&mut mutable, &entries, RowID::new(30), session.last_cts())
+                .await
+                .unwrap();
+            let index = ColumnBlockIndex::new(
+                root,
+                RowID::new(30),
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                guards.disk_guard(),
+            );
+            let root = index
+                .batch_replace_deletions(
+                    &mut mutable,
+                    &[ColumnDeletionPatch {
+                        start_row_id: RowID::new(10),
+                        deletions: &OrdinalDeletionSet::from_ordinals(3, &[0]).unwrap(),
+                    }],
+                    session.last_cts(),
+                )
+                .await
+                .unwrap();
+            mutable.set_column_block_index_root(root);
+            mutable.apply_checkpoint_metadata(RowID::new(30), session.last_cts());
+            let marker_ts = session.last_cts();
+            let cutoff = TrxID::new(marker_ts.as_u64() + 1);
+            for id in [11, 14, 20, 29] {
+                table
+                    .deletion_buffer()
+                    .put_committed(RowID::new(id), marker_ts)
+                    .unwrap();
+            }
+            let mut sources =
+                CheckpointIndexSources::new(engine.inner().checkpoint_build_policy, cutoff)
+                    .unwrap();
+            table
+                .apply_deletion_checkpoint(
+                    &mut mutable,
+                    layout.metadata(),
+                    &mut sources,
+                    cutoff,
+                    cutoff,
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap();
+            assert!(sources.is_empty());
+            let root = mutable.root().column_block_index_root;
+            let index = ColumnBlockIndex::new(
+                root,
+                RowID::new(30),
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                guards.disk_guard(),
+            );
+            for (id, expected) in [(11, vec![0, 1]), (20, vec![0, 2])] {
+                let context = index
+                    .locate_deletion_context(RowID::new(id))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.deletions.iter().collect::<Vec<_>>(), expected);
+                assert_eq!(context.identity.row_count(), 3);
+            }
+            for id in [18, 24, 25] {
+                table
+                    .deletion_buffer()
+                    .put_committed(RowID::new(id), cutoff)
+                    .unwrap();
+            }
+            let next = TrxID::new(cutoff.as_u64() + 1);
+            let error = table
+                .apply_deletion_checkpoint(
+                    &mut mutable,
+                    layout.metadata(),
+                    &mut sources,
+                    next,
+                    next,
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap_err();
+            let RuntimeOrFatalError::Runtime(error) = error else {
+                panic!("expected invalid sparse identity");
+            };
+            assert_eq!(
+                error.downcast_ref::<DataIntegrityError>(),
+                Some(&DataIntegrityError::InvalidPayload)
+            );
+            assert_eq!(mutable.root().column_block_index_root, root);
+            assert_eq!(mutable.root().deletion_cutoff_ts, cutoff);
+            table.deletion_buffer().remove(RowID::new(25));
+            table
+                .apply_deletion_checkpoint(
+                    &mut mutable,
+                    layout.metadata(),
+                    &mut sources,
+                    next,
+                    next,
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap();
+            let index = ColumnBlockIndex::new(
+                mutable.root().column_block_index_root,
+                RowID::new(30),
+                table.file().file_kind(),
+                table.file().sparse_file(),
+                table.disk_pool(),
+                guards.disk_guard(),
+            );
+            for (id, ordinal) in [(11, 0), (14, 1), (18, 2), (20, 0), (24, 1), (29, 2)] {
+                let context = index
+                    .locate_deletion_context(RowID::new(id))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(context.ordinal, ordinal);
+                assert_eq!(context.deletions.iter().collect::<Vec<_>>(), [0, 1, 2]);
+                assert_eq!(context.identity.row_count(), 3);
+            }
+        });
+    }
+
+    /// Purpose: Enforce LWC count and binding validation after delete capture moves to metadata only.
+    /// Expected: Structurally valid mismatched blocks fail in extraction with a typed integrity cause, drain workers, and leave every published root and cutoff unchanged.
+    #[test]
+    fn deletion_extraction_rejects_mismatched_lwc_metadata() {
+        use crate::file::cow_file::tests::rewrite_page_with_checksum;
+        smol::block_on(async {
+            for wrong_count in [false, true] {
+                let temp = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp, "delete_binding").await;
+                let table_id = create_table2_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                insert_rows(table_id, &mut session, 0, 8, "name").await;
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let row_id =
+                    unique_disk_tree_lookup(&table, &session.pool_guards(), &single_key(0i32))
+                        .await
+                        .unwrap();
+                let snapshot = column_block_index_snapshot(&engine, table_id);
+                let guards = session.pool_guards();
+                let context = snapshot
+                    .index(guards.disk_guard())
+                    .locate_deletion_context(row_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                expect_delete_committed(table_id, &mut session, &single_key(0i32)).await;
+                session
+                    .wait_for_gc_horizon_after(session.last_cts())
+                    .await
+                    .unwrap();
+                wait_for_checkpoint_root_ready(&mut session, table_id).await;
+                let mut builder = LwcBuilder::new(table.metadata().col.clone());
+                let count = usize::from(context.entry.row_count()) + usize::from(wrong_count);
+                for id in 0..count {
+                    assert!(builder.append_row_values(
+                        RowID::new(id as u64),
+                        &[Val::from(id as i32), Val::from("name")]
+                    ));
+                }
+                let binding = context.entry.block_binding_value() ^ u64::from(!wrong_count);
+                let replacement = builder.build(binding).unwrap();
+                rewrite_page_with_checksum(
+                    engine.inner().table_fs.user_table_file_path(table_id),
+                    context.entry.block_id(),
+                    |page| {
+                        page.copy_from_slice(replacement.data());
+                    },
+                );
+                let _ = table.disk_pool().invalidate_block(
+                    guards.disk_guard(),
+                    table.file().sparse_file().file_id(),
+                    context.entry.block_id(),
+                );
+                // The block itself is valid; only its association with the
+                // captured column-index entry is wrong.
+                let persisted = table
+                    .storage
+                    .load_lwc_block(guards.disk_guard(), context.entry.block_id())
+                    .await
+                    .unwrap();
+                assert_eq!(persisted.block().row_count(), count);
+                assert_eq!(persisted.block().block_binding_value(), binding);
+                drop(persisted);
+                let before = table.file().active_root_unchecked().clone();
+                let error = session.checkpoint_table(table_id).await.unwrap_err();
+                assert_eq!(
+                    error.report().downcast_ref::<DataIntegrityError>(),
+                    Some(&DataIntegrityError::InvalidPayload)
+                );
+                assert!(
+                    format!("{:?}", error.report())
+                        .contains("operation=extract_checkpoint_deletes")
+                );
+                assert_root_metadata_unchanged(&before, &table);
+                assert!(!session.in_trx().unwrap());
+            }
+        });
+    }
+
     /// Purpose: Protect disk-index maintenance during deletion-only checkpointing.
     /// Expected: Unique and nonunique disk indexes remove deleted owners and retain surviving
     /// rows.
@@ -4533,18 +4410,18 @@ mod tests {
 
     /// Purpose: Protect checkpoint overlap between deletion and reinsertion of the same unique
     /// key.
-    /// Expected: The resulting disk tree retains the replacement row as the key owner.
+    /// Expected: The unique tree retains the new owner and nonunique exact identities remove only the old RowID.
     #[test]
     fn test_unique_checkpoint_overlap_keeps_new_disk_tree_owner() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "redo_testsys_lightweight").await;
-            let table_id = create_table2_for_test(&engine).await;
+            let table_id = create_non_unique_name_table_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             let old_row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("old")],
+                vec![Val::from(1i32), Val::from("same")],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4561,7 +4438,7 @@ mod tests {
             let new_row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("new")],
+                vec![Val::from(1i32), Val::from("same")],
             )
             .await;
 
@@ -4587,11 +4464,163 @@ mod tests {
                 .await,
                 Some(new_row_id)
             );
+            assert_ne!(old_row_id, new_row_id);
+            assert_eq!(
+                non_unique_disk_tree_prefix_scan(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &name_key("same"),
+                )
+                .await,
+                vec![new_row_id],
+                "real put and delete producers share a logical key but have disjoint exact RowID identities"
+            );
         });
     }
 
-    /// Purpose: Protect root publication when secondary-index sidecar construction fails.
-    /// Expected: The deletion cutoff and column and secondary index roots remain unchanged.
+    /// Purpose: Cover unique-index creation after historical cold deletes followed by deletion of the surviving same-key owner.
+    /// Expected: One real delete run retains historical and matching owners, and reconciliation removes the unique key while preserving unrelated rows.
+    #[test]
+    fn test_checkpoint_unique_index_created_after_duplicate_cold_deletes() {
+        use crate::catalog::{StorageIndexFlags, StorageIndexKey, StorageIndexSpec};
+        use crate::index::build::RunKind;
+
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "checkpoint_historical_duplicate").await;
+            let table_id = create_table2_for_test(&engine).await;
+            let mut session = engine.new_session().unwrap();
+            let mut deleted_rows = Vec::new();
+            for id in [1i32, 2, 3] {
+                deleted_rows.push(
+                    insert_one_row(
+                        table_id,
+                        &mut session,
+                        vec![Val::from(id), Val::from("duplicate")],
+                    )
+                    .await,
+                );
+            }
+            let kept_row = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(4i32), Val::from("kept")],
+            )
+            .await;
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let previous_cutoff = table.file().active_root_unchecked().deletion_cutoff_ts;
+            for id in [1i32, 3] {
+                expect_delete_committed(table_id, &mut session, &single_key(id)).await;
+            }
+            let index_id = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                table.file().active_root_unchecked().deletion_cutoff_ts,
+                previous_cutoff,
+                "CREATE must leave the historical cold deletes pending"
+            );
+            expect_delete_committed(table_id, &mut session, &single_key(2i32)).await;
+            session
+                .wait_for_gc_horizon_after(session.last_cts())
+                .await
+                .unwrap();
+            let cutoff = engine.inner().trx_sys.published_gc_horizon();
+            let guards = session.pool_guards();
+            let layout = table.layout_snapshot();
+            let index = layout.resolve_index_id(index_id).unwrap();
+            let secondary = layout.expect_secondary_index(index);
+            let runtime = secondary.disk_runtime();
+            let encoder = runtime.key_encoder_arc();
+            let duplicate_key = encoder.encode(&[Val::from("duplicate")]);
+            let mut mutable = test_mutable_table_file(&engine, &table, &guards);
+            let root = mutable.secondary_index_root(index.slot());
+            let tree = runtime.open_unique_at(root, guards.disk_guard()).unwrap();
+            assert_eq!(
+                tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
+                Some(deleted_rows[1]),
+            );
+            assert_eq!(
+                tree.lookup(&[Val::from("kept")]).await.unwrap(),
+                Some(kept_row)
+            );
+            let mut sources =
+                CheckpointIndexSources::new(engine.inner().checkpoint_build_policy, cutoff)
+                    .unwrap();
+            table
+                .apply_deletion_checkpoint(
+                    &mut mutable,
+                    layout.metadata(),
+                    &mut sources,
+                    cutoff,
+                    cutoff,
+                    guards.disk_guard(),
+                )
+                .await
+                .unwrap();
+            let sources = Arc::new(sources);
+            let runs = sources
+                .extract(
+                    table.clone(),
+                    layout.clone(),
+                    guards.clone(),
+                    index,
+                    &engine.inner().thread_pool,
+                    engine.inner().checkpoint_build_policy.max_workers,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                runs.runs().len(),
+                1,
+                "one cold block supplies one delete run"
+            );
+            let run = &runs.runs()[0];
+            assert_eq!(run.kind, RunKind::Delete);
+            assert_eq!(run.entries().len(), 3);
+            assert!(run.entries().iter().all(|entry| entry.key == duplicate_key));
+            let mut actual_rows: Vec<_> = run.entries().iter().map(|entry| entry.row_id).collect();
+            actual_rows.sort_unstable();
+            assert_eq!(actual_rows, deleted_rows);
+            let next = IndexCheckpoint::new(
+                &tree,
+                &mut mutable,
+                Arc::new(runs),
+                cutoff,
+                engine.inner().thread_pool.clone(),
+                sources.admission.clone(),
+            )
+            .apply()
+            .await
+            .unwrap();
+            assert_ne!(next, root);
+            let next_tree = runtime.open_unique_at(next, guards.disk_guard()).unwrap();
+            assert_eq!(
+                next_tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                next_tree.lookup(&[Val::from("kept")]).await.unwrap(),
+                Some(kept_row),
+            );
+            drop(mutable);
+            drop(sources);
+            assert_checkpoint_published(&mut session, table_id).await;
+            let mut reader = session.begin_trx().unwrap();
+            assert_eq!(scan_table_i32s(&mut reader, table_id).await, vec![4]);
+            reader.commit().await.unwrap();
+            assert!(table.file().active_root_unchecked().deletion_cutoff_ts > previous_cutoff);
+        });
+    }
+
+    /// Purpose: Protect atomic publication when the first or a later secondary index fails during a deletion-only checkpoint.
+    /// Expected: Published roots, cutoff, and success metrics stay unchanged; clearing the failure allows a complete retry.
     #[test]
     fn test_secondary_sidecar_failure_keeps_checkpoint_root_atomic() {
         struct ResetSidecarHook(MaintenanceTestController);
@@ -4599,62 +4628,91 @@ mod tests {
         impl Drop for ResetSidecarHook {
             fn drop(&mut self) {
                 self.0.set_force_secondary_sidecar_error(false);
+                self.0.set_secondary_failure_slot(None);
             }
         }
 
-        smol::block_on(async {
-            let temp_dir = TempDir::new().unwrap();
-            let engine =
-                evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
-            let table_id = create_table2_for_test(&engine).await;
-            let mut session = engine.new_session().unwrap();
-            insert_rows(table_id, &mut session, 0, 2, "name").await;
-            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
-            assert_checkpoint_published(&mut session, table_id).await;
+        for later in [false, true] {
+            smol::block_on(async {
+                let temp_dir = TempDir::new().unwrap();
+                let engine =
+                    evictable_test_engine(&temp_dir, 64u64 * 1024 * 1024, "redo_testsys").await;
+                let table_id = create_non_unique_name_table_for_test(&engine).await;
+                let mut session = engine.new_session().unwrap();
+                insert_rows(table_id, &mut session, 0, 2, "name").await;
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
 
-            let key = single_key(0i32);
-            let row_id = unique_disk_tree_lookup(
-                &table_for_internal_assertion(&engine, table_id),
-                &session.pool_guards(),
-                &key,
-            )
-            .await
-            .unwrap();
-            expect_delete_committed(table_id, &mut session, &key).await;
-            let marker_ts = delete_marker_ts(
-                table_for_internal_assertion(&engine, table_id)
-                    .deletion_buffer()
-                    .get(row_id)
-                    .unwrap(),
-            );
-            session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
-            let root_before = table_for_internal_assertion(&engine, table_id)
-                .file()
-                .active_root_unchecked()
-                .clone();
-            wait_for_checkpoint_root_ready(&mut session, table_id).await;
+                let key = single_key(0i32);
+                let row_id = unique_disk_tree_lookup(
+                    &table_for_internal_assertion(&engine, table_id),
+                    &session.pool_guards(),
+                    &key,
+                )
+                .await
+                .unwrap();
+                expect_delete_committed(table_id, &mut session, &key).await;
+                let marker_ts = delete_marker_ts(
+                    table_for_internal_assertion(&engine, table_id)
+                        .deletion_buffer()
+                        .get(row_id)
+                        .unwrap(),
+                );
+                session.wait_for_gc_horizon_after(marker_ts).await.unwrap();
+                let root_before = table_for_internal_assertion(&engine, table_id)
+                    .file()
+                    .active_root_unchecked()
+                    .clone();
+                wait_for_checkpoint_root_ready(&mut session, table_id).await;
 
-            set_test_force_secondary_sidecar_error(&engine, true);
-            let _reset = ResetSidecarHook(engine.inner().maintenance_test.clone());
-            session.checkpoint_table(table_id).await.unwrap_err();
+                #[cfg(feature = "profiling")]
+                let stats = session.index_build_stats().unwrap();
+                if later {
+                    engine
+                        .inner()
+                        .maintenance_test
+                        .set_secondary_failure_slot(Some(1));
+                } else {
+                    set_test_force_secondary_sidecar_error(&engine, true);
+                }
+                let _reset = ResetSidecarHook(engine.inner().maintenance_test.clone());
+                session.checkpoint_table(table_id).await.unwrap_err();
 
-            let root_after = table_for_internal_assertion(&engine, table_id)
-                .file()
-                .active_root_unchecked()
-                .clone();
-            assert_eq!(
-                root_after.deletion_cutoff_ts,
-                root_before.deletion_cutoff_ts
-            );
-            assert_eq!(
-                root_after.column_block_index_root,
-                root_before.column_block_index_root
-            );
-            assert_eq!(
-                root_after.secondary_index_slots,
-                root_before.secondary_index_slots
-            );
-        });
+                let root_after = table_for_internal_assertion(&engine, table_id)
+                    .file()
+                    .active_root_unchecked()
+                    .clone();
+                assert_eq!(
+                    root_after.deletion_cutoff_ts,
+                    root_before.deletion_cutoff_ts
+                );
+                assert_eq!(
+                    root_after.column_block_index_root,
+                    root_before.column_block_index_root
+                );
+                assert_eq!(
+                    root_after.secondary_index_slots,
+                    root_before.secondary_index_slots
+                );
+                #[cfg(feature = "profiling")]
+                assert_eq!(
+                    session.index_build_stats().unwrap(),
+                    stats,
+                    "failed checkpoints publish no success sample"
+                );
+                drop(_reset);
+                assert_checkpoint_published(&mut session, table_id).await;
+                assert_eq!(
+                    unique_disk_tree_lookup(
+                        &table_for_internal_assertion(&engine, table_id),
+                        &session.pool_guards(),
+                        &key
+                    )
+                    .await,
+                    None
+                );
+            });
+        }
     }
 
     /// Purpose: Protect checkpointing a frozen prefix containing no surviving rows.

@@ -237,6 +237,9 @@ pub(crate) enum ConfigError {
     /// Cold-index build admission limits are invalid.
     #[error("invalid cold-index build limit")]
     InvalidColdIndexBuildLimit,
+    /// Checkpoint component budgets or output limits are invalid.
+    #[error("invalid checkpoint-index build limit")]
+    InvalidCheckpointIndexBuildLimit,
     #[error("invalid purge thread count")]
     InvalidPurgeThreads,
     #[error("invalid transaction GC bucket count")]

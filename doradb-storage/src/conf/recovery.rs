@@ -138,7 +138,10 @@ impl RecoveryConfig {
 mod tests {
     use super::*;
     use crate::Engine;
-    use crate::conf::{ColdIndexBuildConfig, EngineConfig, HotIndexBuildConfig, ThreadPoolConfig};
+    use crate::conf::{
+        CheckpointIndexBuildConfig, ColdIndexBuildConfig, EngineConfig, HotIndexBuildConfig,
+        ThreadPoolConfig,
+    };
     use crate::error::ErrorKind;
     use tempfile::TempDir;
 
@@ -171,6 +174,7 @@ mod tests {
                 // build's checked 4P calculation has separate rejection tests.
                 .hot_index_build(HotIndexBuildConfig::default().max_workers(Some(1)))
                 .cold_index_build(ColdIndexBuildConfig::default().max_workers(Some(1)))
+                .checkpoint_index_build(CheckpointIndexBuildConfig::default().max_workers(Some(1)))
                 .recovery(
                     default
                         .clone()

@@ -2,17 +2,21 @@
 //! owns allocation, ingress, write observation, and private-root completion.
 //! Successful sealing hands resource ownership to `sealed_cold` after releasing
 //! construction inputs; readers and cross-tier validation are separate modules.
-#[cfg(any(test, feature = "profiling"))]
-use super::SortedRun;
+use super::budget::handoff_bytes;
 use super::merge::{
-    CompletedPartition, HotDuplicate, HotEntryRef, MergeCompletion, MergeConsumption,
-    MergePreparation, PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
+    CompletedPartition, DEFAULT_BATCH_ENTRIES, HotDuplicate, HotEntryRef, MergeCompletion,
+    MergeConsumption, MergePreparation, PartitionConsumer, PartitionMergeStream, PreparedMerge,
+    execution_error,
 };
 use super::packing::{
-    LeafWindow, max_leaf_window_entries, max_node_slots, plan_candidates, plan_leaf,
+    LeafWindow, fill_final_node, max_leaf_window_entries, max_node_slots, plan_leaf, plan_parent,
+    validate_final_node,
 };
 use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild, SealedColdMetadata};
+use super::write::{PendingWrites, completion_bytes};
 use super::{BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation, SortedRuns};
+#[cfg(any(test, feature = "profiling"))]
+use super::{MemoryUsage, SortedRun};
 use crate::buffer::PoolGuard;
 use crate::catalog::IndexRef;
 use crate::completion::Completion;
@@ -21,18 +25,13 @@ use crate::error::{
     CompletionResult, ConfigResult, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError,
     RuntimeOrFatalResult,
 };
-use crate::file::block_integrity::write_block_checksum;
 use crate::file::cow_file::{MutableCowFile, SUPER_BLOCK_ID};
 use crate::file::table_file::MutableTableFile;
 use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::SecondaryDiskTreeRuntime;
-use crate::index::btree::algo::{
-    KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
-};
-use crate::index::btree::{
-    BTREE_NODE_USABLE_SIZE, BTreeNil, BTreeU64, BTreeValue, PackedNodeSpace,
-};
-use crate::index::disk_tree::{DISK_TREE_BLOCK_SIZE, btree_node_from_block_mut};
+use crate::index::btree::algo::{KnownFenceNodeParams, PackedNodeEntry};
+use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue};
+use crate::index::disk_tree::DISK_TREE_BLOCK_SIZE;
 use crate::io::DirectBuf;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
@@ -40,64 +39,35 @@ use crate::runtime::{thread_pool::ThreadPool, yield_now};
 use error_stack::ResultExt;
 use futures::{
     FutureExt,
-    future::{BoxFuture, pending, poll_fn},
+    future::{BoxFuture, pending},
     select_biased,
 };
 use parking_lot::Mutex;
 use std::mem::{forget, replace, swap};
 use std::ops::Range;
 use std::sync::Arc;
-use std::task::Poll;
+#[cfg(test)]
+pub(crate) use tests::cold_budgets;
 
 #[cfg(feature = "profiling")]
-use crate::profiling::{ColdBuildMeasurements, clock::Instant};
+use crate::profiling::{ColdBuildMeasurements, PackingProfile, clock::Instant};
 #[cfg(feature = "profiling")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "profiling")]
 #[derive(Default)]
-struct PackingProfile {
-    active: AtomicU64,
-    peak: AtomicU64,
-    nanos: AtomicU64,
+struct DiskPackingProfile {
+    packing: PackingProfile,
     buffers: AtomicU64,
     buffer_peak: AtomicU64,
 }
 
 #[cfg(feature = "profiling")]
-struct PackingTimer<'a> {
-    profile: &'a PackingProfile,
-    started: Instant,
-}
-
-#[cfg(feature = "profiling")]
-impl<'a> PackingTimer<'a> {
-    fn new(profile: &'a PackingProfile) -> Self {
-        let active = profile.active.fetch_add(1, Ordering::AcqRel) + 1;
-        profile.peak.fetch_max(active, Ordering::Relaxed);
-        Self {
-            profile,
-            started: Instant::now(),
-        }
-    }
-}
-
-#[cfg(feature = "profiling")]
-impl Drop for PackingTimer<'_> {
-    fn drop(&mut self) {
-        self.profile
-            .nanos
-            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.profile.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(feature = "profiling")]
-struct BufferSlot(Arc<PackingProfile>);
+struct BufferSlot(Arc<DiskPackingProfile>);
 
 #[cfg(feature = "profiling")]
 impl BufferSlot {
-    fn new(profile: Arc<PackingProfile>) -> Self {
+    fn new(profile: Arc<DiskPackingProfile>) -> Self {
         let count = profile.buffers.fetch_add(1, Ordering::AcqRel) + 1;
         profile.buffer_peak.fetch_max(count, Ordering::Relaxed);
         Self(profile)
@@ -114,12 +84,18 @@ impl Drop for BufferSlot {
 /// Normalized invocation limits, shared by all stages of one cold index build.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ColdBuildPolicy {
-    /// Total admitted scratch ceiling for the invocation.
-    pub(crate) max_scratch_bytes: usize,
+    /// Captured sources, resident runs and merge planning.
+    pub(crate) max_input_bytes: usize,
+    /// Extraction and construction scratch per worker slot.
+    pub(crate) worker_scratch_bytes: usize,
+    /// Coordinator, parent packing and retained construction metadata.
+    pub(crate) assembler_scratch_bytes: usize,
     /// Maximum accepted extraction or construction jobs awaiting collection.
     pub(crate) max_workers: usize,
-    max_ready_buffers: usize,
-    max_in_flight_writes: usize,
+    /// Maximum queued output buffers awaiting coordinator acceptance.
+    pub(crate) max_ready_buffers: usize,
+    /// Maximum accepted writes, including reserved parent progress.
+    pub(crate) max_in_flight_writes: usize,
 }
 
 impl ColdBuildPolicy {
@@ -127,7 +103,9 @@ impl ColdBuildPolicy {
     pub(crate) fn new(mut config: ColdIndexBuildConfig, workers: usize) -> ConfigResult<Self> {
         config.validate(workers)?;
         Ok(Self {
-            max_scratch_bytes: config.max_scratch_bytes,
+            max_input_bytes: config.max_input_bytes,
+            worker_scratch_bytes: config.worker_scratch_bytes,
+            assembler_scratch_bytes: config.assembler_scratch_bytes,
             max_workers: config.max_workers.unwrap_or(workers),
             max_ready_buffers: config.max_ready_buffers,
             max_in_flight_writes: config.max_in_flight_writes,
@@ -135,46 +113,141 @@ impl ColdBuildPolicy {
     }
 }
 
-/// Earmarked progress capacity retained before any cold collection allocation.
+/// Independent admission shared by cold extraction, construction and sealed readers.
 pub(crate) struct DiskBuildAdmission {
-    /// Shared admission for collection, retained input, packing, and output.
-    pub(crate) budget: MemoryBudget,
-    spare: Arc<Mutex<MemoryReservation>>,
+    /// Captured sources, resident input and merge planning.
+    pub(crate) input: MemoryBudget,
+    /// Coordinator ledgers, parent packing and sealed-tree reader scratch.
+    pub(crate) assembler: MemoryBudget,
+    workers: Vec<MemoryBudget>,
+    output: MemoryBudget,
     policy: ColdBuildPolicy,
     unique: bool,
+    #[cfg(any(test, feature = "profiling"))]
+    usage: Arc<MemoryUsage>,
     #[cfg(test)]
     hooks: Arc<tests::Hooks>,
     #[cfg(feature = "profiling")]
-    profile: Arc<PackingProfile>,
+    profile: Arc<DiskPackingProfile>,
 }
 
 impl DiskBuildAdmission {
-    /// Protect one leaf worker, parent planning, and every bounded output stage.
-    pub(crate) fn new(policy: ColdBuildPolicy, unique: bool) -> RuntimeOrFatalResult<Self> {
-        let budget = MemoryBudget::new(policy.max_scratch_bytes);
-        let bytes = minimum_progress_bytes(
-            unique,
+    /// Capacity for four admitted merge streams and one active leaf-packing window.
+    /// Run-count-dependent merge metadata and schema-dependent extraction remain admitted at use.
+    pub(crate) fn minimum_worker_bytes() -> usize {
+        4 * DEFAULT_BATCH_ENTRIES * size_of::<HotEntryRef>()
+            + worker_bytes(true).max(worker_bytes(false))
+            + 4 * DISK_TREE_BLOCK_SIZE
+    }
+
+    /// Capacity for parent packing with coordinator bookkeeping headroom.
+    pub(crate) fn minimum_assembler_bytes() -> usize {
+        parent_bytes() + 4 * DISK_TREE_BLOCK_SIZE
+    }
+
+    /// Bound queued and worker-held images, accepted writes and parent progress.
+    /// Queue growth and write observers are included independently of scratch limits.
+    pub(crate) fn output_bytes(workers: usize, ready: usize, writes: usize) -> Option<usize> {
+        workers
+            .checked_add(ready)?
+            .checked_add(writes)?
+            .checked_add(1)?
+            .checked_mul(DISK_TREE_BLOCK_SIZE)?
+            .checked_add(handoff_bytes::<PackedDiskNode>(ready)?)?
+            .checked_add(completion_bytes(writes)?)
+    }
+
+    /// Establish component budgets without reserving construction capacity from input.
+    pub(crate) fn new(policy: ColdBuildPolicy, unique: bool) -> RuntimeOrFatalResult<Arc<Self>> {
+        let output = Self::output_bytes(
+            policy.max_workers,
             policy.max_ready_buffers,
             policy.max_in_flight_writes,
         )
-        .unwrap_or_else(|| unreachable!("validated disk minimum progress capacity"));
-        let spare = budget
-            .reserve(bytes, "disk minimum progress")
-            .change_context(RuntimeError::IndexAccess)?;
-        Ok(Self {
-            budget,
-            spare: Arc::new(Mutex::new(spare)),
+        .ok_or_else(|| execution_error("cold output capacity overflow"))?;
+        #[cfg(any(test, feature = "profiling"))]
+        let usage = Arc::new(MemoryUsage::default());
+        let budget = |limit| {
+            #[cfg(any(test, feature = "profiling"))]
+            {
+                MemoryBudget::tracked(limit, &usage)
+            }
+            #[cfg(not(any(test, feature = "profiling")))]
+            {
+                MemoryBudget::new(limit)
+            }
+        };
+        Ok(Arc::new(Self {
+            input: budget(policy.max_input_bytes),
+            assembler: budget(policy.assembler_scratch_bytes),
+            workers: (0..policy.max_workers)
+                .map(|_| budget(policy.worker_scratch_bytes))
+                .collect(),
+            output: budget(output),
             policy,
             unique,
+            #[cfg(any(test, feature = "profiling"))]
+            usage,
             #[cfg(test)]
             hooks: Arc::new(tests::Hooks::default()),
             #[cfg(feature = "profiling")]
-            profile: Arc::new(PackingProfile::default()),
+            profile: Arc::new(DiskPackingProfile::default()),
+        }))
+    }
+
+    /// Reuse one worker slot across sequential extraction or construction partitions.
+    #[inline]
+    pub(super) fn worker_budget(&self, slot: usize) -> MemoryBudget {
+        self.workers[slot].clone()
+    }
+
+    fn output(
+        &self,
+        bytes: usize,
+        purpose: &'static str,
+    ) -> RuntimeOrFatalResult<MemoryReservation> {
+        self.output
+            .reserve(bytes, purpose)
+            .change_context(RuntimeError::IndexAccess)
+            .map_err(Into::into)
+    }
+}
+
+// Packing headroom stays reserved while other partitions retain merge streams.
+// It belongs to construction, so sealing releases it even if source observers remain.
+struct DiskPackingAdmission {
+    workers: Vec<Mutex<MemoryReservation>>,
+    parent: Mutex<MemoryReservation>,
+}
+
+impl DiskPackingAdmission {
+    fn new(admission: &DiskBuildAdmission, workers: usize) -> RuntimeOrFatalResult<Self> {
+        let workers = (0..workers)
+            .map(|slot| {
+                admission
+                    .worker_budget(slot)
+                    .reserve(worker_bytes(admission.unique), "disk worker packing")
+                    .map(Mutex::new)
+                    .change_context(RuntimeError::IndexAccess)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let parent = admission
+            .assembler
+            .reserve(parent_bytes(), "disk parent packing")
+            .change_context(RuntimeError::IndexAccess)?;
+        Ok(Self {
+            workers,
+            parent: Mutex::new(parent),
         })
     }
 
-    fn take(&self, bytes: usize, purpose: &'static str) -> RuntimeOrFatalResult<MemoryReservation> {
-        self.spare
+    fn take(
+        &self,
+        partition: usize,
+        bytes: usize,
+        purpose: &'static str,
+    ) -> RuntimeOrFatalResult<MemoryReservation> {
+        self.workers[partition % self.workers.len()]
             .lock()
             .take(bytes, purpose)
             .change_context(RuntimeError::IndexAccess)
@@ -244,17 +317,10 @@ struct Allocation {
     reclaim_attempted: bool,
 }
 
-struct PendingWrite {
-    ledger: usize,
-    wait: BoxFuture<'static, CompletionResult<()>>,
-    _allocation: MemoryReservation,
-}
-
 struct Submitting {
     packet: Option<PackedDiskNode>,
     descriptor: Option<DiskChildDescriptor>,
     parent: bool,
-    observer_admission: MemoryReservation,
     ingress: BoxFuture<'static, CompletionResult<Arc<Completion<()>>>>,
 }
 
@@ -335,7 +401,7 @@ impl ColdBuildProgress {
             entries: completed.entries(),
             unique: build.admission.unique,
         };
-        let budget = build.admission.budget.clone();
+        let budget = build.admission.assembler.clone();
         let Self::Building(mut build) = replace(self, Self::Transferred) else {
             unreachable!("validated cold owner")
         };
@@ -406,6 +472,7 @@ impl ColdBuildProgress {
 pub(crate) struct DiskBulkBuild {
     file: Option<MutableTableFile>,
     admission: Arc<DiskBuildAdmission>,
+    packing: Arc<DiskPackingAdmission>,
     pool: QuiescentGuard<ThreadPool>,
     poisoner: QuiescentGuard<EnginePoisoner>,
     preparation: MergePreparation,
@@ -418,7 +485,7 @@ pub(crate) struct DiskBulkBuild {
     children: BudgetedVec<DiskChildDescriptor>,
     parents: BudgetedVec<DiskChildDescriptor>,
     allocations: BudgetedVec<Allocation>,
-    writes: BudgetedVec<PendingWrite>,
+    writes: PendingWrites<usize>,
     submitting: Option<Submitting>,
     completion: Option<MergeCompletion>,
     ts: TrxID,
@@ -436,7 +503,7 @@ impl DiskBulkBuild {
     pub(crate) fn from_runs(
         file: MutableTableFile,
         runs: Arc<SortedRuns>,
-        admission: DiskBuildAdmission,
+        admission: Arc<DiskBuildAdmission>,
         pool: QuiescentGuard<ThreadPool>,
         poisoner: QuiescentGuard<EnginePoisoner>,
         ts: TrxID,
@@ -448,29 +515,20 @@ impl DiskBulkBuild {
             .ok_or_else(|| execution_error("disk input count overflow"))?;
         #[cfg(feature = "profiling")]
         let input_bytes = runs.runs().iter().map(|run| run.retained_bytes()).sum();
-        let mut workers = 1;
-        while workers < admission.policy.max_workers && workers < entries.div_ceil(65_536) {
-            if admission
-                .spare
-                .lock()
-                .grow(
-                    worker_bytes(admission.unique) + DISK_TREE_BLOCK_SIZE,
-                    "disk additional worker",
-                )
-                .is_err()
-            {
-                break;
-            }
-            workers += 1;
-        }
+        let workers = admission
+            .policy
+            .max_workers
+            .min(entries.div_ceil(65_536).max(1));
+        let packing = Arc::new(DiskPackingAdmission::new(&admission, workers)?);
         let preparation = MergePreparation::new(runs, pool.clone(), workers)?;
-        let budget = &admission.budget;
-        let writes = BudgetedVec::from_reservation(
-            admission.take(
-                admission.policy.max_in_flight_writes * size_of::<PendingWrite>(),
-                "disk write ledger",
-            )?,
+        let budget = &admission.assembler;
+        let writes = PendingWrites::new(
             admission.policy.max_in_flight_writes,
+            admission.output(
+                completion_bytes(admission.policy.max_in_flight_writes)
+                    .unwrap_or_else(|| unreachable!("validated disk write capacity")),
+                "disk write completions",
+            )?,
         );
         Ok(Self {
             file: Some(file),
@@ -480,8 +538,8 @@ impl DiskBulkBuild {
             plan: None,
             leaves: None,
             receiver: None,
-            _handoff_admission: admission.take(
-                handoff_bytes(admission.policy.max_ready_buffers)
+            _handoff_admission: admission.output(
+                handoff_bytes::<PackedDiskNode>(admission.policy.max_ready_buffers)
                     .unwrap_or_else(|| unreachable!("validated disk handoff capacity")),
                 "disk handoff queue",
             )?,
@@ -505,7 +563,8 @@ impl DiskBulkBuild {
             },
             #[cfg(feature = "profiling")]
             started: None,
-            admission: Arc::new(admission),
+            admission,
+            packing,
         })
     }
 
@@ -563,6 +622,7 @@ impl DiskBulkBuild {
                 self.pool.clone(),
                 DiskLeafConsumer {
                     admission: self.admission.clone(),
+                    packing: self.packing.clone(),
                     identity: self.identity.clone(),
                     sender,
                     ts: self.ts,
@@ -612,7 +672,7 @@ impl DiskBulkBuild {
                     }
                 }
                 .fuse();
-                let write = wait_write(&mut self.writes).fuse();
+                let write = self.writes.wait_next().fuse();
                 futures::pin_mut!(consumption, delivery, write, poison);
                 select_biased! { () = poison => Progress::Poison, result = write => Progress::Write(result), result = consumption => Progress::Leaves(result), packet = delivery => Progress::Packet(packet) }
             };
@@ -620,7 +680,7 @@ impl DiskBulkBuild {
                 Progress::Poison => {
                     self.poisoner.ensure_healthy()?;
                 }
-                Progress::Write((index, result)) => self.finish_write(index, result)?,
+                Progress::Write((ledger, result)) => self.finish_write(ledger, result)?,
                 Progress::Packet(Ok(packet)) => self.prepare_packet(packet)?,
                 Progress::Packet(Err(_)) => {
                     return Err(execution_error(
@@ -673,8 +733,8 @@ impl DiskBulkBuild {
         #[cfg(feature = "profiling")]
         let settlement_started = Instant::now();
         while !self.writes.is_empty() {
-            let (index, result) = wait_write(&mut self.writes).await;
-            self.finish_write(index, result)?;
+            let (ledger, result) = self.writes.wait_next().await;
+            self.finish_write(ledger, result)?;
         }
         #[cfg(feature = "profiling")]
         {
@@ -743,7 +803,6 @@ impl DiskBulkBuild {
     ) -> RuntimeOrFatalResult<()> {
         // Failed synchronous admission must release any producer already waiting for acknowledgement.
         let result = (|| {
-            let observer_admission = self.admission.take(1024, "disk write observer")?;
             self.allocations
                 .reserve_one("disk allocation ledger")
                 .change_context(RuntimeError::IndexAccess)?;
@@ -786,7 +845,6 @@ impl DiskBulkBuild {
                 }),
                 packet: None,
                 parent,
-                observer_admission,
                 ingress,
             });
             Ok(())
@@ -844,15 +902,7 @@ impl DiskBulkBuild {
                     hooks.completed(ledger).await?;
                     result
                 };
-                assert!(
-                    size_of_val(&wait) <= pending.observer_admission.bytes(),
-                    "disk completion future exceeds admitted allocation"
-                );
-                self.writes.push_reserved(PendingWrite {
-                    ledger: descriptor.ledger,
-                    wait: Box::pin(wait),
-                    _allocation: pending.observer_admission,
-                });
+                self.writes.push(descriptor.ledger, wait);
                 #[cfg(feature = "profiling")]
                 {
                     self.measurements.write_count += 1;
@@ -881,23 +931,22 @@ impl DiskBulkBuild {
 
     fn finish_write(
         &mut self,
-        index: usize,
+        ledger: usize,
         result: CompletionResult<()>,
     ) -> RuntimeOrFatalResult<()> {
-        let pending = self.writes.swap_remove(index);
         result
             .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::IndexAccess))
             .attach("operation=disk_bulk_build, phase=write_completion")?;
-        self.allocations[pending.ledger].completed = true;
+        self.allocations[ledger].completed = true;
         Ok(())
     }
 
     fn observe_ready_writes(&mut self) -> RuntimeOrFatalResult<()> {
         loop {
-            let Some((index, result)) = wait_write(&mut self.writes).now_or_never() else {
+            let Some((ledger, result)) = self.writes.wait_next().now_or_never() else {
                 return Ok(());
             };
-            self.finish_write(index, result)?;
+            self.finish_write(ledger, result)?;
         }
     }
 
@@ -913,8 +962,8 @@ impl DiskBulkBuild {
             self.poisoner.ensure_healthy()?;
             self.observe_ready_writes()?;
             while self.writes.len() >= self.admission.policy.max_in_flight_writes {
-                let (index, result) = wait_write(&mut self.writes).await;
-                self.finish_write(index, result)?;
+                let (ledger, result) = self.writes.wait_next().await;
+                self.finish_write(ledger, result)?;
             }
             let (packet, count) = self.pack_parent(start)?;
             self.start_write(packet, true)?;
@@ -932,14 +981,20 @@ impl DiskBulkBuild {
 
     fn pack_parent(&self, start: usize) -> RuntimeOrFatalResult<(PackedDiskNode, usize)> {
         #[cfg(feature = "profiling")]
-        let _timer = PackingTimer::new(&self.admission.profile);
+        let _timer = self.admission.profile.packing.start();
         let plan = self
             .plan
             .as_ref()
             .unwrap_or_else(|| unreachable!("disk parent retains input coordinates"));
         let runs = plan.runs();
-        let (shape, image, count) =
-            pack_parent_node(&self.admission, runs, &self.children, start, self.ts)?;
+        let (shape, image, count) = pack_parent_node(
+            &self.admission,
+            &self.packing,
+            runs,
+            &self.children,
+            start,
+            self.ts,
+        )?;
         if self.children[start..start + count]
             .iter()
             .any(|child| !self.allocations[child.ledger].accepted)
@@ -975,38 +1030,28 @@ impl DiskBulkBuild {
             merge_failure(&mut failure, error);
         }
         if let Some(leaves) = &mut self.leaves {
-            let settlement = leaves.settle().fuse();
-            futures::pin_mut!(settlement);
             let result = if let Some(receiver) = &self.receiver {
-                loop {
-                    let delivery = receiver.recv_async().fuse();
-                    futures::pin_mut!(delivery);
-                    select_biased! {
-                        result = settlement => break result,
-                        packet = delivery => match packet {
-                            Ok(packet) => packet.ack.complete(OutputStatus::Stopped),
-                            Err(_) => break settlement.await,
-                        },
-                    }
-                }
+                leaves
+                    .settle_rejecting(receiver, |packet| {
+                        packet.ack.complete(OutputStatus::Stopped)
+                    })
+                    .await
             } else {
-                settlement.await
+                leaves.settle().await
             };
             if let Err(error) = result {
                 merge_failure(&mut failure, error);
             }
         }
-        if let Some(receiver) = self.receiver.take() {
-            while let Ok(packet) = receiver.try_recv() {
-                packet.ack.complete(OutputStatus::Stopped);
-            }
-        }
+        // A receiver is installed only with its merge consumer. Shared
+        // settlement has rejected every packet before channel teardown.
+        self.receiver = None;
         if let Err(error) = self.preparation.settle().await {
             merge_failure(&mut failure, error);
         }
         while !self.writes.is_empty() {
-            let (index, result) = wait_write(&mut self.writes).await;
-            if let Err(error) = self.finish_write(index, result) {
+            let (ledger, result) = self.writes.wait_next().await;
+            if let Err(error) = self.finish_write(ledger, result) {
                 merge_failure(&mut failure, error);
             }
         }
@@ -1034,10 +1079,10 @@ impl DiskBulkBuild {
                 + size_of::<PreparedMerge>()
                 + size_of::<SortedRuns>()
                 + size_of::<SortedRun>()) as u64,
-            packing_peak: self.admission.profile.peak.load(Ordering::Acquire),
-            packing_worker_nanos: self.admission.profile.nanos.load(Ordering::Acquire),
+            packing_peak: self.admission.profile.packing.peak(),
+            packing_worker_nanos: self.admission.profile.packing.worker_nanos(),
             buffer_peak: self.admission.profile.buffer_peak.load(Ordering::Acquire),
-            scratch_peak_bytes: self.admission.budget.peak() as u64,
+            scratch_peak_bytes: self.admission.usage.peak() as u64,
             ..self.measurements
         }
     }
@@ -1101,6 +1146,7 @@ impl Drop for DiskBulkBuild {
 
 struct DiskLeafConsumer {
     admission: Arc<DiskBuildAdmission>,
+    packing: Arc<DiskPackingAdmission>,
     identity: Arc<()>,
     sender: flume::Sender<PackedDiskNode>,
     ts: TrxID,
@@ -1108,6 +1154,17 @@ struct DiskLeafConsumer {
 
 impl PartitionConsumer for DiskLeafConsumer {
     type Output = usize;
+
+    fn workspace_budget(&self, _plan: &PreparedMerge, partition: usize) -> MemoryBudget {
+        // Ordered collection keeps a contiguous worker-sized dispatch window,
+        // so a slot's earlier packing job has finished before the slot is reused.
+        self.admission
+            .worker_budget(partition % self.packing.workers.len())
+    }
+
+    fn metadata_budget(&self, _plan: &PreparedMerge) -> MemoryBudget {
+        self.admission.assembler.clone()
+    }
 
     async fn consume(
         &self,
@@ -1133,14 +1190,18 @@ impl DiskLeafConsumer {
         let runs = plan.runs();
         let capacity = max_leaf_window_entries::<V>().min(stream.remaining_entries());
         let window_entries = BudgetedVec::from_reservation(
-            self.admission
-                .take(capacity * size_of::<HotEntryRef>(), "disk packing window")?,
+            self.packing.take(
+                partition,
+                capacity * size_of::<HotEntryRef>(),
+                "disk packing window",
+            )?,
             capacity,
         );
         let mut window = LeafWindow::admitted(window_entries, capacity);
         let entry_capacity = capacity.min(max_node_slots::<V>() + 1);
         let mut entries = BudgetedVec::from_reservation(
-            self.admission.take(
+            self.packing.take(
+                partition,
                 entry_capacity * size_of::<PackedNodeEntry<'_, V>>(),
                 "disk packing entries",
             )?,
@@ -1232,7 +1293,7 @@ impl DiskLeafConsumer {
         rank: usize,
     ) -> RuntimeOrFatalResult<BuildOutcome<usize>> {
         #[cfg(feature = "profiling")]
-        let timer = PackingTimer::new(&self.admission.profile);
+        let timer = self.admission.profile.packing.start();
         let lower = window
             .get(0)
             .unwrap_or_else(|| unreachable!("nonempty disk packing window"));
@@ -1288,62 +1349,41 @@ impl DiskLeafConsumer {
     }
 }
 
-/// Checked reservation for one leaf worker, parent scratch, and bounded output stages.
-pub(crate) fn minimum_progress_bytes(unique: bool, ready: usize, writes: usize) -> Option<usize> {
-    let buffers = ready
-        .checked_add(writes)?
-        .checked_add(2)?
-        .checked_mul(DISK_TREE_BLOCK_SIZE)?;
-    let observers = writes.checked_mul(size_of::<PendingWrite>() + 1024)?;
-    worker_bytes(unique)
-        .checked_add(worker_bytes(true))?
-        .checked_add(buffers)?
-        .checked_add(observers)?
-        .checked_add(handoff_bytes(ready)?)
-}
-
 /// Pack one bounded parent from ordered, contiguous descriptors with accepted
 /// stable BlockIDs. The caller retains allocation/write authority separately.
-pub(super) fn pack_parent_node(
+fn pack_parent_node(
     admission: &DiskBuildAdmission,
+    packing: &DiskPackingAdmission,
     runs: &SortedRuns,
     children: &[DiskChildDescriptor],
     start: usize,
     ts: TrxID,
 ) -> RuntimeOrFatalResult<(DiskNodePlan, DiskNodeImage, usize)> {
     let first = &children[start];
-    let lower = first.shape.lower.resolve(runs).key.as_bytes();
     let available = (children.len() - start - 1).min(max_node_slots::<BTreeU64>() + 1);
-    let reservation = admission.take(
-        (available.max(1)) * size_of::<PackedNodeEntry<'_, BTreeU64>>(),
-        "disk parent window",
-    )?;
+    let reservation = packing
+        .parent
+        .lock()
+        .take(
+            (available.max(1)) * size_of::<PackedNodeEntry<'_, BTreeU64>>(),
+            "disk parent window",
+        )
+        .change_context(RuntimeError::IndexAccess)?;
     let mut entries = BudgetedVec::from_reservation(reservation, available.max(1));
-    let packed = if available == 0 {
-        0
-    } else {
-        plan_candidates(
-            &mut entries,
-            available,
-            PackedNodePlanParams {
-                lower_fence: lower,
-                upper_fence: children
-                    .last()
-                    .and_then(|c| c.shape.upper)
-                    .map(|r| r.resolve(runs).key.as_bytes()),
-                min_slots: 1,
-            },
-            "disk parent entries",
-            |offset| {
-                let child = &children[start + 1 + offset];
-                PackedNodeEntry {
-                    key: child.shape.lower.resolve(runs).key.as_bytes(),
-                    value: BTreeU64::from(child.block.as_u64()),
-                }
-            },
-        )?
-    };
-    let count = packed + 1;
+    let plan = plan_parent(
+        &mut entries,
+        children.len() - start,
+        children
+            .last()
+            .and_then(|c| c.shape.upper)
+            .map(|r| r.resolve(runs).key.as_bytes()),
+        "disk parent entries",
+        |offset| {
+            let child = &children[start + offset];
+            (child.shape.lower.resolve(runs).key.as_bytes(), child.block)
+        },
+    )?;
+    let count = plan.count;
     let last = &children[start + count - 1];
     for pair in children[start..start + count].windows(2) {
         if pair[0].shape.coverage.end != pair[1].shape.coverage.start
@@ -1367,15 +1407,12 @@ pub(super) fn pack_parent_node(
     };
     let image = pack_node(
         admission,
-        KnownFenceNodeParams {
-            height: shape.height,
+        plan.node_params(
+            shape.height,
             ts,
-            lower_fence: lower,
-            upper_fence: shape.upper.map(|r| r.resolve(runs).key.as_bytes()),
-            lower_fence_value: BTreeU64::from(first.block.as_u64()),
-            hints_enabled: true,
-        },
-        &entries[..packed],
+            shape.upper.map(|r| r.resolve(runs).key.as_bytes()),
+        ),
+        &entries[..count - 1],
     )?;
     Ok((shape, image, count))
 }
@@ -1386,28 +1423,11 @@ pub(super) fn pack_node<V: BTreeValue + Copy>(
     params: KnownFenceNodeParams<'_>,
     entries: &[PackedNodeEntry<'_, V>],
 ) -> RuntimeOrFatalResult<DiskNodeImage> {
-    let mut space =
-        PackedNodeSpace::with_fences(params.lower_fence, params.upper_fence.unwrap_or(&[]))
-            .ok_or_else(|| execution_error("disk final fences exceed node capacity"))?;
-    for entry in entries {
-        if space
-            .add_entry::<V>(entry.key)
-            .is_none_or(|bytes| bytes > BTREE_NODE_USABLE_SIZE)
-        {
-            return Err(execution_error("disk final node shape exceeds capacity"));
-        }
-    }
-    if space.total_space() > BTREE_NODE_USABLE_SIZE {
-        return Err(execution_error("disk final fence storage exceeds capacity"));
-    }
-    let allocation = admission.take(DISK_TREE_BLOCK_SIZE, "disk output buffer")?;
+    validate_final_node(params, entries)?;
+    let allocation = admission.output(DISK_TREE_BLOCK_SIZE, "disk output buffer")?;
     #[cfg(feature = "profiling")]
     let slot = BufferSlot::new(admission.profile.clone());
-    let mut buf = DirectBuf::zeroed(DISK_TREE_BLOCK_SIZE);
-    pack_fixed_entries(btree_node_from_block_mut(buf.data_mut()), params, entries);
-    #[cfg(debug_assertions)]
-    debug_assert!(btree_node_from_block_mut(buf.data_mut()).validate_persisted_layout::<V>());
-    write_block_checksum(buf.data_mut());
+    let buf = fill_final_node(params, entries);
     Ok(DiskNodeImage {
         buf: Some(buf),
         allocation: Some(allocation),
@@ -1416,13 +1436,8 @@ pub(super) fn pack_node<V: BTreeValue + Copy>(
     })
 }
 
-// Bounded flume delivery uses a growable deque. Earmark twice its rounded
-// capacity to cover old/replacement backing overlap without relying on queue timing.
-fn handoff_bytes(buffers: usize) -> Option<usize> {
-    buffers
-        .checked_next_power_of_two()?
-        .checked_mul(2)?
-        .checked_mul(size_of::<PackedDiskNode>())
+fn parent_bytes() -> usize {
+    (max_node_slots::<BTreeU64>() + 1) * size_of::<PackedNodeEntry<'static, BTreeU64>>()
 }
 
 fn worker_bytes(unique: bool) -> usize {
@@ -1448,18 +1463,6 @@ fn merge_failure(target: &mut Option<RuntimeOrFatalError>, error: RuntimeOrFatal
     });
 }
 
-async fn wait_write(writes: &mut BudgetedVec<PendingWrite>) -> (usize, CompletionResult<()>) {
-    poll_fn(|cx| {
-        for (index, write) in writes.iter_mut().enumerate() {
-            if let Poll::Ready(result) = write.wait.as_mut().poll(cx) {
-                return Poll::Ready((index, result));
-            }
-        }
-        Poll::Pending
-    })
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::DuplicateCheck;
@@ -1474,6 +1477,7 @@ mod tests {
     use crate::component::{ComponentRegistry, RegistryBuilder};
     use crate::conf::ThreadPoolConfig;
     use crate::file::build_test_fs;
+    use crate::index::btree::BTREE_NODE_USABLE_SIZE;
     use crate::index::btree::KeyRange;
     use crate::index::build::cold_reader::{ColdReadAdmission, ColdReader};
     use crate::index::build::{BuildEntries, IndexBuildEntry};
@@ -1606,6 +1610,17 @@ mod tests {
         }
     }
 
+    /// Inspect all component owners without retaining construction reservations.
+    pub(crate) fn cold_budgets(admission: &DiskBuildAdmission) -> Vec<MemoryBudget> {
+        let mut budgets = vec![
+            admission.input.clone(),
+            admission.assembler.clone(),
+            admission.output.clone(),
+        ];
+        budgets.extend(admission.workers.iter().cloned());
+        budgets
+    }
+
     async fn pool() -> PoolScope {
         let mut registry = RegistryBuilder::new();
         registry.build::<EnginePoisoner>(()).await.unwrap();
@@ -1665,6 +1680,23 @@ mod tests {
     }
 
     async fn roundtrip(unique: bool, count: u32, workers: usize, fail: Option<&'static str>) {
+        let config = ColdIndexBuildConfig::default()
+            .max_workers(Some(workers))
+            .max_ready_buffers(1)
+            .max_in_flight_writes(match fail {
+                Some("delayed child") => 4,
+                Some("late duplicate write") => 32,
+                _ => 2,
+            });
+        roundtrip_config(unique, count, config, fail).await;
+    }
+
+    async fn roundtrip_config(
+        unique: bool,
+        count: u32,
+        config: ColdIndexBuildConfig,
+        fail: Option<&'static str>,
+    ) {
         let scope = pool().await;
         let metadata = Arc::new(
             TableMetadata::try_new(
@@ -1699,27 +1731,17 @@ mod tests {
             guard.clone(),
         );
         let allocated_before = file.root().alloc_map.allocated();
-        let policy = ColdBuildPolicy::new(
-            ColdIndexBuildConfig::default()
-                .max_workers(Some(workers))
-                .max_ready_buffers(1)
-                .max_in_flight_writes(match fail {
-                    Some("delayed child") => 4,
-                    Some("late duplicate write") => 32,
-                    _ => 2,
-                }),
-            2,
-        )
-        .unwrap();
+        let policy = ColdBuildPolicy::new(config, 2).unwrap();
         let admission = DiskBuildAdmission::new(policy, unique).unwrap();
-        let budget = admission.budget.clone();
+        let budget = admission.input.clone();
+        let budgets = cold_budgets(&admission);
         let encoder = secondary_index_encoder(
             &metadata,
             &metadata.idx.index_specs()[IndexSlot::new(0)],
             !unique,
         );
         let duplicate = matches!(fail, Some("late duplicate" | "late duplicate write"));
-        let multiple = duplicate || fail == Some("merge batch");
+        let multiple = duplicate || fail == Some("merge batch") || count >= 524_288;
         let mut inputs = [BuildEntries::new(&budget), BuildEntries::new(&budget)];
         let mut expected = Vec::new();
         for number in (0..count).rev() {
@@ -1738,28 +1760,24 @@ mod tests {
                 encoder.encode_pair(&[value], Val::from(row_id))
             };
             let len = key.as_bytes().len();
-            input
-                .payload
-                .grow(
-                    if len > MEM_CMP_KEY_INLINE { len } else { 0 },
-                    "test disk key",
-                )
-                .unwrap();
             expected.push((key.as_bytes().to_vec(), row_id));
             input
-                .entries
-                .push(IndexBuildEntry { key, row_id }, "test disk entries")
+                .push_with(
+                    if len > MEM_CMP_KEY_INLINE { len } else { 0 },
+                    "test disk entries",
+                    "test disk key",
+                    || IndexBuildEntry { key, row_id },
+                )
                 .unwrap();
         }
         expected.sort_unstable();
         let mut runs = BudgetedVec::new(&budget);
         for (group, input) in inputs.into_iter().enumerate() {
-            if input.entries.is_empty() {
+            if input.is_empty() {
                 continue;
             }
             let run = Arc::new(complete_work(SortedRun::finish_group(
-                input.entries,
-                input.payload,
+                input,
                 if unique {
                     DuplicateCheck::Collect
                 } else {
@@ -1834,7 +1852,11 @@ mod tests {
             Some(
                 "backend" | "settle handoff" | "detach settle handoff" | "seal" | "late duplicate",
             ) => (),
-            Some(purpose) => fail_build_budget(&budget, purpose),
+            Some(purpose) => {
+                for budget in &budgets {
+                    fail_build_budget(budget, purpose);
+                }
+            }
             None => (),
         }
         if let Some((release, reached)) = detached {
@@ -1900,7 +1922,7 @@ mod tests {
             );
             build.settle().await.unwrap();
             drop(build);
-            assert_eq!(budget.used(), 0);
+            assert!(budgets.iter().all(|budget| budget.used() == 0));
             return;
         }
         if matches!(fail, Some("settle handoff" | "detach settle handoff")) {
@@ -1914,7 +1936,7 @@ mod tests {
                 allocated_before
             );
             drop(build);
-            assert_eq!(budget.used(), 0);
+            assert!(budgets.iter().all(|budget| budget.used() == 0));
             return;
         }
         let result = build.build().await;
@@ -1966,9 +1988,20 @@ mod tests {
             {
                 let metrics = build.measurements();
                 assert!(metrics.write_peak <= 2);
-                assert!(metrics.buffer_peak <= workers as u64 + 2);
+                assert!(metrics.buffer_peak <= policy.max_workers as u64 + 2);
                 assert_eq!(metrics.write_count, build.allocations.len() as u64);
-                assert!(metrics.scratch_peak_bytes <= policy.max_scratch_bytes as u64);
+                assert!(
+                    metrics.scratch_peak_bytes
+                        <= (policy.max_input_bytes
+                            + policy.max_workers * policy.worker_scratch_bytes
+                            + policy.assembler_scratch_bytes
+                            + DiskBuildAdmission::output_bytes(
+                                policy.max_workers,
+                                policy.max_ready_buffers,
+                                policy.max_in_flight_writes
+                            )
+                            .unwrap()) as u64
+                );
             }
             let runtime = SecondaryDiskTreeRuntime::new(
                 IndexSlot::new(0),
@@ -2005,7 +2038,10 @@ mod tests {
                 owner.settle().await.unwrap();
                 drop(owner);
                 assert!(weak.upgrade().is_none());
-                assert_eq!(budget.used(), 0);
+                assert!(budgets.iter().all(|budget| budget.used() == 0));
+                for worker in &budgets[3..] {
+                    assert!(worker.peak() <= config.worker_scratch_bytes);
+                }
                 return;
             }
             let mut completed = completed;
@@ -2081,7 +2117,13 @@ mod tests {
             assert!(matches!(owner, ColdBuildProgress::Sealed(_)));
             assert!(weak_plan.upgrade().is_none() && weak_runs.upgrade().is_none());
             assert!(weak_inputs.iter().all(|input| input.upgrade().is_none()));
-            assert_eq!(budget.used(), 0, "seal releases every construction ledger");
+            assert!(
+                budgets.iter().all(|budget| budget.used() == 0),
+                "seal releases every construction allocation"
+            );
+            for worker in &budgets[3..] {
+                assert!(worker.peak() <= config.worker_scratch_bytes);
+            }
             assert!(catch_unwind(AssertUnwindSafe(|| { owner.take_file() })).is_err());
             assert!(matches!(owner, ColdBuildProgress::Sealed(_)));
             assert_eq!(owner.sealed().validation_binding().is_some(), unique);
@@ -2123,7 +2165,10 @@ mod tests {
                 );
                 drop(second);
             }
-            assert_eq!(budget.used(), 0, "released readers return their admission");
+            assert!(
+                budgets.iter().all(|budget| budget.used() == 0),
+                "released readers return their admission"
+            );
             let runtime = owner.finish_reading().unwrap();
             assert!(matches!(owner, ColdBuildProgress::ReadyToPublish(_)));
             assert!(
@@ -2162,9 +2207,8 @@ mod tests {
             return;
         }
         drop(build);
-        assert_eq!(
-            budget.used(),
-            0,
+        assert!(
+            budgets.iter().all(|budget| budget.used() == 0),
             "all producer allocations and backend buffers settled"
         );
     }
@@ -2180,6 +2224,19 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Purpose: Admit four merge streams per worker without charging resident input for merge or packing scratch.
+    /// Expected: A multi-run build covers every row, each slot stays within its minimum scratch allowance, and all components release their charges.
+    #[test]
+    fn disk_worker_slots_cover_pre_admitted_streams() {
+        smol::block_on(roundtrip_config(
+            true,
+            524_288,
+            ColdIndexBuildConfig::default()
+                .worker_scratch_bytes(DiskBuildAdmission::minimum_worker_bytes()),
+            None,
+        ));
     }
 
     /// Purpose: Preserve the retained cleanup owner when a completed build fails seal binding.
@@ -2250,33 +2307,29 @@ mod tests {
         use crate::index::BTreeKey;
         let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 2).unwrap();
         let admission = DiskBuildAdmission::new(policy, true).unwrap();
-        let mut input = BuildEntries::new(&admission.budget);
+        let mut input = BuildEntries::new(&admission.input);
         for number in 0..101u32 {
             let mut key = vec![b'p'; 1024];
             key[1020..].copy_from_slice(&number.to_be_bytes());
-            input.payload.grow(key.len(), "fixture key").unwrap();
             input
-                .entries
-                .push(
+                .push_with(key.len(), "fixture input", "fixture key", || {
                     IndexBuildEntry {
                         key: BTreeKey::from(key.as_slice()),
                         row_id: RowID::from(number as usize),
-                    },
-                    "fixture input",
-                )
+                    }
+                })
                 .unwrap();
         }
         let run = Arc::new(complete_work(SortedRun::finish_group(
-            input.entries,
-            input.payload,
+            input,
             DuplicateCheck::Collect,
             0,
             &AtomicBool::new(false),
         )));
-        let mut owners = BudgetedVec::new(&admission.budget);
+        let mut owners = BudgetedVec::new(&admission.input);
         owners.push(run, "fixture runs").unwrap();
         let runs =
-            SortedRuns::from_admitted(owners, admission.budget.clone(), DuplicateCheck::Collect);
+            SortedRuns::from_admitted(owners, admission.input.clone(), DuplicateCheck::Collect);
         let entries: Vec<_> = runs.single_run().unwrap()[..100]
             .iter()
             .map(|entry| PackedNodeEntry {
@@ -2304,55 +2357,72 @@ mod tests {
             validate_block_checksum(image.buf.as_ref().unwrap().data()).unwrap();
             drop(image);
             params.upper_fence = None;
-            let before = admission.budget.used();
+            let before = admission.output.used();
             assert!(pack_node(&admission, params, &entries).is_err());
-            assert_eq!(admission.budget.used(), before);
+            assert_eq!(admission.output.used(), before);
         }
     }
 
-    /// Purpose: Admit either index kind with exactly the validated minimum progress budget.
-    /// Expected: Both initial reservations fit, the larger consumes the full bound, and dropping admission releases every charge.
+    /// Purpose: Keep cold input, workers, assembler and output allowances independent.
+    /// Expected: Exhausting one component preserves the others, packing fits local minima, and every reservation releases with its owner.
     #[test]
-    fn disk_minimum_progress_admission() {
-        for (ready, writes) in [(1, 2), (3, 2), (8, 32)] {
-            let required = minimum_progress_bytes(true, ready, writes)
-                .unwrap()
-                .max(minimum_progress_bytes(false, ready, writes).unwrap());
-            let policy = ColdBuildPolicy::new(
-                ColdIndexBuildConfig::default()
-                    .max_ready_buffers(ready)
-                    .max_in_flight_writes(writes)
-                    .max_scratch_bytes(required),
-                2,
-            )
-            .unwrap();
-            let mut largest = 0;
-            for unique in [true, false] {
-                let admission = DiskBuildAdmission::new(policy, unique).unwrap();
-                let budget = admission.budget.clone();
-                assert!(budget.used() <= required);
-                largest = largest.max(budget.used());
-                drop(admission);
-                assert_eq!(budget.used(), 0);
-            }
-            assert_eq!(largest, required);
-        }
-    }
-
-    /// Purpose: Check overflow in progress output counts and rounded handoff capacities.
-    /// Expected: Unrepresentable counts or byte capacities return None without wrapping or panicking.
-    #[test]
-    fn disk_progress_capacity_overflow() {
-        for unique in [true, false] {
-            assert_eq!(minimum_progress_bytes(unique, usize::MAX, 2), None);
-            assert_eq!(minimum_progress_bytes(unique, 1, usize::MAX), None);
+    fn disk_component_budgets_and_packing_minima() {
+        for unique in [false, true] {
+            let config = ColdIndexBuildConfig::default()
+                .max_input_bytes(1)
+                .worker_scratch_bytes(DiskBuildAdmission::minimum_worker_bytes())
+                .assembler_scratch_bytes(DiskBuildAdmission::minimum_assembler_bytes());
+            let policy = ColdBuildPolicy::new(config, 2).unwrap();
+            let admission = DiskBuildAdmission::new(policy, unique).unwrap();
+            let budgets = cold_budgets(&admission);
+            assert!(budgets.iter().all(|budget| budget.used() == 0));
+            let limits = [
+                policy.max_input_bytes,
+                policy.assembler_scratch_bytes,
+                DiskBuildAdmission::output_bytes(2, 8, 32).unwrap(),
+                policy.worker_scratch_bytes,
+                policy.worker_scratch_bytes,
+            ];
+            let reservations: Vec<_> = budgets
+                .iter()
+                .zip(limits)
+                .map(|(budget, limit)| {
+                    let reservation = budget.reserve(limit, "test component ceiling").unwrap();
+                    assert!(budget.reserve(1, "exhausted component").is_err());
+                    reservation
+                })
+                .collect();
             assert_eq!(
-                minimum_progress_bytes(unique, 1, usize::MAX / DISK_TREE_BLOCK_SIZE),
-                None
+                admission.usage.peak(),
+                config.total_memory_bytes(2).unwrap()
             );
+            drop(reservations);
+            let packing = DiskPackingAdmission::new(&admission, 2).unwrap();
+            let mut streams = Vec::new();
+            for slot in 0..2 {
+                for _ in 0..4 {
+                    streams.push(
+                        admission
+                            .worker_budget(slot)
+                            .reserve(
+                                DEFAULT_BATCH_ENTRIES * size_of::<HotEntryRef>(),
+                                "test merge batch",
+                            )
+                            .unwrap(),
+                    );
+                }
+                let entries = packing
+                    .take(slot, worker_bytes(unique), "test packing")
+                    .unwrap();
+                drop(entries);
+                let entries = packing
+                    .take(slot, worker_bytes(unique), "test packing reuse")
+                    .unwrap();
+                drop(entries);
+            }
+            drop(streams);
+            drop(packing);
+            assert!(budgets.iter().all(|budget| budget.used() == 0));
         }
-        assert_eq!(handoff_bytes(usize::MAX), None);
-        assert_eq!(handoff_bytes(1 << (usize::BITS - 1)), None);
-        assert_eq!(handoff_bytes(1 << (usize::BITS - 2)), None);
     }
 }

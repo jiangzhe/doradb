@@ -95,6 +95,7 @@ fn plan_internal_metrics(
                 || metric.name.ends_with(".active_count")
                 || metric.name.starts_with("logical_lock.current_")
                 || metric.name.starts_with("create_index.cold_source.run.")
+                || metric.name.starts_with("checkpoint_index.max_")
             {
                 InternalMetricKind::EndGauge
             } else if metric.name.starts_with("logical_lock.peak_")
@@ -145,6 +146,29 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
     push_hot_extraction_metrics(&mut metrics, &before.index_build, &after.index_build);
+    let checkpoint_completed = after.index_build.checkpoint.completed_checkpoints
+        > before.index_build.checkpoint.completed_checkpoints;
+    for (((name, before, peak), (_, after, _)), (_, last, _)) in before
+        .index_build
+        .checkpoint
+        .metrics()
+        .into_iter()
+        .zip(after.index_build.checkpoint.metrics())
+        .zip(after.index_build.checkpoint_last.metrics())
+    {
+        if peak && !checkpoint_completed {
+            continue;
+        }
+        metrics.push(Metric {
+            name: format!("checkpoint_index.{name}"),
+            value: if peak {
+                last
+            } else {
+                after.saturating_sub(before)
+            },
+        });
+    }
+
     push_create_index_metrics(
         &mut metrics,
         &before.index_build.create,
@@ -1507,6 +1531,96 @@ mod tests {
             Bytes,
         ),
         (
+            "checkpoint_index.completed_checkpoints",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        ("checkpoint_index.no_work", 8, 11, CounterDelta, Count),
+        ("checkpoint_index.reconstruct", 8, 11, CounterDelta, Count),
+        ("checkpoint_index.partial", 8, 11, CounterDelta, Count),
+        ("checkpoint_index.put_entries", 8, 11, CounterDelta, Count),
+        (
+            "checkpoint_index.delete_entries",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "checkpoint_index.base_nodes_read",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "checkpoint_index.reused_subtrees",
+            8,
+            11,
+            CounterDelta,
+            Count,
+        ),
+        ("checkpoint_index.written_nodes", 8, 11, CounterDelta, Count),
+        (
+            "checkpoint_index.deletion_checkpoint_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.extraction_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.probe_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.reconcile_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.reachability_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.publication_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        (
+            "checkpoint_index.total_nanos",
+            8,
+            11,
+            CounterDelta,
+            Nanoseconds,
+        ),
+        ("checkpoint_index.max_workers", 11, 11, EndGauge, Count),
+        (
+            "checkpoint_index.max_scratch_bytes",
+            11,
+            11,
+            EndGauge,
+            Bytes,
+        ),
+        (
             "create_index.cold_source.source_height",
             11,
             11,
@@ -2544,6 +2658,79 @@ mod tests {
         );
     }
 
+    /// Purpose: Suppress stale checkpoint peaks while preserving counter deltas and last-checkpoint gauges.
+    /// Expected: Only increased completions emit interval gauges; cumulative reports include gauges after a completion, and both retain the last values rather than lifetime maxima.
+    #[test]
+    fn checkpoint_metrics_require_completion_and_preserve_last_gauges() {
+        for (case, start, end, delta) in [
+            ("empty", 0, 0, 0),
+            ("idle", 2, 2, 0),
+            ("reset", 2, 1, 0),
+            ("one completion", 2, 3, 1),
+            ("multiple completions", 2, 4, 2),
+        ] {
+            let mut before = InternalStatsSnapshot::default();
+            before.index_build.checkpoint.completed_checkpoints = start;
+            before.index_build.checkpoint.put_entries = start * 7;
+            let mut after = before.clone();
+            after.index_build.checkpoint.completed_checkpoints = end;
+            after.index_build.checkpoint.put_entries = end * 7;
+            if end > 0 {
+                after.index_build.checkpoint.max_workers = 8;
+                after.index_build.checkpoint.max_scratch_bytes = 8192;
+                after.index_build.checkpoint_last.max_workers = 2;
+                after.index_build.checkpoint_last.max_scratch_bytes = 1024;
+            }
+            for (mode, metrics, completions, counter_kind) in [
+                ("delta", after.delta_since(&before), delta, CounterDelta),
+                ("cumulative", after.cumulative(), end, CumulativeCounter),
+            ] {
+                let metrics: Vec<_> = metrics
+                    .into_iter()
+                    .filter(|metric| metric.name.starts_with("checkpoint_index."))
+                    .collect();
+                assert_eq!(
+                    metrics.len(),
+                    if completions > 0 { 18 } else { 16 },
+                    "{case} {mode}: metric count"
+                );
+                for (suffix, value, kind, unit) in [
+                    ("completed_checkpoints", completions, counter_kind, Count),
+                    ("put_entries", completions * 7, counter_kind, Count),
+                    ("max_workers", 2, EndGauge, Count),
+                    ("max_scratch_bytes", 1024, EndGauge, Bytes),
+                ] {
+                    let actual = metrics
+                        .iter()
+                        .find(|metric| metric.name == format!("checkpoint_index.{suffix}"))
+                        .map(|metric| (metric.value, metric.kind, metric.unit));
+                    let expected = if kind == EndGauge && completions == 0 {
+                        None
+                    } else {
+                        Some((value, kind, unit))
+                    };
+                    assert_eq!(actual, expected, "{case} {mode}: {suffix}");
+                }
+                for metric in &metrics {
+                    if !matches!(
+                        metric.name.as_str(),
+                        "checkpoint_index.completed_checkpoints"
+                            | "checkpoint_index.put_entries"
+                            | "checkpoint_index.max_workers"
+                            | "checkpoint_index.max_scratch_bytes"
+                    ) {
+                        assert_eq!(
+                            (metric.value, metric.kind),
+                            (0, counter_kind),
+                            "{case} {mode}: {}",
+                            metric.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Purpose: Preserve the complete ordered internal metric contract against independent typed expectations.
     /// Expected: Every metric keeps its name, value, kind, unit, and cumulative interpretation.
     #[test]
@@ -3148,6 +3335,44 @@ mod tests {
         after.index_build.create.cold.merge.validation_bytes = 17;
         before.index_build.create.cold.merge.scratch_peak_bytes = 5;
         after.index_build.create.cold.merge.scratch_peak_bytes = 17;
+        before.index_build.checkpoint.completed_checkpoints = 3;
+        after.index_build.checkpoint.completed_checkpoints = 11;
+        before.index_build.checkpoint.no_work = 3;
+        after.index_build.checkpoint.no_work = 11;
+        before.index_build.checkpoint.reconstruct = 3;
+        after.index_build.checkpoint.reconstruct = 11;
+        before.index_build.checkpoint.partial = 3;
+        after.index_build.checkpoint.partial = 11;
+        before.index_build.checkpoint.put_entries = 3;
+        after.index_build.checkpoint.put_entries = 11;
+        before.index_build.checkpoint.delete_entries = 3;
+        after.index_build.checkpoint.delete_entries = 11;
+        before.index_build.checkpoint.base_nodes_read = 3;
+        after.index_build.checkpoint.base_nodes_read = 11;
+        before.index_build.checkpoint.reused_subtrees = 3;
+        after.index_build.checkpoint.reused_subtrees = 11;
+        before.index_build.checkpoint.written_nodes = 3;
+        after.index_build.checkpoint.written_nodes = 11;
+        before.index_build.checkpoint.deletion_checkpoint_nanos = 3;
+        after.index_build.checkpoint.deletion_checkpoint_nanos = 11;
+        before.index_build.checkpoint.extraction_nanos = 3;
+        after.index_build.checkpoint.extraction_nanos = 11;
+        before.index_build.checkpoint.probe_nanos = 3;
+        after.index_build.checkpoint.probe_nanos = 11;
+        before.index_build.checkpoint.reconcile_nanos = 3;
+        after.index_build.checkpoint.reconcile_nanos = 11;
+        before.index_build.checkpoint.reachability_nanos = 3;
+        after.index_build.checkpoint.reachability_nanos = 11;
+        before.index_build.checkpoint.publication_nanos = 3;
+        after.index_build.checkpoint.publication_nanos = 11;
+        before.index_build.checkpoint.total_nanos = 3;
+        after.index_build.checkpoint.total_nanos = 11;
+        before.index_build.checkpoint.max_workers = 3;
+        after.index_build.checkpoint.max_workers = 11;
+        after.index_build.checkpoint_last.max_workers = 11;
+        before.index_build.checkpoint.max_scratch_bytes = 3;
+        after.index_build.checkpoint.max_scratch_bytes = 11;
+        after.index_build.checkpoint_last.max_scratch_bytes = 11;
         let delta = plan_internal_metrics(&before, &after);
         let cumulative = cumulative_internal_metrics(&after);
         for (mode, metrics, is_cumulative) in

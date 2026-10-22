@@ -108,26 +108,10 @@ pub(crate) enum MemTreeSiblingMergePlan {
     Partial { right_count: usize },
 }
 
-/// Plan the largest valid packed prefix of sorted sibling entries.
-///
-/// DiskTree rewrite uses this as a dry-run before allocating replacement blocks:
-/// candidate right siblings are only accepted when the final packed block count
-/// stays within the rewrite's write budget. When all entries fit, the returned
-/// fence is the caller-supplied run fence; for split nodes it is the first
-/// unpacked entry. The returned fence is later used by `pack_fixed_entries`, so
-/// planning and materialization run against the same lower/upper fence pair.
-pub(crate) fn plan_sibling_node<'a, V>(
-    params: PackedNodePlanParams<'a>,
-    entries: &'a [PackedNodeEntry<'a, V>],
-) -> PackedNodePlan<'a>
-where
-    V: BTreeValue + Copy,
-{
-    try_plan_sibling_node(params, entries)
-        .unwrap_or_else(|| panic!("B-tree pack invariant violated: no sibling plan fits the node"))
-}
-
-/// Plan a bounded candidate window, rejecting unrepresentable fences or entries.
+/// Plan the largest fitting prefix of a bounded sorted candidate window.
+/// Preserve the supplied upper fence when all entries fit; otherwise use the
+/// first unpacked key. Materialization must retain the planned fence pair.
+/// Return `None` when the required slots and fences cannot fit a node.
 pub(crate) fn try_plan_sibling_node<'a, V>(
     params: PackedNodePlanParams<'a>,
     entries: &'a [PackedNodeEntry<'a, V>],
@@ -841,7 +825,7 @@ mod tests {
     /// Purpose: Protect open-ended and explicitly bounded plans when the entire sibling run fits.
     /// Expected: Each plan includes every entry and preserves the caller's requested extent.
     #[test]
-    fn test_plan_sibling_node_preserves_run_upper_fence() {
+    fn test_try_plan_sibling_node_preserves_run_upper_fence() {
         let entries = [
             PackedNodeEntry {
                 key: b"prefix-0001",
@@ -860,31 +844,31 @@ mod tests {
             ("open-ended", 3, None),
             ("supplied upper fence", 2, Some(b"prefix-0003".as_slice())),
         ] {
-            let result = plan_sibling_node(
+            let result = try_plan_sibling_node(
                 PackedNodePlanParams {
                     lower_fence: b"prefix-0001",
                     upper_fence,
                     min_slots: 1,
                 },
                 &entries[..count],
-            );
+            )
+            .expect("test entries and fences must fit a node");
             assert_eq!(result.packed, count, "case={case}");
             assert_eq!(result.upper_fence, upper_fence, "case={case}");
         }
     }
 
     /// Purpose: Reject a sibling plan whose required key and fences cannot fit in a node.
-    /// Expected: Planning reports the packing invariant violation instead of accepting overflow.
+    /// Expected: Planning returns no plan when the required key and fences exceed node capacity.
     #[test]
-    #[should_panic(expected = "B-tree pack invariant violated")]
-    fn test_plan_sibling_node_accounts_for_upper_fence_capacity() {
+    fn test_try_plan_sibling_node_accounts_for_upper_fence_capacity() {
         let long_key = vec![b'x'; BTREE_NODE_USABLE_SIZE];
         let entries = [PackedNodeEntry {
             key: long_key.as_slice(),
             value: BTreeNil,
         }];
 
-        plan_sibling_node(
+        let plan = try_plan_sibling_node(
             PackedNodePlanParams {
                 lower_fence: &long_key,
                 upper_fence: None,
@@ -892,6 +876,7 @@ mod tests {
             },
             &entries,
         );
+        assert_eq!(plan, None);
     }
 
     /// Purpose: Protect merge planning across no-progress, partial, full, and empty-sibling cases.

@@ -1,6 +1,56 @@
 use crate::profiling::clock::Instant;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Concurrent packing measurements for cold index construction workers.
+#[derive(Default)]
+pub(crate) struct PackingProfile {
+    active: AtomicU64,
+    peak: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl PackingProfile {
+    /// Time one packing scope; callers finish it before waiting for handoff.
+    #[inline]
+    pub(crate) fn start(&self) -> PackingTimer<'_> {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::Relaxed);
+        PackingTimer {
+            profile: self,
+            started: Instant::now(),
+        }
+    }
+
+    /// Maximum number of overlapping packing scopes.
+    #[inline]
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Acquire)
+    }
+
+    /// Sum of elapsed packing time across workers, in nanoseconds.
+    #[inline]
+    pub(crate) fn worker_nanos(&self) -> u64 {
+        self.nanos.load(Ordering::Acquire)
+    }
+}
+
+/// Ends one packing scope and releases its active-worker count on every exit.
+pub(crate) struct PackingTimer<'a> {
+    profile: &'a PackingProfile,
+    started: Instant,
+}
+
+impl Drop for PackingTimer<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.profile
+            .nanos
+            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.profile.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Hot-row extraction, sorting, and local duplicate-check measurements.
 /// Worker durations are sums, not stage wall durations.
@@ -60,6 +110,10 @@ pub struct HotExtractionMeasurements {
 /// not a published index; `create` records only completed CREATE publication.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexBuildStats {
+    /// Successfully published checkpoint reconciliation, excluding failed attempts.
+    pub checkpoint: super::CheckpointIndexMeasurements,
+    /// Most recent successful public checkpoint, for operation-specific peaks.
+    pub checkpoint_last: super::CheckpointIndexMeasurements,
     /// Completed CREATE publications, separate from successful extraction.
     pub create: CreateIndexMeasurements,
     /// Number of successful extraction samples published after child settlement.
@@ -350,6 +404,13 @@ impl IndexBuildProfiler {
             .max_cold_hot_sync_nanos
             .max(sample.max_cold_hot_sync_nanos);
         create.total_elapsed_nanos += sample.total_elapsed_nanos;
+    }
+
+    /// Record only after the owning public table checkpoint has succeeded.
+    pub(crate) fn record_checkpoint(&self, sample: &super::CheckpointIndexMeasurements) {
+        let mut stats = self.0.lock();
+        stats.checkpoint.record(sample);
+        stats.checkpoint_last = *sample;
     }
 
     /// Publish hot extraction once after all accepted children complete successfully.
