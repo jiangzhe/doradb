@@ -267,6 +267,10 @@ for new LWC blocks. Deletion checkpoint reconstructs old keys from the affected
 persisted LWC blocks and applies the matching `DiskTree` deletes. Both paths
 publish their roots with the table state that justifies them.
 
+Secondary-index checkpoint planning uses persisted root statistics to choose
+between rebuilding the tree and rewriting affected ranges. PUT-only planning
+requires no tree reads; batches containing deletes may use bounded probes.
+
 See [Secondary Index Design](./secondary-index.md) for index-specific lookup,
 visibility, and cleanup behavior.
 

@@ -4,6 +4,7 @@ use crate::catalog::{
 };
 use crate::compression::bitpacking::*;
 use crate::error::{DataIntegrityError, DataIntegrityResult};
+use crate::index::disk_tree_stats::DiskTreeStats;
 use error_stack::Report;
 use semistr::SemiStr;
 use std::borrow::Cow;
@@ -884,7 +885,7 @@ impl Ser<'_> for SecondaryIndexSlot {
                     + mem::size_of::<u8>()
                     + match root {
                         SecondaryIndexRoot::Empty => 0,
-                        SecondaryIndexRoot::Present(_) => mem::size_of::<u64>(),
+                        SecondaryIndexRoot::Present { .. } => mem::size_of::<u64>() + 34,
                     }
             }
             Self::Retired(_) => mem::size_of::<u8>() + mem::size_of::<u32>(),
@@ -900,9 +901,14 @@ impl Ser<'_> for SecondaryIndexSlot {
                 let idx = out.ser_u32(idx, index_id.get());
                 match root {
                     SecondaryIndexRoot::Empty => out.ser_u8(idx, 0),
-                    SecondaryIndexRoot::Present(block_id) => {
+                    SecondaryIndexRoot::Present { block, stats } => {
                         let idx = out.ser_u8(idx, 1);
-                        out.ser_u64(idx, block_id.get())
+                        let idx = out.ser_u64(idx, block.get());
+                        let idx = out.ser_u64(idx, stats.entries);
+                        let idx = out.ser_u64(idx, stats.encoded_key_bytes);
+                        let idx = out.ser_u64(idx, stats.leaf_nodes);
+                        let idx = out.ser_u64(idx, stats.branch_nodes);
+                        out.ser_u16(idx, stats.height)
                     }
                 }
             }
@@ -933,7 +939,26 @@ impl Deser for SecondaryIndexSlot {
                             return Err(Report::new(DataIntegrityError::InvalidPayload)
                                 .attach("present secondary index root is block zero"));
                         };
-                        (idx, SecondaryIndexRoot::Present(root_block_id))
+                        let (idx, entries) = input.deser_u64(idx)?;
+                        let (idx, encoded_key_bytes) = input.deser_u64(idx)?;
+                        let (idx, leaf_nodes) = input.deser_u64(idx)?;
+                        let (idx, branch_nodes) = input.deser_u64(idx)?;
+                        let (idx, height) = input.deser_u16(idx)?;
+                        let stats = DiskTreeStats {
+                            entries,
+                            encoded_key_bytes,
+                            leaf_nodes,
+                            branch_nodes,
+                            height,
+                        };
+                        stats.validate(u64::MAX)?;
+                        (
+                            idx,
+                            SecondaryIndexRoot::Present {
+                                block: root_block_id,
+                                stats,
+                            },
+                        )
                     }
                     _ => {
                         return Err(Report::new(DataIntegrityError::InvalidPayload)
@@ -1502,9 +1527,21 @@ mod tests {
             (
                 SecondaryIndexSlot::Active {
                     index_id: IndexID::new(0x0102_0304),
-                    root: SecondaryIndexRoot::Present(NonZeroU64::new(9).unwrap()),
+                    root: SecondaryIndexRoot::Present {
+                        block: NonZeroU64::new(9).unwrap(),
+                        stats: DiskTreeStats {
+                            entries: 1,
+                            encoded_key_bytes: 4,
+                            leaf_nodes: 1,
+                            branch_nodes: 0,
+                            height: 0,
+                        },
+                    },
                 },
-                vec![1, 4, 3, 2, 1, 1, 9, 0, 0, 0, 0, 0, 0, 0],
+                vec![
+                    1, 4, 3, 2, 1, 1, 9, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0,
+                    0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
             ),
             (
                 SecondaryIndexSlot::Retired(IndexID::new(0x0506_0708)),
@@ -1518,6 +1555,12 @@ mod tests {
             let (idx, decoded) = SecondaryIndexSlot::deser(&out[..], 0).unwrap();
             assert_eq!(idx, out.len());
             assert_eq!(decoded, slot);
+            for len in 0..out.len() {
+                assert!(
+                    SecondaryIndexSlot::deser(&out[..len], 0).is_err(),
+                    "truncated slot at {len}"
+                );
+            }
         }
         assert!(SecondaryIndexSlot::deser(&[3u8][..], 0).is_err());
         assert!(SecondaryIndexSlot::deser(&[1u8][..], 0).is_err());

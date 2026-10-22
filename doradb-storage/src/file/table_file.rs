@@ -1,6 +1,8 @@
 use crate::bitmap::AllocMap;
 use crate::buffer::{PoolGuard, ReadonlyBufferPool};
-use crate::catalog::{IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, table::TableMetadata};
+use crate::catalog::{
+    IndexRef, IndexSlot, SecondaryIndexRoot, SecondaryIndexSlot, table::TableMetadata,
+};
 use crate::checksum::checksum128;
 use crate::completion::Completion;
 use crate::error::{
@@ -359,29 +361,30 @@ impl MutableTableFile {
         &self.root().secondary_index_slots
     }
 
-    /// Returns one mutable-root secondary DiskTree root, if persisted nodes exist.
-    #[inline]
-    pub(crate) fn secondary_index_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
-        self.root().secondary_index_slots[index_slot.as_usize()]
-            .active_root()
-            .unwrap_or_else(|| {
-                panic!("secondary index root requested for inactive slot {index_slot}")
-            })
-            .block_id()
+    /// Capture one exact index generation and its complete descriptor from this fork.
+    pub(crate) fn secondary_index_descriptor(&self, index: IndexRef) -> SecondaryIndexRoot {
+        match self.root().secondary_index_slots[index.slot().as_usize()] {
+            SecondaryIndexSlot::Active { index_id, root } if index_id == index.id() => root,
+            _ => panic!("secondary root capture requires exact generation: {index:?}"),
+        }
     }
 
-    /// Updates one mutable-root secondary DiskTree root by physical index slot.
-    #[inline]
+    /// Stage a complete root descriptor for the pinned index generation.
     pub(crate) fn set_secondary_index_root(
         &mut self,
-        index_slot: IndexSlot,
-        root_block_id: Option<BlockID>,
+        index: IndexRef,
+        descriptor: SecondaryIndexRoot,
     ) {
-        let slot = &mut self.new_root.root.secondary_index_slots[index_slot.as_usize()];
-        let SecondaryIndexSlot::Active { root, .. } = slot else {
-            panic!("secondary index root update targeted inactive slot {index_slot}");
+        let slot = &mut self.new_root.root.secondary_index_slots[index.slot().as_usize()];
+        let SecondaryIndexSlot::Active { index_id, root } = slot else {
+            panic!("secondary root update targeted inactive generation: {index:?}");
         };
-        *root = SecondaryIndexRoot::from_block_id(root_block_id);
+        assert_eq!(
+            *index_id,
+            index.id(),
+            "secondary root update generation mismatch"
+        );
+        *root = descriptor;
     }
 
     /// Replaces table metadata and its matching secondary-index slot states.
@@ -768,6 +771,7 @@ fn validate_table_root(
         if let SecondaryIndexSlot::Active { root, .. } = state
             && let Some(root_block_id) = root.block_id()
         {
+            root.stats().validate(parsed_meta.alloc_map.len() as u64)?;
             validate_table_root_block(
                 &parsed_meta.alloc_map,
                 root_block_id,
@@ -884,6 +888,7 @@ mod tests {
     use crate::file::cow_file::tests::corrupt_page_checksum;
     use crate::file::fs::FileSystem;
     use crate::file::{BlockKey, FileKind, build_test_fs, build_test_fs_in, test_block_id};
+    use crate::index::disk_tree_stats::DiskTreeStats;
     use crate::io::IOBuf;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
@@ -896,6 +901,20 @@ mod tests {
     struct TestLwcBlock {
         shape: ColumnBlockEntryShape,
         buf: DirectBuf,
+    }
+
+    fn test_root(block: BlockID) -> SecondaryIndexRoot {
+        SecondaryIndexRoot::from_parts(
+            Some(block),
+            DiskTreeStats {
+                entries: 1,
+                encoded_key_bytes: 4,
+                leaf_nodes: 1,
+                branch_nodes: 0,
+                height: 0,
+            },
+        )
+        .unwrap()
     }
 
     fn panic_message(panic: Box<dyn Any + Send>) -> String {
@@ -1195,24 +1214,32 @@ mod tests {
                 disk_guard.clone(),
             );
             let secondary_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(IndexSlot::new(0), Some(secondary_root));
+            mutable.set_secondary_index_root(
+                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                test_root(secondary_root),
+            );
             assert_eq!(
-                mutable.secondary_index_root(IndexSlot::new(0)),
+                mutable.root().secondary_index_root(IndexSlot::new(0)),
                 Some(secondary_root)
             );
-            mutable.set_secondary_index_root(IndexSlot::new(0), None);
-            assert_eq!(mutable.secondary_index_root(IndexSlot::new(0)), None);
-            mutable.set_secondary_index_root(IndexSlot::new(0), Some(secondary_root));
-            let panic = catch_unwind(AssertUnwindSafe(|| {
-                mutable.set_secondary_index_root(IndexSlot::new(0), Some(SUPER_BLOCK_ID));
-            }))
-            .unwrap_err();
+            mutable.set_secondary_index_root(
+                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                SecondaryIndexRoot::Empty,
+            );
+            assert_eq!(mutable.root().secondary_index_root(IndexSlot::new(0)), None);
+            mutable.set_secondary_index_root(
+                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                test_root(secondary_root),
+            );
             assert!(
-                panic_message(panic)
-                    .contains("present secondary index root is the table-file super block")
+                SecondaryIndexRoot::from_parts(
+                    Some(SUPER_BLOCK_ID),
+                    test_root(secondary_root).stats()
+                )
+                .is_err()
             );
             assert_eq!(
-                mutable.secondary_index_root(IndexSlot::new(0)),
+                mutable.root().secondary_index_root(IndexSlot::new(0)),
                 Some(secondary_root)
             );
             let metadata = Arc::clone(&mutable.root().metadata);
@@ -1241,7 +1268,7 @@ mod tests {
                 active_root.secondary_index_slots,
                 vec![SecondaryIndexSlot::Active {
                     index_id: IndexID::new(0),
-                    root: SecondaryIndexRoot::from_block_id(Some(secondary_root)),
+                    root: test_root(secondary_root),
                 }]
             );
             drop(table_file2);
@@ -1271,7 +1298,10 @@ mod tests {
                 disk_guard.clone(),
             );
             let inherited_root = mutable.allocate_block().unwrap();
-            mutable.set_secondary_index_root(IndexSlot::new(0), Some(inherited_root));
+            mutable.set_secondary_index_root(
+                IndexRef::new(IndexID::new(0), IndexSlot::new(0)),
+                test_root(inherited_root),
+            );
             let (table_file, old_root) = mutable.commit(TrxID::new(2), false).await.unwrap();
             drop(old_root);
 
@@ -1868,5 +1898,58 @@ mod tests {
             assert!(report.contains("actual_len=131072"), "{report}");
             assert_eq!(std::fs::metadata(path).unwrap().len(), 131_072);
         });
+    }
+
+    /// Purpose: Keep required secondary statistics in metadata capacity checks and reject impossible persisted node totals.
+    /// Expected: A payload that would fit without statistics returns the existing capacity error, and geometry larger than the allocation map fails integrity validation.
+    #[test]
+    fn required_secondary_statistics_consume_metadata_capacity() {
+        let metadata = build_test_metadata();
+        let mut root = ActiveRoot::new(TrxID::new(1), 128, metadata);
+        root.secondary_index_slots[0] = SecondaryIndexSlot::Active {
+            index_id: IndexID::new(0),
+            root: test_root(BlockID::new(1)),
+        };
+        assert!(root.alloc_map.allocate_at(1));
+        let overhead = root.meta_block_ser_view().ser_len() - root.alloc_map.ser_len();
+        let max = max_payload_len(COW_FILE_PAGE_SIZE);
+        // An allocation-map word occupies eight bytes. Find the last word
+        // whose mandatory descriptor fits, then cross by exactly one word.
+        let mut pages = ((max - overhead - 24) / 8) * 64;
+        loop {
+            root.alloc_map = AllocMap::new(pages);
+            assert!(root.alloc_map.allocate_at(0));
+            assert!(root.alloc_map.allocate_at(1));
+            let bytes = root.meta_block_ser_view().ser_len();
+            if bytes > max {
+                assert!(
+                    bytes - 34 <= max,
+                    "required statistics must cause this boundary failure"
+                );
+                let Err(error) = build_table_meta_block(&root) else {
+                    panic!("oversized metadata must fail");
+                };
+                assert!(matches!(
+                    error.current_context(),
+                    ResourceError::StorageFileCapacityExceeded
+                ));
+                break;
+            }
+            assert!(build_table_meta_block(&root).is_ok());
+            pages += 64;
+        }
+        let mut stats = test_root(BlockID::new(1)).stats();
+        stats.entries = pages as u64;
+        stats.leaf_nodes = pages as u64;
+        stats.branch_nodes = 1;
+        stats.height = 1;
+        root.secondary_index_slots[0] = SecondaryIndexSlot::Active {
+            index_id: IndexID::new(0),
+            root: SecondaryIndexRoot::from_parts(Some(BlockID::new(1)), stats).unwrap(),
+        };
+        let view = root.meta_block_ser_view();
+        let mut bytes = vec![0; view.ser_len()];
+        view.ser(&mut bytes[..], 0);
+        assert!(MetaBlock::deser(&bytes[..], 0).is_err());
     }
 }

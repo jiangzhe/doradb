@@ -78,6 +78,7 @@ async fn extract_group(
     let mut run = SortedRun {
         group_id: group,
         kind: super::RunKind::Create,
+        mutation_key_bytes: 0,
         entries: BuildEntries::new(budget),
         duplicates: LocalDuplicates::Unchecked,
         #[cfg(feature = "profiling")]

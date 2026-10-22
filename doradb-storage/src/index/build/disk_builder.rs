@@ -18,7 +18,7 @@ use super::{BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation, SortedRu
 #[cfg(any(test, feature = "profiling"))]
 use super::{MemoryUsage, SortedRun};
 use crate::buffer::PoolGuard;
-use crate::catalog::IndexRef;
+use crate::catalog::{IndexRef, SecondaryIndexRoot};
 use crate::completion::Completion;
 use crate::conf::ColdIndexBuildConfig;
 use crate::error::{
@@ -32,6 +32,7 @@ use crate::index::SecondaryDiskTreeRuntime;
 use crate::index::btree::algo::{KnownFenceNodeParams, PackedNodeEntry};
 use crate::index::btree::{BTreeNil, BTreeU64, BTreeValue};
 use crate::index::disk_tree::DISK_TREE_BLOCK_SIZE;
+use crate::index::disk_tree_stats::DiskTreeStats;
 use crate::io::DirectBuf;
 use crate::poison::EnginePoisoner;
 use crate::quiescent::QuiescentGuard;
@@ -258,6 +259,7 @@ impl DiskPackingAdmission {
 /// Final node shape: changing fences, coverage, height, or values requires replanning.
 #[derive(Clone, Debug)]
 pub(super) struct DiskNodePlan {
+    encoded_key_bytes: u64,
     lower: HotEntryRef,
     upper: Option<HotEntryRef>,
     height: u16,
@@ -336,7 +338,7 @@ pub(crate) enum ColdBuildOutcome {
 pub(crate) struct CompletedDiskBuild {
     identity: Arc<()>,
     /// Optional readable private root; empty input has no block.
-    pub(crate) root: Option<BlockID>,
+    pub(crate) root: SecondaryIndexRoot,
     completion: MergeCompletion,
 }
 
@@ -397,8 +399,6 @@ impl ColdBuildProgress {
         let metadata = SealedColdMetadata {
             identity: ColdBuildIdentity::new(build.identity.clone(), table, index, build.ts),
             root: completed.root,
-            height: build.children.first().map_or(0, |child| child.shape.height),
-            entries: completed.entries(),
             unique: build.admission.unique,
         };
         let budget = build.admission.assembler.clone();
@@ -492,6 +492,7 @@ pub(crate) struct DiskBulkBuild {
     failed: bool,
     fatal: bool,
     finished: bool,
+    stats: DiskTreeStats,
     #[cfg(feature = "profiling")]
     measurements: ColdBuildMeasurements,
     #[cfg(feature = "profiling")]
@@ -555,6 +556,7 @@ impl DiskBulkBuild {
             failed: false,
             fatal: false,
             finished: false,
+            stats: DiskTreeStats::default(),
             #[cfg(feature = "profiling")]
             measurements: ColdBuildMeasurements {
                 workers: workers as u64,
@@ -766,6 +768,13 @@ impl DiskBulkBuild {
             self.measurements.completion_nanos =
                 self.started.map_or(0, |t| t.elapsed().as_nanos() as u64);
         }
+        if self.stats.entries != completion.entries() as u64 {
+            return Err(execution_error(
+                "cold statistics differ from certified input coverage",
+            ));
+        }
+        self.stats.height = self.children.first().map_or(0, |child| child.shape.height);
+        let root = SecondaryIndexRoot::from_parts(root, self.stats)?;
         self.finished = true;
         Ok(ColdBuildOutcome::Complete(CompletedDiskBuild {
             identity: self.identity.clone(),
@@ -801,6 +810,15 @@ impl DiskBulkBuild {
         mut packet: PackedDiskNode,
         parent: bool,
     ) -> RuntimeOrFatalResult<()> {
+        // Every accepted image remains attached in CREATE. Leaf coverage is
+        // disjoint and later checked against complete merge consumption.
+        let mut added = DiskTreeStats::default();
+        added.add_node(usize::from(packet.shape.height));
+        if packet.shape.height == 0 {
+            added.entries = packet.shape.coverage.len() as u64;
+            added.encoded_key_bytes = packet.shape.encoded_key_bytes;
+        }
+        self.stats.accumulate(added);
         // Failed synchronous admission must release any producer already waiting for acknowledgement.
         let result = (|| {
             self.allocations
@@ -1110,6 +1128,7 @@ impl DiskBulkBuild {
                 .allocations
                 .iter()
                 .any(|record| !record.accepted || !record.completed || record.reclaim_attempted)
+            || completed.root.stats() != self.stats
             || completed.entries() != plan.entries()
             || (self.admission.unique && !completed.completion.checked())
             || runtime.index_slot() != index.slot()
@@ -1117,9 +1136,9 @@ impl DiskBulkBuild {
                 !runtime.matches_build(file.backing_file(), index, self.admission.unique)
                     || file.backing_file().sparse_file().file_id().as_u64() != table.as_u64()
             })
-            || completed.root != self.children.first().map(|child| child.block)
-            || completed.root == Some(SUPER_BLOCK_ID)
-            || completed.root.is_none() != (completed.entries() == 0)
+            || completed.root.block_id() != self.children.first().map(|child| child.block)
+            || completed.root.block_id() == Some(SUPER_BLOCK_ID)
+            || completed.root.block_id().is_none() != (completed.entries() == 0)
             || self.children.len() > 1
             || self.children.first().is_some_and(|child| {
                 child.shape.coverage != (0..completed.entries()) || child.shape.upper.is_some()
@@ -1306,7 +1325,13 @@ impl DiskLeafConsumer {
             entries,
             "disk leaf entries",
         )?;
+        // A planned leaf bounds both the slot count and each encoded key length.
+        let encoded_key_bytes = entries[..plan.count]
+            .iter()
+            .map(|entry| entry.key.len() as u64)
+            .sum();
         let shape = DiskNodePlan {
+            encoded_key_bytes,
             lower,
             upper: plan.upper,
             height: 0,
@@ -1396,6 +1421,7 @@ fn pack_parent_node(
         }
     }
     let shape = DiskNodePlan {
+        encoded_key_bytes: 0,
         lower: first.shape.lower,
         upper: last.shape.upper,
         height: first
@@ -1481,6 +1507,8 @@ mod tests {
     use crate::index::btree::KeyRange;
     use crate::index::build::cold_reader::{ColdReadAdmission, ColdReader};
     use crate::index::build::{BuildEntries, IndexBuildEntry};
+    use crate::index::disk_tree_stats::DiskTreeStats;
+    use crate::index::disk_tree_stats::root_descriptor;
     use crate::index::util::tests::drain_candidates;
     use crate::index::{SecondaryDiskTreeRuntime, secondary_index_encoder};
     use crate::runtime::thread_pool::ThreadPoolWorkers;
@@ -1982,13 +2010,16 @@ mod tests {
             }
             let completed = result.unwrap();
             assert_eq!(completed.entries(), count as usize);
-            assert_eq!(completed.root.is_none(), count == 0);
+            assert_eq!(completed.root.block_id().is_none(), count == 0);
             assert!(build.allocations.iter().all(|r| r.accepted && r.completed));
             #[cfg(feature = "profiling")]
             {
                 let metrics = build.measurements();
-                assert!(metrics.write_peak <= 2);
-                assert!(metrics.buffer_peak <= policy.max_workers as u64 + 2);
+                assert!(metrics.write_peak <= policy.max_in_flight_writes as u64);
+                assert!(
+                    metrics.buffer_peak
+                        <= (policy.max_workers + policy.max_ready_buffers + 1) as u64
+                );
                 assert_eq!(metrics.write_count, build.allocations.len() as u64);
                 assert!(
                     metrics.scratch_peak_bytes
@@ -2069,7 +2100,15 @@ mod tests {
             );
             build.failed = false;
             let root = completed.root;
-            completed.root = Some(SUPER_BLOCK_ID);
+            completed.root = SecondaryIndexRoot::from_parts(
+                Some(BlockID::new(u64::MAX)),
+                DiskTreeStats {
+                    entries: 1,
+                    leaf_nodes: 1,
+                    ..DiskTreeStats::default()
+                },
+            )
+            .unwrap();
             assert!(
                 build
                     .validate_seal(&completed, test_user_table_id(501), binding, &runtime)
@@ -2177,10 +2216,12 @@ mod tests {
             );
             let range = KeyRange::new(Bound::Unbounded, Bound::Unbounded);
             let actual = if unique {
-                let tree = runtime.open_unique_at(root, &guard).unwrap();
+                let tree = runtime.open_unique_at(root.block_id(), &guard).unwrap();
+                assert_eq!(root, root_descriptor(&tree).await.unwrap());
                 drain_candidates(&mut tree.scan_candidate_stream(&range)).await
             } else {
-                let tree = runtime.open_non_unique_at(root, &guard).unwrap();
+                let tree = runtime.open_non_unique_at(root.block_id(), &guard).unwrap();
+                assert_eq!(root, root_descriptor(&tree).await.unwrap());
                 drain_candidates(&mut tree.scan_candidate_stream(&range)).await
             };
             assert_eq!(

@@ -25,6 +25,7 @@ use crate::file::fs::FileSystem;
 use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{BlockID, TableID, TrxID};
 use crate::index::BlockIndex;
+use crate::index::disk_tree_stats::DiskTreeStats;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::poison::EnginePoisoner;
@@ -687,7 +688,12 @@ pub(crate) enum SecondaryIndexRoot {
     /// The active index has no persisted DiskTree nodes.
     Empty,
     /// The active index is rooted at this nonzero table-file block.
-    Present(NonZeroU64),
+    Present {
+        /// Nonzero table-file block containing the root.
+        block: NonZeroU64,
+        /// Exact content and reachable geometry.
+        stats: DiskTreeStats,
+    },
 }
 
 impl SecondaryIndexRoot {
@@ -696,22 +702,38 @@ impl SecondaryIndexRoot {
     pub(crate) fn block_id(self) -> Option<BlockID> {
         match self {
             Self::Empty => None,
-            Self::Present(block_id) => Some(BlockID::new(block_id.get())),
+            Self::Present { block, .. } => Some(BlockID::new(block.get())),
         }
     }
 
-    /// Converts an optional physical root into its persisted representation.
-    ///
-    /// A present root must identify a real DiskTree node rather than the table
-    /// file's super block.
+    /// Exact root facts; empty roots have all-zero statistics.
     #[inline]
-    pub(crate) fn from_block_id(block_id: Option<BlockID>) -> Self {
-        match block_id {
-            None => Self::Empty,
-            Some(block_id) => Self::Present(
-                NonZeroU64::new(block_id.as_u64())
-                    .expect("present secondary index root is the table-file super block"),
-            ),
+    pub(crate) fn stats(self) -> DiskTreeStats {
+        match self {
+            Self::Empty => DiskTreeStats::default(),
+            Self::Present { stats, .. } => stats,
+        }
+    }
+
+    /// Construct a complete descriptor after content and geometry accounting settles.
+    pub(crate) fn from_parts(
+        block: Option<BlockID>,
+        stats: DiskTreeStats,
+    ) -> RuntimeOrFatalResult<Self> {
+        if let Some(block) = block {
+            let block = NonZeroU64::new(block.as_u64()).ok_or_else(|| {
+                Report::new(RuntimeError::IndexAccess).attach("secondary root cannot be block zero")
+            })?;
+            stats
+                .validate(u64::MAX)
+                .change_context(RuntimeError::IndexAccess)?;
+            Ok(Self::Present { block, stats })
+        } else if stats == DiskTreeStats::default() {
+            Ok(Self::Empty)
+        } else {
+            Err(Report::new(RuntimeError::IndexAccess)
+                .attach("empty secondary root has nonzero statistics")
+                .into())
         }
     }
 }

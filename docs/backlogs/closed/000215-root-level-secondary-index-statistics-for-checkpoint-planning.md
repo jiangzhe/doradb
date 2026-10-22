@@ -37,3 +37,10 @@ Verify recorded exact counts against independent tree traversal for initial crea
 
 This item follows the 16/64 sampling refinement. Sampling can remain for mutation effects and output packing that root totals do not determine. Related backlogs 000035, 000084, 000107, 000109, 000144, 000158 and 000212 cover other structures, scheduling, reclamation or CREATE; none records reusable secondary-root statistics.
 
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented and validated via docs/tasks/000333-root-level-secondary-index-statistics-for-checkpoint-planning.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-10-22

@@ -541,6 +541,7 @@ mod tests {
         StorageIndexKey,
     };
     use crate::id::TrxID;
+    use crate::index::disk_tree_stats::DiskTreeStats;
     use crate::value::ValKind;
     use std::num::NonZeroU64;
 
@@ -563,7 +564,16 @@ mod tests {
         let mut active_root = ActiveRoot::new(TrxID::new(20), 128, Arc::new(metadata.clone()));
         active_root.secondary_index_slots[1] = SecondaryIndexSlot::Active {
             index_id: IndexID::new(0),
-            root: SecondaryIndexRoot::Present(NonZeroU64::new(99).unwrap()),
+            root: SecondaryIndexRoot::Present {
+                block: NonZeroU64::new(99).unwrap(),
+                stats: DiskTreeStats {
+                    entries: 1,
+                    encoded_key_bytes: 4,
+                    leaf_nodes: 1,
+                    branch_nodes: 0,
+                    height: 0,
+                },
+            },
         };
 
         let err =
