@@ -2101,7 +2101,7 @@ mod tests {
         StorageColumnSpec, StorageTableSpec, TableCache,
     };
     use crate::completion::{Completion, CompletionTake};
-    use crate::conf::{RecoveryConfig, TrxSysConfig};
+    use crate::conf::{CheckpointIndexBuildConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
         Error, FatalError, IoError, LifecycleError, ResourceError, RuntimeError,
@@ -3907,14 +3907,19 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect prepared deletion bitmaps for tables without secondary indexes.
-    /// Expected: Checkpoint publishes surviving cold rows and omits deleted rows without
-    /// requiring index sidecars.
+    /// Purpose: Protect prepared deletion bitmaps for indexless tables with no room for input allocation.
+    /// Expected: Independent construction budgets permit publication of surviving cold rows while omitting deleted rows without requiring index sidecars.
     #[test]
     fn test_checkpoint_prepared_bitmap_without_secondary_indexes() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "checkpoint-no-index").await;
+            let checkpoint = CheckpointIndexBuildConfig::default().max_input_bytes(1);
+            let engine = Engine::bootstrap(
+                lightweight_test_engine_config(temp_dir.path(), "checkpoint-no-index")
+                    .checkpoint_index_build(checkpoint),
+            )
+            .await
+            .unwrap();
             let mut ddl_session = engine.new_session().unwrap();
             let table_id = ddl_session
                 .create_table(

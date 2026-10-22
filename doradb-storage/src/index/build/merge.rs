@@ -2,8 +2,8 @@
 use super::co_rank::{self, MergeCut};
 use super::loser_tree::LoserTree;
 use super::{
-    BudgetedVec, BuildOutcome, DuplicateCheck, IndexBuildEntry, LocalDuplicates, MemoryReservation,
-    RunKind, SortedRuns,
+    BudgetedVec, BuildOutcome, DuplicateCheck, IndexBuildEntry, LocalDuplicates, MemoryBudget,
+    MemoryReservation, RunKind, SortedRuns,
 };
 use crate::completion::Completion;
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
@@ -26,7 +26,8 @@ pub(crate) use tests::pool as test_pool;
 #[cfg(test)]
 pub(super) use tests::{fixture_in as test_runs, prepare_packed as test_prepare_packed};
 
-const DEFAULT_BATCH_ENTRIES: usize = 32_768;
+/// Maximum entry references retained by one default merge cursor.
+pub(super) const DEFAULT_BATCH_ENTRIES: usize = 32_768;
 
 /// Coordinates established against one retained immutable run owner.
 /// Retained references must be resolved with that same owner, not another plan.
@@ -600,12 +601,14 @@ impl PartitionMergeStream {
         plan: Arc<PreparedMerge>,
         partition: usize,
         stop: Arc<AtomicBool>,
+        budget: Option<MemoryBudget>,
     ) -> RuntimeOrFatalResult<BuildOutcome<Self>> {
         if stop.load(AtomicOrdering::Acquire) {
             return Ok(BuildOutcome::Stopped);
         }
         let range = plan.range(partition);
-        let mut buffer = BudgetedVec::new(&plan.runs.budget);
+        let budget = budget.unwrap_or_else(|| plan.runs.budget.clone());
+        let mut buffer = BudgetedVec::new(&budget);
         let tree = if plan.runs.single_run().is_some() {
             None
         } else {
@@ -617,7 +620,7 @@ impl PartitionMergeStream {
                     &plan.runs,
                     &plan.boundaries.cuts[partition].positions,
                     &plan.boundaries.cuts[partition + 1].positions,
-                    &plan.runs.budget,
+                    &budget,
                 )
                 .change_context(RuntimeError::IndexAccess)?,
             )
@@ -809,6 +812,16 @@ pub(crate) trait PartitionConsumer: Send + Sync + 'static {
     /// Per-partition ownership returned after successful consumption.
     type Output: Send + 'static;
 
+    /// Budget the merge cursor with its consumer when construction has independent scratch.
+    fn workspace_budget(&self, plan: &PreparedMerge, _partition: usize) -> MemoryBudget {
+        plan.runs.budget.clone()
+    }
+
+    /// Budget coordinator bookkeeping independently from retained inputs when requested.
+    fn metadata_budget(&self, plan: &PreparedMerge) -> MemoryBudget {
+        plan.runs.budget.clone()
+    }
+
     /// Consume the owned stream in this same finite ThreadPool job. Yield
     /// between synchronous pulls; awaiting consumer work also releases the worker.
     fn consume(
@@ -892,7 +905,7 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             "hot merge consumption pool is smaller than prepared worker budget"
         );
         let partitions = plan.partitions();
-        let admission = plan.runs.budget.reserve(
+        let admission = consumer.metadata_budget(&plan).reserve(
             partitions
                 * (size_of::<Option<PartitionCompletion<C::Output>>>()
                     + size_of::<CompletedPartition<C::Output>>()
@@ -948,14 +961,18 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
         if let Some(error) = owner.failure.take() {
             return Err(error);
         }
-        let mut streams = BudgetedVec::new(&owner.plan.runs.budget);
+        let mut streams = BudgetedVec::new(&owner.consumer.metadata_budget(&owner.plan));
         streams
             .ensure_capacity(owner.plan.partitions(), "disk merge workspaces")
             .change_context(RuntimeError::IndexAccess)?;
         for partition in 0..owner.plan.partitions() {
             // This new owner has not shared its stop token with any job yet.
-            let BuildOutcome::Complete(stream) =
-                PartitionMergeStream::new(owner.plan.clone(), partition, owner.stop.clone())?
+            let BuildOutcome::Complete(stream) = PartitionMergeStream::new(
+                owner.plan.clone(),
+                partition,
+                owner.stop.clone(),
+                Some(owner.consumer.workspace_budget(&owner.plan, partition)),
+            )?
             else {
                 unreachable!("fresh merge admission cannot be stopped")
             };
@@ -1141,9 +1158,10 @@ impl<C: PartitionConsumer> MergeConsumption<C> {
             self.jobs[partition] = Some(self.pool.submit_async(async move {
                 #[cfg(feature = "profiling")]
                 let started = Instant::now();
+                let budget = consumer.workspace_budget(&plan, partition);
                 let stream = match admitted_stream {
                     Some(stream) => stream,
-                    None => match PartitionMergeStream::new(plan, partition, stop)? {
+                    None => match PartitionMergeStream::new(plan, partition, stop, Some(budget))? {
                         BuildOutcome::Complete(stream) => stream,
                         BuildOutcome::Stopped => return Ok(BuildOutcome::Stopped),
                     },
@@ -1762,7 +1780,9 @@ mod tests {
     }
 
     fn assert_four_leaves<V: BTreeValue>(batch: &HotBatch<'_>, value: V) {
-        use crate::index::btree::algo::{PackedNodeEntry, PackedNodePlanParams, plan_sibling_node};
+        use crate::index::btree::algo::{
+            PackedNodeEntry, PackedNodePlanParams, try_plan_sibling_node,
+        };
         let entries: Vec<_> = (0..batch.ranks().len())
             .map(|index| PackedNodeEntry {
                 key: batch.entry(index).unwrap().1.key.as_bytes(),
@@ -1771,14 +1791,15 @@ mod tests {
             .collect();
         let mut remaining = entries.as_slice();
         for _ in 0..4 {
-            let plan = plan_sibling_node(
+            let plan = try_plan_sibling_node(
                 PackedNodePlanParams {
                     lower_fence: remaining[0].key,
                     upper_fence: None,
                     min_slots: 1,
                 },
                 remaining,
-            );
+            )
+            .expect("test merge batch must have a fitting leaf prefix");
             assert!(
                 plan.packed < remaining.len(),
                 "full production batch must leave a tail after four capacity-limited leaves"
@@ -1937,6 +1958,7 @@ mod tests {
                                 plan.clone(),
                                 partition,
                                 Arc::new(AtomicBool::new(false)),
+                                None,
                             )
                             .unwrap(),
                         );
@@ -2095,7 +2117,7 @@ mod tests {
                         MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 1, 2).unwrap();
                     let plan = preparation.execute().await.unwrap();
                     let mut stream = complete_work(
-                        PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)))
+                        PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)), None)
                             .unwrap(),
                     );
                     let mut count = 0;
@@ -2386,7 +2408,7 @@ mod tests {
                 MergePreparation::with_sizing(runs.clone(), pool.clone(), 2, 2, 1).unwrap();
             let plan = prepare.execute().await.unwrap();
             let stream = complete_work(
-                PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)))
+                PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)), None)
                     .unwrap(),
             );
             assert!(stream.finish(()).is_err());
@@ -2405,6 +2427,7 @@ mod tests {
                         owner,
                         usize::from(!foreign_plan),
                         Arc::new(AtomicBool::new(false)),
+                        None,
                     )
                     .unwrap(),
                 );
@@ -2427,7 +2450,7 @@ mod tests {
             }
             let stop = Arc::new(AtomicBool::new(false));
             let mut stream =
-                complete_work(PartitionMergeStream::new(plan, 0, stop.clone()).unwrap());
+                complete_work(PartitionMergeStream::new(plan, 0, stop.clone(), None).unwrap());
             while complete_work(stream.next_batch().unwrap()).is_some() {}
             stop.store(true, AtomicOrdering::Release);
             assert!(matches!(
@@ -2560,12 +2583,22 @@ mod tests {
                 .unwrap();
                 let plan = prepare.execute().await.unwrap();
                 let mut left = complete_work(
-                    PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)))
-                        .unwrap(),
+                    PartitionMergeStream::new(
+                        plan.clone(),
+                        0,
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                    )
+                    .unwrap(),
                 );
                 let right = complete_work(
-                    PartitionMergeStream::new(plan.clone(), 1, Arc::new(AtomicBool::new(false)))
-                        .unwrap(),
+                    PartitionMergeStream::new(
+                        plan.clone(),
+                        1,
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                    )
+                    .unwrap(),
                 );
                 assert_eq!(left.buffer.capacity(), DEFAULT_BATCH_ENTRIES);
                 assert_eq!(right.buffer.capacity(), DEFAULT_BATCH_ENTRIES);
@@ -2593,7 +2626,7 @@ mod tests {
             let mut prepare = MergePreparation::new(runs, pool.clone(), 2).unwrap();
             let plan = prepare.execute().await.unwrap();
             let stream = complete_work(
-                PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false))).unwrap(),
+                PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)), None).unwrap(),
             );
             assert_eq!(stream.buffer.capacity(), 4);
             let n = DEFAULT_BATCH_ENTRIES;
@@ -2613,7 +2646,7 @@ mod tests {
             let mut prepare = MergePreparation::new(runs, pool, 2).unwrap();
             let plan = prepare.execute().await.unwrap();
             let failed =
-                PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)));
+                PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)), None);
             assert!(
                 failed.is_err(),
                 "default batch admission must not shrink to fit spare scratch"
@@ -2688,7 +2721,7 @@ mod tests {
                     let plan = prepare.execute().await.unwrap();
                     assert_eq!(plan.partitions(), 1);
                     let mut stream = complete_work(
-                        PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)))
+                        PartitionMergeStream::new(plan, 0, Arc::new(AtomicBool::new(false)), None)
                             .unwrap(),
                     );
                     if k == 1 {
@@ -2860,8 +2893,13 @@ mod tests {
             );
             for slot in 0..2 {
                 let mut stream = complete_work(
-                    PartitionMergeStream::new(plan.clone(), 0, Arc::new(AtomicBool::new(false)))
-                        .unwrap(),
+                    PartitionMergeStream::new(
+                        plan.clone(),
+                        0,
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                    )
+                    .unwrap(),
                 );
                 while complete_work(stream.next_batch().unwrap()).is_some() {}
                 let record = complete_work(stream.finish(()).unwrap());

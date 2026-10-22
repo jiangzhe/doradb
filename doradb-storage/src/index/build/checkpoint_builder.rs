@@ -1,19 +1,22 @@
 //! Physical checkpoint construction: range reconciliation, subtree reuse and root assembly.
 //! Strategy selection is supplied by the caller; this module owns admitted execution
 //! and settles every accepted worker and write before returning a candidate root.
+#[cfg(any(test, feature = "profiling"))]
+use super::MemoryUsage;
 use super::checkpoint::IndexCheckpoint;
-use super::disk_builder::{ColdBuildPolicy, minimum_progress_bytes};
 use super::merge::{
-    CompletedPartition, HotEntryRef, MergeAcknowledgement, MergeConsumption, MergePreparation,
-    PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
+    CompletedPartition, DEFAULT_BATCH_ENTRIES, HotEntryRef, MergeAcknowledgement, MergeConsumption,
+    MergePreparation, PartitionConsumer, PartitionMergeStream, PreparedMerge, execution_error,
 };
 use super::packing::{max_node_slots, pack_admitted_node, plan_candidates, plan_parent};
+use super::write::{PendingWrites, completion_bytes};
 use super::{
     BudgetedEntries, BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation,
     PAYLOAD_CREDIT_BYTES, PayloadSize, RunKind, SortedRuns,
 };
 use crate::buffer::PoolGuard;
-use crate::completion::Completion;
+use crate::conf::CheckpointIndexBuildConfig;
+use crate::error::{ConfigResult, ResourceResult};
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
 use crate::file::cow_file::MutableCowFile;
 use crate::file::table_file::MutableTableFile;
@@ -21,7 +24,7 @@ use crate::id::{BlockID, RowID, TrxID};
 use crate::index::BTreeKey;
 use crate::index::btree::algo::{KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams};
 use crate::index::btree::{BTreeEntryView, BTreeKeyView};
-use crate::index::btree::{BTreeNode, BTreeU64};
+use crate::index::btree::{BTreeNil, BTreeNode, BTreeU64};
 use crate::index::disk_tree::DiskTreeNodeView;
 use crate::index::disk_tree::{
     DISK_TREE_BLOCK_SIZE, DiskTree, DiskTreeNodeGuard, DiskTreeRuntime, DiskTreeSpec, LogicalEntry,
@@ -33,6 +36,7 @@ use crate::memcmp::MEM_CMP_KEY_INLINE;
 use crate::runtime::yield_now;
 use error_stack::ResultExt;
 use futures::{FutureExt, future::BoxFuture};
+#[cfg(any(test, feature = "profiling"))]
 use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -41,13 +45,7 @@ use std::sync::Arc;
 use crate::profiling::{CheckpointIndexMeasurements, clock::Instant};
 
 #[cfg(test)]
-pub(crate) use tests::{RewriteWork, rewrite_work};
-
-/// Provisional state retained by each active or unassembled checkpoint job.
-const JOB_BYTES: usize = 4 * 1024 * 1024;
-
-/// Ordered assembly, final-fence repair and bounded planning storage.
-pub(super) const ASSEMBLER_BYTES: usize = 12 * 1024 * 1024;
+pub(crate) use tests::{RewriteWork, checkpoint_budgets, rewrite_work};
 
 // Optional partial-rewrite absorption cannot revisit an ever-growing prefix.
 const OPTIONAL_LEAF_CANDIDATES: usize = 8;
@@ -61,13 +59,51 @@ pub(super) enum BuildMode {
     PartialRewrite,
 }
 
-/// Invocation-wide progress reserved before checkpoint sources or keys grow.
-/// The fixed frontier admission outlives every sequential index consumer.
+/// Validated independent checkpoint budgets and concurrency limits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckpointBuildPolicy {
+    /// Captured inputs and resident run metadata.
+    pub(crate) max_input_bytes: usize,
+    /// Per-worker scratch and pending-output occupancy.
+    pub(crate) worker_scratch_bytes: usize,
+    /// Shared planning, assembly and construction bookkeeping.
+    pub(crate) assembler_scratch_bytes: usize,
+    /// Active or unassembled workers.
+    pub(crate) max_workers: usize,
+    /// Queued outputs.
+    pub(crate) max_ready_buffers: usize,
+    /// Accepted unsettled writes.
+    pub(crate) max_in_flight_writes: usize,
+}
+
+impl CheckpointBuildPolicy {
+    /// Normalize component budgets before constructing runtime owners.
+    pub(crate) fn new(
+        mut config: CheckpointIndexBuildConfig,
+        workers: usize,
+    ) -> ConfigResult<Self> {
+        config.validate(workers)?;
+        Ok(Self {
+            max_input_bytes: config.max_input_bytes,
+            worker_scratch_bytes: config.worker_scratch_bytes,
+            assembler_scratch_bytes: config.assembler_scratch_bytes,
+            max_workers: config.max_workers.unwrap_or(workers),
+            max_ready_buffers: config.max_ready_buffers,
+            max_in_flight_writes: config.max_in_flight_writes,
+        })
+    }
+}
+
+/// Independent allocation owners retained through sequential index consumers.
 pub(crate) struct CheckpointAdmission {
-    policy: ColdBuildPolicy,
-    budget: MemoryBudget,
-    _frontier: MemoryReservation,
-    output: Mutex<MemoryReservation>,
+    policy: CheckpointBuildPolicy,
+    /// Captured sources, resident keys and run-planning metadata.
+    pub(crate) input: MemoryBudget,
+    /// Planner, assembly, shared fences and construction bookkeeping.
+    pub(super) assembler: MemoryBudget,
+    output: MemoryBudget,
+    #[cfg(any(test, feature = "profiling"))]
+    usage: Arc<MemoryUsage>,
     #[cfg(feature = "profiling")]
     measurements: Mutex<CheckpointIndexMeasurements>,
     #[cfg(test)]
@@ -75,34 +111,73 @@ pub(crate) struct CheckpointAdmission {
 }
 
 impl CheckpointAdmission {
-    /// Protect one job, ordered assembly and the minimum durable output pipeline.
-    pub(crate) fn new(
-        budget: &MemoryBudget,
-        policy: ColdBuildPolicy,
-    ) -> RuntimeOrFatalResult<Arc<Self>> {
-        let frontier = budget
-            .reserve(
-                ASSEMBLER_BYTES + JOB_BYTES,
-                "checkpoint provisional progress",
-            )
-            .change_context(RuntimeError::CheckpointExecution)?;
-        let bytes =
-            minimum_progress_bytes(true, policy.max_ready_buffers, policy.max_in_flight_writes)
-                .zip(minimum_progress_bytes(
-                    false,
-                    policy.max_ready_buffers,
-                    policy.max_in_flight_writes,
-                ))
-                .map(|(a, b)| a.max(b))
-                .ok_or_else(|| execution_error("checkpoint progress capacity overflow"))?;
-        let output = budget
-            .reserve(bytes, "checkpoint minimum progress")
-            .change_context(RuntimeError::CheckpointExecution)?;
+    /// Capacity for fixed worker buffers, one merge batch and packing headroom.
+    /// Decoded outlined keys and unusually large run sets remain data-dependent.
+    pub(crate) fn minimum_worker_bytes() -> usize {
+        (2 * max_node_slots::<BTreeNil>() + 1) * size_of::<Entry>()
+            + 3 * (max_node_slots::<BTreeNil>() + 1)
+                * size_of::<PackedNodeEntry<'static, BTreeU64>>()
+            + DEFAULT_BATCH_ENTRIES * size_of::<HotEntryRef>()
+            + 4 * DISK_TREE_BLOCK_SIZE
+    }
+
+    /// Capacity for two decoded leaf windows and replacement packing storage.
+    pub(crate) fn minimum_assembler_bytes() -> usize {
+        2 * max_node_slots::<BTreeNil>() * size_of::<Entry>()
+            + 3 * (max_node_slots::<BTreeNil>() + 1)
+                * size_of::<PackedNodeEntry<'static, BTreeU64>>()
+            + 4 * DISK_TREE_BLOCK_SIZE
+    }
+
+    /// Bound worker-held images, queued images, accepted writes and assembler images.
+    /// Ordered queues can retain up to each worker's pending-output quota, in
+    /// addition to its staged image and pending handoff. Assembly
+    /// needs at most eight overlapping boundary/packing images; accepted writes
+    /// retain their own buffers, with a coarse allowance for completion bookkeeping.
+    pub(crate) fn output_bytes(
+        workers: usize,
+        worker_bytes: usize,
+        ready: usize,
+        writes: usize,
+    ) -> Option<usize> {
+        workers
+            .checked_mul(2)?
+            .checked_add(ready)?
+            .checked_add(writes)?
+            .checked_add(8)?
+            .checked_mul(DISK_TREE_BLOCK_SIZE)?
+            .checked_add(completion_bytes(writes)?)?
+            .checked_add(workers.checked_mul(worker_bytes)?)
+    }
+
+    /// Establish independent quotas without subtracting construction capacity from input.
+    pub(crate) fn new(policy: CheckpointBuildPolicy) -> RuntimeOrFatalResult<Arc<Self>> {
+        let output_bytes = Self::output_bytes(
+            policy.max_workers,
+            policy.worker_scratch_bytes,
+            policy.max_ready_buffers,
+            policy.max_in_flight_writes,
+        )
+        .ok_or_else(|| execution_error("checkpoint output capacity overflow"))?;
+        #[cfg(any(test, feature = "profiling"))]
+        let usage = Arc::new(MemoryUsage::default());
+        let budget = |limit| {
+            #[cfg(any(test, feature = "profiling"))]
+            {
+                MemoryBudget::tracked(limit, &usage)
+            }
+            #[cfg(not(any(test, feature = "profiling")))]
+            {
+                MemoryBudget::new(limit)
+            }
+        };
         Ok(Arc::new(Self {
+            input: budget(policy.max_input_bytes),
+            assembler: budget(policy.assembler_scratch_bytes),
+            output: budget(output_bytes),
             policy,
-            budget: budget.clone(),
-            _frontier: frontier,
-            output: Mutex::new(output),
+            #[cfg(any(test, feature = "profiling"))]
+            usage,
             #[cfg(feature = "profiling")]
             measurements: Mutex::new(CheckpointIndexMeasurements::default()),
             #[cfg(test)]
@@ -110,17 +185,28 @@ impl CheckpointAdmission {
         }))
     }
 
-    /// Accumulate private measurements for the public checkpoint's success boundary.
+    fn worker_budget(&self) -> MemoryBudget {
+        #[cfg(any(test, feature = "profiling"))]
+        {
+            MemoryBudget::tracked(self.policy.worker_scratch_bytes, &self.usage)
+        }
+        #[cfg(not(any(test, feature = "profiling")))]
+        {
+            MemoryBudget::new(self.policy.worker_scratch_bytes)
+        }
+    }
+
+    /// Accumulate measurements for the checkpoint's success boundary.
     #[cfg(feature = "profiling")]
     pub(crate) fn measure(&self, update: impl FnOnce(&mut CheckpointIndexMeasurements)) {
         update(&mut self.measurements.lock());
     }
 
-    /// Snapshot after successful publication and complete child settlement.
+    /// Report simultaneous real allocation admission across all independent budgets.
     #[cfg(feature = "profiling")]
     pub(crate) fn measurements(&self) -> CheckpointIndexMeasurements {
         let mut sample = *self.measurements.lock();
-        sample.max_scratch_bytes = self.budget.peak() as u64;
+        sample.max_scratch_bytes = self.usage.peak() as u64;
         sample
     }
 
@@ -131,8 +217,7 @@ impl CheckpointAdmission {
     ) -> RuntimeOrFatalResult<MemoryReservation> {
         Ok(self
             .output
-            .lock()
-            .take(bytes, purpose)
+            .reserve(bytes, purpose)
             .change_context(RuntimeError::CheckpointExecution)?)
     }
 }
@@ -667,9 +752,10 @@ impl JobOutput<'_> {
             .await
             .map_err(|_| execution_error("checkpoint assembler stopped accepting output"))?;
         // The assembler is the sole progress producer. Queue delivery transfers
-        // ownership; acknowledgement follows consumption or transfer into A.
-        // Receiver teardown wakes rejected producers; the merge owner drains all
-        // accepted jobs before its read authority and invocation budget disappear.
+        // ownership; acknowledgement follows assembly or bounded queue admission.
+        // A future partition can retain this handoff until ordered assembly reaches
+        // it. Failure drops deferred acknowledgements before draining workers and
+        // rejecting channel-held packets, so no producer waits on its cleanup owner.
         accepted
             .recv_async()
             .await
@@ -777,6 +863,14 @@ struct LeafConsumer<F: DiskTreeSpec> {
 impl<F: DiskTreeSpec> PartitionConsumer for LeafConsumer<F> {
     type Output = RangeSummary;
 
+    fn workspace_budget(&self, _plan: &PreparedMerge, partition: usize) -> MemoryBudget {
+        self.jobs[partition].clone()
+    }
+
+    fn metadata_budget(&self, _plan: &PreparedMerge) -> MemoryBudget {
+        self.admission.assembler.clone()
+    }
+
     async fn consume(
         &self,
         stream: PartitionMergeStream,
@@ -820,8 +914,7 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
     ) -> RuntimeOrFatalResult<Self> {
         let runs = plan.runs();
         let (lower, upper) = plan.key_range(partition);
-        // The invocation owns JOB_BYTES through ordered acknowledgement; this
-        // inner budget enforces the per-job allowance against actual growth.
+        // Scratch and pending output share this job quota through ordered acknowledgement.
         let scratch = consumer.jobs[partition].clone();
         let tree = consumer.runtime.open(consumer.root, &consumer.guard);
         let base = BaseReader::new(&tree, &scratch);
@@ -889,7 +982,9 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
             }
             // Flush before another wide key can exhaust the bounded allowance.
             if self.window.len() == self.capacity
-                || (self.window.len() > 1 && self.scratch.used() > JOB_BYTES / 2)
+                || (self.window.len() > 1
+                    && self.scratch.used()
+                        > self.consumer.admission.policy.worker_scratch_bytes / 2)
             {
                 self.leaf_emitted = true;
                 self.emit(self.upper).await?;
@@ -1103,58 +1198,62 @@ struct QueuedOutput {
 
 struct OrderedOutput {
     outputs: BudgetedVec<Option<QueuedOutput>>,
+    deferred: Option<Packet>,
     budget: MemoryBudget,
-    next: usize,
+    head: usize,
     received: usize,
+    consumed: usize,
 }
 
 impl OrderedOutput {
-    fn push(&mut self, output: Output) -> RuntimeOrFatalResult<()> {
-        let (lower, upper, image) = match &output {
+    fn reserve(&mut self, output: &Output) -> ResourceResult<MemoryReservation> {
+        let (lower, upper, image) = match output {
             Output::Image(image) => (&image.lower, &image.upper, DISK_TREE_BLOCK_SIZE),
             Output::Subtree(child) => (&child.lower, &child.upper, 0),
         };
         let bytes = image + lower.bytes().len() + upper.as_ref().map_or(0, |key| key.bytes().len());
         let provisional = self
             .budget
-            .reserve(bytes, "checkpoint ordered provisional payload")
-            .change_context(RuntimeError::CheckpointExecution)?;
-        self.outputs
-            .push(
-                Some(QueuedOutput {
-                    output,
-                    _provisional: provisional,
-                }),
-                "checkpoint ordered output",
-            )
-            .change_context(RuntimeError::CheckpointExecution)?;
+            .quota()
+            .reserve(bytes, "checkpoint ordered provisional payload")?;
+        self.outputs.reserve_one("checkpoint ordered output")?;
+        Ok(provisional)
+    }
+
+    fn push_reserved(&mut self, output: Output, provisional: MemoryReservation) {
+        self.outputs.push_reserved(Some(QueuedOutput {
+            output,
+            _provisional: provisional,
+        }));
         self.received += 1;
-        Ok(())
     }
 
     fn pop(&mut self) -> Option<QueuedOutput> {
-        let output = self.outputs.get_mut(self.next)?.take();
-        self.next += 1;
-        output
+        let output = self.outputs.get_mut(self.head)?.take()?;
+        self.head += 1;
+        self.consumed += 1;
+        if self.head == self.outputs.len() {
+            // The coordinator drains this partition before accepting more packets.
+            // Reuse its admitted slots without resetting cumulative packet counts.
+            self.outputs.clear();
+            self.head = 0;
+        }
+        Some(output)
     }
 
     fn release(&mut self) {
         self.outputs = BudgetedVec::new(&self.budget);
+        self.head = 0;
     }
-}
-
-struct Write {
-    block: BlockID,
-    completion: Arc<Completion<()>>,
-    _observer: MemoryReservation,
 }
 
 /// Retains every accepted write through successful observation or cleanup.
 struct Writer<'a> {
     file: &'a mut MutableTableFile,
+    #[cfg(feature = "profiling")]
     admission: Arc<CheckpointAdmission>,
     limit: usize,
-    writes: BudgetedVec<Write>,
+    writes: PendingWrites<BlockID>,
     allocations: BudgetedVec<BlockID>,
 }
 
@@ -1163,13 +1262,9 @@ impl Writer<'_> {
         if self.writes.len() == self.limit {
             self.observe().await?;
         }
-        self.writes
-            .reserve_one("checkpoint write ledger")
-            .change_context(RuntimeError::CheckpointExecution)?;
         self.allocations
             .reserve_one("checkpoint allocation ledger")
             .change_context(RuntimeError::CheckpointExecution)?;
-        let observer = self.admission.output(1024, "checkpoint write observer")?;
         let block = self.file.allocate_block()?;
         self.allocations.push_reserved(block);
         let ingress = self
@@ -1179,11 +1274,8 @@ impl Writer<'_> {
             .await
             .map_err(|error| error.into_runtime_or_fatal(RuntimeError::CheckpointExecution))
             .attach("operation=checkpoint_reconcile, phase=write_acceptance")?;
-        self.writes.push_reserved(Write {
-            block,
-            completion,
-            _observer: observer,
-        });
+        self.writes
+            .push(block, async move { completion.wait_result().await });
         Ok(Descriptor {
             promotion: image.promotion,
             reused: false,
@@ -1195,14 +1287,11 @@ impl Writer<'_> {
     }
 
     async fn observe(&mut self) -> RuntimeOrFatalResult<()> {
-        let pending = &self.writes[0];
-        let result = pending.completion.wait_result().await;
+        let (block, result) = self.writes.wait_next().await;
         #[cfg(feature = "profiling")]
         if result.is_ok() {
             self.admission.measure(|m| m.written_nodes += 1);
         }
-        let block = pending.block;
-        self.writes.swap_remove(0);
         result
             .map_err(|error| error.into_runtime_or_fatal(RuntimeError::CheckpointExecution))
             .attach_with(|| {
@@ -1224,6 +1313,7 @@ impl Writer<'_> {
             for &block in &*self.allocations {
                 self.file.rollback_allocated_block(block);
             }
+            self.allocations.clear();
         }
         failure.map_or(Ok(()), Err)
     }
@@ -1237,7 +1327,6 @@ struct Assembler<F: DiskTreeSpec> {
     pending_candidates: usize,
     partial: bool,
     levels: BudgetedVec<BudgetedVec<Descriptor>>,
-    scratch: MemoryBudget,
     budget: MemoryBudget,
     admission: Arc<CheckpointAdmission>,
     ts: TrxID,
@@ -1252,8 +1341,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
         partial: bool,
     ) -> Self {
         let (runtime, root, guard) = tree.snapshot();
-        let budget = &admission.budget;
-        let scratch = MemoryBudget::new(ASSEMBLER_BYTES);
+        let budget = &admission.assembler;
         Self {
             runtime,
             root,
@@ -1261,8 +1349,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
             pending: None,
             pending_candidates: 0,
             partial,
-            levels: BudgetedVec::new(&scratch),
-            scratch,
+            levels: BudgetedVec::new(budget),
             budget: budget.clone(),
             admission,
             ts,
@@ -1304,7 +1391,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
             self.pending_candidates = 1;
             return Ok(());
         }
-        let mut entries = BudgetedEntries::with_payload_credit(&self.scratch, PAYLOAD_CREDIT_BYTES);
+        let mut entries = BudgetedEntries::with_payload_credit(&self.budget, PAYLOAD_CREDIT_BYTES);
         self.decode(&pending, &mut entries)?;
         self.decode(&image, &mut entries)?;
         self.repack(writer, entries, image.upper).await?;
@@ -1327,7 +1414,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
         } else {
             // Required fence repair remains legal after optional absorption ends.
             let mut entries =
-                BudgetedEntries::with_payload_credit(&self.scratch, PAYLOAD_CREDIT_BYTES);
+                BudgetedEntries::with_payload_credit(&self.budget, PAYLOAD_CREDIT_BYTES);
             self.decode(&image, &mut entries)?;
             self.repack(writer, entries, Some(upper)).await?;
             self.pending
@@ -1400,7 +1487,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
     ) -> BoxFuture<'a, RuntimeOrFatalResult<BudgetedVec<Descriptor>>> {
         Box::pin(async move {
             let _frame = self
-                .scratch
+                .budget
                 .reserve(2048, "checkpoint fence repair frame")
                 .change_context(RuntimeError::CheckpointExecution)?;
             #[cfg(feature = "profiling")]
@@ -1433,8 +1520,8 @@ impl<F: DiskTreeSpec> Assembler<F> {
         upper: Option<Arc<OwnedKey>>,
     ) -> RuntimeOrFatalResult<BudgetedVec<Descriptor>> {
         let node = guard.view();
-        let mut result = BudgetedVec::new(&self.scratch);
-        let mut entries = BudgetedEntries::with_payload_credit(&self.scratch, PAYLOAD_CREDIT_BYTES);
+        let mut result = BudgetedVec::new(&self.budget);
+        let mut entries = BudgetedEntries::with_payload_credit(&self.budget, PAYLOAD_CREDIT_BYTES);
         entries
             .ensure_capacity(node.count(), "checkpoint old edge entries")
             .change_context(RuntimeError::CheckpointExecution)?;
@@ -1483,8 +1570,8 @@ impl<F: DiskTreeSpec> Assembler<F> {
         upper: Option<Arc<OwnedKey>>,
     ) -> RuntimeOrFatalResult<BudgetedVec<Descriptor>> {
         let node = guard.view();
-        let mut result = BudgetedVec::new(&self.scratch);
-        let mut children = BudgetedVec::new(&self.scratch);
+        let mut result = BudgetedVec::new(&self.budget);
+        let mut children = BudgetedVec::new(&self.budget);
         children
             .ensure_capacity(node.count() + 1, "checkpoint old edge children")
             .change_context(RuntimeError::CheckpointExecution)?;
@@ -1520,7 +1607,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
         }
         while !children.is_empty() {
             let image =
-                Image::from_children(&mut children, &self.scratch, &self.admission, self.ts)?;
+                Image::from_children(&mut children, &self.budget, &self.admission, self.ts)?;
             result
                 .reserve_one("checkpoint repaired forest")
                 .change_context(RuntimeError::CheckpointExecution)?;
@@ -1583,7 +1670,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
             EntryKey::Base(key) => key.as_bytes(),
             EntryKey::Delta(_) => unreachable!("assembler decodes provisional images"),
         };
-        let mut slots = BudgetedVec::new(&self.scratch);
+        let mut slots = BudgetedVec::new(&self.budget);
         let count = plan_candidates(
             &mut slots,
             entries.len(),
@@ -1666,10 +1753,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
             let level = usize::from(child.height);
             while self.levels.len() <= level {
                 self.levels
-                    .push(
-                        BudgetedVec::new(&self.scratch),
-                        "checkpoint parent frontier",
-                    )
+                    .push(BudgetedVec::new(&self.budget), "checkpoint parent frontier")
                     .change_context(RuntimeError::CheckpointExecution)?;
             }
             let children = &mut self.levels[level];
@@ -1698,7 +1782,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
     fn parent(&mut self, level: usize) -> RuntimeOrFatalResult<Image> {
         Image::from_children(
             &mut self.levels[level],
-            &self.scratch,
+            &self.budget,
             &self.admission,
             self.ts,
         )
@@ -1708,7 +1792,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
         if let Some(image) = self.pending.take() {
             if image.upper.is_some() {
                 let mut entries =
-                    BudgetedEntries::with_payload_credit(&self.scratch, PAYLOAD_CREDIT_BYTES);
+                    BudgetedEntries::with_payload_credit(&self.budget, PAYLOAD_CREDIT_BYTES);
                 self.decode(&image, &mut entries)?;
                 self.repack(writer, entries, None).await?;
                 let image = self.pending.take().ok_or_else(|| {
@@ -1802,7 +1886,6 @@ struct CheckpointBuilder<'a, F: DiskTreeSpec> {
     // writes have settled and their owned buffers have been released.
     _preparation: MergePreparation,
     _queue_admission: MemoryReservation,
-    _allowance: MemoryReservation,
     _admission: Arc<CheckpointAdmission>,
 }
 
@@ -1823,19 +1906,9 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         let started = Instant::now();
         let partial = mode == BuildMode::PartialRewrite;
         let policy = admission.policy;
-        let budget = runs.budget.clone();
-        let mut allowance = MemoryReservation::new(&budget);
+        let budget = admission.assembler.clone();
         let entries: usize = runs.runs().iter().map(|run| run.entries().len()).sum();
-        let mut workers = 1;
-        while workers < policy.max_workers && workers < entries.div_ceil(65_536) {
-            if allowance
-                .grow(JOB_BYTES, "checkpoint additional job")
-                .is_err()
-            {
-                break;
-            }
-            workers += 1;
-        }
+        let workers = policy.max_workers.min(entries.div_ceil(65_536).max(1));
         let mut preparation = MergePreparation::new(runs, pool.clone(), workers)?;
         let plan = preparation.execute().await?;
         #[cfg(feature = "profiling")]
@@ -1852,14 +1925,16 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         let mut jobs = BudgetedVec::new(&budget);
         let mut queues = BudgetedVec::new(&budget);
         for _ in 0..plan.partitions() {
-            let job = MemoryBudget::new(JOB_BYTES);
+            let job = admission.worker_budget();
             queues
                 .push(
                     OrderedOutput {
                         outputs: BudgetedVec::new(&job),
+                        deferred: None,
                         budget: job.clone(),
-                        next: 0,
+                        head: 0,
                         received: 0,
+                        consumed: 0,
                     },
                     "checkpoint ordered queues",
                 )
@@ -1868,7 +1943,9 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
                 .change_context(RuntimeError::CheckpointExecution)?;
         }
         let (runtime, root, guard) = tree.snapshot();
-        let consumption = MergeConsumption::new_admitted(
+        // Admit merge scratch only when its worker slot starts. Preallocating
+        // every partition would exceed the active/unassembled worker allowance.
+        let consumption = MergeConsumption::new(
             plan.clone(),
             pool,
             LeafConsumer {
@@ -1882,12 +1959,20 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
                 ts,
                 partial,
             },
-        )?;
+        );
         let writer = Writer {
             file,
+            #[cfg(feature = "profiling")]
             admission: admission.clone(),
             limit: policy.max_in_flight_writes,
-            writes: BudgetedVec::new(&budget),
+            writes: PendingWrites::new(
+                policy.max_in_flight_writes,
+                admission.output(
+                    completion_bytes(policy.max_in_flight_writes)
+                        .unwrap_or_else(|| unreachable!("validated checkpoint write capacity")),
+                    "checkpoint write completions",
+                )?,
+            ),
             allocations: BudgetedVec::new(&budget),
         };
         let assembler = Assembler::<F>::new(tree, admission.clone(), ts, partial);
@@ -1905,7 +1990,6 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
             started,
             _preparation: preparation,
             _queue_admission: queue_admission,
-            _allowance: allowance,
             _admission: admission,
         })
     }
@@ -1923,7 +2007,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
             let mut work = self._admission.rewrite_work.lock();
             work.max_frontier_bytes = work
                 .max_frontier_bytes
-                .max(self.assembler.scratch.peak() as u64);
+                .max(self.assembler.budget.peak() as u64);
         }
         result
     }
@@ -1931,7 +2015,16 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
     async fn consume(&mut self) -> RuntimeOrFatalResult<Option<BlockID>> {
         while self.partition < self.plan.partitions() {
             if let Some(output) = self.queues[self.partition].pop() {
+                let QueuedOutput {
+                    output,
+                    _provisional: provisional,
+                } = output;
                 self.assemble(output).await?;
+                drop(provisional);
+                continue;
+            }
+            if let Some(packet) = self.queues[self.partition].deferred.take() {
+                self.accept(packet).await?;
                 continue;
             }
             enum Progress<T> {
@@ -1965,31 +2058,60 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         self.finish().await
     }
 
-    async fn assemble(&mut self, output: QueuedOutput) -> RuntimeOrFatalResult<()> {
-        match output.output {
+    async fn assemble(&mut self, output: Output) -> RuntimeOrFatalResult<()> {
+        match output {
             Output::Image(image) => self.assembler.append(&mut self.writer, image).await?,
             Output::Subtree(child) => self.assembler.reuse(&mut self.writer, child).await?,
         }
         Ok(())
     }
 
-    async fn accept(&mut self, packet: Packet) -> RuntimeOrFatalResult<()> {
+    async fn accept(&mut self, mut packet: Packet) -> RuntimeOrFatalResult<()> {
         if !Arc::ptr_eq(&packet.plan, &self.plan)
             || packet.partition < self.partition
             || packet.partition >= self.queues.len()
             || packet.ordinal != self.queues[packet.partition].received
+            || self.queues[packet.partition].deferred.is_some()
         {
             return Err(execution_error(
                 "checkpoint output identity or sequence mismatch",
             ));
         }
-        let output = match packet.output {
+        packet.output = match packet.output {
             Output::Image(image) if packet.stable => {
                 Output::Subtree(self.writer.write(image).await?)
             }
             output => output,
         };
-        self.queues[packet.partition].push(output)?;
+        if packet.partition == self.partition {
+            // Current output transfers directly into assembly; waiting for its
+            // worker's queue quota would block the producer needed for progress.
+            self.assemble(packet.output).await?;
+            let queue = &mut self.queues[packet.partition];
+            queue.received += 1;
+            queue.consumed += 1;
+        } else {
+            let queue = &mut self.queues[packet.partition];
+            let reservation = (|| {
+                // Queue occupancy shares the worker's scratch ceiling. Leave
+                // conservative continuation room before acknowledging more output;
+                // this is logical headroom, not an additional allocation.
+                let _headroom = queue.budget.quota().reserve(
+                    CheckpointAdmission::minimum_worker_bytes(),
+                    "checkpoint ordered worker headroom",
+                )?;
+                queue.reserve(&packet.output)
+            })();
+            match reservation {
+                Ok(provisional) => queue.push_reserved(packet.output, provisional),
+                Err(_) => {
+                    // Only local queue admission defers. The producer retains at
+                    // most one staged image and this already-admitted handoff.
+                    queue.deferred = Some(packet);
+                    return Ok(());
+                }
+            }
+        }
         packet
             .ack
             .send(())
@@ -2003,7 +2125,8 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         ack: MergeAcknowledgement,
     ) -> RuntimeOrFatalResult<()> {
         if summary.packets != self.queues[self.partition].received
-            || self.queues[self.partition].next != self.queues[self.partition].received
+            || self.queues[self.partition].consumed != self.queues[self.partition].received
+            || self.queues[self.partition].deferred.is_some()
         {
             return Err(execution_error(
                 "checkpoint packet count differs from exhausted range",
@@ -2040,6 +2163,11 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
     }
 
     async fn settle_failure(&mut self, mut error: RuntimeOrFatalError) -> RuntimeOrFatalError {
+        // Deferred producers await acknowledgements owned outside the channel.
+        // Reject them before settlement waits for their terminal completions.
+        for queue in &mut *self.queues {
+            queue.deferred = None;
+        }
         let cleanup = self.consumption.settle_rejecting(&self.input, drop).await;
         if let Err(cleanup) = cleanup {
             error = error.merge_cleanup(cleanup);
@@ -2065,8 +2193,25 @@ fn consume_prefix<T>(values: &mut BudgetedVec<T>, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{global_readonly_pool_scope, table_readonly_pool};
+    use crate::catalog::{
+        IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec, TableMetadata,
+    };
+    use crate::error::{CompletionErrorBridge, IoError, ResourceError};
+    use crate::file::build_test_fs;
+    use crate::index::btree::KeyRange;
     use crate::index::build::checkpoint::mutation_runs;
+    use crate::index::build::merge::test_pool;
     use crate::index::build::{fail_build_budget, payload_accounting};
+    use crate::index::disk_tree::UniqueDiskTreeRuntime;
+    use crate::index::util::tests::drain_candidates;
+    use crate::table::test_user_table_id;
+    use crate::value::ValKind;
+    use error_stack::Report;
+    use futures::future::ready;
+    use std::io::ErrorKind;
+    use std::ops::Bound;
 
     /// Private observations for the bounded partial-rewrite regression test.
     #[derive(Clone, Copy, Debug, Default)]
@@ -2082,6 +2227,457 @@ mod tests {
     /// Inspect boundary work after all workers and output have settled.
     pub(crate) fn rewrite_work(admission: &CheckpointAdmission) -> RewriteWork {
         *admission.rewrite_work.lock()
+    }
+
+    /// Inspect independent owners for allocation fault injection and settled cleanup.
+    pub(crate) fn checkpoint_budgets(admission: &CheckpointAdmission) -> [MemoryBudget; 3] {
+        [
+            admission.input.clone(),
+            admission.assembler.clone(),
+            admission.output.clone(),
+        ]
+    }
+
+    async fn with_checkpoint_file(
+        check: impl AsyncFnOnce(&UniqueDiskTreeRuntime, &PoolGuard, &mut MutableTableFile),
+    ) {
+        let metadata = Arc::new(
+            TableMetadata::try_new(
+                vec![StorageColumnSpec::new(
+                    ValKind::U32,
+                    StorageColumnFlags::empty(),
+                )],
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::PK,
+                )],
+            )
+            .unwrap(),
+        );
+        let (_temp, fs) = build_test_fs();
+        let table_id = test_user_table_id(503);
+        let table = fs
+            .create_table_file(table_id, metadata.clone(), false)
+            .unwrap();
+        let (table, old_root) = table.commit(TrxID::new(1), false).await.unwrap();
+        drop(old_root);
+        let global = global_readonly_pool_scope(64 * 1024 * 1024);
+        let disk_pool = table_readonly_pool(&global, table_id, &table);
+        let guard = disk_pool.create_base_guard();
+        let mut file = MutableTableFile::fork(
+            &table,
+            fs.background_writes(),
+            disk_pool.global_pool().clone(),
+            guard.clone(),
+        );
+        let runtime = UniqueDiskTreeRuntime::new(
+            &metadata.idx.index_specs()[IndexSlot::new(0)],
+            &metadata,
+            disk_pool.file_kind(),
+            Arc::clone(disk_pool.sparse_file()),
+            disk_pool.global_pool().clone(),
+        );
+        check(&runtime, &guard, &mut file).await;
+    }
+
+    fn ordered_output_fixture() -> (OrderedOutput, Arc<OwnedKey>, usize) {
+        let limit = 8 * size_of::<Option<QueuedOutput>>() + 16;
+        let budget = MemoryBudget::new(limit);
+        let key = OwnedKey::copy(b"k", &MemoryBudget::new(1024)).unwrap();
+        (
+            OrderedOutput {
+                outputs: BudgetedVec::new(&budget),
+                deferred: None,
+                budget,
+                head: 0,
+                received: 0,
+                consumed: 0,
+            },
+            key,
+            limit,
+        )
+    }
+
+    fn queue_output(queue: &mut OrderedOutput, output: Output) -> ResourceResult<()> {
+        let provisional = queue.reserve(&output)?;
+        queue.push_reserved(output, provisional);
+        Ok(())
+    }
+
+    fn subtree_output(block: usize, key: &Arc<OwnedKey>) -> Output {
+        Output::Subtree(Descriptor {
+            promotion: None,
+            reused: true,
+            block: BlockID::new(block as u64),
+            lower: key.clone(),
+            upper: None,
+            height: 0,
+        })
+    }
+
+    fn assert_queued_block(output: &QueuedOutput, block: usize) {
+        let Output::Subtree(child) = &output.output else {
+            panic!("fixture expected a subtree descriptor");
+        };
+        assert_eq!(child.block, BlockID::new(block as u64));
+    }
+
+    async fn checkpoint_backpressure(minimum: bool, fail: bool) {
+        with_checkpoint_file(async |runtime, guard, file| {
+            let (_scope, pool) = test_pool(2).await;
+            let tree = runtime.open(None, guard);
+            let count = 131_072u32;
+            let runs = Arc::new(mutation_runs(
+                vec![(
+                    RunKind::Put,
+                    (0..count)
+                        .map(|key| {
+                            (
+                                BTreeKey::from(key.to_be_bytes().as_slice()),
+                                RowID::new(u64::from(key) + 1),
+                            )
+                        })
+                        .collect(),
+                )],
+                true,
+            ));
+            let input_budget = runs.budget.clone();
+            let mut config = CheckpointIndexBuildConfig::default()
+                .max_workers(Some(2))
+                .max_ready_buffers(1)
+                .max_in_flight_writes(2);
+            if minimum {
+                config.worker_scratch_bytes = CheckpointAdmission::minimum_worker_bytes();
+            }
+            let policy = CheckpointBuildPolicy::new(config, 2).unwrap();
+            let admission = CheckpointAdmission::new(policy).unwrap();
+            let allocated_before = file.root().alloc_map.allocated();
+            let mut builder = CheckpointBuilder::new(
+                IndexCheckpoint::new(&tree, file, runs, TrxID::new(2), pool, admission.clone()),
+                BuildMode::Reconstruct,
+            )
+            .await
+            .unwrap();
+            assert_eq!(builder.plan.partitions(), 2);
+            let jobs: Vec<_> = builder
+                .queues
+                .iter()
+                .map(|queue| queue.budget.clone())
+                .collect();
+            assert!(builder.consumption.next_output().now_or_never().is_none());
+
+            // Receiving without acknowledgement parks each worker at its first
+            // handoff. No timing assumption determines which partition arrives first.
+            let mut first: [Option<Packet>; 2] = [None, None];
+            while first.iter().any(Option::is_none) {
+                let packet = builder.input.recv_async().await.unwrap();
+                let partition = packet.partition;
+                assert_eq!(packet.ordinal, 0);
+                assert!(!packet.stable);
+                assert!(first[partition].replace(packet).is_none());
+            }
+            let mut future = first[1].take().unwrap();
+            let held = if minimum {
+                // Minimum scratch leaves no room for future buffering plus
+                // continuation headroom, so the first unstable image must defer.
+                None
+            } else {
+                builder.accept(future).await.unwrap();
+                assert_eq!(
+                    (builder.queues[1].received, builder.queues[1].consumed),
+                    (1, 0)
+                );
+                assert!(builder.queues[1].deferred.is_none());
+                future = builder.input.recv_async().await.unwrap();
+                assert_eq!((future.partition, future.ordinal), (1, 1));
+                assert!(future.stable);
+                // The producer is parked again. Fill its remaining quota to
+                // force backpressure after already admitting a buffered prefix.
+                Some(
+                    jobs[1]
+                        .quota()
+                        .reserve(
+                            policy.worker_scratch_bytes - jobs[1].used(),
+                            "test occupied future quota",
+                        )
+                        .unwrap(),
+                )
+            };
+            let received = builder.queues[1].received;
+            builder.accept(future).await.unwrap();
+            assert_eq!(
+                (builder.queues[1].received, builder.queues[1].consumed),
+                (received, 0)
+            );
+            let deferred = builder.queues[1].deferred.as_ref().unwrap();
+            assert_eq!(deferred.ordinal, received);
+            assert_eq!(matches!(&deferred.output, Output::Image(_)), minimum);
+            assert!(!deferred.ack.is_disconnected());
+            // Both workers await acknowledgements, and only two jobs were admitted.
+            assert!(builder.input.try_recv().is_err());
+            drop(held);
+            assert!(builder.queues[1].deferred.is_some());
+            builder.accept(first[0].take().unwrap()).await.unwrap();
+            assert_eq!(
+                (builder.queues[0].received, builder.queues[0].consumed),
+                (1, 1)
+            );
+            assert!(builder.queues[1].deferred.is_some());
+
+            if fail {
+                assert!(!builder.writer.allocations.is_empty());
+                let error = builder
+                    .settle_failure(execution_error("test deferred checkpoint failure"))
+                    .await;
+                assert!(matches!(error, RuntimeOrFatalError::Runtime(_)));
+                assert!(format!("{error:?}").contains("test deferred checkpoint failure"));
+                assert!(builder.queues.iter().all(|queue| queue.deferred.is_none()));
+                assert!(builder.writer.writes.is_empty());
+                assert!(builder.writer.allocations.is_empty());
+                assert_eq!(
+                    builder.writer.file.root().alloc_map.allocated(),
+                    allocated_before
+                );
+                drop(builder);
+            } else {
+                let root = builder.run().await.unwrap();
+                let result = runtime.open(root, guard);
+                let range = KeyRange::new(Bound::Unbounded, Bound::Unbounded);
+                let mut stream = result.scan_candidate_stream(&range);
+                let entries = drain_candidates(&mut stream).await;
+                assert_eq!(entries.len(), count as usize);
+                for (key, entry) in (0..count).zip(entries) {
+                    assert_eq!(entry.row_id, RowID::new(u64::from(key) + 1));
+                    assert_eq!(entry.encoded_key.as_bytes(), key.to_be_bytes());
+                }
+            }
+            assert_eq!(input_budget.used(), 0);
+            for job in jobs {
+                assert_eq!(job.used(), 0);
+                assert!(job.peak() <= policy.worker_scratch_bytes);
+            }
+            for budget in checkpoint_budgets(&admission) {
+                assert_eq!(budget.used(), 0);
+            }
+        })
+        .await;
+    }
+
+    /// Purpose: Keep future output bounded while an earlier partition is blocked, including minimum worker scratch and a single-slot handoff.
+    /// Expected: Both unstable images and stable descriptors defer without acknowledgement, the current partition progresses, and resumption preserves exact contents and releases all reservations.
+    #[test]
+    fn future_partition_backpressure_preserves_progress() {
+        smol::block_on(async {
+            for minimum in [false, true] {
+                checkpoint_backpressure(minimum, false).await;
+            }
+        });
+    }
+
+    /// Purpose: Fail a checkpoint while a future producer awaits a deferred acknowledgement and writes have been accepted.
+    /// Expected: Cleanup rejects deferred handoffs before draining workers, preserves the failure, settles writes, and reclaims every private allocation and reservation.
+    #[test]
+    fn deferred_partition_failure_rejects_before_settlement() {
+        smol::block_on(checkpoint_backpressure(false, true));
+    }
+
+    /// Purpose: Repeat checkpoint rollback after a non-fatal write error has already triggered cleanup.
+    /// Expected: All completions drain, the original error survives, allocations are reclaimed once, and repeated settlement succeeds with an empty ledger.
+    #[test]
+    fn writer_rollback_is_idempotent_after_write_failure() {
+        smol::block_on(with_checkpoint_file(async |_, _, file| {
+            let allocated_before = file.root().alloc_map.allocated();
+            let policy = CheckpointBuildPolicy::new(
+                CheckpointIndexBuildConfig::default().max_in_flight_writes(2),
+                1,
+            )
+            .unwrap();
+            let admission = CheckpointAdmission::new(policy).unwrap();
+            let mut writer = Writer {
+                file,
+                #[cfg(feature = "profiling")]
+                admission: admission.clone(),
+                limit: policy.max_in_flight_writes,
+                writes: PendingWrites::new(
+                    policy.max_in_flight_writes,
+                    admission
+                        .output(
+                            completion_bytes(policy.max_in_flight_writes).unwrap(),
+                            "checkpoint write completions",
+                        )
+                        .unwrap(),
+                ),
+                allocations: BudgetedVec::new(&admission.assembler),
+            };
+            for result in [
+                Err(CompletionErrorBridge::capture(
+                    Report::new(IoError::from(ErrorKind::Other))
+                        .attach("checkpoint rollback regression"),
+                )),
+                Ok(()),
+            ] {
+                let block = writer.file.allocate_block().unwrap();
+                writer
+                    .allocations
+                    .push(block, "checkpoint allocation ledger")
+                    .unwrap();
+                writer.writes.push(block, ready(result));
+            }
+            assert_eq!(
+                writer.file.root().alloc_map.allocated(),
+                allocated_before + 2
+            );
+            let RuntimeOrFatalError::Runtime(error) = writer.settle(true).await.unwrap_err() else {
+                panic!("non-fatal write error must retain its runtime context");
+            };
+            assert!(error.contains::<IoError>());
+            assert!(format!("{error:?}").contains("checkpoint rollback regression"));
+            assert!(writer.writes.is_empty());
+            assert_eq!(writer.file.root().alloc_map.allocated(), allocated_before);
+            assert!(writer.allocations.is_empty());
+            writer.settle(true).await.unwrap();
+            assert_eq!(writer.file.root().alloc_map.allocated(), allocated_before);
+            drop(writer);
+            assert_eq!(admission.assembler.used(), 0);
+            assert_eq!(admission.output.used(), 0);
+        }));
+    }
+
+    /// Purpose: Keep checkpoint queue memory bounded across immediate consumption and repeated buffered bursts.
+    /// Expected: Every packet arrives in order, cumulative counts survive drained storage reuse, and payload and metadata admission are released at their ownership boundaries.
+    #[test]
+    fn ordered_output_reuses_drained_slots() {
+        for burst in [1, 3, 8] {
+            let (mut queue, key, limit) = ordered_output_fixture();
+            let mut retained = None;
+            for round in 0..64 {
+                let start = round * burst;
+                for ordinal in start..start + burst {
+                    queue_output(&mut queue, subtree_output(ordinal, &key)).unwrap();
+                }
+                assert_eq!(queue.received, start + burst);
+                for ordinal in start..start + burst {
+                    let before = queue.budget.used();
+                    let output = queue.pop().unwrap();
+                    assert_queued_block(&output, ordinal);
+                    assert_eq!(queue.budget.used(), before, "pop retains payload ownership");
+                    drop(output);
+                    assert_eq!(queue.budget.used(), before - 1);
+                }
+                assert!(queue.pop().is_none());
+                assert!(queue.pop().is_none());
+                assert_eq!(
+                    queue.consumed,
+                    start + burst,
+                    "burst={burst}, round={round}"
+                );
+                assert_eq!(queue.received, start + burst);
+                let metadata = *retained.get_or_insert(queue.budget.used());
+                assert_eq!(
+                    queue.budget.used(),
+                    metadata,
+                    "burst={burst}, round={round}"
+                );
+                assert!(queue.budget.peak() <= limit);
+            }
+            queue.release();
+            assert_eq!(queue.budget.used(), 0);
+        }
+    }
+
+    /// Purpose: Preserve accepted packets and counters when pending checkpoint output exceeds its quota.
+    /// Expected: Metadata and payload admission failures leave FIFO contents and counts intact, and draining or dropping the queue releases every charge.
+    #[test]
+    fn ordered_output_rejects_excess_pending_output() {
+        for payload_failure in [false, true] {
+            let (mut queue, key, limit) = ordered_output_fixture();
+            let budget = queue.budget.clone();
+            for ordinal in 0..8 {
+                queue_output(&mut queue, subtree_output(ordinal, &key)).unwrap();
+            }
+            let held = payload_failure.then(|| {
+                budget
+                    .reserve(limit - budget.used(), "fixture occupied scratch")
+                    .unwrap()
+            });
+            let before = budget.used();
+            let output = subtree_output(8, &key);
+            let error = queue.reserve(&output).err().unwrap();
+            assert_eq!(*error.current_context(), ResourceError::InsufficientMemory);
+            let purpose = if payload_failure {
+                "checkpoint ordered provisional payload"
+            } else {
+                "checkpoint ordered output"
+            };
+            assert!(format!("{error:?}").contains(purpose));
+            assert_eq!(budget.used(), before);
+            assert_eq!((queue.received, queue.consumed), (8, 0));
+            drop(held);
+            for ordinal in 0..8 {
+                let output = queue.pop().unwrap();
+                assert_queued_block(&output, ordinal);
+            }
+            assert!(queue.pop().is_none());
+            assert_eq!((queue.received, queue.consumed), (8, 8));
+            queue.release();
+            assert_eq!(budget.used(), 0);
+            queue_output(&mut queue, output).unwrap();
+            drop(queue);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    /// Purpose: Keep input, worker, assembler and output admission independent.
+    /// Expected: Exhausting any quota leaves the others usable, construction does not deduct input capacity, and release clears every allocation charge.
+    #[test]
+    fn checkpoint_component_budgets_are_independent() {
+        let config = CheckpointIndexBuildConfig::default()
+            .max_input_bytes(64)
+            .worker_scratch_bytes(8 * 1024 * 1024)
+            .assembler_scratch_bytes(16 * 1024 * 1024);
+        let policy = CheckpointBuildPolicy::new(config, 2).unwrap();
+        let admission = CheckpointAdmission::new(policy).unwrap();
+        assert_eq!(admission.input.used(), 0);
+        assert_eq!(admission.assembler.used(), 0);
+        assert_eq!(admission.output.used(), 0);
+        let input = admission.input.reserve(64, "test input").unwrap();
+        let worker = admission.worker_budget();
+        let work = worker
+            .reserve(config.worker_scratch_bytes, "test worker")
+            .unwrap();
+        let assembly = admission
+            .assembler
+            .reserve(config.assembler_scratch_bytes, "test assembler")
+            .unwrap();
+        let output_bytes =
+            CheckpointAdmission::output_bytes(2, config.worker_scratch_bytes, 8, 32).unwrap();
+        let output = admission.output(output_bytes, "test output").unwrap();
+        let expected =
+            64 + config.worker_scratch_bytes + config.assembler_scratch_bytes + output_bytes;
+        assert_eq!(admission.usage.peak(), expected);
+        for budget in [
+            &admission.input,
+            &worker,
+            &admission.assembler,
+            &admission.output,
+        ] {
+            let error = budget.reserve(1, "exhausted component").err().unwrap();
+            assert_eq!(*error.current_context(), ResourceError::InsufficientMemory);
+        }
+        assert_eq!(admission.usage.peak(), expected);
+        drop((input, work, assembly, output));
+        for budget in [
+            &admission.input,
+            &worker,
+            &admission.assembler,
+            &admission.output,
+        ] {
+            assert_eq!(budget.used(), 0);
+        }
+        let output = admission.output(output_bytes, "recycled output").unwrap();
+        assert_eq!(admission.usage.peak(), expected);
+        drop(output);
+        assert_eq!(admission.output.used(), 0);
     }
 
     /// Purpose: Account mixed checkpoint entries without charging borrowed or inline key payloads.

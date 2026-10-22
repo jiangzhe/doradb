@@ -27,19 +27,44 @@ struct BudgetState {
 /// Each caller defines its charged allocations and separately reports fixed
 /// runtime and pool-owned costs; reservations can follow accepted storage work.
 #[derive(Clone)]
-pub(crate) struct MemoryBudget(Arc<BudgetState>);
+pub(crate) struct MemoryBudget {
+    state: Arc<BudgetState>,
+    #[cfg(any(test, feature = "profiling"))]
+    usage: Option<Arc<MemoryUsage>>,
+}
 
 impl MemoryBudget {
     /// Create a budget with no bulk allocations admitted yet.
     pub(crate) fn new(limit: usize) -> Self {
-        Self(Arc::new(BudgetState {
-            limit,
-            used: AtomicUsize::new(0),
-            #[cfg(test)]
-            test: BudgetFailure::default(),
+        Self {
+            state: Arc::new(BudgetState {
+                limit,
+                used: AtomicUsize::new(0),
+                #[cfg(test)]
+                test: BudgetFailure::default(),
+                #[cfg(any(test, feature = "profiling"))]
+                peak: AtomicUsize::new(0),
+            }),
             #[cfg(any(test, feature = "profiling"))]
-            peak: AtomicUsize::new(0),
-        }))
+            usage: None,
+        }
+    }
+
+    /// Observe this independent budget without imposing an aggregate admission limit.
+    #[cfg(any(test, feature = "profiling"))]
+    pub(crate) fn tracked(limit: usize, usage: &Arc<MemoryUsage>) -> Self {
+        let mut budget = Self::new(limit);
+        budget.usage = Some(usage.clone());
+        budget
+    }
+
+    /// Share this ceiling for logical occupancy without counting payload allocations twice.
+    pub(crate) fn quota(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            #[cfg(any(test, feature = "profiling"))]
+            usage: None,
+        }
     }
 
     /// Reserve bytes before their allocation; release follows allocation ownership.
@@ -73,33 +98,43 @@ impl MemoryBudget {
             "scratch admission preference is below requirement: required={required}, preferred={preferred}"
         );
         #[cfg(test)]
-        if self.0.test.rejects(purpose) {
-            return Err(memory_error(required, self.used(), self.0.limit, purpose));
+        if self.state.test.rejects(purpose) {
+            return Err(memory_error(
+                required,
+                self.used(),
+                self.state.limit,
+                purpose,
+            ));
         }
         if required == 0 {
             return Ok(0);
         }
-        let mut used = self.0.used.load(Ordering::Relaxed);
+        let mut used = self.state.used.load(Ordering::Relaxed);
         loop {
             let minimum = used
                 .checked_add(required)
-                .filter(|&next| next <= self.0.limit)
-                .ok_or_else(|| memory_error(required, used, self.0.limit, purpose))?;
+                .filter(|&next| next <= self.state.limit)
+                .ok_or_else(|| memory_error(required, used, self.state.limit, purpose))?;
             let next = used
                 .checked_add(preferred)
-                .filter(|&next| next <= self.0.limit)
+                .filter(|&next| next <= self.state.limit)
                 .unwrap_or(minimum);
-            match self
-                .0
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Relaxed)
-            {
+            match self.state.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     // Peak is monotonic; avoid another shared write when
                     // admitted buffers only revisit an earlier peak.
                     #[cfg(any(test, feature = "profiling"))]
-                    if next > self.0.peak.load(Ordering::Relaxed) {
-                        self.0.peak.fetch_max(next, Ordering::Relaxed);
+                    if next > self.state.peak.load(Ordering::Relaxed) {
+                        self.state.peak.fetch_max(next, Ordering::Relaxed);
+                    }
+                    #[cfg(any(test, feature = "profiling"))]
+                    if let Some(usage) = &self.usage {
+                        usage.admit(next - used);
                     }
                     return Ok(next - used);
                 }
@@ -111,7 +146,7 @@ impl MemoryBudget {
     /// Return admitted bulk allocation bytes.
     #[inline]
     pub(crate) fn used(&self) -> usize {
-        self.0.used.load(Ordering::Acquire)
+        self.state.used.load(Ordering::Acquire)
     }
 
     /// Assert quiescence and reset the next build's high-water to retained descriptors.
@@ -122,14 +157,37 @@ impl MemoryBudget {
             "hot-build scratch remains at index boundary"
         );
         #[cfg(any(test, feature = "profiling"))]
-        self.0.peak.store(retained, Ordering::Release);
+        self.state.peak.store(retained, Ordering::Release);
     }
 
     /// Return the highest simultaneous bulk allocation capacity admitted.
     #[cfg(any(test, feature = "profiling"))]
     #[inline]
     pub(crate) fn peak(&self) -> usize {
-        self.0.peak.load(Ordering::Acquire)
+        self.state.peak.load(Ordering::Acquire)
+    }
+}
+
+/// Simultaneous allocation high-water across independently limited components.
+#[cfg(any(test, feature = "profiling"))]
+#[derive(Default)]
+pub(crate) struct MemoryUsage {
+    used: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[cfg(any(test, feature = "profiling"))]
+impl MemoryUsage {
+    #[inline]
+    fn admit(&self, bytes: usize) {
+        let used = self.used.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak.fetch_max(used, Ordering::Relaxed);
+    }
+
+    /// Read the largest simultaneous admitted allocation total.
+    #[inline]
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
     }
 }
 
@@ -222,7 +280,12 @@ impl MemoryReservation {
             "hot-build scratch release exceeds owned reservation"
         );
         self.bytes -= bytes;
-        self.budget.0.used.fetch_sub(bytes, Ordering::AcqRel);
+        #[cfg(any(test, feature = "profiling"))]
+        if let Some(usage) = &self.budget.usage {
+            usage.used.fetch_sub(bytes, Ordering::AcqRel);
+        }
+        // Publish released usage before another reservation can reuse its capacity.
+        self.budget.state.used.fetch_sub(bytes, Ordering::AcqRel);
     }
 
     /// Release all admission after the associated allocations have been freed.
@@ -270,12 +333,6 @@ impl<T> BudgetedVec<T> {
             values: Vec::with_capacity(capacity),
             reservation,
         }
-    }
-
-    /// Remove an unordered element while retaining its backing capacity.
-    #[inline]
-    pub(crate) fn swap_remove(&mut self, index: usize) -> T {
-        self.values.swap_remove(index)
     }
 
     /// Remove the final element while retaining backing allocation admission.
@@ -337,7 +394,7 @@ impl<T> BudgetedVec<T> {
             memory_error(
                 usize::MAX,
                 self.reservation.budget.used(),
-                self.reservation.budget.0.limit,
+                self.reservation.budget.state.limit,
                 purpose,
             )
         })?;
@@ -365,7 +422,7 @@ impl<T> BudgetedVec<T> {
                     memory_error(
                         usize::MAX,
                         self.reservation.budget.used(),
-                        self.reservation.budget.0.limit,
+                        self.reservation.budget.state.limit,
                         purpose,
                     )
                 })?;
@@ -462,7 +519,7 @@ impl<T: PayloadSize> BudgetedEntries<T> {
                 memory_error(
                     bytes,
                     self.payload.budget.used(),
-                    self.payload.budget.0.limit,
+                    self.payload.budget.state.limit,
                     payload_purpose,
                 )
             })?;
@@ -566,7 +623,7 @@ fn memory_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetedEntries, MemoryBudget, MemoryReservation, PayloadSize};
+    use super::{BudgetedEntries, MemoryBudget, MemoryReservation, MemoryUsage, PayloadSize};
     use parking_lot::Mutex;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -626,9 +683,13 @@ mod tests {
 
     /// Reject a named request after a deterministic number of successful admissions.
     pub(crate) fn fail_after(budget: &MemoryBudget, purpose: &'static str, successful: usize) {
-        *budget.0.test.purpose.lock() = Some(purpose);
-        budget.0.test.remaining.store(successful, Ordering::Release);
-        budget.0.test.enabled.store(true, Ordering::Release);
+        *budget.state.test.purpose.lock() = Some(purpose);
+        budget
+            .state
+            .test
+            .remaining
+            .store(successful, Ordering::Release);
+        budget.state.test.enabled.store(true, Ordering::Release);
     }
 
     fn append(
@@ -646,6 +707,30 @@ mod tests {
                 dropped: dropped.clone(),
             })
             .unwrap();
+    }
+
+    /// Purpose: Measure simultaneous allocations across independent budgets without counting occupancy twice.
+    /// Expected: Logical quotas enforce their ceiling, aggregate peaks exclude quotas and nonoverlapping allocations, and all usage is released.
+    #[test]
+    fn independent_budget_usage_excludes_occupancy_quotas() {
+        let usage = Arc::new(MemoryUsage::default());
+        let first = MemoryBudget::tracked(64, &usage);
+        let second = MemoryBudget::tracked(128, &usage);
+        let payload = first.reserve(48, "first payload").unwrap();
+        let quota = first.quota().reserve(16, "pending payload quota").unwrap();
+        assert_eq!(first.used(), 64);
+        assert!(first.reserve(1, "over quota").is_err());
+        let mut other = second.reserve(80, "second payload").unwrap();
+        assert_eq!(usage.peak(), 128);
+        drop(payload);
+        other.grow(48, "second growth").unwrap();
+        assert_eq!(usage.peak(), 128);
+        drop(quota);
+        assert_eq!(first.used(), 0);
+        assert_eq!(usage.used.load(Ordering::Acquire), 128);
+        drop(other);
+        assert_eq!(second.used(), 0);
+        assert_eq!(usage.used.load(Ordering::Acquire), 0);
     }
 
     /// Purpose: Preserve payload ownership through sorting, prefix consumption, reuse and destruction.

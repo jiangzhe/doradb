@@ -956,7 +956,7 @@ mod tests {
         IndexSlot, StorageColumnFlags, StorageColumnSpec, StorageIndexFlags, StorageIndexKey,
         StorageIndexSpec,
     };
-    use crate::conf::ColdIndexBuildConfig;
+    use crate::conf::CheckpointIndexBuildConfig;
     use crate::error::RuntimeOrFatalError;
     use crate::error::{CompletionErrorBridge, CompletionResult, DataIntegrityError, IoError};
     use crate::file::block_integrity::checksum_offset;
@@ -969,11 +969,11 @@ mod tests {
     use crate::index::btree::PackedNodeSpace;
     use crate::index::btree::algo::{
         KnownFenceNodeParams, PackedNodeEntry, PackedNodePlanParams, pack_fixed_entries,
-        plan_sibling_node,
+        try_plan_sibling_node,
     };
     use crate::index::btree::{BTREE_NODE_USABLE_SIZE, BTreeHeader, BTreeKey, BTreeSlot, KeyRange};
+    use crate::index::build::checkpoint::CheckpointBuildPolicy;
     use crate::index::build::checkpoint::{mutation_runs, partial_rewrite, reconstruct, strategy};
-    use crate::index::build::disk_builder::ColdBuildPolicy;
     use crate::index::build::merge::test_pool;
     use crate::index::util::tests::{drain_candidates, drain_row_ids};
     use crate::io::DirectBuf;
@@ -1793,14 +1793,15 @@ mod tests {
             let mut rewrite_entries = Vec::new();
             let mut start = 0usize;
             while start < entries.len() {
-                let plan = plan_sibling_node(
+                let plan = try_plan_sibling_node(
                     PackedNodePlanParams {
                         lower_fence: &entries[start].key,
                         upper_fence,
                         min_slots: 1,
                     },
                     &slot_entries[start..],
-                );
+                )
+                .expect("test leaf rewrite entries must fit a node");
                 let end = start + plan.packed;
                 rewrite_entries.push(RewriteEntry::Pending(PendingRewriteEntry {
                     key: entries[start].key.clone(),
@@ -1843,14 +1844,15 @@ mod tests {
             let mut start = 0usize;
             while start < entries.len() {
                 let first = &entries[start];
-                let plan = plan_sibling_node(
+                let plan = try_plan_sibling_node(
                     PackedNodePlanParams {
                         lower_fence: first.key(),
                         upper_fence,
                         min_slots: usize::from(start + 1 < entries.len()),
                     },
                     &slot_entries[start + 1..],
-                );
+                )
+                .expect("test branch rewrite entries must fit a node");
                 let end = start + 1 + plan.packed;
                 rewrite_entries.push(RewriteEntry::Pending(PendingRewriteEntry {
                     key: first.key().to_vec(),
@@ -3409,20 +3411,22 @@ mod tests {
         ));
     }
 
-    /// Purpose: Reconstruct tall captured roots and split a tiny base across parallel insertion ranges.
-    /// Expected: Selection waits for 16 samples; physical contents match an independent oracle, scattered survivors collapse to one open leaf, complete removal returns no root, and captured old roots remain readable.
+    /// Purpose: Reconstruct tall roots and parallel insertion ranges with merge scratch independent of input admission.
+    /// Expected: Local scratch minima permit initial construction; rejecting merge buffers in the input budget leaves complete oracle-matching output, root collapse and captured-root readability intact.
     #[test]
     fn test_checkpoint_reconstruction_growth_and_scattered_survivors() {
-        use crate::conf::ColdIndexBuildConfig;
+        use crate::conf::CheckpointIndexBuildConfig;
         use crate::index::build::RunKind::{Delete, Put};
-        use crate::index::build::checkpoint::{mutation_runs, reconstruct};
-        use crate::index::build::disk_builder::ColdBuildPolicy;
+        use crate::index::build::checkpoint::CheckpointBuildPolicy;
+        use crate::index::build::checkpoint::{CheckpointAdmission, mutation_runs, reconstruct};
+        use crate::index::build::fail_build_budget;
         use crate::index::build::merge::test_pool;
         smol::block_on(with_unique_rows(
             353,
             async |runtime, guard, mutable, root, _| {
                 let (_scope, pool) = test_pool(4).await;
-                let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 4).unwrap();
+                let policy =
+                    CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 4).unwrap();
                 use crate::index::build::checkpoint::{apply_unique, strategy};
                 let tree = runtime.open(root, guard);
                 let old = unique_scan_entries(&tree).await;
@@ -3441,12 +3445,19 @@ mod tests {
                         })
                         .collect();
                     let runs = Arc::new(mutation_runs(
-                        vec![(
-                            Put,
-                            (0..count)
-                                .map(|row| (make_key(row), RowID::new(u64::from(row) + 1000)))
-                                .collect(),
-                        )],
+                        (0..2)
+                            .map(|parity| {
+                                (
+                                    Put,
+                                    (parity..count)
+                                        .step_by(2)
+                                        .map(|row| {
+                                            (make_key(row), RowID::new(u64::from(row) + 1000))
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
                         true,
                     ));
                     let seed = Arc::new(mutation_runs(
@@ -3459,12 +3470,21 @@ mod tests {
                         )],
                         true,
                     ));
+                    let minimum_policy = CheckpointBuildPolicy::new(
+                        CheckpointIndexBuildConfig::default()
+                            .worker_scratch_bytes(CheckpointAdmission::minimum_worker_bytes())
+                            .assembler_scratch_bytes(CheckpointAdmission::minimum_assembler_bytes())
+                            .max_ready_buffers(1)
+                            .max_in_flight_writes(2),
+                        4,
+                    )
+                    .unwrap();
                     let seed_root = reconstruct(
                         &runtime.open(None, guard),
                         mutable,
                         seed,
                         pool.clone(),
-                        policy,
+                        minimum_policy,
                         TrxID::new(2),
                     )
                     .await
@@ -3482,6 +3502,7 @@ mod tests {
                         strategy(&runtime.open(seed_root, guard), &runs).await,
                         ("reconstruct", 16)
                     );
+                    fail_build_budget(&runs.budget, "merge batch");
                     let grown = reconstruct(
                         &runtime.open(seed_root, guard),
                         mutable,
@@ -3561,16 +3582,17 @@ mod tests {
     /// Expected: Selection refines from 16 to 64 samples only for ambiguous costs; both strategies preserve an independent owner map including insertions beyond leaf tails, partial work reuses old blocks, no-effect work preserves the exact root, and old contents remain readable.
     #[test]
     fn test_checkpoint_partial_rewrite_sparse_edges() {
-        use crate::conf::ColdIndexBuildConfig;
+        use crate::conf::CheckpointIndexBuildConfig;
         use crate::index::build::RunKind::{Delete, Put};
+        use crate::index::build::checkpoint::CheckpointBuildPolicy;
         use crate::index::build::checkpoint::{mutation_runs, partial_rewrite, reconstruct};
-        use crate::index::build::disk_builder::ColdBuildPolicy;
         use crate::index::build::merge::test_pool;
         smol::block_on(with_unique_rows(
             354,
             async |runtime, guard, mutable, _, _| {
                 let (_scope, pool) = test_pool(4).await;
-                let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 4).unwrap();
+                let policy =
+                    CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 4).unwrap();
                 let make_key = |row: u32| {
                     let mut bytes = vec![0x80; 1024];
                     bytes[..4].copy_from_slice(&row.to_be_bytes());
@@ -3759,7 +3781,8 @@ mod tests {
             356,
             async |runtime, guard, mutable, _, _| {
                 let (_scope, pool) = test_pool(2).await;
-                let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 2).unwrap();
+                let policy =
+                    CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 2).unwrap();
                 let entries: Vec<_> = (0u32..12_000)
                     .map(|row| {
                         let mut key = vec![0x80; 1024];
@@ -3822,27 +3845,30 @@ mod tests {
         ));
     }
 
-    /// Purpose: Reject output admission after workers start without leaking accepted CPU jobs or private allocations.
+    /// Purpose: Reject initial completion admission or later output admission without leaking accepted CPU jobs or private allocations.
     /// Expected: The typed resource cause survives, old roots stay readable, allocation counts are restored, and every invocation charge is released.
     #[test]
     fn test_checkpoint_reconcile_failure_drains_and_reclaims() {
-        use crate::conf::ColdIndexBuildConfig;
-        use crate::index::build::checkpoint::{mutation_runs, reconstruct};
-        use crate::index::build::disk_builder::ColdBuildPolicy;
+        use crate::conf::CheckpointIndexBuildConfig;
+        use crate::index::build::checkpoint::CheckpointBuildPolicy;
+        use crate::index::build::checkpoint::{
+            CheckpointAdmission, checkpoint_budgets, mutation_runs, reconstruct_admitted,
+        };
         use crate::index::build::merge::test_pool;
         use crate::index::build::{RunKind, fail_build_budget_after};
         smol::block_on(with_unique_rows(
             355,
             async |runtime, guard, mutable, root, _| {
                 let (_scope, pool) = test_pool(4).await;
-                let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 4).unwrap();
+                let policy =
+                    CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 4).unwrap();
                 let tree = runtime.open(root, guard);
                 let old = unique_scan_entries(&tree).await;
-                for (purpose, after) in [
-                    ("checkpoint output image", 4),
-                    ("checkpoint allocation ledger", 1),
-                    ("checkpoint retained key", 4),
-                    ("checkpoint write observer", 4),
+                for (purpose, owner, after) in [
+                    ("checkpoint output image", 2, 4),
+                    ("checkpoint allocation ledger", 1, 1),
+                    ("checkpoint retained key", 1, 4),
+                    ("checkpoint write completions", 2, 0),
                 ] {
                     let runs = Arc::new(mutation_runs(
                         vec![(
@@ -3859,11 +3885,19 @@ mod tests {
                         true,
                     ));
                     let budget = runs.budget.clone();
-                    fail_build_budget_after(&budget, purpose, after);
+                    let admission = CheckpointAdmission::new(policy).unwrap();
+                    let budgets = checkpoint_budgets(&admission);
+                    fail_build_budget_after(&budgets[owner], purpose, after);
                     let allocated = mutable.root().alloc_map.allocated();
-                    let result =
-                        reconstruct(&tree, mutable, runs, pool.clone(), policy, TrxID::new(3))
-                            .await;
+                    let result = reconstruct_admitted(
+                        &tree,
+                        mutable,
+                        runs,
+                        pool.clone(),
+                        admission,
+                        TrxID::new(3),
+                    )
+                    .await;
                     let Err(RuntimeOrFatalError::Runtime(error)) = result else {
                         panic!("{purpose}: expected resource error");
                     };
@@ -3873,6 +3907,9 @@ mod tests {
                     );
                     assert_eq!(mutable.root().alloc_map.allocated(), allocated, "{purpose}");
                     assert_eq!(budget.used(), 0, "{purpose}");
+                    for budget in budgets {
+                        assert_eq!(budget.used(), 0, "{purpose}");
+                    }
                     assert_eq!(unique_scan_entries(&tree).await, old, "{purpose}");
                 }
             },
@@ -3989,7 +4026,8 @@ mod tests {
             assert!(size(None) > BTREE_NODE_USABLE_SIZE);
             let before = unique_scan_entries(&tree).await;
             let (_scope, pool) = test_pool(2).await;
-            let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 2).unwrap();
+            let policy =
+                CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 2).unwrap();
             for partial in [false, true] {
                 let runs = Arc::new(mutation_runs(
                     vec![(

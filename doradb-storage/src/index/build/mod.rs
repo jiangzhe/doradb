@@ -31,7 +31,10 @@ mod source;
 /// Packed construction shared by bootstrap and private DDL staging targets.
 pub(crate) mod tree_builder;
 mod worker;
+mod write;
 
+#[cfg(any(test, feature = "profiling"))]
+pub(crate) use budget::MemoryUsage;
 pub(crate) use budget::{
     BudgetedEntries, BudgetedVec, MemoryBudget, MemoryReservation, PAYLOAD_CREDIT_BYTES,
     PayloadSize,

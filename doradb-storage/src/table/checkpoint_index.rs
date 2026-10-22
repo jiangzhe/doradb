@@ -12,7 +12,7 @@ use crate::error::{
 };
 use crate::id::{PageID, RowID, TrxID};
 use crate::index::build::checkpoint::CheckpointAdmission;
-use crate::index::build::disk_builder::ColdBuildPolicy;
+use crate::index::build::checkpoint::CheckpointBuildPolicy;
 use crate::index::build::local_sort::LocalSortJobs;
 use crate::index::build::merge::execution_error;
 use crate::index::build::{
@@ -63,18 +63,18 @@ type ExtractionResult = RuntimeOrFatalResult<BuildOutcome<ExtractedGroup>>;
 pub(super) struct CheckpointIndexSources {
     puts: BudgetedVec<PutPage>,
     deletes: BudgetedVec<DeleteBlock>,
-    /// Shared scratch follows sources, keys, planning, and output ownership.
+    /// Input scratch follows sources, resident keys and run-planning metadata.
     pub(super) budget: MemoryBudget,
-    // Held before source growth so resident input cannot consume output progress.
+    // Independent construction budgets outlive accepted workers and output.
     pub(super) admission: Arc<CheckpointAdmission>,
     cutoff: TrxID,
 }
 
 impl CheckpointIndexSources {
-    /// Protect downstream progress before capturing any index source.
-    pub(super) fn new(policy: ColdBuildPolicy, cutoff: TrxID) -> RuntimeOrFatalResult<Self> {
-        let budget = MemoryBudget::new(policy.max_scratch_bytes);
-        let admission = CheckpointAdmission::new(&budget, policy)?;
+    /// Establish independent input and construction budgets before source capture.
+    pub(super) fn new(policy: CheckpointBuildPolicy, cutoff: TrxID) -> RuntimeOrFatalResult<Self> {
+        let admission = CheckpointAdmission::new(policy)?;
+        let budget = admission.input.clone();
         Ok(Self {
             puts: BudgetedVec::new(&budget),
             deletes: BudgetedVec::new(&budget),
@@ -464,7 +464,7 @@ impl IndexSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conf::ColdIndexBuildConfig;
+    use crate::conf::CheckpointIndexBuildConfig;
     use crate::error::ResourceError;
     use crate::index::build::{fail_build_budget, payload_accounting};
     use crate::session::tests::SessionTestExt;
@@ -508,7 +508,7 @@ mod tests {
 
     fn sources() -> CheckpointIndexSources {
         CheckpointIndexSources::new(
-            ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 2).unwrap(),
+            CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 2).unwrap(),
             TrxID::new(10),
         )
         .unwrap()

@@ -146,6 +146,8 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
     push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
     push_hot_extraction_metrics(&mut metrics, &before.index_build, &after.index_build);
+    let checkpoint_completed = after.index_build.checkpoint.completed_checkpoints
+        > before.index_build.checkpoint.completed_checkpoints;
     for (((name, before, peak), (_, after, _)), (_, last, _)) in before
         .index_build
         .checkpoint
@@ -154,6 +156,9 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
         .zip(after.index_build.checkpoint.metrics())
         .zip(after.index_build.checkpoint_last.metrics())
     {
+        if peak && !checkpoint_completed {
+            continue;
+        }
         metrics.push(Metric {
             name: format!("checkpoint_index.{name}"),
             value: if peak {
@@ -2651,6 +2656,79 @@ mod tests {
             (entries.value, entries.kind),
             (27, InternalMetricKind::CumulativeCounter)
         );
+    }
+
+    /// Purpose: Suppress stale checkpoint peaks while preserving counter deltas and last-checkpoint gauges.
+    /// Expected: Only increased completions emit interval gauges; cumulative reports include gauges after a completion, and both retain the last values rather than lifetime maxima.
+    #[test]
+    fn checkpoint_metrics_require_completion_and_preserve_last_gauges() {
+        for (case, start, end, delta) in [
+            ("empty", 0, 0, 0),
+            ("idle", 2, 2, 0),
+            ("reset", 2, 1, 0),
+            ("one completion", 2, 3, 1),
+            ("multiple completions", 2, 4, 2),
+        ] {
+            let mut before = InternalStatsSnapshot::default();
+            before.index_build.checkpoint.completed_checkpoints = start;
+            before.index_build.checkpoint.put_entries = start * 7;
+            let mut after = before.clone();
+            after.index_build.checkpoint.completed_checkpoints = end;
+            after.index_build.checkpoint.put_entries = end * 7;
+            if end > 0 {
+                after.index_build.checkpoint.max_workers = 8;
+                after.index_build.checkpoint.max_scratch_bytes = 8192;
+                after.index_build.checkpoint_last.max_workers = 2;
+                after.index_build.checkpoint_last.max_scratch_bytes = 1024;
+            }
+            for (mode, metrics, completions, counter_kind) in [
+                ("delta", after.delta_since(&before), delta, CounterDelta),
+                ("cumulative", after.cumulative(), end, CumulativeCounter),
+            ] {
+                let metrics: Vec<_> = metrics
+                    .into_iter()
+                    .filter(|metric| metric.name.starts_with("checkpoint_index."))
+                    .collect();
+                assert_eq!(
+                    metrics.len(),
+                    if completions > 0 { 18 } else { 16 },
+                    "{case} {mode}: metric count"
+                );
+                for (suffix, value, kind, unit) in [
+                    ("completed_checkpoints", completions, counter_kind, Count),
+                    ("put_entries", completions * 7, counter_kind, Count),
+                    ("max_workers", 2, EndGauge, Count),
+                    ("max_scratch_bytes", 1024, EndGauge, Bytes),
+                ] {
+                    let actual = metrics
+                        .iter()
+                        .find(|metric| metric.name == format!("checkpoint_index.{suffix}"))
+                        .map(|metric| (metric.value, metric.kind, metric.unit));
+                    let expected = if kind == EndGauge && completions == 0 {
+                        None
+                    } else {
+                        Some((value, kind, unit))
+                    };
+                    assert_eq!(actual, expected, "{case} {mode}: {suffix}");
+                }
+                for metric in &metrics {
+                    if !matches!(
+                        metric.name.as_str(),
+                        "checkpoint_index.completed_checkpoints"
+                            | "checkpoint_index.put_entries"
+                            | "checkpoint_index.max_workers"
+                            | "checkpoint_index.max_scratch_bytes"
+                    ) {
+                        assert_eq!(
+                            (metric.value, metric.kind),
+                            (0, counter_kind),
+                            "{case} {mode}: {}",
+                            metric.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Purpose: Preserve the complete ordered internal metric contract against independent typed expectations.

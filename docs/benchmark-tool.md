@@ -159,14 +159,29 @@ are not additive with elapsed wall time.
 
 ### Checkpoint-index build settings
 
-`[engine.checkpoint_index_build]` accepts the same four limits and defaults as
-`cold_index_build`. It controls secondary-index work during table checkpoints,
-independently of CREATE. Indexes are processed sequentially; memory limits can
-reduce parallelism within each index.
+`[engine.checkpoint_index_build]` controls secondary-index work during table
+checkpoints, independently of CREATE. Indexes are processed sequentially.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `max_input_bytes` | `"256 MiB"` | Captured sources, resident runs and extraction/sort/merge-planning workspace. |
+| `worker_scratch_bytes` | `"4 MiB"` | Scratch and pending-output quota per active or unassembled worker. |
+| `assembler_scratch_bytes` | `"12 MiB"` | Shared planning, assembly, retained fences and bookkeeping. |
+| `max_workers` | Pool worker count | Maximum active or unassembled workers. |
+| `max_ready_buffers` | 8 | Queued output buffers. |
+| `max_in_flight_writes` | 32 | Accepted unsettled writes. |
+
+These budgets are independent. Output capacity is derived from the worker,
+queue and write limits. Resolved settings include `total_memory_bytes`, a
+conservative aggregate allowance, not another admission limit. The former
+checkpoint `max_scratch_bytes` setting is replaced by the three byte limits above.
 
 `checkpoint_index.*` counters report successful checkpoints; `max_*` gauges
-report the last successful checkpoint. Phase timings can overlap, and peak
-scratch usage does not represent total process memory.
+report the last successful checkpoint and are omitted from intervals without a
+newly completed checkpoint. Phase timings can overlap, and peak
+scratch usage counts simultaneous admitted memory across these budgets, including
+the conservative completion bookkeeping allowance and excluding duplicate
+pending-output quota charges; it is not total process memory.
 
 ### Recovery settings
 

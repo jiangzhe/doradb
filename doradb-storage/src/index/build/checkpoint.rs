@@ -1,6 +1,6 @@
 //! Checkpoint strategy selection and application against a captured secondary root.
 //! The bounded planner lives here; physical execution belongs to `checkpoint_builder`.
-use super::checkpoint_builder::{ASSEMBLER_BYTES, BuildMode};
+use super::checkpoint_builder::BuildMode;
 use super::co_rank;
 use super::merge::{HotEntryRef, execution_error};
 use super::{BudgetedVec, BuildOutcome, MemoryBudget, RunKind, SortedRuns};
@@ -19,10 +19,13 @@ use std::sync::atomic::AtomicBool;
 #[cfg(test)]
 pub(crate) use tests::{
     apply_non_unique, apply_unique, mutation_runs, partial_rewrite, partial_with_rewrite_work,
-    reconstruct, strategy,
+    reconstruct, reconstruct_admitted, strategy,
 };
 
-pub(crate) use super::checkpoint_builder::CheckpointAdmission;
+#[cfg(test)]
+pub(crate) use super::checkpoint_builder::checkpoint_budgets;
+
+pub(crate) use super::checkpoint_builder::{CheckpointAdmission, CheckpointBuildPolicy};
 
 // Coefficients are work units per persisted block. Read includes decoding;
 // packing includes comparison/fence work; write includes validation and ingress.
@@ -80,7 +83,7 @@ impl<'a, 'tree, F: DiskTreeSpec> IndexCheckpoint<'a, 'tree, F> {
         #[cfg(feature = "profiling")]
         let started = Instant::now();
         let strategy = {
-            let scratch = MemoryBudget::new(ASSEMBLER_BYTES);
+            let scratch = self.admission.assembler.clone();
             let mut planner = CheckpointPlanner::new(self.tree, &self.runs, &scratch);
             let strategy = planner.choose().await?;
             #[cfg(feature = "profiling")]
@@ -527,16 +530,16 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conf::ColdIndexBuildConfig;
+    use crate::conf::CheckpointIndexBuildConfig;
     use crate::error::RuntimeError;
     use crate::error::{ResourceError, RuntimeOrFatalError};
     use crate::file::table_file::MutableTableFile;
     use crate::id::{RowID, TrxID};
     use crate::index::BTreeKey;
+    use crate::index::build::checkpoint::CheckpointBuildPolicy;
     use crate::index::build::checkpoint_builder::{RewriteWork, rewrite_work};
     use crate::index::build::co_rank;
     use crate::index::build::cross_tier::test_with_cold;
-    use crate::index::build::disk_builder::ColdBuildPolicy;
     use crate::index::build::loser_tree::LoserTree;
     use crate::index::build::merge::test_pool;
     use crate::index::build::{
@@ -583,7 +586,8 @@ mod tests {
         tree: &DiskTree<'_, F>,
         runs: &SortedRuns,
     ) -> (&'static str, usize) {
-        let scratch = MemoryBudget::new(ASSEMBLER_BYTES);
+        let scratch =
+            MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
         let mut planner = CheckpointPlanner::new(tree, runs, &scratch);
         let strategy = planner.choose().await.unwrap();
         assert!(planner.base_paths <= 64 && planner.delta_paths <= 64);
@@ -622,10 +626,10 @@ mod tests {
         file: &mut MutableTableFile,
         runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
-        policy: ColdBuildPolicy,
+        policy: CheckpointBuildPolicy,
         ts: TrxID,
     ) -> (Option<BlockID>, RewriteWork) {
-        let admission = CheckpointAdmission::new(&runs.budget, policy).unwrap();
+        let admission = CheckpointAdmission::new(policy).unwrap();
         let root = IndexCheckpoint::new(tree, file, runs, ts, pool, admission.clone())
             .build(BuildMode::PartialRewrite)
             .await
@@ -639,10 +643,22 @@ mod tests {
         file: &mut MutableTableFile,
         runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
-        policy: ColdBuildPolicy,
+        policy: CheckpointBuildPolicy,
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Option<BlockID>> {
-        let admission = CheckpointAdmission::new(&runs.budget, policy)?;
+        let admission = CheckpointAdmission::new(policy)?;
+        reconstruct_admitted(tree, file, runs, pool, admission, ts).await
+    }
+
+    /// Reconstruct with caller-retained budget owners for fault and cleanup assertions.
+    pub(crate) async fn reconstruct_admitted<F: DiskTreeSpec>(
+        tree: &DiskTree<'_, F>,
+        file: &mut MutableTableFile,
+        runs: Arc<SortedRuns>,
+        pool: QuiescentGuard<ThreadPool>,
+        admission: Arc<CheckpointAdmission>,
+        ts: TrxID,
+    ) -> RuntimeOrFatalResult<Option<BlockID>> {
         IndexCheckpoint::new(tree, file, runs, ts, pool, admission)
             .build(BuildMode::Reconstruct)
             .await
@@ -654,10 +670,10 @@ mod tests {
         file: &mut MutableTableFile,
         runs: Arc<SortedRuns>,
         pool: QuiescentGuard<ThreadPool>,
-        policy: ColdBuildPolicy,
+        policy: CheckpointBuildPolicy,
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Option<BlockID>> {
-        let admission = CheckpointAdmission::new(&runs.budget, policy)?;
+        let admission = CheckpointAdmission::new(policy)?;
         IndexCheckpoint::new(tree, file, runs, ts, pool, admission)
             .build(BuildMode::PartialRewrite)
             .await
@@ -707,8 +723,8 @@ mod tests {
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Option<BlockID>> {
         let (_scope, pool) = test_pool(4).await;
-        let policy = ColdBuildPolicy::new(ColdIndexBuildConfig::default(), 4).unwrap();
-        let admission = CheckpointAdmission::new(&runs.budget, policy)?;
+        let policy = CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 4).unwrap();
+        let admission = CheckpointAdmission::new(policy)?;
         let mut owners = BudgetedVec::new(&runs.budget);
         for run in runs.runs() {
             owners.push(run.clone(), "fixture retained runs").unwrap();
@@ -804,7 +820,8 @@ mod tests {
                 ],
                 true,
             );
-            let scratch = MemoryBudget::new(ASSEMBLER_BYTES);
+            let scratch =
+                MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
             let mut planner = CheckpointPlanner::new(&tree, &runs, &scratch);
             for (key, owner, expected, multiplicity, inspected) in [
                 (b"a", Some(30), Some(5), 6, 3),
@@ -856,7 +873,8 @@ mod tests {
                 true,
             );
             let first_owner = runs.runs()[0].entries()[0].row_id;
-            let scratch = MemoryBudget::new(ASSEMBLER_BYTES);
+            let scratch =
+                MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
             for remaining in [4, 3, 1, 0] {
                 let mut planner = CheckpointPlanner::new(&tree, &runs, &scratch);
                 planner.identity_probes = MAX_IDENTITIES - remaining;

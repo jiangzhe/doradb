@@ -12,8 +12,8 @@ use super::consts::{
     MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
 use super::{
-    ColdIndexBuildConfig, EvictableBufferPoolConfig, FileSystemConfig, HotIndexBuildConfig,
-    RecoveryConfig, TrxSysConfig,
+    CheckpointIndexBuildConfig, ColdIndexBuildConfig, EvictableBufferPoolConfig, FileSystemConfig,
+    HotIndexBuildConfig, RecoveryConfig, TrxSysConfig,
 };
 
 /// Immutable sizing for the engine-owned thread pool.
@@ -167,7 +167,7 @@ pub struct EngineConfig {
     /// Per-invocation cold index construction limits.
     pub cold_index_build: ColdIndexBuildConfig,
     /// Per-checkpoint secondary-index reconciliation limits, shared across sequential indexes.
-    pub checkpoint_index_build: ColdIndexBuildConfig,
+    pub checkpoint_index_build: CheckpointIndexBuildConfig,
     /// Engine-owned thread-pool configuration.
     pub thread_pool: ThreadPoolConfig,
     /// Engine-owned mandatory runtime configuration.
@@ -193,7 +193,7 @@ impl Default for EngineConfig {
             recovery: RecoveryConfig::default(),
             hot_index_build: HotIndexBuildConfig::default(),
             cold_index_build: ColdIndexBuildConfig::default(),
-            checkpoint_index_build: ColdIndexBuildConfig::default(),
+            checkpoint_index_build: CheckpointIndexBuildConfig::default(),
             thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
             table_scan: TableScanConfig::default(),
@@ -226,7 +226,7 @@ impl EngineConfig {
         self.cold_index_build
             .validate(self.thread_pool.worker_threads)?;
         self.checkpoint_index_build
-            .validate_named(self.thread_pool.worker_threads, "checkpoint_index_build")?;
+            .validate(self.thread_pool.worker_threads)?;
         self.recovery.validate(self.thread_pool.worker_threads)?;
         self.mandatory_runtime.validate()?;
         self.table_scan.validate()?;
@@ -292,7 +292,7 @@ impl EngineConfig {
 
     /// Set checkpoint secondary-index scratch, worker, and output limits.
     #[inline]
-    pub fn checkpoint_index_build(mut self, config: ColdIndexBuildConfig) -> Self {
+    pub fn checkpoint_index_build(mut self, config: CheckpointIndexBuildConfig) -> Self {
         self.checkpoint_index_build = config;
         self
     }

@@ -13,6 +13,7 @@ use super::packing::{
     validate_final_node,
 };
 use super::sealed_cold::{ColdBuildIdentity, SealedColdBuild, SealedColdMetadata};
+use super::write::{PendingWrites, completion_bytes};
 use super::{BudgetedVec, BuildOutcome, MemoryBudget, MemoryReservation, SortedRuns};
 use crate::buffer::PoolGuard;
 use crate::catalog::IndexRef;
@@ -36,14 +37,13 @@ use crate::runtime::{thread_pool::ThreadPool, yield_now};
 use error_stack::ResultExt;
 use futures::{
     FutureExt,
-    future::{BoxFuture, pending, poll_fn},
+    future::{BoxFuture, pending},
     select_biased,
 };
 use parking_lot::Mutex;
 use std::mem::{forget, replace, swap};
 use std::ops::Range;
 use std::sync::Arc;
-use std::task::Poll;
 
 #[cfg(feature = "profiling")]
 use crate::profiling::{ColdBuildMeasurements, PackingProfile, clock::Instant};
@@ -212,17 +212,10 @@ struct Allocation {
     reclaim_attempted: bool,
 }
 
-struct PendingWrite {
-    ledger: usize,
-    wait: BoxFuture<'static, CompletionResult<()>>,
-    _allocation: MemoryReservation,
-}
-
 struct Submitting {
     packet: Option<PackedDiskNode>,
     descriptor: Option<DiskChildDescriptor>,
     parent: bool,
-    observer_admission: MemoryReservation,
     ingress: BoxFuture<'static, CompletionResult<Arc<Completion<()>>>>,
 }
 
@@ -386,7 +379,7 @@ pub(crate) struct DiskBulkBuild {
     children: BudgetedVec<DiskChildDescriptor>,
     parents: BudgetedVec<DiskChildDescriptor>,
     allocations: BudgetedVec<Allocation>,
-    writes: BudgetedVec<PendingWrite>,
+    writes: PendingWrites<usize>,
     submitting: Option<Submitting>,
     completion: Option<MergeCompletion>,
     ts: TrxID,
@@ -433,12 +426,13 @@ impl DiskBulkBuild {
         }
         let preparation = MergePreparation::new(runs, pool.clone(), workers)?;
         let budget = &admission.budget;
-        let writes = BudgetedVec::from_reservation(
-            admission.take(
-                admission.policy.max_in_flight_writes * size_of::<PendingWrite>(),
-                "disk write ledger",
-            )?,
+        let writes = PendingWrites::new(
             admission.policy.max_in_flight_writes,
+            admission.take(
+                completion_bytes(admission.policy.max_in_flight_writes)
+                    .unwrap_or_else(|| unreachable!("validated disk write capacity")),
+                "disk write completions",
+            )?,
         );
         Ok(Self {
             file: Some(file),
@@ -580,7 +574,7 @@ impl DiskBulkBuild {
                     }
                 }
                 .fuse();
-                let write = wait_write(&mut self.writes).fuse();
+                let write = self.writes.wait_next().fuse();
                 futures::pin_mut!(consumption, delivery, write, poison);
                 select_biased! { () = poison => Progress::Poison, result = write => Progress::Write(result), result = consumption => Progress::Leaves(result), packet = delivery => Progress::Packet(packet) }
             };
@@ -588,7 +582,7 @@ impl DiskBulkBuild {
                 Progress::Poison => {
                     self.poisoner.ensure_healthy()?;
                 }
-                Progress::Write((index, result)) => self.finish_write(index, result)?,
+                Progress::Write((ledger, result)) => self.finish_write(ledger, result)?,
                 Progress::Packet(Ok(packet)) => self.prepare_packet(packet)?,
                 Progress::Packet(Err(_)) => {
                     return Err(execution_error(
@@ -641,8 +635,8 @@ impl DiskBulkBuild {
         #[cfg(feature = "profiling")]
         let settlement_started = Instant::now();
         while !self.writes.is_empty() {
-            let (index, result) = wait_write(&mut self.writes).await;
-            self.finish_write(index, result)?;
+            let (ledger, result) = self.writes.wait_next().await;
+            self.finish_write(ledger, result)?;
         }
         #[cfg(feature = "profiling")]
         {
@@ -711,7 +705,6 @@ impl DiskBulkBuild {
     ) -> RuntimeOrFatalResult<()> {
         // Failed synchronous admission must release any producer already waiting for acknowledgement.
         let result = (|| {
-            let observer_admission = self.admission.take(1024, "disk write observer")?;
             self.allocations
                 .reserve_one("disk allocation ledger")
                 .change_context(RuntimeError::IndexAccess)?;
@@ -754,7 +747,6 @@ impl DiskBulkBuild {
                 }),
                 packet: None,
                 parent,
-                observer_admission,
                 ingress,
             });
             Ok(())
@@ -812,15 +804,7 @@ impl DiskBulkBuild {
                     hooks.completed(ledger).await?;
                     result
                 };
-                assert!(
-                    size_of_val(&wait) <= pending.observer_admission.bytes(),
-                    "disk completion future exceeds admitted allocation"
-                );
-                self.writes.push_reserved(PendingWrite {
-                    ledger: descriptor.ledger,
-                    wait: Box::pin(wait),
-                    _allocation: pending.observer_admission,
-                });
+                self.writes.push(descriptor.ledger, wait);
                 #[cfg(feature = "profiling")]
                 {
                     self.measurements.write_count += 1;
@@ -849,23 +833,22 @@ impl DiskBulkBuild {
 
     fn finish_write(
         &mut self,
-        index: usize,
+        ledger: usize,
         result: CompletionResult<()>,
     ) -> RuntimeOrFatalResult<()> {
-        let pending = self.writes.swap_remove(index);
         result
             .map_err(|bridge| bridge.into_runtime_or_fatal(RuntimeError::IndexAccess))
             .attach("operation=disk_bulk_build, phase=write_completion")?;
-        self.allocations[pending.ledger].completed = true;
+        self.allocations[ledger].completed = true;
         Ok(())
     }
 
     fn observe_ready_writes(&mut self) -> RuntimeOrFatalResult<()> {
         loop {
-            let Some((index, result)) = wait_write(&mut self.writes).now_or_never() else {
+            let Some((ledger, result)) = self.writes.wait_next().now_or_never() else {
                 return Ok(());
             };
-            self.finish_write(index, result)?;
+            self.finish_write(ledger, result)?;
         }
     }
 
@@ -881,8 +864,8 @@ impl DiskBulkBuild {
             self.poisoner.ensure_healthy()?;
             self.observe_ready_writes()?;
             while self.writes.len() >= self.admission.policy.max_in_flight_writes {
-                let (index, result) = wait_write(&mut self.writes).await;
-                self.finish_write(index, result)?;
+                let (ledger, result) = self.writes.wait_next().await;
+                self.finish_write(ledger, result)?;
             }
             let (packet, count) = self.pack_parent(start)?;
             self.start_write(packet, true)?;
@@ -963,8 +946,8 @@ impl DiskBulkBuild {
             merge_failure(&mut failure, error);
         }
         while !self.writes.is_empty() {
-            let (index, result) = wait_write(&mut self.writes).await;
-            if let Err(error) = self.finish_write(index, result) {
+            let (ledger, result) = self.writes.wait_next().await;
+            if let Err(error) = self.finish_write(ledger, result) {
                 merge_failure(&mut failure, error);
             }
         }
@@ -1252,7 +1235,7 @@ pub(crate) fn minimum_progress_bytes(unique: bool, ready: usize, writes: usize) 
         .checked_add(writes)?
         .checked_add(2)?
         .checked_mul(DISK_TREE_BLOCK_SIZE)?;
-    let observers = writes.checked_mul(size_of::<PendingWrite>() + 1024)?;
+    let observers = completion_bytes(writes)?;
     worker_bytes(unique)
         .checked_add(worker_bytes(true))?
         .checked_add(buffers)?
@@ -1372,18 +1355,6 @@ fn merge_failure(target: &mut Option<RuntimeOrFatalError>, error: RuntimeOrFatal
         Some(old) => old.merge_cleanup(error),
         None => error,
     });
-}
-
-async fn wait_write(writes: &mut BudgetedVec<PendingWrite>) -> (usize, CompletionResult<()>) {
-    poll_fn(|cx| {
-        for (index, write) in writes.iter_mut().enumerate() {
-            if let Poll::Ready(result) = write.wait.as_mut().poll(cx) {
-                return Poll::Ready((index, result));
-            }
-        }
-        Poll::Pending
-    })
-    .await
 }
 
 #[cfg(test)]
@@ -2230,7 +2201,7 @@ mod tests {
     }
 
     /// Purpose: Admit either index kind with exactly the validated minimum progress budget.
-    /// Expected: Both initial reservations fit, the larger consumes the full bound, and dropping admission releases every charge.
+    /// Expected: Both index kinds fit the bound, completion bookkeeping transfers existing progress admission, and dropping each owner releases its charge.
     #[test]
     fn disk_minimum_progress_admission() {
         for (ready, writes) in [(1, 2), (3, 2), (8, 32)] {
@@ -2251,7 +2222,16 @@ mod tests {
                 let budget = admission.budget.clone();
                 assert!(budget.used() <= required);
                 largest = largest.max(budget.used());
+                let before = budget.used();
+                let bytes = completion_bytes(writes).unwrap();
+                let completions = PendingWrites::<usize>::new(
+                    writes,
+                    admission.take(bytes, "disk write completions").unwrap(),
+                );
+                assert_eq!(budget.used(), before);
                 drop(admission);
+                assert_eq!(budget.used(), bytes);
+                drop(completions);
                 assert_eq!(budget.used(), 0);
             }
             assert_eq!(largest, required);

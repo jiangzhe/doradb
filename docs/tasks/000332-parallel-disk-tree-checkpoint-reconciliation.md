@@ -105,16 +105,16 @@ primitives. Required repair may split old leaves/branches after prefix loss.
 
 | Limit | Delivered policy |
 | --- | --- |
-| Per active/unassembled job B | 4 MiB |
-| Assembly/probe allowance A | 12 MiB |
-| Fixed frontier reservation R | A + J × B, frozen before output |
-| Concurrent jobs J | Worker/input bound, reduced by available admission |
+| Resident input allowance | Configurable; default 256 MiB |
+| Per active/unassembled job B | Configurable; default 4 MiB |
+| Assembly/probe allowance A | Configurable; default 12 MiB |
+| Concurrent jobs J | Configured worker and input-size bound |
 | Optional neighbor window W | At most eight source candidates; only two packed images decoded together |
 | Ready buffers / accepted writes | Configured independently; defaults 8 / 32 |
 
-A + B and minimum output progress are reserved before source capture. Sources, runs,
-sort/decode workspace, ordered handoffs, retained keys and write/allocation ledgers carry
-lifetime admission. Completion acknowledgement releases a job slot only after ordered
+Input, worker and assembly budgets are independent; output capacity is derived from worker,
+queue and write limits. Sources, runs, workspace, handoffs and bookkeeping carry lifetime
+admission. Completion acknowledgement releases a job slot only after ordered
 assembly; completed-but-unassembled jobs still consume J. Pool-owned pages, unchanged
 checkpoint/reachability state and fixed runtime metadata remain outside this index scratch
 budget. RSS is measured separately.
@@ -264,7 +264,7 @@ four workers fell 34.12→31.19 ms and CPU 49.23→46.23 ms. Follow-ups did not 
 
 ## Impacts
 
-Independent `EngineConfig::checkpoint_index_build(ColdIndexBuildConfig)` and benchmark settings
+Independent `EngineConfig::checkpoint_index_build(CheckpointIndexBuildConfig)` and benchmark settings
 control the shared scheduler, group-aware merge, incremental completion and packing path.
 Source capture stays in table checkpoint; reconciliation stays in index build. No persisted format,
 recovery protocol, MVCC rule, CREATE configuration or publication boundary changes.

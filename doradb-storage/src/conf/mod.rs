@@ -1,4 +1,5 @@
 mod buffer;
+mod checkpoint;
 pub(crate) mod consts;
 mod engine;
 mod fs;
@@ -8,6 +9,7 @@ mod recovery;
 mod trx;
 
 pub use self::buffer::EvictableBufferPoolConfig;
+pub use self::checkpoint::CheckpointIndexBuildConfig;
 pub use self::consts::{
     DEFAULT_CATALOG_CHECKPOINT_SCAN_IO_DEPTH, DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_GC_BUCKETS,
     DEFAULT_LOG_BLOCK_SIZE, DEFAULT_LOG_DIR, DEFAULT_LOG_FILE_MAX_SIZE, DEFAULT_LOG_FILE_STEM,

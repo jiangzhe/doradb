@@ -22,6 +22,7 @@ use crate::error::{
 use crate::file::fs::{FileSystem, FileSystemWorkers};
 use crate::id::SessionID;
 use crate::index::build::HotBuildPolicy;
+use crate::index::build::checkpoint::CheckpointBuildPolicy;
 use crate::index::build::disk_builder::ColdBuildPolicy;
 use crate::lock::LockManager;
 use crate::obs;
@@ -543,7 +544,7 @@ pub(crate) struct EngineCore {
     /// Validated cold index construction limits.
     pub(crate) cold_build_policy: ColdBuildPolicy,
     /// Independent per-checkpoint index reconciliation admission policy.
-    pub(crate) checkpoint_build_policy: ColdBuildPolicy,
+    pub(crate) checkpoint_build_policy: CheckpointBuildPolicy,
     /// Engine-level fatal runtime poison state.
     pub(crate) poisoner: QuiescentGuard<EnginePoisoner>,
     /// Engine-owned executor for finite synchronous and asynchronous jobs.
@@ -824,7 +825,7 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
             config.thread_pool.worker_threads,
         )
         .disclose()?,
-        checkpoint_build_policy: ColdBuildPolicy::new(
+        checkpoint_build_policy: CheckpointBuildPolicy::new(
             config.checkpoint_index_build,
             config.thread_pool.worker_threads,
         )

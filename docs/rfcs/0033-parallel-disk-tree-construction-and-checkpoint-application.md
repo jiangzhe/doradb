@@ -544,7 +544,7 @@ projection/decode temporaries and stable-sort workspace before allocation.
 Shared source ownership lasts through the final index consumer. Keep one
 coordinator for allocation, write submission and private root staging. The
 checkpoint policy is independently configured through
-`EngineConfig::checkpoint_index_build(ColdIndexBuildConfig)`; CREATE keeps its
+`EngineConfig::checkpoint_index_build(CheckpointIndexBuildConfig)`; CREATE keeps its
 existing per-row decode exclusion. [U12] [C5] [C6]
 
 Capture and collection are fallible. Settle every accepted CPU job and storage
@@ -668,19 +668,19 @@ read/completion authority until its retained write barrier has settled.
 
 Use explicit admission limits: at most `J` active or completed-but-unassembled
 jobs, at most `B` bytes of provisional state per job across all its levels, and
-`A` bytes reserved for the assembler's frontier, reconciliation scratch and
-neighbor lookahead. Enforce `J * B + A <= R`, where `R` is a reservation within
-the shared checkpoint invocation scratch budget across all indexes. Charge
+`A` bytes for the assembler's frontier, reconciliation scratch and
+neighbor lookahead. Input, per-job and assembler budgets are independent and
+configured separately; output capacity follows concurrency and queue limits. Charge
 actual retained capacity, including keys, containers, nested boundary state
 and backing buffers/pins; compressed node count alone is not a byte bound.
 Shared storage is charged once and its reservation lasts through its final
 reference. References into resident input keep its existing reservations;
 additional boundary-owned backing storage counts against `B` or `A`. Compact
-interior descriptors and accepted I/O remain separately charged under the same
-invocation budget. Phase 4 fixes measured values for these limits; none grows
+interior descriptors and accepted I/O remain charged through their owning component.
+Phase 4 supplies defaults for these limits; none grows
 automatically with pending siblings. [U10] [C2] [C6]
 
-Reserve a job's boundary allowance before dispatch. Completion or collection
+Establish a job's boundary quota before dispatch. Completion or collection
 alone does not release it: assembly must consume the state or transfer it into
 the reserved frontier allowance first. Collect and reconcile incrementally;
 do not retain every worker payload until the whole index finishes. Admission
@@ -692,8 +692,8 @@ waiting on output that needs the same credits to drain. [U10] [C2] [C6]
 `MergeConsumption` retains whole-plan output collection for CREATE and exposes
 incremental validated delivery plus explicit assembly acknowledgement for
 checkpoint. Completed but unassembled jobs retain their admission slots.
-Task 000332 fixes B=4 MiB, A=12 MiB and R=A+J×B before output; minimum progress
-is reserved before source capture. Partial rewrite absorbs at most eight
+Task 000332 defaults B to 4 MiB and A to 12 MiB, with independent configurable
+budgets and local progress validation. Partial rewrite absorbs at most eight
 candidates per optional window. Required fence repair and reconstruction
 range-boundary combination preserve final geometry independently of that
 optional limit. [U10] [C2]
@@ -1171,8 +1171,8 @@ The direction and phase dependencies above define this proposal. Coordinator
 allocation/write submission and the progress model are settled above for
 Phase 1; a worker-owned mutable-file write interface is not required. Phase 1
 selected `ColdIndexBuildConfig` for CREATE. Task 000332 selects independent
-`checkpoint_index_build` controls backed by the same validated limits, with
-invocation-wide admission and sequential index application. Cross-index
+`checkpoint_index_build` component budgets through `CheckpointIndexBuildConfig`,
+with sequential index application. Cross-index
 parallelism remains deferred in backlog 000084.
 
 Validation crossover values, dense rewrite-window thresholds, run sizes,
