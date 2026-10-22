@@ -10,280 +10,259 @@ github_issue: 1151
 
 ## Summary
 
-Table checkpoint applies captured puts and eligible deletes through parallel extraction,
-sorting, streaming reconciliation and DiskTree packing within each secondary index. A bounded
-selector chooses reconstruction or subtree reuse. One coordinator settles writes and stages
-roots for atomic publication. Sequential indexes share one budget; correctness, restart and
-matched public-checkpoint evidence complete RFC 0033 Phase 4's narrowed scope.
+Table checkpoint now extracts, sorts, reconciles and packs captured secondary-index
+changes in parallel within each index. A bounded planner selects reconstruction or
+partial rewrite, preserving sparse subtree reuse and exact unique/nonunique contents.
+One coordinator settles writes and stages roots for atomic table publication.
+Indexes remain sequential and share independently limited memory components.
+This completes the narrowed checkpoint scope of RFC 0033 Phase 4.
 
 ## Context
 
-Parent RFC: docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md
+Parent RFC:
 
-Parent phase: **Phase 4: Parallel DiskTree Checkpoint Reconciliation**. Tasks 000329–000331
-supply shared packing, merge and extraction machinery. There is no following phase.
+- docs/rfcs/0033-parallel-disk-tree-construction-and-checkpoint-application.md
 
-Source backlog: docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md
+Parent phase: **Phase 4: Parallel DiskTree Checkpoint Reconciliation**. Tasks
+000329–000331 provide shared packing, merge and extraction machinery. There is no
+following phase.
 
-At baseline `2976ed05`, eager all-index encoded sidecars and serial recursive rewrites caused
-expensive materialization and repeated sibling-prefix repacking. Finite-to-open fence
-promotion could also invalidate compression and capacity. Eligibility and Transition's
-irreversible failure boundary remain unchanged.
+Source Backlogs:
+
+- docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md
+
+Only the within-index portion of 000084 is delivered. Its remaining cross-index
+scheduling scope is explicitly deferred, so the backlog remains open.
+
+At baseline `2976ed05`, eager all-index encoded sidecars and serial recursive
+rewrites caused expensive materialization and repeated sibling-prefix repacking.
+Finite-to-open fence promotion could invalidate compression and capacity.
+Fixed-cutoff eligibility and Transition's irreversible failure boundary remain
+unchanged.
 
 ## Goals
 
-- Parallel extraction, reconciliation and packing, including deletes and single-leaf growth.
-- Deterministic unique/nonunique ownership, exact coverage and atomic root/cutoff publication.
-- Sparse locality, empty results, root growth and dense-deletion collapse under final fences.
-- Admitted memory and settled CPU/I/O before private allocation reclamation.
-- Physical/restart correctness and measured public-call speed, CPU overlap and resources.
+- Parallel source extraction, reconciliation and packing, including deletion and growth.
+- Deterministic ownership, complete mutation coverage and atomic root/cutoff publication.
+- Sparse locality, unchanged-root reuse, empty results and safe root growth/collapse.
+- Bounded admitted memory and settled CPU/I/O before private allocation reclamation.
+- Independent physical/restart verification and measured public-checkpoint improvement.
 
 ## Non-Goals
 
-- Cross-index scheduling, catalog checkpoint and global compaction.
-- New MVCC/GC semantics, current-state deletion inference or storage formats.
-- External sorting/spilling or process-wide memory admission.
+- Cross-index scheduling, catalog checkpoint and independent global compaction.
+- New MVCC/GC rules, current-state deletion inference or persisted storage formats.
+- External sorting, process-wide admission or per-subtree strategy selection.
 - Changes to ordinary benchmark workload admission.
-
-Backlog 000084 remains open specifically for cross-index parallelism. Independent compaction
-remains in backlog 000083; resident/external-sort follow-ups are not reopened by this task.
 
 ## Rejected Alternatives
 
 - Rebuilding every checkpoint loses sparse locality.
-- Indivisible old subtrees serialize single-leaf growth and retain levels after dense deletion.
-- Current-live rebuilds violate fixed-cutoff eligibility.
-- Separate machinery duplicates established admission, source-order and settlement contracts.
+- Treating old subtrees as indivisible serializes growth and obstructs dense-deletion collapse.
+- Rebuilding from current live state violates fixed-cutoff eligibility.
+- Separate extraction and merge frameworks duplicate source-order and settlement contracts.
 
 ## Plan
 
-`CheckpointIndexSources` owns immutable page identities/bitmaps and selected old LWC
-ordinals/RowIDs. Capture follows authoritative Transition revalidation and cold-row identity
-resolution. Per-index extraction validates LWC count/binding and rereads immutable images
-without consulting newer visibility, admits projection/decode temporaries, and uses the shared
-`LocalSortJobs` scheduler. CREATE retains its existing decoded-row accounting policy.
-Extraction resolves uniqueness once per job and specializes the row loop. Outlined keys consume
-local credit refilled in 64 KiB chunks; shared admission falls back to the exact shortfall near
-the ceiling, and keys larger than a chunk request only that shortfall. Unused credit stays below
-64 KiB per active job. Projection/decode workspace and unused credit release before sorting;
-retained keys keep exact lifetime charges, including failure and cooperative-stop cleanup.
+### Source authority and reconciliation
 
-`BudgetedEntries<T>` keeps element storage and aggregate payload admission together across
-CREATE extraction, checkpoint extraction, sorted runs and checkpoint assembly. CREATE keeps
-exact payload admission; checkpoint buffers use the bounded credit policy above. Construction
-follows admission, and prefix consumption releases payload only after destroying its entries.
-Decoded base keys no longer carry per-key reservations. Retained `OwnedKey` fences still own
-their admission through the final `Arc`; adjacent output fences and branch separators share
-equal keys instead of materializing duplicate allocations.
+Capture retains immutable page identities and visibility selections for hot PUTs,
+and resolved old LWC RowID/ordinal pairs for eligible DELETEs. Extraction reads
+these fixed selections per index, validates source binding and uses the shared
+local-sort scheduler. It never substitutes a newer visibility decision.
 
-Homogeneous `RunKind` metadata distinguishes puts/deletes from CREATE inputs. Stable put
-sorting and source group order preserve last-put ownership regardless of completion order.
-Co-rank boundaries move to complete physical-key groups. The shared `PartitionMergeStream`
-feeds the checkpoint reducer without copying an entire merged delta. Unique puts suppress
-same-key deletes; otherwise a conditional delete must match the captured base owner. Nonunique
-exact keys include RowID; synthetic overlap retains delete-wins compatibility.
+Homogeneous mutation runs preserve source provenance. Complete physical-key groups
+stay together across merge partitions; source order determines PUT ownership.
+A unique PUT supersedes a same-key DELETE; otherwise deletion requires the captured
+base owner to match. Historical unique DELETE owners remain checked. Nonunique
+physical keys include RowID, with delete precedence retained for synthetic overlap.
+The reducer streams results without retaining an entire merged delta or rebuilt tree.
 
-Selection returns NoWork, Reconstruct or PartialRewrite before emitting output. Empty input,
-an absent root, a root leaf and small routed deltas have direct rules. Other cases use nested
-stratified base paths plus merged-delta quantiles, deciding at 16 or 64 paths per
-source and 4,096 identity inspections. Base estimates carry reciprocal path probabilities;
-cached duplicate probes retain their sampling weight. Uncertain decisions retain partial
-rewrite.
+### Physical selection and construction
 
-Both physical paths use the same reducer. Ordered key intervals include base-only gaps and can
-split an old leaf across jobs. Partial traversal uses validated parent fences to retain
-untouched subtrees without reading their leaves. No-effect leaf windows retain old blocks; a
-globally ineffective delta retains the exact original root. Reconstruction can produce no root
-or a compact new root independent of the old height.
+The planner returns no work, reconstruction or partial rewrite before output starts.
+Empty input, an absent root and small routed deltas avoid general cost estimation.
+Other cases use nested deterministic base paths and mutation quantiles, refining
+from 16 to 64 samples per source with at most 4,096 identity inspections.
+Weighted estimates affect strategy only; uncertain decisions retain partial rewrite.
 
-Workers emit shallow subtree descriptors and packed images through a shared bounded channel.
-Only provisional edges remain revisitable; finalized interiors are written once and carried as
-descriptors. One assembler owns adjacent-edge combination, balanced parent construction and
-root promotion. Mixed-height old subtrees receive necessary unary wrappers below retained
-attachments; collapse is root-only. Final fences are checked through shared packing
-primitives. Required repair may split old leaves/branches after prefix loss.
+Both physical modes share mutation reduction and final-fence packing. Ordered ranges
+include base-only gaps and may split an old leaf between jobs. Partial rewrite
+retains untouched subtrees; ineffective changes retain the original root. Full
+reconstruction may return an empty tree or a compact root independent of old height.
 
-| Limit | Delivered policy |
-| --- | --- |
-| Resident input allowance | Configurable; default 256 MiB |
-| Per active/unassembled job B | Configurable; default 4 MiB |
-| Assembly/probe allowance A | Configurable; default 12 MiB |
-| Concurrent jobs J | Configured worker and input-size bound |
-| Optional neighbor window W | At most eight source candidates; only two packed images decoded together |
-| Ready buffers / accepted writes | Configured independently; defaults 8 / 32 |
+Workers emit bounded packed images and subtree descriptors. The assembler revisits
+only provisional boundaries, writes finalized interiors once and constructs balanced
+parents. Optional neighbor absorption stops after eight candidates; required fence
+repair continues independently. Root collapse preserves attached subtree geometry.
 
-Input, worker and assembly budgets are independent; output capacity is derived from worker,
-queue and write limits. Sources, runs, workspace, handoffs and bookkeeping carry lifetime
-admission. Completion acknowledgement releases a job slot only after ordered
-assembly; completed-but-unassembled jobs still consume J. Pool-owned pages, unchanged
-checkpoint/reachability state and fixed runtime metadata remain outside this index scratch
-budget. RSS is measured separately.
+### Admission, output and publication
 
-The coordinator is the sole mutable-file allocator and write-submission owner. Source
-identity, index identity, plan identity, packet sequence, complete-group consumption and exact
-range completion are checked before root authority. Every accepted write must settle before
-the result becomes stageable. Cleanup rejects queued handoffs while draining workers, then
-settles writes before safe rollback. A later index failure cannot publish an earlier staged
-root.
+CREATE and checkpoint have separate configurations with the same independent
+input, worker-scratch, assembler-scratch and derived-output budget structure.
+
+| Allowance | Default | Upper bound |
+| --- | --- | --- |
+| Resident input | 256 MiB | 64 GiB |
+| Scratch per worker/job | 4 MiB | 1 GiB |
+| Shared assembly/planning scratch | 12 MiB | 1 GiB |
+| Workers | Pool size, capped at 256 | Pool size and 256 |
+| Queued buffers | 8 | 256 |
+| Accepted writes | 32 | 256; at least 2 |
+
+Output capacity includes images, handoff storage and coarse completion bookkeeping;
+it no longer consumes input or assembler allowance. Component minima and supported
+ranges are checked before startup. Hot builds also cap scratch at 64 GiB, workers
+at 256 and the soft run target at 8,192 pages.
+
+Input and payload admission follows allocation lifetime. Shared fences retain one
+charge through their final owner, and consumed output storage is reusable. Future
+partitions must admit retained output before acknowledgement; the current partition
+can progress without waiting for future quotas. Completed but unassembled jobs
+retain their scheduling slots until ordered assembly acknowledges them.
+
+One coordinator owns file allocation and write submission. CREATE and checkpoint
+share completion-driven write observation, freeing capacity when any write finishes.
+Every accepted write settles before a root becomes stageable. Failure cleanup rejects
+handoffs, drains jobs and writes, then reclaims private blocks exactly once.
+A later-index failure cannot publish an earlier staged root. Existing Transition
+poison rules continue to govern failures after the irreversible boundary.
 
 ## Implementation Notes
 
-Delivered the complete within-index checkpoint pipeline, adaptive physical selection, bounded
-incremental assembly and success-only profiling. Multi-index publication remains atomic;
-cross-index execution is the intentionally deferred remainder of backlog 000084.
-The replaced serial writer remains a test-only ordered-operation regression fixture.
-The production reducer has independent map/set physical-content oracles; shared CREATE paths
-retain their own duplicate, source and completion policies.
+Delivered parallel checkpoint reconciliation with adaptive subtree reuse, bounded output and atomic publication; subsequent review separated CREATE/checkpoint memory allowances and hardened backpressure, write settlement and rollback.
 
-Cleanup actively rejects queued handoffs while accepted jobs settle, preventing an output-drain
-cycle. The 18 retained checkpoint metrics cover outcomes, input volume, rewrite work,
-coarse phase times, admitted workers and peak scratch. Detailed calibration measurements
-below remain historical evidence; boundary-revisit and assembler-budget observations now
-exist only in tests, including builds with profiling disabled.
-Optional partial absorption stops after eight candidates; required fence repair continues.
-Full reconstruction combines range boundaries when a few survivors fit one open leaf.
+The serial writer remains only as an ordered-operation regression fixture.
+Independent map/set content oracles verify the production reducer. Shared CREATE
+paths retain their own duplicate, source and completed-root authority policies.
 
-### Matched production measurements
+Review exposed lifetime and progress issues beyond the original packing work:
+consumed packet slots retained memory, future partitions acknowledged output before
+quota admission, write observation could delay reusable capacity, and repeated
+settlement could revisit rolled-back allocations. The final implementation reuses
+queue storage, defers acknowledgements, observes ready writes and clears reclaimed
+allocation ledgers. Deterministic failure and scheduling tests cover these contracts.
 
-These measurements precede the encoding, deletion and 16/64 sampling refinements. Wall time is median ± MAD in ms;
-CPU is the process sum. S / 1 / 4 denotes serial baseline / one / four checkpoint workers.
+Fixed source/output reservations also coupled accepted configurations to unrelated
+scratch limits. Sources are skipped when no secondary-index work exists, and the
+final configurations separate input, worker, assembler and derived-output capacity.
+Cold CREATE releases extraction scratch before construction and admits all merge
+streams before durable output. This replaces its former aggregate scratch ceiling;
+configured totals now report the sum of independent allowances.
 
-| Case | Serial ms | One ms | Four ms | One / four | CPU ms (S / 1 / 4) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| insert | 2474.25 ± 20.68 | 62.40 ± 1.81 | 49.36 ± 4.41 | 1.26× | 2508.24 / 81.94 / 77.27 |
-| delete | 710.24 ± 4.41 | 43.95 ± 1.89 | 36.35 ± 2.74 | 1.21× | 707.61 / 42.43 / 50.81 |
-| replace | 623.89 ± 8.62 | 52.81 ± 1.07 | 43.78 ± 1.59 | 1.21× | 626.48 / 58.86 / 59.04 |
-| sparse | 4.64 ± 0.05 | 4.08 ± 0.43 | 4.21 ± 0.72 | 0.97× | 1.96 / 1.09 / 1.21 |
-| contiguous | 35.66 ± 0.18 | 12.12 ± 0.51 | 10.19 ± 0.35 | 1.19× | 33.01 / 8.47 / 9.01 |
-| skew | 561.80 ± 11.96 | 98.99 ± 6.90 | 63.49 ± 2.44 | 1.56× | 582.69 / 105.53 / 145.80 |
-| noop | 2.78 ± 1.13 | 3.18 ± 0.91 | 3.14 ± 1.68 | 1.01× | 0.41 / 0.36 / 0.37 |
-| tiny-growth | 275.88 ± 4.59 | 59.68 ± 1.74 | 46.56 ± 3.53 | 1.28× | 305.72 / 78.76 / 76.64 |
-| tall-near-total | 12.00 ± 0.65 | 8.26 ± 0.96 | 7.74 ± 0.53 | 1.07× | 9.51 / 5.79 / 6.12 |
-| wide | 15775.04 ± 152.27 | 120.00 ± 18.72 | 79.94 ± 2.92 | 1.50× | 15786.04 / 122.89 / 124.39 |
-| constrained | 177.99 ± 6.08 | 46.85 ± 1.03 | 40.07 ± 2.86 | 1.17× | 192.30 / 58.06 / 55.39 |
+Production checkpoint profiling retains 18 metrics for outcomes, input volume,
+rewrite work, coarse phase timing, workers and admitted scratch. End gauges describe
+the last successful checkpoint and are omitted when no checkpoint completed during
+the interval; counters retain delta semantics. Detailed boundary/revisit evidence
+is test-only. Profiling does not supply correctness or admission authority.
 
-Resources are medians except observed packing overlap, which shows its run range. Writes are
-whole-call background write requests; DiskTree node metrics are separate.
+### Historical performance evidence
 
-| Case | RSS MiB (S / 1 / 4) | Scratch MiB (1 / 4) | Writes (S / 1 / 4) | Four-worker DiskTree writes / reused subtrees | CPU packing overlap |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| insert | 338.4 / 134.9 / 130.4 | 43.2 / 54.6 | 953 / 954 / 956 | 103 / 0 | 3–4 |
-| delete | 416.7 / 278.7 / 274.5 | 46.7 / 58.7 | 32 / 35 / 33 | 27 / 0 | 1–3 |
-| replace | 549.5 / 462.0 / 458.1 | 44.7 / 58.2 | 503 / 505 / 503 | 51 / 0 | 2–4 |
-| sparse | 145.7 / 84.3 / 79.3 | 19.5 / 19.5 | 6 / 7 / 7 | 3 / 51 | 1–1 |
-| contiguous | 183.5 / 120.6 / 114.3 | 26.8 / 30.8 | 7 / 6 / 6 | 2 / 31 | 1–2 |
-| skew | 392.3 / 212.8 / 212.5 | 67.8 / 79.8 | 599 / 602 / 602 | 40 / 4 | 3–4 |
-| noop | 147.2 / 85.0 / 78.0 | 19.5 / 19.5 | 3 / 3 / 3 | 0 / 0 | 0–0 |
-| tiny-growth | 280.9 / 142.6 / 136.2 | 43.4 / 55.1 | 997 / 998 / 997 | 100 / 0 | 3–4 |
-| tall-near-total | 155.6 / 112.6 / 108.7 | 33.2 / 33.2 | 7 / 5 / 5 | 1 / 0 | 1–1 |
-| wide | 591.2 / 232.2 / 230.3 | 74.3 / 78.3 | 1656 / 1712 / 1712 | 976 / 0 | 2–2 |
-| constrained | 199.0 / 113.4 / 104.7 | 39.8 / 47.7 | 673 / 674 / 676 | 71 / 0 | 2–3 |
+The matched measurements below precede later encoding, deletion, 16/64 sampling
+and budget refinements. They establish the original pipeline improvement, not
+fresh measurements of the final revision. Wall times are median ± MAD in ms.
 
-Large inserts improve 50.1× versus serial and 1.26× versus one worker; dense deletes improve
-19.5× and 1.21×. Observed synchronous packing overlap establishes CPU parallelism.
+| Case | Serial | One worker | Four workers |
+| --- | ---: | ---: | ---: |
+| insert | 2474.25 ± 20.68 | 62.40 ± 1.81 | 49.36 ± 4.41 |
+| delete | 710.24 ± 4.41 | 43.95 ± 1.89 | 36.35 ± 2.74 |
+| replace | 623.89 ± 8.62 | 52.81 ± 1.07 | 43.78 ± 1.59 |
+| sparse | 4.64 ± 0.05 | 4.08 ± 0.43 | 4.21 ± 0.72 |
+| contiguous | 35.66 ± 0.18 | 12.12 ± 0.51 | 10.19 ± 0.35 |
+| skew | 561.80 ± 11.96 | 98.99 ± 6.90 | 63.49 ± 2.44 |
+| noop | 2.78 ± 1.13 | 3.18 ± 0.91 | 3.14 ± 1.68 |
+| tiny-growth | 275.88 ± 4.59 | 59.68 ± 1.74 | 46.56 ± 3.53 |
+| tall-near-total | 12.00 ± 0.65 | 8.26 ± 0.96 | 7.74 ± 0.53 |
+| wide | 15775.04 ± 152.27 | 120.00 ± 18.72 | 79.94 ± 2.92 |
+| constrained | 177.99 ± 6.08 | 46.85 ± 1.03 | 40.07 ± 2.86 |
 
-All reported cases have seven fresh runs of each variant, interleaved with rotating
-serial/one/four order. The public timed call includes maintenance retry waits; fixture
-loading, horizon preparation and content/restart checks are outside it. Every sample passed
-generated expected-content verification through the table and every index before, after and
-after reopening storage.
+Each case used seven fresh runs per variant in rotating serial/one/four order.
+Timing covered the public checkpoint call, including maintenance retry waits.
+Generated expected contents were checked through the table and every index before,
+after and after reopening; setup and verification were outside timing.
+The baseline was `2976ed05`, on Linux 7.2.9-orbstack aarch64, Apple CPU,
+14 visible cores, 15 GiB RAM and btrfs on `/dev/vdb1`. Both variants used the same
+allocator, io_uring, fsync policy, four-thread pool and warm preverification policy.
+Initial builds used 256 MiB scratch, 8 queued buffers and 32 writes; the constrained
+case used 48 MiB, 1 buffer and 2 writes. These are historical budget settings.
 
-Machine: Linux 7.2.9-orbstack aarch64, Apple CPU, 14 visible cores, 15 GiB RAM, btrfs on
-`/dev/vdb1`. Both variants use the same default allocator, io_uring, fsync policy and engine
-pool of four. The cache policy is warm from identical preverification; there is no cache
-flush. New configurations use 256 MiB scratch, 8 ready buffers and 32 accepted writes, except
-the constrained case (48 MiB, 1 ready buffer, 2 accepted writes). The old engine has no
-corresponding index admission controls. Base logical contents match; physical packing can
-differ because untimed preparation uses each measured engine.
+Cases covered 400k-row insertion/deletion/growth, 200k-row replacement/locality/no-op,
+270k-row nonunique skew, 100k-row wide composite keys and 12k-row tall-tree deletion.
+Wide/tall keys used 512/1,024 bytes; sparse deletion selected 16 keys, contiguous
+80k, dense deletion retained every fourth row, and tall deletion left two survivors.
 
-Cases cover 400k-row insert/delete/tiny-growth, 200k-row replacement/sparse/contiguous/no-op,
-270k-row nonunique skew/constrained, 100k-row wide/composite and 12k-row tall near-total
-deletion. Keys are interleaved; wide keys use 512-byte composite values, tall keys 1,024
-bytes. Sparse deletes select 16 keys, contiguous deletes 80k, dense deletion keeps every
-fourth row, and tall deletion leaves two scattered survivors. Skew has four logical values.
+Large inserts improved 50.1× versus serial and 1.26× versus one worker; dense deletes
+improved 19.5× and 1.21×. Observed synchronous packing overlap reached three to four
+workers on inserts. Sparse retained 51 subtrees with three node writes; contiguous
+retained 31 with two. Four-worker admitted scratch ranged from 19.5 to 79.8 MiB;
+RSS was lower than baseline across these fixtures and is separate from admission.
 
-### Selector calibration and limitations
+The cost weights remain READ/PACK/WRITE=1/2/4 with a 10% retention margin.
+Ratios above 1.35 or below 0.75 stop refinement at 16 samples; other cases can reach
+64. Wide growth conservatively retained partial rewrite despite reusing no whole
+subtree, issuing 1,712 background writes versus 1,656 on baseline (about 3.4% more).
+Four-worker skew lowered latency but raised CPU from 105.53 to 145.80 ms.
+Small/no-op cases did not demonstrate worker scaling: the no-op median rose from
+2.78 to 3.14 ms, and its 35.86 ms outlier spent 35.70 ms in publication with no
+packing jobs. Sparse one/four medians differed by only 0.13 ms.
 
-| Case | Strategy / reason | Estimated cost R / P | Exact nodes base → output | Height base → output |
-| --- | --- | ---: | ---: | ---: |
-| insert | reconstruct / cost margin | 745.5 / 826.9 | 7 → 103 | 1 → 1 |
-| delete | reconstruct / cost margin | 263.6 / 333.2 | 100 → 27 | 1 → 1 |
-| sparse | partial / small delta | 0.0 / 0.0 | 53 → 53 | 1 → 1 |
-| contiguous | partial / retain margin | 287.1 / 39.3 | 53 → 33 | 1 → 1 |
-| skew | partial / retain margin | 672.1 / 718.1 | 9 → 44 | 1 → 1 |
-| wide | partial / retain margin | 5569.1 / 5807.7 | 92 → 976 | 1 → 2 |
-| tall-near-total | reconstruct / cost margin | 216.6 / 421.8 | 220 → 1 | 2 → 0 |
-| tiny-growth | reconstruct / leaf | direct rule | 1 → 100 | 0 → 1 |
-
-Heights count edges; a leaf has height zero. Costs use block-work units; direct rules bypass costs.
-Tiny-growth costs are omitted because its seed occupancy does not estimate packed capacity.
-Wide growth admits two workers, tall and sparse one; small deltas skip cardinality probes.
-Sparse keeps 51 subtrees with three writes; contiguous keeps 31 with two writes.
-The 48 MiB constrained case admits three range workers.
-
-Block-work weights remain READ=1, PACK=2, WRITE=4 with a 10% retention margin. Cost ratios
-above 1.35 or below 0.75 stop refinement at 16 samples; otherwise sampling continues to 64.
-Forced full/partial component fixtures produce the same independent physical contents and
-prove retained-block locality. Measured sparse, contiguous, dense-delete and
-structural-extreme outcomes support keeping these conservative defaults. Cardinalities and
-costs remain estimates, not coverage proofs or promises of globally optimal packing.
-
-The wide-growth estimate favors reconstruction by less than the retention margin, so partial
-rewrite conservatively retains the strategy despite reusing no whole subtree in that fixture.
-This exposes a calibration tradeoff rather than hiding it: final writes and shape are reported
-alongside elapsed time. Wide growth issues 1,712 background writes versus 1,656 on the
-baseline (56 more, about 3.4%). Four-worker skew uses more CPU than one worker while reducing
-latency. Warm-cache table-read request counts match the baseline in these cases; extra source
-traversal still appears in CPU and logical-node work. Worker CPU and RSS are included in the
-measured public call. Small/no-op latency is dominated by publication and scheduling; worker
-overlap is not claimed for cases too small to admit parallel range work. The no-op median rose
-from 2.78 to 3.14 ms with four configured workers, while CPU fell from 0.41 to 0.37 ms. Its
-35.86 ms outlier spent 35.70 ms in publication and ran no packing jobs. Sparse four-versus-one
-medians differ by 0.13 ms; both admit only one range worker, so this is not evidence of worker
-scaling.
-
-Encoding refinement: 112 samples plus 72 follow-ups separated encoding work from
-publication noise.
-Deletion refinement streams one block at a time, preserves resolved RowID/ordinal pairs,
-skips retired slots, combines metadata lookup, and validates patch counts during rewrite.
-LWC validation moves to extraction; ordinal encoding avoids widening `u16` input into RowIDs.
-Deletion refinement: 324 verified samples; broad deletion with
-four workers fell 34.12→31.19 ms and CPU 49.23→46.23 ms. Follow-ups did not establish an insert CPU regression.
+Later encoding refinement used 112 samples plus 72 follow-ups. Deletion refinement
+streamed one block at a time, retained resolved ordinals and avoided repeated lookup
+and widening. Across 324 verified samples, broad four-worker deletion fell from
+34.12 to 31.19 ms and CPU from 49.23 to 46.23 ms. Follow-ups did not establish an
+insert CPU regression. Reusable root statistics remain deferred to 000215.
 
 ### Verification
 
-- `rtk cargo nextest run --workspace`: 2,391 passed, 2 skipped.
-- Storage without default features: 2,122 passed, 2 skipped; strict workspace Clippy passed.
-- Formatting, diff checks, and branch style/test-contract gate: 35 Rust files,
-  377 contracts, no violations; an isolated Git index includes new files without staging.
-- Semantic review retained independent physical map/set oracles, public/restart
-  checks, fixed source authority, feature-specific failures and semantic scheduler
-  gates; no timing thresholds establish concurrency or test readiness.
-- Initial implementation coverage: **93.37%**, 4,127 / 4,420 lines across nine files; every file
-  exceeds 88%, measured with the default workspace and nextest CI timeout policy.
+Final validation passed 2,413 workspace tests and 2,145 storage tests with profiling
+disabled, with two skips in each run. Strict Clippy passed for both configurations.
+The resolve style gate passed 36 branch-diff Rust files and 488 test contracts;
+formatting and diff checks passed.
+
+Semantic review retained independent content/restart oracles and distinct source,
+construction, publication and failure lifecycles. Packet/cleanup/write tests use
+acknowledgements and completion predicates rather than timing assumptions.
+Initial implementation coverage was 93.37% (4,127/4,420 lines across nine files,
+each above 88%); this is historical evidence, not coverage of later refinements.
 
 ## Impacts
 
-Independent `EngineConfig::checkpoint_index_build(CheckpointIndexBuildConfig)` and benchmark settings
-control the shared scheduler, group-aware merge, incremental completion and packing path.
-Source capture stays in table checkpoint; reconciliation stays in index build. No persisted format,
-recovery protocol, MVCC rule, CREATE configuration or publication boundary changes.
+Table checkpoint owns captured source authority; index build owns planning,
+reconciliation and durable construction. No persisted format, recovery protocol,
+MVCC rule or atomic publication boundary changed.
+
+`EngineConfig::checkpoint_index_build` controls checkpoint work independently of
+CREATE. Cold CREATE's `max_scratch_bytes` is replaced by `max_input_bytes`,
+`worker_scratch_bytes` and `assembler_scratch_bytes`; benchmark overlays and resolved
+configuration reflect those limits and derived totals. Queue, concurrency and
+memory bounds reject unsupported values before startup. Scratch peaks represent
+simultaneous admitted memory, excluding pool-owned pins and fixed runtime overhead.
 
 ## Test Cases
 
-- Independent physical map/set oracles cover stable duplicate puts, unique owner replacement,
-  conditional mismatch/absence and synthetic nonunique delete precedence.
-- Source bitmap/provenance/admission, cutoff and old-snapshot cases include real replacement
-  with distinct nonunique RowIDs and generated public/restart table/all-index verification.
-- Complete cuts, direct/multirun inputs, cancelled waits, foreign/premature acknowledgements
-  and completed-result backpressure retain semantic scheduler gates.
-- One-leaf growth, tall-to-one-leaf/all-gone results, sparse block reuse and forced-strategy
-  equivalence preserve exact old-root contents and no-op root identity; selector cases cover 16/64 decisions.
-- The compressed 599/1 leaf split and complete suffix-branch removal exercise both strategies;
-  recursive final-fence repair and long partial absorption preserve bounded revisit work.
-- Failures cover source/post-worker admission, allocation/budget cleanup, first/later-index
-  atomicity, unchanged success stats, deletion-only retry and retained Transition/poison rules.
+- Unique owner replacement, historical conditional deletes, mismatch/absence and
+  nonunique exact membership against independent physical-content oracles.
+- Captured bitmap/ordinal provenance, source corruption, retired slots, fixed cutoff,
+  old snapshots, tables without active indexes and public/restart verification.
+- Complete-key cuts, direct/multirun consumption, detached waits, foreign completion
+  rejection and completed-but-unassembled backpressure.
+- Empty roots, one-leaf growth, scattered survivors, tall-tree collapse, no-op root
+  identity, forced-strategy equivalence and sparse retained-block locality.
+- Compressed 599/1 splits, suffix-branch removal, final-fence repair and bounded
+  optional absorption; selector decisions at 16/64 samples.
+- Reusable output storage, future-partition quota pressure, current-partition progress,
+  unordered write completion, failed/deferred handoffs and repeatable rollback.
+- Independent budget exhaustion, local progress minima, supported configuration
+  boundaries, all-worker stream admission, unchanged success metrics on failure,
+  multi-index atomicity, deletion-only retry and retained Transition/poison behavior.
 
 ## Open Questions
 
-No blockers remain. Backlog 000084 retains cross-index scheduling; [000215](../backlogs/000215-root-level-secondary-index-statistics-for-checkpoint-planning.md) defers reusable root-level checkpoint statistics.
+No implementation blockers remain. Explicit follow-ups are:
+
+- [000084](../backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md):
+  cross-index scheduling under shared admission; keep open for that remaining scope.
+- [000212](../backlogs/000212-external-memory-create-index-cold-runs.md): external
+  sorting and shared sorted-input/construction interfaces, including checkpoint reconstruction.
+- [000215](../backlogs/000215-root-level-secondary-index-statistics-for-checkpoint-planning.md):
+  reusable statistics per published root; per-subtree strategy selection remains excluded.

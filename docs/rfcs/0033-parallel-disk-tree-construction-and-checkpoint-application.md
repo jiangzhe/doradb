@@ -731,26 +731,23 @@ Move reservations with ownership transfers, including the Phase 1 legacy
 validator and checkpoint sidecars. Release payload charges only after their
 allocations are freed. [U12] [C2] [C5]
 
-Keep minimum packing/parent, output-buffer and settlement capacity reserved
-away from resident-input growth from the start of collection. Refine the
-minimum as the input shape and construction plan become known, and validate
-the combined requirement before the first DiskTree output write. Transfer
-earmarked reservations into downstream storage without charging them again.
-An allowance that fits resident input alone but cannot admit input plus this
-minimum must fail with a typed resource cause before output starts. Checkpoint
-additionally
-reserves the reconciliation capacity described above before filling sidecars;
-sidecar failure after other checkpoint writes uses their existing settlement
-path. Streaming and parallelism do not relax these admission boundaries.
+Task 000332 separates input, per-worker and assembler allowances for both CREATE
+and checkpoint; output capacity is derived independently from concurrency and
+queue limits. Local progress minima and supported upper bounds are validated
+before startup. CREATE releases extraction scratch before reserving construction
+headroom and admits every merge stream before its first DiskTree output write.
+Checkpoint sources are captured only when active secondary-index work exists;
+later failures retain the enclosing checkpoint's settlement and poison policy.
+Allocation-lifetime reservations still transfer with their owners. Streaming
+and parallelism do not relax these admission boundaries.
 [U12] [C2] [C5] [C6]
 
-Keep existing hot-build settings and semantics. Add a cold-build policy usable
-by CREATE and checkpoint, with an invocation-wide worker/scratch bound for
-multi-index checkpoint work and explicit bounded output admission. Final
-configuration names/defaults and byte accounting are Phase 1 choices reviewed
-with the caller adapters. The normalized benchmark configuration must record
-all effective limits. Existing trees are traversed incrementally; this does
-not require loading an entire checkpoint base into the resident delta budget.
+CREATE and checkpoint use separate configurations with shared admission
+mechanics. Sequential checkpoint indexes reuse the same component allowances.
+Hot-build behavior is unchanged apart from supported configuration bounds.
+Normalized benchmark configuration records effective limits and aggregate
+allowances. Existing trees are traversed incrementally; this does not require
+loading an entire checkpoint base into the resident delta budget.
 [C10] [C11] [U4]
 
 Use existing profiling conventions: distinguish wall spans, worker sums,
@@ -760,11 +757,11 @@ rewritten blocks, selected rewrite/validation strategies, I/O and occupancy.
 Publish success counters only after the owning public operation succeeds;
 partial work must not be reported as a completed CREATE/checkpoint. [C10] [C11]
 
-Checkpoint measurements also report peak provisional bytes across active jobs,
-completed results and assembler frontiers, retained-result counts, maximum
-candidate-window size, and entries/bytes revisited during reconciliation.
-These distinguish bounded output from merely bounded worker execution and
-expose growing-prefix repacking costs. [U10] [C4] [C11]
+Checkpoint production metrics retain outcomes, input volume, rewrite work,
+coarse phase times, workers and admitted scratch. Detailed boundary/revisit
+measurements remain test-only, distinguishing bounded output from merely
+bounded worker execution without expanding the production metric contract.
+[U10] [C4] [C11]
 
 Construction measurements distinguish packing completion, storage acceptance,
 write completion and private-root completion. Report packing/ready-buffer and
@@ -947,9 +944,9 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - Scope: Admitted immutable checkpoint source capture, shared parallel
     extraction/local sorting, group-aligned streaming mutation reduction, and
     adaptive reconstruction or partial rewrite within one index. Indexes remain
-    sequential under one invocation budget. Leaf-slice jobs, bounded provisional
-    frontiers, safe final-fence packing and settled completion evidence preserve
-    atomic table-root publication. Task 000332 defines the bounded selector,
+    sequential under shared independent component allowances. Leaf-slice jobs,
+    bounded provisional frontiers, safe final-fence packing and settled completion
+    evidence preserve atomic table-root publication. Task 000332 defines the bounded selector,
     fixed frontier limits, calibrated conservative selection and matched public
     performance evidence.
   - Prerequisites: Phase 1's node/level packing, ordered-descriptor and
@@ -958,13 +955,16 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
     Phase 3 supplies the shared extraction scheduler and resident-run handoff;
     its CREATE row-selection policy is not checkpoint deletion authority.
   - Phase-local Choices: Complete physical-key groups; adaptive base/delta
-    probes capped at 64 paths each and 4,096 identities; READ/PACK/WRITE weights
-    1/2/4 with a 10% retention margin; B=4 MiB, A=12 MiB and optional W=8.
-    Incremental packet/assembly acknowledgements preserve progress. Exact node
-    counts reuse existing reachability traversal, and success-only measurements
-    report actual synchronous packing overlap and last-checkpoint peaks.
+    probes at 16/64 paths each and at most 4,096 identities; READ/PACK/WRITE weights
+    1/2/4 with a 10% retention margin; default B=4 MiB, A=12 MiB and optional W=8.
+    CREATE and checkpoint have separate input, worker, assembler and derived-output
+    allowances, with supported bounds checked before startup. Future output is
+    admitted before acknowledgement; consumed queue storage is reused and shared
+    write observation collects ready completions. Reachability validation preserves
+    exact geometry; production metrics remain coarse and success-only, with
+    last-checkpoint gauges. Historical measurements establish packing overlap.
   - Goals: Preserve every normalized put/delete rule and atomic root/cutoff
-    publication. Test shared-budget sidecar collection/normalization failure,
+    publication. Test captured-source and component-admission failure,
     accepted-write settlement and reversible deletion-only retry. Fix promotion
     overflow through Phase 1's final packing-plan contract; include the
     finite-to-open fence deletion regression with exact contents, old-root reads
@@ -979,15 +979,18 @@ inventory, and run the prescribed lint/test checks. [D6] [D8]
   - After This Phase: Checkpoint applies eligible secondary-index deltas in
     parallel within each index through the shared durable machinery, with
     measured locality and deletion safety. Backlog 000084 retains cross-index
-    parallelism and must not be closed wholesale.
+    parallelism and must not be closed wholesale. Backlogs 000212 and 000215 retain
+    external sorted-input/construction interfaces and reusable root statistics.
   - Non-goals: New MVCC/GC rules, current-state deletion inference, parallel
     catalog checkpoint or independent global compaction.
   - Task Doc: `docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md`
   - Task Issue: `#1151`
   - Phase Status: done
-  - Implementation Summary: Delivered parallel captured-source extraction, complete-key reconciliation, adaptive reconstruction/partial rewrite and bounded incremental assembly within each secondary index. Indexes remain sequential under one budget with atomic root/cutoff publication and settled failure cleanup; backlog 000084 now retains only cross-index scheduling. Seven fresh interleaved runs per variant across eleven public fixtures passed content/restart checks: median large inserts improved 2474 ms to 49 ms and dense deletes 710 ms to 36 ms versus serial 2976ed05, with measured CPU packing overlap and documented memory/write/selector tradeoffs. Validation passed 2380 workspace tests, 2111 profiling-disabled tests, strict Clippy, the 32-file/329-contract style gate, and 93.37% focused production coverage. No following phase exists. [Task Resolve Sync: docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md @ 2026-10-17]
+  - Implementation Summary: Delivered parallel captured-source extraction, complete-key reconciliation, adaptive reconstruction/partial rewrite and bounded incremental assembly within each secondary index. Atomic root/cutoff publication and settled failure cleanup remain intact. Review separated CREATE/checkpoint input, worker, assembler and derived-output budgets, bounded supported configurations, and hardened output backpressure, ready-write observation and repeatable rollback. Historical seven-run comparisons improved large inserts from 2474 ms to 49 ms and dense deletes from 710 ms to 36 ms versus serial 2976ed05; these precede later refinements. Final validation passed 2,413 workspace tests, 2,145 profiling-disabled tests, strict Clippy in both configurations and the 36-file/488-contract style gate. Backlogs 000084, 000212 and 000215 retain cross-index scheduling, external sorted-input/construction interfaces and reusable root statistics. No following phase exists. [Task Resolve Sync: docs/tasks/000332-parallel-disk-tree-checkpoint-reconciliation.md @ 2026-10-22]
   - Related Backlogs:
     - `docs/backlogs/000084-parallel-secondary-disk-tree-checkpoint-application.md`
+    - `docs/backlogs/000212-external-memory-create-index-cold-runs.md`
+    - `docs/backlogs/000215-root-level-secondary-index-statistics-for-checkpoint-planning.md`
 
 ## Validation and Performance
 

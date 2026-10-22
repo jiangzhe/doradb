@@ -1697,7 +1697,6 @@ mod tests {
         config: ColdIndexBuildConfig,
         fail: Option<&'static str>,
     ) {
-        let workers = config.max_workers.unwrap_or(2);
         let scope = pool().await;
         let metadata = Arc::new(
             TableMetadata::try_new(
@@ -1989,7 +1988,7 @@ mod tests {
             {
                 let metrics = build.measurements();
                 assert!(metrics.write_peak <= 2);
-                assert!(metrics.buffer_peak <= workers as u64 + 2);
+                assert!(metrics.buffer_peak <= policy.max_workers as u64 + 2);
                 assert_eq!(metrics.write_count, build.allocations.len() as u64);
                 assert!(
                     metrics.scratch_peak_bytes

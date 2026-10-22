@@ -2,7 +2,7 @@
 
 ## Summary
 
-Task 000331 completes bounded parallel extraction and direct consumption of resident cold runs. All encoded cold keys still remain resident until durable construction seals. CREATE therefore rejects inputs whose admitted keys and progress capacity exceed the cold scratch budget. Design one bounded run-generation and consumption framework for resident and external sorting, including single-worker builds, without weakening completed-root authority or accepted-work cleanup.
+Task 000331 completes bounded parallel extraction and direct consumption of resident cold runs. All encoded cold keys still remain resident until durable construction seals. Task 000332 separates retained input, worker scratch, assembler scratch and derived output allowances; keys exceeding the input allowance still fail admission. Design one bounded run-generation and consumption framework for resident and external sorting, including single-worker builds, without weakening completed-root authority or accepted-work cleanup.
 
 Include DiskTree checkpoint reconstruction from task 000332 as a use case for
 the shared sorted-input and bulk-construction interfaces.

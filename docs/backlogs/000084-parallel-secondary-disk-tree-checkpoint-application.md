@@ -22,12 +22,13 @@ task 000332 / RFC 0033 Phase 4.
 ## Deferral Context (Optional)
 
 - Defer Reason: Task 000332 explicitly narrowed Phase 4 to within-index work.
-  Indexes remain sequential so one coordinator and one invocation budget own
-  mutable-file allocation, accepted writes and deterministic root staging.
+  Indexes remain sequential so one coordinator and shared component allowances
+  own mutable-file allocation, accepted writes and deterministic root staging.
 - Findings: The shared pipeline now accepts immutable checkpoint sources,
   homogeneous resident runs, complete mutation groups and bounded incremental
   output. Both reconstruction and partial rewrite use the same reducer. Active
-  or unassembled jobs retain 4 MiB credits; assembly/probing reserves 12 MiB;
+  or unassembled jobs default to 4 MiB credits; assembly/probing defaults to 12 MiB;
+  input, worker, assembler and derived-output budgets are independent;
   optional partial absorption is capped at eight candidates. One successful
   index still cannot authorize publication when a later index fails.
 - Findings: Seven-run public-checkpoint comparisons show within-index improvement
