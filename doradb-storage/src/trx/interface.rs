@@ -241,7 +241,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn row(id: i32, name: &str) -> Vec<Val> {
-        vec![Val::from(id), Val::from(name)]
+        vec![Val::from(id), Val::try_from(name).unwrap()]
     }
 
     /// Purpose: Preserve input order and read-your-writes visibility in direct batch insertion.
@@ -461,7 +461,7 @@ mod tests {
                 normal_equality
                     .table_index_lookup_mvcc(
                         TableIndex(table_id, non_unique_id),
-                        &[Val::from("one")],
+                        &[Val::try_from("one").unwrap()],
                         &[0, 1],
                     )
                     .await
@@ -546,7 +546,11 @@ mod tests {
             let mut equality = session.begin_trx().unwrap();
             assert!(
                 equality
-                    .table_index_lookup_mvcc(resolved_non_unique, &[Val::from("one")], &[0, 1])
+                    .table_index_lookup_mvcc(
+                        resolved_non_unique,
+                        &[Val::try_from("one").unwrap()],
+                        &[0, 1]
+                    )
                     .await
                     .unwrap()
                     .has_rows()
@@ -603,7 +607,7 @@ mod tests {
                             Ok(if entry.is_some() {
                                 UniqueMutation::Update(vec![UpdateCol {
                                     idx: 1,
-                                    val: Val::from("updated"),
+                                    val: Val::try_from("updated").unwrap(),
                                 }])
                             } else {
                                 UniqueMutation::Skip
@@ -661,7 +665,7 @@ mod tests {
                                     },
                                     UpdateCol {
                                         idx: 1,
-                                        val: Val::from("upserted"),
+                                        val: Val::try_from("upserted").unwrap(),
                                     },
                                 ]),
                             })
@@ -730,8 +734,11 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let result: Result<()> = async {
                 let mut trx = session.begin_trx()?;
-                trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("row")])
-                    .await?;
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1i32), Val::try_from("row").unwrap()],
+                )
+                .await?;
                 trx.table_mutate_mvcc(table_id, |row| -> CallbackResult<_> {
                     row.val(0)?;
                     Ok(RowMutation::Skip)

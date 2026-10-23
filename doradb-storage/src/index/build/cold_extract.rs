@@ -549,7 +549,10 @@ pub(super) mod tests {
             let mut values = Vec::new();
             for group in 0..groups {
                 for id in group * 8..group * 8 + 8 {
-                    let row = vec![Val::from(id), Val::from("outlined".repeat(32).as_str())];
+                    let row = vec![
+                        Val::from(id),
+                        Val::try_from("outlined".repeat(32).as_str()).unwrap(),
+                    ];
                     let row_id = insert_one_row(table_id, &mut session, row.clone()).await;
                     values.push((row, row_id));
                 }

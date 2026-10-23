@@ -4488,9 +4488,12 @@ pub(crate) mod tests {
         let payload = [7u8; 196];
         for value in 0..256 {
             let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(value), Val::from(&payload[..])])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(value), Val::try_from(&payload[..]).unwrap()],
+            )
+            .await
+            .unwrap();
             trx.commit().await.unwrap();
             if redo_file_path(main_dir, log_file_stem, target_file_seq).exists() {
                 return table_id;
@@ -4504,7 +4507,7 @@ pub(crate) mod tests {
         let mut trx = session.begin_trx().unwrap();
         trx.table_insert_mvcc(
             table_id,
-            vec![Val::from(10_000i32), Val::from(&payload[..])],
+            vec![Val::from(10_000i32), Val::try_from(&payload[..]).unwrap()],
         )
         .await
         .unwrap();

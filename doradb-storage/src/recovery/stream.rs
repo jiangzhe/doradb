@@ -3208,7 +3208,7 @@ mod tests {
                     row_id: RowID::new(0),
                     kind: RowRedoKind::Insert(
                         test_page_id(1),
-                        vec![Val::from(vec![7u8; STORAGE_SECTOR_SIZE * 3])],
+                        vec![Val::try_from(vec![7u8; STORAGE_SECTOR_SIZE * 3]).unwrap()],
                     ),
                 },
             );
@@ -3498,7 +3498,10 @@ mod tests {
                 USER_TABLE_ID_START,
                 RowRedo {
                     row_id: RowID::new(1),
-                    kind: RowRedoKind::Insert(PageID::new(10), vec![Val::from(bytes.as_slice())]),
+                    kind: RowRedoKind::Insert(
+                        PageID::new(10),
+                        vec![Val::try_from(bytes.as_slice()).unwrap()],
+                    ),
                 },
             );
             let log = TrxLog::new(

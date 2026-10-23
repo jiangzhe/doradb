@@ -2403,7 +2403,7 @@ pub(crate) mod tests {
             let mut session = engine.new_session().unwrap();
             for (key, value) in &expected {
                 let mut trx = session.begin_trx().unwrap();
-                let insert = vec![Val::from(*key), Val::from(value.as_str())];
+                let insert = vec![Val::from(*key), Val::try_from(value.as_str()).unwrap()];
                 trx.table_insert_mvcc(table_id, insert).await.unwrap();
                 trx.commit().await.unwrap();
             }
@@ -2545,7 +2545,7 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let value = [7u8; 196];
             let rows = (0..384)
-                .map(|i| vec![Val::from(i), Val::from(&value[..])])
+                .map(|i| vec![Val::from(i), Val::try_from(&value[..]).unwrap()])
                 .collect();
             trx.table_insert_batch_mvcc(table_id, rows).await.unwrap();
             let (entry, status) = capture_transaction_cleanup_state(&engine, &trx);

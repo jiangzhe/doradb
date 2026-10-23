@@ -622,8 +622,8 @@ mod tests {
             (
                 vec![ValType::new(ValKind::VarByte, true)],
                 vec![
-                    vec![Val::from(vec![7u8; 128])],
-                    vec![Val::from(vec![7u8; 128])],
+                    vec![Val::try_from(vec![7u8; 128]).unwrap()],
+                    vec![Val::try_from(vec![7u8; 128]).unwrap()],
                     vec![Val::Null],
                 ],
             ),
@@ -633,9 +633,9 @@ mod tests {
                     ValType::new(ValKind::U64, false),
                 ],
                 vec![
-                    vec![Val::from(vec![7u8; 128]), Val::from(9u64)],
-                    vec![Val::from(vec![7u8; 128]), Val::from(9u64)],
-                    vec![Val::from(vec![3u8; 128]), Val::from(8u64)],
+                    vec![Val::try_from(vec![7u8; 128]).unwrap(), Val::from(9u64)],
+                    vec![Val::try_from(vec![7u8; 128]).unwrap(), Val::from(9u64)],
+                    vec![Val::try_from(vec![3u8; 128]).unwrap(), Val::from(8u64)],
                 ],
             ),
         ] {
@@ -651,7 +651,7 @@ mod tests {
         let budget = MemoryBudget::new(1024 * 1024);
         let mut encoding = Encoding::new(&budget, &[ValType::new(ValKind::VarByte, false)]);
         encoding.rows.ensure_capacity(128, "test entries").unwrap();
-        let values = [Val::from(vec![7u8; 1024])];
+        let values = [Val::try_from(vec![7u8; 1024]).unwrap()];
         encoding.push::<true>(&values, 0).unwrap();
         let bytes = encoding.rows[0].key.as_bytes().len();
         assert_eq!(payload_accounting(&encoding.rows).1, PAYLOAD_CREDIT_BYTES);
@@ -679,7 +679,10 @@ mod tests {
         let budget = MemoryBudget::new(1024 * 1024);
         let mut encoding = Encoding::new(&budget, &[ValType::new(ValKind::VarByte, false); 2]);
         encoding.rows.ensure_capacity(64, "test entries").unwrap();
-        let values = [Val::from(vec![7u8; 1024]), Val::from(vec![9u8; 1024])];
+        let values = [
+            Val::try_from(vec![7u8; 1024]).unwrap(),
+            Val::try_from(vec![9u8; 1024]).unwrap(),
+        ];
         for row in 0..35 {
             encoding.push::<true>(&values, row).unwrap();
             assert!(payload_accounting(&encoding.rows).1 >= payload_accounting(&encoding.rows).0);
@@ -690,7 +693,10 @@ mod tests {
         }
         assert!(payload_accounting(&encoding.rows).1 > PAYLOAD_CREDIT_BYTES);
         assert!(payload_accounting(&encoding.rows).1 > payload_accounting(&encoding.rows).0);
-        let large = [Val::from(vec![7u8; 40_000]), Val::from(vec![9u8; 40_000])];
+        let large = [
+            Val::try_from(vec![7u8; 40_000]).unwrap(),
+            Val::try_from(vec![9u8; 40_000]).unwrap(),
+        ];
         let bytes = encoding.encoder.encoded_len(&large).unwrap();
         assert!(bytes > PAYLOAD_CREDIT_BYTES);
         assert!(
@@ -725,7 +731,7 @@ mod tests {
                 encoding.rows.ensure_capacity(1, "test entry").unwrap();
                 let values: Vec<_> = lengths
                     .iter()
-                    .map(|&len| Val::from(vec![7u8; len]))
+                    .map(|&len| Val::try_from(vec![7u8; len]).unwrap())
                     .collect();
                 let expected = encoding.encoder.encode(&values);
                 let len = expected.as_bytes().len();
@@ -775,7 +781,7 @@ mod tests {
                 .await
                 .unwrap();
             let page = guard.page();
-            let values = [Val::from(vec![7u8; 128])];
+            let values = [Val::try_from(vec![7u8; 128]).unwrap()];
             for _ in 0..8 {
                 assert!(page.insert(&layout.metadata().col, &values).is_ok());
             }
@@ -927,7 +933,7 @@ mod tests {
                     insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(key), Val::from("name")],
+                        vec![Val::from(key), Val::try_from("name").unwrap()],
                     )
                     .await,
                 );

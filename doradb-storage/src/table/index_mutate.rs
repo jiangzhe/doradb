@@ -989,7 +989,7 @@ mod tests {
             trx_select_row_mvcc_by_id(&mut reader, table_id, &single_key(1i32), &[0, 1])
                 .await
                 .unwrap(),
-            SelectMvcc::Found(vec![Val::from(1i32), Val::from("original")]),
+            SelectMvcc::Found(vec![Val::from(1i32), Val::try_from("original").unwrap()]),
             "{mutation:?}: owner rollback must restore the row",
         );
         assert_eq!(
@@ -1029,13 +1029,13 @@ mod tests {
                         Ok(match row.val(0)?.as_i32().unwrap() {
                             0 => RowMutation::Update(vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from("cold-updated"),
+                                val: Val::try_from("cold-updated").unwrap(),
                             }]),
                             1 | 12 => RowMutation::Delete,
                             2 => RowMutation::Skip,
                             10 => RowMutation::Update(vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from("hot-updated"),
+                                val: Val::try_from("hot-updated").unwrap(),
                             }]),
                             11 => RowMutation::Update(Vec::new()),
                             _ => unreachable!(),
@@ -1218,7 +1218,7 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut setup = session.begin_trx().unwrap();
             setup
-                .table_insert_mvcc(table_id, vec![Val::from("old")])
+                .table_insert_mvcc(table_id, vec![Val::try_from("old").unwrap()])
                 .await
                 .unwrap();
             setup.commit().await.unwrap();
@@ -1233,7 +1233,7 @@ mod tests {
                         assert_eq!(row.val(0)?.as_str(), Some("old"));
                         Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 0,
-                            val: Val::from("new-variable-length-key"),
+                            val: Val::try_from("new-variable-length-key").unwrap(),
                         }]))
                     },
                 )
@@ -1242,8 +1242,8 @@ mod tests {
             assert_eq!(outcome.update_count, 1);
             writer.commit().await.unwrap();
 
-            let old_key = [Val::from("old")];
-            let new_key = [Val::from("new-variable-length-key")];
+            let old_key = [Val::try_from("old").unwrap()];
+            let new_key = [Val::try_from("new-variable-length-key").unwrap()];
             let mut reader = session.begin_trx().unwrap();
             let old_row = reader
                 .table_lookup_unique_mvcc(
@@ -1264,7 +1264,7 @@ mod tests {
             assert!(old_row.not_found());
             assert_eq!(
                 new_row.unwrap_found(),
-                vec![Val::from("new-variable-length-key")]
+                vec![Val::try_from("new-variable-length-key").unwrap()]
             );
             reader.commit().await.unwrap();
         });
@@ -1558,7 +1558,7 @@ mod tests {
                 &single_key(1i32),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("competitor"),
+                    val: Val::try_from("competitor").unwrap(),
                 }],
             )
             .await;
@@ -1701,7 +1701,7 @@ mod tests {
                         &single_key(id),
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("competitor"),
+                            val: Val::try_from("competitor").unwrap(),
                         }],
                     )
                     .await
@@ -1726,9 +1726,12 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
 
-            trx.table_insert_mvcc(table_id, vec![Val::from(7i32), Val::from("inserted")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(7i32), Val::try_from("inserted").unwrap()],
+            )
+            .await
+            .unwrap();
 
             let mut callbacks = 0usize;
             let outcome = trx

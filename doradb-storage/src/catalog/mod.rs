@@ -2621,7 +2621,7 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(
                 replay_only_table_id,
-                vec![Val::I32(9), Val::from("replay-backed")],
+                vec![Val::I32(9), Val::try_from("replay-backed").unwrap()],
             )
             .await
             .unwrap();

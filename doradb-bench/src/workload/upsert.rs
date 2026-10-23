@@ -241,13 +241,13 @@ async fn upsert_point(
                 match row {
                     None => Ok(UniqueMutation::Insert(vec![
                         Val::from(key),
-                        Val::from(changed_payload(
+                        Val::try_from(changed_payload(
                             offset,
                             config.seed,
                             config.value_size_bytes,
                             false,
                             None,
-                        )),
+                        ))?,
                     ])),
                     Some(row) => {
                         if row.val(0)?.as_u64() != Some(key) {
@@ -262,13 +262,13 @@ async fn upsert_point(
                         })?;
                         Ok(UniqueMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from(changed_payload(
+                            val: Val::try_from(changed_payload(
                                 offset,
                                 config.seed,
                                 config.value_size_bytes,
                                 false,
                                 Some(current),
-                            )),
+                            ))?,
                         }]))
                     }
                 }
@@ -702,13 +702,13 @@ mod tests {
             let original = trx
                 .table_insert_mvcc(
                     primary.table_id,
-                    vec![Val::from(10u64), Val::from(vec![42u8; 30_000])],
+                    vec![Val::from(10u64), Val::try_from(vec![42u8; 30_000]).unwrap()],
                 )
                 .await
                 .unwrap();
             trx.table_insert_mvcc(
                 primary.table_id,
-                vec![Val::from(11u64), Val::from(vec![43u8; 30_000])],
+                vec![Val::from(11u64), Val::try_from(vec![43u8; 30_000]).unwrap()],
             )
             .await
             .unwrap();
@@ -766,7 +766,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap_found();
-            assert_eq!(neighbor, vec![Val::from(vec![43u8; 30_000])]);
+            assert_eq!(neighbor, vec![Val::try_from(vec![43u8; 30_000]).unwrap()]);
             trx.commit().await.unwrap();
             complete_upsert(&engine, primary, 0).await.unwrap();
             session.close().await.unwrap();

@@ -1310,7 +1310,7 @@ mod tests {
                     .map(|(key, payload)| {
                         vec![
                             Val::from(key as u64),
-                            Val::from(payload.to_le_bytes().to_vec()),
+                            Val::try_from(payload.to_le_bytes().to_vec()).unwrap(),
                         ]
                     })
                     .collect();
@@ -1545,7 +1545,7 @@ mod tests {
                             .unwrap();
                         assert_eq!(
                             stream.next().await.unwrap(),
-                            Some(vec![Val::from(1u64), Val::from(vec![0u8])])
+                            Some(vec![Val::from(1u64), Val::try_from(vec![0u8]).unwrap()])
                         );
                         assert_eq!(stream.next().await.unwrap(), None);
                         drop(stream);
@@ -1559,7 +1559,7 @@ mod tests {
                             .unwrap();
                         assert_eq!(
                             stream.next().await.unwrap(),
-                            Some(vec![Val::from(1u64), Val::from(vec![0u8])])
+                            Some(vec![Val::from(1u64), Val::try_from(vec![0u8]).unwrap()])
                         );
                         assert_eq!(stream.next().await.unwrap(), None);
                         drop(stream);
@@ -1630,7 +1630,7 @@ mod tests {
                     let mut trx = session.begin_trx().unwrap();
                     trx.table_insert_mvcc(
                         primary.table_id,
-                        vec![Val::from(99u64), Val::from("unexpected")],
+                        vec![Val::from(99u64), Val::try_from("unexpected").unwrap()],
                     )
                     .await
                     .unwrap();
@@ -1791,7 +1791,7 @@ mod tests {
                         let mut trx = session.begin_trx().unwrap();
                         trx.table_insert_mvcc(
                             primary.table_id,
-                            vec![Val::from(99u64), Val::from("unexpected")],
+                            vec![Val::from(99u64), Val::try_from("unexpected").unwrap()],
                         )
                         .await
                         .unwrap();

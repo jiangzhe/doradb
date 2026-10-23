@@ -106,7 +106,7 @@ mod tests {
         let mut result = Fingerprint::default();
         for (key, payload) in rows {
             result
-                .add_row(&[Val::from(*key), Val::from(*payload)])
+                .add_row(&[Val::from(*key), Val::try_from(*payload).unwrap()])
                 .unwrap();
         }
         result
@@ -145,7 +145,7 @@ mod tests {
         for row in [
             vec![],
             vec![Val::from(0u64)],
-            vec![Val::from(0u32), Val::from("x")],
+            vec![Val::from(0u32), Val::try_from("x").unwrap()],
             vec![Val::from(0u64), Val::from(1u64)],
         ] {
             assert!(Fingerprint::default().add_row(&row).is_err());
@@ -155,11 +155,15 @@ mod tests {
             sum: u128::MAX,
         };
         let before = full.clone();
-        assert!(full.add_row(&[Val::from(0u64), Val::from("")]).is_err());
+        assert!(
+            full.add_row(&[Val::from(0u64), Val::try_from("").unwrap()])
+                .is_err()
+        );
         assert_eq!(full, before);
         // Digest addition intentionally wraps; only the independent row count is checked.
         full.rows = 0;
-        full.add_row(&[Val::from(0u64), Val::from("")]).unwrap();
+        full.add_row(&[Val::from(0u64), Val::try_from("").unwrap()])
+            .unwrap();
         let expected = fingerprint(&[(0, b"")]);
         let minus_one = expected.sum.wrapping_sub(1);
         assert_eq!(full.sum, minus_one);

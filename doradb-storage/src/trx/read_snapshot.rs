@@ -1845,9 +1845,12 @@ mod tests {
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
         for key in 0..count {
-            trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("value")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(key), Val::try_from("value").unwrap()],
+            )
+            .await
+            .unwrap();
         }
         trx.commit().await.unwrap();
         session.close().await.unwrap();
@@ -1859,7 +1862,10 @@ mod tests {
         for key in 0..count {
             trx.table_insert_mvcc(
                 table_id,
-                vec![Val::from(key), Val::from(vec![b'x'; 40 * 1024])],
+                vec![
+                    Val::from(key),
+                    Val::try_from(vec![b'x'; 40 * 1024]).unwrap(),
+                ],
             )
             .await
             .unwrap();
@@ -1973,9 +1979,12 @@ mod tests {
             let mut writer = engine.new_session().unwrap();
             let mut trx = writer.begin_trx().unwrap();
             for key in 3..5 {
-                trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("hot")])
-                    .await
-                    .unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(key), Val::try_from("hot").unwrap()],
+                )
+                .await
+                .unwrap();
             }
             trx.commit().await.unwrap();
             writer.close().await.unwrap();
@@ -2247,7 +2256,7 @@ mod tests {
                     table_id,
                     vec![
                         Val::from(row_no),
-                        Val::from(vec![b'a' + row_no as u8; 40 * 1024]),
+                        Val::try_from(vec![b'a' + row_no as u8; 40 * 1024]).unwrap(),
                     ],
                 )
                 .await
@@ -2361,7 +2370,10 @@ mod tests {
             assert_eq!(
                 rows,
                 (0..4)
-                    .map(|key| vec![Val::from(key), Val::from(vec![b'x'; 40 * 1024])])
+                    .map(|key| vec![
+                        Val::from(key),
+                        Val::try_from(vec![b'x'; 40 * 1024]).unwrap()
+                    ])
                     .collect::<Vec<_>>()
             );
             drop(repartitioned);

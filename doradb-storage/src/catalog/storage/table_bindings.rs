@@ -14,7 +14,7 @@ use crate::id::TableID;
 use crate::row::{Row, RowRead};
 use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
-use crate::value::{Val, ValKind};
+use crate::value::{MemVar, Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::sync::OnceLock;
 
@@ -37,7 +37,11 @@ impl TableBindings<'_> {
         namespace_id: BindingNamespaceID,
         binding_key: &[u8],
     ) -> RuntimeOrFatalResult<Option<TableID>> {
-        let key = [Val::from(namespace_id.as_u64()), Val::from(binding_key)];
+        // Managed requests and decoded bindings enforce MAX_TABLE_BINDING_KEY_BYTES.
+        let key = [
+            Val::from(namespace_id.as_u64()),
+            Val::VarByte(MemVar::from_bytes(binding_key)),
+        ];
         let table_id = self
             .table
             .index_lookup_unique_uncommitted(guards, PK_NO_TABLE_BINDINGS, &key, |layout, row| {
@@ -184,7 +188,8 @@ impl TableBindings<'_> {
             .map(|object| {
                 vec![
                     Val::from(object.namespace_id.as_u64()),
-                    Val::from(object.binding_key.as_ref()),
+                    // Binding objects are validated against MAX_TABLE_BINDING_KEY_BYTES.
+                    Val::VarByte(MemVar::from_bytes(object.binding_key.as_ref())),
                 ]
             })
             .collect();
@@ -315,7 +320,8 @@ fn cols_from_table_binding_object(object: &TableBindingObject) -> DataIntegrityR
     }
     Ok(vec![
         Val::from(object.namespace_id.as_u64()),
-        Val::from(object.binding_key.as_ref()),
+        // Binding objects are validated against MAX_TABLE_BINDING_KEY_BYTES.
+        Val::VarByte(MemVar::from_bytes(object.binding_key.as_ref())),
         Val::from(object.table_id),
     ])
 }
@@ -337,7 +343,11 @@ mod tests {
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
 
     fn binding_values(key: Vec<u8>) -> Vec<Val> {
-        vec![Val::from(7u64), Val::from(key), Val::from(TableID::new(42))]
+        vec![
+            Val::from(7u64),
+            Val::try_from(key).unwrap(),
+            Val::from(TableID::new(42)),
+        ]
     }
 
     /// Purpose: Protect durable binding lookup and reverse-lookup structure.
@@ -397,13 +407,13 @@ mod tests {
             Vec::new(),
             vec![
                 Val::from(1u32),
-                Val::from(Vec::<u8>::new()),
+                Val::try_from(Vec::<u8>::new()).unwrap(),
                 Val::from(1u64),
             ],
             vec![Val::from(1u64), Val::from(1u64), Val::from(1u64)],
             vec![
                 Val::from(1u64),
-                Val::from(Vec::<u8>::new()),
+                Val::try_from(Vec::<u8>::new()).unwrap(),
                 Val::from(TABLE_ID_TABLE_BINDINGS),
             ],
             binding_values(vec![0; MAX_TABLE_BINDING_KEY_BYTES + 1]),

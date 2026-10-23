@@ -629,7 +629,8 @@ impl RowPage {
             ValKind::VarByte => {
                 let b: [u8; 8] = bs.try_into().unwrap();
                 let var = PageVar::from_le_bytes(b);
-                Val::VarByte(MemVar::from(var.as_bytes(self.data())))
+                // The page descriptor stores a u16 length.
+                Val::VarByte(MemVar::from_bytes(var.as_bytes(self.data())))
             }
         }
     }
@@ -652,7 +653,8 @@ impl RowPage {
 
     /// Updates one column value and returns the next variable-length write offset.
     /// Input bytes must be separate from this page and are copied into reserved space.
-    /// Panics before writing the column if nonempty input overlaps this page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn update_col(
         &self,
@@ -713,7 +715,8 @@ impl RowPage {
 
     /// Updates one column value through exclusive page access.
     /// Input bytes must be separate from this page and are copied into reserved space.
-    /// Panics before writing the column if nonempty input overlaps this page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn update_col_exclusive(
         &mut self,
@@ -775,7 +778,8 @@ impl RowPage {
     /// Update variable-length value.
     /// If old value exists, we will try to reuse space occupied by old value.
     /// Returns the updated var length offset.
-    /// Panics before writing the column if nonempty input overlaps this page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn modify_var(
         &self,
@@ -785,6 +789,12 @@ impl RowPage {
         var_offset: usize,
         old_exists: bool,
     ) -> Option<usize> {
+        assert!(
+            checked_var_len(input.len()).is_some(),
+            "RowPage::modify_var byte length exceeds limit: column_no={col_idx}, len={}, max={}",
+            input.len(),
+            MemVar::MAX_LEN
+        );
         self.assert_external_var_input(input);
         if input.len() <= PAGE_VAR_LEN_INLINE {
             // inlined var can be directly updated,
@@ -844,18 +854,25 @@ impl RowPage {
     }
 
     /// Appends a variable-length value and returns its page descriptor and next offset.
-    /// Panics if nonempty input overlaps this page, including inline input.
+    /// Panics before copying on oversized or page-aliased input (including inline
+    /// input), or an invalid outlined destination range.
     #[inline]
     pub(crate) fn add_var(&self, input: &[u8], var_offset: usize) -> (PageVar, usize) {
+        let Some(len) = checked_var_len(input.len()) else {
+            panic!(
+                "RowPage::add_var byte length exceeds limit: len={}, max={}",
+                input.len(),
+                MemVar::MAX_LEN
+            );
+        };
         self.assert_external_var_input(input);
-        let len = input.len();
-        if len <= PAGE_VAR_LEN_INLINE {
+        if usize::from(len) <= PAGE_VAR_LEN_INLINE {
             return (PageVar::inline(input), var_offset);
         }
-        self.copy_var_bytes(var_offset, input);
+        let end = self.copy_var_bytes(var_offset, input);
         (
-            PageVar::outline(len as u16, var_offset as u16, &input[..PAGE_VAR_LEN_PREFIX]),
-            var_offset + len,
+            PageVar::outline(len, var_offset as u16, &input[..PAGE_VAR_LEN_PREFIX]),
+            end,
         )
     }
 
@@ -1108,15 +1125,25 @@ impl RowPage {
     }
 
     #[inline]
-    fn copy_var_bytes(&self, offset: usize, input: &[u8]) {
-        debug_assert!(offset + input.len() <= self.data().len());
+    fn copy_var_bytes(&self, offset: usize, input: &[u8]) -> usize {
+        let capacity = self.data().len();
+        let end = offset.checked_add(input.len());
+        // The page data excludes its integrity footer. Validate both the range
+        // and descriptor offset before the first write, including in release.
+        assert!(
+            u16::try_from(offset).is_ok() && end.is_some_and(|end| end <= capacity),
+            "RowPage::copy_var_bytes destination out of range: offset={offset}, len={}, capacity={capacity}",
+            input.len()
+        );
         // SAFETY: `add_var` checks that input is disjoint from the entire page.
-        // The caller reserves and bounds-checks the destination range, and the
-        // row/page lock protocol excludes conflicting writers to this range.
+        // The release assertion above proves this destination lies within data,
+        // including overflow/offset checks. The caller reserves the range and
+        // the row/page lock protocol excludes conflicting writers to it.
         unsafe {
             let dst = self.data().as_ptr().add(offset) as *mut u8;
             copy_nonoverlapping(input.as_ptr(), dst, input.len());
         }
+        offset + input.len()
     }
 
     /// Creates an empty zeroed row page for tests.
@@ -1331,7 +1358,8 @@ impl NewRow<'_> {
     }
 
     /// Add variable-length value to current row.
-    /// Panics before writing the column if nonempty input overlaps the destination page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn add_var(&mut self, col_layout: &TableColumnLayout, input: &[u8]) {
         debug_assert!(self.col_idx < self.page.header.col_count as usize);
@@ -1345,7 +1373,8 @@ impl NewRow<'_> {
 
     /// Adds one typed column value to the current row.
     /// Input bytes must be separate from the destination page.
-    /// Panics before writing the column if nonempty input overlaps that page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn add_col(&mut self, col_layout: &TableColumnLayout, val: ValRef<'_>) {
         match val {
@@ -1456,7 +1485,8 @@ pub(crate) trait RowRead {
             let pv = page.var(row_idx, col_idx);
             let v = pv.as_bytes(page.data());
             let offset = pv.offset().map(|os| os as u16);
-            return (Val::VarByte(MemVar::from(v)), offset);
+            // PageVar bounds the stored length to u16.
+            return (Val::VarByte(MemVar::from_bytes(v)), offset);
         }
         (page.non_null_val(col_layout, row_idx, col_idx), None)
     }
@@ -1596,7 +1626,8 @@ impl RowRead for RowMut<'_> {
 impl RowMut<'_> {
     /// Update column by given index and value.
     /// Input bytes must be separate from the destination page.
-    /// Panics before writing the column if nonempty input overlaps that page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn update_col(
         &mut self,
@@ -1652,7 +1683,8 @@ impl RowRead for RowMutExclusive<'_> {
 impl RowMutExclusive<'_> {
     /// Update column by given index and value.
     /// Input bytes must be separate from the destination page.
-    /// Panics before writing the column if nonempty input overlaps that page.
+    /// Panics before writing the column on oversized or page-aliased input,
+    /// or an invalid outlined destination range.
     #[inline]
     pub(crate) fn update_col(
         &mut self,
@@ -1820,8 +1852,8 @@ pub(crate) mod tests {
         let mut page = create_row_page();
         page.init(RowID::new(100), 4, &metadata.col);
         for value in [
-            Val::from("abcdefghijklmnop"),
-            Val::from("inline"),
+            Val::try_from("abcdefghijklmnop").unwrap(),
+            Val::try_from("inline").unwrap(),
             Val::Null,
         ] {
             assert!(page.insert(&metadata.col, &[value]).is_ok());
@@ -1829,12 +1861,21 @@ pub(crate) mod tests {
         (metadata, page)
     }
 
+    fn page_write_snapshot(page: &RowPage) -> (Vec<u8>, String, Vec<u8>) {
+        (
+            page.data().to_vec(),
+            format!(
+                "{:?} deleted={} padding={:?}",
+                page.header,
+                page.header.approx_deleted.load(Ordering::Relaxed),
+                page.header.padding
+            ),
+            page.footer.to_vec(),
+        )
+    }
+
     fn assert_aliased_var_input_rejected(page: &RowPage, input_len: usize, write: impl FnOnce()) {
-        let before = page.data().to_vec();
-        let header_before = format!("{:?}", page.header);
-        let approx_deleted_before = page.header.approx_deleted.load(Ordering::Relaxed);
-        let padding_before = page.header.padding;
-        let footer_before = page.footer;
+        let before = page_write_snapshot(page);
         let panic = catch_unwind(AssertUnwindSafe(write)).expect_err("page input must be rejected");
         let message = panic
             .downcast_ref::<String>()
@@ -1850,14 +1891,7 @@ pub(crate) mod tests {
             "{message}"
         );
         // Includes the payloads, inline descriptors, null bits, and deletion bits.
-        assert_eq!(page.data(), before);
-        assert_eq!(format!("{:?}", page.header), header_before);
-        assert_eq!(
-            page.header.approx_deleted.load(Ordering::Relaxed),
-            approx_deleted_before
-        );
-        assert_eq!(page.header.padding, padding_before);
-        assert_eq!(page.footer, footer_before);
+        assert_eq!(page_write_snapshot(page), before);
     }
 
     fn insert_view_case(
@@ -2087,7 +2121,7 @@ pub(crate) mod tests {
         let before = page.data().to_vec();
         let oversized = vec![0xAB; max_var_len + 1];
         assert!(matches!(
-            page.insert(metadata.col.as_ref(), &[Val::from(oversized)]),
+            page.insert(metadata.col.as_ref(), &[Val::try_from(oversized).unwrap()]),
             InsertRow::NoFreeSpaceOrRowID
         ));
         assert_eq!(page.header.row_count(), 0);
@@ -2099,7 +2133,7 @@ pub(crate) mod tests {
         assert!(matches!(
             page.insert(
                 metadata.col.as_ref(),
-                &[Val::VarByte(MemVar::from(&value[..]))]
+                &[Val::VarByte(MemVar::try_from(&value[..]).unwrap())]
             ),
             InsertRow::Ok(id) if id == RowID::new(0)
         ));
@@ -2125,7 +2159,7 @@ pub(crate) mod tests {
         .expect("valid table metadata");
         let mut page = create_row_page();
         page.init(RowID::new(100), 8, metadata.col.as_ref());
-        let expected = vec![Val::U32(7), Val::from("row-value")];
+        let expected = vec![Val::U32(7), Val::try_from("row-value").unwrap()];
         assert!(page.insert(metadata.col.as_ref(), &expected).is_ok());
 
         let (index_slot, indexed_metadata) = metadata
@@ -2174,11 +2208,17 @@ pub(crate) mod tests {
                 ],
                 index: StorageIndexSpec::new(vec![StorageIndexKey::new(0)], StorageIndexFlags::UK),
                 inserted: [
-                    vec![Val::I32(1_000_000), Val::from("hello")],
-                    vec![Val::I32(2_000_000), Val::from("this value is not inline")],
+                    vec![Val::I32(1_000_000), Val::try_from("hello").unwrap()],
+                    vec![
+                        Val::I32(2_000_000),
+                        Val::try_from("this value is not inline").unwrap(),
+                    ],
                 ],
                 target: 1,
-                updated: vec![Val::Null, Val::from("update to non-inline value")],
+                updated: vec![
+                    Val::Null,
+                    Val::try_from("update to non-inline value").unwrap(),
+                ],
             },
             Case {
                 name: "mixed widths and inline-to-outlined update",
@@ -2196,14 +2236,14 @@ pub(crate) mod tests {
                         Val::U16(1000),
                         Val::U32(1_000_000),
                         Val::U64(1 << 35),
-                        Val::from("short"),
+                        Val::try_from("short").unwrap(),
                     ],
                     vec![
                         Val::U8(3),
                         Val::U16(3000),
                         Val::U32(3_000_000),
                         Val::U64(3 << 35),
-                        Val::from("neighbor"),
+                        Val::try_from("neighbor").unwrap(),
                     ],
                 ],
                 target: 0,
@@ -2212,7 +2252,7 @@ pub(crate) mod tests {
                     Val::U16(2000),
                     Val::U32(2_000_000),
                     Val::U64(2 << 35),
-                    Val::from("very loooooooooooooooooong"),
+                    Val::try_from("very loooooooooooooooooong").unwrap(),
                 ],
             },
         ];
@@ -2331,6 +2371,143 @@ pub(crate) mod tests {
         }
     }
 
+    /// Purpose: Enforce byte lengths and destination bounds in insert and shared/exclusive column writers when validation is bypassed.
+    /// Expected: Oversized, overflowing, and footer-crossing writes panic before changing payloads, descriptors, null bits, or page metadata.
+    #[test]
+    fn test_row_page_var_write_bounds_before_mutation() {
+        let capacity = ROW_PAGE_DATA_SIZE;
+        for (len, offset, diagnostic) in [
+            (MemVar::MAX_LEN + 1, 0, "byte length exceeds limit"),
+            (MemVar::MAX_LEN + 16, 0, "byte length exceeds limit"),
+            (32, capacity - 31, "destination out of range"),
+            (32, capacity, "destination out of range"),
+            (32, capacity + 1, "destination out of range"),
+            (32, usize::MAX, "destination out of range"),
+        ] {
+            let bytes = vec![0xff; len];
+            for mode in ["insert", "shared", "exclusive"] {
+                let targets = if mode == "insert" { 0..1 } else { 0..3 };
+                for target in targets {
+                    let (metadata, mut page) = var_input_test_page();
+                    let row_idx = if mode == "insert" {
+                        page.request_row_idx_and_free_space(0).unwrap().0
+                    } else {
+                        target
+                    };
+                    let before = page_write_snapshot(&page);
+                    let panic = catch_unwind(AssertUnwindSafe(|| match mode {
+                        "insert" => {
+                            let mut row = page.new_row(row_idx, offset);
+                            row.add_col(&metadata.col, ValRef::VarByte(&bytes));
+                            row.finish();
+                        }
+                        "shared" => {
+                            page.update_col(
+                                &metadata.col,
+                                row_idx,
+                                0,
+                                ValRef::VarByte(&bytes),
+                                offset,
+                                true,
+                            );
+                        }
+                        "exclusive" => {
+                            page.update_col_exclusive(
+                                &metadata.col,
+                                row_idx,
+                                0,
+                                ValRef::VarByte(&bytes),
+                                offset,
+                                true,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }))
+                    .expect_err("invalid byte write must panic");
+                    let message = panic.downcast_ref::<String>().unwrap();
+                    assert!(message.contains(diagnostic), "mode={mode}, {message}");
+                    assert!(message.contains(&format!("len={len}")), "{message}");
+                    if diagnostic == "destination out of range" {
+                        assert!(message.contains(&format!("offset={offset}")), "{message}");
+                        assert!(
+                            message.contains(&format!("capacity={capacity}")),
+                            "{message}"
+                        );
+                    }
+                    assert_eq!(
+                        page_write_snapshot(&page),
+                        before,
+                        "mode={mode}, target={target}, len={len}, offset={offset}"
+                    );
+                    if mode == "insert" {
+                        assert!(page.is_deleted(row_idx));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Purpose: Preserve exact destination endpoints and ignore unused outlined offsets for inline writes.
+    /// Expected: Boundary writes stop before the footer; empty and inline values work with any unused offset, and page capacity remains distinct from value length.
+    #[test]
+    fn test_row_page_var_write_valid_boundaries() {
+        let (metadata, _) = var_input_test_page();
+        let mut page = create_row_page();
+        page.init(RowID::new(100), 4, &metadata.col);
+        page.footer.fill(0xa5);
+        let bytes = b"outlined at exact end";
+        let (row_idx, offset) = page.request_row_idx_and_free_space(bytes.len()).unwrap();
+        assert_eq!(offset + bytes.len(), page.data().len());
+        let footer = page.footer;
+        let mut row = page.new_row(row_idx, offset);
+        row.add_col(&metadata.col, ValRef::VarByte(bytes));
+        row.finish();
+        assert_eq!(page.row(row_idx).var(0), bytes);
+        assert_eq!(page.footer, footer);
+        for bytes in [b"".as_slice(), b"inline"] {
+            assert_eq!(
+                page.update_col(
+                    &metadata.col,
+                    row_idx,
+                    0,
+                    ValRef::VarByte(bytes),
+                    usize::MAX,
+                    true
+                ),
+                usize::MAX
+            );
+            assert_eq!(page.row(row_idx).var(0), bytes);
+            assert_eq!(
+                page.update_col_exclusive(
+                    &metadata.col,
+                    row_idx,
+                    0,
+                    ValRef::VarByte(bytes),
+                    usize::MAX,
+                    true
+                ),
+                usize::MAX
+            );
+            assert_eq!(page.row(row_idx).var(0), bytes);
+        }
+        let (row_idx, _) = page.request_row_idx_and_free_space(0).unwrap();
+        let mut row = page.new_row(row_idx, usize::MAX);
+        row.add_col(&metadata.col, ValRef::VarByte(b""));
+        row.finish();
+        assert_eq!(page.row(row_idx).var(0), b"");
+        assert_eq!(page.footer, footer);
+        let max = [Val::try_from(vec![0xff; MemVar::MAX_LEN]).unwrap()];
+        DmlValidator::new(&metadata)
+            .validate_full_row(&max[..])
+            .unwrap();
+        let before = page_write_snapshot(&page);
+        assert!(matches!(
+            page.insert(&metadata.col, &max),
+            InsertRow::NoFreeSpaceOrRowID
+        ));
+        assert_eq!(page_write_snapshot(&page), before);
+    }
+
     /// Purpose: Reject variable-length update inputs borrowed from the destination page.
     /// Expected: Aliased writes panic with context before changing page data or metadata.
     #[test]
@@ -2436,13 +2613,19 @@ pub(crate) mod tests {
         let empty = &source.var(0)[..0];
         let offset = page.header.var_field_offset();
         page.update_col(&metadata.col, 0, 0, ValRef::VarByte(empty), offset, true);
-        assert_eq!(page.row(0).val(&metadata.col, 0), Val::from(""));
+        assert_eq!(
+            page.row(0).val(&metadata.col, 0),
+            Val::try_from("").unwrap()
+        );
         assert_eq!(page.header.var_field_offset(), offset);
         let (row_idx, offset) = page.request_row_idx_and_free_space(0).unwrap();
         let mut row = page.new_row(row_idx, offset);
         row.add_col(&metadata.col, ValRef::VarByte(empty));
         row.finish();
-        assert_eq!(page.row(row_idx).val(&metadata.col, 0), Val::from(""));
+        assert_eq!(
+            page.row(row_idx).val(&metadata.col, 0),
+            Val::try_from("").unwrap()
+        );
         assert!(!page.is_deleted(row_idx));
     }
 
@@ -2464,7 +2647,7 @@ pub(crate) mod tests {
         ];
         let first_var = expected.len();
         for len in [0, 6, 7, 14, 15, 128] {
-            expected.push(Val::from(vec![b'x'; len]));
+            expected.push(Val::try_from(vec![b'x'; len]).unwrap());
         }
         expected.push(Val::Null);
         let metadata = TableMetadata::try_new(
@@ -2558,7 +2741,7 @@ pub(crate) mod tests {
             let bytes = vec![0xff; len];
             let update = [UpdateCol {
                 idx: first_var,
-                val: Val::from(bytes.as_slice()),
+                val: Val::try_from(bytes.as_slice()).unwrap(),
             }];
             let mut input = BufferValues::new([(first_var, ValRef::VarByte(&bytes))]);
             for (page, &(borrowed, exclusive)) in pages.iter_mut().zip(&modes) {

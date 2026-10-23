@@ -1724,7 +1724,7 @@ mod tests {
             let mut row_ids = Vec::new();
             for _ in batch_start..(batch_start + batch_size).min(row_count) {
                 let row_id = trx
-                    .table_insert_mvcc(table_id, vec![Val::from(payload.as_slice())])
+                    .table_insert_mvcc(table_id, vec![Val::try_from(payload.as_slice()).unwrap()])
                     .await
                     .unwrap();
                 row_ids.push(row_id);
@@ -2196,7 +2196,7 @@ mod tests {
         insert_one_row(
             table_id,
             &mut session,
-            vec![Val::from(1i32), Val::from("name")],
+            vec![Val::from(1i32), Val::try_from("name").unwrap()],
         )
         .await;
         assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -3969,7 +3969,7 @@ mod tests {
                     let row_id = trx
                         .table_insert_mvcc(
                             table_id,
-                            vec![Val::from(vec![3u8; 48 * 1024].as_slice())],
+                            vec![Val::try_from(vec![3u8; 48 * 1024].as_slice()).unwrap()],
                         )
                         .await
                         .unwrap();

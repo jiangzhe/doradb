@@ -13,7 +13,7 @@ use crate::id::TableID;
 use crate::row::RowRead;
 use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::trx::PrivateTransaction;
-use crate::value::{Val, ValKind};
+use crate::value::{MemVar, Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::sync::OnceLock;
 
@@ -282,12 +282,13 @@ pub(super) fn table_descriptor_object_from_vals(
 
 #[inline]
 fn cols_from_table_descriptor(descriptor: &TableDescriptorObject) -> Vec<Val> {
+    // Descriptor construction/decoding bounds the payload; the fingerprint has fixed size.
     vec![
         Val::from(descriptor.table_id),
         Val::from(descriptor.descriptor_revision),
         Val::from(descriptor.compiled_storage_epoch),
-        Val::from(&descriptor.storage_schema_fingerprint),
-        Val::from(descriptor.payload.as_ref()),
+        Val::VarByte(MemVar::from_bytes(&descriptor.storage_schema_fingerprint)),
+        Val::VarByte(MemVar::from_bytes(descriptor.payload.as_ref())),
     ]
 }
 
@@ -316,8 +317,8 @@ mod tests {
             Val::from(TableID::new(7)),
             Val::from(3u64),
             Val::from(4u64),
-            Val::from(vec![5; 16]),
-            Val::from(payload),
+            Val::try_from(vec![5; 16]).unwrap(),
+            Val::try_from(payload).unwrap(),
         ]
     }
 
@@ -378,7 +379,7 @@ mod tests {
 
         for len in [0, 15, 17, 31, 32] {
             let mut vals = descriptor_vals(vec![]);
-            vals[3] = Val::from(vec![0; len]);
+            vals[3] = Val::try_from(vec![0; len]).unwrap();
             assert_invalid(&vals);
         }
 

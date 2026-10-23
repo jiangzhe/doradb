@@ -1784,12 +1784,16 @@ mod tests {
     fn name_key(value: &str) -> SelectKey {
         SelectKey {
             index_slot: IndexSlot::new(1),
-            vals: vec![Val::from(value)],
+            vals: vec![Val::try_from(value).unwrap()],
         }
     }
 
     fn indexed_payload_row(id: i32, name: &str, payload: &[u8]) -> Vec<Val> {
-        vec![Val::from(id), Val::from(name), Val::from(payload)]
+        vec![
+            Val::from(id),
+            Val::try_from(name).unwrap(),
+            Val::try_from(payload).unwrap(),
+        ]
     }
 
     async fn insert_mem_mvcc(
@@ -1919,7 +1923,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s: String = (0..1000).map(|_| 'a').collect();
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 trx.commit().await.unwrap();
@@ -2001,7 +2005,7 @@ mod tests {
                             },
                             UpdateCol {
                                 idx: 2,
-                                val: Val::from(vec![b'm'; 48_000]),
+                                val: Val::try_from(vec![b'm'; 48_000]).unwrap(),
                             },
                         ],
                     )
@@ -2125,7 +2129,7 @@ mod tests {
                     let row_id = mem_table_insert_mvcc(
                         &mut setup,
                         &table,
-                        vec![Val::from(key), Val::from("old")],
+                        vec![Val::from(key), Val::try_from("old").unwrap()],
                     )
                     .await
                     .unwrap();
@@ -2148,7 +2152,7 @@ mod tests {
                             &single_key(0i32),
                             vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from(vec![b'r'; 48_000]),
+                                val: Val::try_from(vec![b'r'; 48_000]).unwrap(),
                             }],
                         )
                         .await
@@ -2169,7 +2173,7 @@ mod tests {
                             &single_key(0i32),
                             vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from("reader"),
+                                val: Val::try_from("reader").unwrap(),
                             }],
                         )
                         .await
@@ -2190,7 +2194,7 @@ mod tests {
                         let result = mem_table_upsert_unique_mvcc(
                             &mut reader,
                             &table,
-                            vec![Val::from(0i32), Val::from("reader")],
+                            vec![Val::from(0i32), Val::try_from("reader").unwrap()],
                         )
                         .await
                         .unwrap();
@@ -2221,7 +2225,7 @@ mod tests {
             let inserted = mem_table_upsert_unique_mvcc(
                 &mut trx,
                 &mem_table,
-                vec![Val::from(1i32), Val::from("hello")],
+                vec![Val::from(1i32), Val::try_from("hello").unwrap()],
             )
             .await
             .unwrap();
@@ -2235,7 +2239,7 @@ mod tests {
             let updated = mem_table_upsert_unique_mvcc(
                 &mut trx,
                 &mem_table,
-                vec![Val::from(1i32), Val::from("world")],
+                vec![Val::from(1i32), Val::try_from("world").unwrap()],
             )
             .await
             .unwrap();
@@ -2252,7 +2256,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(row, Some(vec![Val::from(1i32), Val::from("world")]));
+            assert_eq!(
+                row,
+                Some(vec![Val::from(1i32), Val::try_from("world").unwrap()])
+            );
         });
     }
 
@@ -2274,7 +2281,7 @@ mod tests {
                 mem_table_upsert_unique_mvcc(
                     &mut trx1,
                     &mem_table,
-                    vec![Val::from(2i32), Val::from("first")],
+                    vec![Val::from(2i32), Val::try_from("first").unwrap()],
                 )
                 .await
                 .unwrap(),
@@ -2286,7 +2293,7 @@ mod tests {
             let err = mem_table_upsert_unique_mvcc(
                 &mut trx2,
                 &mem_table,
-                vec![Val::from(2i32), Val::from("second")],
+                vec![Val::from(2i32), Val::try_from("second").unwrap()],
             )
             .await
             .unwrap_err();
@@ -2420,7 +2427,7 @@ mod tests {
                         cols,
                         vec![UpdateCol {
                             idx: 2,
-                            val: Val::from(&b"new"[..]),
+                            val: Val::try_from(&b"new"[..]).unwrap(),
                         }]
                     );
                 }
@@ -2532,7 +2539,11 @@ mod tests {
             let guards = session.pool_guards();
 
             let err = mem_table
-                .insert_no_trx(&guards, &[Val::from(1i32), Val::from("short")], false)
+                .insert_no_trx(
+                    &guards,
+                    &[Val::from(1i32), Val::try_from("short").unwrap()],
+                    false,
+                )
                 .await
                 .unwrap_err();
             let RuntimeOrFatalError::Runtime(err) = err else {
@@ -2579,7 +2590,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 2,
-                        val: Val::from(&b"new"[..]),
+                        val: Val::try_from(&b"new"[..]).unwrap(),
                     }],
                     false,
                 )
@@ -2653,7 +2664,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 1,
-                        val: Val::from("new"),
+                        val: Val::try_from("new").unwrap(),
                     }],
                     false,
                 )
@@ -2700,7 +2711,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 1,
-                        val: Val::from("new"),
+                        val: Val::try_from("new").unwrap(),
                     }],
                     false,
                 )
@@ -2746,7 +2757,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 2,
-                        val: Val::from(&b"new"[..]),
+                        val: Val::try_from(&b"new"[..]).unwrap(),
                     }],
                     false,
                 )
@@ -2768,7 +2779,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 2,
-                        val: Val::from(&b"new"[..]),
+                        val: Val::try_from(&b"new"[..]).unwrap(),
                     }],
                     true,
                 )
@@ -2789,7 +2800,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 1,
-                        val: Val::from("changed"),
+                        val: Val::try_from("changed").unwrap(),
                     }],
                     true,
                 )
@@ -2845,7 +2856,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 1,
-                        val: Val::from("two"),
+                        val: Val::try_from("two").unwrap(),
                     }],
                     false,
                 )
@@ -2916,7 +2927,7 @@ mod tests {
                     &key.vals,
                     &[UpdateCol {
                         idx: 2,
-                        val: Val::from(&large_payload[..]),
+                        val: Val::try_from(&large_payload[..]).unwrap(),
                     }],
                     false,
                 )
@@ -3061,7 +3072,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("new"),
+                        val: Val::try_from("new").unwrap(),
                     },
                 ],
             )
@@ -3172,7 +3183,7 @@ mod tests {
                 single_key(0i32),
                 vec![UpdateCol {
                     idx: 2,
-                    val: Val::from(&large_payload[..]),
+                    val: Val::try_from(&large_payload[..]).unwrap(),
                 }],
             )
             .await;
@@ -3225,11 +3236,11 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("moved"),
+                        val: Val::try_from("moved").unwrap(),
                     },
                     UpdateCol {
                         idx: 2,
-                        val: Val::from(&changed_payload[..]),
+                        val: Val::try_from(&changed_payload[..]).unwrap(),
                     },
                 ],
             )
@@ -3322,7 +3333,7 @@ mod tests {
                 let (page_id, row_id) = mem_table
                     .insert_no_trx_location(
                         &session.pool_guards(),
-                        &[Val::from(1i32), Val::from("invalid page")],
+                        &[Val::from(1i32), Val::try_from("invalid page").unwrap()],
                         false,
                     )
                     .await
@@ -3352,7 +3363,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 ))
                 .catch_unwind()
@@ -3410,7 +3421,7 @@ mod tests {
             let row_id = insert_mem_mvcc(
                 &mut session,
                 &mem_table,
-                vec![Val::from(1i32), Val::from("rollback")],
+                vec![Val::from(1i32), Val::try_from("rollback").unwrap()],
             )
             .await;
             let page_id = match mem_table
@@ -3583,7 +3594,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 _ = trx.commit().await.unwrap();

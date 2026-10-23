@@ -248,7 +248,7 @@ mod tests {
                 row_id: RowID::new(100),
                 kind: RowRedoKind::Insert(
                     test_page_id(5),
-                    vec![Val::from(1u32), Val::from(&s[..])],
+                    vec![Val::from(1u32), Val::try_from(&s[..]).unwrap()],
                 ),
             },
         );

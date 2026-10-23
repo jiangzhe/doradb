@@ -301,9 +301,12 @@ mod tests {
                     .unwrap()
                     .table_id();
                 let mut trx = session.begin_trx().unwrap();
-                trx.table_insert_mvcc(table_id, vec![Val::from(1u64), Val::from("before")])
-                    .await
-                    .unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1u64), Val::try_from("before").unwrap()],
+                )
+                .await
+                .unwrap();
                 trx.commit().await.unwrap();
                 session.close().await.unwrap();
                 drop(session);
@@ -342,7 +345,7 @@ mod tests {
                                     trx.table_mutate_mvcc(table_id, |_| -> CallbackResult<_> {
                                         Ok(RowMutation::Update(vec![UpdateCol {
                                             idx: 1,
-                                            val: Val::from("after"),
+                                            val: Val::try_from("after").unwrap(),
                                         }]))
                                     })
                                     .await?;

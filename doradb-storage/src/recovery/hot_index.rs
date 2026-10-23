@@ -524,9 +524,12 @@ mod tests {
                 .table_id();
             let mut trx = session.begin_trx().unwrap();
             for key in 0..400u64 {
-                trx.table_insert_mvcc(table, vec![Val::from(key), Val::from(vec![b'x'; 256])])
-                    .await
-                    .unwrap();
+                trx.table_insert_mvcc(
+                    table,
+                    vec![Val::from(key), Val::try_from(vec![b'x'; 256]).unwrap()],
+                )
+                .await
+                .unwrap();
             }
             trx.commit().await.unwrap();
             ids.push(table);

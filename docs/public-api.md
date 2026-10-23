@@ -262,19 +262,27 @@ points, but does not guard later planning or execution.
 | `VarByte` | Owned variable-length bytes in `MemVar`. |
 | — | `Val::Null`, valid only for nullable columns. |
 
-Primitive numbers, byte slices, byte vectors, and strings implement `From` for
-`Val`:
+Primitive numbers implement `From` for `Val`. Byte slices, references to byte
+arrays, vectors, and strings implement `TryFrom` with the crate `Error` type:
 
 ```rust,ignore
-let row = vec![Val::from(42i32), Val::from("alice")];
-let bytes = Val::from(&b"opaque"[..]);
+let row = vec![Val::from(42i32), Val::try_from("alice")?];
+let bytes = Val::try_from(&b"opaque"[..])?;
 let null = Val::Null;
 ```
 
 Use typed accessors such as `as_i32`, `as_u64`, `as_f64`, and `as_bytes` when
-decoding projections. `as_str` is appropriate only when the `VarByte` payload
-is known to contain valid UTF-8. `ValType` pairs a `ValKind` with nullability;
+decoding projections. `ValType` pairs a `ValKind` with nullability;
 `MemVar` is the lower-level owned representation behind `Val::VarByte`.
+
+Variable bytes may contain arbitrary binary data. `TryFrom` rejects inputs above
+`MemVar::MAX_LEN` (65535 bytes) with `OperationError::InvalidDmlInput`.
+Both `Val` and `MemVar` also provide `try_from_bytes` and `try_from_vec`;
+vector conversions consume the vector even on error.
+
+`Val::as_str` returns `None` for invalid UTF-8 or non-byte values;
+`MemVar::as_str` panics on invalid UTF-8. Both provide `try_as_str` to report
+invalid UTF-8 as `std::str::Utf8Error`.
 
 Identifiers are strong `u64`-backed newtypes in `doradb_storage::id`:
 
@@ -356,7 +364,7 @@ borrow.
 
 DML validation is enabled by default. Depending on the operation, it checks:
 
-- complete row shape, value kind, and nullability;
+- complete row shape, value kind, nullability, and variable-byte length;
 - active index identity and complete key shape;
 - range-bound key shape;
 - non-empty, in-range, strictly increasing read sets; and
@@ -369,7 +377,7 @@ the stream is constructed.
 `Transaction::disable_dml_validation(true)` disables these caller-input checks
 for subsequent direct and streaming operations in that transaction. Use it
 only when inputs have already been proven against the bound table metadata.
-Invalid trusted input may then produce a debug assertion or internal error
+Invalid trusted input may then produce an assertion or internal error
 instead of `InvalidDmlInput`. Calling it with `false` restores validation.
 Table admission, schema-change checks, locking, MVCC, uniqueness, and storage
 invariants are never disabled.
@@ -390,7 +398,7 @@ projection:
 ```rust,ignore
 let mut stream = trx
     .table_scan_mvcc_stream(table_id, &[0, 2], |row| -> CallbackResult<_> {
-        if row.val(1)? == &Val::from("active") {
+        if row.val(1)? == &Val::try_from("active")? {
             Ok(ScanRowDecision::Include)
         } else {
             Ok(ScanRowDecision::Skip)
@@ -538,8 +546,8 @@ range. Bounds contain a complete index key in the same order as the
 `StorageIndexSpec`; partial-prefix bounds are not accepted.
 
 ```rust,ignore
-let lower = [Val::from("a")];
-let upper = [Val::from("z")];
+let lower = [Val::try_from("a")?];
+let upper = [Val::try_from("z")?];
 let rows = trx
     .table_index_scan_mvcc(
         TableIndex(table_id, name_index_id),
@@ -557,7 +565,7 @@ Rust's `RangeBounds` syntax controls inclusive, exclusive, and unbounded ends.
 Use `table_index_scan_mvcc_stream` when rows should be consumed incrementally:
 
 ```rust,ignore
-let key = [Val::from("alice")];
+let key = [Val::try_from("alice")?];
 let mut stream = trx
     .table_index_scan_mvcc_stream(
         TableIndex(table_id, name_index_id),
@@ -598,8 +606,8 @@ let row_ids = trx
     .table_insert_batch_mvcc(
         table_id,
         vec![
-            vec![Val::from(1i32), Val::from("alice")],
-            vec![Val::from(2i32), Val::from("bob")],
+            vec![Val::from(1i32), Val::try_from("alice")?],
+            vec![Val::from(2i32), Val::try_from("bob")?],
         ],
     )
     .await?;
@@ -759,7 +767,7 @@ let outcome = trx
             Ok(match entry {
                 Some(_) => UniqueMutation::Update(vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("ada"),
+                    val: Val::try_from("ada")?,
                 }]),
                 None => UniqueMutation::Skip,
             })

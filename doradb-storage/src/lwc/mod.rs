@@ -554,7 +554,8 @@ impl PreparedLwcData {
                 };
                 let start = offset(idx);
                 let end = offset(idx + 1);
-                Some(Val::VarByte(MemVar::from(
+                // Stored values obey the owned length limit; corruption violates that invariant.
+                Some(Val::VarByte(MemVar::from_bytes(
                     &input[data_start + start..data_start + end],
                 )))
             }
@@ -1600,7 +1601,8 @@ impl<'a> LwcBytes<'a> {
     /// Returns the varbyte value at `idx`.
     #[inline]
     pub(crate) fn value_at(&self, idx: usize) -> Option<MemVar> {
-        self.slice(idx).map(MemVar::from)
+        // LWC writers accept bounded owned values; oversized stored bytes violate that contract.
+        self.slice(idx).map(MemVar::from_bytes)
     }
 }
 
@@ -2313,6 +2315,7 @@ mod tests {
     use crate::row::{Delete, InsertRow, RowPage};
     use crate::value::{MemVar, Val};
     use ordered_float::OrderedFloat;
+    use std::fmt::Debug;
 
     #[track_caller]
     fn assert_invalid_payload<T>(case: &str, result: DataIntegrityResult<T>) {
@@ -2379,12 +2382,16 @@ mod tests {
         }
     }
 
-    fn assert_primitive_roundtrip<T: Copy + Into<Val>>(
-        kind: ValKind,
-        serializer: LwcPrimitiveSer<'_>,
-        input: &[T],
-    ) {
-        let expected: Vec<_> = input.iter().copied().map(Into::into).collect();
+    fn assert_primitive_roundtrip<T>(kind: ValKind, serializer: LwcPrimitiveSer<'_>, input: &[T])
+    where
+        T: Copy + TryInto<Val>,
+        T::Error: Debug,
+    {
+        let expected: Vec<_> = input
+            .iter()
+            .copied()
+            .map(|v| v.try_into().unwrap())
+            .collect();
         let case = format!("{kind:?}, input={expected:?}");
         let mut bytes = vec![0u8; serializer.ser_len()];
         assert_eq!(serializer.ser(&mut bytes[..], 0), bytes.len(), "{case}");
@@ -2921,7 +2928,7 @@ mod tests {
             vec![
                 Val::Null,
                 Val::U64(10),
-                Val::from(Vec::from(&b"alpha"[..])),
+                Val::try_from(Vec::from(&b"alpha"[..])).unwrap(),
                 Val::F32(OrderedFloat(1.25)),
             ],
             vec![
@@ -2933,7 +2940,7 @@ mod tests {
             vec![
                 Val::I16(9),
                 Val::U64(12),
-                Val::from(Vec::from(&b"beta"[..])),
+                Val::try_from(Vec::from(&b"beta"[..])).unwrap(),
                 Val::F32(OrderedFloat(3.75)),
             ],
         ];
@@ -2970,13 +2977,13 @@ mod tests {
         )
         .expect("valid table metadata");
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let first_row = vec![Val::I16(5), Val::from("ok")];
+        let first_row = vec![Val::I16(5), Val::try_from("ok").unwrap()];
         assert!(builder.append_row_values(RowID::new(1), &first_row));
         let expected_stats = vec![(true, 5, 5, 0, 0), (false, 0, 0, 0, 0)];
         assert_eq!(integer_stats(&builder), expected_stats);
 
         for value in [Val::I16(1000), Val::Null] {
-            let oversized = Val::from(vec![0; LWC_BLOCK_PAYLOAD_SIZE]);
+            let oversized = Val::try_from(vec![0; LWC_BLOCK_PAYLOAD_SIZE]).unwrap();
             assert!(!builder.append_row_values(RowID::new(2), &[value, oversized]));
             assert_eq!(builder.row_count(), 1);
             assert_eq!(builder.row_ids(), &[RowID::new(1)]);
@@ -3015,8 +3022,8 @@ mod tests {
                 Val::U64(row_no),
                 Val::U64(0),
                 Val::U64(0),
-                Val::from(vec![0u8; 32]),
-                Val::from(vec![row_no as u8; 6_718]),
+                Val::try_from(vec![0u8; 32]).unwrap(),
+                Val::try_from(vec![row_no as u8; 6_718]).unwrap(),
             ];
             if !builder.append_row_values(RowID::new(row_no), &vals) {
                 break;

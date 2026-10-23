@@ -315,7 +315,8 @@ mod tests {
                 );
                 let layout = MemTableLayout::new_memory(metadata, indexes);
                 let table = MemTable::new(row_store, layout, PoolRole::Meta);
-                let text = Val::from("an indexed value longer than the inline representation");
+                let text = Val::try_from("an indexed value longer than the inline representation")
+                    .unwrap();
                 let row = vec![Val::from(7i32), text.clone(), Val::from(999i64)];
                 table.insert_no_trx(&guards, &row, false).await.unwrap();
                 let row_id = RowID::new(0);

@@ -3833,8 +3833,11 @@ mod tests {
 
         let mut trx = session.begin_trx().unwrap();
         let first_row_id = unwrap_insert_result(
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("first-session")])
-                .await,
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::try_from("first-session").unwrap()],
+            )
+            .await,
         );
         trx.commit().await.unwrap();
         let first_page_id = match table_for_internal_assertion(&engine, table_id)
@@ -3856,8 +3859,11 @@ mod tests {
         let mut next_session = engine.new_session().unwrap();
         let mut trx = next_session.begin_trx().unwrap();
         let next_row_id = unwrap_insert_result(
-            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("next-session")])
-                .await,
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(2), Val::try_from("next-session").unwrap()],
+            )
+            .await,
         );
         trx.commit().await.unwrap();
         let next_page_id = match table_for_internal_assertion(&engine, table_id)
@@ -3934,7 +3940,7 @@ mod tests {
             trx_select_row_mvcc_by_id(&mut reader, table_id, &key, &[0, 1])
                 .await
                 .unwrap(),
-            SelectMvcc::Found(vec![Val::from(1i32), Val::from("name")]),
+            SelectMvcc::Found(vec![Val::from(1i32), Val::try_from("name").unwrap()]),
             "uncorrupted fixture: {case:?}",
         );
         reader.commit().await.unwrap();
@@ -4002,7 +4008,7 @@ mod tests {
 
     fn assert_lazy_row_buffer_cleared(clear: impl FnOnce(&mut LazyRowBuffer)) {
         let mut buffer = LazyRowBuffer::new(3);
-        buffer.cache_value(0, Val::from("stale"));
+        buffer.cache_value(0, Val::try_from("stale").unwrap());
         buffer.cache_value(2, Val::from(2i32));
         let pointers = (
             buffer.values.as_ptr(),
@@ -4098,8 +4104,8 @@ mod tests {
         old: &str,
         new: &str,
     ) -> RowID {
-        let old_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(old)]);
-        let new_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(new)]);
+        let old_key = SelectKey::new(IndexSlot::new(0), vec![Val::try_from(old).unwrap()]);
+        let new_key = SelectKey::new(IndexSlot::new(0), vec![Val::try_from(new).unwrap()]);
         let mut writer = session.begin_trx().unwrap();
         let result = trx_update_row_by_id(
             &mut writer,
@@ -4107,7 +4113,7 @@ mod tests {
             &old_key,
             vec![UpdateCol {
                 idx: 0,
-                val: Val::from(new),
+                val: Val::try_from(new).unwrap(),
             }],
         )
         .await
@@ -4127,7 +4133,7 @@ mod tests {
             trx_select_row_mvcc_by_id(&mut reader, table_id, &new_key, &[0])
                 .await
                 .unwrap(),
-            SelectMvcc::Found(vec![Val::from(new)])
+            SelectMvcc::Found(vec![Val::try_from(new).unwrap()])
         );
         reader.commit().await.unwrap();
         row_id
@@ -4164,7 +4170,7 @@ mod tests {
         assert!(delete_cts > writer_sts);
 
         writer = expect_trx_select(table_id, writer, &key, |row| {
-            assert_eq!(row, vec![Val::from(5i32), Val::from("name")]);
+            assert_eq!(row, vec![Val::from(5i32), Val::try_from("name").unwrap()]);
         })
         .await;
 
@@ -4179,7 +4185,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 )
                 .await
@@ -4203,7 +4209,7 @@ mod tests {
         expect_insert_committed(
             table_id,
             &mut session,
-            vec![Val::from(1i32), Val::from("hello")],
+            vec![Val::from(1i32), Val::try_from("hello").unwrap()],
         )
         .await;
         let mut original_session = engine.new_session().unwrap();
@@ -4219,7 +4225,7 @@ mod tests {
                 },
                 UpdateCol {
                     idx: 1,
-                    val: Val::from("world"),
+                    val: Val::try_from("world").unwrap(),
                 },
             ],
         )
@@ -4231,7 +4237,7 @@ mod tests {
                 expect_insert_committed(
                     table_id,
                     &mut session,
-                    vec![Val::from(1i32), Val::from("rust")],
+                    vec![Val::from(1i32), Val::try_from("rust").unwrap()],
                 )
                 .await;
                 "rust"
@@ -4240,7 +4246,7 @@ mod tests {
                 expect_insert_committed(
                     table_id,
                     &mut session,
-                    vec![Val::from(5i32), Val::from("rust")],
+                    vec![Val::from(5i32), Val::try_from("rust").unwrap()],
                 )
                 .await;
                 expect_update_committed(
@@ -4254,7 +4260,7 @@ mod tests {
                         },
                         UpdateCol {
                             idx: 1,
-                            val: Val::from("c++"),
+                            val: Val::try_from("c++").unwrap(),
                         },
                     ],
                 )
@@ -4266,14 +4272,14 @@ mod tests {
             (
                 "original",
                 &mut original,
-                SelectMvcc::Found(vec![Val::from(1i32), Val::from("hello")]),
+                SelectMvcc::Found(vec![Val::from(1i32), Val::try_from("hello").unwrap()]),
                 SelectMvcc::NotFound,
             ),
             (
                 "moved",
                 &mut moved,
                 SelectMvcc::NotFound,
-                SelectMvcc::Found(vec![Val::from(2i32), Val::from("world")]),
+                SelectMvcc::Found(vec![Val::from(2i32), Val::try_from("world").unwrap()]),
             ),
         ] {
             for (key, expected) in [(1i32, first), (2i32, second), (5i32, SelectMvcc::NotFound)] {
@@ -4292,11 +4298,11 @@ mod tests {
         for (key, expected) in [
             (
                 1i32,
-                SelectMvcc::Found(vec![Val::from(1i32), Val::from(replacement)]),
+                SelectMvcc::Found(vec![Val::from(1i32), Val::try_from(replacement).unwrap()]),
             ),
             (
                 2i32,
-                SelectMvcc::Found(vec![Val::from(2i32), Val::from("world")]),
+                SelectMvcc::Found(vec![Val::from(2i32), Val::try_from("world").unwrap()]),
             ),
             (5i32, SelectMvcc::NotFound),
         ] {
@@ -4432,7 +4438,7 @@ mod tests {
                 ]
                 .into_boxed_slice(),
             );
-            let row = vec![Val::from(7i32), Val::from("unindexed")];
+            let row = vec![Val::from(7i32), Val::try_from("unindexed").unwrap()];
             let retained_keys = WriteIndexKeySet::from_full_row(&original, &row);
             let new_keys = WriteIndexKeySet::from_full_row(&replacement, &row);
             let read_set = replacement.indexed_column_read_set();
@@ -4518,7 +4524,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 trx.commit().await.unwrap();
@@ -4531,7 +4537,7 @@ mod tests {
                         assert!(vals.len() == 2);
                         assert!(vals[0] == Val::from(i));
                         let s = format!("{}", i);
-                        assert!(vals[1] == Val::from(&s[..]));
+                        assert!(vals[1] == Val::try_from(&s[..]).unwrap());
                     })
                     .await;
                 }
@@ -4553,13 +4559,13 @@ mod tests {
             // dup key
             {
                 // insert [1, "hello"]
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 let mut trx = session.begin_trx().unwrap();
                 trx = expect_trx_insert(table_id, trx, insert).await;
                 trx.commit().await.unwrap();
 
                 // insert [1, "world"]
-                let insert = vec![Val::from(1i32), Val::from("world")];
+                let insert = vec![Val::from(1i32), Val::try_from("world").unwrap()];
                 let mut trx = session.begin_trx().unwrap();
                 let res = trx.table_insert_mvcc(table_id, insert).await;
                 let err = res.unwrap_err();
@@ -4572,14 +4578,14 @@ mod tests {
             // write conflict
             {
                 // insert [2, "hello"], but not commit
-                let insert1 = vec![Val::from(2i32), Val::from("hello")];
+                let insert1 = vec![Val::from(2i32), Val::try_from("hello").unwrap()];
                 let mut trx1 = session.begin_trx().unwrap();
                 let res = trx1.table_insert_mvcc(table_id, insert1).await;
                 assert!(res.is_ok());
 
                 // begin concurrent transaction and insert [2, "world"]
                 let mut session2 = engine.new_session().unwrap();
-                let insert2 = vec![Val::from(2i32), Val::from("world")];
+                let insert2 = vec![Val::from(2i32), Val::try_from("world").unwrap()];
                 let mut trx2 = session2.begin_trx().unwrap();
                 let res = trx2.table_insert_mvcc(table_id, insert2).await;
                 // still dup key because circuit breaker on index search.
@@ -4614,7 +4620,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 trx.commit().await.unwrap();
@@ -4625,7 +4631,7 @@ mod tests {
                 let s1 = "hello";
                 let update1 = vec![UpdateCol {
                     idx: 1,
-                    val: Val::from(s1),
+                    val: Val::try_from(s1).unwrap(),
                 }];
                 trx = expect_trx_update(table_id, trx, &k1, update1).await;
                 trx.commit().await.unwrap();
@@ -4636,7 +4642,7 @@ mod tests {
                 let s2: String = (0..50_000).map(|_| '1').collect();
                 let update2 = vec![UpdateCol {
                     idx: 1,
-                    val: Val::from(&s2[..]),
+                    val: Val::try_from(&s2[..]).unwrap(),
                 }];
                 trx = expect_trx_update(table_id, trx, &k2, update2).await;
 
@@ -4644,7 +4650,7 @@ mod tests {
                 trx = expect_trx_select(table_id, trx, &k2, |row| {
                     assert!(row.len() == 2);
                     assert!(row[0] == k2.vals[0]);
-                    assert!(row[1] == Val::from(&s2[..]));
+                    assert!(row[1] == Val::try_from(&s2[..]).unwrap());
                 })
                 .await;
 
@@ -4655,7 +4661,7 @@ mod tests {
                 trx = expect_trx_select(table_id, trx, &k2, |row| {
                     assert!(row.len() == 2);
                     assert!(row[0] == k2.vals[0]);
-                    assert!(row[1] == Val::from(&s2[..]));
+                    assert!(row[1] == Val::try_from(&s2[..]).unwrap());
                 })
                 .await;
 
@@ -4684,7 +4690,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(1i32), Val::from("hello")],
+                            vec![Val::from(1i32), Val::try_from("hello").unwrap()],
                         ))
                     },
                 )
@@ -4704,7 +4710,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(1i32), Val::from("world")],
+                            vec![Val::from(1i32), Val::try_from("world").unwrap()],
                         ))
                     },
                 )
@@ -4714,7 +4720,7 @@ mod tests {
             trx.commit().await.unwrap();
 
             expect_select_committed(table_id, &mut session, &single_key(1i32), |row| {
-                assert_eq!(row, vec![Val::from(1i32), Val::from("world")]);
+                assert_eq!(row, vec![Val::from(1i32), Val::try_from("world").unwrap()]);
             })
             .await;
         });
@@ -4768,8 +4774,8 @@ mod tests {
                         &mut session,
                         vec![
                             Val::from(id),
-                            Val::from(&name[..]),
-                            Val::from(&base_payload[..]),
+                            Val::try_from(&name[..]).unwrap(),
+                            Val::try_from(&base_payload[..]).unwrap(),
                         ],
                     )
                     .await,
@@ -4787,8 +4793,8 @@ mod tests {
                     .unwrap_found(),
                 vec![
                     Val::from(0i32),
-                    Val::from("name0"),
-                    Val::from(&base_payload[..]),
+                    Val::try_from("name0").unwrap(),
+                    Val::try_from(&base_payload[..]).unwrap(),
                 ]
             );
 
@@ -4803,8 +4809,8 @@ mod tests {
                             entry.is_some(),
                             vec![
                                 Val::from(0i32),
-                                Val::from("name0"),
-                                Val::from(&large_payload[..]),
+                                Val::try_from("name0").unwrap(),
+                                Val::try_from(&large_payload[..]).unwrap(),
                             ],
                         ))
                     },
@@ -4834,7 +4840,7 @@ mod tests {
                 .non_unique_mem()
                 .unwrap()
                 .bind(guards.index_guard());
-            let name_key = [Val::from("name0")];
+            let name_key = [Val::try_from("name0").unwrap()];
             assert_eq!(
                 non_unique
                     .lookup_unique(&name_key, old_row_id, writer.sts())
@@ -4859,8 +4865,8 @@ mod tests {
                     .unwrap_found(),
                 vec![
                     Val::from(0i32),
-                    Val::from("name0"),
-                    Val::from(&large_payload[..]),
+                    Val::try_from("name0").unwrap(),
+                    Val::try_from(&large_payload[..]).unwrap(),
                 ]
             );
             fresh_reader.commit().await.unwrap();
@@ -4872,8 +4878,8 @@ mod tests {
                     .unwrap_found(),
                 vec![
                     Val::from(0i32),
-                    Val::from("name0"),
-                    Val::from(&base_payload[..]),
+                    Val::try_from("name0").unwrap(),
+                    Val::try_from(&base_payload[..]).unwrap(),
                 ]
             );
             old_reader.commit().await.unwrap();
@@ -4903,7 +4909,7 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("base")],
+                vec![Val::from(1i32), Val::try_from("base").unwrap()],
             )
             .await;
 
@@ -4915,7 +4921,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(1i32), Val::from("held")],
+                            vec![Val::from(1i32), Val::try_from("held").unwrap()],
                         ))
                     }
                 )
@@ -4933,7 +4939,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(1i32), Val::from("conflict")],
+                            vec![Val::from(1i32), Val::try_from("conflict").unwrap()],
                         ))
                     },
                 )
@@ -4955,7 +4961,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(2i32), Val::from("first")],
+                            vec![Val::from(2i32), Val::try_from("first").unwrap()],
                         ))
                     }
                 )
@@ -4972,7 +4978,7 @@ mod tests {
                     |entry| -> CallbackResult<_> {
                         Ok(upsert_action(
                             entry.is_some(),
-                            vec![Val::from(2i32), Val::from("second")],
+                            vec![Val::from(2i32), Val::try_from("second").unwrap()],
                         ))
                     },
                 )
@@ -5006,7 +5012,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 trx.commit().await.unwrap();
@@ -5098,7 +5104,7 @@ mod tests {
 
             expect_select_committed(table_id, &mut session, &key, |vals| {
                 assert_eq!(vals[0], Val::from(1i32));
-                assert_eq!(vals[1], Val::from("name"));
+                assert_eq!(vals[1], Val::try_from("name").unwrap());
             })
             .await;
             let allocated_after_first = engine.inner().pools.disk.allocated();
@@ -5106,7 +5112,7 @@ mod tests {
 
             expect_select_committed(table_id, &mut session, &key, |vals| {
                 assert_eq!(vals[0], Val::from(1i32));
-                assert_eq!(vals[1], Val::from("name"));
+                assert_eq!(vals[1], Val::try_from("name").unwrap());
             })
             .await;
             assert_eq!(engine.inner().pools.disk.allocated(), allocated_after_first);
@@ -5395,7 +5401,7 @@ mod tests {
                 &key,
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("updated"),
+                    val: Val::try_from("updated").unwrap(),
                 }],
             )
             .await
@@ -5433,21 +5439,24 @@ mod tests {
             assert!(matches!(
                 trx_select_row_mvcc_by_id(&mut writer, table_id, &key, &[0, 1]).await,
                 Ok(SelectMvcc::Found(vals))
-                    if vals == vec![Val::from(1i32), Val::from("updated")]
+                    if vals == vec![Val::from(1i32), Val::try_from("updated").unwrap()]
             ));
             old_reader = expect_trx_select(table_id, old_reader, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
 
             writer.commit().await.unwrap();
 
             expect_select_committed(table_id, &mut session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("updated")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(1i32), Val::try_from("updated").unwrap()]
+                );
             })
             .await;
             old_reader = expect_trx_select(table_id, old_reader, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
             old_reader.commit().await.unwrap();
@@ -5502,7 +5511,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("moved"),
+                        val: Val::try_from("moved").unwrap(),
                     },
                 ],
             )
@@ -5533,12 +5542,15 @@ mod tests {
 
             expect_select_not_found_committed(table_id, &mut session, &old_key).await;
             expect_select_committed(table_id, &mut session, &new_key, |vals| {
-                assert_eq!(vals, vec![Val::from(20i32), Val::from("moved")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(20i32), Val::try_from("moved").unwrap()]
+                );
             })
             .await;
 
             old_reader = expect_trx_select(table_id, old_reader, &old_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(2i32), Val::try_from("name").unwrap()]);
             })
             .await;
             old_reader = expect_trx_select_not_found(table_id, old_reader, &new_key).await;
@@ -5598,11 +5610,11 @@ mod tests {
                     .is_none()
             );
             expect_select_committed(table_id, &mut session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
             expect_select_committed(table_id, &mut session, &duplicate_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(2i32), Val::try_from("name").unwrap()]);
             })
             .await;
         });
@@ -5688,7 +5700,10 @@ mod tests {
             )
             .await;
             expect_select_committed(table_id, &mut session, &unique_key, |vals| {
-                assert_eq!(vals, vec![Val::from(0i32), Val::from("persisted")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(0i32), Val::try_from("persisted").unwrap()]
+                );
             })
             .await;
 
@@ -5755,18 +5770,21 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("claimed"),
+                        val: Val::try_from("claimed").unwrap(),
                     },
                 ],
             )
             .await;
 
             expect_select_committed(table_id, &mut session, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("claimed")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(2i32), Val::try_from("claimed").unwrap()]
+                );
             })
             .await;
             old_reader = expect_trx_select(table_id, old_reader, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(2i32), Val::try_from("name").unwrap()]);
             })
             .await;
             gap_reader = expect_trx_select_not_found(table_id, gap_reader, &claimed_key).await;
@@ -5824,7 +5842,7 @@ mod tests {
             .await;
 
             writer = expect_trx_select(table_id, writer, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(2i32), Val::try_from("name").unwrap()]);
             })
             .await;
 
@@ -5839,7 +5857,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("claimed"),
+                        val: Val::try_from("claimed").unwrap(),
                     },
                 ],
             )
@@ -5863,7 +5881,7 @@ mod tests {
             writer.rollback().await.unwrap();
 
             expect_select_committed(table_id, &mut session, &old_key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
             expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
@@ -5920,7 +5938,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("claimed"),
+                        val: Val::try_from("claimed").unwrap(),
                     },
                 ],
             )
@@ -5962,12 +5980,12 @@ mod tests {
             )
             .await;
             expect_select_committed(table_id, &mut session, &old_key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
             expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
             old_reader = expect_trx_select(table_id, old_reader, &claimed_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(2i32), Val::try_from("name").unwrap()]);
             })
             .await;
             old_reader.commit().await.unwrap();
@@ -6040,7 +6058,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("claimed"),
+                        val: Val::try_from("claimed").unwrap(),
                     },
                 ],
             )
@@ -6106,7 +6124,7 @@ mod tests {
             // root; MVCC reads filter that stale cold owner through the committed
             // deletion marker.
             expect_select_committed(table_id, &mut session, &old_key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("name")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("name").unwrap()]);
             })
             .await;
             expect_select_not_found_committed(table_id, &mut session, &claimed_key).await;
@@ -6125,7 +6143,7 @@ mod tests {
             let table_id = create_table2_for_test(&engine).await;
             let mut session = engine.new_session().unwrap();
             {
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 let mut trx = session.begin_trx().unwrap();
                 trx = expect_trx_insert(table_id, trx, insert).await;
                 trx.commit().await.unwrap();
@@ -6179,11 +6197,11 @@ mod tests {
                 .lock_shared_async()
                 .await
                 .unwrap();
-            let insert = vec![Val::from(2i32), Val::from("insert")];
+            let insert = vec![Val::from(2i32), Val::try_from("insert").unwrap()];
             let table = table_for_internal_assertion(&engine, table_id);
             let update = vec![UpdateCol {
                 idx: 1,
-                val: Val::from("world"),
+                val: Val::try_from("world").unwrap(),
             }];
             let (insert_retry, update_retry) = transition_insert_update(
                 &mut trx,
@@ -6236,7 +6254,7 @@ mod tests {
             {
                 let mut session = engine.new_session().unwrap();
                 // insert 1 row
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 expect_insert_committed(table_id, &mut session, insert).await;
 
                 // we must hold a transaction before the deletion,
@@ -6251,14 +6269,14 @@ mod tests {
                 let mut deleted = deleted_session.begin_trx().unwrap();
 
                 // insert again, trigger insert+link
-                let insert = vec![Val::from(1i32), Val::from("world")];
+                let insert = vec![Val::from(1i32), Val::try_from("world").unwrap()];
                 expect_insert_committed(table_id, &mut session, insert).await;
 
                 assert_eq!(
                     trx_select_row_mvcc_by_id(&mut original, table_id, &key, &[0, 1])
                         .await
                         .unwrap(),
-                    SelectMvcc::Found(vec![Val::from(1i32), Val::from("hello")]),
+                    SelectMvcc::Found(vec![Val::from(1i32), Val::try_from("hello").unwrap()]),
                 );
                 assert_eq!(
                     trx_select_row_mvcc_by_id(&mut deleted, table_id, &key, &[0, 1])
@@ -6273,7 +6291,7 @@ mod tests {
                 let key = single_key(1i32);
                 _ = expect_select_committed(table_id, &mut session, &key, |vals| {
                     assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("world"));
+                    assert!(vals[1] == Val::try_from("world").unwrap());
                 })
                 .await;
             }
@@ -6429,7 +6447,7 @@ mod tests {
             {
                 let mut session = engine.new_session().unwrap();
                 // insert: v1
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 expect_insert_committed(table_id, &mut session, insert).await;
 
                 // transaction to see version 1
@@ -6441,7 +6459,7 @@ mod tests {
                 let key = single_key(1i32);
                 let update = vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("rust"),
+                    val: Val::try_from("rust").unwrap(),
                 }];
                 trx = expect_trx_update(table_id, trx, &key, update).await;
                 // update 2: v3
@@ -6453,7 +6471,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("world"),
+                        val: Val::try_from("world").unwrap(),
                     },
                 ];
                 trx = expect_trx_update(table_id, trx, &key, update).await;
@@ -6465,7 +6483,7 @@ mod tests {
                 let key = single_key(2i32);
                 trx = expect_trx_select(table_id, trx, &key, |vals| {
                     assert!(vals[0] == Val::from(2i32));
-                    assert!(vals[1] == Val::from("world"));
+                    assert!(vals[1] == Val::try_from("world").unwrap());
                 })
                 .await;
                 trx.commit().await.unwrap();
@@ -6474,7 +6492,7 @@ mod tests {
                 let key = single_key(1i32);
                 trx1 = expect_trx_select(table_id, trx1, &key, |vals| {
                     assert!(vals[0] == Val::from(1i32));
-                    assert!(vals[1] == Val::from("hello"));
+                    assert!(vals[1] == Val::try_from("hello").unwrap());
                 })
                 .await;
                 trx1.commit().await.unwrap();
@@ -6496,7 +6514,7 @@ mod tests {
             {
                 let mut session = engine.new_session().unwrap();
                 let value = vec![1u8; SIZE];
-                let insert = vec![Val::from(1i32), Val::from(&[])];
+                let insert = vec![Val::from(1i32), Val::try_from(&[]).unwrap()];
                 expect_insert_committed(table_id, &mut session, insert).await;
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
                 for i in SIZE - COUNT..SIZE {
@@ -6506,12 +6524,15 @@ mod tests {
                         &key,
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from(&value[..i]),
+                            val: Val::try_from(&value[..i]).unwrap(),
                         }],
                     )
                     .await;
                     expect_select_committed(table_id, &mut session, &key, |row| {
-                        assert_eq!(row, vec![Val::from(1i32), Val::from(&value[..i])]);
+                        assert_eq!(
+                            row,
+                            vec![Val::from(1i32), Val::try_from(&value[..i]).unwrap()]
+                        );
                     })
                     .await;
                 }
@@ -6537,7 +6558,7 @@ mod tests {
                 let s: String = repeat_n('0', SIZE).collect();
                 // insert single row.
                 {
-                    let insert = vec![Val::from(&s[..0])];
+                    let insert = vec![Val::try_from(&s[..0]).unwrap()];
                     let mut trx = session.begin_trx().unwrap();
                     let res = trx.table_insert_mvcc(table_id, insert).await;
                     assert!(res.is_ok());
@@ -6571,7 +6592,7 @@ mod tests {
                 let mut original_ids = Vec::new();
                 // Fill the source page before growing indexed values.
                 for i in 0usize..COUNT {
-                    let insert = vec![Val::from(&s[..BASE + i])];
+                    let insert = vec![Val::try_from(&s[..BASE + i]).unwrap()];
                     let mut trx = session.begin_trx().unwrap();
                     original_ids.push(trx.table_insert_mvcc(table_id, insert).await.unwrap());
                     trx.commit().await.unwrap();
@@ -6592,7 +6613,7 @@ mod tests {
                 let mut actual = scan_table_rows(&mut reader, table_id, &[0]).await;
                 actual.sort_by_key(|row| row[0].as_str().unwrap().len());
                 let expected: Vec<_> = (BASE + DELTA..BASE + COUNT + DELTA)
-                    .map(|len| vec![Val::from(&s[..len])])
+                    .map(|len| vec![Val::try_from(&s[..len]).unwrap()])
                     .collect();
                 assert_eq!(actual, expected);
                 reader.commit().await.unwrap();
@@ -6618,7 +6639,7 @@ mod tests {
                 let mut trx = session1.begin_trx().unwrap();
                 for i in 0..SIZE {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 _ = trx.commit().await.unwrap();
@@ -6636,7 +6657,7 @@ mod tests {
                 let mut trx = session1.begin_trx().unwrap();
                 for i in SIZE..SIZE * 2 {
                     let s = format!("{}", i);
-                    let insert = vec![Val::from(i), Val::from(&s[..])];
+                    let insert = vec![Val::from(i), Val::try_from(&s[..]).unwrap()];
                     trx = expect_trx_insert(table_id, trx, insert).await;
                 }
                 trx
@@ -6884,7 +6905,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("should-not-apply"),
+                        val: Val::try_from("should-not-apply").unwrap(),
                     }],
                 )
                 .await
@@ -6907,7 +6928,10 @@ mod tests {
             // because durable deletion is now the final authority.
             insert_rows(table_id, &mut session, 1, 1, "replacement").await;
             expect_select_committed(table_id, &mut session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("replacement")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(1i32), Val::try_from("replacement").unwrap()]
+                );
             })
             .await;
         });
@@ -6992,7 +7016,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 )
                 .await
@@ -7033,7 +7057,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 )
                 .await;
@@ -7079,7 +7103,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("owner"),
+                        val: Val::try_from("owner").unwrap(),
                     }],
                 )
                 .await
@@ -7098,7 +7122,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("writer"),
+                        val: Val::try_from("writer").unwrap(),
                     }],
                 )
                 .await;
@@ -7145,7 +7169,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 )
                 .await;
@@ -7166,7 +7190,10 @@ mod tests {
             let (result, ()) = futures::join!(update, release);
             assert!(matches!(result, Ok(UniqueMutationOutcome::Updated(_))));
             expect_select_committed(table_id, &mut setup_session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("updated")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(1i32), Val::try_from("updated").unwrap()]
+                );
             })
             .await;
         });
@@ -7253,7 +7280,7 @@ mod tests {
                     if first % 2 == 0 {
                         Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from(format!("updated-{first}").as_str()),
+                            val: Val::try_from(format!("updated-{first}").as_str()).unwrap(),
                         }]))
                     } else {
                         Ok(RowMutation::Skip)
@@ -7291,7 +7318,7 @@ mod tests {
                     }
                     Ok(RowMutation::Update(vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("should-rollback"),
+                        val: Val::try_from("should-rollback").unwrap(),
                     }]))
                 })
                 .await;
@@ -7345,7 +7372,7 @@ mod tests {
                     &old_key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("stale-update"),
+                        val: Val::try_from("stale-update").unwrap(),
                     }],
                 )
                 .await
@@ -7362,7 +7389,7 @@ mod tests {
                 trx_select_row_mvcc_by_id(&mut trx, table_id, &new_key, &[0, 1])
                     .await
                     .unwrap(),
-                SelectMvcc::Found(vec![Val::from(2i32), Val::from("original")])
+                SelectMvcc::Found(vec![Val::from(2i32), Val::try_from("original").unwrap()])
             );
             trx.commit().await.unwrap();
         });
@@ -7461,11 +7488,11 @@ mod tests {
                         0 | 10 => RowMutation::Delete,
                         1 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("cold-updated"),
+                            val: Val::try_from("cold-updated").unwrap(),
                         }]),
                         11 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("hot-updated"),
+                            val: Val::try_from("hot-updated").unwrap(),
                         }]),
                         12 => RowMutation::Update(Vec::new()),
                         2 => RowMutation::Skip,
@@ -7540,7 +7567,7 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 trx.table_insert_mvcc(
                     table_id,
-                    vec![Val::from(99i32), Val::from("prior statement")],
+                    vec![Val::from(99i32), Val::try_from("prior statement").unwrap()],
                 )
                 .await
                 .unwrap();
@@ -7567,7 +7594,7 @@ mod tests {
                         0 | 10 => RowMutation::Delete,
                         1 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("changed"),
+                            val: Val::try_from("changed").unwrap(),
                         }]),
                         _ => unreachable!("callback must stop at its first error"),
                     })
@@ -7643,7 +7670,7 @@ mod tests {
                         0 | 10 => RowMutation::Delete,
                         1 | 11 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("changed"),
+                            val: Val::try_from("changed").unwrap(),
                         }]),
                         _ => unreachable!(),
                     })
@@ -7709,7 +7736,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7751,7 +7778,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7772,7 +7799,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7819,7 +7846,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7842,7 +7869,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7871,7 +7898,7 @@ mod tests {
             let rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("shared")],
+                    &[Val::try_from("shared").unwrap()],
                     &[0],
                 )
                 .await
@@ -7984,7 +8011,7 @@ mod tests {
                     &single_key(0),
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("newer"),
+                        val: Val::try_from("newer").unwrap(),
                     }],
                 )
                 .await,
@@ -8033,7 +8060,7 @@ mod tests {
                 &single_key(0),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("newer"),
+                    val: Val::try_from("newer").unwrap(),
                 }],
             )
             .await;
@@ -8294,7 +8321,7 @@ mod tests {
                     &single_key(0),
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("first"),
+                        val: Val::try_from("first").unwrap(),
                     }],
                 )
                 .await,
@@ -8308,7 +8335,7 @@ mod tests {
                     &single_key(1),
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("second"),
+                        val: Val::try_from("second").unwrap(),
                     }],
                 )
                 .await,
@@ -8522,8 +8549,8 @@ mod tests {
                     assert_eq!(row.val(1)?, &name, "repeated lazy reads must be stable");
                     let id = row.val(0)?.as_i32().unwrap();
                     Ok(
-                        if (name == Val::from("cold") && id % 2 == 0)
-                            || (name == Val::from("hot") && id == 101)
+                        if (name == Val::try_from("cold").unwrap() && id % 2 == 0)
+                            || (name == Val::try_from("hot").unwrap() && id == 101)
                         {
                             ScanRowDecision::Include
                         } else {
@@ -8612,7 +8639,7 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut writer_session,
-                vec![Val::from(1i32), Val::from("old")],
+                vec![Val::from(1i32), Val::try_from("old").unwrap()],
             )
             .await;
 
@@ -8625,7 +8652,7 @@ mod tests {
                     &single_key(1i32),
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from(value),
+                        val: Val::try_from(value).unwrap(),
                     }],
                 )
                 .await;
@@ -8633,14 +8660,14 @@ mod tests {
 
             let mut stream = reader
                 .table_scan_mvcc_stream(table_id, &[0, 1], |row| -> CallbackResult<_> {
-                    assert_eq!(row.val(1)?, &Val::from("old"));
+                    assert_eq!(row.val(1)?, &Val::try_from("old").unwrap());
                     Ok(ScanRowDecision::Include)
                 })
                 .await
                 .unwrap();
             assert_eq!(
                 stream.next().await.unwrap(),
-                Some(vec![Val::from(1i32), Val::from("old")])
+                Some(vec![Val::from(1i32), Val::try_from("old").unwrap()])
             );
             assert_eq!(stream.next().await.unwrap(), None);
             drop(stream);
@@ -8666,13 +8693,13 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut writer_session,
-                vec![Val::from(0i32), Val::from("zero-old")],
+                vec![Val::from(0i32), Val::try_from("zero-old").unwrap()],
             )
             .await;
             expect_insert_committed(
                 table_id,
                 &mut writer_session,
-                vec![Val::from(1i32), Val::from("one-old")],
+                vec![Val::from(1i32), Val::try_from("one-old").unwrap()],
             )
             .await;
 
@@ -8684,7 +8711,7 @@ mod tests {
                 &single_key(0i32),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("zero-new"),
+                    val: Val::try_from("zero-new").unwrap(),
                 }],
             )
             .await;
@@ -8698,11 +8725,11 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 stream.next().await.unwrap(),
-                Some(vec![Val::from(0i32), Val::from("zero-old")])
+                Some(vec![Val::from(0i32), Val::try_from("zero-old").unwrap()])
             );
             assert_eq!(
                 stream.next().await.unwrap(),
-                Some(vec![Val::from(1i32), Val::from("one-old")])
+                Some(vec![Val::from(1i32), Val::try_from("one-old").unwrap()])
             );
             assert_eq!(stream.next().await.unwrap(), None);
             drop(stream);
@@ -8746,7 +8773,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 stream.next().await.unwrap(),
-                Some(vec![Val::from(0i32), Val::from("old")])
+                Some(vec![Val::from(0i32), Val::try_from("old").unwrap()])
             );
 
             let exclusive_guards = writer_session.pool_guards();
@@ -8764,14 +8791,14 @@ mod tests {
                 &single_key(1i32),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("new"),
+                    val: Val::try_from("new").unwrap(),
                 }],
             )
             .await;
 
             assert_eq!(
                 stream.next().await.unwrap(),
-                Some(vec![Val::from(1i32), Val::from("old")])
+                Some(vec![Val::from(1i32), Val::try_from("old").unwrap()])
             );
 
             let exclusive_guards = writer_session.pool_guards();
@@ -9083,7 +9110,7 @@ mod tests {
                 &single_key(1i32),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("updated"),
+                    val: Val::try_from("updated").unwrap(),
                 }],
             )
             .await;
@@ -9249,7 +9276,7 @@ mod tests {
             let mut session1 = engine.new_session().unwrap();
             {
                 let trx = session1.begin_trx().unwrap();
-                let insert = vec![Val::from(1), Val::from("1")];
+                let insert = vec![Val::from(1), Val::try_from("1").unwrap()];
                 expect_trx_insert(table_id, trx, insert)
                     .await
                     .commit()
@@ -9262,7 +9289,7 @@ mod tests {
             // after freezing, new row should be inserted into second page.
             {
                 let trx = session1.begin_trx().unwrap();
-                let insert = vec![Val::from(2), Val::from("2")];
+                let insert = vec![Val::from(2), Val::try_from("2").unwrap()];
                 expect_trx_insert(table_id, trx, insert)
                     .await
                     .commit()
@@ -9287,7 +9314,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("3"),
+                        val: Val::try_from("3").unwrap(),
                     }],
                 )
                 .await;
@@ -9307,7 +9334,7 @@ mod tests {
                     &key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("4"),
+                        val: Val::try_from("4").unwrap(),
                     }],
                 )
                 .await;
@@ -9462,8 +9489,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1), Val::try_from("cached-row").unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
@@ -9480,8 +9510,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let next_row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("still-cached")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(2), Val::try_from("still-cached").unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
@@ -9534,8 +9567,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1), Val::try_from("cached-row").unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
@@ -9565,14 +9601,20 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let _post_gc_row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("post-gc-row")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(2), Val::try_from("post-gc-row").unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
             let key = single_key(2i32);
             expect_select_committed(table_id, &mut session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(2), Val::from("post-gc-row")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(2), Val::try_from("post-gc-row").unwrap()]
+                );
             })
             .await;
 
@@ -9595,8 +9637,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let stale_row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("cached-row")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1), Val::try_from("cached-row").unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
@@ -9628,8 +9673,11 @@ mod tests {
             for key in 2..258 {
                 let mut trx = session.begin_trx().unwrap();
                 let row_id = unwrap_insert_result(
-                    trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from(&large[..])])
-                        .await,
+                    trx.table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(key), Val::try_from(&large[..]).unwrap()],
+                    )
+                    .await,
                 );
                 trx.commit().await.unwrap();
                 match table_for_internal_assertion(&engine, table_id)
@@ -9699,8 +9747,11 @@ mod tests {
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
             let _row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(1), Val::try_from(&large[..]).unwrap()],
+                )
+                .await,
             );
             trx.commit().await.unwrap();
 
@@ -9721,7 +9772,10 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let res = trx
-                .table_insert_mvcc(table_id, vec![Val::from(100), Val::from("reload-fails")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(100), Val::try_from("reload-fails").unwrap()],
+                )
                 .await;
             trx.rollback().await.unwrap();
             assert!(
@@ -9752,9 +9806,12 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let large = "r".repeat(48 * 1024);
             let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from(&large[..])])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::try_from(&large[..]).unwrap()],
+            )
+            .await
+            .unwrap();
 
             let cached_page = session.load_active_insert_page(table_id).unwrap();
             test_evict_existing_page(engine.inner().pools.mem.clone(), cached_page.page_id).await;
@@ -9937,7 +9994,10 @@ mod tests {
                     let seed = format!("{:08x}", row_id);
                     let key = seed.repeat(64);
                     let res = trx
-                        .table_insert_mvcc(table_id, vec![Val::from(row_id), Val::from(&key[..])])
+                        .table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(row_id), Val::try_from(&key[..]).unwrap()],
+                        )
                         .await;
                     assert!(res.is_ok(), "res={res:?}");
                     inserted.push((row_id, key));
@@ -9972,7 +10032,7 @@ mod tests {
                             vals,
                             vec![
                                 Val::from(inserted[key_idx].0),
-                                Val::from(&inserted[key_idx].1[..]),
+                                Val::try_from(&inserted[key_idx].1[..]).unwrap(),
                             ]
                         );
                     }

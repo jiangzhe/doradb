@@ -62,7 +62,7 @@ use doradb_storage::{TableIndex, UpdateCol, Val};
 
 let mut trx = session.begin_trx()?;
 
-trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("alice")])
+trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::try_from("alice")?])
     .await?;
 
 let key = [Val::from(1i32)];
@@ -72,7 +72,7 @@ let updated = trx
         &key,
         vec![UpdateCol {
             idx: 1,
-            val: Val::from("ada"),
+            val: Val::try_from("ada")?,
         }],
     )
     .await?;
@@ -113,7 +113,7 @@ let _row = trx
     .table_lookup_unique_mvcc(TableIndex(table_id, id_index), &id_key, &[0, 1])
     .await?;
 
-let name_key = [Val::from("ada")];
+let name_key = [Val::try_from("ada")?];
 let _matching_rows = trx
     .table_index_lookup_mvcc(TableIndex(table_id, name_index), &name_key, &[0, 1])
     .await?

@@ -579,7 +579,7 @@ mod tests {
             ],
             async |index, pool_guard| {
                 let guarded = index.bind(pool_guard);
-                let key = [Val::from("encoded"), Val::Null];
+                let key = [Val::try_from("encoded").unwrap(), Val::Null];
                 let row_id1 = RowID::new(10);
                 let row_id2 = RowID::new(20);
                 let encoded_key1 = index.encoder().encode_pair(&key, Val::from(row_id1));
