@@ -28,4 +28,10 @@ A deterministically paused stale GC operation resumes after DROP without panic, 
 
 ## Notes (Optional)
 
+## Close Reason
 
+- Type: implemented
+- Detail: Implemented and verified by docs/tasks/000334-stale-secondary-index-gc-identity-retirement.md; exact-generation MemIndex purge, deterministic DROP/reuse/worker tests, full validation, and matched release measurements.
+- Closed By: backlog close
+- Reference: docs/tasks/000334-stale-secondary-index-gc-identity-retirement.md
+- Closed At: 2026-10-23

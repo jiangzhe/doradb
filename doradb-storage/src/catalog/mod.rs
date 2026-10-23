@@ -1297,11 +1297,11 @@ impl DroppedTableFileCleanup {
 ///
 /// Row-only paths can use the table directly. Index rollback and purge use this
 /// entry to lazily pin one user-table layout snapshot for repeated same-table
-/// index operations. A purge cycle may cache a layout before a later DROP INDEX
-/// publishes a new inactive slot; that is safe only because RFC 0018 keeps
-/// the index slot stable and non-reused. If the cached/current layout sees the slot
-/// inactive, index purge is a no-op; if it still sees the old slot active, it
-/// can only touch the old runtime/root identity for that same stable slot.
+/// index operations. Purge retains it within the existing bucket invocation and
+/// validates the exact generation against this layout and the current root before each
+/// attempt, then borrows only its retained MemIndex. DROP can complete while an
+/// admitted attempt finishes against that runtime. Layout ownership delays
+/// physical destruction and slot reuse without delaying logical DROP.
 pub(crate) struct UserTableCacheEntry {
     table: Arc<Table>,
     user_layout: Option<Arc<TableRuntimeLayout>>,

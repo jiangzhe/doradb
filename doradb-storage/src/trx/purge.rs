@@ -27,6 +27,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
+#[cfg(test)]
+pub(crate) use tests::{PurgeTestAction, PurgeTestEvent, PurgeTestHook};
+
 /// Swapped user-table active root retained until post-publish readers drain.
 struct RetainedTableRoot {
     fence_ts: TrxID,
@@ -516,6 +519,12 @@ impl TransactionSystem {
                             .delete_index(guards, &ip.key, ip.row_id, ip.unique, min_active_sts)
                             .await?
                     };
+                    #[cfg(test)]
+                    self.observe_purge_test_event(PurgeTestEvent::IndexEntryCompleted {
+                        table_id: ip.table_id,
+                        index: ip.key.index,
+                        deleted,
+                    });
                     if deleted {
                         #[cfg(feature = "profiling")]
                         {
@@ -1124,68 +1133,6 @@ struct PurgeCyclePlan {
     advance_completed_horizon: bool,
 }
 
-/// Test-only action returned by a purge scheduling hook.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PurgeTestAction {
-    /// Continue normal purge execution.
-    Continue,
-    /// Fail the selected bucket before its committed prefix is drained.
-    Fail,
-}
-
-/// Test-only purge scheduling callback.
-#[cfg(test)]
-pub(crate) type PurgeTestHook = Arc<dyn Fn(PurgeTestEvent) -> PurgeTestAction + Send + Sync>;
-
-/// Narrow purge scheduling events used by deterministic concurrency tests.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PurgeTestEvent {
-    /// The coordinator is about to scan authoritative bucket minima.
-    PreScan,
-    /// One committed handoff was fully recorded in authoritative buckets.
-    CommittedRecorded {
-        min_original_sts: Option<TrxID>,
-        min_system_cts: Option<TrxID>,
-    },
-    /// One coalesced work item was planned.
-    Planned {
-        /// Whether all GC buckets were selected.
-        transaction_gc: bool,
-        /// Whether success may advance completed-horizon progress.
-        advance_completed_horizon: bool,
-    },
-    /// One remote bucket task was successfully enqueued.
-    RemoteEnqueued { gc_no: usize, worker_slot: usize },
-    /// One bucket is about to drain its eligible committed prefix.
-    BucketStarted { gc_no: usize },
-    /// One bucket completed successfully.
-    BucketCompleted { gc_no: usize },
-    /// One bucket failed before the cycle barrier completed.
-    BucketFailed { gc_no: usize },
-    /// The dispatcher started one local bucket.
-    LocalStarted { gc_no: usize },
-    /// The dispatcher completed one local bucket successfully.
-    LocalCompleted { gc_no: usize },
-    /// The dispatcher received one successful remote bucket result.
-    RemoteCompleted { gc_no: usize },
-    /// All selected bucket results passed and retirement processing is starting.
-    RetirementStarted,
-    /// Retained-root housekeeping is starting.
-    TableRootRetentionStarted,
-    /// Dropped-table housekeeping is starting.
-    DroppedTableStarted,
-    /// Retired secondary-index runtime housekeeping is starting.
-    RetiredIndexRuntimeStarted,
-    /// Retired secondary-index runtime housekeeping reached one registered table.
-    RetiredIndexRuntimeTableStarted { table_id: TableID },
-    /// The completed purge horizon was published after cycle success.
-    CompletedHorizonPublished { sts: TrxID },
-    /// One planned cycle finished all selected work.
-    CycleCompleted,
-}
-
 struct PurgeTask {
     gc_no: usize,
     min_active_sts: TrxID,
@@ -1591,9 +1538,9 @@ mod tests {
     use crate::buffer::page::{PAGE_SIZE, Page, VersionedPageID};
     use crate::buffer::{BufferPool, PoolGuards, PoolRole};
     use crate::buffer::{test_evict_existing_page, test_frame_kind};
-    use crate::catalog::IndexSlot;
     use crate::catalog::storage::TABLE_ID_TABLES;
     use crate::catalog::tests::table1;
+    use crate::catalog::{IndexRef, IndexSlot};
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
     use crate::conf::{DEFAULT_GC_BUCKETS, EngineConfig, EvictableBufferPoolConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -1616,6 +1563,71 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    /// Test-only action returned by a purge scheduling hook.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum PurgeTestAction {
+        /// Continue normal purge execution.
+        Continue,
+        /// Fail the selected bucket before its committed prefix is drained.
+        Fail,
+    }
+
+    /// Test-only purge scheduling callback.
+    pub(crate) type PurgeTestHook = Arc<dyn Fn(PurgeTestEvent) -> PurgeTestAction + Send + Sync>;
+
+    /// Narrow purge scheduling events used by deterministic concurrency tests.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum PurgeTestEvent {
+        /// One deferred index record completed through its retained table cache.
+        IndexEntryCompleted {
+            table_id: TableID,
+            index: IndexRef,
+            deleted: bool,
+        },
+        /// The coordinator is about to scan authoritative bucket minima.
+        PreScan,
+        /// One committed handoff was fully recorded in authoritative buckets.
+        CommittedRecorded {
+            min_original_sts: Option<TrxID>,
+            min_system_cts: Option<TrxID>,
+        },
+        /// One coalesced work item was planned.
+        Planned {
+            /// Whether all GC buckets were selected.
+            transaction_gc: bool,
+            /// Whether success may advance completed-horizon progress.
+            advance_completed_horizon: bool,
+        },
+        /// One remote bucket task was successfully enqueued.
+        RemoteEnqueued { gc_no: usize, worker_slot: usize },
+        /// One bucket is about to drain its eligible committed prefix.
+        BucketStarted { gc_no: usize },
+        /// One bucket completed successfully.
+        BucketCompleted { gc_no: usize },
+        /// One bucket failed before the cycle barrier completed.
+        BucketFailed { gc_no: usize },
+        /// The dispatcher started one local bucket.
+        LocalStarted { gc_no: usize },
+        /// The dispatcher completed one local bucket successfully.
+        LocalCompleted { gc_no: usize },
+        /// The dispatcher received one successful remote bucket result.
+        RemoteCompleted { gc_no: usize },
+        /// All selected bucket results passed and retirement processing is starting.
+        RetirementStarted,
+        /// Retained-root housekeeping is starting.
+        TableRootRetentionStarted,
+        /// Dropped-table housekeeping is starting.
+        DroppedTableStarted,
+        /// Retired secondary-index runtime housekeeping is starting.
+        RetiredIndexRuntimeStarted,
+        /// Retired secondary-index runtime housekeeping reached one registered table.
+        RetiredIndexRuntimeTableStarted { table_id: TableID },
+        /// The completed purge horizon was published after cycle success.
+        CompletedHorizonPublished { sts: TrxID },
+        /// One planned cycle finished all selected work.
+        CycleCompleted,
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum MissingUndoPage {
@@ -2165,6 +2177,102 @@ mod tests {
             _initial.purge_index_count + PURGE_SIZE,
             "workers={workers}"
         );
+    }
+
+    async fn assert_cached_index_purge_drop(unique: bool, workers: usize, bucket: usize) {
+        use crate::session::tests::assert_checkpoint_published;
+        use crate::table::tests::{
+            active_index_ref, assert_freeze_created, create_non_unique_name_table_for_test,
+            create_table2_for_test, insert_one_row, table_for_internal_assertion,
+        };
+        use crate::table::{PurgeIndexTestPhase, install_purge_index_hook};
+        let (_temp, engine) = purge_test_engine("cached_index_drop", 2, workers).await;
+        let table_id = if unique {
+            create_table2_for_test(&engine).await
+        } else {
+            create_non_unique_name_table_for_test(&engine).await
+        };
+        let mut session = engine.new_session().unwrap();
+        insert_one_row(
+            table_id,
+            &mut session,
+            vec![Val::from(1i32), Val::from("name")],
+        )
+        .await;
+        assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+        assert_checkpoint_published(&mut session, table_id).await;
+        session
+            .wait_for_purge_completion_after(engine.inner().trx_sys.purge_handoff_cts())
+            .await
+            .unwrap();
+        let table = table_for_internal_assertion(&engine, table_id);
+        let index = active_index_ref(
+            &table.layout_snapshot(),
+            IndexSlot::new(if unique { 0 } else { 1 }),
+        );
+        let mut blocker = engine.new_session().unwrap();
+        let hold = blocker.begin_trx().unwrap();
+        let mut deleting = loop {
+            let mut trx = session.begin_trx().unwrap();
+            if trx.checkout().unwrap().inner().gc_no() == bucket {
+                break trx;
+            }
+            trx.rollback().await.unwrap();
+        };
+        let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(1i32)]);
+        trx_delete_row_by_id(&mut deleting, table_id, &key)
+            .await
+            .unwrap();
+        let target = deleting.commit().await.unwrap();
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, release_rx) = flume::bounded(1);
+        let _hook = install_purge_index_hook(
+            &table,
+            index,
+            PurgeIndexTestPhase::BeforeAdmission,
+            async move {
+                entered_tx.send_async(()).await.unwrap();
+                release_rx.recv_async().await.unwrap();
+            },
+        );
+        let (events, received) = flume::unbounded();
+        engine.inner().trx_sys.set_purge_test_observer(events);
+        hold.rollback().await.unwrap();
+        // Entry to this hook proves the worker's TableCache already retained
+        // the old layout, rather than pausing before a first layout lookup.
+        entered.recv_async().await.unwrap();
+        session.drop_index(table_id, index.id()).await.unwrap();
+        assert!(table.has_retired_secondary_indexes());
+        release.send_async(()).await.unwrap();
+        let entry = recv_purge_event(&received, |event| {
+            matches!(event,
+            PurgeTestEvent::IndexEntryCompleted { table_id: actual_table, index: actual_index, .. }
+                if *actual_table == table_id && *actual_index == index)
+        })
+        .await;
+        assert_eq!(
+            entry,
+            PurgeTestEvent::IndexEntryCompleted {
+                table_id,
+                index,
+                deleted: false
+            }
+        );
+        recv_purge_event(&received, |event| {
+            *event == PurgeTestEvent::BucketCompleted { gc_no: bucket }
+        })
+        .await;
+        recv_purge_event(&received, |event| {
+            matches!(event,
+            PurgeTestEvent::CompletedHorizonPublished { sts } if *sts > target)
+        })
+        .await;
+        session
+            .wait_for_purge_completion_after(target)
+            .await
+            .unwrap();
+        assert_checkpoint_published(&mut session, table_id).await;
+        assert!(engine.new_session().is_ok());
     }
 
     /// Purpose: Keep dropped-file cleanup ordered during initialization and insertion.
@@ -3894,6 +4002,20 @@ mod tests {
                     .unwrap();
                 assert_eq!(map.version_map().create_cts(), create_cts);
                 assert!(map.version_map().try_write_row(row_id).unwrap().is_none());
+            }
+        });
+    }
+
+    /// Purpose: Complete cached-layout purge across DROP on dispatcher and remote worker buckets.
+    /// Expected: Logical DROP finishes while purge is paused, the stale record is skipped,
+    /// and bucket completion, published purge progress, and public checkpoint all succeed.
+    #[test]
+    fn test_cached_index_purge_drop_worker_progress() {
+        smol::block_on(async {
+            for unique in [true, false] {
+                for (workers, bucket) in [(1, 0), (2, 1)] {
+                    assert_cached_index_purge_drop(unique, workers, bucket).await;
+                }
             }
         });
     }

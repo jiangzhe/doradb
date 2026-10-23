@@ -2241,21 +2241,6 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        /// Looks up an entry through the test fixture.
-        #[inline]
-        pub(crate) async fn lookup_unique(
-            &self,
-            key: &[Val],
-            row_id: RowID,
-            ts: TrxID,
-        ) -> RuntimeOrFatalResult<Option<bool>> {
-            let index = self.layout.secondary_index(self.index_slot)?;
-            index
-                .bind_non_unique_unchecked(self.guards, self.root)?
-                .lookup_unique(key, row_id, ts)
-                .await
-        }
-
         /// Inject an active MemIndex exact entry for a state that normal table
         /// operations cannot construct.
         #[inline]
