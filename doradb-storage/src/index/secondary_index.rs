@@ -1140,9 +1140,11 @@ mod tests {
     use crate::file::build_test_fs;
     use crate::file::table_file::{MutableTableFile, TableFile};
     use crate::index::btree::BTreeKeyEncoder;
+    use crate::index::disk_tree::{DiskTree, DiskTreeSpec};
     use crate::index::disk_tree::{
         NonUniqueDiskTree, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
     };
+    use crate::index::disk_tree_stats::root_descriptor;
     use crate::index::util::tests::drain_row_ids;
     use crate::quiescent::QuiescentBox;
     use crate::table::test_user_table_id;
@@ -1312,13 +1314,23 @@ mod tests {
             .collect()
     }
 
-    async fn publish_secondary_root(
+    async fn publish_secondary_root<F: DiskTreeSpec>(
+        tree: &DiskTree<'_, F>,
         mut mutable: MutableTableFile,
         index_slot: IndexSlot,
         root: Option<BlockID>,
         ts: TrxID,
     ) -> Arc<TableFile> {
-        mutable.set_secondary_index_root(index_slot, root);
+        let (runtime, _, guard) = tree.snapshot();
+        let descriptor = root_descriptor(&runtime.open(root, &guard)).await.unwrap();
+        let index = mutable
+            .root()
+            .metadata
+            .idx
+            .index_spec(index_slot)
+            .unwrap()
+            .index;
+        mutable.set_secondary_index_root(index, descriptor);
         let (table, old_root) = mutable
             .commit(ts, false)
             .await
@@ -1468,8 +1480,14 @@ mod tests {
             let encoded_puts = encode_unique_puts(&puts);
             writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
             let root = writer.finish().await.unwrap();
-            let table =
-                publish_secondary_root(mutable, IndexSlot::new(0), root, TrxID::new(2)).await;
+            let table = publish_secondary_root(
+                &disk_runtime.open(None, &disk_guard),
+                mutable,
+                IndexSlot::new(0),
+                root,
+                TrxID::new(2),
+            )
+            .await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -1840,8 +1858,14 @@ mod tests {
                 writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 writer.finish().await.unwrap()
             };
-            let table =
-                publish_secondary_root(mutable, IndexSlot::new(0), root_a, TrxID::new(2)).await;
+            let table = publish_secondary_root(
+                &disk_runtime.open(None, &disk_guard),
+                mutable,
+                IndexSlot::new(0),
+                root_a,
+                TrxID::new(2),
+            )
+            .await;
             let runtime = SecondaryDiskTreeRuntime::new(
                 IndexSlot::new(0),
                 Arc::clone(&metadata),
@@ -1872,8 +1896,14 @@ mod tests {
                 writer.finish().await.unwrap()
             };
             assert_ne!(root_a, root_b);
-            let table_after_b =
-                publish_secondary_root(mutable, IndexSlot::new(0), root_b, TrxID::new(3)).await;
+            let table_after_b = publish_secondary_root(
+                &disk_runtime.open(None, &disk_guard),
+                mutable,
+                IndexSlot::new(0),
+                root_b,
+                TrxID::new(3),
+            )
+            .await;
             assert_eq!(
                 table_after_b
                     .active_root_unchecked()
@@ -1941,8 +1971,14 @@ mod tests {
                 .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                 .unwrap();
             let root = writer.finish().await.unwrap();
-            let table =
-                publish_secondary_root(mutable, IndexSlot::new(1), root, TrxID::new(2)).await;
+            let table = publish_secondary_root(
+                &disk_runtime.open(None, &disk_guard),
+                mutable,
+                IndexSlot::new(1),
+                root,
+                TrxID::new(2),
+            )
+            .await;
 
             let index_pool = QuiescentBox::new(
                 FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -2180,8 +2216,14 @@ mod tests {
                 let encoded_puts = encode_unique_puts(&puts);
                 writer.batch_put_encoded(&unique_put_refs(&encoded_puts));
                 let root = writer.finish().await.unwrap();
-                let table =
-                    publish_secondary_root(mutable, IndexSlot::new(0), root, TrxID::new(2)).await;
+                let table = publish_secondary_root(
+                    &disk_runtime.open(None, &disk_guard),
+                    mutable,
+                    IndexSlot::new(0),
+                    root,
+                    TrxID::new(2),
+                )
+                .await;
 
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),
@@ -2284,8 +2326,14 @@ mod tests {
                     .batch_insert_encoded(&non_unique_exact_refs(&encoded_entries))
                     .unwrap();
                 let root = writer.finish().await.unwrap();
-                let table =
-                    publish_secondary_root(mutable, IndexSlot::new(1), root, TrxID::new(2)).await;
+                let table = publish_secondary_root(
+                    &disk_runtime.open(None, &disk_guard),
+                    mutable,
+                    IndexSlot::new(1),
+                    root,
+                    TrxID::new(2),
+                )
+                .await;
 
                 let index_pool = QuiescentBox::new(
                     FixedBufferPool::with_capacity(PoolRole::Index, 64 * 1024 * 1024).unwrap(),

@@ -4,10 +4,13 @@ use super::checkpoint_builder::BuildMode;
 use super::co_rank;
 use super::merge::{HotEntryRef, execution_error};
 use super::{BudgetedVec, BuildOutcome, MemoryBudget, RunKind, SortedRuns};
+use crate::catalog::SecondaryIndexRoot;
 use crate::error::{RuntimeError, RuntimeOrFatalResult};
 use crate::file::table_file::MutableTableFile;
 use crate::id::{BlockID, RowID, TrxID};
-use crate::index::disk_tree::{DiskTree, DiskTreeNodeGuard, DiskTreeSpec};
+use crate::index::btree::{BTreeSlot, BTreeValue};
+use crate::index::disk_tree::{DiskTree, DiskTreeSpec};
+use crate::index::disk_tree_stats::DiskTreeStats;
 #[cfg(feature = "profiling")]
 use crate::profiling::clock::Instant;
 use crate::quiescent::QuiescentGuard;
@@ -29,12 +32,13 @@ pub(crate) use super::checkpoint_builder::{CheckpointAdmission, CheckpointBuildP
 
 // Coefficients are work units per persisted block. Read includes decoding;
 // packing includes comparison/fence work; write includes validation and ingress.
-// Calibration retains these block-work weights and a 10% retention margin;
-// task 000332 records the matched production cases and forced-strategy oracles.
+// Task 000333 calibrates volume and retention against matched total checkpoint
+// costs, including wide-key growth and broad deletion.
 const READ: f64 = 1.0;
 const PACK: f64 = 2.0;
 const WRITE: f64 = 4.0;
-const RETAIN_MARGIN: f64 = 1.10;
+const RETAIN_MARGIN: f64 = 0.99;
+const PUT_RECONSTRUCT_VOLUME: u64 = 16;
 const INITIAL_PATHS: usize = 16;
 const MAX_PATHS: usize = 64;
 const MAX_IDENTITIES: usize = 4096;
@@ -45,6 +49,8 @@ const MAX_IDENTITIES: usize = 4096;
 pub(crate) struct IndexCheckpoint<'a, 'tree, F: DiskTreeSpec> {
     /// Captured tree used by planning and physical reads.
     pub(super) tree: &'a DiskTree<'tree, F>,
+    /// Descriptor captured with the borrowed tree from the pinned index generation.
+    pub(super) root: SecondaryIndexRoot,
     /// Private file fork receiving replacement blocks.
     pub(super) file: &'a mut MutableTableFile,
     /// Selected sorted mutation runs.
@@ -62,6 +68,7 @@ impl<'a, 'tree, F: DiskTreeSpec> IndexCheckpoint<'a, 'tree, F> {
     #[inline]
     pub(crate) fn new(
         tree: &'a DiskTree<'tree, F>,
+        root: SecondaryIndexRoot,
         file: &'a mut MutableTableFile,
         runs: Arc<SortedRuns>,
         ts: TrxID,
@@ -70,6 +77,7 @@ impl<'a, 'tree, F: DiskTreeSpec> IndexCheckpoint<'a, 'tree, F> {
     ) -> Self {
         Self {
             tree,
+            root,
             file,
             runs,
             ts,
@@ -78,20 +86,31 @@ impl<'a, 'tree, F: DiskTreeSpec> IndexCheckpoint<'a, 'tree, F> {
         }
     }
 
+    /// Reject a descriptor from a different root before planning or output starts.
+    pub(super) fn validate_root(&self) -> RuntimeOrFatalResult<()> {
+        if self.root.block_id() != self.tree.snapshot().1 {
+            return Err(execution_error(
+                "checkpoint descriptor differs from captured tree",
+            ));
+        }
+        Ok(())
+    }
+
     /// Select and apply the physical checkpoint strategy against the captured root.
-    pub(crate) async fn apply(self) -> RuntimeOrFatalResult<Option<BlockID>> {
+    pub(crate) async fn apply(self) -> RuntimeOrFatalResult<SecondaryIndexRoot> {
+        self.validate_root()?;
         #[cfg(feature = "profiling")]
         let started = Instant::now();
         let strategy = {
             let scratch = self.admission.assembler.clone();
-            let mut planner = CheckpointPlanner::new(self.tree, &self.runs, &scratch);
+            let mut planner = CheckpointPlanner::new(self.tree, self.root, &self.runs, &scratch)?;
             let strategy = planner.choose().await?;
             #[cfg(feature = "profiling")]
             planner.record(strategy, started, &self.admission);
             strategy
         };
         let mode = match strategy {
-            Strategy::NoWork => return Ok(self.tree.snapshot().1),
+            Strategy::NoWork => return Ok(self.root),
             Strategy::Reconstruct => BuildMode::Reconstruct,
             Strategy::PartialRewrite => BuildMode::PartialRewrite,
         };
@@ -109,10 +128,12 @@ enum Strategy {
 
 #[derive(Clone, Copy)]
 struct Probe {
+    #[cfg(test)]
     row: Option<RowID>,
     multiplicity: usize,
     changed: bool,
     inserted: bool,
+    removed: bool,
 }
 
 /// Inputs, bounded sampling state and costs for one strategy selection.
@@ -120,21 +141,23 @@ struct Probe {
 struct CheckpointPlanner<'a, 'tree, F: DiskTreeSpec> {
     tree: &'a DiskTree<'tree, F>,
     runs: &'a SortedRuns,
-    scratch: &'a MemoryBudget,
     mutation_count: usize,
-    exact_entries: Option<usize>,
-    base_height: usize,
+    stats: DiskTreeStats,
+    put_count: u64,
+    put_bytes: u64,
+    delete_count: u64,
+    base_mass: u64,
+    put_mass: u64,
     node_reads: usize,
-    base_paths: usize,
     delta_paths: usize,
     identity_probes: usize,
     seen: BudgetedVec<(HotEntryRef, Probe)>,
     delta_leaves: BudgetedVec<BlockID>,
-    leaf_sum: f64,
-    entry_sum: f64,
-    surviving_sum: f64,
-    touched_sum: f64,
-    growth_sum: f64,
+    changed_keys: usize,
+    inserted_sum: f64,
+    removed_sum: f64,
+    inserted_bytes: f64,
+    removed_bytes: f64,
     effective_sum: f64,
     uncertain: bool,
     reconstruct_cost: f64,
@@ -143,33 +166,67 @@ struct CheckpointPlanner<'a, 'tree, F: DiskTreeSpec> {
 
 impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
     /// Initialize selection state without allocating sampling caches.
-    fn new(tree: &'a DiskTree<'tree, F>, runs: &'a SortedRuns, scratch: &'a MemoryBudget) -> Self {
-        Self {
+    fn new(
+        tree: &'a DiskTree<'tree, F>,
+        root: SecondaryIndexRoot,
+        runs: &'a SortedRuns,
+        scratch: &'a MemoryBudget,
+    ) -> RuntimeOrFatalResult<Self> {
+        let mut put_count = 0u64;
+        let mut put_bytes = 0u64;
+        let mut delete_count = 0u64;
+        // Runs own disjoint entries under one input budget, so their total
+        // entry count and full key bytes fit usize as well as u64.
+        for run in runs.runs() {
+            let count = run.entries().len() as u64;
+            match run.kind {
+                RunKind::Put => {
+                    put_count += count;
+                    put_bytes += run.mutation_key_bytes;
+                }
+                RunKind::Delete => delete_count += count,
+                RunKind::Create => {
+                    return Err(execution_error("checkpoint planner received CREATE input"));
+                }
+            }
+        }
+        let mutation_count = (put_count + delete_count) as usize;
+        let stats = root.stats();
+        Ok(Self {
             tree,
             runs,
-            scratch,
-            mutation_count: runs.runs().iter().map(|run| run.entries().len()).sum(),
-            exact_entries: None,
-            base_height: 0,
+            mutation_count,
+            stats,
+            put_count,
+            put_bytes,
+            delete_count,
+            base_mass: Self::mass(stats.entries, stats.encoded_key_bytes)?,
+            put_mass: Self::mass(put_count, put_bytes)?,
             node_reads: 0,
-            base_paths: 0,
             delta_paths: 0,
             identity_probes: 0,
             seen: BudgetedVec::new(scratch),
             delta_leaves: BudgetedVec::new(scratch),
-            leaf_sum: 0.0,
-            entry_sum: 0.0,
-            surviving_sum: 0.0,
-            touched_sum: 0.0,
-            growth_sum: 0.0,
+            changed_keys: 0,
+            inserted_sum: 0.0,
+            removed_sum: 0.0,
+            inserted_bytes: 0.0,
+            removed_bytes: 0.0,
             effective_sum: 0.0,
             uncertain: false,
             reconstruct_cost: 0.0,
             partial_cost: 0.0,
-        }
+        })
     }
 
-    /// Select at 16 samples, refining inconclusive estimates to 64 before falling back.
+    fn mass(entries: u64, key_bytes: u64) -> RuntimeOrFatalResult<u64> {
+        entries
+            .checked_mul((size_of::<BTreeSlot>() + F::LeafValue::ENCODED_LEN) as u64)
+            .and_then(|bytes| bytes.checked_add(key_bytes))
+            .ok_or_else(|| execution_error("checkpoint uncompressed entry mass overflow"))
+    }
+
+    /// Required totals settle PUT-only choices before any cache admission or node read.
     async fn choose(&mut self) -> RuntimeOrFatalResult<Strategy> {
         if self.mutation_count == 0 {
             return Ok(Strategy::NoWork);
@@ -177,16 +234,23 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
         let Some(root) = self.tree.snapshot().1 else {
             return Ok(Strategy::Reconstruct);
         };
-        let guard = self.tree.read_node(root).await?;
-        self.base_height = guard.view().height();
-        self.node_reads = 1;
-        let leaf_root = guard.view().is_leaf();
-        if !leaf_root && self.mutation_count < 128 {
+        if self.stats.height == 0 {
+            return Ok(Strategy::Reconstruct);
+        }
+        if self.delete_count == 0 {
+            return Ok(
+                if self.put_count / PUT_RECONSTRUCT_VOLUME >= self.stats.entries
+                    || self.put_mass / PUT_RECONSTRUCT_VOLUME >= self.base_mass
+                {
+                    Strategy::Reconstruct
+                } else {
+                    Strategy::PartialRewrite
+                },
+            );
+        }
+        if self.mutation_count < 128 {
             return Ok(Strategy::PartialRewrite);
         }
-        self.exact_entries = leaf_root.then(|| guard.view().count());
-        drop(guard);
-        // Admit bounded caches only after shortcuts and release of the root guard.
         self.seen
             .ensure_capacity(MAX_PATHS, "checkpoint probe keys")
             .change_context(RuntimeError::CheckpointExecution)?;
@@ -194,96 +258,18 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
             .ensure_capacity(MAX_PATHS, "checkpoint probe leaves")
             .change_context(RuntimeError::CheckpointExecution)?;
         for target in [INITIAL_PATHS, MAX_PATHS] {
-            self.sample_until(root, target).await?;
+            for sample in self.delta_paths..target {
+                self.sample_delta(root, sample).await?;
+                if self.uncertain {
+                    return Ok(Strategy::PartialRewrite);
+                }
+            }
             self.update_costs();
             if let Some(strategy) = self.decision() {
                 return Ok(strategy);
             }
-            if self.identity_probes == MAX_IDENTITIES {
-                break;
-            }
         }
-        // Unresolved estimates deliberately preserve sparse locality.
         Ok(Strategy::PartialRewrite)
-    }
-
-    /// Retain sample order and inspect a root leaf only once across both stages.
-    async fn sample_until(&mut self, root: BlockID, target: usize) -> RuntimeOrFatalResult<()> {
-        // Bit reversal spreads the initial 16 positions across the traversal interval.
-        // Refinement fills the gaps up to 64 positions; paths may reach the same leaf.
-        for sample in self.delta_paths..target {
-            if self.exact_entries.is_none() || sample == 0 {
-                self.sample_base(root, sample).await?;
-            }
-            self.sample_delta(root, sample).await?;
-        }
-        Ok(())
-    }
-
-    /// Accumulate weighted base size, surviving entries and mutation overlap.
-    async fn sample_base(&mut self, root: BlockID, sample: usize) -> RuntimeOrFatalResult<()> {
-        let stratum = (sample as u8).reverse_bits() as usize >> 2;
-        let (guard, weight) = self.sampled_leaf(root, stratum).await?;
-        let node = guard.view();
-        let slots = if self.exact_entries.is_some() {
-            node.count()
-        } else {
-            node.count().min(16)
-        };
-        let mut surviving = 0;
-        let mut effective = false;
-        for n in 0..slots {
-            let slot = n * node.count() / slots;
-            let entry = node.leaf_entry(slot)?;
-            let row = F::entry_row(&entry).change_context(RuntimeError::CheckpointExecution)?;
-            let _key_admission = self
-                .scratch
-                .reserve(entry.key.len(), "checkpoint probe key")
-                .change_context(RuntimeError::CheckpointExecution)?;
-            let key = entry.key.to_vec();
-            match self.probe(&key, Some(row)) {
-                Some(result) => {
-                    surviving += usize::from(result.row.is_some());
-                    effective |= result.changed;
-                }
-                None => {
-                    self.uncertain = true;
-                    surviving += 1;
-                }
-            }
-        }
-        // A range can contain new puts even when none of its old owners move.
-        let _fences = self
-            .scratch
-            .reserve(
-                node.fence_key(false).len() + node.fence_key(true).len(),
-                "checkpoint probe fences",
-            )
-            .change_context(RuntimeError::CheckpointExecution)?;
-        let lower = node.fence_key(false).to_vec();
-        let upper = (!node.has_no_upper_fence()).then(|| node.fence_key(true).to_vec());
-        let touched = effective
-            || self.runs.runs().iter().any(|run| {
-                let at = run
-                    .entries()
-                    .partition_point(|entry| entry.key.as_bytes() < lower.as_slice());
-                run.entries().get(at).is_some_and(|entry| {
-                    upper
-                        .as_ref()
-                        .is_none_or(|upper| entry.key.as_bytes() < upper.as_slice())
-                })
-            });
-        self.leaf_sum += weight;
-        self.entry_sum += weight * node.count() as f64;
-        self.surviving_sum += weight
-            * if slots == 0 {
-                0.0
-            } else {
-                node.count() as f64 * surviving as f64 / slots as f64
-            };
-        self.touched_sum += if touched { weight } else { 0.0 };
-        self.base_paths += 1;
-        Ok(())
     }
 
     /// Probe one merged rank, retaining duplicate sampling weight when its key is cached.
@@ -315,11 +301,14 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
                 Some(*result)
             } else {
                 let (leaf, owner) = self.lookup(root, key).await?;
-                if !self.delta_leaves.contains(&leaf) {
-                    self.delta_leaves.push_reserved(leaf);
-                }
                 let result = self.probe(key, owner);
                 if let Some(result) = result {
+                    if result.changed {
+                        self.changed_keys += 1;
+                        if !self.delta_leaves.contains(&leaf) {
+                            self.delta_leaves.push_reserved(leaf);
+                        }
+                    }
                     self.seen.push_reserved((reference, result));
                 }
                 result
@@ -330,7 +319,12 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
                     // bounded identity inspection, not its statistical contribution.
                     let weight = count as f64 / result.multiplicity.max(1) as f64;
                     if result.inserted {
-                        self.growth_sum += weight;
+                        self.inserted_sum += weight;
+                        self.inserted_bytes += weight * key.len() as f64;
+                    }
+                    if result.removed {
+                        self.removed_sum += weight;
+                        self.removed_bytes += weight * key.len() as f64;
                     }
                     if result.changed {
                         self.effective_sum += weight;
@@ -343,52 +337,61 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
         Ok(())
     }
 
-    /// Convert accumulated observations into costs, retaining cardinalities only for profiling.
+    /// Estimate mutation effects and locality without replacing any known root total.
     fn update_costs(&mut self) {
-        let paths = self.delta_paths;
-        let base_leaves = self.leaf_sum / self.base_paths as f64;
-        let base_entries = self
-            .exact_entries
-            .map_or(self.entry_sum / self.base_paths as f64, |count| {
-                count as f64
-            });
-        let surviving_entries = self.surviving_sum / self.base_paths as f64;
-        let growth_entries = self.growth_sum / paths as f64;
-        let touched = self.touched_sum / self.base_paths as f64;
-        let touched_leaves = touched.max(self.delta_leaves.len() as f64).min(base_leaves);
-        let average_entries = (base_entries / base_leaves.max(1.0)).max(1.0);
-        let output = (surviving_entries + growth_entries) / average_entries;
-        let growth_blocks = growth_entries / average_entries;
-        let touched_output = (output - (base_leaves - touched_leaves)).max(0.0);
-        let parents = (self.base_height as f64 * touched_leaves.sqrt()).min(base_leaves);
-        let probing = self.node_reads as f64 * READ / 16.0;
-        self.reconstruct_cost = probing + base_leaves * READ + output * (PACK + WRITE);
-        self.partial_cost = probing
-            + (touched_leaves + parents) * READ
-            + (touched_output + parents + growth_blocks.sqrt()) * (PACK + WRITE);
+        let samples = self.delta_paths as f64;
+        let n = self.stats.entries as f64;
+        let l = self.stats.leaf_nodes as f64;
+        let b = self.stats.branch_nodes as f64;
+        let removed = (self.removed_sum / samples).min(n);
+        let inserted = (self.inserted_sum / samples).min(self.put_count as f64);
+        let width = (size_of::<BTreeSlot>() + F::LeafValue::ENCODED_LEN) as f64;
+        let removed_mass = (self.removed_bytes / samples).min(self.stats.encoded_key_bytes as f64)
+            + removed * width;
+        let inserted_mass =
+            (self.inserted_bytes / samples).min(self.put_bytes as f64) + inserted * width;
+        let mass_per_leaf = self.base_mass as f64 / l;
+        let output_entries = n - removed + inserted;
+        let output = if output_entries == 0.0 {
+            0.0
+        } else {
+            ((self.base_mass as f64 - removed_mass + inserted_mass) / mass_per_leaf).max(1.0)
+        };
+        let growth = inserted_mass / mass_per_leaf;
+        let u = self.delta_leaves.len() as f64;
+        // Cap the extrapolation population before applying observed diversity.
+        // Capping only the final result treats moderate contiguous batches as
+        // touching every leaf, even after refinement observes a small leaf set.
+        let touched = if self.changed_keys == 0 {
+            0.0
+        } else {
+            u.max((self.effective_sum / samples).min(l) * u / self.changed_keys as f64)
+                .min(l)
+        };
+        let output_branches = if output <= 1.0 {
+            0.0
+        } else {
+            (b * (output - 1.0) / (l - 1.0).max(1.0)).max(1.0)
+        };
+        let ancestors = (f64::from(self.stats.height) * touched).min(b);
+        let touched_output = (output - (l - touched)).max(0.0);
+        self.reconstruct_cost = (l + b) * READ + (output + output_branches) * (PACK + WRITE);
+        self.partial_cost = (touched + ancestors) * READ
+            + (touched_output + ancestors + growth.sqrt()) * (PACK + WRITE);
     }
 
-    /// Return an exact shortcut or sufficiently separated cost choice at a stage boundary.
+    /// Deterministic diversity extrapolation is a heuristic, not a confidence bound.
     fn decision(&self) -> Option<Strategy> {
-        let paths = self.delta_paths;
-        if self.exact_entries.is_some()
-            && self.mutation_count <= paths
-            && self.effective_sum == 0.0
-            && !self.uncertain
-        {
-            return Some(Strategy::NoWork);
-        }
-        // Leaf roots have exact base geometry; growth creates independent key
-        // ranges even when the old tree supplied only one physical leaf.
-        if self.exact_entries.is_some() && self.effective_sum > 0.0 && !self.uncertain {
-            return Some(Strategy::Reconstruct);
+        if self.uncertain || self.changed_keys == 0 {
+            return Some(Strategy::PartialRewrite);
         }
         let ratio = self.partial_cost / self.reconstruct_cost.max(1.0);
-        if !self.uncertain && (ratio > 1.35 || ratio < 0.75 || paths == MAX_PATHS) {
-            if ratio > RETAIN_MARGIN {
-                return Some(Strategy::Reconstruct);
-            }
-            return Some(Strategy::PartialRewrite);
+        if ratio > 1.35 || ratio < 0.75 || self.delta_paths == MAX_PATHS {
+            return Some(if ratio > RETAIN_MARGIN {
+                Strategy::Reconstruct
+            } else {
+                Strategy::PartialRewrite
+            });
         }
         None
     }
@@ -439,40 +442,13 @@ impl<'a, 'tree, F: DiskTreeSpec> CheckpointPlanner<'a, 'tree, F> {
                 .or_else(|| owner.filter(|_| !deleted))
         };
         Some(Probe {
+            #[cfg(test)]
             row,
             multiplicity,
             changed: row != owner,
             inserted: owner.is_none() && row.is_some(),
+            removed: owner.is_some() && row.is_none(),
         })
-    }
-
-    /// Descend one stratified position and retain its reciprocal path-probability weight.
-    async fn sampled_leaf(
-        &mut self,
-        mut block: BlockID,
-        numerator: usize,
-    ) -> RuntimeOrFatalResult<(DiskTreeNodeGuard<F>, f64)> {
-        let mut fraction = (numerator as f64 + 0.5) / MAX_PATHS as f64;
-        let mut weight = 1.0;
-        let mut expected = None;
-        loop {
-            self.node_reads += 1;
-            let guard = self.tree.read_node(block).await?;
-            let node = guard.view();
-            if expected.is_some_and(|height| node.height() != height) {
-                return Err(execution_error("checkpoint probe child height mismatch"));
-            }
-            if node.is_leaf() {
-                return Ok((guard, weight));
-            }
-            let fanout = node.count() + 1;
-            let scaled = fraction * fanout as f64;
-            let child = (scaled as usize).min(fanout - 1);
-            fraction = scaled - child as f64;
-            weight *= fanout as f64;
-            expected = Some(node.height() - 1);
-            block = node.child_block(child)?;
-        }
     }
 
     /// Resolve one mutation key to its captured owner and destination leaf.
@@ -546,7 +522,8 @@ mod tests {
         BudgetedVec, BuildEntries, BuildOutcome, DuplicateCheck, IndexBuildEntry, MemoryBudget,
         SortedRun, fail_build_budget,
     };
-    use crate::index::disk_tree::{NonUniqueDiskTree, UniqueDiskTree};
+    use crate::index::disk_tree::{NonUniqueDiskTree, UniqueDiskTree, UniqueDiskTreeSpec};
+    use crate::index::disk_tree_stats::{root_descriptor, verify_root};
     use crate::memcmp::MEM_CMP_KEY_INLINE;
     use crate::quiescent::QuiescentGuard;
     use crate::runtime::thread_pool::ThreadPool;
@@ -588,9 +565,11 @@ mod tests {
     ) -> (&'static str, usize) {
         let scratch =
             MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
-        let mut planner = CheckpointPlanner::new(tree, runs, &scratch);
+        let mut planner =
+            CheckpointPlanner::new(tree, root_descriptor(tree).await.unwrap(), runs, &scratch)
+                .unwrap();
         let strategy = planner.choose().await.unwrap();
-        assert!(planner.base_paths <= 64 && planner.delta_paths <= 64);
+        assert!(planner.delta_paths <= 64);
         assert!(planner.identity_probes <= 4096);
         let strategy = match strategy {
             Strategy::NoWork => "no-work",
@@ -630,11 +609,22 @@ mod tests {
         ts: TrxID,
     ) -> (Option<BlockID>, RewriteWork) {
         let admission = CheckpointAdmission::new(policy).unwrap();
-        let root = IndexCheckpoint::new(tree, file, runs, ts, pool, admission.clone())
-            .build(BuildMode::PartialRewrite)
-            .await
-            .unwrap();
-        (root, rewrite_work(&admission))
+        let root = IndexCheckpoint::new(
+            tree,
+            root_descriptor(tree).await.unwrap(),
+            file,
+            runs,
+            ts,
+            pool,
+            admission.clone(),
+        )
+        .build(BuildMode::PartialRewrite)
+        .await
+        .unwrap();
+        (
+            verify_root(tree, root).await.unwrap(),
+            rewrite_work(&admission),
+        )
     }
 
     /// Run the production reconstruction path with fixture-owned admission.
@@ -659,9 +649,18 @@ mod tests {
         admission: Arc<CheckpointAdmission>,
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Option<BlockID>> {
-        IndexCheckpoint::new(tree, file, runs, ts, pool, admission)
-            .build(BuildMode::Reconstruct)
-            .await
+        let root = IndexCheckpoint::new(
+            tree,
+            root_descriptor(tree).await?,
+            file,
+            runs,
+            ts,
+            pool,
+            admission,
+        )
+        .build(BuildMode::Reconstruct)
+        .await?;
+        verify_root(tree, root).await
     }
 
     /// Force the production partial path for independent physical-oracle fixtures.
@@ -674,9 +673,18 @@ mod tests {
         ts: TrxID,
     ) -> RuntimeOrFatalResult<Option<BlockID>> {
         let admission = CheckpointAdmission::new(policy)?;
-        IndexCheckpoint::new(tree, file, runs, ts, pool, admission)
-            .build(BuildMode::PartialRewrite)
-            .await
+        let root = IndexCheckpoint::new(
+            tree,
+            root_descriptor(tree).await?,
+            file,
+            runs,
+            ts,
+            pool,
+            admission,
+        )
+        .build(BuildMode::PartialRewrite)
+        .await?;
+        verify_root(tree, root).await
     }
 
     /// Construct real checkpoint runs in reverse arrival order for storage fixtures.
@@ -687,8 +695,10 @@ mod tests {
         let budget = MemoryBudget::new(64 * 1024 * 1024);
         let mut runs = BudgetedVec::new(&budget);
         for (group_id, (kind, entries)) in groups.into_iter().enumerate() {
+            let mut mutation_key_bytes = 0u64;
             let mut rows = BuildEntries::new(&budget);
             for (key, row_id) in entries {
+                mutation_key_bytes += key.as_bytes().len() as u64;
                 rows.push_with(
                     if key.as_bytes().len() > MEM_CMP_KEY_INLINE {
                         key.as_bytes().len()
@@ -701,10 +711,15 @@ mod tests {
                 )
                 .unwrap();
             }
-            let BuildOutcome::Complete(run) =
-                SortedRun::finish_mutations(rows, group_id, kind, unique, &AtomicBool::new(false))
-                    .unwrap()
-            else {
+            let BuildOutcome::Complete(run) = SortedRun::finish_mutations(
+                rows,
+                mutation_key_bytes,
+                group_id,
+                kind,
+                unique,
+                &AtomicBool::new(false),
+            )
+            .unwrap() else {
                 panic!("fixture unexpectedly stopped")
             };
             if !run.entries().is_empty() {
@@ -734,9 +749,18 @@ mod tests {
             runs.budget.clone(),
             DuplicateCheck::Skip,
         ));
-        IndexCheckpoint::new(tree, file, retained, ts, pool, admission)
-            .apply()
-            .await
+        let root = IndexCheckpoint::new(
+            tree,
+            root_descriptor(tree).await?,
+            file,
+            retained,
+            ts,
+            pool,
+            admission,
+        )
+        .apply()
+        .await?;
+        verify_root(tree, root).await
     }
 
     /// Purpose: Cover missing, singleton and repeated keys at sorted-run boundaries.
@@ -746,6 +770,7 @@ mod tests {
         let budget = MemoryBudget::new(1024);
         let BuildOutcome::Complete(empty) = SortedRun::finish_mutations(
             BuildEntries::new(&budget),
+            0,
             0,
             RunKind::Put,
             true,
@@ -822,7 +847,13 @@ mod tests {
             );
             let scratch =
                 MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
-            let mut planner = CheckpointPlanner::new(&tree, &runs, &scratch);
+            let mut planner = CheckpointPlanner::new(
+                &tree,
+                root_descriptor(&tree).await.unwrap(),
+                &runs,
+                &scratch,
+            )
+            .unwrap();
             for (key, owner, expected, multiplicity, inspected) in [
                 (b"a", Some(30), Some(5), 6, 3),
                 (b"a", None, Some(5), 6, 3),
@@ -876,7 +907,13 @@ mod tests {
             let scratch =
                 MemoryBudget::new(CheckpointIndexBuildConfig::default().assembler_scratch_bytes);
             for remaining in [4, 3, 1, 0] {
-                let mut planner = CheckpointPlanner::new(&tree, &runs, &scratch);
+                let mut planner = CheckpointPlanner::new(
+                    &tree,
+                    root_descriptor(&tree).await.unwrap(),
+                    &runs,
+                    &scratch,
+                )
+                .unwrap();
                 planner.identity_probes = MAX_IDENTITIES - remaining;
                 let result = planner.probe(b"key", Some(first_owner));
                 assert_eq!(result.is_some(), remaining == 4, "remaining={remaining}");
@@ -940,7 +977,7 @@ mod tests {
         .unwrap();
         fail_build_budget(&budget, "checkpoint stable sort");
         let result =
-            SortedRun::finish_mutations(rows, 0, RunKind::Put, true, &AtomicBool::new(false));
+            SortedRun::finish_mutations(rows, 3, 0, RunKind::Put, true, &AtomicBool::new(false));
         let Err(error) = result else {
             panic!("sort admission must fail")
         };
@@ -949,5 +986,137 @@ mod tests {
         };
         assert!(error.contains::<ResourceError>());
         assert_eq!(budget.used(), 0);
+    }
+
+    /// Purpose: Protect the exact PUT-volume thresholds without reading or allocating probe state.
+    /// Expected: Repeated keys and owner replacements use raw volume, leaf shape stays explicit, and every shortcut uses zero reads and scratch bytes.
+    #[test]
+    fn put_only_planning_uses_required_totals_without_probes() {
+        smol::block_on(test_with_cold(Vec::new(), async |cold| {
+            let empty = cold.tree().unwrap();
+            let (runtime, _, guard) = empty.snapshot();
+            // Deliberately unreadable block: these branches must never perform I/O.
+            let block = BlockID::new(999);
+            let tree = runtime.open(Some(block), &guard);
+            let stats = DiskTreeStats {
+                entries: 1000,
+                encoded_key_bytes: 4000,
+                leaf_nodes: 10,
+                branch_nodes: 1,
+                height: 1,
+            };
+            for (count, width, expected) in [
+                (0, 4, Strategy::NoWork),
+                (1, 4, Strategy::PartialRewrite),
+                (999, 4, Strategy::PartialRewrite),
+                (1000, 4, Strategy::PartialRewrite),
+                (15999, 4, Strategy::PartialRewrite),
+                (16000, 4, Strategy::Reconstruct),
+                (16001, 4, Strategy::Reconstruct),
+                (10, 31983, Strategy::PartialRewrite),
+                (10, 31984, Strategy::Reconstruct),
+                (10, 31985, Strategy::Reconstruct),
+            ] {
+                let runs = mutation_runs(
+                    vec![(
+                        RunKind::Put,
+                        (0..count)
+                            .map(|row| (BTreeKey::from(vec![7; width].as_slice()), RowID::new(row)))
+                            .collect(),
+                    )],
+                    true,
+                );
+                let root = SecondaryIndexRoot::from_parts(Some(block), stats).unwrap();
+                let scratch = MemoryBudget::new(0);
+                let mut planner = CheckpointPlanner::new(&tree, root, &runs, &scratch).unwrap();
+                assert_eq!(
+                    planner.choose().await.unwrap(),
+                    expected,
+                    "count={count}, width={width}"
+                );
+                assert_eq!(planner.node_reads, 0);
+                assert_eq!(planner.delta_paths, 0);
+                assert!(planner.seen.is_empty() && planner.delta_leaves.is_empty());
+                assert_eq!(scratch.used(), 0);
+            }
+            let runs = mutation_runs(
+                vec![(
+                    RunKind::Delete,
+                    vec![(BTreeKey::from(&b"absent"[..]), RowID::new(1))],
+                )],
+                true,
+            );
+            let leaf = SecondaryIndexRoot::from_parts(
+                Some(block),
+                DiskTreeStats {
+                    leaf_nodes: 1,
+                    branch_nodes: 0,
+                    height: 0,
+                    ..stats
+                },
+            )
+            .unwrap();
+            let scratch = MemoryBudget::new(0);
+            let mut planner = CheckpointPlanner::new(&tree, leaf, &runs, &scratch).unwrap();
+            assert_eq!(planner.choose().await.unwrap(), Strategy::Reconstruct);
+            assert_eq!(planner.node_reads, 0);
+            assert!(CheckpointPlanner::<UniqueDiskTreeSpec>::mass(u64::MAX, 0).is_err());
+        }));
+    }
+
+    /// Purpose: Preserve repeated quantile contributions while caching complete-key deletion probes.
+    /// Expected: One repeated effective delete estimates exactly one removal and one changed key; no-effect and identity-cap exhaustion conservatively retain partial work.
+    #[test]
+    fn deletion_planning_weights_cached_groups_and_bounds_inspection() {
+        let entries = (0u32..6000)
+            .map(|key| IndexBuildEntry {
+                key: BTreeKey::from(key.to_be_bytes().as_slice()),
+                row_id: RowID::new(u64::from(key) + 1),
+            })
+            .collect();
+        smol::block_on(test_with_cold(entries, async |cold| {
+            let tree = cold.tree().unwrap();
+            let root = root_descriptor(&tree).await.unwrap();
+            assert!(root.stats().height > 0);
+            for (count, owner, changed) in [(200, 1, true), (200, 99999, false), (4096, 1, false)] {
+                let runs = mutation_runs(
+                    vec![(
+                        RunKind::Delete,
+                        (0..count)
+                            .map(|_| {
+                                (
+                                    BTreeKey::from(0u32.to_be_bytes().as_slice()),
+                                    RowID::new(owner),
+                                )
+                            })
+                            .collect(),
+                    )],
+                    true,
+                );
+                let scratch = MemoryBudget::new(128 * 1024);
+                let mut planner = CheckpointPlanner::new(&tree, root, &runs, &scratch).unwrap();
+                assert_eq!(planner.choose().await.unwrap(), Strategy::PartialRewrite);
+                assert!(planner.delta_paths <= 64);
+                assert!(planner.identity_probes <= MAX_IDENTITIES);
+                if count == 4096 {
+                    assert!(planner.uncertain);
+                    assert_eq!(planner.identity_probes, MAX_IDENTITIES);
+                    assert_eq!(planner.seen.len(), 0);
+                } else {
+                    assert_eq!(planner.seen.len(), 1);
+                    assert_eq!(planner.node_reads, usize::from(root.stats().height) + 1);
+                    assert_eq!(planner.identity_probes, count + 1);
+                    assert_eq!(planner.changed_keys, usize::from(changed));
+                    assert_eq!(
+                        planner.removed_sum / planner.delta_paths as f64,
+                        f64::from(changed)
+                    );
+                    assert_eq!(
+                        planner.removed_bytes / planner.delta_paths as f64,
+                        if changed { 4.0 } else { 0.0 }
+                    );
+                }
+            }
+        }));
     }
 }

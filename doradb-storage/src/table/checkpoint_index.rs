@@ -341,6 +341,7 @@ impl IndexSource {
                 "checkpoint projection",
             )
             .change_context(RuntimeError::CheckpointExecution)?;
+        let mut mutation_key_bytes = 0u64;
         let mut rows = BuildEntries::with_payload_credit(budget, PAYLOAD_CREDIT_BYTES);
         for offset in group.range.clone() {
             if stop.load(Ordering::Acquire) {
@@ -376,6 +377,7 @@ impl IndexSource {
                             &mut projection,
                             page.row_id(row),
                             &mut rows,
+                            &mut mutation_key_bytes,
                         )?;
                     }
                 }
@@ -412,7 +414,13 @@ impl IndexSource {
                                     .change_context(RuntimeError::CheckpointExecution)?,
                             );
                         }
-                        Self::encode::<UNIQUE>(&self.encoder, &mut projection, row_id, &mut rows)?;
+                        Self::encode::<UNIQUE>(
+                            &self.encoder,
+                            &mut projection,
+                            row_id,
+                            &mut rows,
+                            &mut mutation_key_bytes,
+                        )?;
                     }
                 }
                 RunKind::Create => unreachable!("checkpoint source group has a mutation kind"),
@@ -422,7 +430,7 @@ impl IndexSource {
         drop(projection);
         drop(decode);
         rows.trim_payload();
-        match SortedRun::finish_mutations(rows, id, group.kind, UNIQUE, stop)? {
+        match SortedRun::finish_mutations(rows, mutation_key_bytes, id, group.kind, UNIQUE, stop)? {
             BuildOutcome::Stopped => Ok(BuildOutcome::Stopped),
             BuildOutcome::Complete(run) => Ok(BuildOutcome::Complete(ExtractedGroup {
                 source: self.source.clone(),
@@ -439,6 +447,7 @@ impl IndexSource {
         values: &mut BudgetedVec<Val>,
         row_id: RowID,
         rows: &mut BuildEntries,
+        mutation_key_bytes: &mut u64,
     ) -> RuntimeOrFatalResult<()> {
         if !UNIQUE {
             values.push_reserved(Val::from(row_id));
@@ -456,6 +465,9 @@ impl IndexSource {
             },
         )
         .change_context(RuntimeError::CheckpointExecution)?;
+        // Inline keys fit their admitted entries; outlined keys have separate
+        // payload admission. Their total bytes cannot exceed retained storage.
+        *mutation_key_bytes += len as u64;
         values.clear();
         Ok(())
     }
@@ -474,6 +486,7 @@ mod tests {
         encoder: BTreeKeyEncoder,
         projection: BudgetedVec<Val>,
         rows: BuildEntries,
+        mutation_key_bytes: u64,
     }
 
     impl Encoding {
@@ -486,6 +499,7 @@ mod tests {
                 encoder: BTreeKeyEncoder::new(types.iter().copied()),
                 projection,
                 rows: BuildEntries::with_payload_credit(budget, PAYLOAD_CREDIT_BYTES),
+                mutation_key_bytes: 0,
             }
         }
 
@@ -502,6 +516,7 @@ mod tests {
                 &mut self.projection,
                 RowID::new(row),
                 &mut self.rows,
+                &mut self.mutation_key_bytes,
             )
         }
     }
@@ -558,12 +573,20 @@ mod tests {
             assert_eq!(payload_accounting(&encoding.rows).1, 0);
         }
         let Encoding {
-            rows, projection, ..
+            rows,
+            projection,
+            mutation_key_bytes,
+            ..
         } = encoding;
-        let BuildOutcome::Complete(run) =
-            SortedRun::finish_mutations(rows, 0, RunKind::Put, UNIQUE, &AtomicBool::new(false))
-                .unwrap()
-        else {
+        let BuildOutcome::Complete(run) = SortedRun::finish_mutations(
+            rows,
+            mutation_key_bytes,
+            0,
+            RunKind::Put,
+            UNIQUE,
+            &AtomicBool::new(false),
+        )
+        .unwrap() else {
             panic!("encoding fixture stopped");
         };
         let actual: Vec<_> = run

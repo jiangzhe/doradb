@@ -16,6 +16,7 @@ use super::{
     PAYLOAD_CREDIT_BYTES, PayloadSize, RunKind, SortedRuns,
 };
 use crate::buffer::PoolGuard;
+use crate::catalog::SecondaryIndexRoot;
 use crate::conf::CheckpointIndexBuildConfig;
 use crate::error::{ConfigResult, ResourceResult};
 use crate::error::{MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult};
@@ -30,6 +31,7 @@ use crate::index::disk_tree::DiskTreeNodeView;
 use crate::index::disk_tree::{
     DISK_TREE_BLOCK_SIZE, DiskTree, DiskTreeNodeGuard, DiskTreeRuntime, DiskTreeSpec, LogicalEntry,
 };
+use crate::index::disk_tree_stats::DiskTreeStats;
 use crate::index::util::Maskable;
 use crate::io::DirectBuf;
 use crate::layout;
@@ -260,6 +262,7 @@ struct BaseReader<F: DiskTreeSpec> {
     pending: Option<BlockID>,
     leaf_complete: bool,
     exhausted: bool,
+    retired: DiskTreeStats,
     #[cfg(feature = "profiling")]
     reads: u64,
 }
@@ -277,6 +280,7 @@ impl<F: DiskTreeSpec> BaseReader<F> {
             pending: root,
             leaf_complete: false,
             exhausted: false,
+            retired: DiskTreeStats::default(),
             #[cfg(feature = "profiling")]
             reads: 0,
         }
@@ -339,6 +343,11 @@ impl<F: DiskTreeSpec> BaseReader<F> {
                 self.slot = node.lower_bound_slot_idx(key)?;
                 self.leaf = Some(guard);
                 return Ok(None);
+            }
+            // Only the half-open range containing the lower fence retires a
+            // shared ancestor. Resumed frames never repeat this accounting.
+            if range.reuse && owns_fence(node.fence_key(false), range.lower, range.upper) {
+                self.retired.add_node(node.height());
             }
             let child = node.lower_bound_child_entry_idx(key)?;
             let next = node.child_block(child)?;
@@ -678,6 +687,8 @@ enum Output {
 }
 
 struct RangeSummary {
+    added: DiskTreeStats,
+    removed: DiskTreeStats,
     #[cfg(feature = "profiling")]
     measurements: CheckpointIndexMeasurements,
     packets: usize,
@@ -903,6 +914,8 @@ struct RangeWorker<'a, F: DiskTreeSpec> {
     changed: bool,
     leaf_changed: bool,
     leaf_emitted: bool,
+    added: DiskTreeStats,
+    removed: DiskTreeStats,
     #[cfg(feature = "profiling")]
     measurements: CheckpointIndexMeasurements,
 }
@@ -945,6 +958,8 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
             changed: false,
             leaf_changed: false,
             leaf_emitted: false,
+            added: DiskTreeStats::default(),
+            removed: DiskTreeStats::default(),
             #[cfg(feature = "profiling")]
             measurements: CheckpointIndexMeasurements::default(),
         })
@@ -1018,6 +1033,9 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
         if take_base {
             let entry = self.base.entry()?;
             let row = F::entry_row(&entry).change_context(RuntimeError::CheckpointExecution)?;
+            if !self.consumer.partial {
+                self.added.add_entry(entry.key.len());
+            }
             self.window
                 .push_with(
                     if entry.key.len() > MEM_CMP_KEY_INLINE {
@@ -1055,6 +1073,13 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
             let BuildOutcome::Complete(row) = self.mutations.reduce(owner, F::UNIQUE)? else {
                 return Ok(BuildOutcome::Stopped);
             };
+            let key_bytes = reference.resolve(self.runs).key.as_bytes().len();
+            if row.is_some() && (!self.consumer.partial || owner.is_none()) {
+                self.added.add_entry(key_bytes);
+            }
+            if owner.is_some() && row.is_none() {
+                self.removed.add_entry(key_bytes);
+            }
             self.changed |= row != owner;
             self.leaf_changed |= row != owner;
             if let Some(row) = row {
@@ -1083,6 +1108,11 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
             }
             self.output.stage(Output::Subtree(leaf)).await?;
         } else {
+            if self.lower.is_none_or(|lower| leaf.lower.bytes() >= lower)
+                && self.upper.is_none_or(|upper| leaf.lower.bytes() < upper)
+            {
+                self.removed.add_node(0);
+            }
             let fence = match (leaf.upper.as_ref().map(|key| key.bytes()), self.upper) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -1122,7 +1152,10 @@ impl<'a, F: DiskTreeSpec> RangeWorker<'a, F> {
             self.measurements.base_nodes_read = self.base.reads;
         }
         self.output.finish().await?;
+        self.removed.accumulate(self.base.retired);
         self.mutations.finish(RangeSummary {
+            added: self.added,
+            removed: self.removed,
             #[cfg(feature = "profiling")]
             measurements: self.measurements,
             packets: self.output.next,
@@ -1251,6 +1284,7 @@ impl OrderedOutput {
 
 /// Retains every accepted write through successful observation or cleanup.
 struct Writer<'a> {
+    created: DiskTreeStats,
     file: &'a mut MutableTableFile,
     #[cfg(feature = "profiling")]
     admission: Arc<CheckpointAdmission>,
@@ -1278,6 +1312,7 @@ impl Writer<'_> {
             .attach("operation=checkpoint_reconcile, phase=write_acceptance")?;
         self.writes
             .push(block, async move { completion.wait_result().await });
+        self.created.add_node(usize::from(image.height));
         Ok(Descriptor {
             promotion: image.promotion,
             reused: false,
@@ -1322,6 +1357,7 @@ impl Writer<'_> {
 }
 
 struct Assembler<F: DiskTreeSpec> {
+    retired: DiskTreeStats,
     runtime: DiskTreeRuntime<F>,
     root: Option<BlockID>,
     guard: PoolGuard,
@@ -1350,6 +1386,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
             guard,
             pending: None,
             pending_candidates: 0,
+            retired: DiskTreeStats::default(),
             partial,
             levels: BudgetedVec::new(budget),
             budget: budget.clone(),
@@ -1507,6 +1544,7 @@ impl<F: DiskTreeSpec> Assembler<F> {
                     "checkpoint retained edge changed identity or height",
                 ));
             }
+            self.retired.add_node(node.height());
             if node.is_leaf() {
                 self.repair_leaf(writer, guard, upper).await
             } else {
@@ -1790,7 +1828,10 @@ impl<F: DiskTreeSpec> Assembler<F> {
         )
     }
 
-    async fn finish(&mut self, writer: &mut Writer<'_>) -> RuntimeOrFatalResult<Option<BlockID>> {
+    async fn finish(
+        &mut self,
+        writer: &mut Writer<'_>,
+    ) -> RuntimeOrFatalResult<Option<(BlockID, u16)>> {
         if let Some(image) = self.pending.take() {
             if image.upper.is_some() {
                 let mut entries =
@@ -1831,6 +1872,17 @@ impl<F: DiskTreeSpec> Assembler<F> {
                 let (mut block, mut height, reused) =
                     root.promotion
                         .unwrap_or((root.block, root.height, root.reused));
+                // Promotion metadata bypasses only finalized new unary chains;
+                // old ancestors are inspected and retired separately below.
+                writer.created.branch_nodes = writer
+                    .created
+                    .branch_nodes
+                    .checked_sub(u64::from(root.height.checked_sub(height).ok_or_else(
+                        || execution_error("checkpoint promotion height increased"),
+                    )?))
+                    .ok_or_else(|| {
+                        execution_error("checkpoint promoted node accounting underflow")
+                    })?;
                 while reused && height != 0 {
                     let guard = self
                         .runtime
@@ -1848,10 +1900,11 @@ impl<F: DiskTreeSpec> Assembler<F> {
                     if node.count() != 0 {
                         break;
                     }
+                    self.retired.add_node(node.height());
                     block = node.child_block(0)?;
                     height -= 1;
                 }
-                return Ok(Some(block));
+                return Ok(Some((block, height)));
             }
             while !self.levels[level].is_empty() {
                 let image = self.parent(level)?;
@@ -1867,7 +1920,8 @@ impl<F: DiskTreeSpec> IndexCheckpoint<'_, '_, F> {
     /// Build a replacement with admitted range workers and an ordered assembler.
     /// Root authority follows exact merge coverage and successful terminal
     /// observation of every accepted write.
-    pub(super) async fn build(self, mode: BuildMode) -> RuntimeOrFatalResult<Option<BlockID>> {
+    pub(super) async fn build(self, mode: BuildMode) -> RuntimeOrFatalResult<SecondaryIndexRoot> {
+        self.validate_root()?;
         CheckpointBuilder::new(self, mode).await?.run().await
     }
 }
@@ -1879,7 +1933,9 @@ struct CheckpointBuilder<'a, F: DiskTreeSpec> {
     input: flume::Receiver<Packet>,
     queues: BudgetedVec<OrderedOutput>,
     plan: Arc<PreparedMerge>,
-    root: Option<BlockID>,
+    root: SecondaryIndexRoot,
+    added: DiskTreeStats,
+    removed: DiskTreeStats,
     partition: usize,
     changed: bool,
     #[cfg(feature = "profiling")]
@@ -1898,6 +1954,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
     ) -> RuntimeOrFatalResult<Self> {
         let IndexCheckpoint {
             tree,
+            root: descriptor,
             file,
             runs,
             ts,
@@ -1962,6 +2019,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
             },
         );
         let writer = Writer {
+            created: DiskTreeStats::default(),
             file,
             #[cfg(feature = "profiling")]
             admission: admission.clone(),
@@ -1984,7 +2042,9 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
             input,
             queues,
             plan,
-            root,
+            root: descriptor,
+            added: DiskTreeStats::default(),
+            removed: DiskTreeStats::default(),
             partition: 0,
             changed: false,
             #[cfg(feature = "profiling")]
@@ -1995,7 +2055,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         })
     }
 
-    async fn run(mut self) -> RuntimeOrFatalResult<Option<BlockID>> {
+    async fn run(mut self) -> RuntimeOrFatalResult<SecondaryIndexRoot> {
         let result = self.consume().await;
         if let Err(error) = result {
             return Err(self.settle_failure(error).await);
@@ -2013,7 +2073,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         result
     }
 
-    async fn consume(&mut self) -> RuntimeOrFatalResult<Option<BlockID>> {
+    async fn consume(&mut self) -> RuntimeOrFatalResult<SecondaryIndexRoot> {
         while self.partition < self.plan.partitions() {
             if let Some(output) = self.queues[self.partition].pop() {
                 let QueuedOutput {
@@ -2134,6 +2194,8 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
             ));
         }
         self.changed |= summary.changed;
+        self.added.accumulate(summary.added);
+        self.removed.accumulate(summary.removed);
         #[cfg(feature = "profiling")]
         self._admission.measure(|m| m.record(&summary.measurements));
         // Packet acknowledgements only transfer payload ownership. This ordered
@@ -2144,7 +2206,7 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         Ok(())
     }
 
-    async fn finish(&mut self) -> RuntimeOrFatalResult<Option<BlockID>> {
+    async fn finish(&mut self) -> RuntimeOrFatalResult<SecondaryIndexRoot> {
         if self.consumption.next_output().await?.is_some() {
             return Err(execution_error("checkpoint merge produced an extra range"));
         }
@@ -2160,7 +2222,20 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         }
         let root = self.assembler.finish(&mut self.writer).await?;
         self.writer.settle(false).await?;
-        Ok(root)
+        self.added.accumulate(self.writer.created);
+        let height = root.map_or(0, |(_, height)| height);
+        let stats = if self.assembler.partial {
+            self.removed.accumulate(self.assembler.retired);
+            self.root
+                .stats()
+                .apply_delta(self.removed, self.added, height)?
+        } else {
+            DiskTreeStats {
+                height,
+                ..self.added
+            }
+        };
+        SecondaryIndexRoot::from_parts(root.map(|(block, _)| block), stats)
     }
 
     async fn settle_failure(&mut self, mut error: RuntimeOrFatalError) -> RuntimeOrFatalError {
@@ -2182,6 +2257,12 @@ impl<'a, F: DiskTreeSpec> CheckpointBuilder<'a, F> {
         }
         error
     }
+}
+
+// Outer ranges are unbounded; internal cuts assign each old node to one worker.
+fn owns_fence(fence: BTreeKeyView<'_>, lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
+    lower.is_none_or(|lower| !fence.cmp_bytes(lower).is_lt())
+        && upper.is_none_or(|upper| fence.cmp_bytes(upper).is_lt())
 }
 
 fn consume_prefix<T>(values: &mut BudgetedVec<T>, count: usize) {
@@ -2206,6 +2287,7 @@ mod tests {
     use crate::index::build::merge::test_pool;
     use crate::index::build::{fail_build_budget, payload_accounting};
     use crate::index::disk_tree::UniqueDiskTreeRuntime;
+    use crate::index::disk_tree_stats::root_descriptor;
     use crate::index::util::tests::drain_candidates;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
@@ -2354,7 +2436,15 @@ mod tests {
             let admission = CheckpointAdmission::new(policy).unwrap();
             let allocated_before = file.root().alloc_map.allocated();
             let mut builder = CheckpointBuilder::new(
-                IndexCheckpoint::new(&tree, file, runs, TrxID::new(2), pool, admission.clone()),
+                IndexCheckpoint::new(
+                    &tree,
+                    SecondaryIndexRoot::Empty,
+                    file,
+                    runs,
+                    TrxID::new(2),
+                    pool,
+                    admission.clone(),
+                ),
                 BuildMode::Reconstruct,
             )
             .await
@@ -2442,7 +2532,8 @@ mod tests {
                 drop(builder);
             } else {
                 let root = builder.run().await.unwrap();
-                let result = runtime.open(root, guard);
+                let result = runtime.open(root.block_id(), guard);
+                assert_eq!(root, root_descriptor(&result).await.unwrap());
                 let range = KeyRange::new(Bound::Unbounded, Bound::Unbounded);
                 let mut stream = result.scan_candidate_stream(&range);
                 let entries = drain_candidates(&mut stream).await;
@@ -2462,6 +2553,87 @@ mod tests {
             }
         })
         .await;
+    }
+
+    async fn unary_pair(
+        file: &mut MutableTableFile,
+        admission: &Arc<CheckpointAdmission>,
+        depth: u16,
+    ) -> SecondaryIndexRoot {
+        let mut writer = Writer {
+            created: DiskTreeStats::default(),
+            file,
+            #[cfg(feature = "profiling")]
+            admission: admission.clone(),
+            limit: 2,
+            writes: PendingWrites::new(
+                2,
+                admission
+                    .output(completion_bytes(2).unwrap(), "fixture writes")
+                    .unwrap(),
+            ),
+            allocations: BudgetedVec::new(&admission.assembler),
+        };
+        let mut roots = BudgetedVec::new(&admission.assembler);
+        for (key, upper, row) in [
+            (b"a".as_slice(), Some(b"z".as_slice()), 1),
+            (b"z".as_slice(), None, 2),
+        ] {
+            let image = Image {
+                promotion: None,
+                buf: pack_admitted_node(
+                    KnownFenceNodeParams {
+                        height: 0,
+                        ts: TrxID::new(2),
+                        lower_fence: key,
+                        lower_fence_value: BTreeU64::INVALID_VALUE,
+                        upper_fence: upper,
+                        hints_enabled: true,
+                    },
+                    &[PackedNodeEntry {
+                        key,
+                        value: BTreeU64::from(row),
+                    }],
+                )
+                .unwrap(),
+                allocation: admission
+                    .output(DISK_TREE_BLOCK_SIZE, "fixture leaf")
+                    .unwrap(),
+                lower: OwnedKey::copy(key, &admission.assembler).unwrap(),
+                upper: upper.map(|key| OwnedKey::copy(key, &admission.assembler).unwrap()),
+                height: 0,
+                count: 1,
+            };
+            let mut child = writer.write(image).await.unwrap();
+            for _ in 0..depth {
+                let mut children = BudgetedVec::new(&admission.assembler);
+                children.push(child, "fixture children").unwrap();
+                let image = Image::from_children(
+                    &mut children,
+                    &admission.assembler,
+                    admission,
+                    TrxID::new(2),
+                )
+                .unwrap();
+                child = writer.write(image).await.unwrap();
+            }
+            roots.push(child, "fixture roots").unwrap();
+        }
+        let image =
+            Image::from_children(&mut roots, &admission.assembler, admission, TrxID::new(2))
+                .unwrap();
+        let root = writer.write(image).await.unwrap();
+        writer.settle(false).await.unwrap();
+        SecondaryIndexRoot::from_parts(
+            Some(root.block),
+            DiskTreeStats {
+                entries: 2,
+                encoded_key_bytes: 2,
+                height: depth + 1,
+                ..writer.created
+            },
+        )
+        .unwrap()
     }
 
     /// Purpose: Keep future output bounded while an earlier partition is blocked, including minimum worker scratch and a single-slot handoff.
@@ -2495,6 +2667,7 @@ mod tests {
             .unwrap();
             let admission = CheckpointAdmission::new(policy).unwrap();
             let mut writer = Writer {
+                created: DiskTreeStats::default(),
                 file,
                 #[cfg(feature = "profiling")]
                 admission: admission.clone(),
@@ -2785,5 +2958,110 @@ mod tests {
             drop(shared);
             assert_eq!(budget.used(), 0);
         }
+    }
+
+    /// Purpose: Account for old unary root promotion and new unary chains bypassed after recursive fence repair.
+    /// Expected: Removing either half leaves one exact leaf, every retired ancestor is counted once, and repaired suffix removal writes more nodes than remain reachable.
+    #[test]
+    fn checkpoint_statistics_exclude_bypassed_unary_ancestors() {
+        smol::block_on(with_checkpoint_file(async |runtime, guard, file| {
+            let (_scope, pool) = test_pool(2).await;
+            let policy =
+                CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 2).unwrap();
+            let seed_admission = CheckpointAdmission::new(policy).unwrap();
+            let root = unary_pair(file, &seed_admission, 3).await;
+            let tree = runtime.open(root.block_id(), guard);
+            assert_eq!(root_descriptor(&tree).await.unwrap(), root);
+            for (delete, owner, survivor, writes) in [
+                (b"a".as_slice(), 1, b"z".as_slice(), 0),
+                (b"z".as_slice(), 2, b"a".as_slice(), 4),
+            ] {
+                let admission = CheckpointAdmission::new(policy).unwrap();
+                let before = file.root().alloc_map.allocated();
+                let runs = Arc::new(mutation_runs(
+                    vec![(
+                        RunKind::Delete,
+                        vec![(BTreeKey::from(delete), RowID::new(owner))],
+                    )],
+                    true,
+                ));
+                let next = IndexCheckpoint::new(
+                    &tree,
+                    root,
+                    file,
+                    runs,
+                    TrxID::new(3),
+                    pool.clone(),
+                    admission.clone(),
+                )
+                .build(BuildMode::PartialRewrite)
+                .await
+                .unwrap();
+                let result = runtime.open(next.block_id(), guard);
+                assert_eq!(next, root_descriptor(&result).await.unwrap());
+                assert_eq!(
+                    next.stats(),
+                    DiskTreeStats {
+                        entries: 1,
+                        encoded_key_bytes: 1,
+                        leaf_nodes: 1,
+                        branch_nodes: 0,
+                        height: 0
+                    }
+                );
+                let leaf = result.read_node(next.block_id().unwrap()).await.unwrap();
+                assert_eq!(leaf.view().leaf_entry(0).unwrap().key.to_vec(), survivor);
+                assert_eq!(file.root().alloc_map.allocated() - before, writes);
+                #[cfg(feature = "profiling")]
+                assert_eq!(admission.measurements().written_nodes, writes as u64);
+                assert_eq!(root_descriptor(&tree).await.unwrap(), root);
+            }
+        }));
+    }
+
+    /// Purpose: Reject a checkpoint descriptor captured from a different root before output admission.
+    /// Expected: Neither selector nor forced construction allocates blocks, starts writes, or modifies the original descriptor.
+    #[test]
+    fn checkpoint_rejects_mismatched_root_descriptor() {
+        smol::block_on(with_checkpoint_file(async |runtime, guard, file| {
+            let (_scope, pool) = test_pool(1).await;
+            let policy =
+                CheckpointBuildPolicy::new(CheckpointIndexBuildConfig::default(), 1).unwrap();
+            let tree = runtime.open(None, guard);
+            let root = SecondaryIndexRoot::from_parts(
+                Some(BlockID::new(999)),
+                DiskTreeStats {
+                    entries: 1,
+                    leaf_nodes: 1,
+                    ..DiskTreeStats::default()
+                },
+            )
+            .unwrap();
+            let before = file.root().alloc_map.allocated();
+            for forced in [false, true] {
+                let admission = CheckpointAdmission::new(policy).unwrap();
+                let request = IndexCheckpoint::new(
+                    &tree,
+                    root,
+                    file,
+                    Arc::new(mutation_runs(Vec::new(), true)),
+                    TrxID::new(2),
+                    pool.clone(),
+                    admission.clone(),
+                );
+                let result = if forced {
+                    request.build(BuildMode::PartialRewrite).await
+                } else {
+                    request.apply().await
+                };
+                assert!(result.is_err());
+                assert_eq!(file.root().alloc_map.allocated(), before);
+                assert!(
+                    checkpoint_budgets(&admission)
+                        .iter()
+                        .all(|budget| budget.used() == 0)
+                );
+            }
+        }));
     }
 }

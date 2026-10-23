@@ -1588,6 +1588,7 @@ mod tests {
             }
             let duplicates = worker::local_duplicates(&entries, policy);
             runs.push(Arc::new(SortedRun {
+                mutation_key_bytes: 0,
                 kind: RunKind::Create,
                 group_id: group * 3 + 1,
                 entries,

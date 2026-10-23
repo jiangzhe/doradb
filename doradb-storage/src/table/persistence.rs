@@ -1501,12 +1501,13 @@ impl Table {
                 });
                 continue;
             }
-            let old_root = mutable_file.secondary_index_root(index.slot());
+            let old_root = mutable_file.secondary_index_descriptor(index);
             let runtime = secondary.disk_runtime();
             let disk_guard = session.pool_guards().disk_guard();
             let new_root = if layout.metadata().idx.expect_index_spec(index).unique() {
                 IndexCheckpoint::new(
-                    &runtime.open_unique_at(old_root, disk_guard)?,
+                    &runtime.open_unique_at(old_root.block_id(), disk_guard)?,
+                    old_root,
                     mutable_file,
                     Arc::new(runs),
                     checkpoint_ts,
@@ -1517,7 +1518,8 @@ impl Table {
                 .await?
             } else {
                 IndexCheckpoint::new(
-                    &runtime.open_non_unique_at(old_root, disk_guard)?,
+                    &runtime.open_non_unique_at(old_root.block_id(), disk_guard)?,
+                    old_root,
                     mutable_file,
                     Arc::new(runs),
                     checkpoint_ts,
@@ -1530,7 +1532,7 @@ impl Table {
             // Every index remains private until the enclosing checkpoint commits.
             // Dropping runs here releases keys before extracting the next index.
             if new_root != old_root {
-                mutable_file.set_secondary_index_root(index.slot(), new_root);
+                mutable_file.set_secondary_index_root(index, new_root);
             }
         }
         Ok(())
@@ -4540,7 +4542,7 @@ mod tests {
             let encoder = runtime.key_encoder_arc();
             let duplicate_key = encoder.encode(&[Val::from("duplicate")]);
             let mut mutable = test_mutable_table_file(&engine, &table, &guards);
-            let root = mutable.secondary_index_root(index.slot());
+            let root = mutable.root().secondary_index_root(index.slot());
             let tree = runtime.open_unique_at(root, guards.disk_guard()).unwrap();
             assert_eq!(
                 tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
@@ -4590,6 +4592,7 @@ mod tests {
             assert_eq!(actual_rows, deleted_rows);
             let next = IndexCheckpoint::new(
                 &tree,
+                mutable.secondary_index_descriptor(index),
                 &mut mutable,
                 Arc::new(runs),
                 cutoff,
@@ -4599,8 +4602,10 @@ mod tests {
             .apply()
             .await
             .unwrap();
-            assert_ne!(next, root);
-            let next_tree = runtime.open_unique_at(next, guards.disk_guard()).unwrap();
+            assert_ne!(next.block_id(), root);
+            let next_tree = runtime
+                .open_unique_at(next.block_id(), guards.disk_guard())
+                .unwrap();
             assert_eq!(
                 next_tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
                 None
@@ -8568,7 +8573,7 @@ mod tests {
     }
 
     /// Purpose: Protect reopening a checkpointed table file.
-    /// Expected: The recovered root preserves the persisted pivot and replay cutoffs.
+    /// Expected: The recovered root preserves the persisted pivot, replay cutoffs, and complete secondary descriptors.
     #[test]
     fn test_checkpoint_persistence_recovery() {
         smol::block_on(async {
@@ -8595,6 +8600,19 @@ mod tests {
             assert_checkpoint_published(&mut session, table.table_id()).await;
 
             let root_before = table.file().active_root_unchecked().clone();
+            let stats = root_before.secondary_index_slots[0]
+                .active_root()
+                .unwrap()
+                .stats();
+            assert_eq!(
+                (
+                    stats.entries,
+                    stats.leaf_nodes,
+                    stats.branch_nodes,
+                    stats.height
+                ),
+                (150, 1, 0, 0)
+            );
             drop(table);
 
             let table_file = engine
@@ -8608,6 +8626,10 @@ mod tests {
                 .await
                 .unwrap();
             let root_after = table_file.active_root_unchecked();
+            assert_eq!(
+                root_after.secondary_index_slots,
+                root_before.secondary_index_slots
+            );
             assert_eq!(root_after.pivot_row_id, root_before.pivot_row_id);
             assert_eq!(
                 root_after.heap_redo_start_ts,

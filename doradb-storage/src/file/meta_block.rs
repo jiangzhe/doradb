@@ -18,7 +18,7 @@ use std::num::NonZeroU64;
 pub(crate) const TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'T', b'B', b'L', b'M', b'E', b'T', b'A', 0];
 /// Table meta-block envelope version.
-pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 9;
+pub(crate) const TABLE_META_BLOCK_VERSION: u64 = 10;
 /// Magic bytes stored at the beginning of every `catalog.mtb` meta block envelope.
 pub(crate) const MULTI_TABLE_META_BLOCK_MAGIC_WORD: [u8; 8] =
     [b'M', b'T', b'B', b'M', b'E', b'T', b'A', 0];
@@ -67,6 +67,13 @@ impl Deser for MetaBlock {
         let (idx, column_block_index_root) = input.deser_u64(idx)?;
         let (idx, secondary_index_slots) = <Vec<SecondaryIndexSlot>>::deser(input, idx)?;
         validate_secondary_index_state(&schema, &secondary_index_slots)?;
+        for slot in &secondary_index_slots {
+            if let Some(root) = slot.active_root()
+                && root.block_id().is_some()
+            {
+                root.stats().validate(alloc_map.len() as u64)?;
+            }
+        }
         Ok((
             idx,
             MetaBlock {
@@ -413,6 +420,7 @@ mod tests {
     };
     use crate::file::multi_table_file::CATALOG_TABLE_ROOT_DESC_COUNT;
     use crate::file::table_file::ActiveRoot;
+    use crate::index::disk_tree_stats::DiskTreeStats;
     use crate::value::ValKind;
     use std::sync::Arc;
 
@@ -449,7 +457,16 @@ mod tests {
     fn active_slot(index_id: u32, root_block_id: u64) -> SecondaryIndexSlot {
         SecondaryIndexSlot::Active {
             index_id: IndexID::new(index_id),
-            root: SecondaryIndexRoot::Present(NonZeroU64::new(root_block_id).unwrap()),
+            root: SecondaryIndexRoot::Present {
+                block: NonZeroU64::new(root_block_id).unwrap(),
+                stats: DiskTreeStats {
+                    entries: 1,
+                    encoded_key_bytes: 4,
+                    leaf_nodes: 1,
+                    branch_nodes: 0,
+                    height: 0,
+                },
+            },
         }
     }
 

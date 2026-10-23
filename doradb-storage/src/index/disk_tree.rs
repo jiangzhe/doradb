@@ -3500,7 +3500,7 @@ mod tests {
                     );
                     assert_eq!(
                         strategy(&runtime.open(seed_root, guard), &runs).await,
-                        ("reconstruct", 16)
+                        ("reconstruct", 0)
                     );
                     fail_build_budget(&runs.budget, "merge batch");
                     let grown = reconstruct(
@@ -3535,7 +3535,7 @@ mod tests {
                         )],
                         true,
                     ));
-                    assert_eq!(strategy(&grown_tree, &runs).await, ("reconstruct", 16));
+                    assert_eq!(strategy(&grown_tree, &runs).await, ("reconstruct", 64));
                     let reduced = apply_unique(&grown_tree, mutable, &runs, TrxID::new(4))
                         .await
                         .unwrap();
@@ -3579,7 +3579,7 @@ mod tests {
     }
 
     /// Purpose: Preserve sparse subtree locality while repairing gaps and the right edge under both physical strategies.
-    /// Expected: Selection refines from 16 to 64 samples only for ambiguous costs; both strategies preserve an independent owner map including insertions beyond leaf tails, partial work reuses old blocks, no-effect work preserves the exact root, and old contents remain readable.
+    /// Expected: PUT-only selection uses no probes and localized deletes settle within the probe bounds; both strategies preserve an independent owner map including insertions beyond leaf tails, partial work reuses old blocks, no-effect work preserves the exact root, and old contents remain readable.
     #[test]
     fn test_checkpoint_partial_rewrite_sparse_edges() {
         use crate::conf::CheckpointIndexBuildConfig;
@@ -3628,9 +3628,8 @@ mod tests {
                 .unwrap();
                 let tree = runtime.open(root, guard);
                 let old = unique_scan_entries(&tree).await;
-                // Identical puts across the whole tree leave no reusable key range.
-                // Estimated ancestor work separates the costs only modestly, so
-                // the selector must refine beyond its initial sample allowance.
+                // Repeated same-owner PUT volume reaches the exact base count.
+                // Planning performs no reads; execution establishes no effect.
                 let unchanged = mutation_runs(
                     vec![(
                         Put,
@@ -3640,7 +3639,7 @@ mod tests {
                     )],
                     true,
                 );
-                assert_eq!(strategy(&tree, &unchanged).await, ("reconstruct", 64));
+                assert_eq!(strategy(&tree, &unchanged).await, ("partial", 0));
                 drop(unchanged);
                 let removes: Vec<_> = (0..100).chain(6000..6200).chain(11900..12000).collect();
                 for row in &removes {

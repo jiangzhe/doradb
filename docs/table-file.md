@@ -79,7 +79,7 @@ The active `MetaBlock` stores:
 
 - schema metadata
 - `column_block_index_root`, the root block id of the persistent cold-row index
-- secondary-index slot states and active `DiskTree` root block ids
+- secondary-index slot states and active `DiskTree` roots with exact statistics
 - `alloc_map`, the inline block allocation bitmap
 - `pivot_row_id`
 - `heap_redo_start_ts`
@@ -117,6 +117,11 @@ both cleared, before extending the vector. Reuse changes the stable `IndexID`
 while preserving the physical slot and `index_slot_count`; crossed append gaps
 are persisted as `Vacant`. No free list or runtime lifecycle state is written
 to the table file.
+
+Each secondary-index root includes exact entry and full encoded-key byte counts,
+leaf and branch counts, and tree height. These statistics are published with the
+root and restored during recovery. Table metadata version 10 is required; older
+versions are unsupported.
 
 Persistent secondary-index state is recovered by loading the checkpointed
 `DiskTree` roots directly. Hot post-checkpoint index state is rebuilt from redo.

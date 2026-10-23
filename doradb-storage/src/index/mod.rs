@@ -9,6 +9,7 @@ pub(crate) use column_block_index::tests::adaptive_leaf_fixture;
 mod ordinal_deletion_set;
 pub(crate) use ordinal_deletion_set::OrdinalDeletionSet;
 pub(crate) mod disk_tree;
+pub(crate) mod disk_tree_stats;
 pub(crate) mod identity_set;
 mod index_stream;
 mod mem_index;

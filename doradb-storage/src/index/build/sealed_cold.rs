@@ -5,7 +5,7 @@
 use super::merge::execution_error;
 use super::{MemoryBudget, MemoryReservation};
 use crate::buffer::PoolGuard;
-use crate::catalog::{IndexRef, SecondaryIndexSlot, TableMetadata};
+use crate::catalog::{IndexRef, SecondaryIndexRoot, SecondaryIndexSlot, TableMetadata};
 use crate::error::RuntimeOrFatalResult;
 use crate::file::table_file::MutableTableFile;
 use crate::id::{BlockID, TableID, TrxID};
@@ -55,11 +55,7 @@ pub(super) struct SealedColdMetadata {
     /// Exact invocation and catalog binding verified by the builder.
     pub(super) identity: ColdBuildIdentity,
     /// Completed root; empty input has no root.
-    pub(super) root: Option<BlockID>,
-    /// Checked height of the completed root.
-    pub(super) height: u16,
-    /// Entry count certified by complete construction coverage.
-    pub(super) entries: usize,
+    pub(super) root: SecondaryIndexRoot,
     /// Whether the completed tree stores unique logical keys.
     pub(super) unique: bool,
 }
@@ -142,7 +138,7 @@ impl ColdReadAuthority {
     /// Exact cold coverage certified before construction storage was released.
     #[inline]
     pub(crate) fn entries(&self) -> usize {
-        self.0.metadata.entries
+        self.0.metadata.root.stats().entries as usize
     }
 
     /// Invocation budget, reused after releasing cold construction allocations.
@@ -154,20 +150,20 @@ impl ColdReadAuthority {
     /// Height of the completed root; bounds traversal without retaining nodes.
     #[inline]
     pub(crate) fn height(&self) -> u16 {
-        self.0.metadata.height
+        self.0.metadata.root.stats().height
     }
 
     /// Optional completed root, never the super block.
     #[inline]
     pub(crate) fn root(&self) -> Option<BlockID> {
-        self.0.metadata.root
+        self.0.metadata.root.block_id()
     }
 
     /// Open persisted unique reads using this lease's operation provenance.
     pub(crate) fn tree(&self) -> RuntimeOrFatalResult<UniqueDiskTree<'_>> {
         self.0
             .runtime
-            .open_unique_at(self.0.metadata.root, &self.0.guard)
+            .open_unique_at(self.0.metadata.root.block_id(), &self.0.guard)
             .map_err(Into::into)
     }
 }
@@ -204,7 +200,7 @@ impl SealedColdBuild {
         let metadata = &self.root.metadata;
         metadata
             .unique
-            .then_some((&metadata.identity, metadata.entries))
+            .then_some((&metadata.identity, metadata.root.stats().entries as usize))
     }
 
     /// Issue read authority only for a fully checked unique cold tree.

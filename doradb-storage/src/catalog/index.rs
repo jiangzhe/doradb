@@ -1,8 +1,8 @@
 use crate::buffer::{EvictableBufferPool, PoolGuard, PoolGuards};
 use crate::catalog::storage::{TABLE_ID_INDEXES, TABLE_ID_TABLE_DESCRIPTORS, TABLE_ID_TABLES};
 use crate::catalog::{
-    Catalog, CatalogDefinitionEffects, IndexID, IndexRef, IndexSlot, SecondaryIndexRoot,
-    SecondaryIndexSlot, TableMetadata,
+    Catalog, CatalogDefinitionEffects, IndexID, IndexRef, IndexSlot, SecondaryIndexSlot,
+    TableMetadata,
 };
 use crate::component::panic_payload_description;
 use crate::engine::EngineCore;
@@ -772,7 +772,7 @@ impl CreateIndexProgress {
         )?;
         secondary_index_slots[index_slot.as_usize()] = SecondaryIndexSlot::Active {
             index_id: self.index.id(),
-            root: SecondaryIndexRoot::from_block_id(cold_root),
+            root: cold_root,
         };
         sealed.replace_metadata(Arc::clone(plan.new_metadata()), secondary_index_slots);
         #[cfg(test)]

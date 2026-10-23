@@ -184,6 +184,8 @@ pub(crate) struct SortedRun {
     pub(crate) group_id: usize,
     /// Caller-selected operation for every entry in this run.
     pub(crate) kind: RunKind,
+    /// Full encoded mutation-key bytes retained during extraction; unused for CREATE.
+    pub(crate) mutation_key_bytes: u64,
     entries: BuildEntries,
     /// Local evidence selected by the invocation duplicate policy.
     pub(crate) duplicates: LocalDuplicates,
@@ -210,6 +212,7 @@ impl SortedRun {
         BuildOutcome::Complete(Self {
             group_id,
             kind: RunKind::Create,
+            mutation_key_bytes: 0,
             entries,
             duplicates: evidence,
             #[cfg(feature = "profiling")]
@@ -220,6 +223,7 @@ impl SortedRun {
     /// Sort checkpoint input with stable source order for equal-key unique puts.
     pub(crate) fn finish_mutations(
         mut rows: BuildEntries,
+        mutation_key_bytes: u64,
         group_id: usize,
         kind: RunKind,
         unique: bool,
@@ -244,6 +248,7 @@ impl SortedRun {
         Ok(BuildOutcome::Complete(Self {
             group_id,
             kind,
+            mutation_key_bytes,
             entries: rows,
             duplicates: LocalDuplicates::Unchecked,
             #[cfg(feature = "profiling")]
