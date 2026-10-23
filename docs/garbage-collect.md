@@ -35,6 +35,12 @@ round does not repeat retained-root or dropped-table housekeeping and does not
 advance completed progress. If the horizon is newer, the same payload joins a
 complete horizon cycle.
 
+Secondary-index purge removes obsolete `MemIndex` entries using row-visibility
+proofs; it does not consult `DiskTree`. Cleanup starts only for the active index
+generation. DROP may complete while already-started cleanup finishes against
+the retained old generation. That retention delays physical reclamation and
+slot reuse.
+
 ## Row-Page Undo GC
 
 Row-page undo-chain GC is local to the row page and keeps historical versions

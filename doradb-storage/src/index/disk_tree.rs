@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use tests::{
-    DiskTreeOperation, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut,
+    DiskTreeOperation, NonUniqueDiskTreeEncodedExact, UniqueDiskTreeEncodedPut, point_probes,
 };
 
 /// Physical size of one persisted secondary DiskTree block.
@@ -624,6 +624,8 @@ impl<'a, F: DiskTreeSpec> DiskTree<'a, F> {
     /// Branch traversal follows child block ids until a leaf is reached. Empty
     /// roots and leaf misses return `Ok(None)`.
     async fn lookup_encoded_value(&self, key: &[u8]) -> RuntimeOrFatalResult<Option<F::LeafValue>> {
+        #[cfg(test)]
+        tests::record_point_probe();
         let Some(mut block_id) = self.root_block_id else {
             return Ok(None);
         };
@@ -852,17 +854,6 @@ impl<'a> UniqueDiskTree<'a> {
 pub(crate) type NonUniqueDiskTree<'a> = DiskTree<'a, NonUniqueDiskTreeSpec>;
 
 impl<'a> NonUniqueDiskTree<'a> {
-    /// Return whether one exact `(logical_key, row_id)` entry exists.
-    #[inline]
-    pub(crate) async fn contains_exact(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-    ) -> RuntimeOrFatalResult<bool> {
-        let key = self.encoder().encode_pair(key, Val::from(row_id));
-        self.contains_exact_encoded(key.as_bytes()).await
-    }
-
     /// Return whether one already-encoded exact `(logical_key, row_id)` entry
     /// exists in the current root snapshot.
     #[inline]
@@ -980,6 +971,7 @@ mod tests {
     use crate::layout::LayoutError;
     use crate::table::test_user_table_id;
     use crate::value::ValKind;
+    use std::cell::Cell;
     use std::cmp::Ordering as KeyOrdering;
     use std::pin::Pin;
 
@@ -995,6 +987,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    thread_local! {
+        static POINT_PROBES: Cell<usize> = const { Cell::new(0) };
+    }
 
     /// One unique DiskTree batch insertion item with an already-encoded key.
     pub(crate) struct UniqueDiskTreeEncodedPut<'a> {
@@ -2486,6 +2482,11 @@ mod tests {
         keys: Vec<Vec<u8>>,
     }
 
+    /// Returns persistent point probes performed on the current test thread.
+    pub(crate) fn point_probes() -> usize {
+        POINT_PROBES.get()
+    }
+
     /// Preserve staged-operation ordering for generic unique-writer fixtures.
     pub(super) fn apply_unique_operations(
         entries: &[LogicalEntry],
@@ -2513,6 +2514,11 @@ mod tests {
                 panic!("DiskTree non-unique rewrite received a unique operation")
             }
         })
+    }
+
+    /// Records one persistent point traversal on the current test thread.
+    pub(super) fn record_point_probe() {
+        POINT_PROBES.set(POINT_PROBES.get() + 1);
     }
 
     /// Ensure caller-provided batches are already in strict durable key order.
@@ -3302,9 +3308,12 @@ mod tests {
             let guard = disk_pool.create_base_guard();
             let runtime = non_unique_runtime!(metadata, disk_pool);
             let tree = runtime.open(None, &guard);
+            let exact_key = tree
+                .encoder()
+                .encode_pair(&[Val::from(1u32)], Val::from(RowID::new(10)));
             assert!(
                 !tree
-                    .contains_exact(&[Val::from(1u32)], RowID::new(10))
+                    .contains_exact_encoded(exact_key.as_bytes())
                     .await
                     .unwrap()
             );
@@ -4324,7 +4333,12 @@ mod tests {
                 .unwrap();
             let root = writer.finish().await.unwrap();
             let tree = runtime.open(root, &guard);
-            assert!(tree.contains_exact(&key1, RowID::new(10)).await.unwrap());
+            let exact_key = tree.encoder().encode_pair(&key1, Val::from(RowID::new(10)));
+            assert!(
+                tree.contains_exact_encoded(exact_key.as_bytes())
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
                 non_unique_prefix_scan_rows(&tree, &key1).await,
                 test_row_ids([10, 11])
@@ -4357,7 +4371,7 @@ mod tests {
             );
             assert!(
                 !new_tree
-                    .contains_exact(&key1, RowID::new(10))
+                    .contains_exact_encoded(exact_key.as_bytes())
                     .await
                     .unwrap()
             );
@@ -4664,7 +4678,7 @@ mod tests {
     }
 
     /// Purpose: Protect the empty-root transition after deleting every non-unique exact entry.
-    /// Expected: The new root is absent across all read paths while the prior root retains its candidates.
+    /// Expected: The new root is absent and scans are empty while the prior root retains its candidates.
     #[test]
     fn test_non_unique_delete_all_exact_entries_returns_empty_root() {
         smol::block_on(async {
@@ -4734,24 +4748,7 @@ mod tests {
             assert_eq!(empty_root, None);
 
             let empty_tree = runtime.open(empty_root, &guard);
-            assert!(
-                !empty_tree
-                    .contains_exact(&key1, RowID::new(10))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !empty_tree
-                    .contains_exact(&key1, RowID::new(11))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                !empty_tree
-                    .contains_exact(&key2, RowID::new(20))
-                    .await
-                    .unwrap()
-            );
+
             assert_eq!(non_unique_prefix_scan_rows(&empty_tree, &key1).await, []);
             assert_eq!(non_unique_prefix_scan_rows(&empty_tree, &key2).await, []);
             assert_eq!(non_unique_scan_entries(&empty_tree).await, []);

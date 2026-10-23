@@ -750,20 +750,26 @@ mod tests {
     use super::SecondaryMemIndexCleanupIndexStats;
     use crate::buffer::PoolGuards;
     use crate::catalog::tests::wait_for_dropped_table_floor;
-    use crate::catalog::{IndexID, IndexSlot};
+    use crate::catalog::{
+        IndexDdlTestPhase, IndexID, IndexRef, IndexSlot, StorageIndexFlags, StorageIndexKey,
+        StorageIndexSpec,
+    };
     use crate::engine::Engine;
     use crate::error::{DataIntegrityError, FatalError, LifecycleError};
     use crate::id::{RowID, TableID, TrxID};
-    use crate::index::{IndexInsert, IndexMask};
+    use crate::index::disk_tree::point_probes;
+    use crate::index::util::Maskable;
+    use crate::index::{IndexInsert, IndexMask, RowLocation};
     use crate::row::ops::SelectKey;
     use crate::session::Session;
     use crate::session::tests::{
         SessionTestExt, active_operation_snapshot, assert_checkpoint_published,
         remove_session_for_test, wait_for_checkpoint_purge, wait_for_session_idle,
     };
+    use crate::table::access::{PurgeIndexTestPhase, install_purge_index_hook};
     use crate::table::persistence::test_hooks::set_test_checkpoint_after_trx_start_hook;
     use crate::table::tests::*;
-    use crate::table::{CheckpointOutcome, Table};
+    use crate::table::{CheckpointOutcome, Table, TableRuntimeLayout};
     use crate::trx::{MAX_SNAPSHOT_TS, tests::active_sts_count};
     use crate::value::Val;
     use smol::Timer;
@@ -772,6 +778,13 @@ mod tests {
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PurgeEntryChange {
+        Reactivate,
+        Remove,
+        Replace,
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum CleanupIndexKind {
         Unique,
@@ -779,7 +792,6 @@ mod tests {
     }
 
     impl CleanupIndexKind {
-        #[cfg(feature = "profiling")]
         fn slot(self) -> IndexSlot {
             IndexSlot::new(match self {
                 Self::Unique => 0,
@@ -880,10 +892,10 @@ mod tests {
                 IndexMask::Masked
             ),
         }
-        assert_overlay_state(kind, table, guards, key, row_id, Some(true)).await;
+        assert_mem_overlay_state(kind, table, guards, key, row_id, Some(true)).await;
     }
 
-    async fn assert_overlay_state(
+    async fn assert_mem_overlay_state(
         kind: CleanupIndexKind,
         table: &Table,
         guards: &PoolGuards,
@@ -891,23 +903,48 @@ mod tests {
         row_id: RowID,
         deleted: Option<bool>,
     ) {
+        let layout = table.layout_snapshot();
+        assert_eq!(
+            retained_overlay_state(kind, &layout, guards, key, row_id).await,
+            deleted,
+            "{kind:?}: {key:?}",
+        );
+    }
+
+    async fn assert_disk_entry(
+        kind: CleanupIndexKind,
+        table: &Table,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+    ) {
         match kind {
-            CleanupIndexKind::Unique => assert_eq!(
-                bound_unique_index(table, guards, key.index_slot)
-                    .lookup(&key.vals, MAX_SNAPSHOT_TS)
-                    .await
-                    .unwrap(),
-                deleted.map(|deleted| (row_id, deleted)),
-                "{kind:?}: {key:?}",
-            ),
-            CleanupIndexKind::NonUnique => assert_eq!(
-                bound_non_unique_index(table, guards, key.index_slot)
-                    .lookup_unique(&key.vals, row_id, MAX_SNAPSHOT_TS)
-                    .await
-                    .unwrap(),
-                deleted.map(|deleted| !deleted),
-                "{kind:?}: {key:?}",
-            ),
+            CleanupIndexKind::Unique => {
+                assert_eq!(
+                    unique_disk_tree_lookup(table, guards, key).await,
+                    Some(row_id)
+                );
+            }
+            CleanupIndexKind::NonUnique => {
+                let layout = table.layout_snapshot();
+                let index = layout.secondary_index(key.index_slot).unwrap();
+                let root = table
+                    .file()
+                    .active_root_unchecked()
+                    .secondary_index_root(key.index_slot);
+                let disk = index
+                    .disk_runtime()
+                    .open_non_unique_at(root, guards.disk_guard())
+                    .unwrap();
+                let exact_key = index
+                    .key_encoder()
+                    .encode_pair(&key.vals, Val::from(row_id));
+                assert!(
+                    disk.contains_exact_encoded(exact_key.as_bytes())
+                        .await
+                        .unwrap()
+                );
+            }
         }
     }
 
@@ -949,7 +986,16 @@ mod tests {
                 },
                 "{kind:?}, purgeable={purgeable}"
             );
-            assert_overlay_state(kind, &table, &guards, &key, row_id, Some(!purgeable)).await;
+            assert_mem_overlay_state(
+                kind,
+                &table,
+                &guards,
+                &key,
+                row_id,
+                if purgeable { None } else { Some(true) },
+            )
+            .await;
+            assert_disk_entry(kind, &table, &guards, &key, row_id).await;
         }
     }
 
@@ -985,8 +1031,8 @@ mod tests {
             }
         }
         install_delete_overlay(kind, &table, &guards, &stale, row_id).await;
-        assert_overlay_state(kind, &table, &guards, &stale, row_id, Some(true)).await;
-        assert_overlay_state(kind, &table, &guards, &current, row_id, Some(false)).await;
+        assert_mem_overlay_state(kind, &table, &guards, &stale, row_id, Some(true)).await;
+        assert_mem_overlay_state(kind, &table, &guards, &current, row_id, Some(false)).await;
         let outcome = session
             .cleanup_secondary_mem_indexes(table_id, true)
             .await
@@ -1006,8 +1052,9 @@ mod tests {
             },
             "{kind:?}"
         );
-        assert_overlay_state(kind, &table, &guards, &stale, row_id, None).await;
-        assert_overlay_state(kind, &table, &guards, &current, row_id, Some(false)).await;
+        assert_mem_overlay_state(kind, &table, &guards, &stale, row_id, None).await;
+        assert_mem_overlay_state(kind, &table, &guards, &current, row_id, None).await;
+        assert_disk_entry(kind, &table, &guards, &current, row_id).await;
     }
 
     async fn assert_cold_purge_compares_persisted_key(kind: CleanupIndexKind) {
@@ -1052,7 +1099,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(removed, expected_removed, "{kind:?}: {key:?}");
-            assert_overlay_state(
+            assert_mem_overlay_state(
                 kind,
                 &table,
                 &guards,
@@ -1062,6 +1109,172 @@ mod tests {
             )
             .await;
         }
+    }
+
+    fn pause_index_purge(
+        table: &Table,
+        index: IndexRef,
+        phase: PurgeIndexTestPhase,
+    ) -> (impl Drop, flume::Receiver<()>, flume::Sender<()>) {
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, release_rx) = flume::bounded(1);
+        let hook = install_purge_index_hook(table, index, phase, async move {
+            entered_tx.send_async(()).await.unwrap();
+            release_rx.recv_async().await.unwrap();
+        });
+        (hook, entered, release)
+    }
+
+    async fn retained_overlay_state(
+        kind: CleanupIndexKind,
+        layout: &TableRuntimeLayout,
+        guards: &PoolGuards,
+        key: &SelectKey,
+        row_id: RowID,
+    ) -> Option<bool> {
+        let runtime = layout.expect_secondary_index(active_index_ref(layout, key.index_slot));
+        if kind.unique() {
+            runtime
+                .unique_mem()
+                .unwrap()
+                .bind(guards.index_guard())
+                .lookup(&key.vals, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .map(|(actual, deleted)| {
+                    assert_eq!(actual, row_id);
+                    deleted
+                })
+        } else {
+            runtime
+                .non_unique_mem()
+                .unwrap()
+                .bind(guards.index_guard())
+                .lookup_unique(&key.vals, row_id, MAX_SNAPSHOT_TS)
+                .await
+                .unwrap()
+                .map(|active| !active)
+        }
+    }
+
+    async fn drain_retired_indexes(engine: &Engine, table: &Table) {
+        let (events, received) = flume::unbounded();
+        engine.inner().trx_sys.set_purge_test_observer(events);
+        engine.inner().trx_sys.request_retired_index_runtime_retry();
+        while table.has_retired_secondary_indexes() {
+            received.recv_async().await.unwrap();
+        }
+    }
+
+    async fn assert_purge_drop_admission(kind: CleanupIndexKind, phase: PurgeIndexTestPhase) {
+        let (_root, engine, table_id, mut session) = cleanup_fixture(kind).await;
+        let table = table_for_internal_assertion(&engine, table_id);
+        let layout = table.layout_snapshot();
+        let index = active_index_ref(&layout, kind.slot());
+        let guards = session.pool_guards();
+        let key = kind.stale_key();
+        let row_id = RowID::new(9999);
+        install_delete_overlay(kind, &table, &guards, &key, row_id).await;
+        let (_hook, entered, release) = pause_index_purge(&table, index, phase);
+        let accessor = table.accessor_with_layout(&layout);
+        let mut purge = Box::pin(accessor.delete_index(
+            &guards,
+            index,
+            &key.vals,
+            row_id,
+            kind.unique(),
+            MAX_SNAPSHOT_TS,
+        ));
+        assert!(futures::poll!(purge.as_mut()).is_pending());
+        entered.recv_async().await.unwrap();
+        session.drop_index(table_id, index.id()).await.unwrap();
+        session
+            .checkpoint_catalog_and_truncate_redo_log()
+            .await
+            .unwrap();
+        assert!(
+            table.has_retired_secondary_indexes(),
+            "retained layout must gate destruction"
+        );
+        assert_eq!(
+            retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+            Some(true)
+        );
+        release.send_async(()).await.unwrap();
+        let admitted = phase == PurgeIndexTestPhase::AfterAdmission;
+        assert_eq!(purge.await.unwrap(), admitted);
+        assert_eq!(
+            retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+            if admitted { None } else { Some(true) }
+        );
+        drop(layout);
+        drain_retired_indexes(&engine, &table).await;
+
+        // Reuse only after real catalog coverage and runtime destruction. Keep
+        // only the stale identity/key, never an impossible old runtime pin.
+        let replacement_kind = if admitted {
+            kind
+        } else {
+            match kind {
+                CleanupIndexKind::Unique => CleanupIndexKind::NonUnique,
+                CleanupIndexKind::NonUnique => CleanupIndexKind::Unique,
+            }
+        };
+        let replacement = session
+            .create_index(
+                table_id,
+                StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(if kind.unique() { 0 } else { 1 })],
+                    if replacement_kind.unique() {
+                        StorageIndexFlags::UK
+                    } else {
+                        StorageIndexFlags::empty()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let current = table.layout_snapshot();
+        assert_eq!(
+            current.resolve_index_id(replacement).unwrap().slot(),
+            index.slot()
+        );
+        assert_ne!(replacement, index.id());
+        install_delete_overlay(replacement_kind, &table, &guards, &key, row_id).await;
+        assert!(
+            !table
+                .accessor_with_layout(&current)
+                .delete_index(
+                    &guards,
+                    index,
+                    &key.vals,
+                    row_id,
+                    kind.unique(),
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            retained_overlay_state(replacement_kind, &current, &guards, &key, row_id).await,
+            Some(true)
+        );
+        // A new generation can clean its own matching entry normally.
+        assert!(
+            table
+                .accessor_with_layout(&current)
+                .delete_index(
+                    &guards,
+                    current.resolve_index_id(replacement).unwrap(),
+                    &key.vals,
+                    row_id,
+                    replacement_kind.unique(),
+                    MAX_SNAPSHOT_TS,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(engine.new_session().is_ok());
     }
 
     /// Purpose: Protect memory-index cleanup when checkpoint publication races with root
@@ -1945,13 +2158,15 @@ mod tests {
             assert_eq!(_stats.indexes[1].skipped_live, 1);
             #[cfg(feature = "profiling")]
             assert_eq!(_stats.indexes[1].skipped_hot_deleted, 1);
-            assert_eq!(
-                index
-                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
-                    .await
-                    .unwrap(),
-                Some(false)
-            );
+            assert_mem_overlay_state(
+                CleanupIndexKind::NonUnique,
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                &stale_key,
+                row_id,
+                Some(true),
+            )
+            .await;
         });
     }
 
@@ -2016,13 +2231,15 @@ mod tests {
             assert_eq!(_stats.indexes[1].skipped_live, 0);
             #[cfg(feature = "profiling")]
             assert_eq!(_stats.indexes[1].skipped_hot_deleted, 0);
-            assert_eq!(
-                index
-                    .lookup_unique(&stale_key.vals, row_id, MAX_SNAPSHOT_TS,)
-                    .await
-                    .unwrap(),
-                None
-            );
+            assert_mem_overlay_state(
+                CleanupIndexKind::NonUnique,
+                &table_for_internal_assertion(&engine, table_id),
+                &pool_guards,
+                &stale_key,
+                row_id,
+                None,
+            )
+            .await;
         });
     }
 
@@ -2368,18 +2585,15 @@ mod tests {
                     .unwrap(),
             ) + 1;
             let pool_guards = session.pool_guards();
-            let index = bound_non_unique_index(
+            assert_mem_overlay_state(
+                CleanupIndexKind::NonUnique,
                 &table_for_internal_assertion(&engine, table_id),
                 &pool_guards,
-                key.index_slot,
-            );
-            assert!(matches!(
-                index
-                    .lookup_unique(&key.vals, row_id, MAX_SNAPSHOT_TS,)
-                    .await
-                    .unwrap(),
-                Some(false)
-            ));
+                &key,
+                row_id,
+                Some(true),
+            )
+            .await;
             let retained_index = {
                 let layout = table_for_internal_assertion(&engine, table_id).layout_snapshot();
                 active_index_ref(&layout, key.index_slot)
@@ -2404,5 +2618,469 @@ mod tests {
             assert!(!deleted);
             hold_trx.commit().await.unwrap();
         })
+    }
+
+    /// Purpose: Protect exact-generation purge admission and retirement across DROP and slot reuse.
+    /// Expected: Pre-admission work skips, admitted work completes, DROP stays nonblocking,
+    /// and stale records cannot mutate same-kind or changed-kind replacement entries.
+    #[test]
+    fn test_index_purge_drop_admission_and_slot_reuse() {
+        smol::block_on(async {
+            for kind in [CleanupIndexKind::Unique, CleanupIndexKind::NonUnique] {
+                for phase in [
+                    PurgeIndexTestPhase::BeforeAdmission,
+                    PurgeIndexTestPhase::AfterAdmission,
+                ] {
+                    assert_purge_drop_admission(kind, phase).await;
+                }
+            }
+        });
+    }
+
+    /// Purpose: Protect purge during DROP's retired-root/old-layout publication interval.
+    /// Expected: Both index kinds skip the retired generation while its old layout is still installed.
+    #[test]
+    fn test_index_purge_drop_root_before_layout() {
+        smol::block_on(async {
+            for kind in [CleanupIndexKind::Unique, CleanupIndexKind::NonUnique] {
+                let (_root, engine, table_id, mut session) = cleanup_fixture(kind).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let index = active_index_ref(&layout, kind.slot());
+                let guards = session.pool_guards();
+                let key = kind.stale_key();
+                let row_id = RowID::new(9999);
+                install_delete_overlay(kind, &table, &guards, &key, row_id).await;
+                let (entered, release) = engine
+                    .inner()
+                    .index_ddl_test
+                    .install_gate(IndexDdlTestPhase::DropRootPublished);
+                let mut dropping = Box::pin(session.drop_index(table_id, index.id()));
+                assert!(futures::poll!(dropping.as_mut()).is_pending());
+                entered.recv_async().await.unwrap();
+                assert!(Arc::ptr_eq(&layout, &table.layout_snapshot()));
+                assert!(
+                    !table
+                        .accessor_with_layout(&layout)
+                        .delete_index(
+                            &guards,
+                            index,
+                            &key.vals,
+                            row_id,
+                            kind.unique(),
+                            MAX_SNAPSHOT_TS,
+                        )
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+                    Some(true)
+                );
+                release.send_async(()).await.unwrap();
+                dropping.await.unwrap();
+            }
+        });
+    }
+
+    /// Purpose: Recheck generation admission after a hot-page validation retry crosses DROP.
+    /// Expected: Retiring the routed page forces a new attempt, which skips the dropped index.
+    #[test]
+    fn test_index_purge_retry_revalidates_generation() {
+        smol::block_on(async {
+            for kind in [CleanupIndexKind::Unique, CleanupIndexKind::NonUnique] {
+                let (_root, engine, table_id, mut session) = cleanup_fixture(kind).await;
+                let row_id = insert_one_row(
+                    table_id,
+                    &mut session,
+                    vec![Val::from(0i32), Val::from("current")],
+                )
+                .await;
+                let stale_page = session.load_active_insert_page(table_id).unwrap();
+                let table = table_for_internal_assertion(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let index = active_index_ref(&layout, kind.slot());
+                let guards = session.pool_guards();
+                let key = kind.stale_key();
+                install_delete_overlay(kind, &table, &guards, &key, row_id).await;
+                let (_hook, entered, release) =
+                    pause_index_purge(&table, index, PurgeIndexTestPhase::BeforeRowPage);
+                let accessor = table.accessor_with_layout(&layout);
+                let mut purge = Box::pin(accessor.delete_index(
+                    &guards,
+                    index,
+                    &key.vals,
+                    row_id,
+                    kind.unique(),
+                    MAX_SNAPSHOT_TS,
+                ));
+                assert!(futures::poll!(purge.as_mut()).is_pending());
+                entered.recv_async().await.unwrap();
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                let target = engine.inner().trx_sys.purge_handoff_cts();
+                session
+                    .wait_for_purge_completion_after(target)
+                    .await
+                    .unwrap();
+                session.drop_index(table_id, index.id()).await.unwrap();
+                // Reuse the reclaimed physical frame before the stale lookup:
+                // row-range validation, rather than access to an uninitialized
+                // allocation, is the retry condition under test.
+                let large = "r".repeat(48 * 1024);
+                let mut reused = false;
+                for key in 2..258 {
+                    let new_row = insert_one_row(
+                        table_id,
+                        &mut session,
+                        vec![Val::from(key), Val::from(large.as_str())],
+                    )
+                    .await;
+                    if matches!(table.find_row(&guards, new_row).await.unwrap(),
+                        RowLocation::RowPage(page) if page == stale_page.page_id)
+                    {
+                        reused = true;
+                        break;
+                    }
+                }
+                assert!(reused, "the routed page must have a different row range");
+                let (_retry_hook, retry_entered, retry_release) =
+                    pause_index_purge(&table, index, PurgeIndexTestPhase::BeforeAdmission);
+                release.send_async(()).await.unwrap();
+                assert!(futures::poll!(purge.as_mut()).is_pending());
+                retry_entered.recv_async().await.unwrap();
+                retry_release.send_async(()).await.unwrap();
+                assert!(!purge.await.unwrap());
+                assert_eq!(
+                    retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+                    Some(true)
+                );
+            }
+        });
+    }
+
+    /// Purpose: Avoid secondary DiskTree fallback for memory misses in an active generation.
+    /// Expected: Existing and absent disk keys both return false with zero persistent point probes.
+    #[test]
+    fn test_index_purge_memory_miss_never_probes_disk() {
+        smol::block_on(async {
+            for kind in [CleanupIndexKind::Unique, CleanupIndexKind::NonUnique] {
+                let (_root, engine, table_id, mut session) = cleanup_fixture(kind).await;
+                let row_id = insert_one_row(
+                    table_id,
+                    &mut session,
+                    vec![Val::from(0i32), Val::from("current")],
+                )
+                .await;
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                let table = table_for_internal_assertion(&engine, table_id);
+                let layout = table.layout_snapshot();
+                let index = active_index_ref(&layout, kind.slot());
+                let guards = session.pool_guards();
+                let key = kind.current_key();
+                assert!(
+                    table
+                        .file()
+                        .active_root_unchecked()
+                        .secondary_index_root(kind.slot())
+                        .is_some()
+                );
+                let runtime = layout.expect_secondary_index(index);
+                let removed = if kind.unique() {
+                    runtime
+                        .unique_mem()
+                        .unwrap()
+                        .bind(guards.index_guard())
+                        .compare_delete(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                        .await
+                        .unwrap()
+                } else {
+                    runtime
+                        .non_unique_mem()
+                        .unwrap()
+                        .bind(guards.index_guard())
+                        .compare_delete(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                        .await
+                        .unwrap()
+                };
+                assert!(removed);
+                assert_mem_overlay_state(kind, &table, &guards, &key, row_id, None).await;
+                let probes = point_probes();
+                // A production DiskTree point read independently proves the
+                // persisted entry exists and the probe counter is effective.
+                assert_disk_entry(kind, &table, &guards, &key, row_id).await;
+                assert!(point_probes() > probes);
+                let probes = point_probes();
+                for key in [key, kind.stale_key()] {
+                    assert!(
+                        !table
+                            .accessor_with_layout(&layout)
+                            .delete_index(
+                                &guards,
+                                index,
+                                &key.vals,
+                                row_id,
+                                kind.unique(),
+                                MAX_SNAPSHOT_TS,
+                            )
+                            .await
+                            .unwrap()
+                    );
+                }
+                assert_eq!(point_probes(), probes);
+            }
+        });
+    }
+
+    /// Purpose: Keep obsolete-entry purge conditional on exact ownership and hot visibility.
+    /// Expected: Visible versions, reactivated entries, and replacement owners survive;
+    /// an entry removed after lookup still counts as successful cleanup.
+    #[test]
+    fn test_index_purge_memory_entry_guards() {
+        smol::block_on(async {
+            for kind in [CleanupIndexKind::Unique, CleanupIndexKind::NonUnique] {
+                for change in [
+                    PurgeEntryChange::Reactivate,
+                    PurgeEntryChange::Remove,
+                    PurgeEntryChange::Replace,
+                ] {
+                    let (_root, engine, table_id, mut session) = cleanup_fixture(kind).await;
+                    let row_id = insert_one_row(
+                        table_id,
+                        &mut session,
+                        vec![Val::from(0i32), Val::from("current")],
+                    )
+                    .await;
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let layout = table.layout_snapshot();
+                    let index = active_index_ref(&layout, kind.slot());
+                    let guards = session.pool_guards();
+                    let accessor = table.accessor_with_layout(&layout);
+                    let current = kind.current_key();
+                    assert!(
+                        !accessor
+                            .delete_index(
+                                &guards,
+                                index,
+                                &current.vals,
+                                row_id,
+                                kind.unique(),
+                                MAX_SNAPSHOT_TS
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    install_delete_overlay(kind, &table, &guards, &current, row_id).await;
+                    assert!(
+                        !accessor
+                            .delete_index(
+                                &guards,
+                                index,
+                                &current.vals,
+                                row_id,
+                                kind.unique(),
+                                MAX_SNAPSHOT_TS
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    let key = kind.stale_key();
+                    install_delete_overlay(kind, &table, &guards, &key, row_id).await;
+                    assert!(
+                        !accessor
+                            .delete_index(
+                                &guards,
+                                index,
+                                &key.vals,
+                                row_id + 1,
+                                kind.unique(),
+                                MAX_SNAPSHOT_TS
+                            )
+                            .await
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+                        Some(true)
+                    );
+                    let (_hook, entered, release) =
+                        pause_index_purge(&table, index, PurgeIndexTestPhase::BeforeRowPage);
+                    let mut purge = Box::pin(accessor.delete_index(
+                        &guards,
+                        index,
+                        &key.vals,
+                        row_id,
+                        kind.unique(),
+                        MAX_SNAPSHOT_TS,
+                    ));
+                    assert!(futures::poll!(purge.as_mut()).is_pending());
+                    entered.recv_async().await.unwrap();
+                    let runtime = layout.expect_secondary_index(index);
+                    if kind.unique() {
+                        let mem = runtime.unique_mem().unwrap().bind(guards.index_guard());
+                        if change == PurgeEntryChange::Remove {
+                            assert!(
+                                mem.compare_delete(&key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap()
+                            );
+                        } else if change == PurgeEntryChange::Replace {
+                            assert!(
+                                mem.replace_or_insert(
+                                    &key.vals,
+                                    row_id.deleted(),
+                                    row_id + 1,
+                                    MAX_SNAPSHOT_TS
+                                )
+                                .await
+                                .unwrap()
+                                .is_ok()
+                            );
+                            assert!(
+                                mem.mask_as_deleted(&key.vals, row_id + 1, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap()
+                            );
+                        } else {
+                            assert_eq!(
+                                mem.insert_if_not_exists(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap(),
+                                IndexInsert::Ok(true)
+                            );
+                        }
+                    } else {
+                        let mem = runtime.non_unique_mem().unwrap().bind(guards.index_guard());
+                        if change == PurgeEntryChange::Remove {
+                            assert!(
+                                mem.compare_delete(&key.vals, row_id, false, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap()
+                            );
+                        } else if change == PurgeEntryChange::Replace {
+                            assert_eq!(
+                                mem.insert_if_not_exists(
+                                    &key.vals,
+                                    row_id + 1,
+                                    false,
+                                    MAX_SNAPSHOT_TS
+                                )
+                                .await
+                                .unwrap(),
+                                IndexInsert::Ok(false)
+                            );
+                            assert!(
+                                mem.mask_as_deleted(&key.vals, row_id + 1, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap()
+                            );
+                        } else {
+                            assert_eq!(
+                                mem.insert_if_not_exists(&key.vals, row_id, true, MAX_SNAPSHOT_TS)
+                                    .await
+                                    .unwrap(),
+                                IndexInsert::Ok(true)
+                            );
+                        }
+                    }
+                    release.send_async(()).await.unwrap();
+                    let deleted = change == PurgeEntryChange::Remove
+                        || (change == PurgeEntryChange::Replace && !kind.unique());
+                    assert_eq!(purge.await.unwrap(), deleted, "{kind:?}: {change:?}");
+                    if change == PurgeEntryChange::Replace {
+                        assert_eq!(
+                            retained_overlay_state(kind, &layout, &guards, &key, row_id + 1).await,
+                            Some(true)
+                        );
+                        if !kind.unique() {
+                            assert_eq!(
+                                retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+                                None
+                            );
+                        }
+                    } else {
+                        assert_eq!(
+                            retained_overlay_state(kind, &layout, &guards, &key, row_id).await,
+                            if deleted { None } else { Some(false) }
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// Purpose: Exercise historical cold deletes followed immediately by unique CREATE and DROP.
+    /// Expected: The surviving payloads support a unique index and public checkpoint completes
+    /// without a deletion-purge prerequisite before dropping the original nonunique index.
+    #[test]
+    fn test_index_purge_historical_delete_create_drop_checkpoint() {
+        use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
+        use crate::{CallbackResult, RowMutation, TableIndex, ValKind};
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&root, "historical_delete_drop").await;
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    ]),
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    )],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let mut trx = session.begin_trx().unwrap();
+            for i in 0..200i32 {
+                unwrap_insert_result(
+                    trx.table_insert_mvcc(table_id, vec![Val::from(i), Val::from(i % 100)])
+                        .await,
+                );
+            }
+            trx.commit().await.unwrap();
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            let mut trx = session.begin_trx().unwrap();
+            let outcome = trx
+                .table_index_mutate_mvcc(
+                    TableIndex(table_id, IndexID::new(0)),
+                    ..,
+                    |row| -> CallbackResult<_> {
+                        Ok(if row.val(0)?.as_i32().unwrap() < 100 {
+                            RowMutation::Delete
+                        } else {
+                            RowMutation::Skip
+                        })
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.delete_count, 100);
+            trx.commit().await.unwrap();
+            let replacement = session
+                .create_index(
+                    table_id,
+                    StorageIndexSpec::new(vec![StorageIndexKey::new(1)], StorageIndexFlags::UK),
+                )
+                .await
+                .unwrap();
+            session.drop_index(table_id, IndexID::new(0)).await.unwrap();
+            assert_checkpoint_published(&mut session, table_id).await;
+            let mut reader = session.begin_trx().unwrap();
+            let mut scan = reader
+                .table_index_scan_mvcc_stream(TableIndex(table_id, replacement), .., &[0, 1])
+                .await
+                .unwrap();
+            let mut found = Vec::new();
+            while let Some(row) = scan.next().await.unwrap() {
+                found.push((row[0].as_i32().unwrap(), row[1].as_i32().unwrap()));
+            }
+            assert_eq!(found, (100..200).map(|i| (i, i % 100)).collect::<Vec<_>>());
+        });
     }
 }

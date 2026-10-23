@@ -9,7 +9,9 @@ use super::{
 };
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::buffer::{EvictableBufferPool, PoolGuards};
-use crate::catalog::{IndexRef, IndexSlot, ResolvedIndexKey, TableColumnLayout, TableMetadata};
+use crate::catalog::{
+    IndexRef, ResolvedIndexKey, SecondaryIndexSlot, TableColumnLayout, TableMetadata,
+};
 use crate::error::{
     CallbackError, CallbackResult, DataIntegrityError, DataIntegrityResult, DiscloseError,
     DiscloseResultExt, InternalError, MultiDomainResultExt, OperationError, OperationOrFatalResult,
@@ -24,8 +26,8 @@ use crate::index::util::{Maskable, RowPageCreateRedoCtx};
 use crate::index::{
     BorrowedIndexMutationStream, ColumnBlockIndex, ColumnBlockScanEntry, ColumnLeafEntry,
     CurrentIndexReadHandle, IndexBatchStream, IndexCompareExchange, IndexLookupCandidate,
-    IndexMask, KeyRange, LwcRowLocation, NonUniqueSecondaryIndex, OwnedCurrentIndexReadHandle,
-    OwnedIndexCandidateStream, RowLocation, SecondaryIndex, UniqueSecondaryIndex,
+    IndexMask, KeyRange, LwcRowLocation, OwnedCurrentIndexReadHandle, OwnedIndexCandidateStream,
+    RowLocation, SecondaryIndex, UniqueSecondaryIndex,
 };
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::lwc::{LwcBlock, PersistedLwcBlock, PreparedLwcBlock};
@@ -66,6 +68,9 @@ use super::unique_mutate::run_current_cold_hook;
 
 #[cfg(test)]
 pub(super) use tests::dense_initializations;
+
+#[cfg(test)]
+pub(crate) use tests::{PurgeIndexTestPhase, install_purge_index_hook, run_purge_index_hook};
 
 pub(super) enum LazyRowSource<'row> {
     Cold {
@@ -853,28 +858,6 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn require_unique_index_unchecked<'g>(
-        &self,
-        guards: &'g PoolGuards,
-        index: IndexRef,
-        root: Option<BlockID>,
-    ) -> RuntimeResult<UniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
-        self.require_sec_idx(index)
-            .bind_unique_unchecked(guards, root)
-    }
-
-    #[inline]
-    fn require_non_unique_index_unchecked<'g>(
-        &self,
-        guards: &'g PoolGuards,
-        index: IndexRef,
-        root: Option<BlockID>,
-    ) -> RuntimeResult<NonUniqueSecondaryIndex<'_, 'g, EvictableBufferPool>> {
-        self.require_sec_idx(index)
-            .bind_non_unique_unchecked(guards, root)
-    }
-
-    #[inline]
     fn current_index_read_handle<'g, 'idx>(
         &'idx self,
         rt: TrxRuntime<'g>,
@@ -917,14 +900,15 @@ impl<'op> UserTableAccessor<'op> {
     }
 
     #[inline]
-    fn unchecked_secondary_root(&self, index_slot: IndexSlot) -> Option<BlockID> {
-        // Unchecked internal callers share the same layout/root compatibility
-        // contract as proof-gated foreground reads. Purge additionally treats
-        // inactive layout slots as no-ops before reaching this binding point.
-        self.storage
-            .file()
-            .active_root_unchecked()
-            .secondary_index_root(index_slot)
+    fn purge_index_is_active(&self, index: IndexRef) -> bool {
+        // This observation admits one attempt. DROP may publish afterward:
+        // the retained layout still owns the exact MemIndex we borrow. Purge
+        // finishes its buckets before the coordinator reclaims retained roots.
+        let root = self.storage.file().active_root_unchecked();
+        matches!(
+            root.secondary_index_slots.get(index.slot().as_usize()),
+            Some(SecondaryIndexSlot::Active { index_id, .. }) if *index_id == index.id()
+        )
     }
 
     /// Captures the full proof-branded root used by transaction scan planning.
@@ -1575,9 +1559,18 @@ impl<'op> UserTableAccessor<'op> {
         min_active_sts: TrxID,
     ) -> RuntimeOrFatalResult<bool> {
         let index_slot = index_ref.slot();
-        let (page_guard, row_id, index) = loop {
-            let root = self.unchecked_secondary_root(index_slot);
-            let index = self.require_unique_index_unchecked(guards, index_ref, root)?;
+        let index = self
+            .require_sec_idx(index_ref)
+            .unique_mem()?
+            .bind(guards.index_guard());
+        let page_guard = loop {
+            #[cfg(test)]
+            run_purge_index_hook(self.table, index_ref, PurgeIndexTestPhase::BeforeAdmission).await;
+            if !self.purge_index_is_active(index_ref) {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            run_purge_index_hook(self.table, index_ref, PurgeIndexTestPhase::AfterAdmission).await;
             match index.lookup(key_vals, MIN_SNAPSHOT_TS).await? {
                 None => return Ok(false), // Another thread deleted this entry.
                 Some((index_row_id, deleted)) => {
@@ -1595,11 +1588,18 @@ impl<'op> UserTableAccessor<'op> {
                     {
                         IndexPurgeDecision::Delete => {
                             return index
-                                .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
+                            #[cfg(test)]
+                            run_purge_index_hook(
+                                self.table,
+                                index_ref,
+                                PurgeIndexTestPhase::BeforeRowPage,
+                            )
+                            .await;
                             let Some(page_guard) = self
                                 .row_store()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
@@ -1607,7 +1607,7 @@ impl<'op> UserTableAccessor<'op> {
                             else {
                                 continue;
                             };
-                            break (page_guard, row_id, index);
+                            break page_guard;
                         }
                     }
                 }
@@ -1620,7 +1620,7 @@ impl<'op> UserTableAccessor<'op> {
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), index_slot, key_vals) {
             return index
-                .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
+                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -1636,9 +1636,18 @@ impl<'op> UserTableAccessor<'op> {
         min_active_sts: TrxID,
     ) -> RuntimeOrFatalResult<bool> {
         let index_slot = index_ref.slot();
-        let (page_guard, row_id, index) = loop {
-            let root = self.unchecked_secondary_root(index_slot);
-            let index = self.require_non_unique_index_unchecked(guards, index_ref, root)?;
+        let index = self
+            .require_sec_idx(index_ref)
+            .non_unique_mem()?
+            .bind(guards.index_guard());
+        let page_guard = loop {
+            #[cfg(test)]
+            run_purge_index_hook(self.table, index_ref, PurgeIndexTestPhase::BeforeAdmission).await;
+            if !self.purge_index_is_active(index_ref) {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            run_purge_index_hook(self.table, index_ref, PurgeIndexTestPhase::AfterAdmission).await;
             match index
                 .lookup_unique(key_vals, row_id, MIN_SNAPSHOT_TS)
                 .await?
@@ -1659,11 +1668,18 @@ impl<'op> UserTableAccessor<'op> {
                     {
                         IndexPurgeDecision::Delete => {
                             return index
-                                .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
+                                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                                 .await;
                         }
                         IndexPurgeDecision::Keep => return Ok(false),
                         IndexPurgeDecision::RowPage(page_id) => {
+                            #[cfg(test)]
+                            run_purge_index_hook(
+                                self.table,
+                                index_ref,
+                                PurgeIndexTestPhase::BeforeRowPage,
+                            )
+                            .await;
                             let Some(page_guard) = self
                                 .row_store()
                                 .try_get_validated_row_page_shared_result(guards, page_id, row_id)
@@ -1671,7 +1687,7 @@ impl<'op> UserTableAccessor<'op> {
                             else {
                                 continue;
                             };
-                            break (page_guard, row_id, index);
+                            break page_guard;
                         }
                     }
                 }
@@ -1684,7 +1700,7 @@ impl<'op> UserTableAccessor<'op> {
         // LWC rows whose persisted image is the only current key material.
         if !access.any_version_matches_key(self.metadata(), index_slot, key_vals) {
             return index
-                .compare_delete_mem(key_vals, row_id, false, MIN_SNAPSHOT_TS)
+                .compare_delete(key_vals, row_id, false, MIN_SNAPSHOT_TS)
                 .await;
         }
         Ok(false)
@@ -3130,8 +3146,10 @@ impl<'op> UserTableAccessor<'op> {
         if !self.validates_index_ref(index_ref) {
             return Ok(false);
         }
-        let index_schema = self.metadata().idx.expect_index_spec(index_ref);
-        debug_assert_eq!(unique, index_schema.unique());
+        debug_assert_eq!(
+            unique,
+            self.metadata().idx.expect_index_spec(index_ref).unique()
+        );
         if unique {
             self.delete_unique_index(guards, index_ref, key_vals, row_id, min_active_sts)
                 .await
@@ -3563,17 +3581,54 @@ mod tests {
     use crate::value::{Val, ValKind};
     use error_stack::Report;
     use futures::FutureExt;
+    use parking_lot::Mutex;
     use smol::Timer;
     use smol::future::yield_now;
     use std::cell::Cell;
+    use std::future::Future;
     use std::io::Error as StdIoError;
     use std::iter::repeat_n;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::pin::Pin;
+    use std::ptr::from_ref;
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::TempDir;
+
+    static PURGE_INDEX_HOOKS: Mutex<Vec<PurgeIndexHookEntry>> = Mutex::new(Vec::new());
+    static PURGE_INDEX_HOOK_ID: AtomicUsize = AtomicUsize::new(0);
+
+    /// Boundaries of one secondary-index purge attempt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum PurgeIndexTestPhase {
+        /// The layout and exact memory runtime have already been retained.
+        BeforeAdmission,
+        /// The current root admitted this exact generation.
+        AfterAdmission,
+        /// Row routing selected a hot page, before validating its identity.
+        BeforeRowPage,
+    }
+
+    type PurgeIndexHook = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+    struct PurgeIndexHookEntry {
+        table: usize,
+        index: IndexRef,
+        phase: PurgeIndexTestPhase,
+        hook: PurgeIndexHook,
+        id: usize,
+    }
+
+    /// Removes an unconsumed targeted hook when its test scope exits.
+    pub(crate) struct PurgeIndexHookGuard(usize);
+
+    impl Drop for PurgeIndexHookGuard {
+        fn drop(&mut self) {
+            PURGE_INDEX_HOOKS.lock().retain(|entry| entry.id != self.0);
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ColdReadCorruption {
@@ -3614,6 +3669,46 @@ mod tests {
 
     thread_local! {
         static DENSE_INITIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Installs a one-shot hook for an exact table runtime and index generation.
+    pub(crate) fn install_purge_index_hook(
+        table: &Table,
+        index: IndexRef,
+        phase: PurgeIndexTestPhase,
+        hook: impl Future<Output = ()> + Send + 'static,
+    ) -> PurgeIndexHookGuard {
+        let id = PURGE_INDEX_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+        PURGE_INDEX_HOOKS.lock().push(PurgeIndexHookEntry {
+            table: from_ref(table) as usize,
+            index,
+            phase,
+            hook: Box::pin(hook),
+            id,
+        });
+        PurgeIndexHookGuard(id)
+    }
+
+    /// Runs targeted control after releasing the hook registry lock.
+    pub(crate) async fn run_purge_index_hook(
+        table: &Table,
+        index: IndexRef,
+        phase: PurgeIndexTestPhase,
+    ) {
+        let hook = {
+            let mut hooks = PURGE_INDEX_HOOKS.lock();
+            hooks
+                .iter()
+                .position(|entry| {
+                    entry.table == from_ref(table) as usize
+                        && entry.index == index
+                        && entry.phase == phase
+                })
+                .map(|pos| hooks.remove(pos).hook)
+        };
+        if let Some(hook) = hook {
+            hook.await;
+        }
     }
 
     /// Returns dense callback initializations on this test thread.

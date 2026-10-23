@@ -683,21 +683,6 @@ impl<P: BufferPool> UniqueSecondaryIndex<'_, '_, P> {
         Ok(disk.lookup(key).await?.map(|row_id| (row_id, false)))
     }
 
-    /// Physically delete only a matching MemIndex owner.
-    #[inline]
-    pub(crate) async fn compare_delete_mem(
-        &self,
-        key: &[Val],
-        old_row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> StdResult<bool, P::Error> {
-        debug_assert!(!old_row_id.is_deleted());
-        self.mem
-            .compare_delete(key, old_row_id, ignore_del_mask, ts)
-            .await
-    }
-
     /// Scan lookup candidates across MemIndex and the captured DiskTree root.
     #[inline]
     pub(crate) fn index_scan_candidates<'a>(
@@ -862,47 +847,6 @@ impl<'a, 'g, P: BufferPool> NonUniqueSecondaryIndex<'a, 'g, P> {
 }
 
 impl<P: BufferPool> NonUniqueSecondaryIndex<'_, '_, P> {
-    /// Lookup one exact entry across MemIndex and the captured DiskTree root.
-    #[inline]
-    pub(crate) async fn lookup_unique(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        ts: TrxID,
-    ) -> RuntimeOrFatalResult<Option<bool>> {
-        if let Some(mem_hit) = self
-            .mem
-            .lookup_unique(key, row_id, ts)
-            .await
-            .map_err(Into::<RuntimeOrFatalError>::into)?
-        {
-            return Ok(Some(mem_hit));
-        }
-        let Some(disk) = self.open()? else {
-            return Ok(None);
-        };
-        if disk.contains_exact(key, row_id).await? {
-            Ok(Some(true))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Physically delete only a matching MemIndex exact entry.
-    #[inline]
-    pub(crate) async fn compare_delete_mem(
-        &self,
-        key: &[Val],
-        row_id: RowID,
-        ignore_del_mask: bool,
-        ts: TrxID,
-    ) -> StdResult<bool, P::Error> {
-        debug_assert!(!row_id.is_deleted());
-        self.mem
-            .compare_delete(key, row_id, ignore_del_mask, ts)
-            .await
-    }
-
     /// Scan lookup candidates across MemIndex and the captured DiskTree root.
     #[inline]
     pub(crate) fn index_scan_candidates<'a>(
@@ -1361,10 +1305,10 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect unique and non-unique point access when the captured disk root is absent.
-    /// Expected: No disk view is opened, missing keys stay absent, and unique insertion can use memory.
+    /// Purpose: Protect unique point reads and nonunique equality scans without a captured disk root.
+    /// Expected: Both read paths report no candidates and unique insertion succeeds in memory.
     #[test]
-    fn test_secondary_point_reads_skip_absent_disk_root() {
+    fn test_secondary_reads_skip_absent_disk_root() {
         smol::block_on(async {
             let (_temp_dir, fs) = build_test_fs();
             let metadata = metadata_with_indexes();
@@ -1420,13 +1364,14 @@ mod tests {
                 .bind_non_unique_unchecked(&pool_guards, None)
                 .unwrap();
             assert!(non_unique.open().unwrap().is_none());
-            assert_eq!(
-                non_unique
-                    .lookup_unique(&key, RowID::new(70), TrxID::new(2))
-                    .await
-                    .unwrap(),
-                None
-            );
+            let range = non_unique
+                .mem
+                .key_encoder()
+                .encode_non_unique_equal_range(&key);
+            let mut stream = non_unique
+                .equal_scan_candidates(&range, TrxID::new(2))
+                .unwrap();
+            assert_eq!(drain_row_ids(&mut stream).await, []);
         });
     }
 
@@ -1778,18 +1723,6 @@ mod tests {
                     .unwrap(),
                 IndexCompareExchange::Ok
             );
-            assert!(
-                bound
-                    .compare_delete_mem(&key4, RowID::new(40), false, TrxID::new(7))
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                bound
-                    .compare_delete_mem(&key4, RowID::new(41), false, TrxID::new(7))
-                    .await
-                    .unwrap()
-            );
 
             let full_range = KeyRange::new(Unbounded, Unbounded);
             let mut full_stream = bound
@@ -1922,7 +1855,7 @@ mod tests {
     }
 
     /// Purpose: Protect non-unique candidate merging and masking across memory and disk sources.
-    /// Expected: Scans deduplicate exact owners and memory masks take precedence without changing disk data.
+    /// Expected: Scans deduplicate exact owners before and after memory masking without changing disk data.
     #[test]
     fn test_non_unique_dual_tree_merge_and_overlay_semantics() {
         smol::block_on(async {
@@ -2037,8 +1970,8 @@ mod tests {
             #[cfg(feature = "profiling")]
             assert_eq!(_hot_insert_delta.cache_misses, 0);
             assert!(
-                bound
-                    .compare_delete_mem(&key1, RowID::new(100), true, TrxID::new(4))
+                non_unique_mem_bound
+                    .compare_delete(&key1, RowID::new(100), true, TrxID::new(4))
                     .await
                     .unwrap()
             );
@@ -2064,27 +1997,7 @@ mod tests {
                 drain_row_ids(&mut key1_stream).await,
                 test_row_ids([10, 11, 12])
             );
-            assert_eq!(
-                bound
-                    .lookup_unique(&key1, RowID::new(10), TrxID::new(4))
-                    .await
-                    .unwrap(),
-                Some(false)
-            );
-            assert_eq!(
-                bound
-                    .lookup_unique(&key1, RowID::new(11), TrxID::new(4))
-                    .await
-                    .unwrap(),
-                Some(true)
-            );
-            assert_eq!(
-                bound
-                    .lookup_unique(&key1, RowID::new(99), TrxID::new(4))
-                    .await
-                    .unwrap(),
-                None
-            );
+
             assert!(
                 non_unique_mem_bound
                     .mask_as_active(&key1, RowID::new(10), TrxID::new(5))
@@ -2119,12 +2032,6 @@ mod tests {
                     .await
                     .unwrap(),
                 IndexMask::Masked
-            );
-            assert!(
-                bound
-                    .compare_delete_mem(&key3, RowID::new(30), false, TrxID::new(7))
-                    .await
-                    .unwrap()
             );
 
             let key1_range = index.key_encoder().encode_non_unique_equal_range(&key1);
