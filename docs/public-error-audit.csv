@@ -83,3 +83,7 @@ doradb-storage/src/trx/stream_stmt.rs,StreamStmtState::table_index_scan_mvcc_str
 doradb-storage/src/trx/stream_stmt.rs,StreamStmtState::table_scan_mvcc_stream,3
 doradb-storage/src/trx/stream_stmt.rs,TableScanMvccStreamState::load_pending,1
 doradb-storage/src/value.rs,ValKind::try_from,1
+doradb-storage/src/value.rs,invalid_length,1
+doradb-storage/src/value.rs,invalid_length,1
+doradb-storage/src/value.rs,invalid_length,1
+doradb-storage/src/value.rs,invalid_length,1

@@ -673,8 +673,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let new_row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(10_001i32), Val::from("reborn")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(10_001i32), Val::try_from("reborn").unwrap()],
+                )
+                .await,
             );
             assert_ne!(new_row_id, RowID::new(stale_row_id));
             assert_unique_index_entry(
@@ -701,11 +704,14 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(10_001i32), Val::from("reclaimed")],
+                vec![Val::from(10_001i32), Val::try_from("reclaimed").unwrap()],
             )
             .await;
             expect_select_committed(table_id, &mut session, &key, |vals| {
-                assert_eq!(vals, vec![Val::from(10_001i32), Val::from("reclaimed")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(10_001i32), Val::try_from("reclaimed").unwrap()]
+                );
             })
             .await;
         });
@@ -727,7 +733,7 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("one")],
+                vec![Val::from(1i32), Val::try_from("one").unwrap()],
             )
             .await;
 
@@ -778,8 +784,11 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let new_row_id = unwrap_insert_result(
-                trx.table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from("two")])
-                    .await,
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(2i32), Val::try_from("two").unwrap()],
+                )
+                .await,
             );
             assert_ne!(new_row_id, old_row_id);
             assert_unique_index_entry(
@@ -803,18 +812,21 @@ mod tests {
             )
             .await;
             expect_select_committed(table_id, &mut session, &live_key, |vals| {
-                assert_eq!(vals, vec![Val::from(1i32), Val::from("one")]);
+                assert_eq!(vals, vec![Val::from(1i32), Val::try_from("one").unwrap()]);
             })
             .await;
             expect_select_not_found_committed(table_id, &mut session, &stale_key).await;
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(2i32), Val::from("two-final")],
+                vec![Val::from(2i32), Val::try_from("two-final").unwrap()],
             )
             .await;
             expect_select_committed(table_id, &mut session, &stale_key, |vals| {
-                assert_eq!(vals, vec![Val::from(2i32), Val::from("two-final")]);
+                assert_eq!(
+                    vals,
+                    vec![Val::from(2i32), Val::try_from("two-final").unwrap()]
+                );
             })
             .await;
         });
@@ -833,7 +845,7 @@ mod tests {
                 let mut session = engine.new_session().unwrap();
                 // insert 1 row
                 let mut trx = session.begin_trx().unwrap();
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 trx = expect_trx_insert(table_id, trx, insert).await;
                 // explicit rollback
                 trx.rollback().await.unwrap();
@@ -857,7 +869,7 @@ mod tests {
             {
                 let mut session = engine.new_session().unwrap();
                 // insert 1 row
-                let insert = vec![Val::from(1i32), Val::from("hello")];
+                let insert = vec![Val::from(1i32), Val::try_from("hello").unwrap()];
                 expect_insert_committed(table_id, &mut session, insert).await;
 
                 // delete it
@@ -865,7 +877,7 @@ mod tests {
                 expect_delete_committed(table_id, &mut session, &key).await;
 
                 // insert again, trigger insert+link
-                let insert = vec![Val::from(1i32), Val::from("world")];
+                let insert = vec![Val::from(1i32), Val::try_from("world").unwrap()];
                 let mut trx = session.begin_trx().unwrap();
                 trx = expect_trx_insert(table_id, trx, insert).await;
                 // explicit rollback

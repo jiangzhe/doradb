@@ -962,10 +962,14 @@ mod tests {
                 Val::from(f64::MAX),
                 &[0xFF, 0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
             ),
-            (ValType::new(ValKind::VarByte, false), Val::from(b""), &[]),
             (
                 ValType::new(ValKind::VarByte, false),
-                Val::from(b"test"),
+                Val::try_from(b"").unwrap(),
+                &[],
+            ),
+            (
+                ValType::new(ValKind::VarByte, false),
+                Val::try_from(b"test").unwrap(),
                 b"test",
             ),
             // Nullable
@@ -1062,7 +1066,7 @@ mod tests {
             ),
             (
                 ValType::new(ValKind::VarByte, false),
-                Val::from(b"test"),
+                Val::try_from(b"test").unwrap(),
                 b"test",
             ),
             (ValType::new(ValKind::I8, true), Val::Null, &[0x01]),
@@ -1080,14 +1084,17 @@ mod tests {
             ValType::new(ValKind::VarByte, false),
             ValType::new(ValKind::U8, true),
         ]);
-        let key = encoder.encode(&[Val::from(b"segmented"), Val::Null]);
+        let key = encoder.encode(&[Val::try_from(b"segmented").unwrap(), Val::Null]);
         assert_eq!(
             key.as_bytes(),
             &[
                 b's', b'e', b'g', b'm', b'e', b'n', b't', b'e', b'd', 0, 0, 0, 0, 0, 0, 9, 0x01
             ]
         );
-        let key = encoder.encode(&[Val::from(b"a very long key with three segments"), Val::Null]);
+        let key = encoder.encode(&[
+            Val::try_from(b"a very long key with three segments").unwrap(),
+            Val::Null,
+        ]);
         assert_eq!(
             key.as_bytes(),
             &[
@@ -1105,7 +1112,11 @@ mod tests {
             ValType::new(ValKind::VarByte, false),
             ValType::new(ValKind::F64, false),
         ]);
-        let keys = vec![Val::from(42i32), Val::from(b"multi"), Val::from(PI)];
+        let keys = vec![
+            Val::from(42i32),
+            Val::try_from(b"multi").unwrap(),
+            Val::from(PI),
+        ];
         let key = encoder.encode(&keys);
         assert_eq!(
             key.as_bytes(),
@@ -1120,7 +1131,7 @@ mod tests {
             ValType::new(ValKind::I32, true),
             ValType::new(ValKind::VarByte, true),
         ]);
-        let keys = vec![Val::Null, Val::from(b"null_test")];
+        let keys = vec![Val::Null, Val::try_from(b"null_test").unwrap()];
         let key = encoder.encode(&keys);
         assert_eq!(key.as_bytes(), b"\x01\x02null_test");
     }
@@ -1134,7 +1145,11 @@ mod tests {
             ValType::new(ValKind::VarByte, false),
             ValType::new(ValKind::F64, true),
         ];
-        let keys = vec![Val::from(42u32), Val::from(b"segmented-prefix"), Val::Null];
+        let keys = vec![
+            Val::from(42u32),
+            Val::try_from(b"segmented-prefix").unwrap(),
+            Val::Null,
+        ];
 
         let btree_encoder = BTreeKeyEncoder::new(val_types.clone());
         let multi_encoder = MultiKeyEncoder::new(val_types);

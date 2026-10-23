@@ -79,8 +79,11 @@ pub(super) async fn prepare_index_fixture(
                         };
                         let mut payload = vec![b'x'; fixture.value_bytes];
                         payload[..8].copy_from_slice(&payload_key.to_le_bytes());
-                        trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from(payload)])
-                            .await?;
+                        trx.table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(key), Val::try_from(payload)?],
+                        )
+                        .await?;
                     }
                     fence = Some(trx.commit().await?);
                 }
@@ -121,7 +124,7 @@ pub(super) async fn prepare_index_fixture(
                         }
                         Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from(vec![b'y'; fixture.value_bytes]),
+                            val: Val::try_from(vec![b'y'; fixture.value_bytes])?,
                         }]))
                     } else {
                         Ok(RowMutation::Skip)

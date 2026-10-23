@@ -434,7 +434,11 @@ mod tests {
                     row_id: RowID::new(1),
                     kind: RowRedoKind::Insert(
                         PageID::new(2),
-                        vec![Val::Null, Val::from("sample bytes"), Val::I32(17)],
+                        vec![
+                            Val::Null,
+                            Val::try_from("sample bytes").unwrap(),
+                            Val::I32(17),
+                        ],
                     ),
                 },
             },
@@ -446,7 +450,7 @@ mod tests {
                         PageID::new(2),
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("replacement bytes"),
+                            val: Val::try_from("replacement bytes").unwrap(),
                         }],
                     ),
                 },

@@ -2704,12 +2704,13 @@ mod tests {
                                     let values = match shape {
                                         0 => vec![Val::from(n)],
                                         1 => vec![
-                                            Val::from(vec![7u8; 128].as_slice()),
+                                            Val::try_from(vec![7u8; 128].as_slice()).unwrap(),
                                             Val::from(u64::from(n)),
                                         ],
                                         _ => vec![
                                             Val::from(n),
-                                            Val::from(vec![(n % 251) as u8; 192].as_slice()),
+                                            Val::try_from(vec![(n % 251) as u8; 192].as_slice())
+                                                .unwrap(),
                                         ],
                                     };
                                     encoder.encode(&values)
@@ -2767,7 +2768,9 @@ mod tests {
                 ValType::new(ValKind::I32, true),
                 ValType::new(ValKind::VarByte, false),
             ]);
-            let key = |value| composite.encode(&[value, Val::from(vec![17u8; 128].as_slice())]);
+            let key = |value| {
+                composite.encode(&[value, Val::try_from(vec![17u8; 128].as_slice()).unwrap()])
+            };
             let runs = fixture(
                 vec![
                     vec![key(Val::Null), key(Val::from(3i32))],

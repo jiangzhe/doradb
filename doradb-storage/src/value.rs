@@ -1,7 +1,10 @@
-// Intentional public trait convergence: `ValKind::try_from(u32)` must expose the
-// crate error while forwarding its sole DataIntegrity report; internal decoders
-// retain `DataIntegrityResult` and do not cross this boundary.
-use crate::error::{DataIntegrityError, DataIntegrityResult, DiscloseResultExt, Error, Result};
+// Public TryFrom adapters disclose crate errors: ValKind forwards DataIntegrity,
+// while owned byte conversions forward Operation. Internal construction and
+// decoding retain their native report domains.
+use crate::error::{
+    DataIntegrityError, DataIntegrityResult, DiscloseError, DiscloseResultExt, Error,
+    OperationError, Result,
+};
 use crate::memcmp::{
     BytesExtendable, MIN_VAR_MCF_LEN, MIN_VAR_NMCF_LEN, MemCmpFormat, Null, NullableMemCmpFormat,
     SegmentedBytes,
@@ -9,13 +12,13 @@ use crate::memcmp::{
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use error_stack::Report;
 use ordered_float::OrderedFloat;
-use std::alloc::{Layout as AllocLayout, alloc, dealloc};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::mem::{self, ManuallyDrop, MaybeUninit};
-use std::ptr::copy_nonoverlapping;
+use std::ptr::{copy_nonoverlapping, slice_from_raw_parts_mut};
+use std::result::Result as StdResult;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
-use std::str::from_utf8_unchecked;
+use std::str::{Utf8Error, from_utf8};
 use std::sync::atomic::*;
 use zerocopy_derive::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -263,6 +266,42 @@ impl Hash for Val {
 }
 
 impl Val {
+    /// Copies at most [`MemVar::MAX_LEN`] bytes, returning `InvalidDmlInput` if oversized.
+    /// Representable values may still exceed a row page's capacity.
+    #[inline]
+    pub fn try_from_bytes(data: &[u8]) -> Result<Self> {
+        // Keep report construction outside the successful constructor's inline body.
+        #[cold]
+        fn invalid_length(len: usize) -> Error {
+            MemVar::invalid_length(len)
+                .attach("Val::try_from_bytes")
+                .disclose()
+        }
+
+        if checked_var_len(data.len()).is_none() {
+            return Err(invalid_length(data.len()));
+        }
+        Ok(Self::VarByte(MemVar::from_bytes(data)))
+    }
+
+    /// Consumes a byte vector, returning `InvalidDmlInput` if it exceeds [`MemVar::MAX_LEN`].
+    /// The vector is consumed on error too; allocation failure is not recoverable.
+    #[inline]
+    pub fn try_from_vec(data: Vec<u8>) -> Result<Self> {
+        // Keep report construction outside the successful constructor's inline body.
+        #[cold]
+        fn invalid_length(data: Vec<u8>) -> Error {
+            MemVar::invalid_length(data.len())
+                .attach("Val::try_from_vec")
+                .disclose()
+        }
+
+        if checked_var_len(data.len()).is_none() {
+            return Err(invalid_length(data));
+        }
+        Ok(Self::VarByte(MemVar::from_vec(data)))
+    }
+
     /// Borrows this value without allocating or copying its byte payload.
     #[inline]
     pub(crate) fn view(&self) -> ValRef<'_> {
@@ -387,12 +426,19 @@ impl Val {
         }
     }
 
-    /// Returns this value as UTF-8 text, when it is varlen bytes.
+    /// Returns UTF-8 text, or `None` for invalid UTF-8 and non-byte values.
+    /// Use [`Self::try_as_str`] to distinguish invalid UTF-8 from other value kinds.
     #[inline]
     pub fn as_str(&self) -> Option<&str> {
+        self.try_as_str().ok().flatten()
+    }
+
+    /// Checks byte values as UTF-8, returning `Ok(None)` for non-byte values and null.
+    #[inline]
+    pub fn try_as_str(&self) -> StdResult<Option<&str>, Utf8Error> {
         match self {
-            Val::VarByte(v) => Some(v.as_str()),
-            _ => None,
+            Val::VarByte(v) => v.try_as_str().map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -534,31 +580,39 @@ impl From<f64> for Val {
     }
 }
 
-impl From<&[u8]> for Val {
+impl TryFrom<&[u8]> for Val {
+    type Error = Error;
+
     #[inline]
-    fn from(value: &[u8]) -> Self {
-        Val::VarByte(MemVar::from(value))
+    fn try_from(value: &[u8]) -> Result<Self> {
+        Self::try_from_bytes(value)
     }
 }
 
-impl<const LEN: usize> From<&[u8; LEN]> for Val {
+impl<const LEN: usize> TryFrom<&[u8; LEN]> for Val {
+    type Error = Error;
+
     #[inline]
-    fn from(value: &[u8; LEN]) -> Self {
-        Val::VarByte(MemVar::from(value))
+    fn try_from(value: &[u8; LEN]) -> Result<Self> {
+        Self::try_from_bytes(value)
     }
 }
 
-impl From<&str> for Val {
+impl TryFrom<&str> for Val {
+    type Error = Error;
+
     #[inline]
-    fn from(value: &str) -> Self {
-        Val::VarByte(MemVar::from(value.as_bytes()))
+    fn try_from(value: &str) -> Result<Self> {
+        Self::try_from_bytes(value.as_bytes())
     }
 }
 
-impl From<Vec<u8>> for Val {
+impl TryFrom<Vec<u8>> for Val {
+    type Error = Error;
+
     #[inline]
-    fn from(value: Vec<u8>) -> Self {
-        Val::VarByte(MemVar::from(value))
+    fn try_from(value: Vec<u8>) -> Result<Self> {
+        Self::try_from_vec(value)
     }
 }
 
@@ -619,7 +673,8 @@ impl Deser for Val {
             ValRef::I64(v) => Val::I64(v),
             ValRef::U64(v) => Val::U64(v),
             ValRef::F64(v) => Val::F64(v),
-            ValRef::VarByte(v) => Val::VarByte(MemVar::from(v)),
+            // The wire decoder reads a u16 byte length.
+            ValRef::VarByte(v) => Val::VarByte(MemVar::from_bytes(v)),
         };
         Ok((idx, value))
     }
@@ -627,6 +682,7 @@ impl Deser for Val {
 
 /// A short-lived value view borrowing bytes from its input owner.
 /// Scalar payloads retain their exact bits, including floating-point values.
+/// Byte slices need not be bounded; validators and writers enforce [`MemVar::MAX_LEN`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValRef<'a> {
     Null,
@@ -987,7 +1043,11 @@ impl PageVar {
     /// The data length must be no more than 6 bytes.
     #[inline]
     pub(crate) fn inline(data: &[u8]) -> Self {
-        debug_assert!(data.len() <= PAGE_VAR_LEN_INLINE);
+        assert!(
+            data.len() <= PAGE_VAR_LEN_INLINE,
+            "PageVar::inline length out of range: len={}, max={PAGE_VAR_LEN_INLINE}",
+            data.len()
+        );
         let mut b = [0u8; PAGE_VAR_HEADER];
         b[..2].copy_from_slice(&(data.len() as u16).to_le_bytes());
         b[2..2 + data.len()].copy_from_slice(data);
@@ -998,7 +1058,15 @@ impl PageVar {
     /// The prefix length must be 4 bytes.
     #[inline]
     pub(crate) fn outline(len: u16, offset: u16, prefix: &[u8]) -> Self {
-        debug_assert!(prefix.len() == PAGE_VAR_LEN_PREFIX);
+        assert!(
+            usize::from(len) > PAGE_VAR_LEN_INLINE,
+            "PageVar::outline requires outlined length: len={len}, offset={offset}"
+        );
+        assert!(
+            prefix.len() == PAGE_VAR_LEN_PREFIX,
+            "PageVar::outline prefix length mismatch: len={}, expected={PAGE_VAR_LEN_PREFIX}",
+            prefix.len()
+        );
         let mut b = [0u8; PAGE_VAR_HEADER];
         b[..2].copy_from_slice(&len.to_le_bytes());
         b[2..4].copy_from_slice(&offset.to_le_bytes());
@@ -1082,31 +1150,30 @@ impl PageVar {
     ///
     /// If this value is currently outlined, `ptr` must point at the start of
     /// the page backing this `PageVar`, and the existing outlined payload range
-    /// must be valid for writes. The caller must also ensure `val` fits within
-    /// the currently reserved inline or outlined storage.
+    /// must be valid for writes and disjoint from `val`. Representational length
+    /// and fit are checked before modifying the descriptor or payload.
     #[inline]
     #[cfg_attr(not(test), expect(dead_code, reason = "reserved update_in_place"))]
     pub(crate) unsafe fn update_in_place(&mut self, ptr: *mut u8, val: &[u8]) {
-        // SAFETY: the function contract guarantees `ptr` covers the current
-        // outlined payload, and this helper only writes within the existing
-        // inline bytes or reserved outlined storage.
-        unsafe {
-            debug_assert!(val.len() <= PAGE_VAR_LEN_INLINE || val.len() <= self.len());
-
-            if val.len() > PAGE_VAR_LEN_INLINE {
-                // all not inline, but original is longer or equal to input value.
-                debug_assert!(self.len() > PAGE_VAR_LEN_INLINE);
-                self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
-                let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
-                let target = from_raw_parts_mut(ptr.add(offset), val.len());
-                target.copy_from_slice(val);
-            } else {
-                // input is inlined.
-                // better to reuse release page data.
-                self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
-                self.b[2..].fill(0);
-                self.b[2..2 + val.len()].copy_from_slice(val);
-            }
+        assert!(
+            checked_var_len(val.len()).is_some()
+                && (val.len() <= PAGE_VAR_LEN_INLINE || val.len() <= self.len()),
+            "PageVar::update_in_place length does not fit: len={}, current_len={}, max={}",
+            val.len(),
+            self.len(),
+            MemVar::MAX_LEN
+        );
+        if val.len() > PAGE_VAR_LEN_INLINE {
+            let offset = u16::from_le_bytes([self.b[2], self.b[3]]) as usize;
+            // SAFETY: the caller supplies live, disjoint storage for the old
+            // outlined payload. The checked new length fits that allocation;
+            // inline old values cannot reach this branch after the fit check.
+            let target = unsafe { from_raw_parts_mut(ptr.add(offset), val.len()) };
+            target.copy_from_slice(val);
+            self.b[..2].copy_from_slice(&(val.len() as u16).to_le_bytes());
+            self.b[4..].copy_from_slice(&val[..PAGE_VAR_LEN_PREFIX]);
+        } else {
+            *self = Self::inline(val);
         }
     }
 
@@ -1132,68 +1199,160 @@ impl PageVar {
     }
 }
 
-/// VarBytes is similar to PageVar, but more general to use.
-/// It does not depend on page data.
+/// Owned binary bytes, stored inline up to 14 bytes and outlined otherwise.
+///
+/// Values contain at most [`Self::MAX_LEN`] bytes. Slice, array, and vector
+/// `TryFrom` conversions return `InvalidDmlInput` for oversized inputs, as do
+/// [`Self::try_from_bytes`] and [`Self::try_from_vec`]. Bytes need not be UTF-8.
+#[repr(C)]
 pub union MemVar {
     i: MemVarInline,
     o: ManuallyDrop<MemVarOutline>,
 }
 
 impl MemVar {
-    /// Create a new MemVar with inline data.
-    /// The data length must be no more than 14 bytes.
+    /// Maximum byte length representable by owned values and page descriptors.
+    /// A value within this limit may still exceed a row page's available capacity.
+    pub const MAX_LEN: usize = u16::MAX as usize;
+
+    /// Copies bytes, returning `InvalidDmlInput` if they exceed [`Self::MAX_LEN`].
+    /// This validates length but does not make allocation failure recoverable.
+    #[inline]
+    pub fn try_from_bytes(data: &[u8]) -> Result<Self> {
+        // Keep report construction outside the successful constructor's inline body.
+        #[cold]
+        fn invalid_length(len: usize) -> Error {
+            MemVar::invalid_length(len)
+                .attach("MemVar::try_from_bytes")
+                .disclose()
+        }
+
+        if checked_var_len(data.len()).is_none() {
+            return Err(invalid_length(data.len()));
+        }
+        Ok(Self::from_bytes(data))
+    }
+
+    /// Consumes a byte vector, returning `InvalidDmlInput` if it exceeds [`Self::MAX_LEN`].
+    /// The vector is consumed on error too; allocation failure is not recoverable.
+    #[inline]
+    pub fn try_from_vec(data: Vec<u8>) -> Result<Self> {
+        // Keep report construction outside the successful constructor's inline body.
+        #[cold]
+        fn invalid_length(data: Vec<u8>) -> Error {
+            MemVar::invalid_length(data.len())
+                .attach("MemVar::try_from_vec")
+                .disclose()
+        }
+
+        if checked_var_len(data.len()).is_none() {
+            return Err(invalid_length(data));
+        }
+        Ok(Self::from_vec(data))
+    }
+
+    /// Copies bytes whose length is established by an internal storage or catalog contract.
+    /// Panics in release builds if that invariant is violated. Runtime inputs must
+    /// use the public fallible constructors instead.
+    #[inline]
+    pub(crate) fn from_bytes(data: &[u8]) -> Self {
+        if data.len() <= MEM_VAR_LEN_INLINE {
+            Self::inline(data)
+        } else {
+            assert!(
+                checked_var_len(data.len()).is_some(),
+                "MemVar::from_bytes length exceeds limit: len={}, max={}",
+                data.len(),
+                Self::MAX_LEN
+            );
+            Self::outline(data)
+        }
+    }
+
+    /// Consumes bytes whose length is established by an internal catalog contract.
+    /// Panics in release builds if that invariant is violated, before ownership transfer.
+    #[inline]
+    pub(crate) fn from_vec(data: Vec<u8>) -> Self {
+        assert!(
+            checked_var_len(data.len()).is_some(),
+            "MemVar::from_vec length exceeds limit: len={}, max={}",
+            data.len(),
+            Self::MAX_LEN
+        );
+        if data.len() <= MEM_VAR_LEN_INLINE {
+            Self::inline(&data)
+        } else {
+            Self::outline_boxed_slice(data.into_boxed_slice())
+        }
+    }
+
+    #[cold]
+    fn invalid_length(len: usize) -> Report<OperationError> {
+        Report::new(OperationError::InvalidDmlInput).attach(format!(
+            "variable byte length exceeds limit: len={len}, max={}",
+            Self::MAX_LEN
+        ))
+    }
+
+    /// Creates an inline value without allocating.
+    ///
+    /// # Panics
+    /// Panics if `data` exceeds 14 bytes. Use [`Self::try_from_bytes`] for
+    /// runtime input that should select its storage mode automatically.
     #[inline]
     pub fn inline(data: &[u8]) -> Self {
-        debug_assert!(data.len() <= MEM_VAR_LEN_INLINE);
-        // SAFETY: we initialize only the inline variant fields before assuming
-        // the union is initialized.
-        unsafe {
-            let mut var = MaybeUninit::<MemVar>::uninit();
-            let i = &mut var.assume_init_mut().i;
-            i.len = data.len() as u16;
-            i.data[..data.len()].copy_from_slice(data);
-            var.assume_init()
+        assert!(
+            data.len() <= MEM_VAR_LEN_INLINE,
+            "MemVar::inline length out of range: len={}, max={MEM_VAR_LEN_INLINE}",
+            data.len()
+        );
+        let mut bytes = [MaybeUninit::uninit(); MEM_VAR_LEN_INLINE];
+        bytes[..data.len()].write_copy_of_slice(data);
+        Self {
+            i: MemVarInline {
+                len: data.len() as u16,
+                data: bytes,
+            },
         }
     }
 
-    /// Create a new outlined MemVar.
+    /// Copies bytes into an outlined allocation.
+    ///
+    /// # Panics
+    /// Panics unless the length is in `15..=Self::MAX_LEN`.
     #[inline]
     pub fn outline(data: &[u8]) -> Self {
-        debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff); // must be in range of u16
-        // SAFETY: this initializes the outlined variant fields plus a freshly
-        // allocated payload buffer before assuming the union is initialized.
-        // The allocation is checked before writing through its pointer.
-        unsafe {
-            let mut var = MaybeUninit::<MemVar>::uninit();
-            let o = &mut var.assume_init_mut().o;
-            o.len = data.len() as u16;
-            o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
-            let layout = AllocLayout::from_size_align_unchecked(data.len(), 1);
-            o.ptr = alloc(layout);
-            assert!(
-                !o.ptr.is_null(),
-                "MemVar allocation failed: bytes={}",
-                data.len()
-            );
-            o.ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
-            var.assume_init()
-        }
+        assert!(
+            data.len() > MEM_VAR_LEN_INLINE && checked_var_len(data.len()).is_some(),
+            "MemVar::outline length out of range: len={}, min={}, max={}",
+            data.len(),
+            MEM_VAR_LEN_INLINE + 1,
+            Self::MAX_LEN
+        );
+        Self::outline_boxed_slice(Box::from(data))
     }
 
-    /// Creates an outlined `MemVar` from an owned boxed slice.
+    /// Takes ownership of an outlined boxed slice.
+    ///
+    /// # Panics
+    /// Panics unless the length is in `15..=Self::MAX_LEN`.
     #[inline]
     pub fn outline_boxed_slice(data: Box<[u8]>) -> Self {
-        debug_assert!(data.len() > MEM_VAR_LEN_INLINE && data.len() <= 0xffff);
-        // SAFETY: this initializes the outlined variant fields and stores the
-        // leaked boxed-slice pointer as the owned payload pointer.
-        unsafe {
-            let mut var = MaybeUninit::<MemVar>::uninit();
-            let o = &mut var.assume_init_mut().o;
-            o.len = data.len() as u16;
-            o.prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
-            let ptr = Box::leak(data);
-            o.ptr = ptr as *mut [u8] as *mut u8;
-            var.assume_init()
+        assert!(
+            data.len() > MEM_VAR_LEN_INLINE && checked_var_len(data.len()).is_some(),
+            "MemVar::outline_boxed_slice length out of range: len={}, min={}, max={}",
+            data.len(),
+            MEM_VAR_LEN_INLINE + 1,
+            Self::MAX_LEN
+        );
+        let len = data.len() as u16;
+        let mut prefix = [0; MEM_VAR_LEN_PREFIX];
+        prefix.copy_from_slice(&data[..MEM_VAR_LEN_PREFIX]);
+        // All checks and prefix preparation precede ownership transfer. The
+        // unchanged length is retained to reconstruct this exact box in Drop.
+        let ptr = Box::into_raw(data).cast::<u8>();
+        Self {
+            o: ManuallyDrop::new(MemVarOutline { len, prefix, ptr }),
         }
     }
 
@@ -1201,8 +1360,8 @@ impl MemVar {
     #[expect(clippy::len_without_is_empty, reason = "code style")]
     #[inline]
     pub fn len(&self) -> usize {
-        // SAFETY: both `MemVar` union variants store `len` in the same leading
-        // position.
+        // SAFETY: the C-layout union and both C-layout members share the same
+        // initialized leading u16 length, regardless of the active member.
         unsafe { self.i.len as usize }
     }
 
@@ -1223,38 +1382,36 @@ impl MemVar {
         }
     }
 
-    /// Returns bytes.
+    /// Borrows only the initialized payload bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         let len = self.len();
         if len <= MEM_VAR_LEN_INLINE {
-            // SAFETY: the inline representation stores the payload bytes in the
-            // union's inline field.
-            unsafe { &self.i.data[..len] }
+            // SAFETY: len selects the inline member. Construction initializes
+            // exactly this prefix; MaybeUninit tail slots are never exposed.
+            // The slice borrows this member for no longer than self.
+            unsafe { from_raw_parts(self.i.data.as_ptr().cast::<u8>(), len) }
         } else {
-            // SAFETY: when `len` exceeds the inline threshold, the outlined
-            // representation owns `ptr..ptr+len`.
+            // SAFETY: len selects the outlined member, which uniquely owns a
+            // live Box<[u8]> of exactly len initialized bytes for self's lifetime.
             unsafe { from_raw_parts(self.o.ptr, len) }
         }
     }
 
-    /// Returns string.
+    /// Checks the payload as UTF-8 without allocating or changing its bytes.
+    #[inline]
+    pub fn try_as_str(&self) -> StdResult<&str, Utf8Error> {
+        from_utf8(self.as_bytes())
+    }
+
+    /// Borrows the payload as UTF-8 text.
+    ///
+    /// # Panics
+    /// Panics on invalid UTF-8. Use [`Self::try_as_str`] for arbitrary bytes.
     #[inline]
     pub fn as_str(&self) -> &str {
-        let len = self.len();
-        if len <= MEM_VAR_LEN_INLINE {
-            // SAFETY: callers only use `as_str` for values known to have been
-            // constructed from valid UTF-8 bytes.
-            unsafe { from_utf8_unchecked(&self.i.data[..len]) }
-        } else {
-            // SAFETY: callers only use `as_str` for values known to have been
-            // constructed from valid UTF-8 bytes, and the outlined payload is
-            // live for `self`'s lifetime.
-            unsafe {
-                let bytes = from_raw_parts(self.o.ptr, len);
-                from_utf8_unchecked(bytes)
-            }
-        }
+        self.try_as_str()
+            .unwrap_or_else(|err| panic!("MemVar::as_str requires valid UTF-8: {err}"))
     }
 }
 
@@ -1277,16 +1434,12 @@ impl Eq for MemVar {}
 impl Clone for MemVar {
     #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: `len` selects the active union layout, and the outlined path
-        // clones the owned heap payload before constructing the new union.
-        unsafe {
-            if self.len() > MEM_VAR_LEN_INLINE {
-                MemVar {
-                    o: ManuallyDrop::new((*self.o).clone()),
-                }
-            } else {
-                MemVar { i: self.i }
-            }
+        if self.is_inlined() {
+            // SAFETY: len selects the inline member. Copying MaybeUninit slots
+            // preserves the initialized prefix without reading the unused tail.
+            unsafe { Self { i: self.i } }
+        } else {
+            Self::outline(self.as_bytes())
         }
     }
 }
@@ -1296,60 +1449,50 @@ impl Drop for MemVar {
     fn drop(&mut self) {
         let len = self.len();
         if len > MEM_VAR_LEN_INLINE {
-            // SAFETY: outlined values own a heap allocation of exactly `len`
-            // bytes stored in `self.o.ptr`.
+            // SAFETY: len selects the outlined member and is unchanged since
+            // Box::into_raw. This value uniquely owns that allocation; rebuilding
+            // its original slice metadata drops it exactly once with its layout.
             unsafe {
-                let layout = AllocLayout::from_size_align_unchecked(len, 1);
-                dealloc(self.o.ptr, layout);
+                drop(Box::from_raw(slice_from_raw_parts_mut(self.o.ptr, len)));
             }
         }
     }
 }
 
-impl From<&[u8]> for MemVar {
+impl TryFrom<&[u8]> for MemVar {
+    type Error = Error;
+
     #[inline]
-    fn from(value: &[u8]) -> Self {
-        debug_assert!(value.len() <= 0xffff);
-        if value.len() <= MEM_VAR_LEN_INLINE {
-            Self::inline(value)
-        } else {
-            Self::outline(value)
-        }
+    fn try_from(value: &[u8]) -> Result<Self> {
+        Self::try_from_bytes(value)
     }
 }
 
-impl<const LEN: usize> From<&[u8; LEN]> for MemVar {
+impl<const LEN: usize> TryFrom<&[u8; LEN]> for MemVar {
+    type Error = Error;
+
     #[inline]
-    fn from(value: &[u8; LEN]) -> Self {
-        debug_assert!(LEN <= 0xffff);
-        if LEN <= MEM_VAR_LEN_INLINE {
-            Self::inline(value)
-        } else {
-            Self::outline(value)
-        }
+    fn try_from(value: &[u8; LEN]) -> Result<Self> {
+        Self::try_from_bytes(value)
     }
 }
 
-impl From<Vec<u8>> for MemVar {
+impl TryFrom<Vec<u8>> for MemVar {
+    type Error = Error;
+
     #[inline]
-    fn from(value: Vec<u8>) -> Self {
-        debug_assert!(value.len() <= 0xffff);
-        if value.len() <= MEM_VAR_LEN_INLINE {
-            Self::inline(&value[..])
-        } else {
-            Self::outline_boxed_slice(value.into_boxed_slice())
-        }
+    fn try_from(value: Vec<u8>) -> Result<Self> {
+        Self::try_from_vec(value)
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 #[repr(C, align(8))]
 struct MemVarInline {
     len: u16,
-    data: [u8; MEM_VAR_LEN_INLINE],
+    data: [MaybeUninit<u8>; MEM_VAR_LEN_INLINE],
 }
 
-#[derive(PartialEq, Eq)]
 #[repr(C, align(8))]
 struct MemVarOutline {
     len: u16,
@@ -1357,29 +1500,319 @@ struct MemVarOutline {
     ptr: *mut u8,
 }
 
-impl Clone for MemVarOutline {
-    #[inline]
-    fn clone(&self) -> Self {
-        // SAFETY: this allocates a fresh buffer of `self.len` bytes and copies
-        // exactly that many bytes from the live source pointer.
-        unsafe {
-            let layout = AllocLayout::from_size_align_unchecked(self.len as usize, 1);
-            let ptr = alloc(layout);
-            copy_nonoverlapping(self.ptr, ptr, self.len as usize);
-            MemVarOutline {
-                len: self.len,
-                prefix: self.prefix,
-                ptr,
-            }
-        }
-    }
+/// Checks whether a variable byte length fits the owned and stored representations.
+#[inline]
+pub(crate) fn checked_var_len(len: usize) -> Option<u16> {
+    u16::try_from(len).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use std::array::from_fn;
     use std::f64::consts::PI as PI_F64;
+    use std::hash::DefaultHasher;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    fn assert_contract_panic<T>(operation: impl FnOnce() -> T, diagnostic: &str) {
+        let result = catch_unwind(AssertUnwindSafe(operation));
+        let Err(panic) = result else {
+            panic!("expected contract rejection: {diagnostic}");
+        };
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains(diagnostic), "{message}");
+    }
+
+    fn check_binary_construction<const N: usize>() {
+        let bytes: [u8; N] = from_fn(|idx| if idx % 2 == 0 { 0xff } else { 0 });
+        let direct = if N <= MEM_VAR_LEN_INLINE {
+            MemVar::inline(&bytes)
+        } else {
+            MemVar::outline(&bytes)
+        };
+        // Typed results also exercise the blanket TryInto adapters for every byte source.
+        let array_var: Result<MemVar> = (&bytes).try_into();
+        let slice_var: Result<MemVar> = bytes.as_slice().try_into();
+        let vec_var: Result<MemVar> = bytes.to_vec().try_into();
+        let array_val: Result<Val> = (&bytes).try_into();
+        let slice_val: Result<Val> = bytes.as_slice().try_into();
+        let vec_val: Result<Val> = bytes.to_vec().try_into();
+        let values = [
+            Val::VarByte(direct),
+            Val::VarByte(array_var.unwrap()),
+            Val::VarByte(slice_var.unwrap()),
+            Val::VarByte(vec_var.unwrap()),
+            Val::VarByte(MemVar::try_from_bytes(&bytes).unwrap()),
+            Val::VarByte(MemVar::try_from_vec(bytes.to_vec()).unwrap()),
+            Val::try_from_bytes(&bytes).unwrap(),
+            Val::try_from_vec(bytes.to_vec()).unwrap(),
+            array_val.unwrap(),
+            slice_val.unwrap(),
+            vec_val.unwrap(),
+        ];
+        for value in values {
+            let clone = value.clone();
+            assert_eq!(value.as_bytes(), Some(bytes.as_slice()), "len={N}");
+            assert_eq!(clone, value, "len={N}");
+            assert_ne!(clone, Val::Null);
+            let Val::VarByte(var) = &value else {
+                unreachable!()
+            };
+            let Val::VarByte(cloned_var) = &clone else {
+                unreachable!()
+            };
+            assert_eq!(var.len(), N);
+            assert_eq!(var.is_inlined(), N <= MEM_VAR_LEN_INLINE);
+            assert!(var == cloned_var);
+            let hash = |v: &MemVar| {
+                let mut h = DefaultHasher::new();
+                v.hash(&mut h);
+                h.finish()
+            };
+            assert_eq!(hash(var), hash(cloned_var));
+            if N > MEM_VAR_LEN_INLINE {
+                assert_ne!(var.as_bytes().as_ptr(), cloned_var.as_bytes().as_ptr());
+            }
+            assert_eq!(
+                format!("{value:?}"),
+                if N == 0 {
+                    "bytes()".to_owned()
+                } else {
+                    format!("bytes({bytes:?})")
+                }
+            );
+            let mut encoded = vec![0; value.ser_len()];
+            assert_eq!(value.ser(&mut encoded[..], 0), encoded.len());
+            assert_eq!(&encoded[..4], &11u32.to_le_bytes());
+            assert_eq!(&encoded[4..6], &(N as u16).to_le_bytes());
+            assert_eq!(&encoded[6..], bytes.as_slice());
+            let (end, decoded) = Val::deser(encoded.as_slice(), 0).unwrap();
+            assert_eq!(end, encoded.len());
+            assert_eq!(decoded, value);
+            drop(value);
+            assert_eq!(clone.as_bytes(), Some(bytes.as_slice()));
+        }
+        if N > MEM_VAR_LEN_INLINE {
+            let boxed = MemVar::outline_boxed_slice(bytes.to_vec().into_boxed_slice());
+            assert_eq!(boxed.as_bytes(), bytes);
+        }
+        let text = "x".repeat(N);
+        let text_val: Result<Val> = text.as_str().try_into();
+        assert_eq!(text_val.unwrap().as_str(), Some(text.as_str()));
+    }
+
+    fn check_oversized_construction<const N: usize>() {
+        let bytes = [b'x'; N];
+        for (constructor, err) in [
+            (
+                "MemVar::try_from_bytes",
+                MemVar::try_from_bytes(&bytes).err().unwrap(),
+            ),
+            (
+                "MemVar::try_from_vec",
+                MemVar::try_from_vec(bytes.to_vec()).err().unwrap(),
+            ),
+            (
+                "Val::try_from_bytes",
+                Val::try_from_bytes(&bytes).unwrap_err(),
+            ),
+            (
+                "Val::try_from_vec",
+                Val::try_from_vec(bytes.to_vec()).unwrap_err(),
+            ),
+            (
+                "MemVar::try_from_bytes",
+                MemVar::try_from(bytes.as_slice()).err().unwrap(),
+            ),
+            (
+                "MemVar::try_from_bytes",
+                MemVar::try_from(&bytes).err().unwrap(),
+            ),
+            (
+                "MemVar::try_from_vec",
+                MemVar::try_from(bytes.to_vec()).err().unwrap(),
+            ),
+            (
+                "Val::try_from_bytes",
+                Val::try_from(bytes.as_slice()).unwrap_err(),
+            ),
+            ("Val::try_from_bytes", Val::try_from(&bytes).unwrap_err()),
+            (
+                "Val::try_from_vec",
+                Val::try_from(bytes.to_vec()).unwrap_err(),
+            ),
+            (
+                "Val::try_from_bytes",
+                Val::try_from("x".repeat(N).as_str()).unwrap_err(),
+            ),
+        ] {
+            assert_eq!(err.kind(), ErrorKind::Operation);
+            assert_eq!(
+                err.report().downcast_ref::<OperationError>(),
+                Some(&OperationError::InvalidDmlInput)
+            );
+            let report = format!("{err:?}");
+            for fact in [
+                constructor.to_owned(),
+                format!("len={N}"),
+                "max=65535".to_owned(),
+            ] {
+                assert!(report.contains(&fact), "{report}");
+            }
+        }
+        assert_contract_panic(|| MemVar::from_bytes(&bytes), "MemVar::from_bytes length");
+        assert_contract_panic(
+            || MemVar::from_vec(bytes.to_vec()),
+            "MemVar::from_vec length",
+        );
+        assert_contract_panic(|| MemVar::outline(&bytes), "MemVar::outline length");
+        assert_contract_panic(
+            || MemVar::outline_boxed_slice(bytes.to_vec().into_boxed_slice()),
+            "MemVar::outline_boxed_slice length",
+        );
+    }
+
+    /// Purpose: Protect owned binary values across storage and representational length boundaries.
+    /// Expected: Every conversion preserves exact bytes, independent clones, logical comparisons, and the wire format.
+    #[test]
+    fn test_owned_binary_length_boundaries() {
+        check_binary_construction::<0>();
+        check_binary_construction::<1>();
+        check_binary_construction::<6>();
+        check_binary_construction::<7>();
+        check_binary_construction::<13>();
+        check_binary_construction::<14>();
+        check_binary_construction::<15>();
+        check_binary_construction::<65535>();
+        assert_eq!(mem::align_of::<MemVar>(), 8);
+    }
+
+    /// Purpose: Reject lengths that would truncate the owned discriminator or violate an explicit storage mode.
+    /// Expected: Public conversions preserve typed length diagnostics; explicit modes and internal invariant constructors reject misuse.
+    #[test]
+    fn test_owned_constructor_rejections() {
+        check_oversized_construction::<65536>();
+        check_oversized_construction::<65551>();
+        assert_contract_panic(|| MemVar::inline(&[0; 15]), "MemVar::inline length");
+        for len in [0, 1, 6, 7, 14] {
+            let bytes = vec![0; len];
+            assert_contract_panic(|| MemVar::outline(&bytes), "MemVar::outline length");
+            assert_contract_panic(
+                || MemVar::outline_boxed_slice(bytes.into_boxed_slice()),
+                "MemVar::outline_boxed_slice length",
+            );
+        }
+    }
+
+    /// Purpose: Protect safe text access to arbitrary inline and outlined binary payloads.
+    /// Expected: Valid UTF-8 borrows unchanged text, invalid bytes retain native UTF-8 errors, and only the legacy MemVar accessor panics.
+    #[test]
+    fn test_checked_utf8_access() {
+        for text in ["", "a\0b", "你好", "你好，世界！hello"] {
+            let var = MemVar::try_from(text.as_bytes()).unwrap();
+            assert_eq!(var.try_as_str(), Ok(text));
+            assert_eq!(var.as_str(), text);
+            assert_eq!(var.try_as_str().unwrap().as_ptr(), var.as_bytes().as_ptr());
+            let val = Val::try_from(text).unwrap();
+            assert_eq!(val.try_as_str(), Ok(Some(text)));
+            assert_eq!(val.as_str(), Some(text));
+        }
+        for bytes in [
+            vec![0xff, 0],
+            vec![0xe4, 0xbd],
+            vec![0xff; 15],
+            [b"long binary bytes".as_slice(), &[0xe4]].concat(),
+        ] {
+            let expected = from_utf8(&bytes).unwrap_err();
+            let var = MemVar::try_from(bytes.as_slice()).unwrap();
+            assert_eq!(var.try_as_str(), Err(expected));
+            assert_contract_panic(|| var.as_str(), "MemVar::as_str requires valid UTF-8");
+            let val = Val::try_from(bytes.as_slice()).unwrap();
+            assert_eq!(val.try_as_str(), Err(expected));
+            assert_eq!(val.as_str(), None);
+            assert_eq!(val.as_bytes(), Some(bytes.as_slice()));
+        }
+        for val in [Val::Null, Val::I32(3)] {
+            assert_eq!(val.try_as_str(), Ok(None));
+            assert_eq!(val.as_str(), None);
+        }
+    }
+
+    /// Purpose: Protect page descriptor modes and in-place update bounds before mutation.
+    /// Expected: Invalid modes, prefixes, and growth leave bytes untouched, while accepted outlined updates refresh their prefix.
+    #[test]
+    fn test_page_var_contracts() {
+        assert_contract_panic(|| PageVar::inline(&[0; 7]), "PageVar::inline length");
+        assert_contract_panic(
+            || PageVar::outline(6, 0, b"abcd"),
+            "requires outlined length",
+        );
+        for prefix in [b"abc".as_slice(), b"abcde"] {
+            assert_contract_panic(|| PageVar::outline(7, 0, prefix), "prefix length mismatch");
+        }
+        for initial in [b"inline".as_slice(), b"outlined initial"] {
+            let mut page = vec![0xa5; MemVar::MAX_LEN + 1];
+            page[..initial.len()].copy_from_slice(initial);
+            let mut var = if initial.len() <= PAGE_VAR_LEN_INLINE {
+                PageVar::inline(initial)
+            } else {
+                PageVar::outline(initial.len() as u16, 0, &initial[..4])
+            };
+            for len in [initial.len() + 1, MemVar::MAX_LEN + 1] {
+                let bytes = vec![0; len];
+                let before = page.clone();
+                let descriptor = var.into_u64();
+                assert_contract_panic(
+                    || {
+                        // SAFETY: page backs the existing range and is disjoint from
+                        // bytes; the method must reject a new length that cannot fit.
+                        unsafe { var.update_in_place(page.as_mut_ptr(), &bytes) };
+                    },
+                    "PageVar::update_in_place length does not fit",
+                );
+                assert_eq!(var.into_u64(), descriptor);
+                assert_eq!(page, before);
+            }
+        }
+        let mut page = [0; 16];
+        let mut var = PageVar::outline(16, 0, b"old!");
+        // SAFETY: page holds the complete existing outlined range and does not alias input.
+        unsafe { var.update_in_place(page.as_mut_ptr(), b"new data") };
+        assert_eq!(&var.b[4..], b"new ");
+        assert_eq!(var.as_bytes(&page), b"new data");
+    }
+
+    /// Purpose: Preserve checked borrowed decoding at the maximum byte length and malformed wire boundaries.
+    /// Expected: Valid bytes borrow the wire payload exactly; truncation, invalid tags, and offset overflow return typed integrity errors.
+    #[test]
+    fn test_borrowed_decode_length_boundaries() {
+        let mut encoded = Vec::from(11u32.to_le_bytes());
+        encoded.extend(u16::MAX.to_le_bytes());
+        encoded.extend(vec![0xff; MemVar::MAX_LEN]);
+        let (end, val) = ValRef::deser(encoded.as_slice(), 0).unwrap();
+        assert_eq!(end, encoded.len());
+        let ValRef::VarByte(bytes) = val else {
+            panic!("expected borrowed bytes")
+        };
+        assert_eq!(bytes, &encoded[6..]);
+        assert_eq!(bytes.as_ptr(), encoded[6..].as_ptr());
+        for input in [
+            &encoded[..3],
+            &encoded[..5],
+            &encoded[..encoded.len() - 1],
+            &[0xff; 4],
+        ] {
+            let err = ValRef::deser(input, 0).unwrap_err();
+            assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
+        }
+        let err = ValRef::deser(encoded.as_slice(), usize::MAX).unwrap_err();
+        assert_eq!(err.current_context(), &DataIntegrityError::InvalidPayload);
+    }
 
     /// Purpose: Protect public disclosure of an invalid value-kind tag.
     /// Expected: The error retains its data-integrity classification and native invalid-payload cause.
@@ -1406,14 +1839,14 @@ mod tests {
     /// Expected: Bytes, text, length, and outlined-storage requirements match the input.
     #[test]
     fn test_mem_var() {
-        let var1 = MemVar::from(&b"hello"[..]);
+        let var1 = MemVar::try_from(&b"hello"[..]).unwrap();
         assert!(var1.is_inlined());
         assert!(var1.len() == 5);
         assert!(var1.as_bytes() == b"hello");
         assert!(var1.as_str() == "hello");
         assert!(MemVar::outline_len(b"hello") == 0);
 
-        let var2 = MemVar::from(&b"a long value stored outline"[..]);
+        let var2 = MemVar::try_from(&b"a long value stored outline"[..]).unwrap();
         assert!(!var2.is_inlined());
         assert!(var2.len() == 27);
         assert!(var2.as_bytes() == b"a long value stored outline");
@@ -1533,13 +1966,13 @@ mod tests {
         assert!(val == Val::from(PI_F64));
 
         // serialize and deserialize bytes
-        let val = Val::from(&b"hello"[..]);
+        let val = Val::try_from(&b"hello"[..]).unwrap();
         let mut buf = vec![0; val.ser_len()];
         val.ser(&mut buf[..], 0);
         assert!(buf == b"\x0b\x00\x00\x00\x05\x00\x68\x65\x6c\x6c\x6f");
 
         let (_, val) = Val::deser(&buf[..], 0).unwrap();
-        assert!(val == Val::from(&b"hello"[..]));
+        assert!(val == Val::try_from(&b"hello"[..]).unwrap());
     }
 
     /// Purpose: Protect value-type metadata serialization including nonzero offsets.
@@ -1796,7 +2229,7 @@ mod tests {
     /// Expected: The clone owns independent bytes that remain valid after the original is dropped.
     #[test]
     fn test_val_clone() {
-        let v1 = Val::from("000000000000000");
+        let v1 = Val::try_from("000000000000000").unwrap();
         let v2 = v1.clone();
         println!("v1={:?}", v1.as_bytes());
         println!("v2={:?}", v2.as_bytes());
@@ -1825,9 +2258,9 @@ mod tests {
         assert!(format!("{:?}", Val::U64(64)) == "u64(64)");
         assert!(format!("{:?}", Val::F64(OrderedFloat(2.5))) == "f64(2.5)");
 
-        let utf8 = Val::VarByte(MemVar::from(&b"hi"[..]));
+        let utf8 = Val::VarByte(MemVar::try_from(&b"hi"[..]).unwrap());
         assert!(format!("{:?}", utf8) == "bytes(hi)");
-        let non_utf8 = Val::VarByte(MemVar::from(&[0xffu8][..]));
+        let non_utf8 = Val::VarByte(MemVar::try_from(&[0xffu8][..]).unwrap());
         assert!(format!("{:?}", non_utf8) == "bytes([255])");
     }
 
@@ -1905,7 +2338,7 @@ mod tests {
     fn test_value_views_borrow_inline_and_outlined_bytes() {
         for len in [0, 6, 7, 14, 15, 128] {
             let input = vec![b'x'; len];
-            let owned = Val::from(input.as_slice());
+            let owned = Val::try_from(input.as_slice()).unwrap();
             let ValRef::VarByte(bytes) = owned.view() else {
                 panic!("expected bytes")
             };
@@ -1925,7 +2358,7 @@ mod tests {
             (&[0xff, 0, 0x80], "bytes([255, 0, 128])"),
         ] {
             assert_eq!(format!("{:?}", ValRef::VarByte(bytes)), expected);
-            assert_eq!(format!("{:?}", Val::from(bytes)), expected);
+            assert_eq!(format!("{:?}", Val::try_from(bytes).unwrap()), expected);
         }
     }
 }

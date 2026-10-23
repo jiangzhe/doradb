@@ -2597,7 +2597,7 @@ pub(crate) mod tests {
                     true,
                     UniqueMutation::Update(vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("invalid epoch"),
+                        val: Val::try_from("invalid epoch").unwrap(),
                     }]),
                 ),
             ] {

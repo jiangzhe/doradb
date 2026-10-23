@@ -1822,7 +1822,7 @@ pub(crate) mod tests {
                 Val::from(index_id),
                 Val::from(index_id as u16),
                 Val::from(0u32),
-                Val::from(key_spec),
+                Val::try_from(key_spec).unwrap(),
             ],
         }
     }

@@ -1,6 +1,6 @@
 use crate::catalog::{IndexSlot, PrimaryKeyMatchError, TableIndexMetadata, TableMetadata};
 use crate::row::{RowValues, UpdateValues};
-use crate::value::Val;
+use crate::value::{MemVar, Val, ValRef, checked_var_len};
 use error_stack::Report;
 use std::ops::{Bound, RangeBounds};
 use std::result::Result as StdResult;
@@ -62,6 +62,15 @@ impl<'m> DmlValidator<'m> {
                     self.metadata.col.col_type(col_no)
                 )));
             }
+            if let ValRef::VarByte(bytes) = val
+                && checked_var_len(bytes.len()).is_none()
+            {
+                return Err(Report::new(DmlValidationError::RowShape).attach(format!(
+                    "row byte length exceeds limit: column_no={col_no}, len={}, max={}",
+                    bytes.len(),
+                    MemVar::MAX_LEN
+                )));
+            }
         }
         Ok(())
     }
@@ -99,6 +108,17 @@ impl<'m> DmlValidator<'m> {
                         col_idx,
                         self.metadata.col.col_type(col_idx),
                         val
+                    )),
+                );
+            }
+            if let ValRef::VarByte(bytes) = val
+                && checked_var_len(bytes.len()).is_none()
+            {
+                return Err(
+                    Report::new(DmlValidationError::SparseUpdate).attach(format!(
+                        "update byte length exceeds limit: column_no={col_idx}, len={}, max={}",
+                        bytes.len(),
+                        MemVar::MAX_LEN
                     )),
                 );
             }
@@ -311,6 +331,126 @@ mod tests {
         }
     }
 
+    /// Purpose: Bound borrowed row and update bytes without changing existing validation precedence.
+    /// Expected: Representable binary inputs pass; oversized bytes retain column diagnostics and caller-specific error domains after shape, order, and type checks.
+    #[test]
+    fn test_borrowed_byte_length_validation() {
+        use crate::error::{DataIntegrityError, OperationError};
+        use crate::value::{MemVar, ValRef};
+        use error_stack::ResultExt;
+
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let validator = DmlValidator::new(&metadata);
+        for len in [
+            0,
+            6,
+            7,
+            14,
+            15,
+            MemVar::MAX_LEN,
+            MemVar::MAX_LEN + 1,
+            MemVar::MAX_LEN + 16,
+        ] {
+            let bytes = vec![0xff; len];
+            let row = BufferValues::new([(0, ValRef::I32(1)), (1, ValRef::VarByte(&bytes))]);
+            let update = BufferValues::new([(1, ValRef::VarByte(&bytes))]);
+            let valid = len <= MemVar::MAX_LEN;
+            for (result, context) in [
+                (
+                    validator.validate_full_row(&row),
+                    DmlValidationError::RowShape,
+                ),
+                (
+                    validator.validate_sparse_update(&update),
+                    DmlValidationError::SparseUpdate,
+                ),
+            ] {
+                assert_eq!(result.is_ok(), valid, "len={len}, result={result:?}");
+                if let Err(err) = result {
+                    assert_eq!(err.current_context(), &context);
+                    let report = format!("{err:?}");
+                    for fact in [
+                        "column_no=1".to_owned(),
+                        format!("len={len}"),
+                        "max=65535".to_owned(),
+                    ] {
+                        assert!(report.contains(&fact), "{report}");
+                    }
+                }
+            }
+            if valid {
+                let owned = [Val::I32(1), Val::try_from(bytes.as_slice()).unwrap()];
+                assert_validation_parity(
+                    validator.validate_full_row(&owned[..]),
+                    validator.validate_full_row(&row),
+                    None,
+                    "",
+                );
+            } else {
+                let foreground = validator
+                    .validate_full_row(&row)
+                    .change_context(OperationError::InvalidDmlInput)
+                    .unwrap_err();
+                assert_eq!(
+                    foreground.current_context(),
+                    &OperationError::InvalidDmlInput
+                );
+                assert_eq!(
+                    foreground.downcast_ref::<DmlValidationError>(),
+                    Some(&DmlValidationError::RowShape)
+                );
+                let recovery = validator
+                    .validate_sparse_update(&update)
+                    .change_context(DataIntegrityError::InvalidPayload)
+                    .unwrap_err();
+                assert_eq!(
+                    recovery.current_context(),
+                    &DataIntegrityError::InvalidPayload
+                );
+                assert_eq!(
+                    recovery.downcast_ref::<DmlValidationError>(),
+                    Some(&DmlValidationError::SparseUpdate)
+                );
+            }
+        }
+        let oversized = vec![0xff; MemVar::MAX_LEN + 1];
+        for (values, fact) in [
+            (vec![(0, ValRef::VarByte(&oversized))], "count mismatch"),
+            (
+                vec![(0, ValRef::VarByte(&oversized)), (1, ValRef::VarByte(b""))],
+                "type mismatch",
+            ),
+        ] {
+            let err = validator
+                .validate_full_row(&BufferValues::new(values))
+                .unwrap_err();
+            assert!(format!("{err:?}").contains(fact), "{err:?}");
+        }
+        for (values, fact) in [
+            (vec![(2, ValRef::VarByte(&oversized))], "out of range"),
+            (vec![(0, ValRef::VarByte(&oversized))], "type mismatch"),
+            (
+                vec![
+                    (1, ValRef::VarByte(b"ok")),
+                    (1, ValRef::VarByte(&oversized)),
+                ],
+                "not strictly ordered",
+            ),
+        ] {
+            let err = validator
+                .validate_sparse_update(&BufferValues::new(values))
+                .unwrap_err();
+            assert!(format!("{err:?}").contains(fact), "{err:?}");
+        }
+    }
+
     /// Purpose: Protect sparse-update validation at ordering, column, type, and nullability
     /// boundaries.
     /// Expected: Valid updates pass and malformed updates return the sparse-update error
@@ -345,7 +485,11 @@ mod tests {
                 false,
             ),
             ("out of range", vec![(3, Val::from(42u64))], false),
-            ("type mismatch", vec![(0, Val::from("not an i32"))], false),
+            (
+                "type mismatch",
+                vec![(0, Val::try_from("not an i32").unwrap())],
+                false,
+            ),
             ("non-nullable column", vec![(0, Val::Null)], false),
         ];
         for (case, cols, valid) in cases {
@@ -380,7 +524,7 @@ mod tests {
         .unwrap();
         let validator = DmlValidator::new(&metadata);
         let rows = [
-            (vec![Val::I32(1), Val::from("bytes")], true, ""),
+            (vec![Val::I32(1), Val::try_from("bytes").unwrap()], true, ""),
             (vec![Val::I32(1), Val::Null], true, ""),
             (vec![Val::I32(1)], false, "actual=1, expected=2"),
             (
@@ -388,8 +532,16 @@ mod tests {
                 false,
                 "actual=3, expected=2",
             ),
-            (vec![Val::Null, Val::from("")], false, "column_no=0"),
-            (vec![Val::U32(1), Val::from("")], false, "actual=u32(1)"),
+            (
+                vec![Val::Null, Val::try_from("").unwrap()],
+                false,
+                "column_no=0",
+            ),
+            (
+                vec![Val::U32(1), Val::try_from("").unwrap()],
+                false,
+                "actual=u32(1)",
+            ),
             (vec![Val::I32(1), Val::I8(1)], false, "column_no=1"),
         ];
         for (owned, valid, fact) in rows {
@@ -404,7 +556,11 @@ mod tests {
         }
         let updates = [
             (vec![], true, ""),
-            (vec![(0, Val::I32(2)), (1, Val::from("new"))], true, ""),
+            (
+                vec![(0, Val::I32(2)), (1, Val::try_from("new").unwrap())],
+                true,
+                "",
+            ),
             (vec![(1, Val::Null)], true, ""),
             (vec![(0, Val::Null)], false, "type mismatch"),
             (vec![(0, Val::U32(2))], false, "actual=u32(2)"),

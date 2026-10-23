@@ -4303,8 +4303,8 @@ pub(crate) mod tests {
                             Val::U64(123),
                             Val::U32(1),
                             Val::U32(2),
-                            Val::from(&PSEUDO_SYSBENCH_VAR1[..]),
-                            Val::from(&PSEUDO_SYSBENCH_VAR2[..]),
+                            Val::try_from(&PSEUDO_SYSBENCH_VAR1[..]).unwrap(),
+                            Val::try_from(&PSEUDO_SYSBENCH_VAR2[..]).unwrap(),
                         ],
                     ),
                 },
@@ -4677,9 +4677,12 @@ pub(crate) mod tests {
         let (temp_dir, engine) = test_engine(log_file_stem).await;
         let table_id = catalog_tests::table2(&engine).await;
         let (session, mut trx) = begin_production_test_transaction(&engine);
-        trx.table_insert_mvcc(table_id, vec![Val::from(value), Val::from(label)])
-            .await
-            .unwrap();
+        trx.table_insert_mvcc(
+            table_id,
+            vec![Val::from(value), Val::try_from(label).unwrap()],
+        )
+        .await
+        .unwrap();
         assert!(lock_entry_count(&engine, lock_owner(&trx).unwrap()) > 0);
         (temp_dir, engine, table_id, session, trx)
     }
@@ -4919,8 +4922,11 @@ pub(crate) mod tests {
         // Focused owned-runner cancellation during statement rollback folds
         // residual row and index undo into cleanup.
         let mut exec = Box::pin(trx.exec(async |stmt| -> CallbackResult<_, String> {
-            stmt.table_insert_mvcc(table_id, vec![Val::from(value), Val::from("cancelled")])
-                .await?;
+            stmt.table_insert_mvcc(
+                table_id,
+                vec![Val::from(value), Val::try_from("cancelled").unwrap()],
+            )
+            .await?;
             Err::<(), _>(CallbackError::User("cancelled callback".to_owned()))
         }));
 
@@ -7180,7 +7186,10 @@ pub(crate) mod tests {
 
             let mut trx3 = session3.begin_trx().unwrap();
             let row_id3 = trx3
-                .table_insert_mvcc(table_id, vec![Val::from(91_263i32), Val::from(&large[..])])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91_263i32), Val::try_from(&large[..]).unwrap()],
+                )
                 .await
                 .unwrap();
             let cached_page = session3.load_active_insert_page(table_id).unwrap();

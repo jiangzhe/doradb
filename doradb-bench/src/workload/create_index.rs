@@ -415,7 +415,7 @@ mod tests {
                     // Row two survives the mutation stride with the original cardinality-three payload.
                     let mut payload = vec![b'x'; 512];
                     payload[..8].copy_from_slice(&2u64.to_le_bytes());
-                    let row = vec![Val::from(2u64), Val::from(payload)];
+                    let row = vec![Val::from(2u64), Val::try_from(payload).unwrap()];
                     let key: Vec<_> = ordinals
                         .iter()
                         .map(|ordinal| row[*ordinal as usize].clone())
@@ -605,9 +605,12 @@ mod tests {
             session.drop_index(table_id, old_id).await.unwrap();
             let mut trx = session.begin_trx().unwrap();
             for _ in 0..3 {
-                trx.table_insert_mvcc(table_id, vec![Val::from(7u64), Val::from("same")])
-                    .await
-                    .unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(7u64), Val::try_from("same").unwrap()],
+                )
+                .await
+                .unwrap();
             }
             trx.commit().await.unwrap();
             let index_id = session

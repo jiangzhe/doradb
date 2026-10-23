@@ -751,9 +751,12 @@ mod tests {
         let table = create_table2_for_test(&engine).await;
         let mut session = engine.new_session().unwrap();
         let mut trx = session.begin_trx().unwrap();
-        trx.table_insert_mvcc(table, vec![Val::from(7i32), Val::from("committed")])
-            .await
-            .unwrap();
+        trx.table_insert_mvcc(
+            table,
+            vec![Val::from(7i32), Val::try_from("committed").unwrap()],
+        )
+        .await
+        .unwrap();
         trx.commit().await.unwrap();
     }
 
@@ -778,7 +781,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap_found();
-        assert_eq!(row, vec![Val::from(7i32), Val::from("committed")]);
+        assert_eq!(
+            row,
+            vec![Val::from(7i32), Val::try_from("committed").unwrap()]
+        );
         trx.rollback().await.unwrap();
     }
 
@@ -789,7 +795,10 @@ mod tests {
                 row_id,
                 kind: RowRedoKind::Insert(
                     page,
-                    vec![Val::from(row_id.as_u64() as i32), Val::from(value)],
+                    vec![
+                        Val::from(row_id.as_u64() as i32),
+                        Val::try_from(value).unwrap(),
+                    ],
                 ),
             },
         }
@@ -804,7 +813,7 @@ mod tests {
                     page,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from(value),
+                        val: Val::try_from(value).unwrap(),
                     }],
                 ),
             },
@@ -1116,11 +1125,11 @@ mod tests {
             let metadata = layout.metadata();
             assert_eq!(
                 page.page().row(0).val(&metadata.col, 1),
-                Val::from(large_value.as_str())
+                Val::try_from(large_value.as_str()).unwrap()
             );
             assert_eq!(
                 page.page().row(1).val(&metadata.col, 1),
-                Val::from("initial")
+                Val::try_from("initial").unwrap()
             );
             drop(page);
             drop(held0);
@@ -1214,7 +1223,7 @@ mod tests {
             assert!(!guard.page().is_deleted(0));
             assert_eq!(
                 guard.page().row(0).val(&f.table.metadata().col, 1),
-                Val::from("initial")
+                Val::try_from("initial").unwrap()
             );
         });
     }
@@ -1545,7 +1554,7 @@ mod tests {
                     .page()
                     .row(0)
                     .val(&f.table.metadata().col, 1),
-                Val::from(initial.as_str())
+                Val::try_from(initial.as_str()).unwrap()
             );
             assert_eq!(
                 f.lock(1)
@@ -1553,7 +1562,7 @@ mod tests {
                     .page()
                     .row(0)
                     .val(&f.table.metadata().col, 1),
-                Val::from("b".repeat(512).as_str())
+                Val::try_from("b".repeat(512).as_str()).unwrap()
             );
             f.dispatch.drain_all().await.unwrap();
             assert_eq!(pool_snapshot(&f.dispatch.recycled), (0, 0));

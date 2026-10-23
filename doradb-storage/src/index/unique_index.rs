@@ -651,7 +651,7 @@ mod tests {
     ) {
         assert_unique_index_mutations(
             &index,
-            |prefix, value| vec![Val::from(prefix), Val::from(value)],
+            |prefix, value| vec![Val::try_from(prefix).unwrap(), Val::from(value)],
             &[
                 RowID::new(400),
                 RowID::new(500),
@@ -662,7 +662,7 @@ mod tests {
         .await;
 
         // 验证insert覆盖
-        let key4 = vec![Val::from("rust"), Val::from(97i32)];
+        let key4 = vec![Val::try_from("rust").unwrap(), Val::from(97i32)];
         let row_id4 = 800u64;
         let inserted = index
             .insert_if_not_exists(&key4, RowID::new(row_id4), false, TrxID::new(100))
@@ -741,7 +741,7 @@ mod tests {
             ],
             async |index, pool_guard| {
                 let guarded = index.bind(pool_guard);
-                let key = [Val::from("encoded"), Val::Null];
+                let key = [Val::try_from("encoded").unwrap(), Val::Null];
                 let encoded_key = index.encoder().encode(&key);
                 let row_id = RowID::new(10);
 

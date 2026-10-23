@@ -555,7 +555,7 @@ mod tests {
                 Val::from(0u32),
                 Val::from(0u16),
                 Val::from(0u32),
-                Val::from(vec![1, 1, 0, 0, 0, 0, 0, 0]),
+                Val::try_from(vec![1, 1, 0, 0, 0, 0, 0, 0]).unwrap(),
             ];
         }
         if table_id == TABLE_ID_TABLE_DESCRIPTORS {
@@ -563,15 +563,19 @@ mod tests {
                 Val::from(parent),
                 Val::from(0u64),
                 Val::from(0u64),
-                Val::from(vec![0; 32]),
-                Val::from(Vec::<u8>::new()),
+                Val::try_from(vec![0; 32]).unwrap(),
+                Val::try_from(Vec::<u8>::new()).unwrap(),
             ];
         }
         if table_id == TABLE_ID_TABLE_REPLAY_SILENT_WATERMARKS {
             return vec![Val::from(parent), Val::from(1u64), Val::from(1u64)];
         }
         assert_eq!(table_id, TABLE_ID_TABLE_BINDINGS);
-        vec![Val::from(0u64), Val::from(vec![1u8]), Val::from(parent)]
+        vec![
+            Val::from(0u64),
+            Val::try_from(vec![1u8]).unwrap(),
+            Val::from(parent),
+        ]
     }
 
     fn central_row(table_id: TableID) -> Vec<Val> {

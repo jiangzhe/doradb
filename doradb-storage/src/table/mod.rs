@@ -3054,7 +3054,7 @@ pub(crate) mod tests {
     pub(crate) fn name_key(value: &str) -> SelectKey {
         SelectKey {
             index_slot: IndexSlot::new(1),
-            vals: vec![Val::from(value)],
+            vals: vec![Val::try_from(value).unwrap()],
         }
     }
 
@@ -3251,7 +3251,7 @@ pub(crate) mod tests {
     ) {
         let mut trx = session.begin_trx().unwrap();
         for i in 0..count {
-            let insert = vec![Val::from(start + i), Val::from(name)];
+            let insert = vec![Val::from(start + i), Val::try_from(name).unwrap()];
             trx = expect_trx_insert(table_id, trx, insert).await;
         }
         trx.commit().await.unwrap();
@@ -3342,7 +3342,10 @@ pub(crate) mod tests {
             let err = trx
                 .table_insert_mvcc(
                     table_id,
-                    vec![Val::from("wrong-id-type"), Val::from("name")],
+                    vec![
+                        Val::try_from("wrong-id-type").unwrap(),
+                        Val::try_from("name").unwrap(),
+                    ],
                 )
                 .await
                 .unwrap_err();
@@ -3351,7 +3354,7 @@ pub(crate) mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             let err = trx
-                .table_insert_mvcc(table_id, vec![Val::Null, Val::from("name")])
+                .table_insert_mvcc(table_id, vec![Val::Null, Val::try_from("name").unwrap()])
                 .await
                 .unwrap_err();
             assert_invalid_dml_input(err);
@@ -3377,7 +3380,7 @@ pub(crate) mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("old")],
+                vec![Val::from(1i32), Val::try_from("old").unwrap()],
             )
             .await;
 
@@ -3385,11 +3388,11 @@ pub(crate) mod tests {
             let err = trx
                 .table_unique_mutate_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("new")],
+                    &[Val::try_from("new").unwrap()],
                     |_| -> CallbackResult<_> {
                         Ok(UniqueMutation::Insert(vec![
                             Val::from(2i32),
-                            Val::from("new"),
+                            Val::try_from("new").unwrap(),
                         ]))
                     },
                 )
@@ -3410,11 +3413,11 @@ pub(crate) mod tests {
                             UniqueMutation::Update(vec![
                                 UpdateCol {
                                     idx: 1,
-                                    val: Val::from("new"),
+                                    val: Val::try_from("new").unwrap(),
                                 },
                                 UpdateCol {
                                     idx: 1,
-                                    val: Val::from("duplicate"),
+                                    val: Val::try_from("duplicate").unwrap(),
                                 },
                             ])
                         } else {
@@ -3429,7 +3432,7 @@ pub(crate) mod tests {
             trx.rollback().await.unwrap();
 
             let mut trx = session.begin_trx().unwrap();
-            let key = SelectKey::new(IndexSlot::new(1), vec![Val::from("old")]);
+            let key = SelectKey::new(IndexSlot::new(1), vec![Val::try_from("old").unwrap()]);
             let err = trx
                 .table_unique_mutate_mvcc(
                     crate::TableIndex(table_id, IndexID::new(1)),

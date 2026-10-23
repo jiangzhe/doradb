@@ -4019,9 +4019,12 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             let owner = trx_tests::lock_owner(&trx).unwrap();
 
-            trx.table_insert_mvcc(table_id, vec![Val::from(10i32), Val::from("a")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(10i32), Val::try_from("a").unwrap()],
+            )
+            .await
+            .unwrap();
             assert!(has_lock_entry(
                 &engine,
                 owner,
@@ -4038,9 +4041,12 @@ pub(crate) mod tests {
             ));
             assert_eq!(lock_entry_count(&engine, owner), 2);
 
-            trx.table_insert_mvcc(table_id, vec![Val::from(11i32), Val::from("b")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(11i32), Val::try_from("b").unwrap()],
+            )
+            .await
+            .unwrap();
             assert_eq!(lock_entry_count(&engine, owner), 2);
 
             trx.rollback().await.unwrap();
@@ -4383,7 +4389,10 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 writer_trx
-                    .table_insert_mvcc(table_id, vec![Val::from(31_001i32), Val::from("blocked")])
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(31_001i32), Val::try_from("blocked").unwrap()],
+                    )
                     .await?;
                 writer_trx.commit().await?;
                 Ok::<(), Error>(())
@@ -4482,7 +4491,10 @@ pub(crate) mod tests {
             let err = write_trx
                 .table_insert_mvcc(
                     table_id,
-                    vec![Val::from(31_101i32), Val::from("same-session-s")],
+                    vec![
+                        Val::from(31_101i32),
+                        Val::try_from("same-session-s").unwrap(),
+                    ],
                 )
                 .await
                 .unwrap_err();
@@ -4517,7 +4529,10 @@ pub(crate) mod tests {
 
             trx.table_insert_mvcc(
                 table_id,
-                vec![Val::from(31_301i32), Val::from("same-session-ix")],
+                vec![
+                    Val::from(31_301i32),
+                    Val::try_from("same-session-ix").unwrap(),
+                ],
             )
             .await
             .unwrap();
@@ -4678,7 +4693,10 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 writer_trx
-                    .table_insert_mvcc(table_id, vec![Val::from(31_201i32), Val::from("external")])
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(31_201i32), Val::try_from("external").unwrap()],
+                    )
                     .await?;
                 writer_trx.commit().await?;
                 Ok::<(), Error>(())
@@ -4696,7 +4714,10 @@ pub(crate) mod tests {
             let mut same_session_trx = session.begin_trx().unwrap();
             let same_session_owner = trx_tests::lock_owner(&same_session_trx).unwrap();
             same_session_trx
-                .table_insert_mvcc(table_id, vec![Val::from(31_202i32), Val::from("covered")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(31_202i32), Val::try_from("covered").unwrap()],
+                )
                 .await
                 .unwrap();
             assert!(has_lock_entry(
@@ -5601,7 +5622,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("drop-me")],
+                vec![Val::from(1), Val::try_from("drop-me").unwrap()],
             )
             .await;
             let (other_spec, other_indexes) = drop_table_test_spec();
@@ -5706,7 +5727,10 @@ pub(crate) mod tests {
 
             let mut stale_write = session.begin_trx().unwrap();
             let err = stale_write
-                .table_insert_mvcc(table_id, vec![Val::from(2), Val::from("blocked")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(2), Val::try_from("blocked").unwrap()],
+                )
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -5748,7 +5772,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(11), Val::from("gc-delete")],
+                vec![Val::from(11), Val::try_from("gc-delete").unwrap()],
             )
             .await;
             let table_file_path = engine.inner().table_fs.user_table_file_path(table_id);
@@ -5898,7 +5922,7 @@ pub(crate) mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("seed")],
+                vec![Val::from(1), Val::try_from("seed").unwrap()],
             )
             .await;
             let redo_file_path = temp_dir.path().join("redo_testsys_lightweight.00000000");
@@ -5906,8 +5930,12 @@ pub(crate) mod tests {
             let _install = install_storage_backend_test_hook(hook.clone());
 
             let mut trx = session.begin_trx().unwrap();
-            trx = expect_trx_insert(table_id, trx, vec![Val::from(169), Val::from("redo-fail")])
-                .await;
+            trx = expect_trx_insert(
+                table_id,
+                trx,
+                vec![Val::from(169), Val::try_from("redo-fail").unwrap()],
+            )
+            .await;
             let err = trx.commit().await.unwrap_err();
             let report = format!("{err:?}");
 
@@ -5974,7 +6002,10 @@ pub(crate) mod tests {
             let mut writer_session = engine.new_session().unwrap();
             let mut writer_trx = writer_session.begin_trx().unwrap();
             writer_trx
-                .table_insert_mvcc(table_id, vec![Val::from(91), Val::from("writer")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(91), Val::try_from("writer").unwrap()],
+                )
                 .await
                 .unwrap();
 
@@ -6055,7 +6086,7 @@ pub(crate) mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     table_id,
-                    vec![Val::from(7), Val::from("checkpoint-covered")],
+                    vec![Val::from(7), Val::try_from("checkpoint-covered").unwrap()],
                 )
                 .await;
             let Ok(_) = insert else {

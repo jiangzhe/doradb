@@ -2934,7 +2934,7 @@ mod tests {
                             if i % 3 == 0 {
                                 Val::Null
                             } else {
-                                Val::from("composite")
+                                Val::try_from("composite").unwrap()
                             },
                             Val::from(if unique { i } else { i % 5 }),
                         ];

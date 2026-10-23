@@ -2308,7 +2308,10 @@ mod tests {
             .catalog_replay_start_ts;
         let mut trx = session.begin_trx().unwrap();
         let row_id = trx
-            .table_insert_mvcc(table_id, vec![Val::from(7u32), Val::from("cold-row")])
+            .table_insert_mvcc(
+                table_id,
+                vec![Val::from(7u32), Val::try_from("cold-row").unwrap()],
+            )
             .await
             .unwrap();
         trx.commit().await.unwrap();
@@ -4286,7 +4289,10 @@ mod tests {
                 let mut trx = session.begin_trx().unwrap();
                 for j in i..i + INS_STEP {
                     let res = trx
-                        .table_insert_mvcc(table_id, vec![Val::from(j as u32), Val::from(&s[..])])
+                        .table_insert_mvcc(
+                            table_id,
+                            vec![Val::from(j as u32), Val::try_from(&s[..]).unwrap()],
+                        )
                         .await;
                     assert!(res.is_ok());
                 }
@@ -4299,7 +4305,7 @@ mod tests {
                 let key = SelectKey::new(IndexSlot::new(0), vec![Val::from(i as u32)]);
                 let uc = UpdateCol {
                     idx: 1,
-                    val: Val::from(&s2[..]),
+                    val: Val::try_from(&s2[..]).unwrap(),
                 };
                 let res = trx_update_row_by_id(&mut trx, table_id, &key, vec![uc]).await;
                 assert!(matches!(res, Ok(UniqueMutationOutcome::Updated(_))));
@@ -4380,7 +4386,10 @@ mod tests {
                     let expected = if id % UPD_STEP == 0 { &s2 } else { &s };
                     assert_eq!(
                         row,
-                        SelectMvcc::Found(vec![Val::from(id as u32), Val::from(expected.as_str())]),
+                        SelectMvcc::Found(vec![
+                            Val::from(id as u32),
+                            Val::try_from(expected.as_str()).unwrap()
+                        ]),
                         "surviving key={id}"
                     );
                 }
@@ -4617,7 +4626,7 @@ mod tests {
             let row = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
-                vec![Val::from(7u32), Val::from("cold-row")]
+                vec![Val::from(7u32), Val::try_from("cold-row").unwrap()]
             );
             trx.commit().await.unwrap();
         });
@@ -4725,7 +4734,10 @@ mod tests {
             trx.commit().await.unwrap();
             let mut trx = session.begin_trx().unwrap();
             let hot_row_id = trx
-                .table_insert_mvcc(table_id, vec![Val::from(7u32), Val::from("hot-row")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(7u32), Val::try_from("hot-row").unwrap()],
+                )
                 .await
                 .unwrap();
             assert_ne!(cold_row_id, hot_row_id);
@@ -4742,7 +4754,7 @@ mod tests {
             let row = trx_select_row_mvcc_by_id(&mut trx, table_id, &key, &[0, 1]).await;
             assert_eq!(
                 row.unwrap().unwrap_found(),
-                vec![Val::from(7u32), Val::from("hot-row")]
+                vec![Val::from(7u32), Val::try_from("hot-row").unwrap()]
             );
             trx.commit().await.unwrap();
         });
@@ -4795,7 +4807,7 @@ mod tests {
                 let insert = trx
                     .table_insert_mvcc(
                         table.table_id(),
-                        vec![Val::from(id), Val::from("same-name")],
+                        vec![Val::from(id), Val::try_from("same-name").unwrap()],
                     )
                     .await;
                 let Ok(row_id) = insert else {
@@ -4839,7 +4851,8 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             assert_eq!(session.total_row_pages(table.table_id()).await.unwrap(), 0);
 
-            let name_key = SelectKey::new(IndexSlot::new(1), vec![Val::from("same-name")]);
+            let name_key =
+                SelectKey::new(IndexSlot::new(1), vec![Val::try_from("same-name").unwrap()]);
             let layout = table.layout_snapshot();
             let index_slot = name_key.index_slot;
             let non_unique = layout.secondary_index(index_slot).unwrap();
@@ -4883,8 +4896,8 @@ mod tests {
             assert_eq!(
                 rows,
                 vec![
-                    vec![Val::from(1u32), Val::from("same-name")],
-                    vec![Val::from(3u32), Val::from("same-name")],
+                    vec![Val::from(1u32), Val::try_from("same-name").unwrap()],
+                    vec![Val::from(3u32), Val::try_from("same-name").unwrap()],
                 ]
             );
             let deleted =
@@ -4939,9 +4952,12 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             for id in 0u32..3 {
-                trx.table_insert_mvcc(table_id, vec![Val::from(id), Val::from("cold")])
-                    .await
-                    .unwrap();
+                trx.table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(id), Val::try_from("cold").unwrap()],
+                )
+                .await
+                .unwrap();
             }
             trx.commit().await.unwrap();
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4949,7 +4965,7 @@ mod tests {
 
             let mut trx = session.begin_trx().unwrap();
             for id in [10u32, 11] {
-                trx.table_insert_mvcc(table_id, vec![Val::from(id), Val::from("hot")])
+                trx.table_insert_mvcc(table_id, vec![Val::from(id), Val::try_from("hot").unwrap()])
                     .await
                     .unwrap();
             }
@@ -4962,11 +4978,11 @@ mod tests {
                         0 | 10 => RowMutation::Delete,
                         1 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("cold-updated"),
+                            val: Val::try_from("cold-updated").unwrap(),
                         }]),
                         11 => RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("hot-updated"),
+                            val: Val::try_from("hot-updated").unwrap(),
                         }]),
                         2 => RowMutation::Skip,
                         _ => unreachable!(),
@@ -5013,7 +5029,7 @@ mod tests {
             let cold_rows = trx
                 .table_index_lookup_mvcc(
                     crate::TableIndex(table_id, crate::IndexID::new(1)),
-                    &[Val::from("cold")],
+                    &[Val::try_from("cold").unwrap()],
                     &[0],
                 )
                 .await
@@ -5086,7 +5102,7 @@ mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     table.table_id(),
-                    vec![Val::from(7u32), Val::from("cold-row")],
+                    vec![Val::from(7u32), Val::try_from("cold-row").unwrap()],
                 )
                 .await;
             assert!(insert.is_ok());
@@ -5107,7 +5123,7 @@ mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     table.table_id(),
-                    vec![Val::from(8u32), Val::from("hot-row")],
+                    vec![Val::from(8u32), Val::try_from("hot-row").unwrap()],
                 )
                 .await;
             assert!(insert.is_ok());
@@ -5133,7 +5149,7 @@ mod tests {
                 trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &cold_key, &[0, 1]).await;
             assert_eq!(
                 cold_row.unwrap().unwrap_found(),
-                vec![Val::from(7u32), Val::from("cold-row")]
+                vec![Val::from(7u32), Val::try_from("cold-row").unwrap()]
             );
 
             let hot_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(8u32)]);
@@ -5141,7 +5157,7 @@ mod tests {
                 trx_select_row_mvcc_by_id(&mut trx, table.table_id(), &hot_key, &[0, 1]).await;
             assert_eq!(
                 hot_row.unwrap().unwrap_found(),
-                vec![Val::from(8u32), Val::from("hot-row")]
+                vec![Val::from(8u32), Val::try_from("hot-row").unwrap()]
             );
 
             trx.commit().await.unwrap();
@@ -5198,7 +5214,7 @@ mod tests {
                     insert_trx
                         .table_insert_mvcc(
                             table.table_id(),
-                            vec![Val::from(id), Val::from(payload.as_str())],
+                            vec![Val::from(id), Val::try_from(payload.as_str()).unwrap()],
                         )
                         .await
                         .unwrap(),
@@ -5282,7 +5298,7 @@ mod tests {
             .await;
             assert_eq!(
                 cold_row.unwrap().unwrap_found(),
-                vec![Val::from(1u32), Val::from(payload.as_str())]
+                vec![Val::from(1u32), Val::try_from(payload.as_str()).unwrap()]
             );
             let hot_row = trx_select_row_mvcc_by_id(
                 &mut trx,
@@ -5293,7 +5309,7 @@ mod tests {
             .await;
             assert_eq!(
                 hot_row.unwrap().unwrap_found(),
-                vec![Val::from(199u32), Val::from(payload.as_str())]
+                vec![Val::from(199u32), Val::try_from(payload.as_str()).unwrap()]
             );
             trx.commit().await.unwrap();
 
@@ -5529,7 +5545,7 @@ mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     checkpointed_table.table_id(),
-                    vec![Val::from(7u32), Val::from("persisted-row")],
+                    vec![Val::from(7u32), Val::try_from("persisted-row").unwrap()],
                 )
                 .await;
             assert!(insert.is_ok());
@@ -5549,7 +5565,7 @@ mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     replay_only_table.table_id(),
-                    vec![Val::from(8u32), Val::from("replayed-row")],
+                    vec![Val::from(8u32), Val::try_from("replayed-row").unwrap()],
                 )
                 .await;
             assert!(insert.is_ok());
@@ -5643,7 +5659,7 @@ mod tests {
             .await;
             assert_eq!(
                 checkpointed_row.unwrap().unwrap_found(),
-                vec![Val::from(7u32), Val::from("persisted-row")]
+                vec![Val::from(7u32), Val::try_from("persisted-row").unwrap()]
             );
 
             let replay_only_key = SelectKey::new(IndexSlot::new(0), vec![Val::from(8u32)]);
@@ -5656,7 +5672,7 @@ mod tests {
             .await;
             assert_eq!(
                 replay_only_row.unwrap().unwrap_found(),
-                vec![Val::from(8u32), Val::from("replayed-row")]
+                vec![Val::from(8u32), Val::try_from("replayed-row").unwrap()]
             );
 
             trx.commit().await.unwrap();
@@ -5707,7 +5723,7 @@ mod tests {
             let insert = trx
                 .table_insert_mvcc(
                     table.table_id(),
-                    vec![Val::from(7u32), Val::from("persisted-row")],
+                    vec![Val::from(7u32), Val::try_from("persisted-row").unwrap()],
                 )
                 .await;
             assert!(insert.is_ok());
@@ -5948,7 +5964,7 @@ mod tests {
                                 key,
                                 vec![UpdateCol {
                                     idx: 1,
-                                    val: Val::from("fully decoded bytes"),
+                                    val: Val::try_from("fully decoded bytes").unwrap(),
                                 }],
                             )
                         } else {

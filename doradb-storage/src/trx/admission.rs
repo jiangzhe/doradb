@@ -765,14 +765,20 @@ mod tests {
                     .unwrap();
 
                 let err = old_trx
-                    .table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from(&b"old"[..])])
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(1i32), Val::try_from(&b"old"[..]).unwrap()],
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&err), Some(OperationError::SchemaChanged));
                 #[cfg(feature = "profiling")]
                 let after_first = old_session.logical_lock_stats().unwrap();
                 let retry = old_trx
-                    .table_insert_mvcc(table_id, vec![Val::from(2i32), Val::from(&b"retry"[..])])
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(2i32), Val::try_from(&b"retry"[..]).unwrap()],
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(operation_error(&retry), Some(OperationError::SchemaChanged));
@@ -867,7 +873,7 @@ mod tests {
                 let new_index_err = old_trx
                     .table_index_lookup_mvcc(
                         TableIndex(table_id, new_index_id),
-                        &[Val::from(&b"new"[..])],
+                        &[Val::try_from(&b"new"[..]).unwrap()],
                         &[0],
                     )
                     .await
@@ -878,7 +884,10 @@ mod tests {
                 );
 
                 let write_err = old_trx
-                    .table_insert_mvcc(table_id, vec![Val::from(8i32), Val::from(&b"stale"[..])])
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(8i32), Val::try_from(&b"stale"[..]).unwrap()],
+                    )
                     .await
                     .unwrap_err();
                 assert_eq!(
@@ -909,7 +918,7 @@ mod tests {
                     let fresh_result = fresh_trx
                         .table_lookup_unique_mvcc(
                             TableIndex(table_id, new_index_id),
-                            &[Val::from(&b"new"[..])],
+                            &[Val::try_from(&b"new"[..]).unwrap()],
                             &[0],
                         )
                         .await
@@ -922,7 +931,7 @@ mod tests {
                     let fresh_result = fresh_trx
                         .table_index_lookup_mvcc(
                             TableIndex(table_id, new_index_id),
-                            &[Val::from(&b"new"[..])],
+                            &[Val::try_from(&b"new"[..]).unwrap()],
                             &[0],
                         )
                         .await

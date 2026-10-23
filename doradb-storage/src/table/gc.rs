@@ -1408,7 +1408,7 @@ mod tests {
             insert = expect_trx_insert(
                 table_id,
                 insert,
-                vec![Val::from(0i32), Val::from("old-root")],
+                vec![Val::from(0i32), Val::try_from("old-root").unwrap()],
             )
             .await;
             let insert_cts = insert.commit().await.unwrap();
@@ -2499,7 +2499,7 @@ mod tests {
             let row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("name")],
+                vec![Val::from(1i32), Val::try_from("name").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -2569,7 +2569,7 @@ mod tests {
             let row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("name")],
+                vec![Val::from(1i32), Val::try_from("name").unwrap()],
             )
             .await;
             let key = name_key("name");
@@ -2693,7 +2693,7 @@ mod tests {
                 let row_id = insert_one_row(
                     table_id,
                     &mut session,
-                    vec![Val::from(0i32), Val::from("current")],
+                    vec![Val::from(0i32), Val::try_from("current").unwrap()],
                 )
                 .await;
                 let stale_page = session.load_active_insert_page(table_id).unwrap();
@@ -2733,7 +2733,7 @@ mod tests {
                     let new_row = insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(key), Val::from(large.as_str())],
+                        vec![Val::from(key), Val::try_from(large.as_str()).unwrap()],
                     )
                     .await;
                     if matches!(table.find_row(&guards, new_row).await.unwrap(),
@@ -2769,7 +2769,7 @@ mod tests {
                 let row_id = insert_one_row(
                     table_id,
                     &mut session,
-                    vec![Val::from(0i32), Val::from("current")],
+                    vec![Val::from(0i32), Val::try_from("current").unwrap()],
                 )
                 .await;
                 assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -2849,7 +2849,7 @@ mod tests {
                     let row_id = insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(0i32), Val::from("current")],
+                        vec![Val::from(0i32), Val::try_from("current").unwrap()],
                     )
                     .await;
                     let table = table_for_internal_assertion(&engine, table_id);

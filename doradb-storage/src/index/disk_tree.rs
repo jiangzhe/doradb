@@ -3997,7 +3997,7 @@ mod tests {
                 .map(|i| {
                     let mut key = vec![b'p'; 512];
                     key.extend_from_slice(&i.to_be_bytes());
-                    [Val::from(key)]
+                    [Val::try_from(key).unwrap()]
                 })
                 .collect::<Vec<_>>();
             let tree = runtime.open(None, &guard);
@@ -4954,7 +4954,7 @@ mod tests {
             // than bulk-loading 10k short keys.
             const ENTRY_COUNT: u32 = 192;
             let keys = (0..ENTRY_COUNT)
-                .map(|idx| [Val::from(long_varbyte_key(idx))])
+                .map(|idx| [Val::try_from(long_varbyte_key(idx)).unwrap()])
                 .collect::<Vec<_>>();
             let encoded_keys = keys
                 .iter()

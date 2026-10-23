@@ -3189,7 +3189,10 @@ mod tests {
                 trx = expect_trx_insert(
                     table_id,
                     trx,
-                    vec![Val::from(id), Val::from(format!("v{id}").as_str())],
+                    vec![
+                        Val::from(id),
+                        Val::try_from(format!("v{id}").as_str()).unwrap(),
+                    ],
                 )
                 .await;
             }
@@ -3248,7 +3251,7 @@ mod tests {
             let page = page_guard.page();
             let payload_len =
                 page.header.var_field_offset() - usize::from(page.header.fix_field_end);
-            let values = [Val::from(vec![0xab; payload_len])];
+            let values = [Val::try_from(vec![0xab; payload_len]).unwrap()];
             assert!(page.insert(metadata.col.as_ref(), &values).is_ok());
             let prepared = PreparedTransitionPage {
                 page_id: page_guard.page_id(),
@@ -3943,7 +3946,10 @@ mod tests {
                     insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(id), Val::from(format!("v{id}").as_str())],
+                        vec![
+                            Val::from(id),
+                            Val::try_from(format!("v{id}").as_str()).unwrap(),
+                        ],
                     )
                     .await,
                 );
@@ -4296,7 +4302,7 @@ mod tests {
                 for id in 0..count {
                     assert!(builder.append_row_values(
                         RowID::new(id as u64),
-                        &[Val::from(id as i32), Val::from("name")]
+                        &[Val::from(id as i32), Val::try_from("name").unwrap()]
                     ));
                 }
                 let binding = context.entry.block_binding_value() ^ u64::from(!wrong_count);
@@ -4423,7 +4429,7 @@ mod tests {
             let old_row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("same")],
+                vec![Val::from(1i32), Val::try_from("same").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4440,7 +4446,7 @@ mod tests {
             let new_row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1i32), Val::from("same")],
+                vec![Val::from(1i32), Val::try_from("same").unwrap()],
             )
             .await;
 
@@ -4498,7 +4504,7 @@ mod tests {
                     insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(id), Val::from("duplicate")],
+                        vec![Val::from(id), Val::try_from("duplicate").unwrap()],
                     )
                     .await,
                 );
@@ -4506,7 +4512,7 @@ mod tests {
             let kept_row = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(4i32), Val::from("kept")],
+                vec![Val::from(4i32), Val::try_from("kept").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4540,16 +4546,20 @@ mod tests {
             let secondary = layout.expect_secondary_index(index);
             let runtime = secondary.disk_runtime();
             let encoder = runtime.key_encoder_arc();
-            let duplicate_key = encoder.encode(&[Val::from("duplicate")]);
+            let duplicate_key = encoder.encode(&[Val::try_from("duplicate").unwrap()]);
             let mut mutable = test_mutable_table_file(&engine, &table, &guards);
             let root = mutable.root().secondary_index_root(index.slot());
             let tree = runtime.open_unique_at(root, guards.disk_guard()).unwrap();
             assert_eq!(
-                tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
+                tree.lookup(&[Val::try_from("duplicate").unwrap()])
+                    .await
+                    .unwrap(),
                 Some(deleted_rows[1]),
             );
             assert_eq!(
-                tree.lookup(&[Val::from("kept")]).await.unwrap(),
+                tree.lookup(&[Val::try_from("kept").unwrap()])
+                    .await
+                    .unwrap(),
                 Some(kept_row)
             );
             let mut sources =
@@ -4607,11 +4617,17 @@ mod tests {
                 .open_unique_at(next.block_id(), guards.disk_guard())
                 .unwrap();
             assert_eq!(
-                next_tree.lookup(&[Val::from("duplicate")]).await.unwrap(),
+                next_tree
+                    .lookup(&[Val::try_from("duplicate").unwrap()])
+                    .await
+                    .unwrap(),
                 None
             );
             assert_eq!(
-                next_tree.lookup(&[Val::from("kept")]).await.unwrap(),
+                next_tree
+                    .lookup(&[Val::try_from("kept").unwrap()])
+                    .await
+                    .unwrap(),
                 Some(kept_row),
             );
             drop(mutable);
@@ -5606,7 +5622,7 @@ mod tests {
                         &first_key,
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from(blocked_value.as_str()),
+                            val: Val::try_from(blocked_value.as_str()).unwrap(),
                         }],
                     )
                     .await
@@ -5632,7 +5648,7 @@ mod tests {
                 &later_key,
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from(later_value.as_str()),
+                    val: Val::try_from(later_value.as_str()).unwrap(),
                 }],
             )
             .await
@@ -6503,7 +6519,7 @@ mod tests {
                 &single_key(1),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("after"),
+                    val: Val::try_from("after").unwrap(),
                 }],
             )
             .await
@@ -6582,7 +6598,7 @@ mod tests {
                 &single_key(1),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("after"),
+                    val: Val::try_from("after").unwrap(),
                 }],
             )
             .await
@@ -6759,7 +6775,7 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut frozen_foreground,
-                vec![Val::from(1000i32), Val::from("active-suffix")],
+                vec![Val::from(1000i32), Val::try_from("active-suffix").unwrap()],
             )
             .await;
             let table = table_for_internal_assertion(&engine, table_id);
@@ -6851,7 +6867,7 @@ mod tests {
                         &single_key(1),
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("updated-after-route"),
+                            val: Val::try_from("updated-after-route").unwrap(),
                         }],
                     )
                     .await
@@ -6963,7 +6979,10 @@ mod tests {
                 expect_insert_committed(
                     table_id,
                     &mut transition_foreground,
-                    vec![Val::from(1001i32), Val::from("transition-suffix")],
+                    vec![
+                        Val::from(1001i32),
+                        Val::try_from("transition-suffix").unwrap(),
+                    ],
                 )
                 .await;
 
@@ -7285,7 +7304,7 @@ mod tests {
                     &update_key,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("must-fail"),
+                        val: Val::try_from("must-fail").unwrap(),
                     }],
                 );
                 futures::pin_mut!(update);
@@ -7370,7 +7389,7 @@ mod tests {
                 insert_then_fail_statement(
                     &mut writer,
                     table_id,
-                    vec![Val::from(1i32), Val::from("replacement")],
+                    vec![Val::from(1i32), Val::try_from("replacement").unwrap()],
                     inserted_tx,
                     fail_rx,
                 )
@@ -7753,7 +7772,10 @@ mod tests {
             let SelectMvcc::Found(vals) = visible else {
                 panic!("MVCC must reconstruct the pre-delete transition image");
             };
-            assert_eq!(vals, vec![Val::from(1i32), Val::from("rollback")]);
+            assert_eq!(
+                vals,
+                vec![Val::from(1i32), Val::try_from("rollback").unwrap()]
+            );
             reader.commit().await.unwrap();
 
             publish_route_tx.send_async(()).await.unwrap();
@@ -7911,7 +7933,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 old,
-                SelectMvcc::Found(vec![Val::from(1i32), Val::from("original")])
+                SelectMvcc::Found(vec![Val::from(1i32), Val::try_from("original").unwrap()])
             );
             let new = trx_select_row_mvcc_by_id(&mut reader, table_id, &new_key, &[0, 1])
                 .await
@@ -8498,7 +8520,7 @@ mod tests {
             let mut write_session = engine.new_session().unwrap();
             let mut write_trx = write_session.begin_trx().unwrap();
             {
-                let insert = vec![Val::from(10_000i32), Val::from("new")];
+                let insert = vec![Val::from(10_000i32), Val::try_from("new").unwrap()];
                 let res = write_trx.table_insert_mvcc(table_id, insert).await;
                 assert!(res.is_ok());
             }
@@ -8557,7 +8579,10 @@ mod tests {
             expect_insert_committed(
                 table_id,
                 &mut session,
-                vec![Val::from(50_000i32), Val::from("after-retention-reader")],
+                vec![
+                    Val::from(50_000i32),
+                    Val::try_from("after-retention-reader").unwrap(),
+                ],
             )
             .await;
 
@@ -9059,9 +9084,12 @@ mod tests {
             let mut writer = engine.new_session().unwrap();
             wait_for_checkpoint_root_ready(&mut writer, table_id).await;
             let mut trx = writer.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1i32), Val::from("blocked")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1i32), Val::try_from("blocked").unwrap()],
+            )
+            .await
+            .unwrap();
 
             let mut checkpoint_session = engine.new_session().unwrap();
             let table = table_for_internal_assertion(&engine, table_id);
@@ -9154,7 +9182,7 @@ mod tests {
                     &single_key(key),
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from(value),
+                        val: Val::try_from(value).unwrap(),
                     }],
                 )
                 .await
@@ -9249,7 +9277,7 @@ mod tests {
                 &key,
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("after"),
+                    val: Val::try_from("after").unwrap(),
                 }],
             )
             .await
@@ -9508,7 +9536,7 @@ mod tests {
                 &key,
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("after"),
+                    val: Val::try_from("after").unwrap(),
                 }],
             )
             .await;

@@ -18,7 +18,7 @@ use crate::row::ops::{UniqueMutation, UniqueMutationOutcome};
 use crate::row::{Row, RowRead};
 use crate::table::IndexLookupCriteria;
 use crate::trx::PrivateTransaction;
-use crate::value::{Val, ValKind};
+use crate::value::{MemVar, Val, ValKind};
 use error_stack::Report;
 use std::sync::OnceLock;
 
@@ -315,12 +315,13 @@ pub(super) fn catalog_definition_of_indexes() -> &'static CatalogDefinition {
 
 #[inline]
 fn cols_from_index_object(obj: &IndexObject) -> Vec<Val> {
+    // Validated index metadata bounds the serialized key specification to u16 bytes.
     vec![
         Val::from(obj.table_id),
         Val::from(obj.index.id().get()),
         Val::from(obj.index.slot().get()),
         Val::from(obj.index_flags.bits()),
-        Val::from(encode_index_key_spec(&obj.keys)),
+        Val::VarByte(MemVar::from_vec(encode_index_key_spec(&obj.keys))),
     ]
 }
 

@@ -44,8 +44,8 @@ async fn run() -> ExampleResult<()> {
         .table_insert_batch_mvcc(
             table_id,
             vec![
-                vec![Val::from(1i32), Val::from("alice")],
-                vec![Val::from(2i32), Val::from("bob")],
+                vec![Val::from(1i32), Val::try_from("alice")?],
+                vec![Val::from(2i32), Val::try_from("bob")?],
             ],
         )
         .await?;
@@ -61,9 +61,9 @@ async fn run() -> ExampleResult<()> {
                 Ok(match entry {
                     Some(_) => UniqueMutation::Update(vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("ada"),
+                        val: Val::try_from("ada")?,
                     }]),
-                    None => UniqueMutation::Insert(vec![Val::from(1i32), Val::from("ada")]),
+                    None => UniqueMutation::Insert(vec![Val::from(1i32), Val::try_from("ada")?]),
                 })
             },
         )
@@ -116,7 +116,7 @@ async fn run() -> ExampleResult<()> {
     assert_eq!(row_pair(found), (1, String::from("ada")));
 
     let name_index = IndexID::new(1);
-    let name_key = [Val::from("ada")];
+    let name_key = [Val::try_from("ada")?];
     // Scan rows that match one secondary-index key.
     let mut matching_rows = read_trx
         .table_index_lookup_mvcc(TableIndex(table_id, name_index), &name_key, &[0, 1])

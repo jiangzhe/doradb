@@ -676,7 +676,7 @@ mod tests {
             Val::from(id),
             Val::from(id),
             Val::from(10i32),
-            Val::from("original"),
+            Val::try_from("original").unwrap(),
         ]
     }
 
@@ -803,7 +803,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 3,
-                        val: Val::from(vec![b'r'; 48_000]),
+                        val: Val::try_from(vec![b'r'; 48_000]).unwrap(),
                     },
                 ]),
             )
@@ -833,7 +833,7 @@ mod tests {
         }
         update.push(UpdateCol {
             idx: 3,
-            val: Val::from(vec![b'm'; 48_000]),
+            val: Val::try_from(vec![b'm'; 48_000]).unwrap(),
         });
         UniqueMutation::Update(update)
     }
@@ -1080,7 +1080,7 @@ mod tests {
             let target = ids[0];
             let mut create = session.begin_trx().unwrap();
             let mut source_values = values(10);
-            source_values[3] = Val::from(vec![b'x'; 48_000]);
+            source_values[3] = Val::try_from(vec![b'x'; 48_000]).unwrap();
             let UniqueMutationOutcome::Inserted(source) = apply(
                 &mut create,
                 index,
@@ -1666,9 +1666,14 @@ mod tests {
                             let CallbackError::Engine(error) = failed.unwrap_err();
                             assert_eq!(error.operation_error(), Some(OperationError::DuplicateKey));
                             writer.commit().await.unwrap();
-                            apply(&mut other, index, 2, assignment(3, "unrelated"))
-                                .await
-                                .unwrap();
+                            apply(
+                                &mut other,
+                                index,
+                                2,
+                                assignment(3, Val::try_from("unrelated").unwrap()),
+                            )
+                            .await
+                            .unwrap();
                             *retained.borrow_mut() = Some(other);
                         });
                         CURRENT_LOOKUP_COUNTS.set((0, 0, 0));
@@ -1975,7 +1980,10 @@ mod tests {
                         index,
                         &[Val::from(0i32)],
                         |row| -> CallbackResult<_> {
-                            assert_eq!(row.unwrap().val(3)?, &Val::from(vec![b'm'; 48_000]));
+                            assert_eq!(
+                                row.unwrap().val(3)?,
+                                &Val::try_from(vec![b'm'; 48_000]).unwrap()
+                            );
                             assert_eq!(
                                 CURRENT_LOOKUP_COUNTS.get(),
                                 (0, 0, 1),
@@ -2049,7 +2057,7 @@ mod tests {
                     .await;
                     let mut updated = values(0);
                     updated[0] = Val::from(new_key);
-                    updated[3] = Val::from(vec![b'm'; 48_000]);
+                    updated[3] = Val::try_from(vec![b'm'; 48_000]).unwrap();
                     assert_eq!(read(&mut writer, index, new_key).await, updated);
                     assert_eq!(read(&mut snapshot, index, 0).await, values(0));
                     if previous == "absent" {
@@ -2160,7 +2168,7 @@ mod tests {
                 let mut verify = session.begin_trx().unwrap();
                 let mut expected = values(0);
                 if commit {
-                    expected[3] = Val::from(vec![b'm'; 48_000]);
+                    expected[3] = Val::try_from(vec![b'm'; 48_000]).unwrap();
                 }
                 assert_eq!(read(&mut verify, index, 0).await, expected);
                 assert_eq!(read(&mut verify, index, 1).await, values(1));
@@ -2642,7 +2650,7 @@ mod tests {
                 UniqueMutationOutcome::Noop
             );
             let mut wrong_kind = values(9);
-            wrong_kind[2] = Val::from("wrong");
+            wrong_kind[2] = Val::try_from("wrong").unwrap();
             let mut wrong_null = values(9);
             wrong_null[1] = Val::Null;
             for row in [vec![], wrong_kind, wrong_null] {
@@ -2655,7 +2663,7 @@ mod tests {
                 }],
                 vec![UpdateCol {
                     idx: 2,
-                    val: Val::from("bad"),
+                    val: Val::try_from("bad").unwrap(),
                 }],
                 vec![
                     UpdateCol {
@@ -2843,9 +2851,9 @@ mod tests {
                     let mut snapshot = snapshot_session.begin_trx().unwrap();
                     let mut trx = session.begin_trx().unwrap();
                     let payload = if state == "space" {
-                        Val::from(vec![b'x'; 48000])
+                        Val::try_from(vec![b'x'; 48000]).unwrap()
                     } else {
-                        Val::from("changed")
+                        Val::try_from("changed").unwrap()
                     };
                     let result = apply(
                         &mut trx,

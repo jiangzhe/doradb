@@ -672,7 +672,7 @@ mod tests {
         assert_eq!(packed_snapshots(&group), owning_snapshots(logs));
         let mut batch = PackedPageBatch::default();
         // A different source group seeds nonzero descriptor and byte offsets.
-        let primer = decode_log(&value_log(vec![Val::from("primer")], 0));
+        let primer = decode_log(&value_log(vec![Val::try_from("primer").unwrap()], 0));
         let DecodedTrxKind::Dml(tables) = &primer.transactions[0].kind else {
             panic!()
         };
@@ -772,7 +772,7 @@ mod tests {
         }
         for len in [0, 1, 6, 7, 14, 15, 255, 256, 4095, 4096, 4097, 65535] {
             let bytes: Vec<_> = (0..len).map(|i| (i * 37) as u8).collect();
-            values.push(Val::from(bytes.as_slice()));
+            values.push(Val::try_from(bytes.as_slice()).unwrap());
         }
         values
     }
@@ -812,7 +812,7 @@ mod tests {
             RowID::new(id / 2),
             RowRedo {
                 row_id: RowID::new(id),
-                kind: RowRedoKind::Insert(PageID::new(10), vec![Val::from(value)]),
+                kind: RowRedoKind::Insert(PageID::new(10), vec![Val::try_from(value).unwrap()]),
             },
         )
     }
@@ -832,7 +832,7 @@ mod tests {
                 vec![
                     Val::Null,
                     Val::F32(OrderedFloat(f32::from_bits(0xffc12345))),
-                    Val::from("outlined insert bytes"),
+                    Val::try_from("outlined insert bytes").unwrap(),
                 ],
             ),
             RowRedoKind::Update(PageID::new(102), vec![]),
@@ -853,7 +853,7 @@ mod tests {
                     },
                     UpdateCol {
                         idx: 1,
-                        val: Val::from("updated bytes"),
+                        val: Val::try_from("updated bytes").unwrap(),
                     },
                 ],
             ),
@@ -862,7 +862,7 @@ mod tests {
             RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(IndexSlot::new(0), vec![])),
             RowRedoKind::DeleteByPrimaryKey(CatalogSelectKey::new(
                 IndexSlot::new(u16::MAX),
-                vec![Val::from("key bytes"), Val::I16(-13)],
+                vec![Val::try_from("key bytes").unwrap(), Val::I16(-13)],
             )),
             RowRedoKind::UpdateByPrimaryKey(
                 CatalogSelectKey::new(IndexSlot::new(3), vec![]),
@@ -872,7 +872,7 @@ mod tests {
                 CatalogSelectKey::new(IndexSlot::new(4), vec![Val::F32(OrderedFloat(-0.0))]),
                 vec![UpdateCol {
                     idx: 2,
-                    val: Val::from("new keyed bytes"),
+                    val: Val::try_from("new keyed bytes").unwrap(),
                 }],
             ),
         ]
@@ -984,7 +984,10 @@ mod tests {
                     RowRedo {
                         row_id: RowID::new(5),
                         kind: RowRedoKind::UpdateByPrimaryKey(
-                            CatalogSelectKey::new(IndexSlot::new(6), vec![Val::from("ddl key")]),
+                            CatalogSelectKey::new(
+                                IndexSlot::new(6),
+                                vec![Val::try_from("ddl key").unwrap()],
+                            ),
                             vec![UpdateCol {
                                 idx: 7,
                                 val: Val::F64(OrderedFloat(-0.0)),
@@ -1165,7 +1168,7 @@ mod tests {
     #[test]
     fn all_value_boundaries_survive_decode_pack_and_repeated_borrows() {
         differential(&[
-            value_log(vec![Val::from("leading transaction")], 1),
+            value_log(vec![Val::try_from("leading transaction").unwrap()], 1),
             value_log(boundary_values(), 2),
         ]);
     }
@@ -1194,7 +1197,7 @@ mod tests {
                             let bytes: Vec<u8> = (0..rng.random_range(0..512))
                                 .map(|_| rng.random())
                                 .collect();
-                            Val::from(bytes.as_slice())
+                            Val::try_from(bytes.as_slice()).unwrap()
                         }
                     })
                     .collect();
@@ -1275,7 +1278,10 @@ mod tests {
                 assert_corrupt(&truncated);
             }
         }
-        let large = encode_logs(&[value_log(vec![Val::from(vec![0x81; 65535])], 7)]);
+        let large = encode_logs(&[value_log(
+            vec![Val::try_from(vec![0x81; 65535]).unwrap()],
+            7,
+        )]);
         for len in [
             4095,
             4096,
@@ -1321,7 +1327,10 @@ mod tests {
             );
         }
         // Sparse updates keep duplicate and descending ordinals for schema validation.
-        let mut log = value_log(vec![Val::Null, Val::from("bytes"), Val::U64(1)], 7);
+        let mut log = value_log(
+            vec![Val::Null, Val::try_from("bytes").unwrap(), Val::U64(1)],
+            7,
+        );
         let RowRedoKind::Update(_, updates) = &mut log
             .payload
             .dml
@@ -1379,7 +1388,7 @@ mod tests {
             (
                 11,
                 vec![3, 0, 0xff, 0, 0x80],
-                Val::from(&[0xff, 0, 0x80][..]),
+                Val::try_from(&[0xff, 0, 0x80][..]).unwrap(),
             ),
         ];
         for (tag, bytes, expected) in cases {

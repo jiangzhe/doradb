@@ -606,7 +606,7 @@ mod tests {
                         ValKind::VarByte,
                         offsets
                             .iter()
-                            .map(|(start, end)| Val::from(&data[*start..*end]))
+                            .map(|(start, end)| Val::try_from(&data[*start..*end]).unwrap())
                             .collect(),
                     )
                 }
@@ -689,8 +689,8 @@ mod tests {
                     2 => f64::from_bits(0x7ff8000000001234),
                     _ => 0.5f64 + ordinal as f64,
                 }),
-                Val::from(short.as_bytes()),
-                Val::from(long.as_bytes()),
+                Val::try_from(short.as_bytes()).unwrap(),
+                Val::try_from(long.as_bytes()).unwrap(),
             ];
             let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
@@ -878,7 +878,7 @@ mod tests {
                 } else {
                     Val::from(10.5f64 + row_idx as f64)
                 },
-                Val::from(row_bytes.as_bytes()),
+                Val::try_from(row_bytes.as_bytes()).unwrap(),
             ];
             let res = page.insert(metadata.col.as_ref(), &insert);
             if let InsertRow::Ok(rid) = res {
@@ -958,13 +958,13 @@ mod tests {
         )
         .unwrap();
         let rows = vec![
-            vec![Val::U16(10), Val::from("first".as_bytes())],
+            vec![Val::U16(10), Val::try_from("first".as_bytes()).unwrap()],
             vec![Val::Null, Val::Null],
             vec![
                 Val::U16(12),
-                Val::from("long source value at two".as_bytes()),
+                Val::try_from("long source value at two".as_bytes()).unwrap(),
             ],
-            vec![Val::Null, Val::from("three".as_bytes())],
+            vec![Val::Null, Val::try_from("three".as_bytes()).unwrap()],
             vec![Val::U16(14), Val::Null],
             vec![Val::U16(15), Val::Null],
         ];

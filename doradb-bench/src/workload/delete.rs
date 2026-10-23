@@ -529,9 +529,12 @@ mod tests {
         assert_ne!(index_id, IndexID::new(0));
         let mut trx = session.begin_trx().unwrap();
         for (key, payload) in rows {
-            trx.table_insert_mvcc(table_id, vec![Val::from(*key), Val::from(payload.clone())])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(*key), Val::try_from(payload.clone()).unwrap()],
+            )
+            .await
+            .unwrap();
         }
         let fence = trx.commit().await.unwrap();
         (
@@ -862,7 +865,7 @@ mod tests {
                     |_| -> CallbackResult<_> {
                         Ok(RowMutation::Update(vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("blocked"),
+                            val: Val::try_from("blocked").unwrap(),
                         }]))
                     },
                 )

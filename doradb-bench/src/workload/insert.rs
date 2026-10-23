@@ -357,8 +357,14 @@ async fn run_insert_operations(
         let mut batch_inserted = 0u64;
         for key in batch {
             let payload = generate_payload(*key, spec.seed, spec.value_size);
-            let row = vec![Val::from(*key), Val::from(&payload[..])];
-            match trx.table_insert_mvcc(spec.table_id, row).await {
+            let insert = match Val::try_from(&payload[..]) {
+                Ok(payload) => {
+                    trx.table_insert_mvcc(spec.table_id, vec![Val::from(*key), payload])
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match insert {
                 Ok(_) => {
                     result.inserted_rows = checked(result.inserted_rows, 1, "inserted rows")?;
                     batch_inserted = checked(batch_inserted, 1, "batch inserted rows")?;
@@ -401,4 +407,66 @@ fn checked(current: u64, addition: u64, label: &str) -> Result<u64> {
     current
         .checked_add(addition)
         .ok_or_else(|| BenchError::message(format!("{label} counter overflow")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workload::update::{assert_rows, fixture, test_engine};
+    use doradb_storage::MemVar;
+
+    /// Purpose: Preserve transaction settlement when an insert payload fails owned-value conversion.
+    /// Expected: Oversized input returns InvalidDmlInput, leaves rows unchanged, and permits a subsequent insert on the session.
+    #[test]
+    fn oversized_payload_rolls_back_transaction() {
+        smol::block_on(async {
+            let (_root, engine) = test_engine().await;
+            let original = [(1, b"existing".to_vec())];
+            let (mut session, primary) = fixture(&engine, IndexMode::Unique, &original).await;
+            let plan = SessionPlan {
+                session_index: 0,
+                key_start: 2,
+                number: 1,
+            };
+            let spec = InsertOperationSpec {
+                table_id: primary.table_id,
+                random: false,
+                index: IndexMode::Unique,
+                seed: 7,
+                value_size: MemVar::MAX_LEN + 1,
+                batch_size: 1,
+            };
+            let error = run_insert_operations(&mut session, spec, &plan, None, None)
+                .await
+                .err()
+                .unwrap();
+            let BenchError::Storage(error) = error else {
+                panic!("expected storage conversion error: {error:?}");
+            };
+            assert_eq!(
+                error.operation_error(),
+                Some(OperationError::InvalidDmlInput)
+            );
+            assert_rows(&mut session, primary, &original).await;
+            let spec = InsertOperationSpec {
+                value_size: 15,
+                ..spec
+            };
+            let result = run_insert_operations(&mut session, spec, &plan, None, None)
+                .await
+                .unwrap();
+            assert_eq!(result.inserted_rows, 1);
+            assert_rows(
+                &mut session,
+                primary,
+                &[
+                    (1, b"existing".to_vec()),
+                    (2, generate_payload(2, spec.seed, spec.value_size)),
+                ],
+            )
+            .await;
+            session.close().await.unwrap();
+            engine.shutdown();
+        });
+    }
 }

@@ -2694,7 +2694,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(primary_key), Val::from("dup")],
+                vec![Val::from(primary_key), Val::try_from("dup").unwrap()],
             )
             .await;
             if split_cold {
@@ -2710,7 +2710,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(100 + offset), Val::from("dup")],
+                vec![Val::from(100 + offset), Val::try_from("dup").unwrap()],
             )
             .await;
         }
@@ -2746,7 +2746,7 @@ pub(crate) mod tests {
         insert_one_row(
             table_id,
             &mut session,
-            vec![Val::from(1), Val::from("alpha")],
+            vec![Val::from(1), Val::try_from("alpha").unwrap()],
         )
         .await;
         let before = index_ddl_snapshot(&engine, table_id, &table);
@@ -2789,7 +2789,7 @@ pub(crate) mod tests {
             .non_unique_mem()
             .unwrap()
             .bind(guards.index_guard())
-            .lookup_unique(&[Val::from(key)], row_id, MAX_SNAPSHOT_TS)
+            .lookup_unique(&[Val::try_from(key).unwrap()], row_id, MAX_SNAPSHOT_TS)
             .await
             .unwrap()
     }
@@ -2804,7 +2804,7 @@ pub(crate) mod tests {
     fn name_key(value: &str) -> SelectKey {
         SelectKey {
             index_slot: IndexSlot::new(1),
-            vals: vec![Val::from(value)],
+            vals: vec![Val::try_from(value).unwrap()],
         }
     }
 
@@ -2917,8 +2917,12 @@ pub(crate) mod tests {
     }
 
     async fn updated_hot_row(table_id: TableID, session: &mut Session) -> RowID {
-        let row_id =
-            insert_one_row(table_id, session, vec![Val::from(1), Val::from("alpha")]).await;
+        let row_id = insert_one_row(
+            table_id,
+            session,
+            vec![Val::from(1), Val::try_from("alpha").unwrap()],
+        )
+        .await;
         assert_eq!(
             update_one_row(
                 table_id,
@@ -2926,7 +2930,7 @@ pub(crate) mod tests {
                 &single_key(1),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("bravo"),
+                    val: Val::try_from("bravo").unwrap(),
                 }],
             )
             .await,
@@ -3129,19 +3133,19 @@ pub(crate) mod tests {
             let row1 = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("alpha")],
+                vec![Val::from(1), Val::try_from("alpha").unwrap()],
             )
             .await;
             let _row2 = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(2), Val::from("beta")],
+                vec![Val::from(2), Val::try_from("beta").unwrap()],
             )
             .await;
             let row3 = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(3), Val::from("alpha")],
+                vec![Val::from(3), Val::try_from("alpha").unwrap()],
             )
             .await;
             let old_generation = table.layout_snapshot().generation();
@@ -3181,7 +3185,7 @@ pub(crate) mod tests {
                 root,
                 &session.pool_guards(),
                 IndexSlot::new(1),
-                &[Val::from("alpha")],
+                &[Val::try_from("alpha").unwrap()],
             )
             .await;
             rows.sort_unstable();
@@ -3190,7 +3194,7 @@ pub(crate) mod tests {
             let row4 = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(4), Val::from("alpha")],
+                vec![Val::from(4), Val::try_from("alpha").unwrap()],
             )
             .await;
             let mut rows = non_unique_runtime_lookup(
@@ -3198,7 +3202,7 @@ pub(crate) mod tests {
                 root,
                 &session.pool_guards(),
                 IndexSlot::new(1),
-                &[Val::from("alpha")],
+                &[Val::try_from("alpha").unwrap()],
             )
             .await;
             rows.sort_unstable();
@@ -3709,7 +3713,7 @@ pub(crate) mod tests {
                     else {
                         panic!("fixture requires a non-unique destination")
                     };
-                    let sentinel = [Val::from("destination")];
+                    let sentinel = [Val::try_from("destination").unwrap()];
                     let sentinel_row = RowID::new(9999);
                     assert!(matches!(
                         destination
@@ -4279,13 +4283,13 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(17), Val::from("duplicate")],
+                vec![Val::from(17), Val::try_from("duplicate").unwrap()],
             )
             .await;
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(18), Val::from("duplicate")],
+                vec![Val::from(18), Val::try_from("duplicate").unwrap()],
             )
             .await;
             let before_duplicate = session.index_build_stats().unwrap();
@@ -4323,7 +4327,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("cold")],
+                vec![Val::from(1), Val::try_from("cold").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4540,7 +4544,7 @@ pub(crate) mod tests {
             let cold_row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("alpha")],
+                vec![Val::from(1), Val::try_from("alpha").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
@@ -4552,7 +4556,7 @@ pub(crate) mod tests {
                 &single_key(1),
                 vec![UpdateCol {
                     idx: 1,
-                    val: Val::from("bravo"),
+                    val: Val::try_from("bravo").unwrap(),
                 }],
             )
             .await;
@@ -4609,7 +4613,7 @@ pub(crate) mod tests {
                     active_secondary_root(&table, IndexSlot::new(1)),
                     &session.pool_guards(),
                     IndexSlot::new(1),
-                    &[Val::from("alpha")],
+                    &[Val::try_from("alpha").unwrap()],
                 )
                 .await,
                 []
@@ -4620,7 +4624,7 @@ pub(crate) mod tests {
                     active_secondary_root(&table, IndexSlot::new(1)),
                     &session.pool_guards(),
                     IndexSlot::new(1),
-                    &[Val::from("bravo")],
+                    &[Val::try_from("bravo").unwrap()],
                 )
                 .await,
                 vec![hot_row_id]
@@ -4656,7 +4660,7 @@ pub(crate) mod tests {
                     &table,
                     IndexSlot::new(1),
                     &session.pool_guards(),
-                    &[Val::from("alpha")],
+                    &[Val::try_from("alpha").unwrap()],
                 )
                 .await,
                 None
@@ -4666,7 +4670,7 @@ pub(crate) mod tests {
                     &table,
                     IndexSlot::new(1),
                     &session.pool_guards(),
-                    &[Val::from("bravo")],
+                    &[Val::try_from("bravo").unwrap()],
                 )
                 .await,
                 Some((row_id, false))
@@ -4688,9 +4692,12 @@ pub(crate) mod tests {
             let mut trx = session.begin_trx().unwrap();
             for key in 10..18 {
                 expected_rows.push(
-                    trx.table_insert_mvcc(table_id, vec![Val::from(key), Val::from("cold")])
-                        .await
-                        .unwrap(),
+                    trx.table_insert_mvcc(
+                        table_id,
+                        vec![Val::from(key), Val::try_from("cold").unwrap()],
+                    )
+                    .await
+                    .unwrap(),
                 );
             }
             trx.commit().await.unwrap();
@@ -4839,7 +4846,7 @@ pub(crate) mod tests {
                         unique_runtime_lookup(&table, IndexSlot::new(0), &guards, &[Val::from(id)])
                             .await
                             .unwrap();
-                    let key = [Val::from(value.as_str()), Val::from(id)];
+                    let key = [Val::try_from(value.as_str()).unwrap(), Val::from(id)];
                     if unique {
                         assert_eq!(
                             unique_runtime_lookup(&table, IndexSlot::new(1), &guards, &key).await,
@@ -5020,7 +5027,7 @@ pub(crate) mod tests {
                     insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(primary_key), Val::from("boundary")],
+                        vec![Val::from(primary_key), Val::try_from("boundary").unwrap()],
                     )
                     .await,
                 );
@@ -5038,7 +5045,7 @@ pub(crate) mod tests {
                     insert_one_row(
                         table_id,
                         &mut session,
-                        vec![Val::from(primary_key), Val::from("boundary")],
+                        vec![Val::from(primary_key), Val::try_from("boundary").unwrap()],
                     )
                     .await,
                 );
@@ -5166,8 +5173,18 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
-            insert_one_row(table_id, &mut session, vec![Val::from(1), Val::from("dup")]).await;
-            insert_one_row(table_id, &mut session, vec![Val::from(2), Val::from("dup")]).await;
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::try_from("dup").unwrap()],
+            )
+            .await;
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(2), Val::try_from("dup").unwrap()],
+            )
+            .await;
             let before = index_ddl_snapshot(&engine, table_id, &table);
 
             let err = session
@@ -5269,9 +5286,18 @@ pub(crate) mod tests {
             let table_id = table2(&engine).await;
             let table = table_for_internal_assertion(&engine, table_id);
             let mut session = engine.new_session().unwrap();
-            let row1 =
-                insert_one_row(table_id, &mut session, vec![Val::from(1), Val::from("dup")]).await;
-            insert_one_row(table_id, &mut session, vec![Val::from(2), Val::from("dup")]).await;
+            let row1 = insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(1), Val::try_from("dup").unwrap()],
+            )
+            .await;
+            insert_one_row(
+                table_id,
+                &mut session,
+                vec![Val::from(2), Val::try_from("dup").unwrap()],
+            )
+            .await;
             assert_freeze_created(
                 session
                     .freeze_table(table.table_id(), usize::MAX)
@@ -5295,7 +5321,7 @@ pub(crate) mod tests {
                     &table,
                     IndexSlot::new(1),
                     &session.pool_guards(),
-                    &[Val::from("dup")],
+                    &[Val::try_from("dup").unwrap()],
                 )
                 .await,
                 Some((row1, false))
@@ -5358,7 +5384,7 @@ pub(crate) mod tests {
             let row_id = insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("persisted")],
+                vec![Val::from(1), Val::try_from("persisted").unwrap()],
             )
             .await;
             assert_freeze_created(
@@ -5399,7 +5425,7 @@ pub(crate) mod tests {
                 non_unique_disk_tree_prefix_scan(
                     &table,
                     &session.pool_guards(),
-                    &SelectKey::new(IndexSlot::new(1), vec![Val::from("persisted")],),
+                    &SelectKey::new(IndexSlot::new(1), vec![Val::try_from("persisted").unwrap()],),
                 )
                 .await,
                 vec![row_id]
@@ -5519,7 +5545,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("same")],
+                vec![Val::from(1), Val::try_from("same").unwrap()],
             )
             .await;
 
@@ -5533,8 +5559,8 @@ pub(crate) mod tests {
                     .unwrap(),
                 crate::IndexID::new(1)
             );
-            let secondary_duplicate = vec![Val::from(2), Val::from("same")];
-            let original_duplicate = vec![Val::from(1), Val::from("different")];
+            let secondary_duplicate = vec![Val::from(2), Val::try_from("same").unwrap()];
+            let original_duplicate = vec![Val::from(1), Val::try_from("different").unwrap()];
             for values in [&secondary_duplicate, &original_duplicate] {
                 let mut trx = session.begin_trx().unwrap();
                 let error = trx
@@ -5762,7 +5788,7 @@ pub(crate) mod tests {
             insert_one_row(
                 table_id,
                 &mut session,
-                vec![Val::from(1), Val::from("current")],
+                vec![Val::from(1), Val::try_from("current").unwrap()],
             )
             .await;
             assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());

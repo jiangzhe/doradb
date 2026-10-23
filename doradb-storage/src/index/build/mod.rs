@@ -674,7 +674,7 @@ mod tests {
                                     if slot % 13 == 0 {
                                         Val::Null
                                     } else {
-                                        Val::from(value.as_str())
+                                        Val::try_from(value.as_str()).unwrap()
                                     },
                                 ],
                             ),
@@ -1150,7 +1150,7 @@ mod tests {
                     ValType::new(ValKind::U64, false),
                 ],
                 vec![
-                    Val::from("long variable prefix crossing segments"),
+                    Val::try_from("long variable prefix crossing segments").unwrap(),
                     Val::from(14u64),
                 ],
             ),
@@ -1164,7 +1164,7 @@ mod tests {
             assert_eq!(from_iter.encode_with_len(&values, len), expected);
         }
         for len in [0, 14, 23, 24, 25, 255] {
-            let values = [Val::from(vec![0xab; len])];
+            let values = [Val::try_from(vec![0xab; len]).unwrap()];
             let encoder = BTreeKeyEncoder::new(vec![ValType::new(ValKind::VarByte, true)]);
             let len = encoder.encoded_len(&values).unwrap();
             assert_eq!(
@@ -2045,7 +2045,7 @@ mod tests {
                             first.page_id,
                             vec![UpdateCol {
                                 idx: 1,
-                                val: Val::from("changed current value"),
+                                val: Val::try_from("changed current value").unwrap(),
                             }],
                         ),
                     },
@@ -2062,7 +2062,10 @@ mod tests {
                     row_id: replacement,
                     kind: RowRedoKind::Insert(
                         second.page_id,
-                        vec![Val::from(777i32), Val::from("live replacement")],
+                        vec![
+                            Val::from(777i32),
+                            Val::try_from("live replacement").unwrap(),
+                        ],
                     ),
                 },
             }]);

@@ -258,7 +258,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 page.page().row(idx).val(&metadata.col, 1),
-                Val::from("changed")
+                Val::try_from("changed").unwrap()
             );
             assert!(replay.is_inserted(idx));
             cts = cts + 1;
@@ -341,7 +341,10 @@ mod tests {
         assert!(replay.is_inserted(1));
         assert_eq!(page.page().header.var_field_offset(), offset_before);
         assert!(!page.page().is_deleted(1));
-        assert_eq!(page.page().row(1).val(&metadata.col, 1), Val::from("name"));
+        assert_eq!(
+            page.page().row(1).val(&metadata.col, 1),
+            Val::try_from("name").unwrap()
+        );
     }
 
     /// Purpose: Protect cold-delete replay boundaries and idempotency.
@@ -390,16 +393,16 @@ mod tests {
     #[test]
     fn test_recover_row_page_sparse_bitmap_boundaries_and_slot_history() {
         smol::block_on(async {
-            let vals = [Val::from(1i32), Val::from("name")];
+            let vals = [Val::from(1i32), Val::try_from("name").unwrap()];
             let update = [UpdateCol {
                 idx: 1,
-                val: Val::from("changed"),
+                val: Val::try_from("changed").unwrap(),
             }];
             let bytes = vec![b'x'; PAGE_SIZE - 1];
-            let huge = [Val::from(1i32), Val::from(bytes.as_slice())];
+            let huge = [Val::from(1i32), Val::try_from(bytes.as_slice()).unwrap()];
             let huge_update = [UpdateCol {
                 idx: 1,
-                val: Val::from(bytes.as_slice()),
+                val: Val::try_from(bytes.as_slice()).unwrap(),
             }];
             check_recovery_slot_history(&vals[..], &update[..], &huge[..], &huge_update[..]).await;
             // Construct the independent payload directly, without owning value objects.
@@ -440,7 +443,7 @@ mod tests {
                     page_id,
                     vec![UpdateCol {
                         idx: 2,
-                        val: Val::from("out-of-range"),
+                        val: Val::try_from("out-of-range").unwrap(),
                     }],
                 ),
             ] {
@@ -482,12 +485,15 @@ mod tests {
             for (slot, disable_validation) in [false, true].into_iter().enumerate() {
                 let current_row = row_id + slot as u64;
                 let kinds = [
-                    RowRedoKind::Insert(page_id, vec![Val::I32(1), Val::from("initial")]),
+                    RowRedoKind::Insert(
+                        page_id,
+                        vec![Val::I32(1), Val::try_from("initial").unwrap()],
+                    ),
                     RowRedoKind::Update(
                         page_id,
                         vec![UpdateCol {
                             idx: 1,
-                            val: Val::from("replacement bytes"),
+                            val: Val::try_from("replacement bytes").unwrap(),
                         }],
                     ),
                 ];
@@ -526,7 +532,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     page.page().row(slot).clone_vals(&table.metadata().col),
-                    vec![Val::I32(1), Val::from("replacement bytes")]
+                    vec![Val::I32(1), Val::try_from("replacement bytes").unwrap()]
                 );
             }
         });
@@ -556,12 +562,15 @@ mod tests {
             page.bf().set_dirty(false);
             drop(page);
             let kinds = [
-                RowRedoKind::Insert(page_id, vec![Val::I32(1), Val::from("initial")]),
+                RowRedoKind::Insert(
+                    page_id,
+                    vec![Val::I32(1), Val::try_from("initial").unwrap()],
+                ),
                 RowRedoKind::Update(
                     page_id,
                     vec![UpdateCol {
                         idx: 1,
-                        val: Val::from("updated"),
+                        val: Val::try_from("updated").unwrap(),
                     }],
                 ),
                 RowRedoKind::Delete(Some(page_id)),
@@ -581,7 +590,7 @@ mod tests {
                                 page_id,
                                 vec![UpdateCol {
                                     idx: 2,
-                                    val: Val::from("invalid column"),
+                                    val: Val::try_from("invalid column").unwrap(),
                                 }],
                             ),
                         },
@@ -614,7 +623,7 @@ mod tests {
                         page.page().row(0).clone_vals(&table.metadata().col),
                         vec![
                             Val::I32(1),
-                            Val::from(if step == 0 { "initial" } else { "updated" })
+                            Val::try_from(if step == 0 { "initial" } else { "updated" }).unwrap()
                         ]
                     );
                 }
@@ -861,9 +870,9 @@ mod tests {
                 Val::I64(i64::MIN),
                 Val::U64(u64::MAX),
                 Val::F64(OrderedFloat(-0.0)),
-                Val::from(""),
-                Val::from("short"),
-                Val::from("outlined bytes with a substantial payload"),
+                Val::try_from("").unwrap(),
+                Val::try_from("short").unwrap(),
+                Val::try_from("outlined bytes with a substantial payload").unwrap(),
             ];
             let updates: Vec<_> = values
                 .iter()
@@ -882,7 +891,9 @@ mod tests {
                         Val::U64(v) => Val::U64(v.wrapping_add(1)),
                         Val::F32(_) => Val::F32(OrderedFloat(-0.0)),
                         Val::F64(_) => Val::F64(OrderedFloat(f64::from_bits(0xfff8123456789abc))),
-                        Val::VarByte(v) if v.len() <= 6 => Val::from("updated outlined bytes"),
+                        Val::VarByte(v) if v.len() <= 6 => {
+                            Val::try_from("updated outlined bytes").unwrap()
+                        }
                         Val::VarByte(_) => Val::Null,
                     },
                 })

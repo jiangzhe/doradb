@@ -2906,7 +2906,7 @@ mod tests {
                 row_id: RowID::new(100),
                 kind: RowRedoKind::Insert(
                     test_page_id(5),
-                    vec![Val::from(1u32), Val::from(&text[..])],
+                    vec![Val::from(1u32), Val::try_from(&text[..]).unwrap()],
                 ),
             },
         );
@@ -3533,7 +3533,10 @@ mod tests {
             let mut session = engine.new_session().unwrap();
             let mut warmup = session.begin_trx().unwrap();
             warmup
-                .table_insert_mvcc(table_id, vec![Val::from(0), Val::from("warmup")])
+                .table_insert_mvcc(
+                    table_id,
+                    vec![Val::from(0), Val::try_from("warmup").unwrap()],
+                )
                 .await
                 .unwrap();
             warmup.commit().await.unwrap();
@@ -3555,7 +3558,10 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             trx.table_insert_mvcc(
                 table_id,
-                vec![Val::from(1), Val::from("rotation-create-failure")],
+                vec![
+                    Val::from(1),
+                    Val::try_from("rotation-create-failure").unwrap(),
+                ],
             )
             .await
             .unwrap();
@@ -3626,9 +3632,12 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("handoff")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::try_from("handoff").unwrap()],
+            )
+            .await
+            .unwrap();
             assert!(session.in_trx().unwrap());
 
             let mut commit_fut = Box::pin(trx.commit());
@@ -3683,9 +3692,12 @@ mod tests {
             let mut trx = session.begin_trx().unwrap();
             let sts = trx.sts();
             assert_eq!(engine.inner().trx_sys.min_active_sts(), sts);
-            trx.table_insert_mvcc(table_id, vec![Val::from(2), Val::from("shutdown")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(2), Val::try_from("shutdown").unwrap()],
+            )
+            .await
+            .unwrap();
 
             let mut commit_fut = Box::pin(trx.commit());
             let waker = noop_waker();
@@ -3754,9 +3766,12 @@ mod tests {
             let table_id = table2(&engine).await;
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("closed")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::try_from("closed").unwrap()],
+            )
+            .await
+            .unwrap();
 
             {
                 let mut group_commit_g = engine.inner().trx_sys.redo_log.group_commit.lock();
@@ -3805,9 +3820,12 @@ mod tests {
 
             let mut session = engine.new_session().unwrap();
             let mut trx = session.begin_trx().unwrap();
-            trx.table_insert_mvcc(table_id, vec![Val::from(1), Val::from("sync-fail")])
-                .await
-                .unwrap();
+            trx.table_insert_mvcc(
+                table_id,
+                vec![Val::from(1), Val::try_from("sync-fail").unwrap()],
+            )
+            .await
+            .unwrap();
 
             let mut commit_fut = Box::pin(trx.commit());
             let waker = noop_waker();
@@ -5310,7 +5328,7 @@ mod tests {
 
             let expected_rows: Vec<_> = INPUTS
                 .into_iter()
-                .map(|i| vec![Val::from(i), Val::from(i.to_string().as_str())])
+                .map(|i| vec![Val::from(i), Val::try_from(i.to_string().as_str()).unwrap()])
                 .collect();
             let mut session = engine.new_session().unwrap();
             for row in &expected_rows {
