@@ -6,8 +6,8 @@ use error_stack::{Report, ResultExt};
 use std::path::PathBuf;
 
 use super::consts::{
-    DEFAULT_ENGINE_INDEX_BUFFER, DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE,
-    DEFAULT_ENGINE_INDEX_SWAP_FILE, DEFAULT_ENGINE_META_BUFFER,
+    DEFAULT_DEADLOCK_SEARCH_WORK_LIMIT, DEFAULT_ENGINE_INDEX_BUFFER,
+    DEFAULT_ENGINE_INDEX_MAX_FILE_SIZE, DEFAULT_ENGINE_INDEX_SWAP_FILE, DEFAULT_ENGINE_META_BUFFER,
     DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION, DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
     MAX_TABLE_SCAN_UNITS_PER_PARTITION,
 };
@@ -153,6 +153,42 @@ impl TableScanConfig {
     }
 }
 
+/// Immutable logical-lock settings selected at engine startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockManagerConfig {
+    /// Positive charged-work allowance per deadlock check, shared across retries.
+    /// This bounds search work and scratch growth, not elapsed lock-wait time.
+    pub deadlock_search_work_limit: usize,
+}
+
+impl Default for LockManagerConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            deadlock_search_work_limit: DEFAULT_DEADLOCK_SEARCH_WORK_LIMIT,
+        }
+    }
+}
+
+impl LockManagerConfig {
+    /// Set the work allowance for each initial deadlock check; zero is invalid.
+    #[inline]
+    pub fn deadlock_search_work_limit(mut self, limit: usize) -> Self {
+        self.deadlock_search_work_limit = limit;
+        self
+    }
+
+    /// Validate the startup allowance without allocating search storage.
+    #[inline]
+    pub(crate) fn validate(&self) -> ConfigResult<()> {
+        if self.deadlock_search_work_limit == 0 {
+            return Err(Report::new(ConfigError::InvalidDeadlockSearchWorkLimit)
+                .attach("lock_manager.deadlock_search_work_limit=0; expected a positive value"));
+        }
+        Ok(())
+    }
+}
+
 /// Storage-engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -174,6 +210,8 @@ pub struct EngineConfig {
     pub mandatory_runtime: MandatoryRuntimeConfig,
     /// Deterministic table-scan planning configuration.
     pub table_scan: TableScanConfig,
+    /// Logical-lock deadlock detection settings.
+    pub lock_manager: LockManagerConfig,
     /// Metadata buffer-pool size.
     pub meta_buffer: Byte,
     /// User-index buffer-pool configuration.
@@ -197,6 +235,7 @@ impl Default for EngineConfig {
             thread_pool: ThreadPoolConfig::default(),
             mandatory_runtime: MandatoryRuntimeConfig::default(),
             table_scan: TableScanConfig::default(),
+            lock_manager: LockManagerConfig::default(),
             meta_buffer: Byte::from_u64(DEFAULT_ENGINE_META_BUFFER as u64),
             index_buffer: EvictableBufferPoolConfig::default()
                 .swap_file(DEFAULT_ENGINE_INDEX_SWAP_FILE)
@@ -230,6 +269,7 @@ impl EngineConfig {
         self.recovery.validate(self.thread_pool.worker_threads)?;
         self.mandatory_runtime.validate()?;
         self.table_scan.validate()?;
+        self.lock_manager.validate()?;
         self.trx.validate()?;
         self.index_buffer = self
             .index_buffer
@@ -318,6 +358,13 @@ impl EngineConfig {
         self
     }
 
+    /// Set immutable logical-lock deadlock detection settings.
+    #[inline]
+    pub fn lock_manager(mut self, lock_manager: LockManagerConfig) -> Self {
+        self.lock_manager = lock_manager;
+        self
+    }
+
     /// Set the metadata buffer-pool size.
     #[inline]
     pub fn meta_buffer(mut self, meta_buffer: impl Into<Byte>) -> Self {
@@ -378,6 +425,30 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use tempfile::TempDir;
+
+    /// Purpose: Keep logical-lock defaults stable while accepting all positive work allowances.
+    /// Expected: Small and largest representable limits validate without allocation; zero retains its typed configuration error.
+    #[test]
+    fn lock_manager_config_defaults_and_positive_limits() {
+        assert_eq!(
+            LockManagerConfig::default().deadlock_search_work_limit,
+            65_536
+        );
+        for limit in [1, 4, 36, 37, usize::MAX] {
+            let config = LockManagerConfig::default().deadlock_search_work_limit(limit);
+            config.validate().unwrap();
+            assert_eq!(config.deadlock_search_work_limit, limit);
+        }
+        let error = LockManagerConfig::default()
+            .deadlock_search_work_limit(0)
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            *error.current_context(),
+            ConfigError::InvalidDeadlockSearchWorkLimit
+        );
+        assert!(format!("{error:?}").contains("lock_manager.deadlock_search_work_limit=0"));
+    }
 
     /// Purpose: Protect table-scan defaults and inclusive partition-size limits.
     /// Expected: Boundary sizes validate; invalid fields retain specific errors and limits.
@@ -495,6 +566,13 @@ mod tests {
     fn invalid_engine_validation_preserves_typed_and_public_errors_without_creating_root() {
         let temp = TempDir::new().unwrap();
         for (case, config, expected, detail) in [
+            (
+                "lock_manager",
+                EngineConfig::default()
+                    .lock_manager(LockManagerConfig::default().deadlock_search_work_limit(0)),
+                ConfigError::InvalidDeadlockSearchWorkLimit,
+                "lock_manager.deadlock_search_work_limit=0",
+            ),
             (
                 "thread_pool",
                 EngineConfig::default().thread_pool(ThreadPoolConfig::default().worker_threads(0)),

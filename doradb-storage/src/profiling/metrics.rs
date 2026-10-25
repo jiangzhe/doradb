@@ -144,7 +144,7 @@ fn internal_metrics(before: &InternalStatsSnapshot, after: &InternalStatsSnapsho
     push_storage_metrics(&mut metrics, before.storage, after.storage);
     push_buffer_metrics(&mut metrics, &before.buffer, &after.buffer);
     push_mandatory_metrics(&mut metrics, before.mandatory, after.mandatory);
-    push_logical_lock_metrics(&mut metrics, before.logical_lock, after.logical_lock);
+    push_logical_lock_metrics(&mut metrics, &before.logical_lock, &after.logical_lock);
     push_hot_extraction_metrics(&mut metrics, &before.index_build, &after.index_build);
     let checkpoint_completed = after.index_build.checkpoint.completed_checkpoints
         > before.index_build.checkpoint.completed_checkpoints;
@@ -551,8 +551,8 @@ fn create_index_peak(name: &str) -> bool {
 
 fn push_logical_lock_metrics(
     metrics: &mut Vec<Metric>,
-    before: LogicalLockStats,
-    after: LogicalLockStats,
+    before: &LogicalLockStats,
+    after: &LogicalLockStats,
 ) {
     macro_rules! delta_metric {
         ($field:ident) => {
@@ -583,6 +583,22 @@ fn push_logical_lock_metrics(
     delta_metric!(completion_allocations);
     delta_metric!(waiter_slab_growths);
     delta_metric!(waiter_slab_reuses);
+    delta_metric!(deadlock_initial_checks);
+    delta_metric!(deadlock_examined_work);
+    delta_metric!(deadlock_candidate_cycles);
+    delta_metric!(deadlock_elections);
+    delta_metric!(deadlock_invalidated_witnesses);
+    delta_metric!(deadlock_check_limits);
+    push_metric(
+        metrics,
+        "logical_lock.current_pending_registrations",
+        after.current_pending_registrations,
+    );
+    push_metric(
+        metrics,
+        "logical_lock.peak_pending_registrations",
+        after.peak_pending_registrations,
+    );
     push_metric(
         metrics,
         "logical_lock.current_physical_resources",
@@ -1353,6 +1369,62 @@ mod tests {
             326,
             539,
             CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_initial_checks",
+            100,
+            200,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_examined_work",
+            102,
+            203,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_candidate_cycles",
+            104,
+            206,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_elections",
+            106,
+            209,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_invalidated_witnesses",
+            108,
+            212,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.deadlock_check_limits",
+            110,
+            215,
+            CounterDelta,
+            Count,
+        ),
+        (
+            "logical_lock.current_pending_registrations",
+            218,
+            218,
+            EndGauge,
+            Count,
+        ),
+        (
+            "logical_lock.peak_pending_registrations",
+            221,
+            221,
+            LifetimePeak,
             Count,
         ),
         (
@@ -2963,6 +3035,22 @@ mod tests {
         after.logical_lock.waiter_slab_growths = 536;
         before.logical_lock.waiter_slab_reuses = 213;
         after.logical_lock.waiter_slab_reuses = 539;
+        before.logical_lock.deadlock_initial_checks = 100;
+        after.logical_lock.deadlock_initial_checks = 200;
+        before.logical_lock.deadlock_examined_work = 101;
+        after.logical_lock.deadlock_examined_work = 203;
+        before.logical_lock.deadlock_candidate_cycles = 102;
+        after.logical_lock.deadlock_candidate_cycles = 206;
+        before.logical_lock.deadlock_elections = 103;
+        after.logical_lock.deadlock_elections = 209;
+        before.logical_lock.deadlock_invalidated_witnesses = 104;
+        after.logical_lock.deadlock_invalidated_witnesses = 212;
+        before.logical_lock.deadlock_check_limits = 105;
+        after.logical_lock.deadlock_check_limits = 215;
+        before.logical_lock.current_pending_registrations = 106;
+        after.logical_lock.current_pending_registrations = 218;
+        before.logical_lock.peak_pending_registrations = 107;
+        after.logical_lock.peak_pending_registrations = 221;
         before.logical_lock.current_physical_resources = 214;
         after.logical_lock.current_physical_resources = 542;
         before.logical_lock.peak_physical_resources = 215;

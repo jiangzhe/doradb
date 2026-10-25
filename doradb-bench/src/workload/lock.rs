@@ -507,7 +507,7 @@ async fn run_contended_lifecycle(
                     "failed to cancel waiter: {error}"
                 )));
             }
-            let (baseline, current) = cancellation_counter(scenario, before);
+            let (baseline, current) = cancellation_counter(scenario, &before);
             if let Err(error) = wait_for_counter(
                 || blocker.logical_lock_stats().map(current),
                 baseline + 1,
@@ -625,7 +625,7 @@ fn wait_for_counter(
 
 fn cancellation_counter(
     scenario: LockTableScenario,
-    before: doradb_storage::LogicalLockStats,
+    before: &doradb_storage::LogicalLockStats,
 ) -> (u64, fn(doradb_storage::LogicalLockStats) -> u64) {
     match scenario {
         LockTableScenario::CancelHead => (before.cancelled_head_waiters, |stats| {

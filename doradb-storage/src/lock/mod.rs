@@ -4,15 +4,19 @@
 //! table metadata and table data resources independently from the
 //! engine/session/transaction lifecycle wiring that later phases will add.
 mod claim;
+mod deadlock;
 mod state;
 mod wait;
 
 use self::claim::PendingClaimToken;
+use self::deadlock::{
+    DeadlockDetector, HolderSnapshot, PendingWait, ResourceSnapshot, SearchBudget, WaitDecision,
+};
 use self::wait::{WaitNodeID, WaitNodePhase, WaitQueue};
 use crate::catalog::storage::layout::{BUILTIN_CATALOG_TABLE_COUNT, builtin_catalog_table_slot};
-use crate::completion::Completion;
 use crate::component::{Component, ComponentRegistry, ShelfScope};
-use crate::error::{OperationError, OperationResult};
+use crate::conf::LockManagerConfig;
+use crate::error::{ConfigError, ConfigResult, OperationError, OperationResult};
 use crate::id::{OperationID, SessionID, SessionOperationKey, TableID, TrxID};
 use crate::map::{FastDashMap, FastHashMap};
 #[cfg(feature = "profiling")]
@@ -25,7 +29,6 @@ use dashmap::mapref::entry::Entry;
 use error_stack::Report;
 use parking_lot::Mutex;
 use std::array::from_fn;
-use std::convert::Infallible;
 use std::fmt;
 use std::mem::take;
 use std::result::Result as StdResult;
@@ -292,19 +295,41 @@ pub(crate) struct LockManager {
     catalog: [CatalogTableLockSlot; BUILTIN_CATALOG_TABLE_COUNT],
     /// Dynamic fallback for user tables and every unknown reserved catalog ID.
     user: FastDashMap<LockResource, ResourceState>,
+    /// Pending-wait registry and cycle-local rejection policy.
+    deadlock: DeadlockDetector,
     #[cfg(feature = "profiling")]
-    stats: LockManagerStats,
+    stats: Arc<LockManagerStats>,
 }
 
 impl LockManager {
     /// Creates an empty lock manager.
     #[inline]
     pub(crate) fn new() -> Self {
+        Self::from_validated_config(LockManagerConfig::default())
+    }
+
+    /// Creates an empty manager after validating its immutable search allowance.
+    #[inline]
+    pub(crate) fn with_config(config: LockManagerConfig) -> ConfigResult<Self> {
+        config.validate()?;
+        Ok(Self::from_validated_config(config))
+    }
+
+    /// Both callers supply either validated settings or the known-valid defaults.
+    fn from_validated_config(config: LockManagerConfig) -> Self {
+        #[cfg(feature = "profiling")]
+        let stats = Arc::new(LockManagerStats::default());
+        let deadlock = DeadlockDetector::new(
+            config.deadlock_search_work_limit,
+            #[cfg(feature = "profiling")]
+            Arc::clone(&stats),
+        );
         LockManager {
             catalog: from_fn(|_| CatalogTableLockSlot::default()),
             user: FastDashMap::default(),
+            deadlock,
             #[cfg(feature = "profiling")]
-            stats: LockManagerStats::default(),
+            stats,
         }
     }
 
@@ -340,6 +365,9 @@ impl LockManager {
                 #[cfg(feature = "profiling")]
                 let old_slots = resource_state.wait_queue.allocated_slots();
                 let result = resource_state.start_pending(token.resource, token, mode);
+                if let Ok(PendingStart::Waiting { pending, .. }) = &result {
+                    self.deadlock.register_pending(pending);
+                }
                 #[cfg(feature = "profiling")]
                 if let Ok(start) = &result {
                     #[cfg(feature = "profiling")]
@@ -427,7 +455,11 @@ impl LockManager {
                             (Some(_), Some(_)) => add(&self.stats.cancelled_middle_waiters, 1),
                         }
                         resource_state.assert_queued_family(&token, node_id);
+                        let pending = Arc::clone(&resource_state.wait_queue.node(node_id).pending);
+                        let mut decision = pending.decision.lock();
+                        self.deadlock.retire_pending(&pending, &mut decision);
                         let _ = resource_state.wait_queue.remove_queued(node_id);
+                        drop(decision);
                         let removed = resource_state.families.remove(&token.owner.family());
                         assert!(
                             removed.is_some(),
@@ -444,7 +476,7 @@ impl LockManager {
                         decrement_current(&self.stats.current_live_waiter_nodes);
                         #[cfg(feature = "profiling")]
                         decrement_current(&self.stats.current_physical_families);
-                        resource_state.grant_waiters(token.resource, &mut notify);
+                        resource_state.grant_waiters(&self.deadlock, token.resource, &mut notify);
                     }
                     WaitNodePhase::Provisional => {
                         resource_state.remove_provisional(&token, mode, node_id);
@@ -453,7 +485,7 @@ impl LockManager {
                         decrement_current(&self.stats.current_live_waiter_nodes);
                         #[cfg(feature = "profiling")]
                         decrement_current(&self.stats.current_physical_families);
-                        resource_state.grant_waiters(token.resource, &mut notify);
+                        resource_state.grant_waiters(&self.deadlock, token.resource, &mut notify);
                     }
                 }
                 #[cfg(feature = "profiling")]
@@ -474,7 +506,7 @@ impl LockManager {
             "cancel_fresh_grant",
             |resource_state| {
                 resource_state.remove_fresh_grant(&token, mode);
-                resource_state.grant_waiters(token.resource, &mut notify);
+                resource_state.grant_waiters(&self.deadlock, token.resource, &mut notify);
                 #[cfg(feature = "profiling")]
                 decrement_current(&self.stats.current_physical_families);
                 #[cfg(feature = "profiling")]
@@ -524,7 +556,7 @@ impl LockManager {
             "remove_family",
             |resource_state| {
                 resource_state.remove_family(resource, family, old_mode);
-                resource_state.grant_waiters(resource, &mut notify);
+                resource_state.grant_waiters(&self.deadlock, resource, &mut notify);
                 #[cfg(feature = "profiling")]
                 decrement_current(&self.stats.current_physical_families);
                 #[cfg(feature = "profiling")]
@@ -532,6 +564,83 @@ impl LockManager {
             },
         );
         notify.publish();
+    }
+
+    /// Runs the detector only after publication with acquisition rollback already armed.
+    #[inline]
+    fn check_deadlock(&self, root: &Arc<PendingWait>) -> OperationResult<()> {
+        self.deadlock
+            .check(root, |source, budget| self.wait_snapshot(source, budget))
+    }
+
+    /// Captures a resource once while every queued/held relationship is guarded.
+    /// Missing resources and stale sources are ordinary terminal observations.
+    fn wait_snapshot(
+        &self,
+        source: &Arc<PendingWait>,
+        budget: &mut SearchBudget,
+    ) -> Result<Option<ResourceSnapshot>, ()> {
+        let mut inspect = |state: &ResourceState| {
+            let Some(node) = state.wait_queue.try_node(source.key.node_id) else {
+                return Ok(None);
+            };
+            if !Arc::ptr_eq(&node.pending, source)
+                || node.pending.identity() != source.identity()
+                || node.pending.owner != source.owner
+                || node.pending.requested_mode != source.requested_mode
+                || !matches!(node.phase, WaitNodePhase::Queued { .. })
+                || !source.is_pending()
+            {
+                return Ok(None);
+            }
+            let mut holders = Vec::new();
+            for (&family, physical) in &state.families {
+                budget.charge(1)?;
+                let Some(mode) = physical.counted_mode() else {
+                    continue;
+                };
+                // Resolve the exact pending identity under the holder's resource
+                // guard, never by looking up the family later during traversal.
+                if let Some(target) = self.deadlock.pending_for(family)
+                    && target.is_pending()
+                {
+                    budget.charge(1)?;
+                    holders.push(HolderSnapshot { target, mode });
+                }
+            }
+            let mut head = None;
+            let mut following = Vec::new();
+            let mut next = state.wait_queue.head();
+            while let Some(id) = next {
+                // Charge both examination and storage before cloning or growing.
+                budget.charge(2)?;
+                let node = state.wait_queue.node(id);
+                if head.is_none() {
+                    head = Some(Arc::clone(&node.pending));
+                } else {
+                    following.push(Arc::clone(&node.pending));
+                }
+                next = match node.phase {
+                    WaitNodePhase::Queued { next, .. } => next,
+                    WaitNodePhase::Provisional => unreachable!("linked FIFO node must be queued"),
+                };
+            }
+            let head = head.unwrap_or_else(|| {
+                unreachable!("a guarded queued source requires a nonempty FIFO")
+            });
+            Ok(Some(ResourceSnapshot {
+                head,
+                following,
+                holders,
+            }))
+        };
+        if let Some(cell) = self.catalog_cell(source.key.resource) {
+            inspect(&cell.lock())
+        } else if let Some(state) = self.user.get(&source.key.resource) {
+            inspect(&state)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Runs one synchronous transition and finishes store-specific accounting/cleanup.
@@ -652,20 +761,20 @@ impl Default for LockManager {
 }
 
 impl Component for LockManager {
-    type Config = ();
+    type Config = LockManagerConfig;
     type Owned = Self;
     type Access = QuiescentGuard<Self>;
-    type Error = Infallible;
+    type Error = Report<ConfigError>;
 
     const NAME: &'static str = "lock_manager";
 
     #[inline]
     async fn build(
-        _config: Self::Config,
+        config: Self::Config,
         registry: &mut ComponentRegistry,
         _shelf: ShelfScope<'_, Self>,
     ) -> StdResult<(), Self::Error> {
-        registry.register::<Self>(Self::new());
+        registry.register::<Self>(Self::with_config(config)?);
         Ok(())
     }
 
@@ -722,10 +831,9 @@ impl ResourceState {
             self.insert_held(family, mode);
             return Ok(PendingStart::Immediate);
         }
-        let completion = Arc::new(Completion::new());
-        let node_id =
-            self.wait_queue
-                .append(token.owner, token.claim_no, mode, Arc::clone(&completion));
+        let node_id = self
+            .wait_queue
+            .append(token.owner, token.claim_no, mode, resource);
         let previous = self
             .families
             .insert(family, PhysicalFamilyState::Queued { node_id });
@@ -738,7 +846,7 @@ impl ResourceState {
         );
         Ok(PendingStart::Waiting {
             node_id,
-            completion,
+            pending: Arc::clone(&self.wait_queue.node(node_id).pending),
         })
     }
 
@@ -827,11 +935,16 @@ impl ResourceState {
     }
 
     #[inline]
-    fn grant_waiters(&mut self, resource: LockResource, notifications: &mut DeferredNotifications) {
+    fn grant_waiters(
+        &mut self,
+        detector: &DeadlockDetector,
+        resource: LockResource,
+        notifications: &mut DeferredNotifications,
+    ) {
         while let Some(node_id) = self.wait_queue.head() {
             let node = self.wait_queue.node(node_id);
-            let owner = node.owner;
-            let mode = node.target_mode;
+            let owner = node.pending.owner;
+            let mode = node.pending.requested_mode;
             let family = owner.family();
             if !self.compatible_with_families(resource, mode, family) {
                 break;
@@ -847,7 +960,12 @@ impl ResourceState {
                  actual={:?}",
                 self.families.get(&family)
             );
-            let completion = Arc::clone(&node.completion);
+            let pending = Arc::clone(&node.pending);
+            let mut decision = pending.decision.lock();
+            if *decision == WaitDecision::DeadlockChosen {
+                break;
+            }
+            detector.retire_pending(&pending, &mut decision);
             self.wait_queue.detach_to_provisional(node_id);
             self.increment_holder(mode);
             let previous = self
@@ -858,7 +976,8 @@ impl ResourceState {
                 "FIFO promotion lost its queued physical family: \
                  resource={resource}, family={family}, node_id={node_id:?}"
             );
-            notifications.push(completion);
+            drop(decision);
+            notifications.push(pending);
         }
     }
 
@@ -1072,7 +1191,7 @@ enum PendingStart {
     Immediate,
     Waiting {
         node_id: WaitNodeID,
-        completion: Arc<Completion<()>>,
+        pending: Arc<PendingWait>,
     },
 }
 
@@ -1080,8 +1199,8 @@ enum PendingStart {
 enum NotificationSet {
     #[default]
     None,
-    One(Arc<Completion<()>>),
-    Many(Vec<Arc<Completion<()>>>),
+    One(Arc<PendingWait>),
+    Many(Vec<Arc<PendingWait>>),
 }
 
 #[derive(Default)]
@@ -1101,7 +1220,7 @@ impl DeferredNotifications {
     }
 
     #[inline]
-    fn push(&mut self, completion: Arc<Completion<()>>) {
+    fn push(&mut self, completion: Arc<PendingWait>) {
         self.notifications = match take(&mut self.notifications) {
             NotificationSet::None => NotificationSet::One(completion),
             NotificationSet::One(first) => NotificationSet::Many(vec![first, completion]),
@@ -1122,10 +1241,10 @@ impl DeferredNotifications {
         let notifications = take(&mut self.notifications);
         match notifications {
             NotificationSet::None => {}
-            NotificationSet::One(completion) => completion.complete(Ok(())),
+            NotificationSet::One(completion) => completion.completion.complete(Ok(())),
             NotificationSet::Many(completions) => {
                 for completion in completions {
-                    completion.complete(Ok(()));
+                    completion.completion.complete(Ok(()));
                 }
             }
         }
@@ -1359,6 +1478,8 @@ pub(crate) mod tests {
         pub(crate) wait_slot: Option<usize>,
         /// Generation paired with `wait_slot`.
         pub(crate) wait_generation: Option<u64>,
+        /// Monotonic decision of the exact queue/provisional record, sampled per resource.
+        pub(crate) wait_decision: Option<&'static str>,
     }
 
     /// Granted-or-waiting state for a debug snapshot entry.
@@ -1447,7 +1568,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Captures the current lock table for tests.
+    /// Captures per-resource observations for tests; this is not an atomic manager snapshot.
     #[inline]
     pub(crate) fn debug_snapshot(manager: &LockManager) -> LockDebugSnapshot {
         let mut resources: Vec<_> = manager
@@ -1521,9 +1642,9 @@ pub(crate) mod tests {
                 PhysicalFamilyState::Queued { node_id } => {
                     let waiter = resource_state.wait_queue.node(node_id);
                     (
-                        waiter.target_mode,
-                        Some(waiter.owner),
-                        Some(waiter.claim_no),
+                        waiter.pending.requested_mode,
+                        Some(waiter.pending.owner),
+                        Some(waiter.pending.claim_no),
                         LockDebugEntryState::Waiting,
                         Some(node_id),
                         queue_ids.iter().position(|&id| id == node_id),
@@ -1533,8 +1654,8 @@ pub(crate) mod tests {
                     let waiter = resource_state.wait_queue.node(node_id);
                     (
                         mode,
-                        Some(waiter.owner),
-                        Some(waiter.claim_no),
+                        Some(waiter.pending.owner),
+                        Some(waiter.pending.claim_no),
                         LockDebugEntryState::Provisional,
                         Some(node_id),
                         None,
@@ -1551,6 +1672,13 @@ pub(crate) mod tests {
                 queue_order,
                 wait_slot: node_id.map(|id| id.slot),
                 wait_generation: node_id.map(|id| id.generation),
+                wait_decision: node_id.map(|id| {
+                    match *resource_state.wait_queue.node(id).pending.decision.lock() {
+                        WaitDecision::Pending => "pending",
+                        WaitDecision::DeadlockChosen => "deadlock_chosen",
+                        WaitDecision::Retired => "retired",
+                    }
+                }),
             }
         }));
         entries
@@ -1571,6 +1699,7 @@ pub(crate) mod tests {
     }
 
     fn assert_drained(manager: &LockManager) {
+        assert_eq!(deadlock::tests::pending_count(&manager.deadlock), 0);
         #[cfg(feature = "profiling")]
         let _stats = manager.stats();
         #[cfg(feature = "profiling")]
@@ -1646,10 +1775,10 @@ pub(crate) mod tests {
         manager: &LockManager,
         token: &PendingClaimToken,
         mode: LockMode,
-    ) -> (WaitNodeID, Arc<Completion<()>>) {
+    ) -> (WaitNodeID, Arc<PendingWait>) {
         let PendingStart::Waiting {
             node_id,
-            completion,
+            pending: completion,
         } = manager.start_pending(token, mode).unwrap()
         else {
             panic!("conflicting request must queue");
@@ -2323,13 +2452,13 @@ pub(crate) mod tests {
             trx(TrxID::new(2)),
             ClaimNo::new(2),
             LockMode::IntentShared,
-            Arc::new(Completion::new()),
+            resource,
         );
         let second = resource_state.wait_queue.append(
             trx(TrxID::new(3)),
             ClaimNo::new(3),
             LockMode::IntentExclusive,
-            Arc::new(Completion::new()),
+            resource,
         );
         resource_state.families.insert(
             trx(TrxID::new(2)).family(),
@@ -2341,7 +2470,13 @@ pub(crate) mod tests {
         );
 
         let mut notifications = DeferredNotifications::default();
-        resource_state.grant_waiters(resource, &mut notifications);
+        let manager = LockManager::new();
+        for id in [first, second] {
+            manager
+                .deadlock
+                .register_pending(&resource_state.wait_queue.node(id).pending);
+        }
+        resource_state.grant_waiters(&manager.deadlock, resource, &mut notifications);
 
         assert_eq!(notifications.len(), 2);
         assert_eq!(resource_state.granted_counts, [1, 1, 0, 0]);
@@ -2373,18 +2508,32 @@ pub(crate) mod tests {
     /// Expected: Completions stay pending while deferred and become successful on drop.
     #[test]
     fn deferred_notifications_publish_on_drop() {
-        let first = Arc::new(Completion::new());
-        let second = Arc::new(Completion::new());
+        let mut queue = WaitQueue::default();
+        let resource = table_data(TableID::new(54));
+        let first_id = queue.append(
+            trx(TrxID::new(2)),
+            ClaimNo::new(2),
+            LockMode::Shared,
+            resource,
+        );
+        let second_id = queue.append(
+            trx(TrxID::new(3)),
+            ClaimNo::new(3),
+            LockMode::Shared,
+            resource,
+        );
+        let first = Arc::clone(&queue.node(first_id).pending);
+        let second = Arc::clone(&queue.node(second_id).pending);
         {
             let mut notifications = DeferredNotifications::default();
             notifications.push(Arc::clone(&first));
             notifications.push(Arc::clone(&second));
             assert_eq!(notifications.len(), 2);
-            assert!(first.completed_result().is_none());
-            assert!(second.completed_result().is_none());
+            assert!(first.completion.completed_result().is_none());
+            assert!(second.completion.completed_result().is_none());
         }
-        assert!(first.completed_result().unwrap().is_ok());
-        assert!(second.completed_result().unwrap().is_ok());
+        assert!(first.completion.completed_result().unwrap().is_ok());
+        assert!(second.completion.completed_result().unwrap().is_ok());
     }
 
     /// Purpose: Acquire an uncontended fresh grant on either resource store.
@@ -2846,7 +2995,7 @@ pub(crate) mod tests {
                 });
                 let waker = Waker::from(Arc::clone(&wake));
                 let mut context = Context::from_waker(&waker);
-                let mut observe = Box::pin(completion.wait_take_result());
+                let mut observe = Box::pin(completion.completion.wait_take_result());
                 assert!(observe.as_mut().poll(&mut context).is_pending());
                 if publication == 0 {
                     manager.cancel_fresh_grant(blocker, LockMode::Exclusive);
@@ -2861,7 +3010,7 @@ pub(crate) mod tests {
                                 state.remove_fresh_grant(&blocker, LockMode::Exclusive);
                                 #[cfg(feature = "profiling")]
                                 decrement_current(&manager.stats.current_physical_families);
-                                state.grant_waiters(resource, &mut notify);
+                                state.grant_waiters(&manager.deadlock, resource, &mut notify);
                                 #[cfg(feature = "profiling")]
                                 manager.record_promotions(&notify);
                                 if publication == 2 {
@@ -2892,12 +3041,12 @@ pub(crate) mod tests {
             table_metadata(BUILTIN_CATALOG_TABLE_IDS[0]),
         ];
         let mut pending = Vec::new();
-        for resource in resources {
+        for (index, resource) in resources.into_iter().enumerate() {
             let blocker = pending_token(resource, 1);
             start_immediate(&manager, &blocker, LockMode::Exclusive);
-            let shared = pending_token(resource, 2);
+            let shared = pending_token(resource, 2 + index as u64 * 3);
             let (shared_node, _) = start_waiting(&manager, &shared, LockMode::Shared);
-            let exclusive = pending_token(resource, 3);
+            let exclusive = pending_token(resource, 3 + index as u64 * 3);
             let (exclusive_node, _) = start_waiting(&manager, &exclusive, LockMode::Exclusive);
             manager.cancel_fresh_grant(blocker, LockMode::Exclusive);
             pending.push((shared, shared_node, exclusive, exclusive_node));

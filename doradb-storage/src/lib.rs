@@ -54,10 +54,11 @@ pub use catalog::{
     TableIndexSelector,
 };
 pub use conf::{
-    ColdIndexBuildConfig, DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION,
-    DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION, EngineConfig, EvictableBufferPoolConfig,
-    FileSystemConfig, HotIndexBuildConfig, LogSync, MAX_TABLE_SCAN_UNITS_PER_PARTITION,
-    MandatoryRuntimeConfig, RecoveryConfig, TableScanConfig, ThreadPoolConfig, TrxSysConfig,
+    ColdIndexBuildConfig, DEFAULT_COW_FILE_MAX_SIZE, DEFAULT_DEADLOCK_SEARCH_WORK_LIMIT,
+    DEFAULT_TABLE_SCAN_LWC_BLOCKS_PER_PARTITION, DEFAULT_TABLE_SCAN_ROW_PAGES_PER_PARTITION,
+    EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, HotIndexBuildConfig,
+    LockManagerConfig, LogSync, MAX_TABLE_SCAN_UNITS_PER_PARTITION, MandatoryRuntimeConfig,
+    RecoveryConfig, TableScanConfig, ThreadPoolConfig, TrxSysConfig,
 };
 pub use engine::Engine;
 pub use error::{CallbackError, CallbackResult, Error, ErrorKind, OperationError, Result};

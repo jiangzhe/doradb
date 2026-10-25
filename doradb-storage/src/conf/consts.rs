@@ -1,5 +1,9 @@
 use crate::log::LogSync;
+
 use byte_unit::Byte;
+
+/// Default charged work allowance for one initial logical-lock deadlock check.
+pub const DEFAULT_DEADLOCK_SEARCH_WORK_LIMIT: usize = 65_536;
 
 /// Default bytes reserved for the fully resident metadata pool.
 pub(crate) const DEFAULT_ENGINE_META_BUFFER: usize = 32 * 1024 * 1024;
