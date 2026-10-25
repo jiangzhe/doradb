@@ -5,7 +5,6 @@
 use crate::layout;
 use crate::lwc::LwcPrimitiveData;
 use std::iter::once;
-use std::mem;
 use zerocopy::IntoBytes;
 
 /// Data type that supports bitpacking.
@@ -358,46 +357,13 @@ impl<T: BitPackable> Iterator for ForBitpacking32Iter<'_, T> {
     }
 }
 
-/// Returns number of bits and minimum value on input data.
-/// Returns None if not available.
+/// Returns a supported packed width strictly narrower than the input integer.
+/// The caller computes the nonnegative range in widened arithmetic.
 #[inline]
-pub(crate) fn prepare_for_bitpacking<T: BitPackable + Ord>(input: &[T]) -> Option<(usize, T)> {
-    if input.is_empty() {
-        return None;
-    }
-    let mut min = input[0];
-    let mut max = input[0];
-    input.iter().for_each(|v| {
-        min = min.min(*v);
-        max = max.max(*v);
-    });
-    let delta = max.sub_to_u64(min);
-    let n_bits = if delta < (1 << 1) {
-        1
-    } else if delta < (1 << 2) {
-        2
-    } else if delta < (1 << 4) {
-        4
-    } else if delta < (1 << 8) {
-        if mem::size_of::<T>() <= 1 {
-            // compression is meaningless.
-            return None;
-        }
-        8
-    } else if delta < (1 << 16) {
-        if mem::size_of::<T>() <= 2 {
-            return None;
-        }
-        16
-    } else if delta < (1 << 32) {
-        if mem::size_of::<T>() <= 4 {
-            return None;
-        }
-        32
-    } else {
-        return None;
-    };
-    Some((n_bits, min))
+pub(crate) fn bitpacking_width(range: u64, input_bytes: usize) -> Option<u8> {
+    [1, 2, 4, 8, 16, 32]
+        .into_iter()
+        .find(|&bits| usize::from(bits) < input_bytes * 8 && range < (1u64 << bits))
 }
 
 /// Pack (bits=1).

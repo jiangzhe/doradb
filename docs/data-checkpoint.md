@@ -183,6 +183,10 @@ for identity and any future deletion state. Splitting across blocks preserves
 prepared visibility, RowID order, and exactly-once inclusion of each accepted
 row and its secondary-index entries.
 
+Block admission accounts for the complete encoded size so accepted rows fit
+within the LWC payload capacity. Physical values beneath integer nulls do not
+affect admission or encoding.
+
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
 complete block input, checkpoint submits LWC serialization, compression,

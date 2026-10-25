@@ -2102,6 +2102,7 @@ mod tests {
         CurrentTableState, IndexSlot, ResolvedVisibleTableMetadata, StorageColumnFlags,
         StorageColumnSpec, StorageTableSpec, TableCache,
     };
+    use crate::catalog::{StorageIndexFlags, StorageIndexKey, StorageIndexSpec};
     use crate::completion::{Completion, CompletionTake};
     use crate::conf::{CheckpointIndexBuildConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
@@ -5112,6 +5113,89 @@ mod tests {
         smol::block_on(assert_checkpoint_delete_metadata_corruption(
             corrupt_leaf_short_delete_section_header,
         ));
+    }
+
+    /// Purpose: Checkpoint nullable large integers spanning multiple source pages through worker encoding and root publication.
+    /// Expected: Every cold row preserves its large value or null, and subsequent transactions keep the engine usable.
+    #[test]
+    fn checkpoint_nullable_large_integers_across_pages() {
+        smol::block_on(async {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp_dir, "nullable-lwc-sizing").await;
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    StorageTableSpec::new(vec![
+                        StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                        StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+                    ]),
+                    vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
+                    )],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let mut writer = session.begin_trx().unwrap();
+            for key in 0..9_000i32 {
+                writer
+                    .table_insert_mvcc(
+                        table_id,
+                        vec![
+                            Val::I32(key),
+                            if key % 2 == 0 {
+                                Val::U64(1 << 40)
+                            } else {
+                                Val::Null
+                            },
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            }
+            writer.commit().await.unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let batch =
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert!(batch.page_count() > 1);
+            assert_checkpoint_published(&mut session, table_id).await;
+            assert_ne!(
+                table.file().active_root_unchecked().column_block_index_root,
+                SUPER_BLOCK_ID
+            );
+            let mut reader = session.begin_trx().unwrap();
+            for key in 0..9_000i32 {
+                let lookup = single_key(key);
+                assert_row_in_lwc(&table, &session.pool_guards(), &lookup, reader.sts()).await;
+                let result = trx_select_row_mvcc_by_id(&mut reader, table_id, &lookup, &[0, 1])
+                    .await
+                    .unwrap();
+                let SelectMvcc::Found(values) = result else {
+                    panic!("missing cold key={key}")
+                };
+                assert_eq!(
+                    values,
+                    vec![
+                        Val::I32(key),
+                        if key % 2 == 0 {
+                            Val::U64(1 << 40)
+                        } else {
+                            Val::Null
+                        }
+                    ],
+                    "key={key}"
+                );
+            }
+            reader.commit().await.unwrap();
+            let mut writer = session.begin_trx().unwrap();
+            writer
+                .table_insert_mvcc(table_id, vec![Val::I32(9_000), Val::U64(u64::MAX)])
+                .await
+                .unwrap();
+            writer.commit().await.unwrap();
+            assert!(engine.inner().poisoner.poison_error().is_none());
+        });
     }
 
     /// Purpose: Protect normal publication of a frozen table prefix.
