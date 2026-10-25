@@ -125,6 +125,12 @@ impl LockScopeState {
 /// conversion, release, and scope cleanup. Consequently a manager transition
 /// can be staged before the two owner-side indexes are changed, and a failed
 /// transition leaves their previous aggregate intact.
+///
+/// The move-only authority is borrowed exclusively across acquisition and cleanup.
+/// A family has at most one pending logical wait and cannot release or convert
+/// accepted claims until that wait retires. Deadlock election relies on this:
+/// an observed dependency persists while both exact waits remain Pending.
+/// Parallel family mutation must revisit that detector contract first.
 pub(crate) struct FamilyLockState {
     family: LockFamily,
     next_claim_no: u64,
@@ -1185,7 +1191,10 @@ mod tests {
             let mut acquire =
                 Box::pin(family.acquire(scope, &manager, &poisoner, resource, LockMode::Shared));
             let first_poll = poll!(acquire.as_mut());
-            let error = if phase == PendingClaimTestPhase::ListenerRegistered {
+            let error = if matches!(
+                phase,
+                PendingClaimTestPhase::ListenerRegistered | PendingClaimTestPhase::DeadlockChecked
+            ) {
                 match first_poll {
                     Poll::Ready(result) => result,
                     Poll::Pending => panic!("listener-phase poison must complete the first poll"),
@@ -1199,7 +1208,10 @@ mod tests {
             assert_fatal_storage_io(error);
             drop(acquire);
 
-            if phase == PendingClaimTestPhase::ListenerRegistered {
+            if matches!(
+                phase,
+                PendingClaimTestPhase::ListenerRegistered | PendingClaimTestPhase::DeadlockChecked
+            ) {
                 assert!(blocker.release(&manager, resource));
             }
             blocker.close(&manager);
@@ -2025,6 +2037,7 @@ mod tests {
     fn pending_claim_poison_cancels_every_wait_to_accept_race() {
         for phase in [
             PendingClaimTestPhase::ListenerRegistered,
+            PendingClaimTestPhase::DeadlockChecked,
             PendingClaimTestPhase::CompletionSelected,
             PendingClaimTestPhase::BeforeProvisionalObservation,
         ] {

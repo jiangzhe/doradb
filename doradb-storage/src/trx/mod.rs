@@ -6394,6 +6394,212 @@ pub(crate) mod tests {
         });
     }
 
+    /// Purpose: Reject reverse public session locks without revoking either session's accepted protection.
+    /// Expected: Deadlock is disclosed, the failed fresh prefix disappears, and explicit unlock permits peer progress.
+    #[test]
+    fn test_session_deadlock_retains_explicit_locks() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("session_deadlock").await;
+            let first = catalog_tests::table1(&engine).await;
+            let second = catalog_tests::table1(&engine).await;
+            let mut a = engine.new_session().unwrap();
+            let mut b = engine.new_session().unwrap();
+            a.lock_table(first, TableLockMode::Exclusive).await.unwrap();
+            b.lock_table(second, TableLockMode::Exclusive)
+                .await
+                .unwrap();
+            let b_owner = LockOwner::session_explicit(b.id());
+            let mut peer = Box::pin(a.lock_table(second, TableLockMode::Exclusive));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            let error = b
+                .lock_table(first, TableLockMode::Exclusive)
+                .await
+                .unwrap_err();
+            assert_eq!(error.operation_error(), Some(OperationError::Deadlock));
+            assert!(!has_lock_entry(
+                &engine,
+                b_owner,
+                LockResource::TableMetadata(first),
+                LockMode::Shared,
+                LockDebugEntryState::Granted
+            ));
+            assert!(has_lock_entry(
+                &engine,
+                b_owner,
+                LockResource::TableData(second),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted
+            ));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            b.unlock_table(second).unwrap();
+            peer.await.unwrap();
+            a.unlock_table(first).unwrap();
+            a.unlock_table(second).unwrap();
+            assert_eq!(lock_entry_count(&engine, b_owner), 0);
+        });
+    }
+
+    /// Purpose: Surface deadlock from automatic DML admission after earlier successful transaction work.
+    /// Expected: Statement effects roll back, first-touch metadata and older work survive, and the reusable transaction can commit to unblock its peer.
+    #[test]
+    fn test_dml_deadlock_rolls_back_only_failed_statement() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("dml_deadlock").await;
+            let first = catalog_tests::table1(&engine).await;
+            let second = catalog_tests::table1(&engine).await;
+            let mut a_session = engine.new_session().unwrap();
+            let mut b_session = engine.new_session().unwrap();
+            let mut a = a_session.begin_trx().unwrap();
+            let mut b = b_session.begin_trx().unwrap();
+            a.lock_table(first, TableLockMode::Exclusive).await.unwrap();
+            b.lock_table(second, TableLockMode::Exclusive)
+                .await
+                .unwrap();
+            let earlier = b
+                .table_insert_mvcc(second, vec![Val::from(1i32)])
+                .await
+                .unwrap();
+            let b_owner = lock_owner(&b).unwrap();
+            let mut peer = Box::pin(a.lock_table(second, TableLockMode::Exclusive));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            let error = b
+                .table_insert_mvcc(first, vec![Val::from(2i32)])
+                .await
+                .unwrap_err();
+            assert_eq!(error.operation_error(), Some(OperationError::Deadlock));
+            assert!(
+                transaction_lock_covers(&b, LockResource::TableMetadata(first), LockMode::Shared)
+                    .unwrap()
+            );
+            assert!(
+                !transaction_lock_covers(
+                    &b,
+                    LockResource::TableData(first),
+                    LockMode::IntentExclusive
+                )
+                .unwrap()
+            );
+            // Inject redo before another automatic lock attempt to observe ordinary
+            // statement settlement independently of first-touch admission.
+            let rolled_back = RowID::new(999_999);
+            let result: Result<()> = b
+                .exec(async |mut stmt| {
+                    stmt_tests::statement_effects_mut(&mut stmt).insert_row_redo(
+                        second,
+                        RowRedo {
+                            row_id: rolled_back,
+                            kind: RowRedoKind::Delete(Some(PageID::new(0))),
+                        },
+                    );
+                    stmt.acquire_table_write_data_lock(first).await.disclose()?;
+                    Ok(())
+                })
+                .await;
+            assert_eq!(
+                result.unwrap_err().operation_error(),
+                Some(OperationError::Deadlock)
+            );
+            with_transaction_inner(&b, "check_deadlock_statement_effects", |inner| {
+                let rows = &inner.effects.redo.dml.get(&second).unwrap().rows;
+                assert!(rows.contains_key(&earlier));
+                assert!(!rows.contains_key(&rolled_back));
+            })
+            .unwrap();
+            b.noop().await.unwrap();
+            assert!(has_lock_entry(
+                &engine,
+                b_owner,
+                LockResource::TableData(second),
+                LockMode::Exclusive,
+                LockDebugEntryState::Granted
+            ));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            b.commit().await.unwrap();
+            peer.await.unwrap();
+            a.rollback().await.unwrap();
+            let mut verify = b_session.begin_trx().unwrap();
+            assert!(
+                !verify
+                    .table_lookup_unique_mvcc(
+                        crate::TableIndex(second, IndexID::new(0)),
+                        &[Val::from(1i32)],
+                        &[0]
+                    )
+                    .await
+                    .unwrap()
+                    .not_found()
+            );
+            assert!(
+                verify
+                    .table_lookup_unique_mvcc(
+                        crate::TableIndex(first, IndexID::new(0)),
+                        &[Val::from(2i32)],
+                        &[0]
+                    )
+                    .await
+                    .unwrap()
+                    .not_found()
+            );
+            verify.rollback().await.unwrap();
+        });
+    }
+
+    /// Purpose: Reject a shared-snapshot metadata cycle while its session retains explicit protection.
+    /// Expected: Snapshot preparation discloses Deadlock, drains its scope, and preserves session claims until unlock.
+    #[test]
+    fn test_snapshot_deadlock_preserves_session_scope() {
+        smol::block_on(async {
+            let (_temp_dir, engine) = test_engine("snapshot_deadlock").await;
+            let first = catalog_tests::table1(&engine).await;
+            let second = catalog_tests::table1(&engine).await;
+            let manager = engine.inner().core.lock_manager();
+            let mut blocker =
+                TestLockOwner::new(LockOwner::session_explicit(SessionID::new(91_990)));
+            blocker
+                .acquire(
+                    manager,
+                    LockResource::TableMetadata(first),
+                    LockMode::Exclusive,
+                )
+                .await
+                .unwrap();
+            let mut session = engine.new_session().unwrap();
+            session
+                .lock_table(second, TableLockMode::Shared)
+                .await
+                .unwrap();
+            let session_owner = LockOwner::session_explicit(session.id());
+            let mut peer = Box::pin(blocker.acquire(
+                manager,
+                LockResource::TableMetadata(second),
+                LockMode::Exclusive,
+            ));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            let error = match session
+                .begin_read_snapshot()
+                .unwrap()
+                .acquire_tables([first])
+                .await
+            {
+                Ok(_) => panic!("snapshot cycle must reject preparation"),
+                Err(error) => error,
+            };
+            assert_eq!(error.operation_error(), Some(OperationError::Deadlock));
+            wait_for_session_idle(&engine.inner().session_registry, session.id()).await;
+            assert!(has_lock_entry(
+                &engine,
+                session_owner,
+                LockResource::TableMetadata(second),
+                LockMode::Shared,
+                LockDebugEntryState::Granted
+            ));
+            assert!(futures::poll!(peer.as_mut()).is_pending());
+            session.unlock_table(second).unwrap();
+            peer.await.unwrap();
+            blocker.close(manager);
+        });
+    }
+
     /// Purpose: Reuse explicit transaction table locks across repeated weaker and equal requests.
     /// Expected: The entry returns to available state with cached claims that terminal rollback releases.
     #[test]

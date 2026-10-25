@@ -138,8 +138,22 @@ such as `S` to `IX`, are unsupported.
 Operations acquire metadata protection before data protection and row write
 ownership. For multiple tables, callers should use a consistent acquisition
 order and request the strongest known mode first. The lock system does not
-reorder separate calls or resolve deadlocks; fresh requests can wait
-indefinitely.
+reorder separate calls. Fresh requests participate in the bounded deadlock
+check below; healthy acyclic waits have no deadline.
+
+## Deadlock detection
+
+Fresh queued requests are checked for cycles involving incompatible lock
+holders and earlier FIFO requests. A request selected to break a cycle returns
+`OperationError::Deadlock`. If the check exhausts its work budget, it returns
+`OperationError::DeadlockCheckLimit`; this does not mean a cycle was found.
+The budget is configured at engine startup through
+[`LockManagerConfig`](./public-api.md#engine-configuration-and-bootstrap).
+
+Both errors reject the current acquisition. Previously accepted locks remain
+held, and ordinary statement rollback preserves earlier successful statements.
+Those locks can still block peers. Release explicit session locks or finish or
+roll back the transaction before retrying the complete operation.
 
 ## Cancellation and completion
 
@@ -166,8 +180,9 @@ such as shared snapshots, have their own shutdown cancellation policy.
 The logical lock system provides table-level coordination within one engine.
 It has no row, gap, or next-key locks, no automatic lock escalation, and no
 distributed ownership. Lock state is volatile and is not restored during
-recovery. Waiting upgrades, lock timeouts, and deadlock detection are not
-supported.
+recovery. Waiting upgrades and lock timeouts are not supported. Detection is
+limited to logical locks; row ownership, latches, external application waits,
+and distributed cycles are outside its scope.
 
 - [Public API: Explicit table locks](./public-api.md#explicit-table-locks)
 - [Transaction System](./transaction-system.md)

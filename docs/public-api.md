@@ -116,9 +116,15 @@ The top-level configuration groups are:
 | `EngineConfig` | Storage root and all component configuration. |
 | `TrxSysConfig` | Redo, recovery, catalog-checkpoint scan, purge, and GC settings. |
 | `MandatoryRuntimeConfig` | Accepted caller-operation limit for mandatory work. |
+| `LockManagerConfig` | Work budget for logical-lock deadlock detection. |
 | `FileSystemConfig` | Table/catalog IO depth, data directory, readonly pool, catalog file name, and CoW file limit. |
 | `EvictableBufferPoolConfig` | Swap path, file and memory limits, and eviction tuning for index or row-data pools. |
 | `LogSync` | `None`, `Fsync`, or `Fdatasync` redo synchronization. |
+
+`EngineConfig::lock_manager` accepts `LockManagerConfig`. Its
+`deadlock_search_work_limit` defaults to `DEFAULT_DEADLOCK_SEARCH_WORK_LIMIT`
+(65,536) and must be positive. This startup setting limits work per deadlock
+check, including retries; it does not set a lock-wait timeout.
 
 All configured data, redo, and swap paths are relative to `storage_root`.
 Bootstrap records the durable layout in that root. Reopening with an
@@ -850,6 +856,13 @@ Lock acquisition is async and may wait. A conversion that cannot be safely
 waited may return `LockUpgradeWouldBlock`, and unsupported or conflicting
 conversions have their own `OperationError` classifications. Keep explicit
 lock order simple and let the storage API acquire ordinary locks when possible.
+
+Queued acquisitions may return `OperationError::Deadlock` or
+`OperationError::DeadlockCheckLimit`; inspect either with
+`Error::operation_error()`. These errors preserve previously accepted locks and
+earlier successful statements. Release explicit session locks or finish or
+roll back the transaction before retrying the complete operation.
+See [Deadlock detection](./lock-system.md#deadlock-detection).
 
 ## Maintenance
 

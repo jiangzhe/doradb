@@ -43,3 +43,11 @@ When a backlog item is moved to `docs/backlogs/closed/`, append:
 - Reference: <task/issue/pr reference>
 - Closed At: <YYYY-MM-DD>
 ```
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000336-logical-lock-deadlock-handling.md: bounded publication-before-check detection with cycle-local single-breaker election, exact retirement, retained accepted claims, and deterministic lifecycle coverage. The older multiple-exact-owner-waiters-per-family assumption is superseded: the current move-only FamilyLockAuthority permits only one pending acquisition per family and prevents accepted claim mutation while that wait remains pending. Future parallel family mutation must revisit this detector contract.
+- Closed By: backlog close
+- Reference: docs/tasks/000336-logical-lock-deadlock-handling.md
+- Closed At: 2026-10-24

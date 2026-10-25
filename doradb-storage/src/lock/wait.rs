@@ -1,7 +1,7 @@
 use super::claim::PendingClaimToken;
+use super::deadlock::{PendingWait, WaitKey};
 use super::state::{FamilyLockState, LockScopeState};
-use super::{LockGrant, LockManager, LockMode, LockOwner, PendingStart};
-use crate::completion::Completion;
+use super::{LockGrant, LockManager, LockMode, LockOwner, LockResource, PendingStart};
 use crate::error::{OperationOrFatalResult, OperationResult};
 use crate::id::ClaimNo;
 use crate::poison::EnginePoisoner;
@@ -9,7 +9,7 @@ use futures::FutureExt;
 use std::mem::replace;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(super) struct WaitNodeID {
     pub(super) slot: usize,
     pub(super) generation: u64,
@@ -26,11 +26,8 @@ pub(super) enum WaitNodeSlotEntry {
 }
 
 pub(super) struct WaitNode {
-    pub(super) owner: LockOwner,
-    pub(super) claim_no: ClaimNo,
-    pub(super) target_mode: LockMode,
+    pub(super) pending: Arc<PendingWait>,
     pub(super) phase: WaitNodePhase,
-    pub(super) completion: Arc<Completion<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +56,7 @@ impl WaitNodeSlab {
     }
 
     #[inline]
-    fn insert(&mut self, node: WaitNode) -> WaitNodeID {
+    fn insert(&mut self, build: impl FnOnce(WaitNodeID) -> WaitNode) -> WaitNodeID {
         let slot = self.free_head;
         if slot < self.slots.len() {
             let next_free = match self.slots[slot].entry {
@@ -75,7 +72,8 @@ impl WaitNodeSlab {
                 self.slots.len()
             );
             let generation = self.slots[slot].generation;
-            self.slots[slot].entry = WaitNodeSlotEntry::Occupied(node);
+            self.slots[slot].entry =
+                WaitNodeSlotEntry::Occupied(build(WaitNodeID { slot, generation }));
             self.free_head = next_free;
             self.live_count += 1;
             return WaitNodeID { slot, generation };
@@ -89,7 +87,10 @@ impl WaitNodeSlab {
         );
         self.slots.push(WaitNodeSlot {
             generation: 0,
-            entry: WaitNodeSlotEntry::Occupied(node),
+            entry: WaitNodeSlotEntry::Occupied(build(WaitNodeID {
+                slot,
+                generation: 0,
+            })),
         });
         self.free_head = self.slots.len();
         self.live_count += 1;
@@ -244,18 +245,20 @@ impl WaitQueue {
         owner: LockOwner,
         claim_no: ClaimNo,
         target_mode: LockMode,
-        completion: Arc<Completion<()>>,
+        resource: LockResource,
     ) -> WaitNodeID {
         let previous_tail = self.tail;
-        let id = self.nodes.insert(WaitNode {
-            owner,
-            claim_no,
-            target_mode,
+        let id = self.nodes.insert(|node_id| WaitNode {
+            pending: Arc::new(PendingWait::new(
+                WaitKey { resource, node_id },
+                owner,
+                claim_no,
+                target_mode,
+            )),
             phase: WaitNodePhase::Queued {
                 prev: previous_tail,
                 next: None,
             },
-            completion,
         });
         if let Some(tail) = previous_tail {
             let tail_node = self.nodes.get_mut(tail);
@@ -296,6 +299,19 @@ impl WaitQueue {
         self.nodes.get(id)
     }
 
+    /// Looks up an observation without asserting that its old generation remains live.
+    #[inline]
+    pub(super) fn try_node(&self, id: WaitNodeID) -> Option<&WaitNode> {
+        let slot = self.nodes.slots.get(id.slot)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        match &slot.entry {
+            WaitNodeSlotEntry::Occupied(node) => Some(node),
+            WaitNodeSlotEntry::Vacant { .. } => None,
+        }
+    }
+
     #[inline]
     pub(super) fn assert_identity(
         &self,
@@ -305,9 +321,14 @@ impl WaitQueue {
     ) {
         let node = self.node(id);
         assert!(
-            node.owner == token.owner
-                && node.claim_no == token.claim_no
-                && node.target_mode == target_mode,
+            node.pending.key
+                == WaitKey {
+                    resource: token.resource,
+                    node_id: id
+                }
+                && node.pending.owner == token.owner
+                && node.pending.claim_no == token.claim_no
+                && node.pending.requested_mode == target_mode,
             "waiter node identity mismatch: id={id:?}, resource={}, \
              expected_owner={}, expected_claim_no={:?}, expected_mode={}, \
              actual_owner={}, actual_claim_no={:?}, actual_mode={}",
@@ -315,9 +336,9 @@ impl WaitQueue {
             token.owner,
             token.claim_no,
             target_mode,
-            node.owner,
-            node.claim_no,
-            node.target_mode
+            node.pending.owner,
+            node.pending.claim_no,
+            node.pending.requested_mode
         );
     }
 
@@ -445,7 +466,7 @@ pub(super) enum PendingGuardState {
     LocalCovered,
     Waiting {
         node_id: WaitNodeID,
-        completion: Arc<Completion<()>>,
+        pending: Arc<PendingWait>,
     },
     FreshGranted,
     Disarmed,
@@ -535,22 +556,14 @@ impl<'a> PendingClaimGuard<'a> {
         });
         self.state = match self.manager.start_pending(token, self.requested_mode)? {
             PendingStart::Immediate => PendingGuardState::FreshGranted,
-            PendingStart::Waiting {
-                node_id,
-                completion,
-            } => PendingGuardState::Waiting {
-                node_id,
-                completion,
-            },
+            PendingStart::Waiting { node_id, pending } => {
+                PendingGuardState::Waiting { node_id, pending }
+            }
         };
 
-        if let PendingGuardState::Waiting {
-            node_id,
-            completion,
-        } = &self.state
-        {
+        if let PendingGuardState::Waiting { node_id, pending } = &self.state {
             let node_id = *node_id;
-            let completion = Arc::clone(completion);
+            let pending = Arc::clone(pending);
             let poisoner = self.poisoner;
             let poison_listener = poisoner.listener();
             #[cfg(test)]
@@ -559,7 +572,15 @@ impl<'a> PendingClaimGuard<'a> {
                 poisoner,
             );
             poisoner.ensure_healthy()?;
-            let completion_wait = completion.wait_take_result().fuse();
+            let checked = self.manager.check_deadlock(&pending);
+            #[cfg(test)]
+            tests::run_pending_claim_test_hook(
+                tests::PendingClaimTestPhase::DeadlockChecked,
+                poisoner,
+            );
+            poisoner.ensure_healthy()?;
+            checked?;
+            let completion_wait = pending.completion.wait_take_result().fuse();
             let poison_wait = poison_listener.fuse();
             futures::pin_mut!(completion_wait);
             futures::pin_mut!(poison_wait);
@@ -734,6 +755,7 @@ pub(in crate::lock) mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(in crate::lock) enum PendingClaimTestPhase {
         ListenerRegistered,
+        DeadlockChecked,
         CompletionSelected,
         BeforeProvisionalObservation,
         AfterAcceptHealthCheck,
@@ -892,8 +914,8 @@ pub(in crate::lock) mod tests {
         LockOwner::transaction(SessionID::new(id), TrxID::new(id))
     }
 
-    fn completion() -> Arc<Completion<()>> {
-        Arc::new(Completion::new())
+    fn resource() -> LockResource {
+        LockResource::TableMetadata(TableID::new(9))
     }
 
     /// Purpose: Protect waiter storage layout on supported wide-pointer targets.
@@ -902,9 +924,9 @@ pub(in crate::lock) mod tests {
     #[test]
     fn waiter_layout_is_recorded() {
         assert_eq!(size_of::<WaitNodeID>(), 16);
-        assert_eq!(size_of::<WaitNode>(), 96);
-        assert_eq!(size_of::<WaitNodeSlot>(), 104);
-        assert_eq!(size_of::<WaitNodeSlotEntry>(), 96);
+        assert_eq!(size_of::<WaitNode>(), 56);
+        assert_eq!(size_of::<WaitNodeSlot>(), 64);
+        assert_eq!(size_of::<WaitNodeSlotEntry>(), 56);
     }
 
     /// Purpose: Reuse a reclaimed waiter slot before growing the slab.
@@ -918,14 +940,14 @@ pub(in crate::lock) mod tests {
         assert_eq!(empty.slab.live_count, 0);
         assert_eq!(empty.slab.free_order, []);
 
-        let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
+        let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, resource());
         let _ = queue.remove_queued(first);
         let reclaimed = queue_snapshot(&queue);
         assert_eq!(reclaimed.slab.slots_len, 1);
         assert_eq!(reclaimed.slab.free_order, vec![0]);
         let retained_capacity = reclaimed.slab.capacity;
 
-        let reused = queue.append(owner(2), ClaimNo::new(2), LockMode::Shared, completion());
+        let reused = queue.append(owner(2), ClaimNo::new(2), LockMode::Shared, resource());
         assert_eq!(reused.slot, first.slot);
         assert_eq!(reused.generation, first.generation + 1);
         let snapshot = queue_snapshot(&queue);
@@ -933,7 +955,7 @@ pub(in crate::lock) mod tests {
         assert_eq!(snapshot.slab.capacity, retained_capacity);
         assert_eq!(snapshot.slab.free_order, []);
 
-        let appended = queue.append(owner(3), ClaimNo::new(3), LockMode::Shared, completion());
+        let appended = queue.append(owner(3), ClaimNo::new(3), LockMode::Shared, resource());
         assert_eq!(appended.slot, 1);
         assert_eq!(appended.generation, 0);
         assert_eq!(queue_snapshot(&queue).slab.slots_len, 2);
@@ -945,14 +967,7 @@ pub(in crate::lock) mod tests {
     fn intrusive_unlink_updates_head_middle_and_tail() {
         let mut queue = WaitQueue::default();
         let ids = (1..=4)
-            .map(|id| {
-                queue.append(
-                    owner(id),
-                    ClaimNo::new(id),
-                    LockMode::Exclusive,
-                    completion(),
-                )
-            })
+            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Exclusive, resource()))
             .collect::<Vec<_>>();
         let _ = queue.remove_queued(ids[1]);
         assert_eq!(linked_ids(&queue), vec![ids[0], ids[2], ids[3]]);
@@ -971,9 +986,9 @@ pub(in crate::lock) mod tests {
     #[test]
     fn stale_id_panics_before_reused_node_mutation() {
         let mut queue = WaitQueue::default();
-        let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
+        let first = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, resource());
         let _ = queue.remove_queued(first);
-        let reused = queue.append(owner(2), ClaimNo::new(2), LockMode::Shared, completion());
+        let reused = queue.append(owner(2), ClaimNo::new(2), LockMode::Shared, resource());
         let before = queue_snapshot(&queue);
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = queue.remove_queued(first);
@@ -989,7 +1004,7 @@ pub(in crate::lock) mod tests {
     fn link_mismatch_panics_before_neighbor_mutation() {
         let mut queue = WaitQueue::default();
         let ids = (1..=3)
-            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, completion()))
+            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, resource()))
             .collect::<Vec<_>>();
         let WaitNodePhase::Queued { prev, .. } = &mut queue.nodes.get_mut(ids[2]).phase else {
             panic!("new waiter must be queued")
@@ -1027,7 +1042,7 @@ pub(in crate::lock) mod tests {
     #[test]
     fn generation_exhaustion_leaves_the_slot_occupied() {
         let mut queue = WaitQueue::default();
-        let initial = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, completion());
+        let initial = queue.append(owner(1), ClaimNo::new(1), LockMode::Shared, resource());
         let exhausted = WaitNodeID {
             slot: initial.slot,
             generation: u64::MAX,
@@ -1060,7 +1075,7 @@ pub(in crate::lock) mod tests {
     fn direct_free_list_reuses_last_reclaimed_slot_first() {
         let mut queue = WaitQueue::default();
         let ids = (1..=3)
-            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, completion()))
+            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, resource()))
             .collect::<Vec<_>>();
         for id in [ids[1], ids[0], ids[2]] {
             let _ = queue.remove_queued(id);
@@ -1068,7 +1083,7 @@ pub(in crate::lock) mod tests {
         assert_eq!(queue_snapshot(&queue).slab.free_order, vec![2, 0, 1]);
 
         let reused = (4..=6)
-            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, completion()))
+            .map(|id| queue.append(owner(id), ClaimNo::new(id), LockMode::Shared, resource()))
             .collect::<Vec<_>>();
         assert_eq!(
             reused.iter().map(|id| id.slot).collect::<Vec<_>>(),
@@ -1106,7 +1121,7 @@ pub(in crate::lock) mod tests {
                     owner(next_owner),
                     ClaimNo::new(next_owner),
                     LockMode::Shared,
-                    completion(),
+                    resource(),
                 );
                 next_owner += 1;
                 assert_eq!(id.slot, expected_slot, "step={step}, random={random:#x}");
@@ -1140,12 +1155,7 @@ pub(in crate::lock) mod tests {
             owner: exact_owner,
             claim_no: ClaimNo::new(17),
         };
-        let id = queue.append(
-            exact_owner,
-            ClaimNo::new(17),
-            LockMode::Exclusive,
-            completion(),
-        );
+        let id = queue.append(exact_owner, ClaimNo::new(17), LockMode::Exclusive, resource);
         queue.assert_identity(id, &token, LockMode::Exclusive);
         let before = queue_snapshot(&queue);
         for (case, request_owner, claim_no, mode) in [

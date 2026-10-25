@@ -260,6 +260,9 @@ pub(crate) enum ConfigError {
     InvalidMandatoryConcurrencyLimit,
     #[error("invalid table scan partition size")]
     InvalidTableScanPartitionSize,
+    /// The initial logical-lock deadlock check requires a positive work allowance.
+    #[error("invalid deadlock search work limit")]
+    InvalidDeadlockSearchWorkLimit,
     #[error("invalid buffer pool configuration")]
     InvalidBufferPoolConfig,
     #[error("invalid fixed buffer pool size")]
@@ -384,6 +387,13 @@ pub(crate) enum ResourceError {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
 pub enum OperationError {
+    /// This acquisition was elected to break a live logical-lock cycle.
+    /// Earlier accepted claims and transaction effects remain owned by the caller.
+    #[error("logical lock deadlock")]
+    Deadlock,
+    /// The bounded logical-lock check could not finish; this acquisition was rejected.
+    #[error("logical lock deadlock check limit exceeded")]
+    DeadlockCheckLimit,
     /// The requested table does not exist.
     #[error("table not found")]
     TableNotFound,
@@ -2294,6 +2304,8 @@ mod tests {
             OperationError::InvalidDmlInput,
             OperationError::InvalidMetadata,
             OperationError::LockUpgradeWouldBlock,
+            OperationError::Deadlock,
+            OperationError::DeadlockCheckLimit,
             OperationError::LockConversionNotSupported,
             OperationError::LockFamilyConflict,
             OperationError::InvalidReadSnapshotInput,

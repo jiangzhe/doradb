@@ -115,7 +115,7 @@ doradb-storage defaults < included [engine] < plan-local [engine]
 
 The overlay covers public engine builder inputs other than the invocation root
 and internal eviction policy. Its tables are `thread_pool`,
-`mandatory_runtime`, `table_scan`, `transaction`, `recovery`, `hot_index_build`,
+`mandatory_runtime`, `table_scan`, `lock_manager`, `transaction`, `recovery`, `hot_index_build`,
 `cold_index_build`, `checkpoint_index_build`, `index_buffer`, `data_buffer`, and `file`;
 `meta_buffer_size` is an `[engine]` leaf.
 `[thread_pool]` accepts `worker_threads`; `[mandatory_runtime]` accepts only
@@ -126,6 +126,11 @@ range is `1..=8192`. Byte inputs are strings such as `"512 MiB"`. The canonical
 result records the complete normalized engine configuration, including both
 effective table-scan counts. Normalized result documents must include the
 `table_scan` table.
+
+`[engine.lock_manager]` accepts `deadlock_search_work_limit` (default 65,536,
+must be positive). It limits work per deadlock check, including retries, rather
+than lock-wait duration. Normalized results require the `lock_manager` table
+and its effective `deadlock_search_work_limit` value.
 
 ### Hot-index build settings
 

@@ -20,6 +20,8 @@ pub struct EngineConfigOverlay {
     pub mandatory_runtime: MandatoryRuntimeOverlay,
     /// Deterministic table-scan planning overrides.
     pub table_scan: TableScanConfigOverlay,
+    /// Initial logical-lock deadlock search allowance.
+    pub lock_manager: LockManagerConfigOverlay,
     /// Transaction-system overrides.
     pub transaction: TransactionConfigOverlay,
     /// Startup recovery overrides.
@@ -45,6 +47,7 @@ impl EngineConfigOverlay {
             .merge(other.checkpoint_index_build);
         self.mandatory_runtime.merge(other.mandatory_runtime);
         self.table_scan.merge(other.table_scan);
+        self.lock_manager.merge(other.lock_manager);
         self.transaction.merge(other.transaction);
         self.recovery.merge(other.recovery);
         replace(&mut self.meta_buffer_size, other.meta_buffer_size);
@@ -174,6 +177,32 @@ pub struct ResolvedColdIndexBuildConfig {
     pub batch_entries: usize,
     /// Partition cap per effective worker.
     pub partitions_per_worker: usize,
+}
+
+/// Strict logical-lock detection overlay; omitted limits retain engine defaults.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LockManagerConfigOverlay {
+    /// Positive charged-work allowance shared across a check's retries.
+    pub deadlock_search_work_limit: Option<usize>,
+}
+
+impl LockManagerConfigOverlay {
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        replace(
+            &mut self.deadlock_search_work_limit,
+            other.deadlock_search_work_limit,
+        );
+    }
+}
+
+/// Effective logical-lock detection settings recorded in benchmark results.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedLockManagerConfig {
+    /// Charged-work allowance for each initial deadlock check.
+    pub deadlock_search_work_limit: usize,
 }
 
 /// Strict deterministic table-scan planning overlay.
@@ -408,6 +437,8 @@ pub struct ResolvedEngineConfig {
     pub mandatory_runtime: ResolvedMandatoryRuntimeConfig,
     /// Deterministic table-scan planning settings.
     pub table_scan: ResolvedTableScanConfig,
+    /// Effective logical-lock detection settings.
+    pub lock_manager: ResolvedLockManagerConfig,
     /// Metadata buffer-pool bytes.
     pub meta_buffer_bytes: u64,
     /// User-index buffer-pool settings.
@@ -495,6 +526,9 @@ impl ResolvedEngineConfig {
             },
             mandatory_runtime: ResolvedMandatoryRuntimeConfig {
                 concurrency_limit: config.mandatory_runtime.concurrency_limit,
+            },
+            lock_manager: ResolvedLockManagerConfig {
+                deadlock_search_work_limit: config.lock_manager.deadlock_search_work_limit,
             },
             table_scan: ResolvedTableScanConfig {
                 lwc_blocks_per_partition: config.table_scan.lwc_blocks_per_partition,
@@ -657,6 +691,10 @@ pub fn resolve_engine_config(
     if let Some(value) = overlay.mandatory_runtime.concurrency_limit {
         mandatory = mandatory.concurrency_limit(value);
     }
+    let mut lock_manager = default.lock_manager;
+    if let Some(value) = overlay.lock_manager.deadlock_search_work_limit {
+        lock_manager = lock_manager.deadlock_search_work_limit(value);
+    }
     let mut table_scan = default.table_scan;
     if let Some(value) = overlay.table_scan.lwc_blocks_per_partition {
         table_scan = table_scan.lwc_blocks_per_partition(value);
@@ -812,6 +850,7 @@ pub fn resolve_engine_config(
         .checkpoint_index_build(checkpoint_index_build)
         .mandatory_runtime(mandatory)
         .table_scan(table_scan)
+        .lock_manager(lock_manager)
         .trx(transaction)
         .recovery(recovery)
         .meta_buffer(
@@ -1187,6 +1226,68 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(toml::from_str::<ResolvedEngineConfig>(&without_scan).is_err());
+    }
+
+    /// Purpose: Propagate logical-lock defaults and explicit overrides into the normalized benchmark configuration.
+    /// Expected: Local values override included values, omitted values preserve them, and the effective limit survives strict round trips.
+    #[test]
+    fn lock_manager_overlay_defaults_merges_and_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("engine");
+        let (config, resolved) =
+            resolve_engine_config(&root, &EngineConfigOverlay::default()).unwrap();
+        assert_eq!(config.lock_manager.deadlock_search_work_limit, 65_536);
+        assert_eq!(resolved.lock_manager.deadlock_search_work_limit, 65_536);
+        assert_resolved_round_trip(&resolved);
+
+        let mut base: EngineConfigOverlay = toml::from_str(
+            "[thread_pool]\nworker_threads = 3\n[lock_manager]\ndeadlock_search_work_limit = 37\n",
+        )
+        .unwrap();
+        base.merge(toml::from_str("[lock_manager]\ndeadlock_search_work_limit = 36\n").unwrap());
+        base.merge(toml::from_str("[lock_manager]\n").unwrap());
+        let (config, resolved) = resolve_engine_config(&root, &base).unwrap();
+        assert_eq!(config.lock_manager.deadlock_search_work_limit, 36);
+        assert_eq!(resolved.lock_manager.deadlock_search_work_limit, 36);
+        assert_eq!(config.thread_pool.worker_threads, 3);
+        let encoded = assert_resolved_round_trip(&resolved);
+        assert!(encoded.contains("[lock_manager]"));
+        let mut missing_field: toml::Value = toml::from_str(&encoded).unwrap();
+        missing_field["lock_manager"]
+            .as_table_mut()
+            .unwrap()
+            .remove("deadlock_search_work_limit");
+        assert!(missing_field.try_into::<ResolvedEngineConfig>().is_err());
+        let mut missing_section: toml::Value = toml::from_str(&encoded).unwrap();
+        missing_section
+            .as_table_mut()
+            .unwrap()
+            .remove("lock_manager");
+        assert!(missing_section.try_into::<ResolvedEngineConfig>().is_err());
+        assert!(!root.exists());
+    }
+
+    /// Purpose: Reject invalid logical-lock settings before benchmark storage preparation.
+    /// Expected: Zero fails engine validation with its field diagnostic; unknown fields and invalid unsigned values fail parsing.
+    #[test]
+    fn lock_manager_overlay_rejects_invalid_settings() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("engine");
+        let overlay: EngineConfigOverlay =
+            toml::from_str("[lock_manager]\ndeadlock_search_work_limit = 0\n").unwrap();
+        let error = resolve_engine_config(&root, &overlay).unwrap_err();
+        assert!(format!("{error:?}").contains("lock_manager.deadlock_search_work_limit=0"));
+        assert!(!root.exists());
+        for invalid in [
+            "[lock_manager]\nunknown = 1\n",
+            "[lock_manager]\ndeadlock_search_work_limit = -1\n",
+            "[lock_manager]\ndeadlock_search_work_limit = \"small\"\n",
+        ] {
+            assert!(
+                toml::from_str::<EngineConfigOverlay>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     /// Purpose: Prevent oversized byte settings from exceeding storage representation limits.

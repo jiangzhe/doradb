@@ -6,6 +6,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// point-in-time observations and peak values are monotonic high-water marks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogicalLockStats {
+    /// Initial checks of published logical waits.
+    pub deadlock_initial_checks: u64,
+    /// Charged scans, expansions, and election work across initial checks.
+    pub deadlock_examined_work: u64,
+    /// Witnesses containing the entering request.
+    pub deadlock_candidate_cycles: u64,
+    /// Successful cycle-local breaker elections.
+    pub deadlock_elections: u64,
+    /// Witnesses invalidated before election and retried within the budget.
+    pub deadlock_invalidated_witnesses: u64,
+    /// Acquisitions rejected because their check exhausted its work budget.
+    pub deadlock_check_limits: u64,
+    /// Currently registered pending families.
+    pub current_pending_registrations: u64,
+    /// Maximum simultaneously registered pending families.
+    pub peak_pending_registrations: u64,
     /// Requests satisfied by an existing exact claim without manager access.
     pub owner_local_exact_covered_hits: u64,
     /// Fresh exact claims published under an unchanged physical family mode.
@@ -67,6 +83,22 @@ pub struct LogicalLockStats {
 /// Component-owned atomic counters and physical representation peaks.
 #[derive(Default)]
 pub(crate) struct LockManagerStats {
+    /// Initial checks of published logical waits.
+    pub(crate) deadlock_initial_checks: AtomicU64,
+    /// Charged scans, expansions, and election work across initial checks.
+    pub(crate) deadlock_examined_work: AtomicU64,
+    /// Witnesses containing the entering request.
+    pub(crate) deadlock_candidate_cycles: AtomicU64,
+    /// Successful cycle-local breaker elections.
+    pub(crate) deadlock_elections: AtomicU64,
+    /// Witnesses invalidated before election and retried within the budget.
+    pub(crate) deadlock_invalidated_witnesses: AtomicU64,
+    /// Acquisitions rejected because their check exhausted its work budget.
+    pub(crate) deadlock_check_limits: AtomicU64,
+    /// Currently registered pending families.
+    pub(crate) current_pending_registrations: AtomicU64,
+    /// Maximum simultaneously registered pending families.
+    pub(crate) peak_pending_registrations: AtomicU64,
     /// Requests satisfied by an existing exact claim without manager access.
     pub(crate) owner_local_exact_covered_hits: AtomicU64,
     /// Fresh exact claims published under an unchanged physical family mode.
@@ -130,6 +162,14 @@ impl LockManagerStats {
     #[inline]
     pub(crate) fn snapshot(&self) -> LogicalLockStats {
         LogicalLockStats {
+            deadlock_initial_checks: load(&self.deadlock_initial_checks),
+            deadlock_examined_work: load(&self.deadlock_examined_work),
+            deadlock_candidate_cycles: load(&self.deadlock_candidate_cycles),
+            deadlock_elections: load(&self.deadlock_elections),
+            deadlock_invalidated_witnesses: load(&self.deadlock_invalidated_witnesses),
+            deadlock_check_limits: load(&self.deadlock_check_limits),
+            current_pending_registrations: load(&self.current_pending_registrations),
+            peak_pending_registrations: load(&self.peak_pending_registrations),
             owner_local_exact_covered_hits: load(&self.owner_local_exact_covered_hits),
             owner_local_covered_publications: load(&self.owner_local_covered_publications),
             owner_local_mode_preserving_conversions: load(

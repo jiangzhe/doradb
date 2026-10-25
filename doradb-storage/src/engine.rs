@@ -761,9 +761,9 @@ async fn bootstrap_engine(config: EngineConfig) -> Result<Engine> {
         .disclose()?;
     builder.build::<ThreadPoolWorkers>(()).await.disclose()?;
     builder
-        .build::<LockManager>(())
+        .build::<LockManager>(config.lock_manager)
         .await
-        .unwrap_or_else(|never| match never {});
+        .disclose()?;
     // Catalog owns user-table runtimes, and those runtimes retain buffer-pool
     // guards for row/index/readonly access. Register catalog after the pools it
     // can pin so reverse shutdown/drop order releases table guards before pool
@@ -905,10 +905,11 @@ mod tests {
     use crate::catalog::tests::table1;
     use crate::conf::HotIndexBuildConfig;
     use crate::conf::{
-        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, RecoveryConfig, TrxSysConfig,
+        EngineConfig, EvictableBufferPoolConfig, FileSystemConfig, LockManagerConfig,
+        RecoveryConfig, TrxSysConfig,
     };
     use crate::error::{
-        ConfigError, Error, ErrorKind, FatalError, LifecycleError, RuntimeError,
+        ConfigError, Error, ErrorKind, FatalError, LifecycleError, OperationError, RuntimeError,
         RuntimeOrFatalError,
     };
     #[cfg(feature = "profiling")]
@@ -935,6 +936,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
+    use std::task::Poll;
     use std::thread::{self, sleep, yield_now};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -1492,6 +1494,88 @@ mod tests {
             first.close(runtime.lock_manager());
             acquire.await.unwrap();
             second.close(engine.inner().core.lock_manager());
+        });
+    }
+
+    /// Purpose: Apply configured deadlock limits independently to engines sharing one caller thread.
+    /// Expected: A tiny allowance repeatedly rejects contention without losing the holder, while another engine waits and grants normally.
+    #[test]
+    fn test_engine_deadlock_work_limits_are_isolated_and_persistent() {
+        smol::block_on(async {
+            let small_root = TempDir::new().unwrap();
+            let larger_root = TempDir::new().unwrap();
+            let small = Engine::bootstrap(
+                test_engine_config_for(small_root.path())
+                    .lock_manager(LockManagerConfig::default().deadlock_search_work_limit(1)),
+            )
+            .await
+            .unwrap();
+            let larger = Engine::bootstrap(
+                test_engine_config_for(larger_root.path())
+                    .lock_manager(LockManagerConfig::default().deadlock_search_work_limit(4)),
+            )
+            .await
+            .unwrap();
+            for (engine, limit) in [(&small, 1), (&larger, 4), (&small, 1)] {
+                let session = engine.new_session().unwrap();
+                let runtime = session.engine();
+                let manager = runtime.lock_manager();
+                let resource = LockResource::TableMetadata(TableID::new(10));
+                let mut holder =
+                    TestLockOwner::new(LockOwner::session_explicit(SessionID::new(10)));
+                let mut waiter =
+                    TestLockOwner::new(LockOwner::session_explicit(SessionID::new(11)));
+                holder
+                    .acquire(manager, resource, LockMode::Exclusive)
+                    .await
+                    .unwrap();
+                let mut acquire = Box::pin(waiter.acquire(manager, resource, LockMode::Shared));
+                let polled = futures::poll!(acquire.as_mut());
+                if limit == 1 {
+                    let Poll::Ready(Err(error)) = polled else {
+                        panic!("tiny configured budget must reject the queued acquisition");
+                    };
+                    assert_eq!(*error.current_context(), OperationError::DeadlockCheckLimit);
+                    assert!(format!("{error:?}").contains("budget=1, work=1"));
+                    drop(acquire);
+                    assert_eq!(
+                        debug_snapshot(manager).entries.len(),
+                        1,
+                        "the older holder must survive"
+                    );
+                    holder.close(manager);
+                } else {
+                    assert!(polled.is_pending());
+                    holder.close(manager);
+                    acquire.await.unwrap();
+                }
+                waiter.close(manager);
+                assert_eq!(debug_snapshot(manager).entries, []);
+            }
+        });
+    }
+
+    /// Purpose: Reject an unusable deadlock allowance before engine bootstrap has filesystem effects.
+    /// Expected: Zero returns the typed configuration cause and never creates the requested storage root.
+    #[test]
+    fn test_engine_rejects_zero_deadlock_budget_before_storage_creation() {
+        smol::block_on(async {
+            let parent = TempDir::new().unwrap();
+            let root = parent.path().join("engine");
+            let error = Engine::bootstrap(
+                test_engine_config_for(&root)
+                    .lock_manager(LockManagerConfig::default().deadlock_search_work_limit(0)),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.kind(), ErrorKind::Config);
+            assert_eq!(
+                error.report().downcast_ref::<ConfigError>(),
+                Some(&ConfigError::InvalidDeadlockSearchWorkLimit)
+            );
+            assert!(format!("{error:?}").contains("lock_manager.deadlock_search_work_limit=0"));
+            assert!(!root.exists());
         });
     }
 
