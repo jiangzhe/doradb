@@ -690,7 +690,7 @@ mod tests {
     use crate::id::RowID;
     use crate::io::DirectBuf;
     use crate::layout::LayoutError;
-    use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer, LwcPrimitiveSer};
+    use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
 
@@ -840,8 +840,8 @@ mod tests {
         assert_lwc_data_integrity(err, test_block_id(7), DataIntegrityError::InvalidVersion);
     }
 
-    /// Purpose: Decode a nullable column with interleaved null and non-null rows.
-    /// Expected: The null bitmap and underlying values retain their row positions.
+    /// Purpose: Decode an existing nullable block with noncanonical values beneath null bits.
+    /// Expected: The null bitmap and all physical values retain their row positions independently of current encoding policy.
     #[test]
     fn test_lwc_block_nullable_column() {
         let metadata = TableMetadata::try_new(
@@ -853,9 +853,9 @@ mod tests {
         )
         .expect("valid table metadata");
         let values = [10u8, 20, 30, 40];
-        let lwc_ser = LwcPrimitiveSer::new_u8(&values);
-        let mut values_bytes = vec![0u8; lwc_ser.ser_len()];
-        lwc_ser.ser(&mut values_bytes[..], 0);
+        // Fixed flat wire fixture: tag, little-endian count, physical values.
+        // The null slots deliberately retain values different from the minimum.
+        let values_bytes = [LwcCode::Flat as u8, 4, 0, 0, 0, 0, 0, 0, 0, 10, 20, 30, 40];
 
         let null_bytes = [0b0000_1010u8];
         let null_ser = LwcNullBitmapSer::new(&null_bytes).unwrap();

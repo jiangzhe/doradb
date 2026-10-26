@@ -15,7 +15,7 @@ use crate::id::RowID;
 use crate::io::DirectBuf;
 use crate::layout;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
-use crate::serde::{ForBitpackingSer, Ser, Serde};
+use crate::serde::{IntegerEncoding, IntegerEncodingPlan, Ser, Serde};
 use crate::value::{MemVar, Val, ValKind};
 use error_stack::{Report, ResultExt};
 use std::borrow::Cow;
@@ -28,6 +28,7 @@ use zerocopy::{Immutable, IntoBytes};
 pub(crate) const MAX_LWC_ROWS: usize = 15_360;
 
 const LWC_BLOCK_HEADER_SIZE: usize = mem::size_of::<LwcBlockHeader>();
+const LWC_BLOCK_BODY_SIZE: usize = LWC_BLOCK_PAYLOAD_SIZE - LWC_BLOCK_HEADER_SIZE;
 
 /// Lightweight compressed data.
 pub(crate) enum LwcData<'a> {
@@ -619,7 +620,7 @@ pub(crate) trait LwcPrimitiveData {
 pub(crate) enum LwcCode {
     Flat = 1,
     // Bitpacking = 2,
-    /// See `ForBitpackingSer` for serialization details.
+    /// See `IntegerEncodingPlan::ser` for serialization details.
     ForBitpacking = 3,
     // todo: dict, fsst.
 }
@@ -745,112 +746,15 @@ impl LwcPrimitive<'_> {
     }
 }
 
-/// Serializer for primitive LWC column payloads.
+/// Serializer for flat floating-point and variable-byte LWC column payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LwcPrimitiveSer<'a> {
-    FlatI8(&'a [i8]),
-    FlatU8(&'a [u8]),
-    FlatI16(Cow<'a, [[u8; 2]]>),
-    FlatU16(Cow<'a, [[u8; 2]]>),
-    FlatI32(Cow<'a, [[u8; 4]]>),
-    FlatU32(Cow<'a, [[u8; 4]]>),
     FlatF32(Cow<'a, [[u8; 4]]>),
-    FlatI64(Cow<'a, [[u8; 8]]>),
-    FlatU64(Cow<'a, [[u8; 8]]>),
     FlatF64(Cow<'a, [[u8; 8]]>),
-    ForBpI8(ForBitpackingSer<'a, i8>),
-    ForBpU8(ForBitpackingSer<'a, u8>),
-    ForBpI16(ForBitpackingSer<'a, i16>),
-    ForBpU16(ForBitpackingSer<'a, u16>),
-    ForBpI32(ForBitpackingSer<'a, i32>),
-    ForBpU32(ForBitpackingSer<'a, u32>),
-    ForBpI64(ForBitpackingSer<'a, i64>),
-    ForBpU64(ForBitpackingSer<'a, u64>),
     Bytes(LwcBytesSer),
 }
 
 impl<'a> LwcPrimitiveSer<'a> {
-    /// Creates an i8 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_i8(input: &'a [i8]) -> Self {
-        if input.is_empty() {
-            return LwcPrimitiveSer::FlatI8(input);
-        }
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpI8(fbp),
-            None => LwcPrimitiveSer::FlatI8(input),
-        }
-    }
-
-    /// Creates a u8 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_u8(input: &'a [u8]) -> Self {
-        if input.is_empty() {
-            return LwcPrimitiveSer::FlatU8(input);
-        }
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpU8(fbp),
-            None => LwcPrimitiveSer::FlatU8(input),
-        }
-    }
-
-    /// Creates a u64 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_u64(input: &'a [u64]) -> Self {
-        if input.is_empty() {
-            return LwcPrimitiveSer::FlatU64(flat_u64_bytes(input));
-        }
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpU64(fbp),
-            None => LwcPrimitiveSer::FlatU64(flat_u64_bytes(input)),
-        }
-    }
-
-    /// Creates an i16 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_i16(input: &'a [i16]) -> Self {
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpI16(fbp),
-            None => LwcPrimitiveSer::FlatI16(flat_i16_bytes(input)),
-        }
-    }
-
-    /// Creates a u16 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_u16(input: &'a [u16]) -> Self {
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpU16(fbp),
-            None => LwcPrimitiveSer::FlatU16(flat_u16_bytes(input)),
-        }
-    }
-
-    /// Creates an i32 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_i32(input: &'a [i32]) -> Self {
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpI32(fbp),
-            None => LwcPrimitiveSer::FlatI32(flat_i32_bytes(input)),
-        }
-    }
-
-    /// Creates a u32 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_u32(input: &'a [u32]) -> Self {
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpU32(fbp),
-            None => LwcPrimitiveSer::FlatU32(flat_u32_bytes(input)),
-        }
-    }
-
-    /// Creates an i64 serializer, choosing bitpacking when it is smaller.
-    #[inline]
-    pub(crate) fn new_i64(input: &'a [i64]) -> Self {
-        match ForBitpackingSer::new(input) {
-            Some(fbp) => LwcPrimitiveSer::ForBpI64(fbp),
-            None => LwcPrimitiveSer::FlatI64(flat_i64_bytes(input)),
-        }
-    }
-
     /// Creates an f32 flat serializer.
     #[inline]
     pub(crate) fn new_f32(input: &'a [f32]) -> Self {
@@ -886,88 +790,30 @@ impl<'a> LwcPrimitiveSer<'a> {
         }
         Ok(LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data }))
     }
-
-    /// Returns the wire compression code for this serializer.
-    #[inline]
-    pub(crate) fn code(&self) -> LwcCode {
-        match self {
-            LwcPrimitiveSer::FlatI8(_)
-            | LwcPrimitiveSer::FlatU8(_)
-            | LwcPrimitiveSer::FlatI16(_)
-            | LwcPrimitiveSer::FlatU16(_)
-            | LwcPrimitiveSer::FlatI32(_)
-            | LwcPrimitiveSer::FlatU32(_)
-            | LwcPrimitiveSer::FlatF32(_)
-            | LwcPrimitiveSer::FlatI64(_)
-            | LwcPrimitiveSer::FlatU64(_)
-            | LwcPrimitiveSer::FlatF64(_)
-            | LwcPrimitiveSer::Bytes(_) => LwcCode::Flat,
-            LwcPrimitiveSer::ForBpI8(_)
-            | LwcPrimitiveSer::ForBpU8(_)
-            | LwcPrimitiveSer::ForBpI16(_)
-            | LwcPrimitiveSer::ForBpU16(_)
-            | LwcPrimitiveSer::ForBpI32(_)
-            | LwcPrimitiveSer::ForBpU32(_)
-            | LwcPrimitiveSer::ForBpI64(_)
-            | LwcPrimitiveSer::ForBpU64(_) => LwcCode::ForBitpacking,
-        }
-    }
 }
 
 impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
     #[inline]
     fn ser_len(&self) -> usize {
-        mem::size_of::<u8>()
-            + match self {
-                LwcPrimitiveSer::FlatI8(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatU8(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatI16(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatU16(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatI32(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatU32(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatF32(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatI64(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatU64(f) => f.ser_len(),
-                LwcPrimitiveSer::FlatF64(f) => f.ser_len(),
-                LwcPrimitiveSer::ForBpI8(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpU8(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpI16(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpU16(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpI32(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpU32(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpI64(b) => b.ser_len(),
-                LwcPrimitiveSer::ForBpU64(b) => b.ser_len(),
-                LwcPrimitiveSer::Bytes(b) => b.ser_len(),
-            }
+        1 + match self {
+            LwcPrimitiveSer::FlatF32(f) => f.ser_len(),
+            LwcPrimitiveSer::FlatF64(f) => f.ser_len(),
+            LwcPrimitiveSer::Bytes(b) => b.ser_len(),
+        }
     }
 
     #[inline]
     fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u8(start_idx, self.code() as u8);
+        let idx = out.ser_u8(start_idx, LwcCode::Flat as u8);
         match self {
-            LwcPrimitiveSer::FlatI8(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatU8(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatI16(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatU16(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatI32(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatU32(f) => f.ser(out, idx),
             LwcPrimitiveSer::FlatF32(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatI64(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatU64(f) => f.ser(out, idx),
             LwcPrimitiveSer::FlatF64(f) => f.ser(out, idx),
-            LwcPrimitiveSer::ForBpI8(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpU8(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpI16(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpU16(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpI32(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpU32(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpI64(b) => b.ser(out, idx),
-            LwcPrimitiveSer::ForBpU64(b) => b.ser(out, idx),
             LwcPrimitiveSer::Bytes(b) => b.ser(out, idx),
         }
     }
 }
 
+// Uninitialized extrema stay zero, supplying the all-null integer plan.
 struct LwcColumnStats {
     min_i64: i64,
     max_i64: i64,
@@ -1179,7 +1025,22 @@ impl LwcBuilder {
         }
         let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
         let mut col_offsets = Vec::with_capacity(self.col_layout.col_count());
-        let mut offset = mem::size_of::<u16>() * self.col_layout.col_count();
+        let mut offset = self
+            .col_layout
+            .col_count()
+            .checked_mul(mem::size_of::<u16>())
+            .ok_or_else(|| {
+                lwc_block_encoding_contract().attach(format!(
+                    "field=column_offset_table, column_count={}, capacity={LWC_BLOCK_BODY_SIZE}",
+                    self.col_layout.col_count()
+                ))
+            })?;
+        if offset > LWC_BLOCK_BODY_SIZE || offset > u16::MAX as usize {
+            return Err(lwc_block_encoding_contract().attach(format!(
+                "field=column_offset_table, actual={offset}, capacity={LWC_BLOCK_BODY_SIZE}, maximum={}",
+                u16::MAX
+            )));
+        }
 
         for col_idx in 0..self.col_layout.col_count() {
             let column = self.buffer.column(col_idx).unwrap_or_else(|| {
@@ -1195,42 +1056,66 @@ impl LwcBuilder {
                 bitmap_ser.ser(&mut tmp[..], 0);
                 data.extend_from_slice(&tmp);
             }
+            let stats = &self.stats[col_idx];
+            let expected_len = estimate_column_payload(
+                self.col_layout.val_kind(col_idx),
+                &column.values,
+                stats,
+                row_count,
+                col_idx,
+            ) + if column.null_bitmap.is_some() {
+                2 + row_count.div_ceil(8)
+            } else {
+                0
+            };
             let payload = match column.values {
-                ScanColumnValues::I8(vals) => {
-                    let ser = LwcPrimitiveSer::new_i8(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::U8(vals) => {
-                    let ser = LwcPrimitiveSer::new_u8(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::I16(vals) => {
-                    let ser = LwcPrimitiveSer::new_i16(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::U16(vals) => {
-                    let ser = LwcPrimitiveSer::new_u16(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::I32(vals) => {
-                    let ser = LwcPrimitiveSer::new_i32(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::U32(vals) => {
-                    let ser = LwcPrimitiveSer::new_u32(vals);
-                    serialize_primitive(&ser)
-                }
+                ScanColumnValues::I8(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_i64 as i8,
+                    stats.max_i64 as i8,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
+                ScanColumnValues::U8(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_u64 as u8,
+                    stats.max_u64 as u8,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
+                ScanColumnValues::I16(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_i64 as i16,
+                    stats.max_i64 as i16,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
+                ScanColumnValues::U16(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_u64 as u16,
+                    stats.max_u64 as u16,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
+                ScanColumnValues::I32(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_i64 as i32,
+                    stats.max_i64 as i32,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
+                ScanColumnValues::U32(vals) => IntegerEncodingPlan::from_extrema(
+                    row_count,
+                    stats.min_u64 as u32,
+                    stats.max_u64 as u32,
+                )
+                .serialize_lwc(vals, column.null_bitmap),
                 ScanColumnValues::F32(vals) => {
                     let ser = LwcPrimitiveSer::new_f32(vals);
                     serialize_primitive(&ser)
                 }
                 ScanColumnValues::I64(vals) => {
-                    let ser = LwcPrimitiveSer::new_i64(vals);
-                    serialize_primitive(&ser)
+                    IntegerEncodingPlan::from_extrema(row_count, stats.min_i64, stats.max_i64)
+                        .serialize_lwc(vals, column.null_bitmap)
                 }
                 ScanColumnValues::U64(vals) => {
-                    let ser = LwcPrimitiveSer::new_u64(vals);
-                    serialize_primitive(&ser)
+                    IntegerEncodingPlan::from_extrema(row_count, stats.min_u64, stats.max_u64)
+                        .serialize_lwc(vals, column.null_bitmap)
                 }
                 ScanColumnValues::F64(vals) => {
                     let ser = LwcPrimitiveSer::new_f64(vals);
@@ -1250,15 +1135,34 @@ impl LwcBuilder {
                 }
             };
             data.extend_from_slice(&payload);
-            offset += data.len();
-            if offset > u16::MAX as usize {
+            if data.len() != expected_len {
                 return Err(lwc_block_encoding_contract().attach(format!(
-                    "field=column_end_offset, column_no={col_idx}, actual={offset}, maximum={}",
+                    "field=column_length, column_no={col_idx}, expected={expected_len}, actual={}, capacity={LWC_BLOCK_BODY_SIZE}",
+                    data.len()
+                )));
+            }
+            offset = offset.checked_add(data.len()).ok_or_else(|| {
+                lwc_block_encoding_contract().attach(format!(
+                    "field=column_end_offset, column_no={col_idx}, start={offset}, length={}, capacity={LWC_BLOCK_BODY_SIZE}",
+                    data.len()
+                ))
+            })?;
+            if offset > LWC_BLOCK_BODY_SIZE || offset > u16::MAX as usize {
+                return Err(lwc_block_encoding_contract().attach(format!(
+                    "field=column_end_offset, column_no={col_idx}, actual={offset}, capacity={LWC_BLOCK_BODY_SIZE}, maximum={}",
                     u16::MAX
                 )));
             }
             col_offsets.push(offset as u16);
             column_payloads.push(data);
+        }
+
+        let actual_len = LWC_BLOCK_HEADER_SIZE + offset;
+        let expected_len = self.estimate_size();
+        if actual_len != expected_len || actual_len > LWC_BLOCK_PAYLOAD_SIZE {
+            return Err(lwc_block_encoding_contract().attach(format!(
+                "field=payload_length, expected={expected_len}, actual={actual_len}, capacity={LWC_BLOCK_PAYLOAD_SIZE}"
+            )));
         }
 
         let header = LwcBlockHeader::new(
@@ -1971,54 +1875,6 @@ where
 
 #[cfg(target_endian = "little")]
 #[inline]
-fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i16_bytes(input: &[i16]) -> Cow<'_, [[u8; 2]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u16_bytes(input: &[u16]) -> Cow<'_, [[u8; 2]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i32_bytes(input: &[i32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u32_bytes(input: &[u32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
 fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
     flat_bytes_borrowed(input)
 }
@@ -2026,30 +1882,6 @@ fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
 #[cfg(not(target_endian = "little"))]
 #[inline]
 fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_i64_bytes(input: &[i64]) -> Cow<'_, [[u8; 8]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_u64_bytes(input: &[u64]) -> Cow<'_, [[u8; 8]]> {
     Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
 }
 
@@ -2070,6 +1902,32 @@ fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>) -> Vec<u8> {
     let mut bytes = vec![0u8; ser.ser_len()];
     ser.ser(&mut bytes[..], 0);
     bytes
+}
+
+impl<T> IntegerEncodingPlan<T>
+where
+    T: BitPackable + IntoBytes + Immutable + for<'a> Ser<'a>,
+{
+    /// Serializes the planned LWC integer payload with canonical null slots.
+    /// Null-free columns borrow their values; other columns replace logical
+    /// null slots with the final minimum in a temporary copy before writing.
+    pub(crate) fn serialize_lwc(&self, values: &[T], nulls: Option<&[u64]>) -> Vec<u8> {
+        let mut values = Cow::Borrowed(values);
+        if let Some(nulls) = nulls {
+            for idx in 0..values.len() {
+                if nulls.bitmap_get(idx) {
+                    values.to_mut()[idx] = self.min();
+                }
+            }
+        }
+        let mut bytes = vec![0; 1 + self.ser_len()];
+        bytes[0] = match self.encoding() {
+            IntegerEncoding::Flat => LwcCode::Flat as u8,
+            IntegerEncoding::ForBitpacking { .. } => LwcCode::ForBitpacking as u8,
+        };
+        self.ser(&values, &mut bytes[..], 1);
+        bytes
+    }
 }
 
 fn bitmap_to_bytes(bitmap: &[u64], len: usize) -> Vec<u8> {
@@ -2133,28 +1991,58 @@ fn estimate_column_payload(
 ) -> usize {
     match (kind, values) {
         (ValKind::I8, ScanColumnValues::I8(_)) => {
-            estimate_i64_payload(stats, row_count, mem::size_of::<i8>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_i64 as i8,
+                stats.max_i64 as i8,
+            )
+            .ser_len()
         }
         (ValKind::U8, ScanColumnValues::U8(_)) => {
-            estimate_u64_payload(stats, row_count, mem::size_of::<u8>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_u64 as u8,
+                stats.max_u64 as u8,
+            )
+            .ser_len()
         }
         (ValKind::I16, ScanColumnValues::I16(_)) => {
-            estimate_i64_payload(stats, row_count, mem::size_of::<i16>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_i64 as i16,
+                stats.max_i64 as i16,
+            )
+            .ser_len()
         }
         (ValKind::U16, ScanColumnValues::U16(_)) => {
-            estimate_u64_payload(stats, row_count, mem::size_of::<u16>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_u64 as u16,
+                stats.max_u64 as u16,
+            )
+            .ser_len()
         }
         (ValKind::I32, ScanColumnValues::I32(_)) => {
-            estimate_i64_payload(stats, row_count, mem::size_of::<i32>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_i64 as i32,
+                stats.max_i64 as i32,
+            )
+            .ser_len()
         }
         (ValKind::U32, ScanColumnValues::U32(_)) => {
-            estimate_u64_payload(stats, row_count, mem::size_of::<u32>())
+            1 + IntegerEncodingPlan::from_extrema(
+                row_count,
+                stats.min_u64 as u32,
+                stats.max_u64 as u32,
+            )
+            .ser_len()
         }
         (ValKind::I64, ScanColumnValues::I64(_)) => {
-            estimate_i64_payload(stats, row_count, mem::size_of::<i64>())
+            1 + IntegerEncodingPlan::from_extrema(row_count, stats.min_i64, stats.max_i64).ser_len()
         }
         (ValKind::U64, ScanColumnValues::U64(_)) => {
-            estimate_u64_payload(stats, row_count, mem::size_of::<u64>())
+            1 + IntegerEncodingPlan::from_extrema(row_count, stats.min_u64, stats.max_u64).ser_len()
         }
         (ValKind::F32, ScanColumnValues::F32(_)) => {
             mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * mem::size_of::<f32>()
@@ -2173,56 +2061,6 @@ fn estimate_column_payload(
             "LWC size estimation value kind for column {col_idx} must match its table layout"
         ),
     }
-}
-
-fn estimate_i64_payload(stats: &LwcColumnStats, row_count: usize, unit: usize) -> usize {
-    let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * unit;
-    if !stats.initialized {
-        return flat;
-    }
-    let range = stats.max_i64.wrapping_sub(stats.min_i64) as u64;
-    estimate_bitpacked_size(range, row_count, unit, flat).min(flat)
-}
-
-fn estimate_u64_payload(stats: &LwcColumnStats, row_count: usize, unit: usize) -> usize {
-    let flat = mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * unit;
-    if !stats.initialized {
-        return flat;
-    }
-    let range = stats.max_u64.wrapping_sub(stats.min_u64);
-    estimate_bitpacked_size(range, row_count, unit, flat).min(flat)
-}
-
-fn estimate_bitpacked_size(range: u64, row_count: usize, unit: usize, flat: usize) -> usize {
-    let bits = if range < (1 << 1) {
-        1
-    } else if range < (1 << 2) {
-        2
-    } else if range < (1 << 4) {
-        4
-    } else if range < (1 << 8) {
-        if unit <= 1 {
-            return flat;
-        }
-        8
-    } else if range < (1 << 16) {
-        if unit <= 2 {
-            return flat;
-        }
-        16
-    } else if range < (1 << 32) {
-        if unit <= 4 {
-            return flat;
-        }
-        32
-    } else {
-        return flat;
-    };
-    mem::size_of::<u8>()
-        + mem::size_of::<u8>()
-        + mem::size_of::<u64>()
-        + unit
-        + (row_count * bits).div_ceil(8)
 }
 
 #[inline]
@@ -2382,7 +2220,16 @@ mod tests {
         }
     }
 
-    fn assert_primitive_roundtrip<T>(kind: ValKind, serializer: LwcPrimitiveSer<'_>, input: &[T])
+    fn encode_integer<T>(values: &[T]) -> Vec<u8>
+    where
+        T: BitPackable + Ord + Into<i128> + IntoBytes + Immutable + for<'a> Ser<'a>,
+    {
+        let min = values.iter().copied().min().unwrap_or(T::ZERO);
+        let max = values.iter().copied().max().unwrap_or(T::ZERO);
+        IntegerEncodingPlan::from_extrema(values.len(), min, max).serialize_lwc(values, None)
+    }
+
+    fn assert_payload_roundtrip<T>(kind: ValKind, bytes: &[u8], input: &[T])
     where
         T: Copy + TryInto<Val>,
         T::Error: Debug,
@@ -2393,9 +2240,7 @@ mod tests {
             .map(|v| v.try_into().unwrap())
             .collect();
         let case = format!("{kind:?}, input={expected:?}");
-        let mut bytes = vec![0u8; serializer.ser_len()];
-        assert_eq!(serializer.ser(&mut bytes[..], 0), bytes.len(), "{case}");
-        assert_decoded_values(&case, kind, &bytes, &expected);
+        assert_decoded_values(&case, kind, bytes, &expected);
     }
 
     fn row_page_with_rows(
@@ -2454,8 +2299,64 @@ mod tests {
 
     fn assert_built_rows(builder: LwcBuilder, expected: &[Vec<Val>]) {
         let col_layout = Arc::clone(&builder.col_layout);
-        let buf = builder.build(0).unwrap();
+        let buf = build_with_size_check(builder);
         assert_persisted_rows(buf.as_bytes(), col_layout.as_ref(), expected);
+    }
+
+    fn used_payload_size(buf: &DirectBuf) -> usize {
+        let block = LwcBlock::try_from_persisted_bytes(
+            buf.as_bytes(),
+            FileKind::TableFile,
+            test_block_id(1),
+        )
+        .unwrap();
+        let end = block.header.col_count() as usize * 2;
+        let used_body = u16::from_le_bytes(block.body[end - 2..end].try_into().unwrap()) as usize;
+        assert!(block.body[used_body..].iter().all(|&byte| byte == 0));
+        24 + used_body
+    }
+
+    fn build_with_size_check(builder: LwcBuilder) -> DirectBuf {
+        let planned = builder.estimate_size();
+        let buf = builder.build(0x0807_0605_0403_0201).unwrap();
+        assert_eq!(used_payload_size(&buf), planned);
+        assert!(planned <= LWC_BLOCK_PAYLOAD_SIZE);
+        buf
+    }
+
+    fn append_stale_pages(
+        builder: &mut LwcBuilder,
+        metadata: &TableMetadata,
+        rows: &[Vec<Val>],
+        stale: &[Val],
+    ) {
+        for (chunk, rows) in rows.chunks(512).enumerate() {
+            let physical: Vec<Vec<Val>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(col, value)| {
+                            if matches!(value, Val::Null) {
+                                stale[col].clone()
+                            } else {
+                                value.clone()
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut page =
+                row_page_with_rows(metadata, RowID::new((chunk * 512) as u64), &physical);
+            for (row_idx, row) in rows.iter().enumerate() {
+                for (col_idx, value) in row.iter().enumerate() {
+                    if matches!(value, Val::Null) {
+                        page.set_null_exclusive(&metadata.col, row_idx, col_idx, true);
+                    }
+                }
+            }
+            assert!(builder.append_view(page.vector_view(&metadata.col), page.header.start_row_id));
+        }
     }
 
     fn integer_stats(builder: &LwcBuilder) -> Vec<(bool, i64, i64, u64, u64)> {
@@ -2472,6 +2373,452 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Purpose: Select integer encodings by full wire cost for every supported type.
+    /// Expected: Empty and singleton inputs stay flat, constants compress, full ranges stay flat, and both readers preserve values.
+    #[test]
+    fn integer_encoding_full_cost_selection() {
+        macro_rules! check_type {
+            ($ty:ty, $kind:ident) => {{
+                let unit = mem::size_of::<$ty>();
+                for (case, values, code, length) in [
+                    ("empty", vec![], LwcCode::Flat, 9),
+                    ("singleton", vec![17 as $ty], LwcCode::Flat, 9 + unit),
+                    (
+                        "short wide range",
+                        vec![0 as $ty, ((1u64 << (unit * 4)) - 1) as $ty],
+                        LwcCode::Flat,
+                        9 + 2 * unit,
+                    ),
+                    (
+                        "constant",
+                        vec![17 as $ty; 65],
+                        LwcCode::ForBitpacking,
+                        10 + unit + 9,
+                    ),
+                    (
+                        "full range",
+                        [<$ty>::MIN, <$ty>::MAX].repeat(32),
+                        LwcCode::Flat,
+                        9 + 64 * unit,
+                    ),
+                ] {
+                    let bytes = encode_integer(&values);
+                    assert_eq!(bytes[0], code as u8, "{}: {case}", stringify!($ty));
+                    assert_eq!(bytes.len(), length, "{}: {case}", stringify!($ty));
+                    if matches!(code, LwcCode::ForBitpacking) {
+                        assert_eq!(bytes[1], 1);
+                    }
+                    assert_payload_roundtrip(ValKind::$kind, &bytes, &values);
+                }
+            }};
+        }
+        check_type!(i8, I8);
+        check_type!(u8, U8);
+        check_type!(i16, I16);
+        check_type!(u16, U16);
+        check_type!(i32, I32);
+        check_type!(u32, U32);
+        check_type!(i64, I64);
+        check_type!(u64, U64);
+
+        for bytes in [
+            encode_integer(&[-7i8; 3]),
+            encode_integer(&[7u8; 3]),
+            encode_integer(&[-700i16; 2]),
+            encode_integer(&[700u16; 2]),
+        ] {
+            assert_eq!(bytes[0], LwcCode::Flat as u8, "ties select flat");
+        }
+    }
+
+    /// Purpose: Preserve width transitions, byte rounding, and signed and unsigned extreme bases.
+    /// Expected: Wire widths and lengths match independent boundary cases and both readers recover exact values in order.
+    #[test]
+    fn integer_encoding_range_boundaries() {
+        for (range, bits) in [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 4),
+            (15, 4),
+            (16, 8),
+            (255, 8),
+            (256, 16),
+            (65_535, 16),
+            (65_536, 32),
+            (u64::from(u32::MAX), 32),
+        ] {
+            let values: Vec<_> = (0..65)
+                .map(|i| u64::MAX - if i % 2 == 0 { range } else { 0 })
+                .collect();
+            let bytes = encode_integer(&values);
+            assert_eq!(bytes[0], LwcCode::ForBitpacking as u8, "range={range}");
+            assert_eq!(bytes[1], bits, "range={range}");
+            assert_eq!(bytes.len(), 18 + (65 * usize::from(bits)).div_ceil(8));
+            assert_payload_roundtrip(ValKind::U64, &bytes, &values);
+        }
+        for values in [
+            [-1001i64, -1000].repeat(33),
+            [-1, 1].repeat(33),
+            [i64::MIN, i64::MIN + 1].repeat(33),
+            [i64::MIN, i64::MAX].repeat(33),
+        ] {
+            assert_payload_roundtrip(ValKind::I64, &encode_integer(&values), &values);
+        }
+    }
+
+    /// Purpose: Encode the formerly overflowing nullable U64 fixtures and all-null columns through both ingestion paths.
+    /// Expected: Both paths produce identical canonical blocks, exact wire sizes, and all logical rows through the row cap.
+    #[test]
+    fn nullable_integer_capacity_regressions() {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(
+                ValKind::U64,
+                StorageColumnFlags::NULLABLE,
+            )],
+            vec![],
+        )
+        .unwrap();
+        for (count, all_null, expected_size) in [
+            (8_060, false, 2_062),
+            (9_000, false, 2_296),
+            (MAX_LWC_ROWS, true, 3_886),
+        ] {
+            let rows: Vec<_> = (0..count)
+                .map(|i| {
+                    vec![if all_null || i % 2 == 1 {
+                        Val::Null
+                    } else {
+                        Val::U64(1 << 40)
+                    }]
+                })
+                .collect();
+            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
+            for (idx, row) in rows.iter().enumerate() {
+                assert!(
+                    direct.append_row_values(RowID::new(idx as u64), row),
+                    "row={idx}"
+                );
+            }
+            if all_null {
+                let seeds = direct.row_set_seeds().to_vec();
+                assert!(!direct.append_row_values(RowID::new(count as u64), &[Val::Null]));
+                assert_eq!(direct.row_set_seeds(), seeds);
+                assert_eq!(integer_stats(&direct), vec![(false, 0, 0, 0, 0)]);
+            }
+            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
+            append_stale_pages(&mut pages, &metadata, &rows, &[Val::U64(u64::MAX)]);
+            assert_eq!(pages.row_ids(), direct.row_ids());
+            let direct = build_with_size_check(direct);
+            let pages = build_with_size_check(pages);
+            assert_eq!(used_payload_size(&direct), expected_size);
+            assert_eq!(direct.as_bytes(), pages.as_bytes());
+            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
+        }
+    }
+
+    /// Purpose: Canonicalize every integer type against the final minimum for flat and packed nullable columns.
+    /// Expected: Stale extremes and deleted rows do not affect canonical bytes, logical nulls, or row order.
+    #[test]
+    fn integer_null_slots_use_final_minimum() {
+        let kinds = [
+            ValKind::I8,
+            ValKind::U8,
+            ValKind::I16,
+            ValKind::U16,
+            ValKind::I32,
+            ValKind::U32,
+            ValKind::I64,
+            ValKind::U64,
+        ];
+        let metadata = TableMetadata::try_new(
+            kinds
+                .into_iter()
+                .map(|kind| StorageColumnSpec::new(kind, StorageColumnFlags::NULLABLE))
+                .collect(),
+            vec![],
+        )
+        .unwrap();
+        let stale = vec![
+            Val::I8(i8::MAX),
+            Val::U8(u8::MAX),
+            Val::I16(i16::MAX),
+            Val::U16(u16::MAX),
+            Val::I32(i32::MAX),
+            Val::U32(u32::MAX),
+            Val::I64(i64::MAX),
+            Val::U64(u64::MAX),
+        ];
+        let low = vec![
+            Val::I8(-100),
+            Val::U8(100),
+            Val::I16(-1000),
+            Val::U16(1000),
+            Val::I32(-100_000),
+            Val::U32(100_000),
+            Val::I64(-(1 << 41)),
+            Val::U64(1 << 40),
+        ];
+        for count in [2, 19] {
+            let mut rows = vec![vec![Val::Null; 8]; count];
+            rows[count - 1] = low.clone();
+            if count > 2 {
+                rows[3] = vec![
+                    Val::I8(-99),
+                    Val::U8(101),
+                    Val::I16(-999),
+                    Val::U16(1001),
+                    Val::I32(-99_999),
+                    Val::U32(100_001),
+                    Val::I64(-(1 << 41) + 1),
+                    Val::U64((1 << 40) + 1),
+                ];
+            }
+            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
+            for (idx, row) in rows.iter().enumerate() {
+                assert!(direct.append_row_values(RowID::new(idx as u64), row));
+            }
+            let mut physical = vec![stale.clone(); count + 1];
+            physical[count - 1] = low.clone();
+            if count > 2 {
+                physical[3] = rows[3].clone();
+            }
+            let mut page = row_page_with_rows(&metadata, RowID::new(0), &physical);
+            for (row_idx, row) in rows.iter().enumerate().take(count - 1) {
+                for (col_idx, value) in row.iter().enumerate() {
+                    page.set_null_exclusive(
+                        &metadata.col,
+                        row_idx,
+                        col_idx,
+                        matches!(value, Val::Null),
+                    );
+                }
+            }
+            assert!(matches!(page.delete(RowID::new(count as u64)), Delete::Ok));
+            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
+            assert!(pages.append_view(page.vector_view(&metadata.col), RowID::new(0)));
+            assert_eq!(pages.row_ids(), direct.row_ids());
+            let direct = build_with_size_check(direct);
+            let pages = build_with_size_check(pages);
+            assert_eq!(direct.as_bytes(), pages.as_bytes());
+            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
+            let block = LwcBlock::try_from_persisted_bytes(
+                direct.as_bytes(),
+                FileKind::TableFile,
+                test_block_id(1),
+            )
+            .unwrap();
+            for (col_idx, expected) in low.iter().enumerate() {
+                let column = block.column(&metadata.col, col_idx).unwrap();
+                let data = column.data().unwrap();
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let expected = if matches!(row[col_idx], Val::Null) {
+                        expected
+                    } else {
+                        &row[col_idx]
+                    };
+                    assert_eq!(
+                        data.value(row_idx).as_ref(),
+                        Some(expected),
+                        "physical row={row_idx}, col={col_idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Purpose: Admit an exact-fit mixed block while rejecting one extra byte and defending bypassed admission.
+    /// Expected: The singleton uses flat, rejected appends restore state, and both body and offset overflow return typed errors.
+    #[test]
+    fn integer_singleton_exact_fit_and_final_capacity_guard() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let row = vec![Val::U64(17), Val::try_from(vec![7; 65_442]).unwrap()];
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+        let too_large = vec![Val::U64(u64::MAX), Val::try_from(vec![7; 65_443]).unwrap()];
+        assert!(!builder.append_row_values(RowID::new(0), &too_large));
+        assert!(builder.is_empty());
+        assert_eq!(builder.row_ids(), &[]);
+        assert_eq!(builder.row_set_seeds(), &[]);
+        assert!(integer_stats(&builder).iter().all(|stat| !stat.0));
+        assert!(builder.append_row_values(RowID::new(0), &row));
+        let buf = build_with_size_check(builder);
+        assert_eq!(used_payload_size(&buf), 65_504);
+        assert_persisted_rows(buf.as_bytes(), &metadata.col, &[row]);
+
+        for length in [65_443, 65_500] {
+            let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+            assert!(!builder.append_row_values_inner(
+                RowID::new(0),
+                &[Val::U64(17), Val::try_from(vec![7; length]).unwrap(),]
+            ));
+            let err = builder
+                .build(0)
+                .err()
+                .expect("oversized internal state must fail");
+            assert_eq!(
+                err.current_context(),
+                &InternalError::LwcBlockEncodingContract
+            );
+            let report = format!("{err:?}");
+            for detail in [
+                "field=column_end_offset",
+                "column_no=1",
+                "capacity=65480",
+                "actual=",
+            ] {
+                assert!(report.contains(detail), "{report}");
+            }
+        }
+    }
+
+    /// Purpose: Roll back direct and page-view capacity failures across bitmap growth and changed integer extrema.
+    /// Expected: Identities, seeds, sizes, and statistics stay exact, and subsequent mixed-column rows round trip.
+    #[test]
+    fn mixed_column_capacity_rollback() {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+        let mut rows: Vec<_> = (0..8)
+            .map(|i| {
+                vec![
+                    if i % 2 == 0 {
+                        Val::Null
+                    } else {
+                        Val::I64(1 << 40)
+                    },
+                    Val::F64(OrderedFloat(i as f64)),
+                    if i == 0 {
+                        Val::try_from(vec![42; 64_900]).unwrap()
+                    } else {
+                        Val::Null
+                    },
+                ]
+            })
+            .collect();
+        for (idx, row) in rows.iter().enumerate() {
+            assert!(builder.append_row_values(RowID::new(idx as u64), row));
+        }
+        let ids = builder.row_ids().to_vec();
+        let seeds = builder.row_set_seeds().to_vec();
+        let stats = integer_stats(&builder);
+        let size = builder.estimate_size();
+        for value in [Val::I64(i64::MIN), Val::Null] {
+            let oversized = vec![
+                value,
+                Val::F64(OrderedFloat(-123.0)),
+                Val::try_from(vec![5; 1_024]).unwrap(),
+            ];
+            assert!(!builder.append_row_values(RowID::new(8), &oversized));
+            assert_eq!(builder.row_ids(), ids);
+            assert_eq!(builder.row_set_seeds(), seeds);
+            assert_eq!(integer_stats(&builder), stats);
+            assert_eq!(builder.estimate_size(), size);
+            let page = row_page_with_rows(&metadata, RowID::new(8), &[oversized]);
+            assert!(!builder.append_view(page.vector_view(&metadata.col), RowID::new(8)));
+            assert_eq!(builder.row_ids(), ids);
+            assert_eq!(builder.row_set_seeds(), seeds);
+            assert_eq!(integer_stats(&builder), stats);
+            assert_eq!(builder.estimate_size(), size);
+        }
+        let last = vec![
+            Val::I64(-(1 << 40)),
+            Val::F64(OrderedFloat(0.5)),
+            Val::try_from("tail").unwrap(),
+        ];
+        assert!(builder.append_row_values(RowID::new(8), &last));
+        rows.push(last);
+        assert_built_rows(builder, &rows);
+    }
+
+    /// Purpose: Compare planned sizes with persisted offsets for reproducible mixed nullable values.
+    /// Expected: Both ingestion paths encode identical logical rows and every accepted block has the exact planned used length.
+    #[test]
+    fn seeded_mixed_column_size_invariant() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(337);
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .unwrap();
+        for case in 0..32 {
+            let count = rng.random_range(1..256);
+            let rows: Vec<_> = (0..count)
+                .map(|row| {
+                    let signed = if case % 2 == 0 {
+                        -(1 << 40) + rng.random_range(0..4)
+                    } else {
+                        rng.random::<i64>()
+                    };
+                    let unsigned = if case % 2 == 0 {
+                        u64::MAX - rng.random_range(0..256)
+                    } else {
+                        rng.random::<u64>()
+                    };
+                    vec![
+                        if case != 0 && rng.random_bool(0.3) {
+                            Val::Null
+                        } else {
+                            Val::I64(signed)
+                        },
+                        if case != 0 && rng.random_bool(0.3) {
+                            Val::Null
+                        } else {
+                            Val::U64(unsigned)
+                        },
+                        Val::F32(OrderedFloat(row as f32 / 4.0)),
+                        Val::try_from(vec![row as u8; rng.random_range(0..32)]).unwrap(),
+                    ]
+                })
+                .collect();
+            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
+            for (idx, row) in rows.iter().enumerate() {
+                assert!(
+                    direct.append_row_values(RowID::new(idx as u64), row),
+                    "seed=337 case={case} row={idx}"
+                );
+            }
+            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
+            append_stale_pages(
+                &mut pages,
+                &metadata,
+                &rows,
+                &[
+                    Val::I64(i64::MAX),
+                    Val::U64(0),
+                    Val::F32(OrderedFloat(0.0)),
+                    Val::try_from("").unwrap(),
+                ],
+            );
+            let direct = build_with_size_check(direct);
+            let pages = build_with_size_check(pages);
+            assert_eq!(direct.as_bytes(), pages.as_bytes(), "seed=337 case={case}");
+            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
+        }
     }
 
     /// Purpose: Validate variable-byte offset origins, ordering, and payload boundaries.
@@ -2504,13 +2851,12 @@ mod tests {
     }
 
     /// Purpose: Round-trip ordinary and prepared columns across value kinds and compression ranges.
-    /// Expected: Both decoders preserve input values and reject out-of-range access, including empty columns.
+    /// Expected: Both decoders preserve varying integer, float, and byte values and reject out-of-range access.
     #[test]
     fn test_lwc_primitive_decoders_roundtrip() {
         // i8
         for input in [
             vec![-8i8, -7, -4, -1],
-            vec![1i8],
             vec![1i8, 0, 1, 0, 1, 0],
             vec![1i8, 2],
             vec![1i8, 2, 4],
@@ -2519,13 +2865,12 @@ mod tests {
             vec![1i8, 2, 4, 8, 16, 32],
             vec![1i8, 2, 4, 16, -100, 100],
         ] {
-            assert_primitive_roundtrip(ValKind::I8, LwcPrimitiveSer::new_i8(&input), &input);
+            assert_payload_roundtrip(ValKind::I8, &encode_integer(&input), &input);
         }
 
         // u8
         for input in [
             vec![1u8, 2, 4, 7],
-            vec![1u8],
             vec![1u8, 2],
             vec![1u8, 2, 4],
             vec![1u8, 2, 4, 8],
@@ -2533,7 +2878,7 @@ mod tests {
             vec![1u8, 2, 4, 8, 16, 32],
             vec![1u8, 2, 4, 16, 100, 200, 250],
         ] {
-            assert_primitive_roundtrip(ValKind::U8, LwcPrimitiveSer::new_u8(&input), &input);
+            assert_payload_roundtrip(ValKind::U8, &encode_integer(&input), &input);
         }
 
         // i16
@@ -2546,7 +2891,7 @@ mod tests {
             vec![-1i16, 2, 3, 4, -8, 16],
             vec![-1i16, 2, 3, 4, -8, 1 << 14],
         ] {
-            assert_primitive_roundtrip(ValKind::I16, LwcPrimitiveSer::new_i16(&input), &input);
+            assert_payload_roundtrip(ValKind::I16, &encode_integer(&input), &input);
         }
 
         // u16
@@ -2559,7 +2904,7 @@ mod tests {
             vec![1u16, 2, 3, 4, 8, 16, 32],
             vec![1u16, 2, 3, 4, 8, 16, 1 << 14],
         ] {
-            assert_primitive_roundtrip(ValKind::U16, LwcPrimitiveSer::new_u16(&input), &input);
+            assert_payload_roundtrip(ValKind::U16, &encode_integer(&input), &input);
         }
 
         // i32
@@ -2574,7 +2919,7 @@ mod tests {
             vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1024],
             vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1 << 30],
         ] {
-            assert_primitive_roundtrip(ValKind::I32, LwcPrimitiveSer::new_i32(&input), &input);
+            assert_payload_roundtrip(ValKind::I32, &encode_integer(&input), &input);
         }
 
         // u32
@@ -2589,12 +2934,16 @@ mod tests {
             vec![1u32, 3, 7, 15, 31, 63, 127, 1 << 14],
             vec![1u32, 3, 7, 15, 31, 63, 1 << 30],
         ] {
-            assert_primitive_roundtrip(ValKind::U32, LwcPrimitiveSer::new_u32(&input), &input);
+            assert_payload_roundtrip(ValKind::U32, &encode_integer(&input), &input);
         }
 
         // f32
         for input in [vec![1.5f32, 2.25, -3.5, 0.0], vec![1.25f32, -2.5, 9.75]] {
-            assert_primitive_roundtrip(ValKind::F32, LwcPrimitiveSer::new_f32(&input), &input);
+            assert_payload_roundtrip(
+                ValKind::F32,
+                &serialize_primitive(&LwcPrimitiveSer::new_f32(&input)),
+                &input,
+            );
         }
 
         // i64
@@ -2610,14 +2959,12 @@ mod tests {
             vec![-2i64, -1, 0, 1, 2, 4, 8, 1024, 65536],
             vec![-2i64, -1, 0, 1, 2, 4, 8, 1024, 1 << 60],
         ] {
-            assert_primitive_roundtrip(ValKind::I64, LwcPrimitiveSer::new_i64(&input), &input);
+            assert_payload_roundtrip(ValKind::I64, &encode_integer(&input), &input);
         }
 
         // u64
         for input in [
             vec![5_000_000_000u64, 5_000_000_001, 6_000_000_000],
-            vec![],
-            vec![1u64],
             vec![1, 1 << 1],
             vec![1, 1 << 1, 1 << 2],
             vec![1, 1 << 1, 1 << 2, 1 << 4],
@@ -2625,7 +2972,7 @@ mod tests {
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
             vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
         ] {
-            assert_primitive_roundtrip(ValKind::U64, LwcPrimitiveSer::new_u64(&input), &input);
+            assert_payload_roundtrip(ValKind::U64, &encode_integer(&input), &input);
         }
 
         // f64
@@ -2633,16 +2980,20 @@ mod tests {
             vec![1.5f64, 2.25, -3.5, 0.0, 128.5],
             vec![1.25f64, -2.5, 9.75],
         ] {
-            assert_primitive_roundtrip(ValKind::F64, LwcPrimitiveSer::new_f64(&input), &input);
+            assert_payload_roundtrip(
+                ValKind::F64,
+                &serialize_primitive(&LwcPrimitiveSer::new_f64(&input)),
+                &input,
+            );
         }
 
         for (offsets, bytes, expected) in [
             (vec![0, 3, 3, 7], &b"abcdefg"[..], ["abc", "", "defg"]),
             (vec![0, 1, 3, 6], &b"abcdef"[..], ["a", "bc", "def"]),
         ] {
-            assert_primitive_roundtrip(
+            assert_payload_roundtrip(
                 ValKind::VarByte,
-                LwcPrimitiveSer::new_bytes(&offsets, bytes).unwrap(),
+                &serialize_primitive(&LwcPrimitiveSer::new_bytes(&offsets, bytes).unwrap()),
                 &expected,
             );
         }

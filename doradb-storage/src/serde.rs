@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::mem;
 use std::num::{NonZeroU64, NonZeroUsize};
-use zerocopy::IntoBytes;
+use zerocopy::{Immutable, IntoBytes};
 
 /// Result returned by byte deserializers before a format caller adds context.
 pub(crate) type DeserResult<T> = DataIntegrityResult<T>;
@@ -1002,75 +1002,130 @@ impl Deser for () {
     }
 }
 
-/// Serialization of FOR+Bitpacking.
-///
-/// The format is as below:
-///
-/// ```text
-/// |----------|----------------|
-/// | field    | length(B)      |
-/// |----------|----------------|
-/// | n_bits   | 1              |
-/// | len      | 8              |
-/// | min      | sizeof(T)      |
-/// | packed   | (n_bits*len)/8 |
-/// |----------|----------------|
-/// ```
-///
-/// Special case handling:
-/// 1. input is empty, n_bits will be set to 0 and no more output.
-/// 2. input should not be packed, as no space can be saved,
-///    no serializer willbe returned. User should use other method.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForBitpackingSer<'a, T> {
-    data: &'a [T],
-    info: (usize, T),
+/// Integer wire encoding selected by complete serialized cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegerEncoding {
+    Flat,
+    ForBitpacking { bits: u8 },
 }
 
-impl<'a, T: BitPackable + Ord> ForBitpackingSer<'a, T> {
-    /// Creates a FOR+bitpacking serializer when packing can save space.
-    #[inline]
-    pub(crate) fn new(data: &'a [T]) -> Option<Self> {
-        prepare_for_bitpacking(data).map(|info| ForBitpackingSer { data, info })
-    }
+/// Exact integer serialization plan, excluding the outer LWC compression tag.
+/// The minimum also supplies the canonical value for physical null slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntegerEncodingPlan<T> {
+    len: usize,
+    min: T,
+    encoding: IntegerEncoding,
 }
 
-impl<'a, T: BitPackable + Ord + Ser<'a>> Ser<'a> for ForBitpackingSer<'a, T> {
+impl<T: BitPackable + Ord + Into<i128>> IntegerEncodingPlan<T> {
+    /// Plans from logical non-null extrema and the full physical row count.
+    /// All-null columns supply zero extrema; empty columns always use flat.
     #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u8>() // number of bits: 0 means empty; 0xFF means no packing.
-        + if self.data.is_empty() {
-                        0
-                    } else {
-                        let (n_bits, _) = self.info;
-                        mem::size_of::<u64>() // total number of elements
-                            + mem::size_of::<T>() // minimum value of all elements
-                            + (n_bits * self.data.len()).div_ceil(8) // packed bytes
-                    }
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = start_idx;
-        if self.data.is_empty() {
-            out.ser_u8(idx, 0)
-        } else {
-            let (n_bits, min) = self.info;
-            let idx = out.ser_u8(idx, n_bits as u8);
-            let idx = out.ser_u64(idx, self.data.len() as u64);
-            let idx = min.ser(out, idx);
-            let packed_len = (n_bits * self.data.len()).div_ceil(8);
-            let (idx, to_pack) = out.ser_mut(idx, packed_len);
-            match n_bits {
-                1 => for_b1_pack(self.data, min, to_pack),
-                2 => for_b2_pack(self.data, min, to_pack),
-                4 => for_b4_pack(self.data, min, to_pack),
-                8 => for_b8_pack(self.data, min, to_pack),
-                16 => for_b16_pack(self.data, min, to_pack),
-                32 => for_b32_pack(self.data, min, to_pack),
-                _ => unreachable!("unexpected number bits of FOR bitpacking"),
+    pub(crate) fn from_extrema(len: usize, min: T, max: T) -> Self {
+        let mut plan = Self {
+            len,
+            min,
+            encoding: IntegerEncoding::Flat,
+        };
+        if len != 0 {
+            // i128 represents every supported integer and its full positive range.
+            let range = (max.into() - min.into()) as u64;
+            if let Some(bits) = bitpacking_width(range, mem::size_of::<T>()) {
+                let packed = Self {
+                    encoding: IntegerEncoding::ForBitpacking { bits },
+                    ..plan
+                };
+                if packed.ser_len() < plan.ser_len() {
+                    plan = packed;
+                }
             }
-            idx
+        }
+        plan
+    }
+}
+
+impl<T: Copy> IntegerEncodingPlan<T> {
+    /// Returns the selected encoding without recomputing statistics.
+    #[inline]
+    pub(crate) fn encoding(&self) -> IntegerEncoding {
+        self.encoding
+    }
+
+    /// Returns the canonical null placeholder and FOR base.
+    #[inline]
+    pub(crate) fn min(&self) -> T {
+        self.min
+    }
+
+    /// Returns the exact serialized length, excluding the LWC compression tag.
+    #[inline]
+    pub(crate) fn ser_len(&self) -> usize {
+        match self.encoding {
+            IntegerEncoding::Flat => 8 + self.len * mem::size_of::<T>(),
+            IntegerEncoding::ForBitpacking { bits } => {
+                1 + 8 + mem::size_of::<T>() + (self.len * usize::from(bits)).div_ceil(8)
+            }
+        }
+    }
+}
+
+impl<T> IntegerEncodingPlan<T>
+where
+    T: BitPackable + IntoBytes + Immutable + for<'a> Ser<'a>,
+{
+    /// Writes the selected integer encoding without the outer LWC tag.
+    /// Flat stores an eight-byte count and little-endian values. FOR stores a
+    /// width byte, count, typed minimum, and rounded packed delta bytes.
+    /// The caller owns the value-range invariant, including null normalization.
+    #[inline]
+    pub(crate) fn ser<S: Serde + ?Sized>(
+        &self,
+        values: &[T],
+        out: &mut S,
+        start_idx: usize,
+    ) -> usize {
+        // The plan owns the physical row count for both encodings. Enforce the
+        // slice pairing before writing any bytes, without rescanning its range.
+        assert_eq!(
+            values.len(),
+            self.len,
+            "integer encoding plan slice length mismatch: encoding={:?}",
+            self.encoding
+        );
+        match self.encoding {
+            IntegerEncoding::Flat => {
+                let idx = out.ser_u64(start_idx, self.len as u64);
+                #[cfg(target_endian = "little")]
+                {
+                    out.ser_byte_slice(idx, values.as_bytes())
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    let mut idx = idx;
+                    for value in values {
+                        idx = value.ser(out, idx);
+                    }
+                    idx
+                }
+            }
+            IntegerEncoding::ForBitpacking { bits } => {
+                let idx = out.ser_u8(start_idx, bits);
+                let idx = out.ser_u64(idx, self.len as u64);
+                let idx = self.min.ser(out, idx);
+                let packed_len = self.ser_len() - 1 - 8 - mem::size_of::<T>();
+                let (idx, to_pack) = out.ser_mut(idx, packed_len);
+                match bits {
+                    1 => for_b1_pack(values, self.min, to_pack),
+                    2 => for_b2_pack(values, self.min, to_pack),
+                    4 => for_b4_pack(values, self.min, to_pack),
+                    8 => for_b8_pack(values, self.min, to_pack),
+                    16 => for_b16_pack(values, self.min, to_pack),
+                    32 => for_b32_pack(values, self.min, to_pack),
+                    _ => unreachable!("integer encoding plan contains an unsupported width"),
+                }
+                idx
+            }
         }
     }
 }
@@ -1202,6 +1257,7 @@ mod tests {
     use super::*;
     use std::any::type_name;
     use std::fmt::Debug;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[derive(Debug, PartialEq, Eq)]
     struct TestStruct {
@@ -1585,62 +1641,80 @@ mod tests {
         assert_eq!(res, array);
     }
 
-    /// Purpose: Protect unsigned frame-of-reference compression across encoded widths.
-    /// Expected: Supported spans round trip while an uneconomical span declines compression.
+    /// Purpose: Write planned flat and FOR payloads into a bounded subrange without reselecting their encoding.
+    /// Expected: Wire bytes match independent fixtures, decode exactly, and leave surrounding bytes untouched.
     #[test]
-    fn test_for_bitpacking_serde() {
-        for input in [
-            vec![1u64],
-            vec![1, 1 << 1],
-            vec![1, 1 << 1, 1 << 2],
-            vec![1, 1 << 1, 1 << 2, 1 << 4],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16],
-            vec![1, 1 << 1, 1 << 2, 1 << 4, 1 << 8, 1 << 16, 1 << 32],
+    fn integer_plan_writes_exact_wire_extent() {
+        for (case, input, min, max, wire) in [
+            ("empty flat", vec![], 0i16, 0, vec![0; 8]),
+            (
+                "singleton flat",
+                vec![-300],
+                -300,
+                -300,
+                vec![1, 0, 0, 0, 0, 0, 0, 0, 0xd4, 0xfe],
+            ),
+            (
+                "preselected flat despite constant values",
+                vec![7; 5],
+                i16::MIN,
+                i16::MAX,
+                vec![5, 0, 0, 0, 0, 0, 0, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0],
+            ),
+            (
+                "signed FOR with preselected base",
+                vec![-1, 0, 1, -1, 0],
+                -2,
+                1,
+                vec![2, 5, 0, 0, 0, 0, 0, 0, 0, 0xfe, 0xff, 0x79, 2],
+            ),
         ] {
-            let bp = ForBitpackingSer::new(&input).unwrap();
-            let mut res = vec![0u8; bp.ser_len()];
-            let ser_idx = bp.ser(&mut res[..], 0);
-            assert_eq!(ser_idx, res.len());
-            let (de_idx, decompressed) = ForBitpackingDeser::<u64>::deser(&res[..], 0).unwrap();
-            assert_eq!(de_idx, res.len());
-            assert_eq!(decompressed.0, input);
+            let plan = IntegerEncodingPlan::from_extrema(input.len(), min, max);
+            assert_eq!(plan.ser_len(), wire.len(), "{case}");
+            let mut out = vec![0xa5; 3 + wire.len() + 5];
+            let end = plan.ser(&input, &mut out[..], 3);
+            assert_eq!(end, 3 + wire.len(), "{case}");
+            assert_eq!(&out[..3], &[0xa5; 3], "{case}: prefix");
+            assert_eq!(&out[3..end], wire, "{case}: wire");
+            assert_eq!(&out[end..], &[0xa5; 5], "{case}: suffix");
+            let (end, decoded) = match plan.encoding() {
+                IntegerEncoding::Flat => Vec::<i16>::deser(&wire[..], 0).unwrap(),
+                IntegerEncoding::ForBitpacking { .. } => {
+                    let (end, values) = ForBitpackingDeser::<i16>::deser(&wire[..], 0).unwrap();
+                    (end, values.0)
+                }
+            };
+            assert_eq!(end, wire.len(), "{case}: read extent");
+            assert_eq!(decoded, input, "{case}: values");
         }
-        let input = vec![
-            1u64,
-            1 << 1,
-            1 << 2,
-            1 << 4,
-            1 << 8,
-            1 << 16,
-            1 << 32,
-            1 << 50,
-        ];
-        let bp = ForBitpackingSer::new(&input);
-        assert!(bp.is_none());
     }
 
-    /// Purpose: Protect frame-of-reference compression across signed zero.
-    /// Expected: Negative and positive values round trip without changing their order or magnitude.
+    /// Purpose: Enforce the plan's physical row count for both integer encodings before writing.
+    /// Expected: Short and long slices fail the length contract and leave the destination unchanged.
     #[test]
-    fn test_for_bitpacking_serde_signed_ints() {
-        let input = vec![-10i16, -3, 0, 1, 5, 8];
-        let bp = ForBitpackingSer::new(&input).unwrap();
-        let mut res = vec![0u8; bp.ser_len()];
-        let ser_idx = bp.ser(&mut res[..], 0);
-        assert_eq!(ser_idx, res.len());
-        let (de_idx, decompressed) = ForBitpackingDeser::<i16>::deser(&res[..], 0).unwrap();
-        assert_eq!(de_idx, res.len());
-        assert_eq!(decompressed.0, input);
-
-        let input = vec![-2i32, -1, 0, 1, 2, 4, 8, 128, 1024];
-        let bp = ForBitpackingSer::new(&input).unwrap();
-        let mut res = vec![0u8; bp.ser_len()];
-        let ser_idx = bp.ser(&mut res[..], 0);
-        assert_eq!(ser_idx, res.len());
-        let (de_idx, decompressed) = ForBitpackingDeser::<i32>::deser(&res[..], 0).unwrap();
-        assert_eq!(de_idx, res.len());
-        assert_eq!(decompressed.0, input);
+    fn integer_plan_rejects_mismatched_slices_before_writing() {
+        for (case, count, encoding) in [
+            ("flat", 1, IntegerEncoding::Flat),
+            ("FOR", 16, IntegerEncoding::ForBitpacking { bits: 1 }),
+        ] {
+            let plan = IntegerEncodingPlan::from_extrema(count, 7u64, 7);
+            assert_eq!(plan.encoding(), encoding, "{case}");
+            for actual in [count - 1, count + 1] {
+                let input = vec![7; actual];
+                let mut out = vec![0xa5; 256];
+                let result = catch_unwind(AssertUnwindSafe(|| plan.ser(&input, &mut out[..], 3)));
+                let panic = result.expect_err("slice mismatch must fail its internal contract");
+                let message = panic.downcast_ref::<String>().unwrap();
+                assert!(
+                    message.contains("integer encoding plan slice length mismatch"),
+                    "{case}: {message}"
+                );
+                assert!(
+                    out.iter().all(|&byte| byte == 0xa5),
+                    "{case}: actual={actual}"
+                );
+            }
+        }
     }
 
     /// Purpose: Protect serialization of signed scalar collections.
