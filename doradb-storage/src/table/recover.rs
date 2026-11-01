@@ -235,7 +235,7 @@ mod tests {
         let metadata = table.metadata();
         let mut page = table
             .row_store
-            .get_insert_page_exclusive(&session.pool_guards(), 70)
+            .get_insert_page_exclusive(&session.pool_guards(), || 70)
             .await
             .unwrap();
         let mut replay = replay_state(&page);
@@ -398,7 +398,8 @@ mod tests {
                 idx: 1,
                 val: Val::try_from("changed").unwrap(),
             }];
-            let bytes = vec![b'x'; PAGE_SIZE - 1];
+            // Fits a singleton, but cannot fit this 70-slot page's fixed layout.
+            let bytes = vec![b'x'; PAGE_SIZE - 128];
             let huge = [Val::from(1i32), Val::try_from(bytes.as_slice()).unwrap()];
             let huge_update = [UpdateCol {
                 idx: 1,
@@ -429,7 +430,7 @@ mod tests {
             let guards = session.pool_guards();
             let page = table
                 .row_store
-                .get_insert_page_exclusive(&guards, 2)
+                .get_insert_page_exclusive(&guards, || 2)
                 .await
                 .unwrap();
             let page_id = page.page_id();
@@ -538,6 +539,114 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject oversized replay inserts and complete update images even when optional payload validation is disabled.
+    /// Expected: InvalidPayload retains capacity diagnostics, leaves rejected slots and values unchanged, and preserves dirty state from the successful batch prefix.
+    #[test]
+    fn test_row_capacity_replay_preserves_prefix() {
+        smol::block_on(async {
+            for disabled in [false, true] {
+                for update in [false, true] {
+                    let root = TempDir::new().unwrap();
+                    let engine =
+                        evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_replay").await;
+                    let mut session = engine.new_session().unwrap();
+                    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, StorageTableSpec};
+                    use crate::value::ValKind;
+                    let table_id = session
+                        .create_table(
+                            StorageTableSpec::new(vec![
+                                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                                StorageColumnSpec::new(
+                                    ValKind::VarByte,
+                                    StorageColumnFlags::empty(),
+                                ),
+                                StorageColumnSpec::new(
+                                    ValKind::VarByte,
+                                    StorageColumnFlags::empty(),
+                                ),
+                            ]),
+                            vec![],
+                        )
+                        .await
+                        .unwrap()
+                        .table_id();
+                    let table = table_for_internal_assertion(&engine, table_id);
+                    let guards = session.pool_guards();
+                    let page = table
+                        .row_store
+                        .get_insert_page_exclusive(&guards, || 2)
+                        .await
+                        .unwrap();
+                    let page_id = page.page_id();
+                    let row_id = page.page().header.start_row_id;
+                    let mut replay = replay_state(&page);
+                    page.bf().set_dirty(false);
+                    drop(page);
+                    let initial = vec![
+                        Val::I32(1),
+                        Val::try_from(vec![b'a'; 30_000]).unwrap(),
+                        Val::try_from("inline").unwrap(),
+                    ];
+                    let large = Val::try_from(vec![b'x'; 35_428]).unwrap();
+                    let rejected = if update {
+                        RowRedoKind::Update(page_id, vec![UpdateCol { idx: 2, val: large }])
+                    } else {
+                        RowRedoKind::Insert(page_id, vec![Val::I32(2), initial[1].clone(), large])
+                    };
+                    let ops = pack_test_ops([
+                        OwnedReplayOp {
+                            cts: TrxID::new(10),
+                            row: RowRedo {
+                                row_id,
+                                kind: RowRedoKind::Insert(page_id, initial.clone()),
+                            },
+                        },
+                        OwnedReplayOp {
+                            cts: TrxID::new(11),
+                            row: RowRedo {
+                                row_id: if update { row_id } else { row_id + 1 },
+                                kind: rejected,
+                            },
+                        },
+                    ]);
+                    let error = table
+                        .recover_row_batch(&guards, &mut replay, &ops, disabled)
+                        .await
+                        .unwrap_err();
+                    let RuntimeOrFatalError::Runtime(report) = error else {
+                        panic!("expected runtime integrity failure")
+                    };
+                    assert_eq!(
+                        report.downcast_ref::<DataIntegrityError>(),
+                        Some(&DataIntegrityError::InvalidPayload)
+                    );
+                    assert_eq!(
+                        report.downcast_ref::<DmlValidationError>(),
+                        Some(&DmlValidationError::RowCapacity)
+                    );
+                    let page = table
+                        .row_store
+                        .must_get_row_page_exclusive(&guards, page_id)
+                        .await
+                        .unwrap();
+                    assert!(page.bf().is_dirty());
+                    assert!(replay.is_inserted(0));
+                    assert!(!replay.is_inserted(1));
+                    assert_eq!(
+                        page.page().row(0).clone_vals(&table.metadata().col),
+                        initial
+                    );
+                    assert!(page.page().is_deleted(1));
+                    assert_eq!(page.page().header.row_count(), 1);
+                    assert_eq!(
+                        page.page().header.var_field_offset(),
+                        page.page().data.len() - 30_000
+                    );
+                }
+            }
+        });
+    }
+
     /// Purpose: Preserve dirty-page tracking independently of optional replay counters.
     /// Expected: An insert, update, or delete followed by invalid replay still marks the
     /// page dirty and retains the successful mutation despite returning an error.
@@ -553,7 +662,7 @@ mod tests {
             let guards = session.pool_guards();
             let page = table
                 .row_store
-                .get_insert_page_exclusive(&guards, 2)
+                .get_insert_page_exclusive(&guards, || 2)
                 .await
                 .unwrap();
             let page_id = page.page_id();
@@ -916,7 +1025,7 @@ mod tests {
             let guards = session.pool_guards();
             let reference = table
                 .row_store
-                .get_insert_page_exclusive(&guards, 2)
+                .get_insert_page_exclusive(&guards, || 2)
                 .await
                 .unwrap();
             let mut reference_state = replay_state(&reference);

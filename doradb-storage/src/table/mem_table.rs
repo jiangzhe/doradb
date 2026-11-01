@@ -3,9 +3,7 @@ use super::layout::{MemTableLayout, RuntimeIndexEntry};
 use super::mutate::MutationExecutor;
 use super::row_store::RowStore;
 use super::unique_mutate::UniqueMutator;
-use super::{
-    DmlValidator, index_key_is_changed, index_key_replace, row_len, unique_key_from_full_row,
-};
+use super::{DmlValidator, index_key_is_changed, index_key_replace, unique_key_from_full_row};
 use crate::buffer::guard::PageGuard;
 use crate::buffer::{BufferPool, PoolGuard, PoolGuards, PoolRole};
 use crate::catalog::{
@@ -26,7 +24,7 @@ use crate::map::FastHashMap;
 use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::row::ops::{SelectKey, UniqueMutation, UniqueMutationOutcome, UpdateCol};
-use crate::row::{Row, RowRead, estimate_max_row_count, var_len_for_insert};
+use crate::row::{Row, RowRead};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::{MIN_SNAPSHOT_TS, TrxRuntime};
 use crate::value::Val;
@@ -561,6 +559,13 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             DmlValidator::new(metadata)
                 .validate_full_row(cols)
                 .change_context(DataIntegrityError::InvalidPayload)
+                .attach_with(|| {
+                    format!(
+                        "invalid catalog row image: value_count={}, column_count={}",
+                        cols.len(),
+                        metadata.col.col_count()
+                    )
+                })
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| format!("operation=insert_no_trx, table_id={}", self.table_id()))?;
         }
@@ -570,19 +575,34 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 .enumerate()
                 .all(|(idx, val)| self.metadata().col.col_type_match(idx, val))
         });
+        let size = DmlValidator::new(metadata)
+            .validate_row_capacity(cols)
+            .change_context(DataIntegrityError::InvalidPayload)
+            .attach_with(|| {
+                format!(
+                    "catalog row exceeds physical capacity: column_count={}, variable_column_count={}",
+                    metadata.col.col_count(),
+                    metadata.col.var_cols().len()
+                )
+            })
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| format!("operation=insert_no_trx, table_id={}", self.table_id()))?;
         let keys = metadata.idx.keys_for_insert(cols);
-        let row_len = row_len(metadata, cols);
-        let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
         loop {
             let mut page_guard = self
                 .row_store
-                .get_insert_page_exclusive(guards, row_count)
+                .get_insert_page_exclusive(guards, || {
+                    metadata
+                        .col
+                        .row_size()
+                        .fitting_row_count(size.outlined_var_bytes)
+                })
                 .await?;
             let page_id = page_guard.page_id();
             let page = page_guard.page_mut();
             debug_assert!(metadata.col.col_count() == page.header.col_count as usize);
             debug_assert!(cols.len() == page.header.col_count as usize);
-            let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
+            let var_len = size.outlined_var_bytes;
             let (row_idx, var_offset) =
                 if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
                     (row_idx, var_offset)
@@ -635,24 +655,53 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
             validator
                 .validate_full_row(cols.as_slice())
                 .change_context(DataIntegrityError::InvalidPayload)
+                .attach_with(|| {
+                    format!(
+                        "invalid catalog row image: value_count={}, column_count={}",
+                        cols.len(),
+                        metadata.col.col_count()
+                    )
+                })
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=upsert_primary_key_no_trx, phase=validate_row, table_id={}",
+                        "operation=upsert_primary_key_no_trx, table_id={}",
                         self.table_id()
                     )
                 })?;
             validator
                 .validate_unique_index(primary_key_index_slot)
                 .change_context(DataIntegrityError::InvalidPayload)
+                .attach_with(|| {
+                    format!(
+                        "catalog primary key requires an active unique index: index_slot={primary_key_index_slot}"
+                    )
+                })
                 .change_context(RuntimeError::TableAccess)
                 .attach_with(|| {
                     format!(
-                        "operation=upsert_primary_key_no_trx, phase=validate_primary_key, table_id={}, index_slot={primary_key_index_slot}",
+                        "operation=upsert_primary_key_no_trx, table_id={}",
                         self.table_id()
                     )
                 })?;
         }
+        DmlValidator::new(metadata)
+            .validate_row_capacity(cols.as_slice())
+            .change_context(DataIntegrityError::InvalidPayload)
+            .attach_with(|| {
+                format!(
+                    "catalog row exceeds physical capacity: column_count={}, variable_column_count={}",
+                    metadata.col.col_count(),
+                    metadata.col.var_cols().len()
+                )
+            })
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=upsert_primary_key_no_trx, table_id={}",
+                    self.table_id()
+                )
+            })?;
         let key = unique_key_from_full_row(
             metadata,
             primary_key_index_slot,
@@ -941,6 +990,23 @@ impl<D: BufferPool, I: BufferPool> MemTable<D, I> {
                 .change_context(RuntimeError::TableAccess)
                 .attach("operation=validate_catalog_primary_key_payload").into());
         }
+        DmlValidator::new(metadata)
+            .validate_hot_update_capacity(&row, update)
+            .change_context(DataIntegrityError::InvalidPayload)
+            .attach_with(|| {
+                format!(
+                    "catalog post-update row exceeds physical capacity: update_count={}, column_count={}",
+                    update.len(),
+                    metadata.col.col_count()
+                )
+            })
+            .change_context(RuntimeError::TableAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=update_primary_key_no_trx, table_id={}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         let var_len = page.var_len_for_update(row_idx, update);
         match page.request_free_space(var_len) {
             Some(var_offset) => {
@@ -2363,6 +2429,101 @@ mod tests {
             assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row1, None).await;
             assert_non_unique_index_entry(&mem_table, &guards, name_key("same"), row2, Some(true))
                 .await;
+        });
+    }
+
+    /// Purpose: Enforce mandatory singleton limits before nontransactional catalog insert, upsert, and sparse replacement mutations.
+    /// Expected: Invalid payload reports preserve the old row and primary index, skip change callbacks, and allow a subsequent valid update with either validation setting.
+    #[test]
+    fn test_row_capacity_catalog_no_trx() {
+        smol::block_on(async {
+            for disabled in [false, true] {
+                let root = TempDir::new().unwrap();
+                let engine =
+                    evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_catalog").await;
+                let table = test_mem_table_with_metadata(
+                    &engine,
+                    test_user_table_id(10_016),
+                    primary_key_payload_metadata(),
+                )
+                .await;
+                let session = engine.new_session().unwrap();
+                let guards = session.pool_guards();
+                let initial = indexed_payload_row(1, &"a".repeat(30_000), b"initial");
+                let (page_id, row_id) = table
+                    .insert_no_trx_location(&guards, &initial, disabled)
+                    .await
+                    .unwrap();
+                let oversized = indexed_payload_row(1, &"a".repeat(30_000), &vec![b'x'; 35_428]);
+                let mut called = false;
+                let errors = [
+                    table
+                        .insert_no_trx(&guards, &oversized, disabled)
+                        .await
+                        .unwrap_err(),
+                    table
+                        .upsert_primary_key_no_trx(&guards, oversized.clone(), disabled, |_| {
+                            called = true
+                        })
+                        .await
+                        .unwrap_err(),
+                    table
+                        .update_primary_key_no_trx(
+                            &guards,
+                            IndexSlot::new(0),
+                            &[Val::I32(1)],
+                            &[UpdateCol {
+                                idx: 2,
+                                val: oversized[2].clone(),
+                            }],
+                            disabled,
+                        )
+                        .await
+                        .unwrap_err(),
+                ];
+                assert!(!called);
+                for error in errors {
+                    let RuntimeOrFatalError::Runtime(report) = error else {
+                        panic!("expected runtime integrity failure")
+                    };
+                    assert_eq!(
+                        report.downcast_ref::<DataIntegrityError>(),
+                        Some(&DataIntegrityError::InvalidPayload)
+                    );
+                    assert_eq!(
+                        report.downcast_ref::<crate::table::DmlValidationError>(),
+                        Some(&crate::table::DmlValidationError::RowCapacity)
+                    );
+                }
+                assert_unique_row(&table, &guards, single_key(1), Some(initial.clone())).await;
+                let page = table
+                    .row_store
+                    .must_get_row_page_shared(&guards, page_id)
+                    .await
+                    .unwrap();
+                assert_eq!(page.page().row(0).row_id(), row_id);
+                assert_eq!(
+                    page.page().row(0).clone_vals(&table.metadata().col),
+                    initial
+                );
+                drop(page);
+                table
+                    .update_primary_key_no_trx(
+                        &guards,
+                        IndexSlot::new(0),
+                        &[Val::I32(1)],
+                        &[UpdateCol {
+                            idx: 2,
+                            val: Val::try_from("ok").unwrap(),
+                        }],
+                        disabled,
+                    )
+                    .await
+                    .unwrap();
+                let mut expected = initial;
+                expected[2] = Val::try_from("ok").unwrap();
+                assert_unique_row(&table, &guards, single_key(1), Some(expected)).await;
+            }
         });
     }
 

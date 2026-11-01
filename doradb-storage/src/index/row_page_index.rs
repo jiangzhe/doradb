@@ -933,6 +933,7 @@ impl RowPageIndex {
 
     /// Get row page for insertion.
     /// Caller should cache insert page ids to avoid invoking this method frequently.
+    /// Evaluates `count` only when allocating a new page after a free-list miss.
     #[inline]
     pub(crate) async fn get_insert_page<B: BufferPool>(
         &self,
@@ -940,16 +941,17 @@ impl RowPageIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         if let Some(free_page) = self
             .get_insert_page_from_free_list(mem_pool, mem_pool_guard)
             .await
             .change_runtime_context(RuntimeError::IndexAccess)
-            .attach_with(|| format!("operation=get_insert_row_page, row_count={count}"))?
+            .attach("operation=get_insert_row_page, phase=cached_page")?
         {
             return Ok(free_page);
         }
+        let count = count();
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
             .await
@@ -966,6 +968,7 @@ impl RowPageIndex {
     }
 
     /// Get a row page for insertion and publish its physical creation redo.
+    /// Evaluates `count` only when allocating a new page after a free-list miss.
     #[inline]
     pub(crate) async fn get_insert_page_with_redo<B: BufferPool>(
         &self,
@@ -973,17 +976,18 @@ impl RowPageIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
         redo_ctx: RowPageCreateRedoCtx<'_>,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         if let Some(free_page) = self
             .get_insert_page_from_free_list(mem_pool, mem_pool_guard)
             .await
             .change_runtime_context(RuntimeError::IndexAccess)
-            .attach_with(|| format!("operation=get_insert_row_page_with_redo, row_count={count}"))?
+            .attach("operation=get_insert_row_page_with_redo, phase=cached_page")?
         {
             return Ok(free_page);
         }
+        let count = count();
         // Empty or stale free-list entries fall back to allocating a fresh row page.
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
@@ -1009,6 +1013,7 @@ impl RowPageIndex {
     }
 
     /// Get exclusive row page for insertion.
+    /// Evaluates `count` only when allocating a new page after a free-list miss.
     #[inline]
     pub(crate) async fn get_insert_page_exclusive<B: BufferPool>(
         &self,
@@ -1016,16 +1021,17 @@ impl RowPageIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         if let Some(free_page) = self
             .get_insert_page_exclusive_from_free_list(mem_pool, mem_pool_guard)
             .await
             .change_runtime_context(RuntimeError::IndexAccess)
-            .attach_with(|| format!("operation=get_exclusive_insert_row_page, row_count={count}"))?
+            .attach("operation=get_exclusive_insert_row_page, phase=cached_page")?
         {
             return Ok(free_page);
         }
+        let count = count();
         // Empty or stale free-list entries fall back to allocating a fresh row page.
         let mut new_page = mem_pool
             .allocate_page::<RowPage>(mem_pool_guard)
@@ -2124,7 +2130,7 @@ mod tests {
                 let page_id = test_page_id(0);
                 let result = match mode {
                     InsertPageMode::Shared => index
-                        .get_insert_page(meta_guard, &**mem_pool, mem_guard, &metadata.col, 100)
+                        .get_insert_page(meta_guard, &**mem_pool, mem_guard, &metadata.col, || 100)
                         .await
                         .map(|page| page.page_id()),
                     InsertPageMode::Exclusive => index
@@ -2133,7 +2139,7 @@ mod tests {
                             &**mem_pool,
                             mem_guard,
                             &metadata.col,
-                            100,
+                            || 100,
                         )
                         .await
                         .map(|page| page.page_id()),
@@ -2174,7 +2180,7 @@ mod tests {
                         &**mem_pool,
                         mem_guard,
                         &metadata.col,
-                        100,
+                        || 100,
                     )
                     .await
                     .unwrap();
@@ -2188,13 +2194,19 @@ mod tests {
                             &failing_pool,
                             mem_guard,
                             &metadata.col,
-                            100,
+                            || panic!("cache reload failure must not plan a new page"),
                         )
                         .await
                         .map(|page| page.page_id())
                 } else {
                     index
-                        .get_insert_page(meta_guard, &failing_pool, mem_guard, &metadata.col, 100)
+                        .get_insert_page(
+                            meta_guard,
+                            &failing_pool,
+                            mem_guard,
+                            &metadata.col,
+                            || panic!("cache reload failure must not plan a new page"),
+                        )
                         .await
                         .map(|page| page.page_id())
                 };
@@ -2234,14 +2246,19 @@ mod tests {
         .unwrap();
         let mem_pool = &*engine.inner().pools.mem;
         let mem_guard = mem_pool.create_base_guard();
+        let plans = AtomicUsize::new(0);
+        let count = || {
+            plans.fetch_add(1, Ordering::Relaxed);
+            100
+        };
         let page = if exclusive {
             index
-                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, count)
                 .await
                 .unwrap()
         } else {
             index
-                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, count)
                 .await
                 .unwrap()
                 .downgrade()
@@ -2249,6 +2266,8 @@ mod tests {
                 .await
                 .unwrap()
         };
+        assert_eq!(plans.load(Ordering::Relaxed), 1, "exclusive={exclusive}");
+        assert_eq!(page.page().header.max_row_count, 100);
         let page_id = page.page_id();
         index.cache_exclusive_insert_page(page);
         assert_eq!(
@@ -2258,18 +2277,19 @@ mod tests {
         );
         let reused_page_id = if exclusive {
             index
-                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page_exclusive(&meta_guard, mem_pool, &mem_guard, &metadata.col, count)
                 .await
                 .unwrap()
                 .page_id()
         } else {
             index
-                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page(&meta_guard, mem_pool, &mem_guard, &metadata.col, count)
                 .await
                 .unwrap()
                 .page_id()
         };
         assert_eq!(reused_page_id, page_id, "exclusive={exclusive}");
+        assert_eq!(plans.load(Ordering::Relaxed), 1, "exclusive={exclusive}");
         assert!(
             index.insert_free_list.lock().is_empty(),
             "exclusive={exclusive}"
@@ -2322,14 +2342,14 @@ mod tests {
     }
 
     /// Purpose: Protect cached row-page reuse through shared insert-page acquisition.
-    /// Expected: Acquisition returns the cached page and removes it from the free list.
+    /// Expected: Acquisition consumes the cached entry without planning new-page capacity.
     #[test]
     fn test_row_page_index_free_list_shared() {
         smol::block_on(assert_free_list_reuse(false));
     }
 
     /// Purpose: Protect cached row-page reuse through exclusive insert-page acquisition.
-    /// Expected: Exclusive acquisition returns the cached page and consumes its free-list entry.
+    /// Expected: Exclusive acquisition consumes the cached entry without planning new-page capacity.
     #[test]
     fn test_row_page_index_free_list_exclusive() {
         smol::block_on(assert_free_list_reuse(true));
@@ -2454,7 +2474,7 @@ mod tests {
                         &*mem_pool,
                         &mem_guard,
                         &metadata.col,
-                        100,
+                        || 100,
                     )
                     .await
                     .expect("test insert-page allocation should succeed");
@@ -2494,7 +2514,7 @@ mod tests {
                                 &*mem_pool,
                                 &mem_guard,
                                 &metadata.col,
-                                100,
+                                || 100,
                             )
                             .await
                             .unwrap(),
@@ -2524,14 +2544,14 @@ mod tests {
     }
 
     /// Purpose: Protect shared insert-page acquisition when a cached page cannot be reloaded.
-    /// Expected: The index-access error retains the underlying I/O failure.
+    /// Expected: The index-access error retains the I/O failure without planning a new page.
     #[test]
     fn test_get_insert_page_returns_error_on_free_list_io_failure() {
         smol::block_on(assert_free_list_io_failure(false));
     }
 
     /// Purpose: Protect exclusive insert-page acquisition when a cached page cannot be reloaded.
-    /// Expected: The error retains its I/O cause and consumes the failed free-list entry.
+    /// Expected: The error retains its I/O cause and consumes the entry without planning a new page.
     #[test]
     fn test_get_insert_page_exclusive_propagates_free_list_io_failure() {
         smol::block_on(assert_free_list_io_failure(true));
@@ -2597,7 +2617,7 @@ mod tests {
                             &*engine.inner().pools.mem,
                             &mem_guard,
                             &metadata.col,
-                            100,
+                            || 100,
                         )
                         .await
                         .expect("test insert-page allocation should succeed");
@@ -3016,7 +3036,7 @@ mod tests {
     }
 
     /// Purpose: Protect create-page redo when a newly allocated page is later reused from the free list.
-    /// Expected: Creation assigns a commit timestamp and reuse does not emit another create-page record.
+    /// Expected: Creation assigns a commit timestamp; reuse skips capacity planning and new creation redo.
     #[test]
     fn test_row_page_index_inline_redo_ctx_commits_create_row_page_once() {
         smol::block_on(async {
@@ -3047,17 +3067,24 @@ mod tests {
                 let mem_guard = engine.inner().pools.mem.create_base_guard();
                 let redo_ctx =
                     RowPageCreateRedoCtx::new(&engine.inner().trx_sys, TableID::new(104));
+                let plans = AtomicUsize::new(0);
+                let count = || {
+                    plans.fetch_add(1, Ordering::Relaxed);
+                    100
+                };
                 let page_guard = blk_idx
                     .get_insert_page_with_redo(
                         &meta_guard,
                         &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
-                        100,
+                        count,
                         redo_ctx,
                     )
                     .await
                     .expect("test insert-page allocation should succeed");
+                assert_eq!(plans.load(Ordering::Relaxed), 1);
+                assert_eq!(page_guard.page().header.max_row_count, 100);
                 let create_cts = page_guard.unwrap_vmap().create_cts();
                 assert!(create_cts > TrxID::new(0));
 
@@ -3071,12 +3098,13 @@ mod tests {
                         &*engine.inner().pools.mem,
                         &mem_guard,
                         &metadata.col,
-                        100,
+                        count,
                         redo_ctx,
                     )
                     .await
                     .expect("test insert-page allocation should succeed");
                 assert_eq!(reused_page.page_id(), page_id);
+                assert_eq!(plans.load(Ordering::Relaxed), 1);
             }
             engine.shutdown();
 
@@ -3141,7 +3169,7 @@ mod tests {
                     &*engine.inner().pools.mem,
                     &mem_guard,
                     &metadata.col,
-                    100,
+                    || 100,
                     redo_ctx,
                 )
                 .await

@@ -254,7 +254,8 @@ impl Transaction {
     /// ranges, and read sets against the target table metadata. The setting is
     /// transaction-local and remains in effect until changed again. Invalid
     /// trusted input may surface as a debug assertion or internal error instead
-    /// of `InvalidDmlInput`.
+    /// of `InvalidDmlInput`. Complete inserted and updated rows must still fit
+    /// a fresh RowPage and a singleton LWC block; capacity checks are mandatory.
     #[inline]
     pub fn disable_dml_validation(&mut self, disable: bool) {
         self.dml_validation_disabled = disable;

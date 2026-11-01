@@ -777,7 +777,7 @@ mod tests {
             let guards = session.pool_guards();
             let guard = table
                 .row_store
-                .try_get_insert_page(&guards, 8)
+                .try_get_insert_page(&guards, || 8)
                 .await
                 .unwrap();
             let page = guard.page();

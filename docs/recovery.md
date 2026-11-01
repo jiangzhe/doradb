@@ -241,6 +241,10 @@ Hot row pages retain their runtime version metadata throughout recovery.
 Redo restores page creation timestamps and committed row images without
 reconstructing pre-crash undo history.
 
+Recovery enforces physical row and page limits for user data and catalog
+reconstruction, even when DML validation is disabled. Oversized rows or invalid
+page capacities fail startup.
+
 The decoder/coordinator consumes redo in its canonical order. Eligible hot-row
 operations are grouped by table and page and run on the existing finite-job
 thread pool. Each page has at most one submitted batch and one pending batch;

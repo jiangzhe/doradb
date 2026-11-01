@@ -388,6 +388,11 @@ instead of `InvalidDmlInput`. Calling it with `false` restores validation.
 Table admission, schema-change checks, locking, MVCC, uniqueness, and storage
 invariants are never disabled.
 
+Every inserted row and complete post-update row must fit in one row page and
+one LWC block. This schema-dependent limit remains enforced when DML validation
+is disabled; oversized writes return `OperationError::InvalidDmlInput` with
+normal statement rollback.
+
 ## Reading data
 
 Read sets are projections expressed as zero-based column numbers. Index-read

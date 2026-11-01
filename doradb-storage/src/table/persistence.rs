@@ -3246,7 +3246,7 @@ mod tests {
             let guards = session.pool_guards();
             let page_guard = table
                 .row_store
-                .try_get_insert_page(&guards, 1)
+                .try_get_insert_page(&guards, || 1)
                 .await
                 .unwrap();
             let page = page_guard.page();
@@ -3330,7 +3330,7 @@ mod tests {
             let first = {
                 let page_guard = table
                     .row_store
-                    .try_get_insert_page(&guards, 1)
+                    .try_get_insert_page(&guards, || 1)
                     .await
                     .unwrap();
                 let page = page_guard.page();
@@ -3355,7 +3355,7 @@ mod tests {
             let second = {
                 let page_guard = table
                     .row_store
-                    .try_get_insert_page(&guards, 1)
+                    .try_get_insert_page(&guards, || 1)
                     .await
                     .unwrap();
                 let page = page_guard.page();
@@ -3464,7 +3464,7 @@ mod tests {
                 let first = {
                     let guard = table
                         .row_store
-                        .try_get_insert_page(&guards, 3 * MAX_LWC_ROWS)
+                        .try_get_insert_page(&guards, || 3 * MAX_LWC_ROWS)
                         .await
                         .unwrap();
                     let page = guard.page();
@@ -3509,7 +3509,7 @@ mod tests {
                 let tail = {
                     let guard = table
                         .row_store
-                        .try_get_insert_page(&guards, 1)
+                        .try_get_insert_page(&guards, || 1)
                         .await
                         .unwrap();
                     let page = guard.page();
@@ -9859,14 +9859,13 @@ mod tests {
             let (runtime_tx, runtime_rx) = flume::unbounded();
             engine.inner().trx_sys.set_purge_test_observer(runtime_tx);
             engine.inner().trx_sys.request_retired_index_runtime_retry();
-            let mut runtime_cleanup_started = false;
-            loop {
-                match runtime_rx.recv_async().await.unwrap() {
-                    PurgeTestEvent::RetiredIndexRuntimeStarted => {
-                        runtime_cleanup_started = true;
-                    }
-                    PurgeTestEvent::CycleCompleted if runtime_cleanup_started => break,
-                    _ => {}
+            // A completed purge cycle need not own this runtime's cleanup:
+            // another accepted cleanup may still hold its Destroying sentinel.
+            // Observe removal itself, requesting production cleanup after wakeups
+            // while an outstanding candidate still needs another attempt.
+            while table.has_retired_secondary_indexes() {
+                if runtime_rx.recv_async().await.unwrap() == PurgeTestEvent::CycleCompleted {
+                    engine.inner().trx_sys.request_retired_index_runtime_retry();
                 }
             }
             assert!(

@@ -1076,6 +1076,17 @@ impl<'a> RecoveryCoordinator<'a> {
                 ))
                 .change_context(RuntimeError::Recovery).into());
         };
+        // Preserve the logged RowID reservation exactly; never clamp replay capacity.
+        if !table
+            .metadata()
+            .col
+            .row_size()
+            .row_page_layout_fits(count as usize)
+        {
+            return Err(Report::new(DataIntegrityError::InvalidPayload)
+                .attach(format!("replay create row page has overflowing fixed layout: table_id={table_id}, page_id={page_id}, row_count={count}"))
+                .change_context(RuntimeError::Recovery).into());
+        }
         // Explicit allocation rejects duplicate pages before initializing replay state.
         let page_guard = table
             .row_store
@@ -2878,8 +2889,8 @@ mod tests {
         });
     }
 
-    /// Purpose: Reject malformed redo row ranges before they become trusted replay descriptors.
-    /// Expected: Empty, reversed, oversized, and displaced ranges return integrity errors without publishing a descriptor or counting a reconstructed page.
+    /// Purpose: Reject malformed redo row ranges and overflowing fixed layouts before they become trusted replay descriptors.
+    /// Expected: Invalid ranges and layouts return integrity errors without publishing a descriptor or counting a reconstructed page.
     #[test]
     fn test_replay_create_row_page_validates_captured_range() {
         smol::block_on(async {
@@ -2891,6 +2902,12 @@ mod tests {
                     70,
                     70 + u64::from(u16::MAX) + 1,
                     "invalid row range",
+                ),
+                (
+                    "fixed layout overflow",
+                    70,
+                    70 + u64::from(u16::MAX),
+                    "overflowing fixed layout",
                 ),
                 ("gap", 71, 141, "range mismatch"),
                 ("overlap", 69, 139, "range mismatch"),

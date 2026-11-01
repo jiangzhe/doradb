@@ -1710,7 +1710,7 @@ impl<'op> UserTableAccessor<'op> {
     pub(super) async fn get_insert_page(
         &self,
         rt: TrxRuntime<'_>,
-        row_count: usize,
+        row_count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         if let Some(page_id) = rt.load_active_insert_page(self.table_id()) {
             let page_guard = self
@@ -2756,7 +2756,7 @@ impl<'op> UserTableAccessor<'op> {
     ) -> QuadResult<RowID> {
         let row_id = access.row().row_id();
         let result = HotRowMutator::new(self.table_id(), self.metadata(), rt, page_guard, row_id)
-            .finish_update_owned(effects, update, None, access);
+            .finish_update_owned(effects, update, None, access)?;
         MutationExecutor::user(self)
             .continue_hot_update(
                 rt,
@@ -2779,6 +2779,15 @@ impl<'op> UserTableAccessor<'op> {
         update: Vec<UpdateCol>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> QuadResult<InsertedRow> {
+        DmlValidator::new(self.metadata())
+            .validate_updated_row_capacity(old_row.as_slice(), update.as_slice())
+            .change_context(OperationError::InvalidDmlInput)
+            .attach_with(|| {
+                format!(
+                    "operation=update_owned_cold_row, table_id={}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         let old_index_keys = WriteIndexKeySet::from_full_row(self.layout(), &old_row);
         self.finish_owned_cold_delete_effects(rt, effects, row_id, old_index_keys, root_snapshot)
             .await
@@ -2847,6 +2856,15 @@ impl<'op> UserTableAccessor<'op> {
         update: Vec<UpdateCol>,
         root_snapshot: &TableRootSnapshot<'_>,
     ) -> QuadResult<InsertedRow> {
+        DmlValidator::new(self.metadata())
+            .validate_updated_row_capacity(old_row.as_slice(), update.as_slice())
+            .change_context(OperationError::InvalidDmlInput)
+            .attach_with(|| {
+                format!(
+                    "operation=update_known_cold_row, table_id={}, row_id={row_id}",
+                    self.table_id()
+                )
+            })?;
         self.claim_known_cold_row(rt, row_id)
             .await
             .attach("full-table mutation cold update marker ownership")?;
@@ -3566,7 +3584,7 @@ mod tests {
         wait_for_checkpoint_purge, wait_for_checkpoint_root_ready,
     };
     use crate::table::tests::*;
-    use crate::table::{CheckpointOutcome, FreezeOutcome};
+    use crate::table::{CheckpointOutcome, DmlValidationError, FreezeOutcome};
     use crate::table::{ColumnDeletionBuffer, DeleteMarker, Table, TableRuntimeLayout};
     use crate::trx::sys::tests::fatal_rollback_retention_count;
     use crate::trx::tests::{
@@ -3575,6 +3593,7 @@ mod tests {
         prepare_transaction, rollback_preparing_shared_trx_status,
         rollback_production_prepared_for_test, shared_trx_status, transaction_redo_kind_counts,
         transaction_status_for_test, transition_delete, transition_insert_update,
+        with_statement_runtime,
     };
     use crate::trx::ver_map::RowPageState;
     use crate::trx::{MAX_SNAPSHOT_TS, MIN_ACTIVE_TRX_ID, MvccReadView, Transaction};
@@ -4315,6 +4334,53 @@ mod tests {
             );
         }
         latest.commit().await.unwrap();
+    }
+
+    fn capacity_row(id: i32, kept: usize, changed: usize) -> Vec<Val> {
+        vec![
+            Val::I32(id),
+            Val::try_from(vec![b'a'; kept]).unwrap(),
+            Val::try_from(vec![b'b'; changed]).unwrap(),
+        ]
+    }
+
+    async fn create_capacity_table(session: &mut Session) -> TableID {
+        session
+            .create_table(
+                StorageTableSpec::new(vec![
+                    StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+                    StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+                ]),
+                vec![StorageIndexSpec::new(
+                    vec![StorageIndexKey::new(0)],
+                    StorageIndexFlags::UK,
+                )],
+            )
+            .await
+            .unwrap()
+            .table_id()
+    }
+
+    fn assert_capacity_error(error: &Error) {
+        assert_eq!(
+            error.operation_error(),
+            Some(OperationError::InvalidDmlInput),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.report().downcast_ref::<DmlValidationError>(),
+            Some(&DmlValidationError::RowCapacity)
+        );
+    }
+
+    async fn assert_capacity_row(trx: &mut Transaction, index: TableIndex, expected: &[Val]) {
+        let actual = trx
+            .table_lookup_unique_mvcc(index, &expected[..1], &[0, 1, 2])
+            .await
+            .unwrap()
+            .unwrap_found();
+        assert_eq!(actual, expected);
     }
 
     /// Purpose: Protect deferred lazy-row materialization and buffer reuse after ownership
@@ -7337,6 +7403,272 @@ mod tests {
         });
     }
 
+    /// Purpose: Reject permanent insert oversize before allocation, including complete batch preflight and unique callbacks with validation disabled.
+    /// Expected: Failed inserts consume no row slots, preserve earlier statements, and allow subsequent valid writes in the same transaction.
+    #[test]
+    fn test_row_capacity_insert_preflight() {
+        smol::block_on(async {
+            for disabled in [false, true] {
+                let root = TempDir::new().unwrap();
+                let engine =
+                    evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_insert").await;
+                let mut session = engine.new_session().unwrap();
+                let table_id = create_capacity_table(&mut session).await;
+                let index = TableIndex(table_id, IndexID::new(0));
+                let mut trx = session.begin_trx().unwrap();
+                trx.disable_dml_validation(disabled);
+                let first = trx
+                    .table_insert_mvcc(table_id, capacity_row(0, 7, 7))
+                    .await
+                    .unwrap();
+                assert_capacity_error(
+                    &trx.table_insert_mvcc(table_id, capacity_row(1, 33_000, 33_000))
+                        .await
+                        .unwrap_err(),
+                );
+                assert_capacity_error(
+                    &trx.table_insert_batch_mvcc(
+                        table_id,
+                        vec![capacity_row(2, 7, 7), capacity_row(3, 33_000, 33_000)],
+                    )
+                    .await
+                    .unwrap_err(),
+                );
+                let err = trx
+                    .table_unique_mutate_mvcc(index, &[Val::I32(4)], |_| -> CallbackResult<_> {
+                        Ok(UniqueMutation::Insert(capacity_row(4, 33_000, 33_000)))
+                    })
+                    .await
+                    .unwrap_err();
+                assert_capacity_error(err.engine().unwrap());
+                let next = trx
+                    .table_insert_mvcc(table_id, capacity_row(5, 7, 7))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next,
+                    first + 1,
+                    "rejected candidates must not reserve row slots"
+                );
+                assert_capacity_row(&mut trx, index, &capacity_row(0, 7, 7)).await;
+                assert_eq!(scan_table_i32s(&mut trx, table_id).await, vec![0, 5]);
+                trx.commit().await.unwrap();
+            }
+        });
+    }
+
+    /// Purpose: Reject final-image update oversize before mutation across hot, frozen, and cold owners, unique callbacks, index scans, and table scans.
+    /// Expected: Rejection restores statement prefixes and index identities, retains prior statements, releases ownership, and permits a valid follow-up update.
+    #[test]
+    fn test_row_capacity_update_rollback() {
+        smol::block_on(async {
+            for state in ["hot", "frozen", "cold"] {
+                for disabled in [false, true] {
+                    let root = TempDir::new().unwrap();
+                    let engine =
+                        evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_update").await;
+                    let mut session = engine.new_session().unwrap();
+                    let table_id = create_capacity_table(&mut session).await;
+                    let index = TableIndex(table_id, IndexID::new(0));
+                    let original = [capacity_row(0, 1_000, 7), capacity_row(1, 30_000, 7)];
+                    let mut trx = session.begin_trx().unwrap();
+                    let ids = trx
+                        .table_insert_batch_mvcc(table_id, original.to_vec())
+                        .await
+                        .unwrap();
+                    trx.commit().await.unwrap();
+                    if state != "hot" {
+                        assert_freeze_created(
+                            session.freeze_table(table_id, usize::MAX).await.unwrap(),
+                        );
+                    }
+                    if state == "cold" {
+                        assert_checkpoint_published(&mut session, table_id).await;
+                    }
+                    let mut trx = session.begin_trx().unwrap();
+                    trx.disable_dml_validation(disabled);
+                    trx.table_insert_mvcc(table_id, capacity_row(99, 7, 7))
+                        .await
+                        .unwrap();
+                    let too_large = || {
+                        vec![UpdateCol {
+                            idx: 2,
+                            val: Val::try_from(vec![b'x'; 35_422]).unwrap(),
+                        }]
+                    };
+                    let error = trx
+                        .table_unique_mutate_mvcc(index, &[Val::I32(1)], |_| -> CallbackResult<_> {
+                            Ok(UniqueMutation::Update(too_large()))
+                        })
+                        .await
+                        .unwrap_err();
+                    assert_capacity_error(error.engine().unwrap());
+                    // Probe before the failing writer commits: statement settlement
+                    // must have released provisional hot or cold row ownership.
+                    let mut probe_session = engine.new_session().unwrap();
+                    let mut probe = probe_session.begin_trx().unwrap();
+                    let outcome = probe
+                        .table_unique_mutate_mvcc(index, &[Val::I32(1)], |_| -> CallbackResult<_> {
+                            Ok(UniqueMutation::Update(vec![]))
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome, UniqueMutationOutcome::Updated(ids[1]));
+                    probe.commit().await.unwrap();
+                    for indexed in [false, true] {
+                        let mut seen = Vec::new();
+                        let mutate = |row: &mut LazyRow<'_>| -> CallbackResult<_> {
+                            let id = row.val(0)?.as_i32().unwrap();
+                            if id == 99 {
+                                return Ok(RowMutation::Skip);
+                            }
+                            seen.push(id);
+                            Ok(RowMutation::Update(too_large()))
+                        };
+                        let result = if indexed {
+                            trx.table_index_mutate_mvcc(index, .., mutate).await
+                        } else {
+                            trx.table_mutate_mvcc(table_id, mutate).await
+                        };
+                        assert_capacity_error(result.unwrap_err().engine().unwrap());
+                        assert_eq!(seen, [0, 1], "{state}, indexed={indexed}");
+                        for (row, &id) in original.iter().zip(&ids) {
+                            assert_capacity_row(&mut trx, index, row).await;
+                            let result = trx
+                                .table_unique_mutate_mvcc(
+                                    index,
+                                    &row[..1],
+                                    |_| -> CallbackResult<_> { Ok(UniqueMutation::Update(vec![])) },
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(result, UniqueMutationOutcome::Updated(id));
+                        }
+                        assert_capacity_row(&mut trx, index, &capacity_row(99, 7, 7)).await;
+                    }
+                    trx.table_unique_mutate_mvcc(index, &[Val::I32(1)], |_| -> CallbackResult<_> {
+                        Ok(UniqueMutation::Update(vec![UpdateCol {
+                            idx: 2,
+                            val: Val::Null,
+                        }]))
+                    })
+                    .await
+                    .unwrap();
+                    let mut expected = original[1].clone();
+                    expected[2] = Val::Null;
+                    assert_capacity_row(&mut trx, index, &expected).await;
+                    trx.commit().await.unwrap();
+                    // A new transaction must be able to acquire the rejected row's ownership.
+                    let mut other = session.begin_trx().unwrap();
+                    other
+                        .table_unique_mutate_mvcc(index, &[Val::I32(0)], |_| -> CallbackResult<_> {
+                            Ok(UniqueMutation::Update(vec![UpdateCol {
+                                idx: 2,
+                                val: Val::Null,
+                            }]))
+                        })
+                        .await
+                        .unwrap();
+                    other.commit().await.unwrap();
+                }
+            }
+        });
+    }
+
+    /// Purpose: Exercise exact singleton admission through allocation, replay, checkpoint, and reopen, including wide and impossible schemas.
+    /// Expected: Boundary values and wide rows remain readable, impossible schemas reject insertion, and validation opt-out preserves capacity checks.
+    #[test]
+    fn test_row_capacity_persistence_and_wide_schema() {
+        smol::block_on(async {
+            let root = TempDir::new().unwrap();
+            let engine = evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_persist").await;
+            let mut session = engine.new_session().unwrap();
+            let table_id = session
+                .create_table(
+                    StorageTableSpec::new(vec![StorageColumnSpec::new(
+                        ValKind::VarByte,
+                        StorageColumnFlags::empty(),
+                    )]),
+                    vec![],
+                )
+                .await
+                .unwrap()
+                .table_id();
+            let boundary = vec![Val::try_from(vec![0x5a; 65_461]).unwrap()];
+            let mut trx = session.begin_trx().unwrap();
+            trx.disable_dml_validation(true);
+            trx.table_insert_mvcc(table_id, boundary.clone())
+                .await
+                .unwrap();
+            assert_capacity_error(
+                &trx.table_insert_mvcc(table_id, vec![Val::try_from(vec![0; 65_462]).unwrap()])
+                    .await
+                    .unwrap_err(),
+            );
+            trx.commit().await.unwrap();
+            for count in [4096, 4000] {
+                let wide = session
+                    .create_table(
+                        StorageTableSpec::new(vec![
+                            StorageColumnSpec::new(
+                                ValKind::U8,
+                                if count == 4000 {
+                                    StorageColumnFlags::NULLABLE
+                                } else {
+                                    StorageColumnFlags::empty()
+                                }
+                            );
+                            count
+                        ]),
+                        vec![],
+                    )
+                    .await
+                    .unwrap()
+                    .table_id();
+                let mut trx = session.begin_trx().unwrap();
+                let result = trx.table_insert_mvcc(wide, vec![Val::U8(42); count]).await;
+                if count == 4000 {
+                    assert_capacity_error(&result.unwrap_err());
+                } else {
+                    result.unwrap();
+                    let mut stream = trx
+                        .table_scan_mvcc_stream(wide, &[0, 4095], |_| -> CallbackResult<_> {
+                            Ok(ScanRowDecision::Include)
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(stream.next().await.unwrap(), Some(vec![Val::U8(42); 2]));
+                    assert_eq!(stream.next().await.unwrap(), None);
+                }
+                trx.commit().await.unwrap();
+            }
+            drop(session);
+            drop(engine);
+            for checkpointed in [false, true] {
+                let engine =
+                    evictable_test_engine(&root, 64 * 1024 * 1024, "capacity_persist").await;
+                let mut session = engine.new_session().unwrap();
+                let mut trx = session.begin_trx().unwrap();
+                let mut stream = trx
+                    .table_scan_mvcc_stream(table_id, &[0], |_| -> CallbackResult<_> {
+                        Ok(ScanRowDecision::Include)
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(stream.next().await.unwrap(), Some(boundary.clone()));
+                assert_eq!(stream.next().await.unwrap(), None);
+                drop(stream);
+                trx.commit().await.unwrap();
+                if !checkpointed {
+                    assert_freeze_created(
+                        session.freeze_table(table_id, usize::MAX).await.unwrap(),
+                    );
+                    assert_checkpoint_published(&mut session, table_id).await;
+                }
+            }
+        });
+    }
+
     /// Purpose: Protect point mutations using a key vacated earlier in the same transaction.
     /// Expected: The old key produces no mutation and the new key retains its row contents.
     #[test]
@@ -9476,8 +9808,8 @@ mod tests {
     }
 
     /// Purpose: Protect session reuse of a valid cached insert-page generation.
-    /// Expected: Later insertion uses the same page and retains the same versioned cache
-    /// entry.
+    /// Expected: Cache acquisition skips capacity planning; later insertion retains the
+    /// same page and versioned cache entry.
     #[test]
     fn test_session_cached_insert_page_reuses_live_versioned_page() {
         smol::block_on(async {
@@ -9509,6 +9841,20 @@ mod tests {
             session.save_active_insert_page(table_id, cached_page);
 
             let mut trx = session.begin_trx().unwrap();
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let accessor = table.accessor_with_layout(&layout);
+            with_statement_runtime(&mut trx, |rt, _| {
+                let page =
+                    smol::block_on(accessor.get_insert_page(rt, || {
+                        panic!("session cache hit must not plan a new page")
+                    }))
+                    .unwrap();
+                assert_eq!(page.page_id(), cached_page.page_id);
+                rt.save_active_insert_page(table_id, cached_page);
+            })
+            .await
+            .unwrap();
             let next_row_id = unwrap_insert_result(
                 trx.table_insert_mvcc(
                     table_id,
