@@ -423,7 +423,7 @@ impl<D: BufferPool> RowStore<D> {
     pub(crate) async fn try_get_insert_page(
         &self,
         guards: &PoolGuards,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
@@ -437,12 +437,7 @@ impl<D: BufferPool> RowStore<D> {
             )
             .await
             .change_runtime_context(RuntimeError::TableAccess)
-            .attach_with(|| {
-                format!(
-                    "operation=get_insert_page, table_id={}, row_capacity={count}",
-                    self.table_id()
-                )
-            })
+            .attach_with(|| format!("operation=get_insert_page, table_id={}", self.table_id()))
     }
 
     /// Find or allocate a shared insert page and publish physical creation redo.
@@ -450,7 +445,7 @@ impl<D: BufferPool> RowStore<D> {
     pub(crate) async fn try_get_insert_page_with_redo(
         &self,
         guards: &PoolGuards,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
         redo_ctx: RowPageCreateRedoCtx<'_>,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
@@ -468,7 +463,7 @@ impl<D: BufferPool> RowStore<D> {
             .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=get_insert_page_with_redo, table_id={}, row_capacity={count}",
+                    "operation=get_insert_page_with_redo, table_id={}",
                     self.table_id()
                 )
             })
@@ -479,7 +474,7 @@ impl<D: BufferPool> RowStore<D> {
     pub(crate) async fn get_insert_page_exclusive(
         &self,
         guards: &PoolGuards,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         let meta_pool_guard = guards.meta_guard();
         let row_pool_guard = self.row_pool_guard(guards);
@@ -495,7 +490,7 @@ impl<D: BufferPool> RowStore<D> {
             .change_runtime_context(RuntimeError::TableAccess)
             .attach_with(|| {
                 format!(
-                    "operation=get_exclusive_insert_page, table_id={}, row_capacity={count}",
+                    "operation=get_exclusive_insert_page, table_id={}",
                     self.table_id()
                 )
             })

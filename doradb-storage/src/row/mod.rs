@@ -153,7 +153,13 @@ impl RowPage {
         max_row_count: usize,
         col_layout: &TableColumnLayout,
     ) {
-        debug_assert!(max_row_count <= 0xffff);
+        // Callers prove capacity before allocation. Defend the exact layout
+        // before narrowing offsets or touching column storage, even in release.
+        assert!(
+            col_layout.row_size().row_page_layout_fits(max_row_count),
+            "RowPage initialization requires a fitting fixed layout: max_row_count={max_row_count}, column_count={}",
+            col_layout.col_count()
+        );
         self.header.start_row_id = start_row_id;
         self.header.max_row_count = max_row_count as u16;
         self.header
@@ -1725,12 +1731,29 @@ impl RowMutExclusive<'_> {
 #[inline]
 pub(crate) const fn estimate_max_row_count(row_len: usize, col_count: usize) -> usize {
     let body_len = ROW_PAGE_USABLE_SIZE
-        .wrapping_sub(mem::size_of::<RowPageHeader>()) // header
-        .wrapping_sub(col_count * 2); // col offset (approx)
+        .saturating_sub(mem::size_of::<RowPageHeader>()) // header
+        .saturating_sub(col_count.saturating_mul(2)); // col offset (approx)
     let estimated_row_size = row_len
-        + 1 // del bitmap (approx)
-        + col_count.div_ceil(8); // null bitmap (approx)
+        .saturating_add(1) // del bitmap (approx)
+        .saturating_add(col_count.div_ceil(8)); // null bitmap (approx)
     body_len / estimated_row_size
+}
+
+/// Returns RowPage header, footer, bitmap, and aligned column-offset storage.
+#[inline]
+pub(crate) fn fixed_page_metadata_bytes(
+    row_count: usize,
+    col_count: usize,
+    nullable_count: usize,
+) -> Option<usize> {
+    let offset_bytes = col_count
+        .checked_mul(mem::size_of::<u16>())?
+        .checked_add(7)?
+        & !7;
+    let bitmap_bytes = row_count.div_ceil(64).checked_mul(mem::size_of::<u64>())?;
+    (ROW_PAGE_HEADER_SIZE + ROW_PAGE_FOOTER_SIZE)
+        .checked_add(bitmap_bytes.checked_mul(nullable_count.checked_add(1)?)?)?
+        .checked_add(offset_bytes)
 }
 
 /// Rounds a byte length up to the next 8-byte boundary.
@@ -1994,6 +2017,136 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Purpose: Bound new-page occupancy by actual aligned layouts for narrow, wide, mixed-width, and nullable schemas.
+    /// Expected: Selected positive capacities initialize and insert all planned rows, with exact offsets across bitmap and alignment boundaries.
+    #[test]
+    fn test_row_capacity_planning_and_layout() {
+        for (nullable, columns) in [
+            (false, vec![(ValKind::U8, Val::U8(1))]),
+            (true, vec![(ValKind::U16, Val::U16(2)); 9]),
+            (true, vec![(ValKind::U32, Val::U32(3)); 65]),
+            (false, vec![(ValKind::U8, Val::U8(1)); 4096]),
+            (
+                false,
+                vec![(ValKind::VarByte, Val::try_from(vec![0x5a; 65_461]).unwrap())],
+            ),
+            (
+                true,
+                vec![
+                    (ValKind::U8, Val::U8(1)),
+                    (ValKind::U8, Val::U8(2)),
+                    (ValKind::U16, Val::U16(3)),
+                    (ValKind::U32, Val::U32(4)),
+                    (ValKind::U64, Val::U64(5)),
+                    (ValKind::VarByte, Val::try_from(vec![0x5a; 7]).unwrap()),
+                ],
+            ),
+        ] {
+            let count = columns.len();
+            let metadata = TableMetadata::try_new(
+                columns
+                    .iter()
+                    .map(|(kind, _)| {
+                        StorageColumnSpec::new(
+                            *kind,
+                            if nullable {
+                                StorageColumnFlags::NULLABLE
+                            } else {
+                                StorageColumnFlags::empty()
+                            },
+                        )
+                    })
+                    .collect(),
+                vec![],
+            )
+            .unwrap();
+            let values: Vec<_> = columns.into_iter().map(|(_, value)| value).collect();
+            let layout = metadata.col.row_size();
+            let size = DmlValidator::new(&metadata)
+                .validate_row_capacity(values.as_slice())
+                .unwrap();
+            let selected = layout.fitting_row_count(size.outlined_var_bytes);
+            assert!(selected > 0);
+            let inline_bytes: usize = metadata
+                .col
+                .col_types()
+                .iter()
+                .map(|column| column.kind.inline_len())
+                .sum();
+            let hint = estimate_max_row_count(inline_bytes + size.outlined_var_bytes, count).max(1);
+            assert!(selected <= hint);
+            if count == 4096 {
+                assert_eq!(hint, 12);
+                assert_eq!(selected, 8);
+            }
+            if count == 1 && metadata.col.val_kind(0) == ValKind::VarByte {
+                assert_eq!(selected, 1);
+            }
+            if selected < hint {
+                assert!(
+                    layout.fixed_page_bytes(selected + 1).unwrap()
+                        + (selected + 1) * size.outlined_var_bytes
+                        > PAGE_SIZE
+                );
+            }
+            for capacity in [1, 7, 8, 9, 63, 64, 65, selected] {
+                if !layout.row_page_layout_fits(capacity) {
+                    continue;
+                }
+                let mut page = create_row_page();
+                page.init(RowID::new(100), capacity, &metadata.col);
+                let measured = layout.fixed_page_bytes(capacity).unwrap();
+                assert_eq!(
+                    measured,
+                    usize::from(page.header.fix_field_end)
+                        + ROW_PAGE_HEADER_SIZE
+                        + ROW_PAGE_FOOTER_SIZE
+                );
+            }
+            let mut page = create_row_page();
+            page.init(RowID::new(100), selected, &metadata.col);
+            for offset in 0..selected {
+                assert!(
+                    matches!(page.insert(&metadata.col, &values), InsertRow::Ok(id) if id == RowID::new(100 + offset as u64))
+                );
+            }
+            assert_eq!(page.row(selected - 1).clone_vals(&metadata.col), values);
+        }
+    }
+
+    /// Purpose: Defend initialization before overflowing layouts or invalid counts can narrow offsets or write storage.
+    /// Expected: Rejected initialization leaves the existing header and data intact, and checked layout arithmetic fails closed.
+    #[test]
+    fn test_row_capacity_init_rejects_before_writes() {
+        let metadata = TableMetadata::try_new(
+            vec![StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()); 4096],
+            vec![],
+        )
+        .unwrap();
+        let mut page = create_row_page();
+        page.init(RowID::new(100), 1, &metadata.col);
+        let before = page.data;
+        for count in [0, 12, usize::from(u16::MAX) + 1, usize::MAX] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| page.init(
+                    RowID::new(200),
+                    count,
+                    &metadata.col
+                )))
+                .is_err()
+            );
+            assert_eq!(page.header.start_row_id, RowID::new(100));
+            assert_eq!(page.header.max_row_count, 1);
+            assert_eq!(page.data, before);
+        }
+        let layout = metadata.col.row_size();
+        assert!(layout.fixed_page_bytes(usize::MAX).is_none());
+        assert!(layout.row_page_bytes(usize::MAX).is_none());
+        assert!(layout.lwc_bytes(usize::MAX).is_none());
+        assert!(fixed_page_metadata_bytes(1, usize::MAX, 1).is_none());
+        assert!(fixed_page_metadata_bytes(1, 1, usize::MAX).is_none());
     }
 
     /// Purpose: Protect the physical row-page layout and checksum reservation.

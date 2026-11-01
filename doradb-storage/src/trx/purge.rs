@@ -3867,7 +3867,7 @@ mod tests {
                 .unwrap();
             let page = catalog
                 .row_store
-                .get_insert_page_exclusive(&guards, 1)
+                .get_insert_page_exclusive(&guards, || 1)
                 .await
                 .unwrap();
             let id = page.versioned_page_id();
@@ -3902,7 +3902,7 @@ mod tests {
             let guards = full_pool_guards(&engine);
             let page = table
                 .row_store
-                .get_insert_page_exclusive(&guards, 4)
+                .get_insert_page_exclusive(&guards, || 4)
                 .await
                 .unwrap();
             let id = page.versioned_page_id();

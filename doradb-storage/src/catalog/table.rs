@@ -1,4 +1,5 @@
 use crate::buffer::PoolGuards;
+use crate::buffer::page::PAGE_SIZE;
 #[cfg(test)]
 use crate::catalog::spec::ActiveIndexSpec;
 use crate::catalog::spec::{
@@ -26,11 +27,12 @@ use crate::file::table_file::{MutableTableFile, TableFile};
 use crate::id::{BlockID, TableID, TrxID};
 use crate::index::BlockIndex;
 use crate::index::disk_tree_stats::DiskTreeStats;
+use crate::lwc::singleton_base_bytes;
 use crate::map::{FastHashMap, FastHashSet};
 use crate::obs;
 use crate::poison::EnginePoisoner;
 use crate::row::ops::SelectKey;
-use crate::row::{Row, RowRead};
+use crate::row::{Row, RowRead, estimate_max_row_count, fixed_page_metadata_bytes};
 use crate::runtime::mandatory::{AcceptedExecution, MandatoryTaskMetadata, PreparedExecution};
 use crate::serde::{Deser, DeserResult, MinBytesHint, Ser, Serde, min_bytes_hint};
 use crate::session::{AcceptedDdlScope, PreparedDdlScope};
@@ -854,6 +856,141 @@ impl Index<IndexSlot> for IndexSpecs {
     }
 }
 
+/// Derived schema costs for fresh RowPage and singleton LWC admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowSizeLayout {
+    /// Complete one-row page size before outlined values.
+    row_page_base_bytes: usize,
+    /// Complete singleton block size before variable values.
+    lwc_base_bytes: usize,
+    /// Column counts by inline byte width; eight-byte slots include VarByte descriptors.
+    b1_count: usize,
+    b2_count: usize,
+    b4_count: usize,
+    b8_count: usize,
+    nullable_cols: usize,
+}
+
+impl RowSizeLayout {
+    fn new(columns: &[ValType]) -> StdResult<Self, String> {
+        // TableColumnLayout::build bounds the column count by the ordinal domain.
+        let mut layout = Self {
+            row_page_base_bytes: 0,
+            lwc_base_bytes: singleton_base_bytes(columns)
+                .ok_or_else(|| "LWC base size overflow".to_owned())?,
+            b1_count: 0,
+            b2_count: 0,
+            b4_count: 0,
+            b8_count: 0,
+            nullable_cols: 0,
+        };
+        for column in columns {
+            match column.kind {
+                ValKind::I8 | ValKind::U8 => layout.b1_count += 1,
+                ValKind::I16 | ValKind::U16 => layout.b2_count += 1,
+                ValKind::I32 | ValKind::U32 | ValKind::F32 => layout.b4_count += 1,
+                ValKind::I64 | ValKind::U64 | ValKind::F64 | ValKind::VarByte => {
+                    layout.b8_count += 1;
+                }
+            }
+            layout.nullable_cols += usize::from(column.nullable);
+        }
+        layout.row_page_base_bytes = layout
+            .fixed_page_bytes(1)
+            .ok_or_else(|| "RowPage base size overflow".to_owned())?;
+        Ok(layout)
+    }
+
+    #[inline]
+    fn col_count(&self) -> usize {
+        self.b1_count + self.b2_count + self.b4_count + self.b8_count
+    }
+
+    #[inline]
+    fn fix_len(&self) -> usize {
+        // The validated column count and maximum eight-byte width bound this sum.
+        self.b1_count + self.b2_count * 2 + self.b4_count * 4 + self.b8_count * 8
+    }
+
+    #[inline]
+    fn nullable_col_count(&self) -> usize {
+        self.nullable_cols
+    }
+
+    /// Returns the complete fixed RowPage size, including per-column alignment.
+    #[inline]
+    pub(crate) fn fixed_page_bytes(&self, row_count: usize) -> Option<usize> {
+        let column_bytes = |width: usize, count: usize| {
+            row_count
+                .checked_mul(width)?
+                .checked_add(7)
+                .map(|bytes| bytes & !7)?
+                .checked_mul(count)
+        };
+        fixed_page_metadata_bytes(row_count, self.col_count(), self.nullable_cols)?
+            .checked_add(column_bytes(1, self.b1_count)?)?
+            .checked_add(column_bytes(2, self.b2_count)?)?
+            .checked_add(column_bytes(4, self.b4_count)?)?
+            .checked_add(column_bytes(8, self.b8_count)?)
+    }
+
+    /// Returns the complete singleton RowPage size for the measured outlined values.
+    #[inline]
+    pub(crate) fn row_page_bytes(&self, outlined_var_bytes: usize) -> Option<usize> {
+        self.row_page_base_bytes.checked_add(outlined_var_bytes)
+    }
+
+    /// Returns the complete singleton LWC size for the measured variable values.
+    #[inline]
+    pub(crate) fn lwc_bytes(&self, total_var_bytes: usize) -> Option<usize> {
+        self.lwc_base_bytes.checked_add(total_var_bytes)
+    }
+
+    /// Whether a recorded page capacity avoids offset narrowing and layout overlap.
+    #[inline]
+    pub(crate) fn row_page_layout_fits(&self, row_count: usize) -> bool {
+        (1..=usize::from(u16::MAX)).contains(&row_count)
+            && self.col_count() <= usize::from(u16::MAX)
+            && self
+                .fixed_page_bytes(row_count)
+                .is_some_and(|bytes| bytes <= PAGE_SIZE)
+    }
+
+    /// Bounds the occupancy hint by the exact layout and an admitted row's outlined bytes.
+    #[inline]
+    pub(crate) fn fitting_row_count(&self, outlined_var_bytes: usize) -> usize {
+        let fits = |count: usize| {
+            self.fixed_page_bytes(count)
+                .and_then(|bytes| count.checked_mul(outlined_var_bytes)?.checked_add(bytes))
+                .is_some_and(|bytes| bytes <= PAGE_SIZE)
+        };
+        // Mandatory singleton admission establishes this contract before allocation.
+        assert!(
+            fits(1),
+            "RowPage capacity planning requires an admitted row: column_count={}, outlined_var_bytes={outlined_var_bytes}",
+            self.col_count()
+        );
+        let hint = estimate_max_row_count(
+            self.fix_len().saturating_add(outlined_var_bytes),
+            self.col_count(),
+        )
+        .clamp(1, usize::from(u16::MAX));
+        if fits(hint) {
+            return hint;
+        }
+        let (mut low, mut high) = (1, hint - 1);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if fits(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+}
+
 /// Immutable physical column layout and stable-ID translation map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableColumnLayout {
@@ -862,10 +999,9 @@ pub(crate) struct TableColumnLayout {
     ordinal_by_id: FastHashMap<ColumnID, ColumnOrdinal>,
     /// Runtime value types in physical ordinal order.
     pub(crate) col_types: Vec<ValType>,
-    fix_len: usize,
     var_cols: Vec<usize>,
-    nullable_cols: usize,
     null_scan_sums: Vec<usize>,
+    row_size: RowSizeLayout,
 }
 
 impl TableColumnLayout {
@@ -885,7 +1021,6 @@ impl TableColumnLayout {
         columns.sort_unstable_by_key(|column| column.ordinal);
         let mut ordinal_by_id = FastHashMap::default();
         let mut col_types = Vec::with_capacity(columns.len());
-        let mut fix_len = 0usize;
         let mut var_cols = Vec::new();
         let mut nullable_cols = 0usize;
         let mut null_scan_sums = Vec::with_capacity(columns.len());
@@ -918,23 +1053,20 @@ impl TableColumnLayout {
             };
             null_scan_sums.push(nullable_cols);
             nullable_cols += usize::from(nullable);
-            fix_len = fix_len
-                .checked_add(ty.kind.inline_len())
-                .ok_or_else(|| "column fixed-length sum overflow".to_owned())?;
             if !ty.kind.is_fixed() {
                 var_cols.push(expected_ordinal);
             }
             col_types.push(ty);
         }
+        let row_size = RowSizeLayout::new(&col_types)?;
         Ok(Self {
             next_column_id,
             columns: columns.into_boxed_slice(),
             ordinal_by_id,
             col_types,
-            fix_len,
             var_cols,
-            nullable_cols,
             null_scan_sums,
+            row_size,
         })
     }
 
@@ -1015,16 +1147,16 @@ impl TableColumnLayout {
         &self.var_cols
     }
 
-    /// Returns the total inline length of one logical row.
-    #[inline]
-    pub(crate) fn fix_len(&self) -> usize {
-        self.fix_len
-    }
-
     /// Returns the number of nullable columns.
     #[inline]
     pub(crate) fn nullable_col_count(&self) -> usize {
-        self.nullable_cols
+        self.row_size.nullable_col_count()
+    }
+
+    /// Returns cached format costs rebuilt with this column layout.
+    #[inline]
+    pub(crate) fn row_size(&self) -> &RowSizeLayout {
+        &self.row_size
     }
 }
 
@@ -3288,6 +3420,9 @@ pub(crate) mod tests {
             vec![
                 StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
                 StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
             ],
             vec![StorageIndexSpec::new(
                 vec![StorageIndexKey::new(0)],
@@ -3578,7 +3713,7 @@ pub(crate) mod tests {
         .expect("valid table metadata");
         assert_eq!(metadata.col.col_count(), 2);
         assert_eq!(
-            metadata.col.fix_len(),
+            metadata.col.row_size().fix_len(),
             ValKind::U32.inline_len() + ValKind::VarByte.inline_len()
         );
         assert_eq!(metadata.col.var_cols(), &[1]);

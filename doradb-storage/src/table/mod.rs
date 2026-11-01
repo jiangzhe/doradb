@@ -80,10 +80,10 @@ use crate::obs;
 use crate::quiescent::QuiescentGuard;
 use crate::recovery::RowReplayState;
 use crate::row::ops::SelectKey;
-use crate::row::{RowPage, RowRead, RowValues, UpdateValues, var_len_for_insert};
+use crate::row::{RowPage, RowRead, RowValues, UpdateValues};
 use crate::runtime::yield_now;
 use crate::trx::{ActiveSnapshotRegistration, PrivateSnapshot, TrxReadProof};
-use crate::value::{PAGE_VAR_LEN_INLINE, Val};
+use crate::value::Val;
 use error_stack::{Report, ResultExt};
 use parking_lot::Mutex;
 use std::marker::PhantomData;
@@ -787,7 +787,10 @@ impl Table {
                 "row slot is not deleted",
             ));
         }
-        let var_len = var_len_for_insert(metadata.col.as_ref(), cols);
+        let size = DmlValidator::new(metadata)
+            .validate_row_capacity(cols)
+            .change_context(DataIntegrityError::InvalidPayload)?;
+        let var_len = size.outlined_var_bytes;
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
         } else {
@@ -864,6 +867,9 @@ impl Table {
                 "row is deleted",
             ));
         }
+        DmlValidator::new(metadata)
+            .validate_hot_update_capacity(&page.row(row_idx), cols)
+            .change_context(DataIntegrityError::InvalidPayload)?;
         let var_len = page.var_len_for_update(row_idx, cols);
         let (var_offset, var_end) = if let Some(var_offset) = page.request_free_space(var_len) {
             (var_offset, var_offset + var_len)
@@ -1170,30 +1176,6 @@ fn recovery_page_invariant_error(
 }
 
 #[inline]
-fn row_len(metadata: &TableMetadata, cols: &[Val]) -> usize {
-    let var_len = metadata
-        .col
-        .var_cols()
-        .iter()
-        .map(|idx| {
-            let val = &cols[*idx];
-            match val {
-                Val::Null => 0,
-                Val::VarByte(var) => {
-                    if var.len() <= PAGE_VAR_LEN_INLINE {
-                        0
-                    } else {
-                        var.len()
-                    }
-                }
-                _ => unreachable!(),
-            }
-        })
-        .sum::<usize>();
-    metadata.col.fix_len() + var_len
-}
-
-#[inline]
 fn index_key_is_changed(
     index_spec: &TableIndexMetadata,
     index_change_cols: &FastHashMap<usize, Val>,
@@ -1335,8 +1317,8 @@ pub(crate) mod tests {
         DeleteInternal, HotRowMutator, InsertRowIntoPage, RowInserter, UpdateRowInplace,
     };
     use crate::table::{
-        DeleteMarker, DmlValidationError, FreezeOutcome, FrozenPageBatchInfo, Table, TableKind,
-        TableRuntimeLayout,
+        DeleteMarker, DmlValidationError, DmlValidator, FreezeOutcome, FrozenPageBatchInfo, Table,
+        TableKind, TableRuntimeLayout,
     };
     use crate::trx::stmt::StmtEffects;
     use crate::trx::{Transaction, TrxRuntime};
@@ -2440,11 +2422,15 @@ pub(crate) mod tests {
     ) -> Result<(bool, bool)> {
         let layout = table.layout_snapshot();
         let metadata = layout.metadata();
+        let size = DmlValidator::new(metadata)
+            .validate_row_capacity(insert.as_slice())
+            .unwrap();
         let insert_retry = matches!(
             RowInserter::new(table.row_store.table_id(), metadata, rt).insert_to_page(
                 effects,
                 insert_page_guard,
                 insert,
+                size.outlined_var_bytes,
                 crate::trx::undo::RowUndoKind::Insert,
                 vec![],
             ),

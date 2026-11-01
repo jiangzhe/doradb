@@ -1,13 +1,13 @@
 use super::{DmlValidator, index_key_is_changed};
 use crate::buffer::guard::{PageGuard, PageSharedGuard};
 use crate::catalog::{CatalogSelectKey, IndexRef, IndexSlot, TableMetadata};
-use crate::error::{FatalResult, OperationError, OperationOrFatalResult};
+use crate::error::{FatalResult, OperationError, OperationOrFatalResult, OperationResult};
 use crate::id::{RowID, TableID};
 use crate::log::redo::{RowRedo, RowRedoKind};
 use crate::map::FastHashMap;
 use crate::poison::PoisonAwareListener;
 use crate::row::ops::{SelectKey, UndoCol, UpdateCol, UpdateRow};
-use crate::row::{RowPage, RowRead, var_len_for_insert};
+use crate::row::{RowPage, RowRead};
 use crate::trx::row::{BoundIndexCandidate, LockRowForWrite, LockUndo, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{
@@ -16,7 +16,7 @@ use crate::trx::undo::{
 use crate::trx::ver_map::RowPageState;
 use crate::trx::{TrxContext, TrxRuntime};
 use crate::value::Val;
-use error_stack::Report;
+use error_stack::{Report, ResultExt};
 use std::mem::replace;
 
 /// Result of inserting a row into one hot row page.
@@ -92,13 +92,14 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         }
     }
 
-    /// Insert one row into an active hot row page.
+    /// Inserts an admitted row using its measured outlined bytes, unchanged across retries.
     #[inline]
     pub(super) fn insert_to_page(
         &self,
         effects: &mut StmtEffects,
         page_guard: PageSharedGuard<RowPage>,
         cols: Vec<Val>,
+        outlined_var_bytes: usize,
         undo_kind: RowUndoKind,
         index_branches: Vec<IndexBranch>,
     ) -> InsertRowIntoPage {
@@ -114,13 +115,13 @@ impl<'m, 'r> RowInserter<'m, 'r> {
         debug_assert!(self.metadata.col.col_count() == page.header.col_count as usize);
         debug_assert!(cols.len() == page.header.col_count as usize);
 
-        let var_len = var_len_for_insert(self.metadata.col.as_ref(), cols.as_slice());
-        let (row_idx, var_offset) =
-            if let Some((row_idx, var_offset)) = page.request_row_idx_and_free_space(var_len) {
-                (row_idx, var_offset)
-            } else {
-                return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
-            };
+        let (row_idx, var_offset) = if let Some((row_idx, var_offset)) =
+            page.request_row_idx_and_free_space(outlined_var_bytes)
+        {
+            (row_idx, var_offset)
+        } else {
+            return InsertRowIntoPage::NoSpaceOrFrozen(cols, undo_kind, index_branches);
+        };
         // Before real insert, we need to lock the row.
         let row_id = page.header.start_row_id + row_idx as u64;
         let mut access = page_guard.write_row_with_state_guard(row_idx, state_guard);
@@ -555,7 +556,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                     .take()
                     .expect("successful hot-row write lock must provide row write access");
                 drop(lock_row);
-                Ok(self.finish_update_owned(effects, update, redo_key, access))
+                Ok(self.finish_update_owned(effects, update, redo_key, access)?)
             }
         }
     }
@@ -567,7 +568,7 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
         update: Vec<UpdateCol>,
         redo_key: Option<CatalogSelectKey>,
         mut access: RowWriteAccess<'g>,
-    ) -> UpdateRowInplace {
+    ) -> OperationResult<UpdateRowInplace> {
         let row_id = self.row_id;
         let page_id = self.page_guard.page_id();
         debug_assert!(
@@ -577,10 +578,19 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
             "row update values must be ordered, in range, and type-compatible"
         );
         if access.row().is_deleted() {
-            return UpdateRowInplace::RowDeleted;
+            return Ok(UpdateRowInplace::RowDeleted);
         }
+        DmlValidator::new(self.metadata)
+            .validate_hot_update_capacity(&access.row(), update.as_slice())
+            .change_context(OperationError::InvalidDmlInput)
+            .attach_with(|| {
+                format!(
+                    "operation=update_owned_hot_row, table_id={}, row_id={row_id}",
+                    self.table_id
+                )
+            })?;
         let frozen = access.page_state() == RowPageState::Frozen;
-        match access.update_row(self.metadata.col.as_ref(), &update, frozen) {
+        let result = match access.update_row(self.metadata.col.as_ref(), &update, frozen) {
             UpdateRow::NoFreeSpaceOrFrozen(old_row) => {
                 access.delete_row();
                 effects.update_last_row_undo(RowUndoKind::delete());
@@ -630,7 +640,8 @@ impl<'m, 'r, 'g> HotRowMutator<'m, 'r, 'g> {
                 }
                 UpdateRowInplace::Ok(row_id, index_change_cols)
             }
-        }
+        };
+        Ok(result)
     }
 
     /// Prepare a replacement row and runtime branches for a hot-row move update.

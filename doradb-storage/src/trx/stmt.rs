@@ -947,9 +947,9 @@ impl<'stmt> Statement<'stmt> {
             .admit_user_table(table_id, true, OPERATION)
             .await
             .disclose()?;
-        if !self.dml_validation_disabled {
-            let validator = DmlValidator::new(layout.metadata());
-            for (batch_index, row) in rows.iter().enumerate() {
+        let validator = DmlValidator::new(layout.metadata());
+        for (batch_index, row) in rows.iter().enumerate() {
+            if !self.dml_validation_disabled {
                 validator
                     .validate_full_row(row.as_slice())
                     .change_context(OperationError::InvalidDmlInput)
@@ -960,6 +960,13 @@ impl<'stmt> Statement<'stmt> {
                     })
                     .disclose()?;
             }
+            validator
+                .validate_row_capacity(row.as_slice())
+                .change_context(OperationError::InvalidDmlInput)
+                .attach_with(|| {
+                    format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
+                })
+                .disclose()?;
         }
         self.acquire_table_write_data_lock(table_id)
             .await
@@ -1054,6 +1061,11 @@ impl<'stmt> Statement<'stmt> {
         narrow_catalog_operation_or_fatal(table_id, metadata_lock)?;
         let validation = DmlValidator::new(table.metadata())
             .validate_full_row(cols.as_slice())
+            .and_then(|()| {
+                DmlValidator::new(table.metadata())
+                    .validate_row_capacity(cols.as_slice())
+                    .map(|_| ())
+            })
             .change_context(OperationError::InvalidDmlInput)
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         assert_catalog_operation_invariant(table_id, validation);
@@ -1087,6 +1099,7 @@ impl<'stmt> Statement<'stmt> {
         for (batch_index, row) in rows.iter().enumerate() {
             let validation = validator
                 .validate_full_row(row.as_slice())
+                .and_then(|()| validator.validate_row_capacity(row.as_slice()).map(|_| ()))
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
@@ -1130,6 +1143,7 @@ impl<'stmt> Statement<'stmt> {
         for (batch_index, row) in rows.iter().enumerate() {
             let validation = validator
                 .validate_full_row(row.as_slice())
+                .and_then(|()| validator.validate_row_capacity(row.as_slice()).map(|_| ()))
                 .change_context(OperationError::InvalidDmlInput)
                 .attach_with(|| {
                     format!("operation={OPERATION}, table_id={table_id}, batch_index={batch_index}")
@@ -1296,6 +1310,7 @@ impl<'stmt> Statement<'stmt> {
         assert_catalog_operation_invariant(table_id, key_validation);
         let row_validation = validator
             .validate_full_row(cols.as_slice())
+            .and_then(|()| validator.validate_row_capacity(cols.as_slice()).map(|_| ()))
             .change_context(OperationError::InvalidDmlInput)
             .attach_with(|| format!("operation={OPERATION}, table_id={table_id}"));
         assert_catalog_operation_invariant(table_id, row_validation);

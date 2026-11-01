@@ -16,7 +16,7 @@ use crate::io::DirectBuf;
 use crate::layout;
 use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
 use crate::serde::{IntegerEncoding, IntegerEncodingPlan, Ser, Serde};
-use crate::value::{MemVar, Val, ValKind};
+use crate::value::{MemVar, Val, ValKind, ValType};
 use error_stack::{Report, ResultExt};
 use std::borrow::Cow;
 use std::mem;
@@ -1718,6 +1718,27 @@ impl_lwc_flat!(FlatI64, i64, [u8; 8], FlatI64Iter);
 impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
 impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
 impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
+
+/// Complete singleton block size excluding variable payloads, using flat singleton encodings.
+pub(crate) fn singleton_base_bytes(columns: &[ValType]) -> Option<usize> {
+    let mut bytes = (COW_FILE_PAGE_SIZE - LWC_BLOCK_PAYLOAD_SIZE)
+        .checked_add(LWC_BLOCK_HEADER_SIZE)?
+        .checked_add(columns.len().checked_mul(mem::size_of::<u16>())?)?;
+    for column in columns {
+        if column.nullable {
+            // Null bitmap byte count followed by one bitmap byte.
+            bytes = bytes.checked_add(mem::size_of::<u16>() + 1)?;
+        }
+        // Compression tag and element count; bytes use two u32 offsets.
+        let value_bytes = if column.kind.is_fixed() {
+            column.kind.inline_len()
+        } else {
+            2 * mem::size_of::<u32>()
+        };
+        bytes = bytes.checked_add(mem::size_of::<u8>() + mem::size_of::<u64>() + value_bytes)?;
+    }
+    Some(bytes)
+}
 
 fn validate_prepared_varbyte_offsets(
     offset_bytes: &[u8],

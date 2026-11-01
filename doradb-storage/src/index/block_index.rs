@@ -144,7 +144,7 @@ impl BlockIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         self.row
             .get_insert_page(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
@@ -159,7 +159,7 @@ impl BlockIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
         redo_ctx: RowPageCreateRedoCtx<'_>,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
         self.row
@@ -182,7 +182,7 @@ impl BlockIndex {
         mem_pool: &B,
         mem_pool_guard: &PoolGuard,
         col_layout: &Arc<TableColumnLayout>,
-        count: usize,
+        count: impl FnOnce() -> usize + Send,
     ) -> RuntimeOrFatalResult<PageExclusiveGuard<RowPage>> {
         self.row
             .get_insert_page_exclusive(meta_pool_guard, mem_pool, mem_pool_guard, col_layout, count)
@@ -565,7 +565,13 @@ mod tests {
             .expect("test block-index construction should succeed");
 
             let page_guard = blk_idx
-                .get_insert_page_exclusive(&meta_guard, &*mem_pool, &mem_guard, &metadata.col, 100)
+                .get_insert_page_exclusive(
+                    &meta_guard,
+                    &*mem_pool,
+                    &mem_guard,
+                    &metadata.col,
+                    || 100,
+                )
                 .await
                 .expect("test insert-page allocation should succeed");
             let page_id = page_guard.page_id();
@@ -573,7 +579,13 @@ mod tests {
 
             let failing_pool = FailingInsertPagePool::new(mem_pool.guard(), page_id);
             let res = blk_idx
-                .try_get_insert_page(&meta_guard, &failing_pool, &mem_guard, &metadata.col, 100)
+                .try_get_insert_page(
+                    &meta_guard,
+                    &failing_pool,
+                    &mem_guard,
+                    &metadata.col,
+                    || 100,
+                )
                 .await;
             let err = match res {
                 Ok(_) => panic!("expected cached insert-page reload failure"),

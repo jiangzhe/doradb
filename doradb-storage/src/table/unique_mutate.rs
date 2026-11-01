@@ -504,7 +504,8 @@ impl<'a, 'op: 'a, 'r, D: BufferPool, R: MemIndexRuntime> UniqueMutator<'a, 'op, 
             UniqueMutation::Update(input) => {
                 let update =
                     HotRowMutator::new(accessor.table_id(), accessor.metadata(), rt, page, row_id)
-                        .finish_update_owned(effects, input, redo_key.take(), access);
+                        .finish_update_owned(effects, input, redo_key.take(), access)
+                        .map_err(|err| map_error(err.into()))?;
                 return Ok(HotMutationResult::Updated(update));
             }
             UniqueMutation::Delete => {

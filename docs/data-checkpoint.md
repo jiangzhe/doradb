@@ -187,6 +187,10 @@ Block admission accounts for the complete encoded size so accepted rows fit
 within the LWC payload capacity. Physical values beneath integer nulls do not
 affect admission or encoding.
 
+Single-row admission ensures that each newly written row fits an LWC block.
+Splitting oversized multirow selections remains follow-up work in
+[backlog 000007](backlogs/000007-lwc-oversize-rowpage-handling.md).
+
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one
 complete block input, checkpoint submits LWC serialization, compression,

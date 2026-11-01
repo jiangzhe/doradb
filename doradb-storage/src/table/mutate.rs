@@ -12,8 +12,8 @@ use super::hot::{
 };
 use super::index_key::{WriteIndexKey, WriteIndexKeySet};
 use super::{
-    MemTable, RowStore, TableRootSnapshot, TableRuntimeLayout, index_key_is_changed,
-    index_key_vals_replace, read_latest_index_key, row_len,
+    DmlValidator, MemTable, RowStore, TableRootSnapshot, TableRuntimeLayout, index_key_is_changed,
+    index_key_vals_replace, read_latest_index_key,
 };
 use crate::buffer::guard::PageSharedGuard;
 use crate::buffer::{BufferPool, EvictableBufferPool, PoolGuards, PoolRole};
@@ -32,7 +32,7 @@ use crate::index::{
 };
 use crate::map::FastHashMap;
 use crate::row::ops::{LinkForUniqueIndex, UpdateCol};
-use crate::row::{RowPage, RowRead, estimate_max_row_count};
+use crate::row::{RowPage, RowRead};
 use crate::trx::row::{FindOldVersion, RowWriteAccess};
 use crate::trx::stmt::StmtEffects;
 use crate::trx::undo::{ForwardHint, HotForwardSource, IndexBranch, RowUndoKind};
@@ -426,8 +426,10 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
     async fn get_insert_page(
         &self,
         rt: TrxRuntime<'_>,
-        row_count: usize,
+        outlined_var_bytes: usize,
     ) -> RuntimeOrFatalResult<PageSharedGuard<RowPage>> {
+        let row_size = self.metadata().col.row_size();
+        let row_count = || row_size.fitting_row_count(outlined_var_bytes);
         match self.family {
             MutationFamily::Memory => Ok(self
                 .rows
@@ -522,14 +524,23 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         mut insert: Vec<Val>,
         mut undo_kind: RowUndoKind,
         mut index_branches: Vec<IndexBranch>,
-    ) -> RuntimeOrFatalResult<(RowID, PageSharedGuard<RowPage>)> {
+    ) -> QuadResult<(RowID, PageSharedGuard<RowPage>)> {
         let metadata = self.metadata();
-        let row_len = row_len(metadata, &insert);
-        let row_count = estimate_max_row_count(row_len, metadata.col.col_count());
+        let size = DmlValidator::new(metadata)
+            .validate_row_capacity(insert.as_slice())
+            .change_context(OperationError::InvalidDmlInput)
+            .attach_with(|| format!("operation=insert_row, table_id={}", self.table_id()))?;
         let inserter = RowInserter::new(self.table_id(), metadata, rt);
         loop {
-            let page_guard = self.get_insert_page(rt, row_count).await?;
-            match inserter.insert_to_page(effects, page_guard, insert, undo_kind, index_branches) {
+            let page_guard = self.get_insert_page(rt, size.outlined_var_bytes).await?;
+            match inserter.insert_to_page(
+                effects,
+                page_guard,
+                insert,
+                size.outlined_var_bytes,
+                undo_kind,
+                index_branches,
+            ) {
                 InsertRowIntoPage::Ok(row_id, page_guard) => {
                     match self.family {
                         MutationFamily::Memory => self
@@ -560,7 +571,7 @@ impl<'op, D: BufferPool, R: MemIndexRuntime> MutationExecutor<'op, D, R> {
         update: Vec<UpdateCol>,
         old_id: RowID,
         old_guard: PageSharedGuard<RowPage>,
-    ) -> RuntimeOrFatalResult<(
+    ) -> QuadResult<(
         RowID,
         FastHashMap<usize, Val>,
         PageSharedGuard<RowPage>,

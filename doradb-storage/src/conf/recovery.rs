@@ -17,6 +17,7 @@ pub struct RecoveryConfig {
     /// Positive direct-IO read-ahead depth used by startup redo recovery.
     pub io_depth: usize,
     /// Disable DML shape, type, and nullability checks in catalog and row replay.
+    /// Complete row capacity remains mandatory.
     pub disable_dml_validation: bool,
     /// Maximum submitted batches whose completions have not been collected.
     ///
@@ -60,6 +61,7 @@ impl RecoveryConfig {
     }
 
     /// Disable recovery/no-transaction DML shape, type, and nullability validation.
+    /// Complete row capacity remains mandatory and oversize fails startup.
     #[inline]
     pub fn disable_dml_validation(mut self, disable: bool) -> Self {
         self.disable_dml_validation = disable;

@@ -1,6 +1,8 @@
+use crate::buffer::page::PAGE_SIZE;
 use crate::catalog::{IndexSlot, PrimaryKeyMatchError, TableIndexMetadata, TableMetadata};
-use crate::row::{RowValues, UpdateValues};
-use crate::value::{MemVar, Val, ValRef, checked_var_len};
+use crate::file::cow_file::COW_FILE_PAGE_SIZE;
+use crate::row::{RowRead, RowValues, UpdateValues};
+use crate::value::{MemVar, PAGE_VAR_LEN_INLINE, Val, ValRef, checked_var_len};
 use error_stack::Report;
 use std::ops::{Bound, RangeBounds};
 use std::result::Result as StdResult;
@@ -12,6 +14,9 @@ pub(crate) enum DmlValidationError {
     /// A full row does not match the table's row shape.
     #[error("invalid DML row shape")]
     RowShape,
+    /// The complete logical row cannot fit a fresh page or singleton block.
+    #[error("DML row exceeds physical capacity")]
+    RowCapacity,
     /// A sparse update does not match the table's update contract.
     #[error("invalid sparse DML update")]
     SparseUpdate,
@@ -29,6 +34,14 @@ pub(crate) enum DmlValidationError {
 /// Result carrying caller-neutral DML validation reports.
 pub(crate) type DmlValidationResult<T> = StdResult<T, Report<DmlValidationError>>;
 
+/// Variable-byte measurement shared by mandatory admission and page planning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSize {
+    total_var_bytes: usize,
+    /// Variable bytes stored outside the RowPage's inline descriptors.
+    pub(crate) outlined_var_bytes: usize,
+}
+
 /// Validates DML payloads against one table's metadata.
 pub(crate) struct DmlValidator<'m> {
     metadata: &'m TableMetadata,
@@ -39,6 +52,108 @@ impl<'m> DmlValidator<'m> {
     #[inline]
     pub(crate) fn new(metadata: &'m TableMetadata) -> Self {
         Self { metadata }
+    }
+
+    /// Enforces aggregate physical capacity independently of optional shape validation.
+    #[inline]
+    pub(crate) fn validate_row_capacity<R: RowValues + ?Sized>(
+        &self,
+        vals: &R,
+    ) -> DmlValidationResult<RowSize> {
+        self.measure_capacity(|col| variable_len(vals.value(col)))
+    }
+
+    /// Checks a complete decoded row with a sorted sparse overlay, without copying payloads.
+    #[inline]
+    pub(crate) fn validate_updated_row_capacity<R: RowValues + ?Sized, U: UpdateValues + ?Sized>(
+        &self,
+        old: &R,
+        update: &U,
+    ) -> DmlValidationResult<RowSize> {
+        self.measure_updated_capacity(update, |col| variable_len(old.value(col)))
+    }
+
+    /// Checks the latest owned hot image, ignoring stale variable fields beneath null bits.
+    #[inline]
+    pub(crate) fn validate_hot_update_capacity<R: RowRead, U: UpdateValues + ?Sized>(
+        &self,
+        old: &R,
+        update: &U,
+    ) -> DmlValidationResult<RowSize> {
+        self.measure_updated_capacity(update, |col| {
+            if old.is_null(&self.metadata.col, col) {
+                0
+            } else {
+                old.var(col).len()
+            }
+        })
+    }
+
+    #[inline]
+    fn measure_updated_capacity<U: UpdateValues + ?Sized>(
+        &self,
+        update: &U,
+        mut old_len: impl FnMut(usize) -> usize,
+    ) -> DmlValidationResult<RowSize> {
+        let mut position = 0;
+        self.measure_capacity(|col| {
+            while position < update.len() {
+                let (updated_col, value) = update.value(position);
+                if updated_col > col {
+                    break;
+                }
+                position += 1;
+                if updated_col == col {
+                    return variable_len(value);
+                }
+            }
+            old_len(col)
+        })
+    }
+
+    #[inline]
+    fn measure_capacity(
+        &self,
+        mut length: impl FnMut(usize) -> usize,
+    ) -> DmlValidationResult<RowSize> {
+        let mut size = RowSize::default();
+        for &col in self.metadata.col.var_cols() {
+            let len = length(col);
+            size.total_var_bytes = size
+                .total_var_bytes
+                .checked_add(len)
+                .ok_or_else(|| self.capacity_error(size, "variable-byte sum overflow"))?;
+            if len > PAGE_VAR_LEN_INLINE {
+                size.outlined_var_bytes = size
+                    .outlined_var_bytes
+                    .checked_add(len)
+                    .ok_or_else(|| self.capacity_error(size, "outlined-byte sum overflow"))?;
+            }
+        }
+        let layout = self.metadata.col.row_size();
+        if layout
+            .row_page_bytes(size.outlined_var_bytes)
+            .is_none_or(|bytes| bytes > PAGE_SIZE)
+        {
+            return Err(self.capacity_error(size, "RowPage bound or size arithmetic overflow"));
+        }
+        if layout
+            .lwc_bytes(size.total_var_bytes)
+            .is_none_or(|bytes| bytes > COW_FILE_PAGE_SIZE)
+        {
+            return Err(self.capacity_error(size, "LWC bound or size arithmetic overflow"));
+        }
+        Ok(size)
+    }
+
+    #[cold]
+    fn capacity_error(&self, size: RowSize, reason: &str) -> Report<DmlValidationError> {
+        let layout = self.metadata.col.row_size();
+        Report::new(DmlValidationError::RowCapacity).attach(format!(
+            "row_page_bytes={:?}, row_page_capacity={PAGE_SIZE}, lwc_bytes={:?}, lwc_capacity={COW_FILE_PAGE_SIZE}, reason={reason}",
+            layout.row_page_bytes(size.outlined_var_bytes),
+            layout.lwc_bytes(size.total_var_bytes),
+        ))
     }
 
     /// Validates a repeatable full-row input without taking ownership of values.
@@ -295,14 +410,23 @@ impl<'m> DmlValidator<'m> {
     }
 }
 
+#[inline]
+fn variable_len(value: ValRef<'_>) -> usize {
+    match value {
+        ValRef::VarByte(bytes) => bytes.len(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DmlValidationError, DmlValidationResult, DmlValidator};
     use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
     use crate::row::ops::UpdateCol;
     use crate::row::tests::BufferValues;
-    use crate::value::{Val, ValKind};
+    use crate::value::{Val, ValKind, ValRef};
     use error_stack::Report;
+    use std::{mem, slice};
 
     fn assert_validation_parity(
         owned: DmlValidationResult<()>,
@@ -328,6 +452,221 @@ mod tests {
             };
             assert_eq!(facts(&owned), facts(&borrowed));
             assert!(format!("{borrowed:?}").contains(fact), "{borrowed:?}");
+        }
+    }
+
+    fn bytes(len: usize) -> Val {
+        Val::try_from(vec![0x5a; len]).unwrap()
+    }
+
+    fn capacity_metadata(kinds: &[(ValKind, bool)]) -> TableMetadata {
+        TableMetadata::try_new(
+            kinds
+                .iter()
+                .map(|&(kind, nullable)| {
+                    StorageColumnSpec::new(
+                        kind,
+                        if nullable {
+                            StorageColumnFlags::NULLABLE
+                        } else {
+                            StorageColumnFlags::empty()
+                        },
+                    )
+                })
+                .collect(),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    fn assert_capacity_formats(metadata: &TableMetadata, row: &[Val]) {
+        use crate::buffer::page::PAGE_SIZE;
+        use crate::file::FileKind;
+        use crate::file::block_integrity::{
+            BLOCK_INTEGRITY_HEADER_SIZE, BLOCK_INTEGRITY_TRAILER_SIZE,
+        };
+        use crate::id::{BlockID, RowID};
+        use crate::io::IOBuf;
+        use crate::lwc::{LwcBlock, LwcBuilder};
+        use crate::row::ops::InsertRow;
+        use crate::row::{RowPage, RowRead};
+        use std::sync::Arc;
+
+        let validator = DmlValidator::new(metadata);
+        let size = validator.validate_row_capacity(row).unwrap();
+        let borrowed =
+            BufferValues::new(row.iter().enumerate().map(|(i, value)| (i, value.view())));
+        assert_eq!(size, validator.validate_row_capacity(&borrowed).unwrap());
+        let mut page = RowPage::new_test_page();
+        page.init(RowID::new(0), 1, &metadata.col);
+        let before = page.header.var_field_offset();
+        assert!(matches!(page.insert(&metadata.col, row), InsertRow::Ok(_)));
+        assert_eq!(page.row(0).clone_vals(&metadata.col), row);
+        let actual_page =
+            PAGE_SIZE - page.data.len() + usize::from(page.header.fix_field_end) + before
+                - page.header.var_field_offset();
+        assert_eq!(
+            metadata
+                .col
+                .row_size()
+                .row_page_bytes(size.outlined_var_bytes)
+                .unwrap(),
+            actual_page
+        );
+        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
+        assert!(builder.append_row_values(RowID::new(0), row));
+        let encoded = builder.build(1).unwrap();
+        let block = LwcBlock::try_from_persisted_bytes(
+            encoded.as_bytes(),
+            FileKind::TableFile,
+            BlockID::new(1),
+        )
+        .unwrap();
+        let end = metadata.col.col_count() * 2;
+        let body_bytes = usize::from(u16::from_le_bytes(
+            block.body[end - 2..end].try_into().unwrap(),
+        ));
+        let actual_lwc = BLOCK_INTEGRITY_HEADER_SIZE
+            + BLOCK_INTEGRITY_TRAILER_SIZE
+            + mem::size_of_val(&block.header)
+            + body_bytes;
+        assert_eq!(
+            metadata
+                .col
+                .row_size()
+                .lwc_bytes(size.total_var_bytes)
+                .unwrap(),
+            actual_lwc
+        );
+        assert_eq!(block.decode_full_row_values(&metadata.col, 0).unwrap(), row);
+    }
+
+    /// Purpose: Compare singleton admission with actual initialized pages and serialized blocks for every value kind.
+    /// Expected: Owned and borrowed measurements equal physical offsets and all nullable, inline, and outlined values round-trip.
+    #[test]
+    fn test_row_capacity_matches_physical_formats() {
+        let values = vec![
+            Val::I8(-1),
+            Val::U8(2),
+            Val::I16(-3),
+            Val::U16(4),
+            Val::I32(-5),
+            Val::U32(6),
+            Val::from(1.5f32),
+            Val::I64(-7),
+            Val::U64(8),
+            Val::from(2.5f64),
+            bytes(0),
+            bytes(6),
+            bytes(7),
+        ];
+        for nullable in [false, true] {
+            let kinds: Vec<_> = values
+                .iter()
+                .map(|v| (v.kind().unwrap(), nullable))
+                .collect();
+            let metadata = capacity_metadata(&kinds);
+            for value in &values {
+                let single = capacity_metadata(&[(value.kind().unwrap(), nullable)]);
+                assert_capacity_formats(&single, slice::from_ref(value));
+                if nullable {
+                    assert_capacity_formats(&single, &[Val::Null]);
+                }
+            }
+            assert_capacity_formats(&metadata, &values);
+            if nullable {
+                assert_capacity_formats(&metadata, &vec![Val::Null; values.len()]);
+            }
+        }
+    }
+
+    /// Purpose: Protect exact RowPage and singleton LWC boundaries, aggregate bytes, and impossible schema overhead.
+    /// Expected: Exact fits encode successfully, one byte over fails the owning bound, and multiple variable values share one limit.
+    #[test]
+    fn test_row_capacity_physical_boundaries() {
+        let single = capacity_metadata(&[(ValKind::VarByte, false)]);
+        assert_capacity_formats(&single, &[bytes(65_461)]);
+        let err = DmlValidator::new(&single)
+            .validate_row_capacity(&[bytes(65_462)][..])
+            .unwrap_err();
+        assert_eq!(*err.current_context(), DmlValidationError::RowCapacity);
+        assert!(format!("{err:?}").contains("LWC bound"));
+        let two = capacity_metadata(&[(ValKind::VarByte, false); 2]);
+        assert_capacity_formats(&two, &[bytes(32_721), bytes(32_721)]);
+        assert!(
+            DmlValidator::new(&two)
+                .validate_row_capacity(&[bytes(32_721), bytes(32_722)][..])
+                .is_err()
+        );
+        let mut kinds = vec![(ValKind::U8, true); 3000];
+        kinds.push((ValKind::VarByte, false));
+        let metadata = capacity_metadata(&kinds);
+        let mut row = vec![Val::Null; 3000];
+        row.push(bytes(11_464));
+        assert_capacity_formats(&metadata, &row);
+        row[3000] = bytes(11_465);
+        let err = DmlValidator::new(&metadata)
+            .validate_row_capacity(row.as_slice())
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("RowPage bound"));
+        for (columns, nullable) in [(6000, false), (4000, true)] {
+            let metadata = capacity_metadata(&vec![(ValKind::U8, nullable); columns]);
+            assert!(
+                DmlValidator::new(&metadata)
+                    .validate_row_capacity(vec![Val::U8(0); columns].as_slice())
+                    .is_err()
+            );
+        }
+    }
+
+    /// Purpose: Measure complete sparse-update images across null and inline boundaries without reading stale null descriptors.
+    /// Expected: Hot and decoded overlays agree, oversized unchanged-plus-new payloads fail, and shrinking or nulling values succeeds.
+    #[test]
+    fn test_row_capacity_update_overlay() {
+        use crate::id::RowID;
+        use crate::row::ops::InsertRow;
+        use crate::row::{RowPage, RowRead};
+        let metadata = capacity_metadata(&[(ValKind::VarByte, true); 2]);
+        let validator = DmlValidator::new(&metadata);
+        for old in [Val::Null, bytes(0), bytes(6), bytes(7), bytes(32_000)] {
+            let row = vec![bytes(32_000), old];
+            let mut page = RowPage::new_test_page();
+            page.init(RowID::new(0), 1, &metadata.col);
+            assert!(matches!(page.insert(&metadata.col, &row), InsertRow::Ok(_)));
+            for new in [Val::Null, bytes(0), bytes(6), bytes(7), bytes(34_000)] {
+                let update = [UpdateCol {
+                    idx: 1,
+                    val: new.clone(),
+                }];
+                let expected = validator.validate_row_capacity(&[row[0].clone(), new][..]);
+                let decoded = validator.validate_updated_row_capacity(row.as_slice(), &update[..]);
+                let hot = validator.validate_hot_update_capacity(&page.row(0), &update[..]);
+                match expected {
+                    Ok(size) => {
+                        assert_eq!(decoded.unwrap(), size);
+                        assert_eq!(hot.unwrap(), size);
+                    }
+                    Err(_) => {
+                        assert!(decoded.is_err());
+                        assert!(hot.is_err());
+                    }
+                }
+            }
+            // Null writes retain the previous descriptor. Admission must inspect
+            // the null bit before borrowing that stale variable field.
+            let mut writer = page.row_mut_exclusive(0, 0, 0);
+            writer.update_col(&metadata.col, 0, ValRef::Null, true);
+            writer.finish_update();
+            assert!(page.row(0).is_null(&metadata.col, 0));
+            let update = [UpdateCol {
+                idx: 1,
+                val: bytes(40_000),
+            }];
+            let size = validator
+                .validate_hot_update_capacity(&page.row(0), &update[..])
+                .unwrap();
+            assert_eq!(size.total_var_bytes, 40_000);
+            assert_eq!(size.outlined_var_bytes, 40_000);
         }
     }
 
