@@ -45,6 +45,23 @@ run a follow-up linking command. The create command immediately syncs
 metadata, then default to `type:epic` and `priority:medium`. CLI
 `type:*`/`priority:*` values override metadata; `codex` is unioned.
 
+## Issue Body Length
+
+Keep the complete issue body at no more than 100 lines, including planning
+metadata, headings, blank lines, and code blocks. The create command checks
+this before contacting GitHub and returns the draft body if it exceeds the
+limit. Summarize the RFC document's leading content: `Summary`,
+`Context`, and `Decision`. Preserve its main concerns, meaning, and selected
+direction while removing repetition and supporting detail. Retain the
+planning metadata and document references for the full context. Do not
+include validation results or simply truncate the body. Shorten only the
+issue body; leave the source RFC document's content unchanged.
+
+Save the shortened complete body to a temporary file and repeat the same
+create command with `--body-file <path>`. The command rechecks the limit;
+continue summarizing until it fits, then remove the temporary file after
+successful creation. Keep bodies that already fit unchanged.
+
 ## List Issues
 
 Retain generic issue listing:
