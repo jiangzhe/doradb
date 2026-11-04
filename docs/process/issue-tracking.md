@@ -25,6 +25,7 @@ Use `$issue-task` or `$issue-rfc` and its `tools/issue.rs create-issue-from-doc`
 - Resolve ID-only inputs to a document path first, e.g. `tools/doc-id.rs search-by-id --kind task --id 000047 --scope open`.
 - Creation must be non-interactive: provide `--title` and `--body` or `--body-file` to `gh`. The helper uses `--body-file`, removes its temporary file, assigns `@me`, and records the issue number as `github_issue` in the planning document.
 - Generated bodies include planning metadata plus `Summary`, `Context`, `Goals`, and `Non-Goals` for tasks; `Summary`, `Context`, and `Decision` for RFCs.
+- Issue bodies must fit within 100 lines, including metadata and blank lines. The helper rejects longer bodies before contacting GitHub and returns the draft. Summarize those same sections while preserving the main concerns and document references, exclude validation results, and retry with `--body-file <path>` containing the complete shortened body. Do not shorten the source planning document.
 - Create the RFC epic first. Read its `github_issue` and pass `--parent <issue-number>` when creating each phase task to establish the native sub-issue relationship in the same command.
 - Keep the hierarchy flat: epic → tasks. Label parents `type:epic` and children `type:task` or `type:feature`.
 - Do not add textual parent references such as `Part of #<number>` or link the parent again after creation. Reference other related work with `Ref #<number>` in the body.

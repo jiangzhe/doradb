@@ -59,6 +59,9 @@ is unioned from both sources.
 - Always use assignee `@me` for creation.
 - Let `tools/issue.rs` use `--body-file`; task bodies include `Summary`,
   `Context`, `Goals`, and `Non-Goals`.
+- Creation enforces the 100-line limit described in `SKILL.md`. If rejected
+  for length, summarize the returned body and retry the same command with
+  `--body-file <path>` containing the complete shortened body.
 - Require the create command to sync `github_issue` into the task document.
 - Use the generic `list-issues` command with JSON output and optional repeated
   `--label` filters.

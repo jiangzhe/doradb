@@ -11,7 +11,28 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, exit};
+
+const ALLOWED_TYPE_LABELS: &[&str] = &[
+    "type:doc",
+    "type:perf",
+    "type:feature",
+    "type:question",
+    "type:bug",
+    "type:chore",
+    "type:epic",
+    "type:task",
+];
+
+const ALLOWED_PRIORITY_LABELS: &[&str] = &[
+    "priority:low",
+    "priority:medium",
+    "priority:high",
+    "priority:critical",
+];
+
+const SPECIAL_LABEL_CODEX: &str = "codex";
+const MAX_ISSUE_BODY_LINES: usize = 100;
 
 #[derive(Debug, Clone)]
 struct CommandResult {
@@ -42,26 +63,6 @@ struct DocSyncResult {
     mode: &'static str,
 }
 
-const ALLOWED_TYPE_LABELS: &[&str] = &[
-    "type:doc",
-    "type:perf",
-    "type:feature",
-    "type:question",
-    "type:bug",
-    "type:chore",
-    "type:epic",
-    "type:task",
-];
-
-const ALLOWED_PRIORITY_LABELS: &[&str] = &[
-    "priority:low",
-    "priority:medium",
-    "priority:high",
-    "priority:critical",
-];
-
-const SPECIAL_LABEL_CODEX: &str = "codex";
-
 fn usage() -> &'static str {
     "Usage: tools/issue.rs <subcommand> [options]\n\n\
 Subcommands:\n\
@@ -76,7 +77,7 @@ fn main() {
         Err(code) => code,
     };
     if code != 0 {
-        std::process::exit(code);
+        exit(code);
     }
 }
 
@@ -132,7 +133,11 @@ fn cmd_validate_doc_path(mut args: impl Iterator<Item = String>) -> Result<(), i
 
     let validated = validate_doc_path(Path::new(&path));
     print_json(&validated);
-    if validated.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if validated
+        .get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         Ok(())
     } else {
         Err(1)
@@ -141,6 +146,7 @@ fn cmd_validate_doc_path(mut args: impl Iterator<Item = String>) -> Result<(), i
 
 fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
     let mut doc: Option<String> = None;
+    let mut body_file: Option<String> = None;
     let mut title: Option<String> = None;
     let mut labels_csv: Option<String> = None;
     let mut assignee = "@me".to_string();
@@ -154,6 +160,13 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
                     return Err(1);
                 };
                 doc = Some(v);
+            }
+            "--body-file" => {
+                let Some(v) = args.next() else {
+                    eprintln!("missing value for --body-file");
+                    return Err(1);
+                };
+                body_file = Some(v);
             }
             "--title" => {
                 let Some(v) = args.next() else {
@@ -191,7 +204,9 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
                 parent = Some(parsed);
             }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs create-issue-from-doc --doc <path> [--labels <csv>] [--title <title>] [--assignee <assignee>] [--parent <issue>]\n");
+                println!(
+                    "Usage: ... issue.rs create-issue-from-doc --doc <path> [--body-file <path>] [--labels <csv>] [--title <title>] [--assignee <assignee>] [--parent <issue>]\n"
+                );
                 return Ok(());
             }
             _ => {
@@ -227,7 +242,9 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
     let validated = match validated_from_json(&validated_value) {
         Some(v) => v,
         None => {
-            print_json(&json!({"created": false, "error": "internal error: invalid validated doc payload"}));
+            print_json(
+                &json!({"created": false, "error": "internal error: invalid validated doc payload"}),
+            );
             return Err(1);
         }
     };
@@ -271,13 +288,35 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     };
 
-    let body = build_body(
-        &validated.path,
-        &validated.doc_type,
-        &validated.doc_id,
-        validated.title_hint.as_deref(),
-        &doc_content,
-    );
+    let body = match body_file {
+        Some(path) => match fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(e) => {
+                print_json(&json!({
+                    "created": false,
+                    "error": format!("failed to read body file {path}: {e}"),
+                }));
+                return Err(1);
+            }
+        },
+        None => build_body(
+            &validated.path,
+            &validated.doc_type,
+            &validated.doc_id,
+            validated.title_hint.as_deref(),
+            &doc_content,
+        ),
+    };
+    if let Err(error) = validate_issue_body(&body) {
+        print_json(&json!({
+            "created": false,
+            "error": error,
+            "body": body,
+            "body_lines": body.lines().count(),
+            "max_body_lines": MAX_ISSUE_BODY_LINES,
+        }));
+        return Err(1);
+    }
 
     let temp_path = match write_temp_issue_body(&body) {
         Ok(p) => p,
@@ -287,13 +326,8 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
         }
     };
 
-    let create_cmd = build_create_issue_command(
-        &issue_title,
-        &temp_path,
-        &labels,
-        &assignee,
-        parent,
-    );
+    let create_cmd =
+        build_create_issue_command(&issue_title, &temp_path, &labels, &assignee, parent);
 
     let create_res = run_command(&create_cmd);
 
@@ -306,7 +340,11 @@ fn cmd_create_issue_from_doc(mut args: impl Iterator<Item = String>) -> Result<(
             "stderr": create_res.stderr.trim(),
             "stdout": create_res.stdout.trim(),
         }));
-        return Err(if create_res.returncode == 0 { 1 } else { create_res.returncode });
+        return Err(if create_res.returncode == 0 {
+            1
+        } else {
+            create_res.returncode
+        });
     }
 
     let issue_url = create_res
@@ -417,7 +455,9 @@ fn cmd_list_issues(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
                 limit = v;
             }
             "-h" | "--help" => {
-                println!("Usage: ... issue.rs list-issues [--state open|closed|all] [--assignee <a>] [--search <q>] [--label <label>]... [--limit <n>]");
+                println!(
+                    "Usage: ... issue.rs list-issues [--state open|closed|all] [--assignee <a>] [--search <q>] [--label <label>]... [--limit <n>]"
+                );
                 return Ok(());
             }
             _ => {
@@ -460,7 +500,11 @@ fn cmd_list_issues(mut args: impl Iterator<Item = String>) -> Result<(), i32> {
             "stderr": res.stderr.trim(),
             "stdout": res.stdout.trim(),
         }));
-        return Err(if res.returncode == 0 { 1 } else { res.returncode });
+        return Err(if res.returncode == 0 {
+            1
+        } else {
+            res.returncode
+        });
     }
 
     let payload = if res.stdout.trim().is_empty() {
@@ -657,7 +701,8 @@ fn upsert_frontmatter_github_issue(
             .enumerate()
             .skip(1)
             .find(|(_, v)| v.trim() == "---")
-            .map(|(idx, _)| idx) else {
+            .map(|(idx, _)| idx)
+        else {
             return Err("unterminated frontmatter: missing closing `---`".to_string());
         };
 
@@ -706,8 +751,7 @@ fn upsert_frontmatter_github_issue(
 
 fn normalize_for_doc_rule(path: &Path) -> String {
     let raw = normalize_path(path);
-    raw.trim_start_matches(|c| c == '.' || c == '/')
-        .to_string()
+    raw.trim_start_matches(|c| c == '.' || c == '/').to_string()
 }
 
 fn validated_from_json(value: &serde_json::Value) -> Option<ValidatedDoc> {
@@ -950,6 +994,19 @@ fn build_body(
     body
 }
 
+fn validate_issue_body(body: &str) -> Result<(), String> {
+    if body.trim().is_empty() {
+        return Err("issue body must not be empty".to_string());
+    }
+    let lines = body.lines().count();
+    if lines > MAX_ISSUE_BODY_LINES {
+        return Err(format!(
+            "issue body has {lines} lines; maximum is {MAX_ISSUE_BODY_LINES}. Summarize the returned body, preserve the planning document's main concerns, and retry with --body-file <path>"
+        ));
+    }
+    Ok(())
+}
+
 fn build_create_issue_command(
     issue_title: &str,
     body_path: &Path,
@@ -1068,8 +1125,12 @@ fn write_temp_issue_body(body: &str) -> Result<PathBuf, String> {
             }
             continue;
         }
-        fs::write(&path, body)
-            .map_err(|e| format!("failed to create temp body file {}: {e}", normalize_path(&path)))?;
+        fs::write(&path, body).map_err(|e| {
+            format!(
+                "failed to create temp body file {}: {e}",
+                normalize_path(&path)
+            )
+        })?;
         return Ok(path);
     }
 }
@@ -1115,6 +1176,23 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        for attempt in 0..100u32 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let filename = format!("{prefix}-{}-{nanos}-{attempt}.md", std::process::id());
+            let path = env::temp_dir().join(filename);
+            if !path.exists() {
+                return path;
+            }
+        }
+        panic!("failed to allocate unique temp path");
+    }
+
+    /// Purpose: Preserve an existing matching issue association.
+    /// Expected: The document is unchanged and synchronization reports no update.
     #[test]
     fn test_upsert_frontmatter_github_issue_already_set() {
         let input = "---\nowner: alice\ngithub_issue: 123\n---\n\n# Title\n";
@@ -1124,6 +1202,8 @@ mod tests {
         assert_eq!(mode, "already_set");
     }
 
+    /// Purpose: Replace an issue field within existing frontmatter.
+    /// Expected: Only the issue value changes and the operation reports an update.
     #[test]
     fn test_upsert_frontmatter_github_issue_updated() {
         let input = "---\nowner: alice\ngithub_issue: 99\n---\n\n# Title\n";
@@ -1134,6 +1214,8 @@ mod tests {
         assert_eq!(mode, "updated");
     }
 
+    /// Purpose: Add an issue association to frontmatter without one.
+    /// Expected: Existing metadata and document content survive the insertion.
     #[test]
     fn test_upsert_frontmatter_github_issue_inserted() {
         let input = "---\nowner: alice\nstatus: open\n---\n\n# Title\n";
@@ -1144,6 +1226,8 @@ mod tests {
         assert_eq!(mode, "inserted");
     }
 
+    /// Purpose: Associate a document that has no frontmatter.
+    /// Expected: New frontmatter precedes the preserved document content.
     #[test]
     fn test_upsert_frontmatter_github_issue_prepended_no_frontmatter() {
         let input = "# Task: Example\n\nBody\n";
@@ -1154,6 +1238,8 @@ mod tests {
         assert_eq!(mode, "prepended");
     }
 
+    /// Purpose: Reject issue insertion into unterminated frontmatter.
+    /// Expected: The operation reports the malformed frontmatter.
     #[test]
     fn test_upsert_frontmatter_github_issue_unterminated_frontmatter_error() {
         let input = "---\nowner: alice\ngithub_issue: 9\n# Missing closing fence\n";
@@ -1161,6 +1247,8 @@ mod tests {
         assert!(err.contains("unterminated frontmatter"));
     }
 
+    /// Purpose: Protect a stored issue association from a conflicting synchronization.
+    /// Expected: Synchronization fails and the source file remains unchanged.
     #[test]
     fn test_upsert_doc_github_issue_conflict_does_not_overwrite() {
         let path = unique_temp_path("issue-script-upsert-conflict");
@@ -1175,6 +1263,8 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Purpose: Protect malformed source documents during issue synchronization.
+    /// Expected: Unterminated frontmatter fails without writing the source file.
     #[test]
     fn test_upsert_doc_github_issue_unterminated_frontmatter_does_not_overwrite() {
         let path = unique_temp_path("issue-script-upsert-unterminated");
@@ -1189,6 +1279,8 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Purpose: Build task issues from the leading planning sections.
+    /// Expected: The source reference and four selected sections appear without implementation plans or textual parents.
     #[test]
     fn test_build_body_includes_task_context_sections() {
         let doc = "\
@@ -1236,6 +1328,8 @@ Do the work.
         assert!(!body.contains("## Plan\n\nDo the work."));
     }
 
+    /// Purpose: Build RFC issues from their context and selected decision.
+    /// Expected: The source reference and selected sections retain nested detail and omit other sections.
     #[test]
     fn test_build_body_includes_rfc_context_sections() {
         let doc = "\
@@ -1286,17 +1380,13 @@ Expected outcomes.
         assert!(!body.contains("## Consequences\n\nExpected outcomes."));
     }
 
+    /// Purpose: Represent missing task sections explicitly in generated bodies.
+    /// Expected: Existing content is retained and each absent selected section is marked.
     #[test]
     fn test_build_body_marks_missing_requested_sections() {
         let doc = "# Task: Example\n\n## Summary\n\nTask summary.\n";
 
-        let body = build_body(
-            "docs/tasks/000124-example.md",
-            "task",
-            "000124",
-            None,
-            doc,
-        );
+        let body = build_body("docs/tasks/000124-example.md", "task", "000124", None, doc);
 
         assert!(body.contains("## Summary\n\nTask summary.\n"));
         assert!(body.contains("## Context\n\n_Section not found in the planning document._\n"));
@@ -1304,6 +1394,49 @@ Expected outcomes.
         assert!(body.contains("## Non-Goals\n\n_Section not found in the planning document._\n"));
     }
 
+    /// Purpose: Enforce the inclusive body limit across Markdown lines and line endings.
+    /// Expected: Bodies through 100 lines pass; 101 lines fail even without a final newline.
+    #[test]
+    fn test_validate_issue_body_line_limit() {
+        for count in [99, 100, 101] {
+            let mut lines = vec!["## Summary", "", "```text", "Context", "```"];
+            lines.resize(count, "Detail");
+            for separator in ["\n", "\r\n"] {
+                for final_newline in [false, true] {
+                    let mut body = lines.join(separator);
+                    if final_newline {
+                        body.push_str(separator);
+                    }
+                    let result = validate_issue_body(&body);
+                    assert_eq!(
+                        result.is_ok(),
+                        count <= 100,
+                        "count={count}, separator={separator:?}, final_newline={final_newline}"
+                    );
+                    if let Err(error) = result {
+                        assert!(error.contains("101 lines"), "{error}");
+                        assert!(error.contains("--body-file"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Purpose: Reject empty replacements that would discard the planning summary.
+    /// Expected: Empty and whitespace-only issue bodies fail validation.
+    #[test]
+    fn test_validate_issue_body_rejects_empty() {
+        for body in ["", "\n", " \t\r\n"] {
+            assert_eq!(
+                validate_issue_body(body).unwrap_err(),
+                "issue body must not be empty",
+                "body={body:?}"
+            );
+        }
+    }
+
+    /// Purpose: Attach a task to its native RFC parent during issue creation.
+    /// Expected: The command retains body, label, and assignee arguments and includes the parent.
     #[test]
     fn test_create_issue_command_includes_native_parent() {
         let labels = vec!["type:task".to_string(), "priority:medium".to_string()];
@@ -1335,6 +1468,8 @@ Expected outcomes.
         );
     }
 
+    /// Purpose: Create standalone tasks without a parent relationship.
+    /// Expected: The creation command omits the parent option.
     #[test]
     fn test_create_issue_command_omits_parent_for_standalone_task() {
         let labels = vec!["type:task".to_string(), "priority:medium".to_string()];
@@ -1349,6 +1484,8 @@ Expected outcomes.
         assert!(!command.iter().any(|arg| arg == "--parent"));
     }
 
+    /// Purpose: Validate parent identifiers before constructing a GitHub command.
+    /// Expected: Positive integers pass while zero, negative, and nonnumeric inputs fail.
     #[test]
     fn test_parent_issue_number_must_be_positive() {
         assert_eq!(parse_parent_issue_number("42").unwrap(), 42);
@@ -1357,26 +1494,13 @@ Expected outcomes.
         assert!(parse_parent_issue_number("not-a-number").is_err());
     }
 
+    /// Purpose: Keep RFC epics at the top level of the issue hierarchy.
+    /// Expected: Tasks may have parents, but RFC documents reject them.
     #[test]
     fn test_parent_is_rejected_for_rfc_documents() {
         assert!(validate_parent_doc_type("task", Some(42)).is_ok());
         assert!(validate_parent_doc_type("task", None).is_ok());
         assert!(validate_parent_doc_type("rfc", None).is_ok());
         assert!(validate_parent_doc_type("rfc", Some(42)).is_err());
-    }
-
-    fn unique_temp_path(prefix: &str) -> PathBuf {
-        for attempt in 0..100u32 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let filename = format!("{prefix}-{}-{nanos}-{attempt}.md", std::process::id());
-            let path = env::temp_dir().join(filename);
-            if !path.exists() {
-                return path;
-            }
-        }
-        panic!("failed to allocate unique temp path");
     }
 }
