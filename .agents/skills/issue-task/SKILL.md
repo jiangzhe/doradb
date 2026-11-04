@@ -65,6 +65,18 @@ syncs `github_issue: <issue-id>` into the task document.
 metadata, then default to `type:task` and `priority:medium`. CLI
 `type:*`/`priority:*` values override metadata; `codex` is unioned.
 
+## PR Description Length
+
+When a PR is requested alongside this workflow, keep its complete Markdown
+body at no more than 100 lines, including headings, blank lines, and code
+blocks. Count lines before creating or updating the PR. If the body exceeds
+100 lines, summarize the task document's leading content: `Summary`,
+`Context`, `Goals`, and `Non-Goals`. Preserve its main concerns, meaning, and
+scope while removing repetition and supporting detail, then recount until
+the body fits. Retain task/RFC/issue references for the full context. Do not
+include validation results. Shorten only the description; leave the source
+task document unchanged. Do not simply truncate the body.
+
 ## List Issues
 
 Retain generic issue listing:
