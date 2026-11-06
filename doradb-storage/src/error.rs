@@ -501,12 +501,8 @@ pub(crate) enum InternalError {
     ReadonlyWriteBlocked,
     #[error("row page scan start is not a page boundary")]
     RowPageScanStartInvalid,
-    #[error("lwc builder misuse")]
-    LwcBuilderMisuse,
     #[error("secondary index out of bounds")]
     SecondaryIndexOutOfBounds,
-    #[error("LWC block encoding contract is unsatisfied")]
-    LwcBlockEncodingContract,
     #[error("redo writer format encoding failed")]
     RedoFormatEncoding,
 }

@@ -24,6 +24,7 @@ mod memcmp;
 mod notify;
 mod obs;
 mod poison;
+mod primitive;
 #[cfg(feature = "profiling")]
 pub mod profiling;
 mod ptr;

@@ -48,3 +48,11 @@ poor compression and large aggregate variable content.
   before irreversible transition. Preserve prepared bitmaps, exact sidecars,
   final coverage/bindings, and the fixed inline-metadata capacity invariant.
   Coordinate unsupported RowID spans with backlog 000208.
+
+## Close Reason
+
+- Type: implemented
+- Detail: Implemented via docs/tasks/000339-stream-partial-rowpages-into-lwc-blocks.md
+- Closed By: backlog close
+- Reference: User decision
+- Closed At: 2026-11-04

@@ -68,7 +68,7 @@ impl IdentitySetStats {
     }
 }
 
-/// A transient packing hint; ordinals refer to the builder's retained RowIDs.
+/// One candidate segment's ordinal range and statistics in the retained input rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IdentitySetSeed {
     start: usize,
@@ -76,43 +76,57 @@ pub(crate) struct IdentitySetSeed {
     stats: IdentitySetStats,
 }
 
-impl IdentitySetSeed {
+/// Accumulates candidate segments for strictly increasing input identities.
+/// Owns their contiguous ordinal ranges, preserving page and logical-window hints.
+#[derive(Default)]
+pub(crate) struct IdentitySetSeeds {
+    seeds: Vec<IdentitySetSeed>,
+}
+
+impl IdentitySetSeeds {
     /// Records accepted rows from a page, splitting oversized ranges into windows.
     #[inline]
-    pub(crate) fn append_page(seeds: &mut Vec<Self>, rows: &[RowID], ordinal: usize) {
+    pub(crate) fn append_page(&mut self, rows: &[RowID]) {
         if rows.is_empty() {
             return;
         }
         if rows[rows.len() - 1].as_u64() - rows[0].as_u64() < u64::from(u16::MAX) {
-            seeds.push(Self {
+            let ordinal = self.seeds.last().map_or(0, |seed| seed.end);
+            self.seeds.push(IdentitySetSeed {
                 start: ordinal,
                 end: ordinal + rows.len(),
                 stats: IdentitySetStats::from_rows(rows),
             });
         } else {
-            for (idx, row) in rows.iter().enumerate() {
-                Self::append_window(seeds, *row, ordinal + idx);
+            for row in rows {
+                self.append_row(*row);
             }
         }
     }
 
-    /// Records a direct-row append in its deterministic logical window.
+    /// Records the next row in its deterministic 4,096-position logical window.
     #[inline]
-    pub(crate) fn append_window(seeds: &mut Vec<Self>, row: RowID, ordinal: usize) {
-        Self::append_value(seeds, row.as_u64(), ordinal);
+    pub(crate) fn append_row(&mut self, row: RowID) {
+        self.append_value(row.as_u64());
+    }
+
+    /// Borrows the candidate segments partitioning all appended input ordinals.
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[IdentitySetSeed] {
+        &self.seeds
     }
 
     #[inline]
-    fn append_value(seeds: &mut Vec<Self>, row: u64, ordinal: usize) {
-        if let Some(last) = seeds.last_mut()
-            && last.end == ordinal
+    fn append_value(&mut self, row: u64) {
+        if let Some(last) = self.seeds.last_mut()
             && last.stats.first / WINDOW == row / WINDOW
         {
             last.end += 1;
             last.stats.push(row);
             return;
         }
-        seeds.push(Self {
+        let ordinal = self.seeds.last().map_or(0, |seed| seed.end);
+        self.seeds.push(IdentitySetSeed {
             start: ordinal,
             end: ordinal + 1,
             stats: IdentitySetStats::from_rows(&[row]),
@@ -171,14 +185,14 @@ impl IdentitySetPlan {
         // and run counts give exact byte costs without encoding each candidate.
         let stats = IdentitySetStats::from_rows(rows);
         let whole = whole_candidate(stats, base, span);
-        let mut generated = Vec::new();
+        let mut generated = IdentitySetSeeds::default();
         // Prefer the builder's source-page/window seeds. Without supplied seeds,
         // group present rows into 4,096-position windows, skipping empty windows.
         let seeds = if seeds.is_empty() {
-            for (idx, row) in rows.iter().enumerate() {
-                IdentitySetSeed::append_value(&mut generated, (*row).into(), idx);
+            for row in rows {
+                generated.append_value((*row).into());
             }
-            &generated
+            generated.as_slice()
         } else {
             seeds
         };
@@ -1403,6 +1417,112 @@ mod tests {
         v ^ (v >> 31)
     }
 
+    /// Purpose: Own ordinal progression across mixed appends, logical-window boundaries, and the page-span limit.
+    /// Expected: Empty appends leave grouping intact, seeds partition every input ordinal, and their statistics match the source rows.
+    #[test]
+    fn seed_collection_preserves_partitions() {
+        enum Append<'a> {
+            Page(&'a [u32]),
+            Row(u32),
+        }
+        struct Case<'a> {
+            name: &'a str,
+            appends: &'a [Append<'a>],
+            ends: &'a [usize],
+        }
+        let cases = [
+            Case {
+                name: "empty pages",
+                appends: &[Append::Page(&[]), Append::Page(&[])],
+                ends: &[],
+            },
+            Case {
+                name: "direct rows cross a logical window",
+                appends: &[
+                    Append::Row(4094),
+                    Append::Row(4095),
+                    Append::Row(4096),
+                    Append::Row(4098),
+                ],
+                ends: &[2, 4],
+            },
+            Case {
+                name: "mixed page and row appends preserve page boundaries",
+                appends: &[
+                    Append::Page(&[]),
+                    Append::Page(&[1, 3]),
+                    Append::Row(4),
+                    Append::Page(&[]),
+                    Append::Page(&[5, 6]),
+                    Append::Row(7),
+                    Append::Row(4096),
+                    Append::Page(&[]),
+                ],
+                ends: &[3, 6, 7],
+            },
+            Case {
+                name: "a page crossing windows remains one seed",
+                appends: &[Append::Page(&[4095, 4096]), Append::Row(4097)],
+                ends: &[2, 3],
+            },
+            Case {
+                name: "maximum page span",
+                appends: &[Append::Page(&[10, 65544]), Append::Row(65545)],
+                ends: &[2, 3],
+            },
+            Case {
+                name: "oversized page uses windows and merges adjacent rows",
+                appends: &[
+                    Append::Row(10),
+                    Append::Page(&[11, 4095, 4096, 65546]),
+                    Append::Row(65547),
+                ],
+                ends: &[3, 4, 6],
+            },
+        ];
+        for case in cases {
+            let mut seeds = IdentitySetSeeds::default();
+            let mut accepted = Vec::new();
+            for append in case.appends {
+                match append {
+                    Append::Page(page) => {
+                        let page = rows(page.iter().copied());
+                        seeds.append_page(&page);
+                        accepted.extend(page);
+                    }
+                    Append::Row(row) => {
+                        let row = RowID::new(u64::from(*row));
+                        seeds.append_row(row);
+                        accepted.push(row);
+                    }
+                }
+            }
+            assert_eq!(seeds.as_slice().len(), case.ends.len(), "{}", case.name);
+            let mut start = 0;
+            for (idx, (seed, &end)) in seeds.as_slice().iter().zip(case.ends).enumerate() {
+                assert_eq!(
+                    (seed.start, seed.end),
+                    (start, end),
+                    "{}, seed={idx}",
+                    case.name
+                );
+                let source = &accepted[start..end];
+                let expected = IdentitySetStats {
+                    first: source[0].as_u64(),
+                    last: source[source.len() - 1].as_u64(),
+                    count: source.len(),
+                    runs: 1 + source
+                        .windows(2)
+                        .filter(|pair| pair[1].as_u64() != pair[0].as_u64() + 1)
+                        .count(),
+                };
+                assert_eq!(seed.stats, expected, "{}, seed={idx}", case.name);
+                start = end;
+            }
+            assert_eq!(start, accepted.len(), "{}", case.name);
+        }
+    }
+
     /// Purpose: Protect every whole codec's membership, inverse mapping, and ordered cursor.
     /// Expected: Compact operations agree with an independent sorted oracle across narrow and wide boundaries.
     #[test]
@@ -1566,16 +1686,16 @@ mod tests {
             if values.is_empty() {
                 continue;
             }
-            let mut seeds = Vec::new();
-            for (idx, chunk) in values.chunks(23).enumerate() {
-                IdentitySetSeed::append_page(&mut seeds, chunk, idx * 23);
+            let mut seeds = IdentitySetSeeds::default();
+            for chunk in values.chunks(23) {
+                seeds.append_page(chunk);
             }
-            let plan = IdentitySetPlan::new(&values, 0, span, &seeds);
+            let plan = IdentitySetPlan::new(&values, 0, span, seeds.as_slice());
             let encoded = EncodedIdentitySet::plan(
                 RowID::new(0),
                 RowID::new(u64::from(span)),
                 &values,
-                &seeds,
+                seeds.as_slice(),
                 65184,
             )
             .unwrap();
@@ -1587,7 +1707,7 @@ mod tests {
                     RowID::new(0),
                     RowID::new(u64::from(span)),
                     &values,
-                    &seeds,
+                    seeds.as_slice(),
                     65184
                 )
                 .unwrap()

@@ -876,8 +876,7 @@ impl RowSizeLayout {
         // TableColumnLayout::build bounds the column count by the ordinal domain.
         let mut layout = Self {
             row_page_base_bytes: 0,
-            lwc_base_bytes: singleton_base_bytes(columns)
-                .ok_or_else(|| "LWC base size overflow".to_owned())?,
+            lwc_base_bytes: singleton_base_bytes(columns),
             b1_count: 0,
             b2_count: 0,
             b4_count: 0,

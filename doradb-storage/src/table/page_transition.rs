@@ -1119,8 +1119,7 @@ pub(crate) mod tests {
             let layout = Arc::clone(&fixture.map.column_layout);
             let view = fixture
                 .page
-                .vector_view_with_del_bitmap(&layout, plan.del_bitmap.clone())
-                .unwrap();
+                .vector_view_with_del_bitmap(&layout, plan.del_bitmap.clone());
             let values = fixture.page.row(0).vals_for_read_set(&layout, &[0]);
             let dirty = AtomicBool::new(false);
             let mut access = test_row_write_access(&fixture.page, &fixture.map, &dirty, 0);
@@ -1131,7 +1130,7 @@ pub(crate) mod tests {
                 undo.kind = RowUndoKind::delete();
             }
             assert!(fixture.page.is_deleted(0));
-            assert_eq!(view.rows_non_deleted(), 1);
+            assert_eq!(view.range_non_deleted_from(0).collect::<Vec<_>>(), [(0, 1)]);
             assert!(!access.validate_undo_rollback(undo, &status).unwrap());
             access.rollback_first_undo(&layout, undo);
             drop(access);
@@ -1143,7 +1142,7 @@ pub(crate) mod tests {
             assert_eq!(fixture.page.row(0).vals_for_read_set(&layout, &[0]), values);
             assert_eq!(fixture.page.header.row_count(), 1);
             assert_eq!(plan.del_bitmap, bitmap);
-            assert_eq!(view.rows_non_deleted(), 1);
+            assert_eq!(view.range_non_deleted_from(0).collect::<Vec<_>>(), [(0, 1)]);
             assert!(
                 fixture
                     .map
@@ -1175,8 +1174,7 @@ pub(crate) mod tests {
             let values = fixture.page.row(0).vals_for_read_set(layout, &[0]);
             let view = fixture
                 .page
-                .vector_view_with_del_bitmap(layout, bitmap.clone())
-                .unwrap();
+                .vector_view_with_del_bitmap(layout, bitmap.clone());
             if transition_first {
                 *fixture.map.write_state() = RowPageState::Transition;
             }
@@ -1203,7 +1201,7 @@ pub(crate) mod tests {
             assert_eq!(fixture.page.header.row_count(), 1);
             assert!(!fixture.page.is_deleted(0));
             assert_eq!(plan.del_bitmap, bitmap);
-            assert_eq!(view.rows_non_deleted(), 1);
+            assert_eq!(view.range_non_deleted_from(0).collect::<Vec<_>>(), [(0, 1)]);
         }
     }
 

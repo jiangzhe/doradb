@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::mem;
 use std::num::{NonZeroU64, NonZeroUsize};
-use zerocopy::{Immutable, IntoBytes};
+use zerocopy::IntoBytes;
 
 /// Result returned by byte deserializers before a format caller adds context.
 pub(crate) type DeserResult<T> = DataIntegrityResult<T>;
@@ -1002,134 +1002,6 @@ impl Deser for () {
     }
 }
 
-/// Integer wire encoding selected by complete serialized cost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IntegerEncoding {
-    Flat,
-    ForBitpacking { bits: u8 },
-}
-
-/// Exact integer serialization plan, excluding the outer LWC compression tag.
-/// The minimum also supplies the canonical value for physical null slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct IntegerEncodingPlan<T> {
-    len: usize,
-    min: T,
-    encoding: IntegerEncoding,
-}
-
-impl<T: BitPackable + Ord + Into<i128>> IntegerEncodingPlan<T> {
-    /// Plans from logical non-null extrema and the full physical row count.
-    /// All-null columns supply zero extrema; empty columns always use flat.
-    #[inline]
-    pub(crate) fn from_extrema(len: usize, min: T, max: T) -> Self {
-        let mut plan = Self {
-            len,
-            min,
-            encoding: IntegerEncoding::Flat,
-        };
-        if len != 0 {
-            // i128 represents every supported integer and its full positive range.
-            let range = (max.into() - min.into()) as u64;
-            if let Some(bits) = bitpacking_width(range, mem::size_of::<T>()) {
-                let packed = Self {
-                    encoding: IntegerEncoding::ForBitpacking { bits },
-                    ..plan
-                };
-                if packed.ser_len() < plan.ser_len() {
-                    plan = packed;
-                }
-            }
-        }
-        plan
-    }
-}
-
-impl<T: Copy> IntegerEncodingPlan<T> {
-    /// Returns the selected encoding without recomputing statistics.
-    #[inline]
-    pub(crate) fn encoding(&self) -> IntegerEncoding {
-        self.encoding
-    }
-
-    /// Returns the canonical null placeholder and FOR base.
-    #[inline]
-    pub(crate) fn min(&self) -> T {
-        self.min
-    }
-
-    /// Returns the exact serialized length, excluding the LWC compression tag.
-    #[inline]
-    pub(crate) fn ser_len(&self) -> usize {
-        match self.encoding {
-            IntegerEncoding::Flat => 8 + self.len * mem::size_of::<T>(),
-            IntegerEncoding::ForBitpacking { bits } => {
-                1 + 8 + mem::size_of::<T>() + (self.len * usize::from(bits)).div_ceil(8)
-            }
-        }
-    }
-}
-
-impl<T> IntegerEncodingPlan<T>
-where
-    T: BitPackable + IntoBytes + Immutable + for<'a> Ser<'a>,
-{
-    /// Writes the selected integer encoding without the outer LWC tag.
-    /// Flat stores an eight-byte count and little-endian values. FOR stores a
-    /// width byte, count, typed minimum, and rounded packed delta bytes.
-    /// The caller owns the value-range invariant, including null normalization.
-    #[inline]
-    pub(crate) fn ser<S: Serde + ?Sized>(
-        &self,
-        values: &[T],
-        out: &mut S,
-        start_idx: usize,
-    ) -> usize {
-        // The plan owns the physical row count for both encodings. Enforce the
-        // slice pairing before writing any bytes, without rescanning its range.
-        assert_eq!(
-            values.len(),
-            self.len,
-            "integer encoding plan slice length mismatch: encoding={:?}",
-            self.encoding
-        );
-        match self.encoding {
-            IntegerEncoding::Flat => {
-                let idx = out.ser_u64(start_idx, self.len as u64);
-                #[cfg(target_endian = "little")]
-                {
-                    out.ser_byte_slice(idx, values.as_bytes())
-                }
-                #[cfg(not(target_endian = "little"))]
-                {
-                    let mut idx = idx;
-                    for value in values {
-                        idx = value.ser(out, idx);
-                    }
-                    idx
-                }
-            }
-            IntegerEncoding::ForBitpacking { bits } => {
-                let idx = out.ser_u8(start_idx, bits);
-                let idx = out.ser_u64(idx, self.len as u64);
-                let idx = self.min.ser(out, idx);
-                let packed_len = self.ser_len() - 1 - 8 - mem::size_of::<T>();
-                let (idx, to_pack) = out.ser_mut(idx, packed_len);
-                match bits {
-                    1 => for_b1_pack(values, self.min, to_pack),
-                    2 => for_b2_pack(values, self.min, to_pack),
-                    4 => for_b4_pack(values, self.min, to_pack),
-                    8 => for_b8_pack(values, self.min, to_pack),
-                    16 => for_b16_pack(values, self.min, to_pack),
-                    32 => for_b32_pack(values, self.min, to_pack),
-                    _ => unreachable!("integer encoding plan contains an unsupported width"),
-                }
-                idx
-            }
-        }
-    }
-}
-
 /// FOR+bitpacking decompression.
 #[cfg_attr(not(test), expect(dead_code, reason = "reserved ForBitpackingDeser"))]
 pub(crate) struct ForBitpackingDeser<T>(
@@ -1257,7 +1129,6 @@ mod tests {
     use super::*;
     use std::any::type_name;
     use std::fmt::Debug;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[derive(Debug, PartialEq, Eq)]
     struct TestStruct {
@@ -1639,82 +1510,6 @@ mod tests {
         let (idx, res) = <[u8; 5]>::deser(&vec[..], 0).unwrap();
         assert_eq!(idx, 5);
         assert_eq!(res, array);
-    }
-
-    /// Purpose: Write planned flat and FOR payloads into a bounded subrange without reselecting their encoding.
-    /// Expected: Wire bytes match independent fixtures, decode exactly, and leave surrounding bytes untouched.
-    #[test]
-    fn integer_plan_writes_exact_wire_extent() {
-        for (case, input, min, max, wire) in [
-            ("empty flat", vec![], 0i16, 0, vec![0; 8]),
-            (
-                "singleton flat",
-                vec![-300],
-                -300,
-                -300,
-                vec![1, 0, 0, 0, 0, 0, 0, 0, 0xd4, 0xfe],
-            ),
-            (
-                "preselected flat despite constant values",
-                vec![7; 5],
-                i16::MIN,
-                i16::MAX,
-                vec![5, 0, 0, 0, 0, 0, 0, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0],
-            ),
-            (
-                "signed FOR with preselected base",
-                vec![-1, 0, 1, -1, 0],
-                -2,
-                1,
-                vec![2, 5, 0, 0, 0, 0, 0, 0, 0, 0xfe, 0xff, 0x79, 2],
-            ),
-        ] {
-            let plan = IntegerEncodingPlan::from_extrema(input.len(), min, max);
-            assert_eq!(plan.ser_len(), wire.len(), "{case}");
-            let mut out = vec![0xa5; 3 + wire.len() + 5];
-            let end = plan.ser(&input, &mut out[..], 3);
-            assert_eq!(end, 3 + wire.len(), "{case}");
-            assert_eq!(&out[..3], &[0xa5; 3], "{case}: prefix");
-            assert_eq!(&out[3..end], wire, "{case}: wire");
-            assert_eq!(&out[end..], &[0xa5; 5], "{case}: suffix");
-            let (end, decoded) = match plan.encoding() {
-                IntegerEncoding::Flat => Vec::<i16>::deser(&wire[..], 0).unwrap(),
-                IntegerEncoding::ForBitpacking { .. } => {
-                    let (end, values) = ForBitpackingDeser::<i16>::deser(&wire[..], 0).unwrap();
-                    (end, values.0)
-                }
-            };
-            assert_eq!(end, wire.len(), "{case}: read extent");
-            assert_eq!(decoded, input, "{case}: values");
-        }
-    }
-
-    /// Purpose: Enforce the plan's physical row count for both integer encodings before writing.
-    /// Expected: Short and long slices fail the length contract and leave the destination unchanged.
-    #[test]
-    fn integer_plan_rejects_mismatched_slices_before_writing() {
-        for (case, count, encoding) in [
-            ("flat", 1, IntegerEncoding::Flat),
-            ("FOR", 16, IntegerEncoding::ForBitpacking { bits: 1 }),
-        ] {
-            let plan = IntegerEncodingPlan::from_extrema(count, 7u64, 7);
-            assert_eq!(plan.encoding(), encoding, "{case}");
-            for actual in [count - 1, count + 1] {
-                let input = vec![7; actual];
-                let mut out = vec![0xa5; 256];
-                let result = catch_unwind(AssertUnwindSafe(|| plan.ser(&input, &mut out[..], 3)));
-                let panic = result.expect_err("slice mismatch must fail its internal contract");
-                let message = panic.downcast_ref::<String>().unwrap();
-                assert!(
-                    message.contains("integer encoding plan slice length mismatch"),
-                    "{case}: {message}"
-                );
-                assert!(
-                    out.iter().all(|&byte| byte == 0xa5),
-                    "{case}: actual={actual}"
-                );
-            }
-        }
     }
 
     /// Purpose: Protect serialization of signed scalar collections.

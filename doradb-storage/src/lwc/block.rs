@@ -477,10 +477,8 @@ impl PreparedLwcBlock {
                         .unwrap(),
                 ) as usize;
                 let bitmap_start = range.start + mem::size_of::<u16>();
-                let bitmap_end = bitmap_start.checked_add(bitmap_len).ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidPayload)
-                        .attach("LWC null bitmap range overflows usize")
-                })?;
+                // Column offsets and bitmap lengths are persisted as u16.
+                let bitmap_end = bitmap_start + bitmap_len;
                 if bitmap_end > range.end {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach("LWC null bitmap payload is shorter than declared length"));
@@ -539,7 +537,17 @@ impl<'a> LwcColumn<'a> {
     /// Parses the compressed value payload for this column.
     #[inline]
     pub(crate) fn data(&self) -> DataIntegrityResult<LwcData<'a>> {
-        LwcData::from_bytes(self.kind, self.values)
+        let data = LwcData::from_bytes(self.kind, self.values)?;
+        if data.len() != self.row_count {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column value count mismatch: values={}, rows={}",
+                    data.len(),
+                    self.row_count
+                )),
+            );
+        }
+        Ok(data)
     }
 
     /// Returns the number of rows represented by this column.
@@ -690,7 +698,8 @@ mod tests {
     use crate::id::RowID;
     use crate::io::DirectBuf;
     use crate::layout::LayoutError;
-    use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer};
+    use crate::lwc::codec::LwcCode;
+    use crate::lwc::{AppendStop, LwcBuilder, LwcNullBitmapSer, LwcSourceCursor};
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
 
@@ -772,9 +781,13 @@ mod tests {
         let buf = {
             let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let view = page.vector_view(metadata.col.as_ref());
-            assert!(builder.append_view(view, page.header.start_row_id));
+            let mut cursor = LwcSourceCursor::new(&view);
+            assert_eq!(
+                builder.append_prefix(&view, &mut cursor, |_| {}).stop,
+                AppendStop::PageExhausted
+            );
             let binding_value = TEST_BLOCK_BINDING_VALUE;
-            builder.build(binding_value).unwrap()
+            builder.finish(binding_value).encode()
         };
         (metadata, buf)
     }
@@ -858,7 +871,7 @@ mod tests {
         let values_bytes = [LwcCode::Flat as u8, 4, 0, 0, 0, 0, 0, 0, 0, 10, 20, 30, 40];
 
         let null_bytes = [0b0000_1010u8];
-        let null_ser = LwcNullBitmapSer::new(&null_bytes).unwrap();
+        let null_ser = LwcNullBitmapSer::new(&null_bytes);
         let mut column_bytes = vec![0u8; null_ser.ser_len() + values_bytes.len()];
         let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
@@ -885,6 +898,30 @@ mod tests {
             output.push(lwc_data.value(i).unwrap().as_u8().unwrap());
         }
         assert_eq!(output, values);
+    }
+
+    /// Purpose: Enforce block row counts in both ordinary and cached column readers.
+    /// Expected: A valid column payload with fewer or more values than its enclosing block fails with a typed integrity error.
+    #[test]
+    fn column_readers_reject_block_row_count_mismatch() {
+        for rows in [2, 4] {
+            let (metadata, mut buf) = build_valid_persisted_lwc_block();
+            let page = persisted_payload_mut(&mut buf);
+            page.header = LwcBlockHeader::new(TEST_BLOCK_BINDING_VALUE, rows, 2, 0);
+            let column = page.column(&metadata.col, 0).unwrap();
+            let ordinary = column
+                .data()
+                .err()
+                .expect("column count differs from block");
+            let mut prepared = PreparedLwcBlock::new(page, &metadata.col).unwrap();
+            let cached = prepared
+                .decode_value(page, &metadata.col, 0, 0)
+                .unwrap_err();
+            for error in [ordinary, cached] {
+                assert_eq!(error.current_context(), &DataIntegrityError::InvalidPayload);
+                assert!(format!("{error:?}").contains("value count mismatch"));
+            }
+        }
     }
 
     /// Purpose: Reject block columns absent from the supplied table metadata.

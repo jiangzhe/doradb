@@ -1449,10 +1449,7 @@ fn build_lwc_blocks_from_row_records(
             )
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=plan_cold_row_identity")?;
-            let buf = builder
-                .build(shape.block_binding_value())
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=build_catalog_lwc_blocks, phase=encode_block")?;
+            let buf = builder.finish(shape.block_binding_value()).encode();
             lwc_blocks.push(PendingLwcBlock { shape, buf });
 
             builder = LwcBuilder::new(Arc::clone(&metadata.col));
@@ -1495,10 +1492,7 @@ fn build_lwc_blocks_from_row_records(
         )
         .change_context(RuntimeError::CatalogAccess)
         .attach("operation=plan_cold_row_identity")?;
-        let buf = builder
-            .build(shape.block_binding_value())
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=build_catalog_lwc_blocks, phase=encode_final_block")?;
+        let buf = builder.finish(shape.block_binding_value()).encode();
         lwc_blocks.push(PendingLwcBlock { shape, buf });
     }
     Ok(lwc_blocks)

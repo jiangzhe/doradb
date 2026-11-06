@@ -515,7 +515,7 @@ mod tests {
         );
         let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
         assert!(builder.append_row_values(RowID::new(0), row));
-        let encoded = builder.build(1).unwrap();
+        let encoded = builder.finish(1).encode();
         let block = LwcBlock::try_from_persisted_bytes(
             encoded.as_bytes(),
             FileKind::TableFile,
