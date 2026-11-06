@@ -2,7 +2,9 @@
 #[cfg(test)]
 use super::cold_extract::tests::Hooks;
 use super::disk_builder::DiskBuildAdmission;
-use super::{BudgetedVec, BuildEntries, BuildOutcome, DuplicateCheck, IndexBuildEntry};
+use super::{
+    BudgetedVec, BuildEntries, BuildOutcome, DuplicateCheck, IndexBuildEntry, MemoryReservation,
+};
 use crate::buffer::PoolGuards;
 use crate::catalog::TableIndexMetadata;
 use crate::catalog::index::IndexDdlGateScope;
@@ -13,7 +15,7 @@ use crate::id::{BlockID, RowID, TrxID};
 use crate::index::column_block_index::ColdReadProfile;
 use crate::index::column_block_index::{ColumnBlockRangeCursor, ColumnBuildWorkspace};
 use crate::index::{BTreeKeyEncoder, ColumnBlockIndex, secondary_index_encoder};
-use crate::lwc::LwcBlock;
+use crate::lwc::{LwcBlock, PreparedLwcBlock};
 use crate::memcmp::MEM_CMP_KEY_INLINE;
 #[cfg(feature = "profiling")]
 use crate::profiling::ColdRunMeasurements;
@@ -34,6 +36,8 @@ pub(super) struct ColdWorkspace {
     pub(super) sample: ColdRunMeasurements,
     // Retain admitted vector capacity; decoded payloads live only through row encoding.
     values: BudgetedVec<Val>,
+    // One block decoder lives within extract(), covered by this worker reservation.
+    _decoder_admission: MemoryReservation,
 }
 
 /// Source resources and exact key shape retained by every accepted cold worker.
@@ -140,9 +144,16 @@ impl ColdBuildSource {
                 "cold projection",
             )
             .change_context(RuntimeError::IndexAccess)?;
+        let decoder_admission = budget
+            .reserve(
+                PreparedLwcBlock::allocation_size(&self.layout.metadata().col),
+                "cold LWC decoder",
+            )
+            .change_context(RuntimeError::IndexAccess)?;
         Ok(ColdWorkspace {
             scan: Some(scan),
             values,
+            _decoder_admission: decoder_admission,
             #[cfg(feature = "profiling")]
             sample: ColdRunMeasurements::default(),
         })
@@ -192,6 +203,9 @@ impl ColdBuildSource {
                         .attach(format!("file={file_kind}, block=lwc_block, block_id={block_id}, create index LWC block binding value mismatch"))
                         .change_context(RuntimeError::CatalogAccess).into());
                 }
+                let mut prepared = PreparedLwcBlock::new(block, &self.layout.metadata().col)
+                    .change_context(RuntimeError::CatalogAccess)
+                    .attach_with(|| format!("operation=create_index, phase=prepare_cold_block, file={file_kind}, block_id={block_id}"))?;
                 for (row_idx, row_id) in identity
                     .as_ref()
                     .iter_deltas()
@@ -208,7 +222,7 @@ impl ColdBuildSource {
                             .attach(format!("create index found uncommitted cold-row delete marker: table_id={}, row_id={row_id}", table.table_id())).into()),
                         None => (),
                     }
-                    self.encode_row(block, row_idx, row_id, projection, &mut rows).attach_with(|| format!("operation=create_index, phase=encode_cold_row, file={file_kind}, block_id={block_id}, row_id={row_id}"))?;
+                    self.encode_row(block, &mut prepared, row_idx, row_id, projection, &mut rows).attach_with(|| format!("operation=create_index, phase=encode_cold_row, file={file_kind}, block_id={block_id}, row_id={row_id}"))?;
                 }
                 drop(persisted);
             }
@@ -226,6 +240,7 @@ impl ColdBuildSource {
     fn encode_row(
         &self,
         block: &LwcBlock,
+        prepared: &mut PreparedLwcBlock,
         row_idx: usize,
         row_id: RowID,
         projection: &mut ColdWorkspace,
@@ -235,8 +250,8 @@ impl ColdBuildSource {
         let index_spec = &self.spec;
         for index_key in &index_spec.keys {
             let column = index_key.column_ordinal.as_usize();
-            let value = block
-                .decode_value(&metadata.col, row_idx, column)
+            let value = prepared
+                .decode_value(block, &metadata.col, row_idx, column)
                 .change_context(RuntimeError::CatalogAccess)?;
             projection.values.push_reserved(value);
         }

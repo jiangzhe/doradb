@@ -2250,7 +2250,7 @@ mod tests {
         let LwcValues::Bytes { offsets, data } = &builder.columns[0].values else {
             panic!("byte column")
         };
-        assert!(data.is_empty());
+        assert_eq!(data.as_slice(), b"");
         assert_eq!(offsets, &vec![0; 257]);
         let buf = build_with_size_check(builder);
         assert_eq!(used_payload_size(&buf), 39 + 4 * 256 + 2 + 32);

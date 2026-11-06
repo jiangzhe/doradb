@@ -1,6 +1,6 @@
-//! Borrowed typed readers built from the same validation as prepared decoders.
+//! Checked point readers sharing structural parsing with fully validated prepared decoders.
 
-use super::codec::{IntegerMinimum, ValidatedLwcLayout, ValueLayout};
+use super::codec::{IntegerMinimum, LwcLayout, ValidatedLwcLayout, ValueLayout};
 use super::{LwcBytes, LwcPrimitiveData};
 use crate::compression::*;
 use crate::error::DataIntegrityResult;
@@ -13,16 +13,16 @@ use std::mem;
 /// Owned decoder metadata cached beside a readonly buffer guard.
 pub(crate) type PreparedLwcData = ValidatedLwcLayout;
 
-/// Borrowed values from one validated LWC column payload.
+/// Borrowed scalar readers that check byte-offset pairs when accessing values.
 pub(crate) enum LwcData<'a> {
     Primitive(LwcPrimitive<'a>),
     Bytes(LwcBytes<'a>),
 }
 
 impl<'a> LwcData<'a> {
-    /// Validates the full wire layout before creating borrowed scalar readers.
+    /// Validates payload framing in constant time; byte offsets are checked on access.
     pub(crate) fn from_bytes(kind: ValKind, input: &'a [u8]) -> DataIntegrityResult<Self> {
-        let parsed = ValidatedLwcLayout::from_bytes(kind, input)?;
+        let parsed = LwcLayout::from_bytes(kind, input)?;
         Ok(match parsed.encoding {
             ValueLayout::FlatVarByte {
                 offsets_start,
@@ -46,6 +46,7 @@ impl<'a> LwcData<'a> {
     }
 
     /// Decodes one physical slot; its column owns logical null handling.
+    /// Returns None for an out-of-range index or invalid offsets of the selected value.
     #[inline]
     pub(crate) fn value(&self, idx: usize) -> Option<Val> {
         match self {
@@ -122,7 +123,7 @@ macro_rules! primitive_readers {
         }
 
         impl<'a> LwcPrimitive<'a> {
-            fn from_layout(parsed: &ValidatedLwcLayout, input: &'a [u8]) -> Self {
+            fn from_layout(parsed: &LwcLayout, input: &'a [u8]) -> Self {
                 match (parsed.kind, parsed.encoding) {
                     $((ValKind::$kind, ValueLayout::FlatPrimitive { data_start, .. }) => Self::$flat(FlatReader::new(&input[data_start..])),)*
                     $((ValKind::$kind, ValueLayout::ForBitpacking { data_start, n_bits, min: IntegerMinimum::$category(min) }) => {

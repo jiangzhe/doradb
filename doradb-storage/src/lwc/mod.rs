@@ -5,6 +5,8 @@ mod builder;
 mod codec;
 mod reader;
 pub(crate) use builder::{AppendStop, LwcBuilder, LwcEncodeInput, LwcSourceCursor};
+#[cfg(test)]
+pub(crate) use codec::offset_validation_count;
 pub(crate) use reader::{LwcData, PreparedLwcData};
 #[cfg(test)]
 pub(crate) use tests::LwcNullBitmapSer;
@@ -578,23 +580,48 @@ mod tests {
         }
     }
 
-    /// Purpose: Validate variable-byte offset origins, ordering, and payload boundaries.
-    /// Expected: Both reader paths reject malformed offsets before exposing values.
+    /// Purpose: Separate point-local offset checks from complete variable-byte validation.
+    /// Expected: Both readers reject invalid endpoints; point reads check only their pair while preparation rejects malformed interior offsets.
     #[test]
     fn lwc_readers_reject_malformed_varbyte_offsets() {
-        for (case, offsets) in [
-            ("nonzero origin", vec![1u32, 1, 3]),
-            ("descending offsets", vec![0, 2, 1, 3]),
-            ("offset past backing data", vec![0, 4, 3]),
-            ("unreferenced trailing data", vec![0, 1, 2]),
+        for (case, offsets, expected) in [
+            ("nonzero origin", vec![1u32, 1, 3], None),
+            ("unreferenced trailing data", vec![0, 1, 2], None),
+            ("terminal past backing data", vec![0, 1, 4], None),
+            (
+                "descending offsets",
+                vec![0, 2, 1, 3],
+                Some(vec![Some("ab"), None, Some("bc")]),
+            ),
+            (
+                "offset past backing data",
+                vec![0, 4, 2, 3],
+                Some(vec![None, None, Some("c")]),
+            ),
         ] {
             let mut bytes = flat_payload((offsets.len() - 1) as u64, &[]);
             for offset in offsets {
                 bytes.extend_from_slice(&offset.to_le_bytes());
             }
             bytes.extend_from_slice(b"abc");
+            let before = offset_validation_count();
+            let ordinary = LwcData::from_bytes(ValKind::VarByte, &bytes);
+            if let Some(expected) = expected {
+                let ordinary = ordinary.unwrap();
+                assert_eq!(ordinary.len(), expected.len(), "{case}");
+                for (row, value) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        ordinary.value(row),
+                        value.map(|value| Val::try_from(value).unwrap()),
+                        "{case}: row={row}"
+                    );
+                }
+                assert_eq!(ordinary.value(ordinary.len()), None, "{case}");
+            } else {
+                assert_invalid_payload(case, ordinary);
+            }
+            assert_eq!(offset_validation_count(), before, "{case}: point access");
             assert_invalid_payload(case, PreparedLwcData::from_bytes(ValKind::VarByte, &bytes));
-            assert_invalid_payload(case, LwcData::from_bytes(ValKind::VarByte, &bytes));
         }
     }
 

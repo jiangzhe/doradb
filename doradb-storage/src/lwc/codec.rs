@@ -10,6 +10,9 @@ use error_stack::Report;
 use std::mem;
 use zerocopy::IntoBytes;
 
+#[cfg(test)]
+pub(crate) use tests::offset_validation_count;
+
 /// Flat codec tag and physical element count.
 pub(super) const FLAT_HEADER_LEN: usize = 1 + 8;
 /// FOR codec tag, packed width and physical element count, before the typed minimum.
@@ -164,7 +167,7 @@ pub(super) enum IntegerMinimum {
     Unsigned(u64),
 }
 
-/// Validated offsets and codec parameters; no page references are retained.
+/// Payload regions and codec parameters; individual byte offsets need separate checks.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ValueLayout {
     FlatPrimitive {
@@ -182,19 +185,19 @@ pub(super) enum ValueLayout {
     },
 }
 
-/// Shared validation result for borrowed readers and owned prepared decoders.
-/// Its offsets may only be applied to the immutable bytes used to construct it.
+/// Shared structural layout with validated extents and byte-offset endpoints.
+/// Interior byte offsets remain unchecked until point access or full validation.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ValidatedLwcLayout {
+pub(super) struct LwcLayout {
     pub(super) kind: ValKind,
     pub(super) len: usize,
     input_len: usize,
     pub(super) encoding: ValueLayout,
 }
 
-impl ValidatedLwcLayout {
-    /// Parses and validates one complete value payload, including byte offsets.
-    pub(crate) fn from_bytes(kind: ValKind, input: &[u8]) -> DataIntegrityResult<Self> {
+impl LwcLayout {
+    /// Parses a value payload in constant time without scanning interior byte offsets.
+    pub(super) fn from_bytes(kind: ValKind, input: &[u8]) -> DataIntegrityResult<Self> {
         let (_, tag) = input.deser_u8(0)?;
         let code = LwcCode::decode(tag)?;
         let count_start = match code {
@@ -216,10 +219,17 @@ impl ValidatedLwcLayout {
                         "LWC varbyte payload is shorter than its offset table",
                     ));
                 }
-                validate_byte_offsets(
-                    &input[FLAT_HEADER_LEN..data_start],
-                    input.len() - data_start,
-                )?;
+                // The extent includes N+1 offsets, even for an empty column.
+                if u32::read_le(&input[FLAT_HEADER_LEN..FLAT_HEADER_LEN + 4]) != 0 {
+                    return Err(invalid_layout("LWC varbyte origin offset is not zero"));
+                }
+                if u32::read_le(&input[data_start - 4..data_start]) as usize
+                    != input.len() - data_start
+                {
+                    return Err(invalid_layout(
+                        "LWC varbyte final offset does not match data length",
+                    ));
+                }
                 ValueLayout::FlatVarByte {
                     offsets_start: FLAT_HEADER_LEN,
                     data_start,
@@ -260,26 +270,49 @@ impl ValidatedLwcLayout {
             encoding,
         })
     }
+}
+
+/// Fully validated metadata for repeated decoding from the same immutable bytes.
+/// Only complete validation may construct this type; prepared access trusts its offsets.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedLwcLayout {
+    layout: LwcLayout,
+}
+
+impl ValidatedLwcLayout {
+    /// Parses the shared structural layout and validates all interior byte offsets.
+    pub(crate) fn from_bytes(kind: ValKind, input: &[u8]) -> DataIntegrityResult<Self> {
+        let layout = LwcLayout::from_bytes(kind, input)?;
+        if let ValueLayout::FlatVarByte {
+            offsets_start,
+            data_start,
+        } = layout.encoding
+        {
+            validate_byte_offsets(&input[offsets_start..data_start], input.len() - data_start)?;
+        }
+        Ok(Self { layout })
+    }
 
     /// Returns the validated physical element count.
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.layout.len
     }
 
     /// Decodes a scalar from the same immutable input used during validation.
     #[inline]
     pub(crate) fn value(&self, input: &[u8], idx: usize) -> Option<Val> {
-        debug_assert_eq!(input.len(), self.input_len);
-        if idx >= self.len {
+        let layout = &self.layout;
+        debug_assert_eq!(input.len(), layout.input_len);
+        if idx >= layout.len {
             return None;
         }
-        match self.encoding {
+        match layout.encoding {
             ValueLayout::FlatPrimitive {
                 data_start,
                 unit_len,
             } => Some(decode_primitive(
-                self.kind,
+                layout.kind,
                 &input[data_start + idx * unit_len..data_start + (idx + 1) * unit_len],
             )),
             ValueLayout::FlatVarByte {
@@ -309,7 +342,7 @@ impl ValidatedLwcLayout {
                     32 => u64::from(u32::read_le(&data[idx * 4..idx * 4 + 4])),
                     _ => unreachable!("validated LWC packing width"),
                 };
-                Some(decode_delta(self.kind, min, delta))
+                Some(decode_delta(layout.kind, min, delta))
             }
         }
     }
@@ -332,6 +365,8 @@ fn validate_extent(actual: usize, expected: usize) -> DataIntegrityResult<()> {
 }
 
 fn validate_byte_offsets(bytes: &[u8], data_len: usize) -> DataIntegrityResult<()> {
+    #[cfg(test)]
+    tests::record_offset_validation();
     let mut previous = None;
     for bytes in bytes.as_chunks::<4>().0 {
         let offset = u32::from_le_bytes(*bytes) as usize;
@@ -474,6 +509,20 @@ mod tests {
     use super::*;
     use crate::serde::{Deser, ForBitpackingDeser};
     use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    thread_local! {
+        static OFFSET_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Returns the number of complete offset validation attempts on this thread.
+    pub(crate) fn offset_validation_count() -> usize {
+        OFFSET_VALIDATIONS.get()
+    }
+
+    /// Records a validation attempt without affecting other test threads.
+    pub(super) fn record_offset_validation() {
+        OFFSET_VALIDATIONS.set(OFFSET_VALIDATIONS.get() + 1);
+    }
 
     fn assert_flat_wire<T: Primitive>(values: &[T], payload: &[u8]) {
         let mut expected = vec![1];

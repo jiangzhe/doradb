@@ -993,27 +993,31 @@ pub(super) mod tests {
                     .iter()
                     .all(|budget| budget.used() == 0)
             );
-            fail_build_budget(&admission.worker_budget(1), "cold identity and deletions");
-            let result = ColdLocalSort::new(
-                fixture.source.clone(),
-                fixture.engine.inner().core.thread_pool.clone(),
-                2,
-            )
-            .await;
-            assert!(matches!(result, Err(QuadError::Runtime(_))));
-            assert!(
-                cold_budgets(admission)
-                    .iter()
-                    .all(|budget| budget.used() == 0)
-            );
+            for purpose in ["cold identity and deletions", "cold LWC decoder"] {
+                fail_build_budget(&admission.worker_budget(1), purpose);
+                let result = ColdLocalSort::new(
+                    fixture.source.clone(),
+                    fixture.engine.inner().core.thread_pool.clone(),
+                    2,
+                )
+                .await;
+                assert!(matches!(result, Err(QuadError::Runtime(_))), "{purpose}");
+                assert!(
+                    cold_budgets(admission)
+                        .iter()
+                        .all(|budget| budget.used() == 0),
+                    "{purpose}"
+                );
+            }
         });
     }
 
     /// Purpose: Extract outlined cold values when scratch fits retained output but not an extra decoded row payload.
-    /// Expected: Both key modes preserve exact contents at the budget limit and release all retained charges on drop.
+    /// Expected: Both key modes preserve exact contents at the budget limit, validate byte offsets once per block, and release all retained charges on drop.
     #[test]
     fn cold_row_temporaries_do_not_consume_retained_budget() {
         use crate::index::build::IndexBuildEntry;
+        use crate::lwc::offset_validation_count;
         smol::block_on(async {
             const LIMIT: usize = 1024 * 1024;
             for unique in [false, true] {
@@ -1045,6 +1049,7 @@ pub(super) mod tests {
                     RowID::new(0)..end,
                     workspace.scan.take().unwrap(),
                 );
+                let validations_before = offset_validation_count();
                 let rows = complete_work(
                     source
                         .extract(&mut cursor, &mut workspace, &AtomicBool::new(false))
@@ -1052,6 +1057,11 @@ pub(super) mod tests {
                         .unwrap(),
                 );
                 assert!(cursor.exhausted());
+                assert_eq!(
+                    offset_validation_count() - validations_before,
+                    1,
+                    "unique={unique}"
+                );
                 let mut actual: Vec<_> = rows
                     .iter()
                     .map(|entry| (entry.key.as_bytes().to_vec(), entry.row_id))

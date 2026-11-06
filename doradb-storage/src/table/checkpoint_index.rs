@@ -20,6 +20,7 @@ use crate::index::build::{
     PAYLOAD_CREDIT_BYTES, RunKind, SortedRun, SortedRuns,
 };
 use crate::index::{BTreeKeyEncoder, ColumnLeafEntry};
+use crate::lwc::PreparedLwcBlock;
 use crate::memcmp::MEM_CMP_KEY_INLINE;
 use crate::quiescent::QuiescentGuard;
 use crate::runtime::{thread_pool::ThreadPool, yield_now};
@@ -402,11 +403,27 @@ impl IndexSource {
                             .attach(format!("operation=extract_checkpoint_deletes, table_id={}", self.table.table_id()))
                             .into());
                     }
+                    // The decoder is dropped before its reservation at the block boundary.
+                    let _decoder_admission = budget
+                        .reserve(
+                            PreparedLwcBlock::allocation_size(columns),
+                            "checkpoint LWC decoder",
+                        )
+                        .change_context(RuntimeError::CheckpointExecution)?;
+                    let mut prepared = PreparedLwcBlock::new(block, columns)
+                        .change_context(RuntimeError::CheckpointExecution)
+                        .attach_with(|| {
+                            format!(
+                                "operation=extract_checkpoint_deletes, phase=prepare_block, table_id={}, block_id={}",
+                                self.table.table_id(), source.entry.block_id()
+                            )
+                        })?;
                     for &(ordinal, row_id) in &*source.rows {
                         for key in &spec.keys {
                             projection.push_reserved(
-                                block
+                                prepared
                                     .decode_value(
+                                        block,
                                         columns,
                                         usize::from(ordinal),
                                         key.column_ordinal.as_usize(),
@@ -847,6 +864,117 @@ mod tests {
                 BuildOutcome::Stopped
             ));
             assert_eq!(budget.used(), retained);
+            drop(source);
+            assert_eq!(budget.used(), 0);
+        });
+    }
+
+    /// Purpose: Reuse one admitted decoder across selected checkpoint delete rows.
+    /// Expected: Extraction validates byte offsets once, preserves selected keys, and releases decoder storage on success, stop, and admission failure.
+    #[test]
+    fn delete_extraction_reuses_decoder_and_releases_admission() {
+        use crate::catalog::tests::table3;
+        use crate::lwc::offset_validation_count;
+        use crate::session::tests::assert_checkpoint_published;
+        use crate::table::tests::{
+            assert_freeze_created, column_block_index_snapshot, insert_one_row,
+            lightweight_test_engine, table_for_internal_assertion,
+        };
+        use tempfile::TempDir;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine = lightweight_test_engine(&temp, "checkpoint_decode_cache").await;
+            let table_id = table3(&engine).await;
+            let table = table_for_internal_assertion(&engine, table_id);
+            let layout = table.layout_snapshot();
+            let index = layout.active_secondary_indexes().next().unwrap().0;
+            let mut session = engine.new_session().unwrap();
+            let mut rows = Vec::new();
+            for key in 0..8 {
+                let value = Val::try_from(format!("{key:03}{}", "payload".repeat(20)).into_bytes())
+                    .unwrap();
+                let row_id = insert_one_row(table_id, &mut session, vec![value.clone()]).await;
+                rows.push((row_id, value));
+            }
+            assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+            assert_checkpoint_published(&mut session, table_id).await;
+            let guards = session.pool_guards();
+            let snapshot = column_block_index_snapshot(&engine, table_id);
+            let context = snapshot
+                .index(guards.disk_guard())
+                .locate_deletion_context(rows[0].0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(context.entry.row_count(), rows.len() as u16);
+            let selected = [0usize, 2, 5];
+            let pairs: Vec<_> = selected
+                .iter()
+                .map(|&row| (row as u16, rows[row].0))
+                .collect();
+            let mut sources = sources();
+            sources.capture_deletes(context.entry, &pairs).unwrap();
+            let budget = sources.budget.clone();
+            let retained = budget.used();
+            let encoder = layout
+                .expect_secondary_index(index)
+                .disk_runtime()
+                .key_encoder_arc();
+            let expected: Vec<_> = selected
+                .iter()
+                .map(|&row| {
+                    (
+                        encoder.encode(std::slice::from_ref(&rows[row].1)),
+                        rows[row].0,
+                    )
+                })
+                .collect();
+            let source = Arc::new(IndexSource {
+                source: Arc::new(sources),
+                table,
+                layout,
+                guards,
+                index,
+                encoder,
+            });
+            let group = SourceGroup {
+                kind: RunKind::Delete,
+                range: 0..1,
+            };
+            let stop = AtomicBool::new(false);
+            let before = offset_validation_count();
+            let BuildOutcome::Complete(result) =
+                source.extract_group(0, group.clone(), &stop).await.unwrap()
+            else {
+                panic!("live extraction stopped");
+            };
+            assert_eq!(offset_validation_count() - before, 1);
+            let actual: Vec<_> = result
+                .run
+                .entries()
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.row_id))
+                .collect();
+            assert_eq!(actual, expected);
+            drop(result);
+            assert_eq!(budget.used(), retained);
+            stop.store(true, Ordering::Release);
+            assert!(matches!(
+                source.extract_group(0, group.clone(), &stop).await.unwrap(),
+                BuildOutcome::Stopped
+            ));
+            assert_eq!(budget.used(), retained);
+            assert_eq!(offset_validation_count() - before, 1);
+            stop.store(false, Ordering::Release);
+            fail_build_budget(&budget, "checkpoint LWC decoder");
+            let error = match source.extract_group(0, group, &stop).await {
+                Err(RuntimeOrFatalError::Runtime(error)) => error,
+                _ => panic!("expected decoder admission failure"),
+            };
+            assert!(error.contains::<ResourceError>(), "{error:?}");
+            assert!(format!("{error:?}").contains("checkpoint LWC decoder"));
+            assert_eq!(budget.used(), retained);
+            assert_eq!(offset_validation_count() - before, 1);
             drop(source);
             assert_eq!(budget.used(), 0);
         });

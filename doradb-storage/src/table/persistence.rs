@@ -3046,7 +3046,7 @@ mod tests {
                     assert_eq!(actual, expected, "group={group}");
                 }
             }
-            _ => assert!(root.secondary_index_slots.is_empty()),
+            _ => assert_eq!(root.secondary_index_slots, [] as [SecondaryIndexSlot; 0]),
         }
     }
 

@@ -147,8 +147,10 @@ variable-byte layout and null policy remain specific to block construction.
 
 `lwc/codec.rs` now owns integer plans, shared flat serialization, exact flat/FOR
 extents, singleton sizing helpers, and one validated payload description.
-Borrowed and prepared readers use the same parser, including byte-offset
-validation, and column readers check payload counts against their block.
+Borrowed and prepared readers share structural parsing, including byte-offset
+endpoints, and column readers check payload counts against their block. Point
+reads check only the selected offset pair; prepared readers validate all offsets
+once per traversal before retaining metadata for repeated decoding.
 The parser bounds persisted counts by the block header's u16 representation
 before sizing; shared flat/FOR extent helpers use ordinary arithmetic and return
 `usize` for both planning and reading.
