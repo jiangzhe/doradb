@@ -880,6 +880,7 @@ mod tests {
             assert_freeze_created, column_block_index_snapshot, insert_one_row,
             lightweight_test_engine, table_for_internal_assertion,
         };
+        use std::slice::from_ref;
         use tempfile::TempDir;
         smol::block_on(async {
             let temp = TempDir::new().unwrap();
@@ -922,12 +923,7 @@ mod tests {
                 .key_encoder_arc();
             let expected: Vec<_> = selected
                 .iter()
-                .map(|&row| {
-                    (
-                        encoder.encode(std::slice::from_ref(&rows[row].1)),
-                        rows[row].0,
-                    )
-                })
+                .map(|&row| (encoder.encode(from_ref(&rows[row].1)), rows[row].0))
                 .collect();
             let source = Arc::new(IndexSource {
                 source: Arc::new(sources),

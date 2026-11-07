@@ -8,6 +8,7 @@ Evaluate and implement advanced compression for LWC variable-length byte columns
 
 1. Source task document: `docs/tasks/000001-row-to-lwc-conversion.md`.
 2. Deferred note: VarByte uses flat encoding for now; advanced encoding deferred to future work.
+3. Exact-prefix and codec foundation: `docs/tasks/000339-stream-partial-rowpages-into-lwc-blocks.md`.
 
 ## Scope Hint
 
@@ -22,4 +23,18 @@ A follow-up task lands with selected VarByte compression strategy, format detail
 ## Notes (Optional)
 
 Coordinate with deletion/checkpoint bitmap and scan-path performance characteristics.
+
+## Deferred From (Optional)
+
+docs/tasks/000339-stream-partial-rowpages-into-lwc-blocks.md
+
+## Deferral Context (Optional)
+
+- Defer Reason: Task 000339 preserves existing flat/FOR encodings and the version-3
+  wire format; new variable-byte codecs need separate design and measurements.
+- Findings: Current prefix refinement relies on monotonic flat/FOR encoded costs.
+  Accepted plans already own the decisions reused by direct final-buffer writing.
+- Direction Hint: Give future codecs any prepared state they require in the frozen
+  encoding plan. Revisit prefix-search assumptions for nonmonotonic codecs instead
+  of forcing dictionary or FSST planning into the current extrema/length model.
 
