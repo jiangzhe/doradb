@@ -1829,7 +1829,7 @@ pub(crate) mod tests {
     pub(crate) mod test_hooks {
         use super::MaintenanceTestController;
         use crate::engine::Engine;
-        use crate::error::{InternalError, RuntimeError, RuntimeResult};
+        use crate::error::{RuntimeError, RuntimeResult};
         use crate::id::PageID;
         use error_stack::Report;
         use std::cell::RefCell;
@@ -1863,9 +1863,7 @@ pub(crate) mod tests {
             test: &MaintenanceTestController,
         ) -> RuntimeResult<()> {
             if test.force_lwc_build_error() {
-                return Err(Report::new(InternalError::LwcBuilderMisuse)
-                    .attach("test LWC build failure")
-                    .change_context(RuntimeError::TableAccess));
+                return Err(Report::new(RuntimeError::TableAccess).attach("test LWC build failure"));
             }
             Ok(())
         }

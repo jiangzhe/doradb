@@ -316,13 +316,14 @@ impl LwcBlock {
         #[cfg(test)]
         tests::record_decode(col_idx);
         let column = self.column(col_layout, col_idx)?;
+        // column() validated the bitmap; null values do not access the value stream.
         if column.is_null(row_idx) {
             return Ok(Val::Null);
         }
         let data = column.data()?;
         data.value(row_idx).ok_or_else(|| {
             Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("LWC row index {row_idx} is out of range"))
+                .attach(format!("invalid LWC value: row_idx={row_idx}, col_idx={col_idx}; row index is out of range or value offsets are invalid"))
         })
     }
 }
@@ -371,16 +372,24 @@ impl PersistedLwcBlock {
 struct PreparedLwcColumn {
     null_bitmap: Option<Range<usize>>,
     values: Range<usize>,
-    data: PreparedLwcData,
+    data: Option<PreparedLwcData>,
 }
 
 /// Lazy owned decoder cache for one loaded immutable LWC block.
+/// All accesses must use the same block bytes and column layout as construction.
 pub(crate) struct PreparedLwcBlock {
     column_ranges: Box<[Range<usize>]>,
     columns: Box<[Option<PreparedLwcColumn>]>,
 }
 
 impl PreparedLwcBlock {
+    /// Returns the heap allocation size of the decoder's two column arrays.
+    #[inline]
+    pub(crate) fn allocation_size(col_layout: &TableColumnLayout) -> usize {
+        col_layout.col_count()
+            * (mem::size_of::<Range<usize>>() + mem::size_of::<Option<PreparedLwcColumn>>())
+    }
+
     /// Parse and validate the column-offset plane once for a loaded block.
     pub(crate) fn new(
         block: &LwcBlock,
@@ -411,7 +420,7 @@ impl PreparedLwcBlock {
         })
     }
 
-    /// Decode one value, preparing its column metadata at most once.
+    /// Decodes one value, validating its value stream once on the first non-null read.
     pub(crate) fn decode_value(
         &mut self,
         block: &LwcBlock,
@@ -436,7 +445,7 @@ impl PreparedLwcBlock {
             self.columns[col_idx] = Some(column);
         }
         let column = self.columns[col_idx]
-            .as_ref()
+            .as_mut()
             .expect("prepared LWC column is present after successful initialization");
         if column.null_bitmap.as_ref().is_some_and(|range| {
             let byte = block.body[range.start + row_idx / 8];
@@ -444,13 +453,41 @@ impl PreparedLwcBlock {
         }) {
             return Ok(Val::Null);
         }
+        let values = &block.body[column.values.clone()];
+        if column.data.is_none() {
+            let data = PreparedLwcData::from_bytes(col_layout.val_kind(col_idx), values)?;
+            if data.len() != block.row_count() {
+                return Err(
+                    Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                        "LWC column value count mismatch: column={col_idx}, values={}, rows={}",
+                        data.len(),
+                        block.row_count()
+                    )),
+                );
+            }
+            column.data = Some(data);
+        }
         column
             .data
-            .value(&block.body[column.values.clone()], row_idx)
+            .as_ref()
+            .expect("prepared LWC value metadata is present after successful validation")
+            .value(values, row_idx)
             .ok_or_else(|| {
                 Report::new(DataIntegrityError::InvalidPayload)
                     .attach(format!("LWC row index {row_idx} is out of range"))
             })
+    }
+
+    /// Decodes a full row in schema order, reusing validated column metadata.
+    pub(crate) fn decode_full_row_values(
+        &mut self,
+        block: &LwcBlock,
+        col_layout: &TableColumnLayout,
+        row_idx: usize,
+    ) -> DataIntegrityResult<Vec<Val>> {
+        (0..col_layout.col_count())
+            .map(|col_idx| self.decode_value(block, col_layout, row_idx, col_idx))
+            .collect()
     }
 
     fn prepare_column(
@@ -477,10 +514,8 @@ impl PreparedLwcBlock {
                         .unwrap(),
                 ) as usize;
                 let bitmap_start = range.start + mem::size_of::<u16>();
-                let bitmap_end = bitmap_start.checked_add(bitmap_len).ok_or_else(|| {
-                    Report::new(DataIntegrityError::InvalidPayload)
-                        .attach("LWC null bitmap range overflows usize")
-                })?;
+                // Column offsets and bitmap lengths are persisted as u16.
+                let bitmap_end = bitmap_start + bitmap_len;
                 if bitmap_end > range.end {
                     return Err(Report::new(DataIntegrityError::InvalidPayload)
                         .attach("LWC null bitmap payload is shorter than declared length"));
@@ -495,21 +530,10 @@ impl PreparedLwcBlock {
             } else {
                 (None, range)
             };
-        let data =
-            PreparedLwcData::from_bytes(col_layout.val_kind(col_idx), &block.body[values.clone()])?;
-        if data.len() != block.row_count() {
-            return Err(
-                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                    "LWC column value count mismatch: column={col_idx}, values={}, rows={}",
-                    data.len(),
-                    block.row_count()
-                )),
-            );
-        }
         Ok(PreparedLwcColumn {
             null_bitmap,
             values,
-            data,
+            data: None,
         })
     }
 }
@@ -536,10 +560,21 @@ impl<'a> LwcColumn<'a> {
             .unwrap_or(false)
     }
 
-    /// Parses the compressed value payload for this column.
+    /// Parses payload framing and checks its row count without scanning byte offsets.
+    /// The returned reader validates the selected offset pair on each byte-value access.
     #[inline]
     pub(crate) fn data(&self) -> DataIntegrityResult<LwcData<'a>> {
-        LwcData::from_bytes(self.kind, self.values)
+        let data = LwcData::from_bytes(self.kind, self.values)?;
+        if data.len() != self.row_count {
+            return Err(
+                Report::new(DataIntegrityError::InvalidPayload).attach(format!(
+                    "LWC column value count mismatch: values={}, rows={}",
+                    data.len(),
+                    self.row_count
+                )),
+            );
+        }
+        Ok(data)
     }
 
     /// Returns the number of rows represented by this column.
@@ -690,7 +725,10 @@ mod tests {
     use crate::id::RowID;
     use crate::io::DirectBuf;
     use crate::layout::LayoutError;
-    use crate::lwc::{LwcBuilder, LwcCode, LwcNullBitmapSer};
+    use crate::lwc::codec::{FLAT_HEADER_LEN, LwcCode};
+    use crate::lwc::{
+        AppendStop, LwcBuilder, LwcNullBitmapSer, LwcSourceCursor, offset_validation_count,
+    };
     use crate::row::{InsertRow, RowPage};
     use crate::value::Val;
 
@@ -772,11 +810,44 @@ mod tests {
         let buf = {
             let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
             let view = page.vector_view(metadata.col.as_ref());
-            assert!(builder.append_view(view, page.header.start_row_id));
+            let mut cursor = LwcSourceCursor::new(&view);
+            assert_eq!(
+                builder.append_prefix(&view, &mut cursor, |_| {}).stop,
+                AppendStop::PageExhausted
+            );
             let binding_value = TEST_BLOCK_BINDING_VALUE;
-            builder.build(binding_value).unwrap()
+            builder.finish(binding_value).encode()
         };
         (metadata, buf)
+    }
+
+    fn nullable_bytes_block() -> (TableMetadata, DirectBuf, Vec<Vec<Val>>) {
+        let metadata = TableMetadata::try_new(
+            vec![
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
+                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+            ],
+            vec![],
+        )
+        .unwrap();
+        let rows: Vec<_> = [
+            Val::Null,
+            Val::try_from("").unwrap(),
+            Val::try_from("abc").unwrap(),
+            Val::Null,
+        ]
+        .into_iter()
+        .map(|value| vec![value, Val::try_from("unread").unwrap()])
+        .collect();
+        let mut builder = LwcBuilder::new(metadata.col.clone());
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert!(builder.append_row_values(RowID::new(row_idx as u64), row));
+        }
+        (
+            metadata,
+            builder.finish(TEST_BLOCK_BINDING_VALUE).encode(),
+            rows,
+        )
     }
 
     /// Purpose: Reject raw block lengths outside the fixed layout and preserve the source error.
@@ -858,7 +929,7 @@ mod tests {
         let values_bytes = [LwcCode::Flat as u8, 4, 0, 0, 0, 0, 0, 0, 0, 10, 20, 30, 40];
 
         let null_bytes = [0b0000_1010u8];
-        let null_ser = LwcNullBitmapSer::new(&null_bytes).unwrap();
+        let null_ser = LwcNullBitmapSer::new(&null_bytes);
         let mut column_bytes = vec![0u8; null_ser.ser_len() + values_bytes.len()];
         let idx = null_ser.ser(&mut column_bytes[..], 0);
         column_bytes[idx..].copy_from_slice(&values_bytes);
@@ -885,6 +956,56 @@ mod tests {
             output.push(lwc_data.value(i).unwrap().as_u8().unwrap());
         }
         assert_eq!(output, values);
+    }
+
+    /// Purpose: Enforce block row counts when accessing LWC value streams while preserving null reads.
+    /// Expected: Value-stream access rejects count mismatches with a typed integrity error; both readers handle nulls using the validated bitmap without decoding physical values.
+    #[test]
+    fn column_readers_reject_block_row_count_mismatch() {
+        for rows in [2, 4] {
+            let (metadata, mut buf) = build_valid_persisted_lwc_block();
+            let page = persisted_payload_mut(&mut buf);
+            page.header = LwcBlockHeader::new(TEST_BLOCK_BINDING_VALUE, rows, 2, 0);
+            assert_eq!(
+                page.decode_value(&metadata.col, 1, 1).unwrap(),
+                Val::Null,
+                "rows={rows}: null read does not decode physical values"
+            );
+            let mut prepared = PreparedLwcBlock::new(page, &metadata.col).unwrap();
+            assert_eq!(
+                prepared.decode_value(page, &metadata.col, 1, 1).unwrap(),
+                Val::Null,
+                "rows={rows}: prepared null read does not decode physical values"
+            );
+            for col_idx in 0..2 {
+                let column = page.column(&metadata.col, col_idx).unwrap();
+                for (reader, result) in [
+                    ("column", column.data().map(|_| ())),
+                    (
+                        "ordinary",
+                        page.decode_value(&metadata.col, 0, col_idx).map(|_| ()),
+                    ),
+                    (
+                        "cached",
+                        prepared
+                            .decode_value(page, &metadata.col, 0, col_idx)
+                            .map(|_| ()),
+                    ),
+                ] {
+                    let case = format!("reader={reader}, rows={rows}, column={col_idx}");
+                    let error = result.expect_err(&case);
+                    assert_eq!(
+                        error.current_context(),
+                        &DataIntegrityError::InvalidPayload,
+                        "{case}: {error:?}"
+                    );
+                    assert!(
+                        format!("{error:?}").contains("value count mismatch"),
+                        "{case}: {error:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Purpose: Reject block columns absent from the supplied table metadata.
@@ -1068,6 +1189,167 @@ mod tests {
         }
         assert_eq!(prepared_column_count(&prepared), 2);
         assert_eq!(PREPARE_COUNT.get() - preparations_before, 2);
+    }
+
+    /// Purpose: Keep full variable-byte validation out of point reads and reuse it within prepared traversals.
+    /// Expected: Point reads perform no full offset scans, prepared streams validate once per traversal, and both paths preserve nulls and empty values.
+    #[test]
+    fn varbyte_readers_bound_full_validation_to_prepared_traversals() {
+        let (metadata, mut buf, rows) = nullable_bytes_block();
+        let block = persisted_payload_mut(&mut buf);
+        let before = offset_validation_count();
+        for _ in 0..2 {
+            for (row_idx, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    block
+                        .decode_full_row_values(&metadata.col, row_idx)
+                        .unwrap(),
+                    *row
+                );
+            }
+        }
+        assert_eq!(
+            offset_validation_count(),
+            before,
+            "point reads do not scan offsets"
+        );
+        let mut prepared = PreparedLwcBlock::new(block, &metadata.col).unwrap();
+        for row in [0, 3] {
+            assert_eq!(
+                prepared.decode_value(block, &metadata.col, row, 0).unwrap(),
+                Val::Null
+            );
+        }
+        assert_eq!(offset_validation_count(), before);
+        assert!(prepared.columns[0].as_ref().unwrap().data.is_none());
+        assert!(prepared.columns[1].is_none());
+        for _ in 0..2 {
+            for (row_idx, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    prepared
+                        .decode_value(block, &metadata.col, row_idx, 0)
+                        .unwrap(),
+                    row[0]
+                );
+            }
+        }
+        assert_eq!(offset_validation_count() - before, 1);
+        assert!(prepared.columns[1].is_none());
+        for (row_idx, row) in rows.iter().enumerate() {
+            assert_eq!(
+                prepared
+                    .decode_full_row_values(block, &metadata.col, row_idx)
+                    .unwrap(),
+                *row
+            );
+        }
+        assert_eq!(offset_validation_count() - before, 2);
+        let mut fresh = PreparedLwcBlock::new(block, &metadata.col).unwrap();
+        assert_eq!(
+            fresh
+                .decode_full_row_values(block, &metadata.col, 2)
+                .unwrap(),
+            rows[2]
+        );
+        assert_eq!(offset_validation_count() - before, 4);
+    }
+
+    /// Purpose: Preserve offset corruption errors after bitmap-only null reads in both reader paths.
+    /// Expected: Invalid requested values return typed errors without caching invalid metadata, and unrelated valid slices remain readable by point access.
+    #[test]
+    fn varbyte_readers_reject_invalid_offsets_after_null() {
+        for (case, offsets, valid_point_value) in [
+            ("nonzero origin", [1u32, 1, 1, 3, 3], None),
+            ("descending", [0, 0, 3, 2, 3], Some("abc")),
+            ("past data", [0, 0, 0, 4, 3], Some("")),
+            ("short final offset", [0, 0, 0, 2, 2], None),
+        ] {
+            let (metadata, mut buf, _) = nullable_bytes_block();
+            let block = persisted_payload_mut(&mut buf);
+            let (start, _) = block.col_offsets().unwrap().get(0).unwrap();
+            let bitmap_len =
+                u16::from_le_bytes(block.body[start..start + 2].try_into().unwrap()) as usize;
+            let offsets_start = start + 2 + bitmap_len + FLAT_HEADER_LEN;
+            for (idx, offset) in offsets.iter().enumerate() {
+                block.body[offsets_start + idx * 4..offsets_start + (idx + 1) * 4]
+                    .copy_from_slice(&offset.to_le_bytes());
+            }
+            let before = offset_validation_count();
+            assert_eq!(
+                block.decode_value(&metadata.col, 0, 0).unwrap(),
+                Val::Null,
+                "{case}: point null read"
+            );
+            let error = block.decode_value(&metadata.col, 2, 0).unwrap_err();
+            assert_eq!(
+                error.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "{case}: {error:?}"
+            );
+            if let Some(expected) = valid_point_value {
+                assert_eq!(
+                    block.decode_value(&metadata.col, 1, 0).unwrap(),
+                    Val::try_from(expected).unwrap(),
+                    "{case}: unaffected point read"
+                );
+            }
+            assert_eq!(offset_validation_count(), before, "{case}: point access");
+            let mut prepared = PreparedLwcBlock::new(block, &metadata.col).unwrap();
+            for attempt in 1..=2 {
+                assert_eq!(
+                    prepared.decode_value(block, &metadata.col, 0, 0).unwrap(),
+                    Val::Null,
+                    "{case}"
+                );
+                let scans = usize::from(valid_point_value.is_some());
+                assert_eq!(
+                    offset_validation_count() - before,
+                    (attempt - 1) * scans,
+                    "{case}"
+                );
+                let error = prepared
+                    .decode_value(block, &metadata.col, 2, 0)
+                    .unwrap_err();
+                assert_eq!(
+                    error.current_context(),
+                    &DataIntegrityError::InvalidPayload,
+                    "{case}: {error:?}"
+                );
+                assert_eq!(
+                    offset_validation_count() - before,
+                    attempt * scans,
+                    "{case}"
+                );
+                assert!(
+                    prepared.columns[0].as_ref().unwrap().data.is_none(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// Purpose: Reject invalid bitmap extents before a prepared nullable read can return null.
+    /// Expected: Short and oversized bitmap lengths report invalid payload without validating the value stream.
+    #[test]
+    fn prepared_null_reads_validate_bitmap_extent() {
+        for bitmap_len in [0u16, u16::MAX] {
+            let (metadata, mut buf, _) = nullable_bytes_block();
+            let block = persisted_payload_mut(&mut buf);
+            let (start, _) = block.col_offsets().unwrap().get(0).unwrap();
+            block.body[start..start + 2].copy_from_slice(&bitmap_len.to_le_bytes());
+            let before = offset_validation_count();
+            let mut prepared = PreparedLwcBlock::new(block, &metadata.col).unwrap();
+            let error = prepared
+                .decode_value(block, &metadata.col, 0, 0)
+                .unwrap_err();
+            assert_eq!(
+                error.current_context(),
+                &DataIntegrityError::InvalidPayload,
+                "bitmap_len={bitmap_len}: {error:?}"
+            );
+            assert_eq!(offset_validation_count(), before);
+            assert!(prepared.columns[0].is_none());
+        }
     }
 
     /// Purpose: Decode persisted rows after index creation and removal.

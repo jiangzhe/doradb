@@ -188,8 +188,8 @@ within the LWC payload capacity. Physical values beneath integer nulls do not
 affect admission or encoding.
 
 Single-row admission ensures that each newly written row fits an LWC block.
-Splitting oversized multirow selections remains follow-up work in
-[backlog 000007](backlogs/000007-lwc-oversize-rowpage-handling.md).
+Checkpoint splits a page's visible rows across blocks as needed and combines
+rows from multiple pages when capacity permits.
 
 Page loading, vector-view construction, visibility filtering, and row copying
 remain on the single mandatory-runtime runner. After a builder owns one

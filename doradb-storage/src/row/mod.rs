@@ -1,10 +1,10 @@
+pub(crate) mod column_view;
 pub(crate) mod ops;
 mod values;
-pub(crate) mod vector_scan;
 
+use column_view::{PageVectorView, ValArrayRef};
 pub(crate) use ops::*;
 pub(crate) use values::{RowValues, UpdateValues};
-pub(crate) use vector_scan::*;
 
 use crate::bitmap::bitmap_required_units;
 use crate::buffer::page::{BufferPage, PAGE_SIZE, assert_buffer_page};
@@ -12,8 +12,8 @@ use crate::catalog::{TableColumnLayout, TableIndexMetadata};
 use crate::file::block_integrity::BLOCK_INTEGRITY_TRAILER_SIZE;
 use crate::id::RowID;
 use crate::layout;
+use crate::primitive::decode_primitive;
 use crate::value::*;
-use ordered_float::OrderedFloat;
 use std::borrow::Cow;
 use std::fmt;
 use std::mem;
@@ -510,7 +510,39 @@ impl RowPage {
         &'a self,
         col_layout: &'b TableColumnLayout,
     ) -> PageVectorView<'a, 'b> {
-        PageVectorView::new(self, col_layout)
+        self.vector_view_with_del_bitmap(col_layout, self.del_bitmap(self.header.row_count()))
+    }
+
+    /// Creates a column view from visibility prepared for this page's physical rows.
+    /// The caller must keep the row count stable between preparing the bitmap and
+    /// constructing the view; checkpoint uses Frozen and Transition pages.
+    ///
+    /// # Panics
+    /// Panics if the bitmap does not contain exactly one u64 per 64 physical rows,
+    /// rounding up for a partial word.
+    #[inline]
+    pub(crate) fn vector_view_with_del_bitmap<'p, 'm>(
+        &'p self,
+        col_layout: &'m TableColumnLayout,
+        del_bitmap: impl Into<Cow<'p, [u64]>>,
+    ) -> PageVectorView<'p, 'm> {
+        let row_count = self.header.row_count();
+        let del_bitmap = del_bitmap.into();
+        // Preparation copies exactly this row count's bitmap, then only changes
+        // bits. Frozen/Transition state prevents inserts from extending the count.
+        assert_eq!(
+            del_bitmap.len(),
+            bitmap_required_units(row_count),
+            "RowPage::vector_view_with_del_bitmap bitmap length mismatch: start_row_id={}, rows={row_count}",
+            self.header.start_row_id
+        );
+        PageVectorView {
+            page: self,
+            col_layout,
+            row_count,
+            source_range: 0..row_count,
+            del_bitmap,
+        }
     }
 
     /// Returns value at given row and given column.
@@ -598,46 +630,14 @@ impl RowPage {
     fn val_by_offset(&self, kind: ValKind, offset: usize) -> Val {
         let bs = &self.data()[offset..offset + kind.inline_len()];
         match kind {
-            ValKind::I8 => Val::I8(bs[0] as i8),
-            ValKind::U8 => Val::U8(bs[0]),
-            ValKind::I16 => {
-                let b: [u8; mem::size_of::<i16>()] = bs.try_into().unwrap();
-                Val::I16(i16::from_le_bytes(b))
-            }
-            ValKind::U16 => {
-                let b: [u8; mem::size_of::<u16>()] = bs.try_into().unwrap();
-                Val::U16(u16::from_le_bytes(b))
-            }
-            ValKind::I32 => {
-                let b: [u8; mem::size_of::<i32>()] = bs.try_into().unwrap();
-                Val::I32(i32::from_le_bytes(b))
-            }
-            ValKind::U32 => {
-                let b: [u8; mem::size_of::<u32>()] = bs.try_into().unwrap();
-                Val::U32(u32::from_le_bytes(b))
-            }
-            ValKind::F32 => {
-                let b: [u8; mem::size_of::<f32>()] = bs.try_into().unwrap();
-                Val::F32(OrderedFloat(f32::from_le_bytes(b)))
-            }
-            ValKind::I64 => {
-                let b: [u8; mem::size_of::<i64>()] = bs.try_into().unwrap();
-                Val::I64(i64::from_le_bytes(b))
-            }
-            ValKind::U64 => {
-                let b: [u8; mem::size_of::<u64>()] = bs.try_into().unwrap();
-                Val::U64(u64::from_le_bytes(b))
-            }
-            ValKind::F64 => {
-                let b: [u8; mem::size_of::<f64>()] = bs.try_into().unwrap();
-                Val::F64(OrderedFloat(f64::from_le_bytes(b)))
-            }
+            kind if kind.is_fixed() => decode_primitive(kind, bs),
             ValKind::VarByte => {
                 let b: [u8; 8] = bs.try_into().unwrap();
                 let var = PageVar::from_le_bytes(b);
                 // The page descriptor stores a u16 length.
                 Val::VarByte(MemVar::from_bytes(var.as_bytes(self.data())))
             }
+            _ => unreachable!("row value kind is fixed-width or variable bytes"),
         }
     }
 
@@ -1822,6 +1822,7 @@ const fn col_inline_len(kind: ValKind, row_count: usize) -> usize {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use ordered_float::OrderedFloat;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use crate::catalog::{

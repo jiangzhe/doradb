@@ -55,7 +55,7 @@ use crate::id::{BlockID, RowID, TableID, TrxID};
 use crate::index::{BlockIndex, ColumnBlockEntryShape, ColumnBlockIndex, ColumnLeafEntry};
 use crate::io::DirectBuf;
 use crate::log::redo::RowRedoKind;
-use crate::lwc::{LwcBuilder, PersistedLwcBlock};
+use crate::lwc::{LwcBuilder, PersistedLwcBlock, PreparedLwcBlock};
 use crate::map::{FastHashMap, FastHashSet};
 #[cfg(feature = "profiling")]
 use crate::profiling::{
@@ -1050,6 +1050,13 @@ impl CatalogStorage {
             .attach("operation=decode_catalog_lwc_page_rows, phase=validate_row_count")
             .map_err(Into::into);
         }
+        let mut prepared = PreparedLwcBlock::new(lwc_block, &metadata.col)
+            .change_context(RuntimeError::CatalogAccess)
+            .attach_with(|| {
+                format!(
+                    "operation=decode_catalog_lwc_page_rows, phase=prepare_block, file={file_kind}, block=lwc_block, block_id={block_id}"
+                )
+            })?;
         let mut rows = Vec::with_capacity(row_count);
         for (row_idx, row_id) in identity
             .as_ref()
@@ -1057,8 +1064,8 @@ impl CatalogStorage {
             .map(|delta| entry.start_row_id + u64::from(delta))
             .enumerate()
         {
-            let vals = lwc_block
-                .decode_full_row_values(&metadata.col, row_idx)
+            let vals = prepared
+                .decode_full_row_values(lwc_block, &metadata.col, row_idx)
                 .attach_with(|| format!("file={file_kind}, block=lwc_block, block_id={block_id}"))
                 .change_context(RuntimeError::CatalogAccess)
                 .attach_with(|| {
@@ -1197,9 +1204,17 @@ impl CatalogStorage {
                     ))
                     .change_context(RuntimeError::CatalogAccess).into());
             }
+            let mut prepared = PreparedLwcBlock::new(block, &metadata.col)
+                .change_context(RuntimeError::CatalogAccess)
+                .attach_with(|| {
+                    format!(
+                        "operation=validate_projected_catalog_integrity, phase=prepare_block, table_id={}, block_id={block_id}",
+                        root.table_id
+                    )
+                })?;
             for row_idx in 0..block_row_count {
-                let val = block
-                    .decode_value(metadata.col.as_ref(), row_idx, column_no)
+                let val = prepared
+                    .decode_value(block, metadata.col.as_ref(), row_idx, column_no)
                     .change_context(RuntimeError::CatalogAccess)
                     .attach_with(|| {
                         format!(
@@ -1449,10 +1464,7 @@ fn build_lwc_blocks_from_row_records(
             )
             .change_context(RuntimeError::CatalogAccess)
             .attach("operation=plan_cold_row_identity")?;
-            let buf = builder
-                .build(shape.block_binding_value())
-                .change_context(RuntimeError::CatalogAccess)
-                .attach("operation=build_catalog_lwc_blocks, phase=encode_block")?;
+            let buf = builder.finish(shape.block_binding_value()).encode();
             lwc_blocks.push(PendingLwcBlock { shape, buf });
 
             builder = LwcBuilder::new(Arc::clone(&metadata.col));
@@ -1495,10 +1507,7 @@ fn build_lwc_blocks_from_row_records(
         )
         .change_context(RuntimeError::CatalogAccess)
         .attach("operation=plan_cold_row_identity")?;
-        let buf = builder
-            .build(shape.block_binding_value())
-            .change_context(RuntimeError::CatalogAccess)
-            .attach("operation=build_catalog_lwc_blocks, phase=encode_final_block")?;
+        let buf = builder.finish(shape.block_binding_value()).encode();
         lwc_blocks.push(PendingLwcBlock { shape, buf });
     }
     Ok(lwc_blocks)
@@ -2924,6 +2933,78 @@ pub(crate) mod tests {
                 #[cfg(feature = "profiling")]
                 assert_eq!(stats.final_compact_bytes, 2 * COW_FILE_PAGE_SIZE);
             }
+        });
+    }
+
+    /// Purpose: Reuse variable-byte validation across full and projected catalog block traversals.
+    /// Expected: Each traversal validates the byte column once and returns every original value in row order.
+    #[test]
+    fn catalog_traversals_validate_varbytes_once_per_block() {
+        use crate::lwc::offset_validation_count;
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let engine =
+                open_catalog_test_engine(temp.path().to_path_buf(), Some("catalog_decode_cache"))
+                    .await;
+            let storage = &engine.inner().core.catalog().storage;
+            let table = storage.get_catalog_table(TABLE_ID_INDEXES).unwrap();
+            let metadata = table.metadata();
+            let rows: Vec<_> = (0..32u32)
+                .map(|id| {
+                    catalog_index_row_record(
+                        RowID::new(u64::from(id)),
+                        USER_TABLE_ID_START + 123,
+                        id,
+                        8,
+                    )
+                })
+                .collect();
+            let root =
+                build_unpublished_catalog_root(storage, TABLE_ID_INDEXES, metadata, &rows, None)
+                    .await;
+            let guard = storage.disk_pool.create_base_guard();
+            #[cfg(feature = "profiling")]
+            let measurement = catalog_measurement(storage);
+            let before = offset_validation_count();
+            let actual = storage
+                .load_rows_from_root(
+                    metadata,
+                    &guard,
+                    root,
+                    #[cfg(feature = "profiling")]
+                    &measurement,
+                )
+                .await
+                .unwrap();
+            assert_eq!(offset_validation_count() - before, 1);
+            assert_eq!(actual.len(), rows.len());
+            for (actual, expected) in actual.iter().zip(&rows) {
+                assert_eq!(actual.row_id, expected.row_id);
+                assert_eq!(actual.vals, expected.vals);
+            }
+            let mut projected = Vec::new();
+            storage
+                .visit_projected_catalog_column(
+                    root,
+                    TABLE_ID_INDEXES,
+                    4,
+                    &guard,
+                    |value| {
+                        projected.push(value);
+                        Ok(())
+                    },
+                    #[cfg(feature = "profiling")]
+                    &measurement,
+                )
+                .await
+                .unwrap();
+            assert_eq!(offset_validation_count() - before, 2);
+            assert_eq!(
+                projected,
+                rows.iter()
+                    .map(|row| row.vals[4].clone())
+                    .collect::<Vec<_>>()
+            );
         });
     }
 

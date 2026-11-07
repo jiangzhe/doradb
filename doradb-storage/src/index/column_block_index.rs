@@ -3090,6 +3090,7 @@ pub(super) mod tests {
     use crate::file::table_file::MutableTableFile;
     use crate::file::test_block_id;
     use crate::file::{FileKind, build_test_fs};
+    use crate::index::identity_set::IdentitySetSeeds;
     use crate::io::IOBuf;
     use crate::layout::LayoutError;
     use crate::lwc::{LWC_BLOCK_PAYLOAD_SIZE, LwcBlock, LwcBlockHeader, PersistedLwcBlock};
@@ -5202,9 +5203,9 @@ pub(super) mod tests {
             let legacy = RowSetRef::validate(2, &bytes, end as u32)
                 .unwrap()
                 .to_owned();
-            let mut seeds = Vec::new();
-            for (idx, chunk) in values.chunks(31).enumerate() {
-                IdentitySetSeed::append_page(&mut seeds, chunk, idx * 31);
+            let mut seeds = IdentitySetSeeds::default();
+            for chunk in values.chunks(31) {
+                seeds.append_page(chunk);
             }
             for hints in [&[][..], seeds.as_slice()] {
                 let adaptive = EncodedRowSet::plan(

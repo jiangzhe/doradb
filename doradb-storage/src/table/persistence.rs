@@ -12,8 +12,8 @@ use crate::catalog::{IndexSlot, SilentWatermarkObject, TableMetadata};
 use crate::completion::{Completion, CompletionTake};
 use crate::error::{
     CompletionErrorBridge, CompletionResult, DataIntegrityError, DataIntegrityResult, FatalError,
-    InternalError, InternalResult, LifecycleError, MultiDomainResultExt, RuntimeError,
-    RuntimeOrFatalError, RuntimeOrFatalResult, RuntimeOrFatalResultExt,
+    LifecycleError, MultiDomainResultExt, RuntimeError, RuntimeOrFatalError, RuntimeOrFatalResult,
+    RuntimeOrFatalResultExt,
 };
 use crate::file::cow_file::SUPER_BLOCK_ID;
 use crate::file::table_file::{ActiveRoot, MutableTableFile};
@@ -26,8 +26,7 @@ use crate::index::{
     ColumnBlockEntryInput, ColumnBlockEntryShape, ColumnBlockIndex, ColumnDeletionPatch,
 };
 use crate::io::DirectBuf;
-use crate::lwc::LwcBuilder;
-use crate::lwc::MAX_LWC_ROWS;
+use crate::lwc::{AppendStop, LwcBuilder, LwcEncodeInput, LwcSourceCursor};
 use crate::obs;
 #[cfg(feature = "profiling")]
 use crate::profiling::{CheckpointLwcProfile, clock::Instant};
@@ -127,7 +126,7 @@ pub(crate) enum CheckpointRetryObservation {
 enum LwcBlockState {
     Encoding {
         shape: ColumnBlockEntryShape,
-        completion: Arc<Completion<InternalResult<DirectBuf>>>,
+        completion: Arc<Completion<DirectBuf>>,
     },
     Writing {
         entry: ColumnBlockEntryInput,
@@ -199,7 +198,7 @@ impl<'a> CheckpointLwcPipeline<'a> {
 
     async fn submit(
         &mut self,
-        builder: LwcBuilder,
+        input: LwcEncodeInput,
         shape: ColumnBlockEntryShape,
     ) -> RuntimeOrFatalResult<()> {
         // First hand every consecutively ready logical predecessor to shared
@@ -214,10 +213,7 @@ impl<'a> CheckpointLwcPipeline<'a> {
                 "full checkpoint CPU stage must have a logical encoding head"
             );
         }
-        let block_binding_value = shape.block_binding_value();
-        let completion = self
-            .thread_pool
-            .submit(move || builder.build(block_binding_value));
+        let completion = self.thread_pool.submit(move || input.encode());
         self.blocks
             .push(Some(LwcBlockState::Encoding { shape, completion }));
         #[cfg(feature = "profiling")]
@@ -316,29 +312,18 @@ impl<'a> CheckpointLwcPipeline<'a> {
         &self,
         start_row_id: RowID,
         end_row_id: RowID,
-        result: CompletionResult<InternalResult<DirectBuf>>,
+        result: CompletionResult<DirectBuf>,
     ) -> RuntimeOrFatalResult<DirectBuf> {
-        result
-            .map_err(|bridge| {
-                bridge
-                    .into_runtime_or_fatal(RuntimeError::CheckpointExecution)
-                    .attach_with(|| {
-                        format!(
-                            "operation=build_and_write_lwc_blocks, phase=await_encode, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
-                            self.table_id
-                        )
-                    })
-            })?
-            .map_err(|report| {
-                RuntimeOrFatalError::from(
-                    report
-                        .change_context(RuntimeError::CheckpointExecution)
-                        .attach(format!(
-                            "operation=build_and_write_lwc_blocks, phase=encode_block, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
-                            self.table_id
-                        )),
-                )
-            })
+        result.map_err(|bridge| {
+            bridge
+                .into_runtime_or_fatal(RuntimeError::CheckpointExecution)
+                .attach_with(|| {
+                    format!(
+                        "operation=build_and_write_lwc_blocks, phase=await_encode, table_id={}, start_row_id={start_row_id}, end_row_id={end_row_id}",
+                        self.table_id
+                    )
+                })
+        })
     }
 
     #[inline]
@@ -1893,84 +1878,49 @@ impl Table {
             let mut current_start = RowID::new(0);
             let mut current_end = RowID::new(0);
             for prepared in prepared_pages {
-                let Some(prepared) = prepared.as_ref() else {
-                    return Err(RuntimeOrFatalError::from(
-                        Report::new(InternalError::LwcBuilderMisuse)
-                            .attach("transitioned page has no prepared visibility plan")
-                            .change_context(RuntimeError::CheckpointExecution)
-                            .attach(format!(
-                                "operation=build_and_write_lwc_blocks, table_id={}",
-                                self.table_id()
-                            )),
-                    ));
-                };
-                let mut cursor = 0usize;
-                let mut retry_end = None;
+                // Transition commits every selected page with its prepared visibility plan.
+                let prepared = prepared.as_ref().unwrap_or_else(|| {
+                    panic!("checkpoint LWC production is missing a prepared page: table_id={}", self.table_id())
+                });
+                let mut cursor = None;
                 loop {
-                    let selection = {
+                    let progress = {
                         let page_guard = self.row_store.must_get_row_page_shared(guards, prepared.page_id).await?;
                         let page = page_guard.page();
-                        assert_eq!(page.header.start_row_id, prepared.start_row_id);
-                        let source_count = page.header.row_count();
-                        let view = page.vector_view_with_del_bitmap(metadata.col.as_ref(), prepared.del_bitmap.clone())
-                            .and_then(|view| view.with_source_range(cursor..source_count))
-                            .change_context(RuntimeError::CheckpointExecution)
-                            .attach(format!("operation=build_checkpoint_selection, table_id={}, page_id={}", self.table_id(), prepared.page_id))?;
-                        let visible = view.rows_non_deleted();
-                        if visible == 0 { None } else if builder.row_count() == MAX_LWC_ROWS {
-                            // Keep a full builder pending until another visible selection
-                            // or the batch end fixes its final coverage and binding.
-                            Some((false, cursor))
-                        } else {
-                            let remaining = MAX_LWC_ROWS - builder.row_count();
-                            let end = retry_end.unwrap_or_else(|| {
-                                if visible <= remaining { return source_count; }
-                                let mut needed = remaining;
-                                for (start, end) in view.range_non_deleted() {
-                                    if end - start >= needed { return start + needed; }
-                                    needed -= end - start;
-                                }
-                                unreachable!("visible checkpoint ranges must satisfy remaining capacity")
-                            });
-                            let view = view.with_source_range(cursor..end)
-                                .change_context(RuntimeError::CheckpointExecution)
-                                .attach("operation=bound_checkpoint_selection")?;
-                            let ranges: Vec<_> = if collect_visible_row.is_some() { view.range_non_deleted().collect() } else { Vec::new() };
-                            let was_empty = builder.is_empty();
-                            let appended = builder.append_view(view, prepared.start_row_id);
-                            if appended {
-                                if was_empty { current_start = prepared.start_row_id + cursor as u64; }
-                                current_end = if end == source_count { prepared.end_row_id } else { prepared.start_row_id + end as u64 };
-                                if let Some(collect) = collect_visible_row.as_mut() {
-                                    for (start, end) in ranges {
-                                        for row_idx in start..end { collect(page, row_idx, page.row_id(row_idx)); }
-                                    }
+                        // Transition retains the source page until this conversion completes.
+                        assert!(page_guard.page_id() == prepared.page_id && page.header.start_row_id == prepared.start_row_id,
+                            "checkpoint LWC source identity changed: table_id={}, expected_page_id={}, actual_page_id={}, expected_start={}, actual_start={}",
+                            self.table_id(), prepared.page_id, page_guard.page_id(), prepared.start_row_id, page.header.start_row_id);
+                        let view = page.vector_view_with_del_bitmap(metadata.col.as_ref(), prepared.del_bitmap.as_slice());
+                        let cursor = cursor.get_or_insert_with(|| LwcSourceCursor::new(&view));
+                        let begin = cursor.consumed_to();
+                        let was_empty = builder.is_empty();
+                        let progress = builder.append_prefix(&view, cursor, |positions| {
+                            if let Some(collect) = collect_visible_row.as_mut() {
+                                for &pos in positions {
+                                    let pos = usize::from(pos);
+                                    collect(page, pos, page.row_id(pos));
                                 }
                             }
-                            Some((appended, end))
+                        });
+                        if progress.appended_rows != 0 {
+                            if was_empty { current_start = prepared.start_row_id + begin as u64; }
+                            current_end = if progress.stop == AppendStop::PageExhausted { prepared.end_row_id }
+                                else { prepared.start_row_id + progress.consumed_to as u64 };
                         }
+                        progress
                     };
-                    // Page guards and borrowed views never cross pipeline waits.
+                    // Cursor summaries and encode inputs own their data; the page guard
+                    // and borrowed prepared bitmap view end before any pipeline wait.
                     pipeline.advance_ready().await?;
-                    let Some((appended, end)) = selection else { break; };
-                    if appended {
-                        cursor = end;
-                        retry_end = None;
-                        continue;
-                    }
-                    if builder.is_empty() {
-                        return Err(Report::new(InternalError::LwcBuilderMisuse)
-                            .attach(format!("source row selection does not fit in LWC block: page_id={}, range={cursor}..{end}", prepared.page_id))
-                            .change_context(RuntimeError::CheckpointExecution)
-                            .attach(format!("operation=build_and_write_lwc_blocks, phase=append_page, table_id={}", self.table_id())).into());
-                    }
-                    if end > cursor { retry_end = Some(end); }
+                    if progress.stop == AppendStop::PageExhausted { break; }
                     let shape = ColumnBlockEntryShape::new(self.table_id(), current_start, current_end,
                         builder.row_ids(), builder.row_set_seeds())
                         .change_context(RuntimeError::CheckpointExecution)
                         .attach("operation=plan_cold_row_identity")?;
                     let completed = replace(&mut builder, LwcBuilder::new(Arc::clone(&metadata.col)));
-                    pipeline.submit(completed, shape).await?;
+                    let input = completed.finish(shape.block_binding_value());
+                    pipeline.submit(input, shape).await?;
                 }
             }
             if !builder.is_empty() {
@@ -1983,7 +1933,8 @@ impl Table {
                 )
                 .change_context(RuntimeError::CheckpointExecution)
                 .attach("operation=plan_cold_row_identity")?;
-                pipeline.submit(builder, shape).await?;
+                let input = builder.finish(shape.block_binding_value());
+                pipeline.submit(input, shape).await?;
             }
             Ok(())
         }
@@ -2104,6 +2055,7 @@ mod tests {
     };
     use crate::catalog::{StorageIndexFlags, StorageIndexKey, StorageIndexSpec};
     use crate::completion::{Completion, CompletionTake};
+    use crate::component::panic_payload_description;
     use crate::conf::{CheckpointIndexBuildConfig, RecoveryConfig, TrxSysConfig};
     use crate::engine::Engine;
     use crate::error::{
@@ -2116,6 +2068,7 @@ mod tests {
     use crate::index::RowLocation;
     use crate::index::{corrupt_leaf_reserved, corrupt_leaf_short_delete_section_header};
     use crate::io::{StorageBackendFileIdentity, install_storage_backend_test_hook};
+    use crate::lwc::MAX_LWC_ROWS;
     use crate::row::RowRead;
     use crate::row::ops::{SelectKey, SelectMvcc, UniqueMutationOutcome, UpdateCol};
     use crate::runtime::mandatory::MandatoryInternalTask;
@@ -2171,7 +2124,9 @@ mod tests {
     use smol::future::yield_now;
     use std::cmp::Ordering;
     use std::io::ErrorKind as IoErrorKind;
+    use std::panic::AssertUnwindSafe;
     use std::ptr::from_ref;
+    use std::slice::from_ref as slice_from_ref;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::task::Poll;
@@ -2784,7 +2739,7 @@ mod tests {
 
     fn test_lwc_encoding_state(
         start_row_id: u64,
-        completion: Arc<Completion<InternalResult<DirectBuf>>>,
+        completion: Arc<Completion<DirectBuf>>,
     ) -> LwcBlockState {
         let start_row_id = RowID::new(start_row_id);
         LwcBlockState::Encoding {
@@ -2999,6 +2954,100 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&marker_status, &ownership_status));
         undo_owner.lock().take();
+    }
+
+    async fn assert_prefix_checkpoint_rows(
+        engine: &Engine,
+        session: &mut Session,
+        table_id: TableID,
+        index_kind: usize,
+        cold: &[(RowID, Vec<Val>)],
+        extra: &[Vec<Val>],
+    ) {
+        let table = table_for_internal_assertion(engine, table_id);
+        let guards = session.pool_guards();
+        let root = table.file().active_root_unchecked();
+        let index = ColumnBlockIndex::new(
+            root.column_block_index_root,
+            root.pivot_row_id,
+            table.file().file_kind(),
+            table.file().sparse_file(),
+            table.disk_pool(),
+            guards.disk_guard(),
+        );
+        let entries = index.collect_leaf_entries().await.unwrap();
+        assert!(entries.len() > 1);
+        let mut actual = Vec::new();
+        for entry in entries {
+            let (identity, deletions) = index
+                .load_entry_identity_and_deletions(&entry)
+                .await
+                .unwrap();
+            assert!(deletions.is_empty());
+            let persisted = table
+                .storage
+                .load_lwc_block(guards.disk_guard(), entry.block_id())
+                .await
+                .unwrap();
+            let block = persisted.block();
+            assert_eq!(block.block_binding_value(), entry.block_binding_value());
+            assert_eq!(block.row_count(), usize::from(entry.row_count()));
+            assert!(block.row_count() <= MAX_LWC_ROWS);
+            for (ordinal, delta) in identity.as_ref().iter_deltas().enumerate() {
+                actual.push((
+                    entry.start_row_id + u64::from(delta),
+                    block
+                        .decode_full_row_values(&table.metadata().col, ordinal)
+                        .unwrap(),
+                ));
+            }
+        }
+        assert_eq!(actual, cold);
+        let mut reader = session.begin_trx().unwrap();
+        let mut scan = scan_table_rows(&mut reader, table_id, &[0, 1]).await;
+        let mut expected: Vec<_> = cold
+            .iter()
+            .map(|(_, row)| row.clone())
+            .chain(extra.iter().cloned())
+            .collect();
+        scan.sort_by_key(|row| row[0].as_u64().unwrap());
+        expected.sort_by_key(|row| row[0].as_u64().unwrap());
+        assert_eq!(scan, expected);
+        reader.commit().await.unwrap();
+        match index_kind {
+            1 => {
+                for (id, row) in cold {
+                    let key = single_key(row[0].as_u64().unwrap());
+                    assert_unique_index_entry(&table, &guards, &key, MAX_SNAPSHOT_TS, *id, false)
+                        .await;
+                }
+                for (_, row) in cold.iter().step_by(127) {
+                    let key = single_key(row[0].as_u64().unwrap());
+                    let trx = session.begin_trx().unwrap();
+                    let trx =
+                        expect_trx_select(table_id, trx, &key, |actual| assert_eq!(&actual, row))
+                            .await;
+                    trx.commit().await.unwrap();
+                }
+            }
+            2 => {
+                for group in 0..17u8 {
+                    let value = Val::try_from(vec![group; 6]).unwrap();
+                    let key = SelectKey {
+                        index_slot: IndexSlot::new(0),
+                        vals: vec![value.clone()],
+                    };
+                    let actual = non_unique_disk_tree_prefix_scan(&table, &guards, &key).await;
+                    let expected: Vec<_> = cold
+                        .iter()
+                        .filter(|(_, row)| row[1] == value)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    assert_eq!(actual, expected, "group={group}");
+                }
+            }
+            _ => assert_eq!(root.secondary_index_slots, [] as [SecondaryIndexSlot; 0]),
+        }
     }
 
     /// Purpose: Protect maintenance wait error classification during engine shutdown.
@@ -3222,10 +3271,10 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect column-block building when even the first row page cannot fit.
-    /// Expected: The operation returns a builder error with the offending page context.
+    /// Purpose: Defend checkpoint encoding against a raw oversized singleton that bypasses DML admission.
+    /// Expected: The builder asserts singleton admission with the offending source row range.
     #[test]
-    fn test_build_and_write_lwc_blocks_rejects_oversized_first_page() {
+    fn test_build_and_write_lwc_blocks_rejects_oversized_single_row() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "oversized-first-lwc-page").await;
@@ -3264,42 +3313,34 @@ mod tests {
                 del_bitmap: page.del_bitmap(page.header.row_count()),
                 overlay_markers: Vec::new(),
             };
-            let page_id = prepared.page_id;
             let new_pivot_row_id = prepared.end_row_id;
             drop(page_guard);
             let mut mutable_file = test_mutable_table_file(&engine, &table, &guards);
 
-            let err = match table
-                .build_and_write_lwc_blocks(
-                    &metadata,
-                    &guards,
-                    CheckpointLwcProduction {
-                        mutable_file: &mut mutable_file,
-                        thread_pool: engine.inner().thread_pool.clone(),
-                        new_pivot_row_id,
-                        prepared_pages: &[Some(prepared)],
-                    },
-                    None::<fn(&RowPage, usize, RowID)>,
-                    &engine.inner().maintenance_test,
-                )
-                .await
-            {
-                Ok(_) => panic!("oversized first row page should fail LWC block build"),
-                Err(err) => err,
-            };
-            let RuntimeOrFatalError::Runtime(runtime) = &err else {
-                panic!("oversized first row page must remain a Runtime error")
-            };
-            assert_eq!(
-                runtime.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::LwcBuilderMisuse)
-            );
-            let report = format!("{err:?}");
-            assert!(
-                report.contains("source row selection does not fit in LWC block"),
-                "{report}"
-            );
-            assert!(report.contains(&format!("page_id={page_id}")), "{report}");
+            let panic = AssertUnwindSafe(table.build_and_write_lwc_blocks(
+                &metadata,
+                &guards,
+                CheckpointLwcProduction {
+                    mutable_file: &mut mutable_file,
+                    thread_pool: engine.inner().thread_pool.clone(),
+                    new_pivot_row_id,
+                    prepared_pages: &[Some(prepared)],
+                },
+                None::<fn(&RowPage, usize, RowID)>,
+                &engine.inner().maintenance_test,
+            ))
+            .catch_unwind()
+            .await
+            .expect_err("raw oversized row bypassed singleton admission");
+            let message = panic_payload_description(panic.as_ref());
+            for detail in [
+                "LwcBuilder::append_prefix",
+                "singleton admission",
+                "range=0..1",
+                "source_rows=1",
+            ] {
+                assert!(message.contains(detail), "{message}");
+            }
         });
     }
 
@@ -3608,6 +3649,137 @@ mod tests {
         });
     }
 
+    /// Purpose: Publish and reopen admissible rows whose poor integer compression and inline-byte expansion overflow individual source pages.
+    /// Expected: Indexless, unique and nonunique tables preserve cold identities and values, exact index memberships, a committed redo tail, and later writes without poison.
+    #[test]
+    fn checkpoint_byte_splits_publish_reopen_and_replay_tail() {
+        smol::block_on(async {
+            for index_kind in 0..3 {
+                let temp = TempDir::new().unwrap();
+                let engine = lightweight_test_engine(&temp, "prefix-recovery").await;
+                let mut session = engine.new_session().unwrap();
+                let indexes = match index_kind {
+                    1 => vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(0)],
+                        StorageIndexFlags::UK,
+                    )],
+                    2 => vec![StorageIndexSpec::new(
+                        vec![StorageIndexKey::new(1)],
+                        StorageIndexFlags::empty(),
+                    )],
+                    _ => vec![],
+                };
+                let table_id = session
+                    .create_table(
+                        StorageTableSpec::new(vec![
+                            StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
+                            StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
+                        ]),
+                        indexes,
+                    )
+                    .await
+                    .unwrap()
+                    .table_id();
+                let mut trx = session.begin_trx().unwrap();
+                for pos in 0..8_000u64 {
+                    let key = pos.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    trx = expect_trx_insert(
+                        table_id,
+                        trx,
+                        vec![
+                            Val::U64(key),
+                            Val::try_from(vec![(pos % 17) as u8; 6]).unwrap(),
+                        ],
+                    )
+                    .await;
+                }
+                trx.commit().await.unwrap();
+                let table = table_for_internal_assertion(&engine, table_id);
+                let mut expected = Vec::new();
+                let mut oversize_sources = 0;
+                table
+                    .mem_scan(&session.pool_guards(), |guard| {
+                        let page = guard.page();
+                        let count = page.header.row_count();
+                        oversize_sources += usize::from(50 + 18 * count > 65_504);
+                        for pos in 0..count {
+                            expected.push((
+                                page.row_id(pos),
+                                vec![
+                                    page.val(&table.metadata().col, pos, 0),
+                                    page.val(&table.metadata().col, pos, 1),
+                                ],
+                            ));
+                        }
+                        true
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    oversize_sources > 0,
+                    "fixture must exercise aggregate byte overflow, index_kind={index_kind}"
+                );
+                expected.sort_by_key(|(id, _)| *id);
+                assert_eq!(expected.len(), 8_000);
+                assert_freeze_created(session.freeze_table(table_id, usize::MAX).await.unwrap());
+                assert_checkpoint_published(&mut session, table_id).await;
+                assert_prefix_checkpoint_rows(
+                    &engine,
+                    &mut session,
+                    table_id,
+                    index_kind,
+                    &expected,
+                    &[],
+                )
+                .await;
+                let tail = vec![Val::U64(1), Val::try_from("tail!!").unwrap()];
+                let trx = session.begin_trx().unwrap();
+                expect_trx_insert(table_id, trx, tail.clone())
+                    .await
+                    .commit()
+                    .await
+                    .unwrap();
+                assert!(engine.inner().poisoner.poison_error().is_none());
+                drop(table);
+                drop(session);
+                engine.shutdown();
+                let recovered = Engine::bootstrap(lightweight_test_engine_config(
+                    temp.path(),
+                    "prefix-recovery",
+                ))
+                .await
+                .unwrap();
+                let mut session = recovered.new_session().unwrap();
+                assert_prefix_checkpoint_rows(
+                    &recovered,
+                    &mut session,
+                    table_id,
+                    index_kind,
+                    &expected,
+                    slice_from_ref(&tail),
+                )
+                .await;
+                let next = vec![Val::U64(2), Val::try_from("next!!").unwrap()];
+                let trx = session.begin_trx().unwrap();
+                expect_trx_insert(table_id, trx, next.clone())
+                    .await
+                    .commit()
+                    .await
+                    .unwrap();
+                assert_prefix_checkpoint_rows(
+                    &recovered,
+                    &mut session,
+                    table_id,
+                    index_kind,
+                    &expected,
+                    &[tail, next],
+                )
+                .await;
+                assert!(recovered.inner().poisoner.poison_error().is_none());
+            }
+        });
+    }
+
     /// Purpose: Protect checkpoint pipeline ordering across encoded tasks.
     /// Expected: Output follows logical row order and consumes every accepted completion.
     #[test]
@@ -3646,8 +3818,8 @@ mod tests {
                 completion: Arc::clone(&second),
             }));
 
-            second.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
-            first.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
+            second.complete(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE)));
+            first.complete(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE)));
             let output = pipeline.finish(Ok(())).await.unwrap();
             assert_eq!(output.len(), 2);
             assert_eq!(output[0].start_row_id(), RowID::new(10));
@@ -3735,21 +3907,22 @@ mod tests {
         });
     }
 
-    /// Purpose: Protect pipeline draining after an encoder returns an internal error.
-    /// Expected: The checkpoint error preserves the builder cause and drains later accepted
-    /// encoding work.
+    /// Purpose: Protect pipeline draining after an encoder panics on a violated internal contract.
+    /// Expected: ThreadPool supervision reports a fatal panic, preserves its diagnostic, and drains later accepted encoding work.
     #[test]
-    fn checkpoint_lwc_pipeline_drains_after_inner_encode_error() {
+    fn checkpoint_lwc_pipeline_drains_after_encode_panic() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
-            let engine = lightweight_test_engine(&temp_dir, "lwc-encode-inner-error").await;
+            let engine = lightweight_test_engine(&temp_dir, "lwc-encode-panic").await;
             let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
             let mut pipeline = CheckpointLwcPipeline::new(
                 &mut mutable_file,
                 engine.inner().thread_pool.clone(),
                 table_id,
             );
-            let failed = Arc::new(Completion::new());
+            let failed = engine.inner().thread_pool.submit(|| -> DirectBuf {
+                panic!("LWC encode contract violated");
+            });
             let later = Arc::new(Completion::new());
             pipeline
                 .blocks
@@ -3757,36 +3930,38 @@ mod tests {
             pipeline
                 .blocks
                 .push(Some(test_lwc_encoding_state(20, Arc::clone(&later))));
-            failed.complete(Ok(Err(
-                Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
-            )));
-            later.complete(Ok(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE))));
+            later.complete(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE)));
 
             let error = match pipeline.finish(Ok(())).await {
-                Ok(_) => panic!("inner LWC encode failure must fail queue finish"),
+                Ok(_) => panic!("LWC encode panic must fail queue finish"),
                 Err(error) => error,
             };
-            let RuntimeOrFatalError::Runtime(report) = error else {
-                panic!("inner LWC encode failure must remain Runtime")
+            let RuntimeOrFatalError::Fatal(report) = error else {
+                panic!("LWC encode panic must remain Fatal")
             };
-            assert_eq!(report.current_context(), &RuntimeError::CheckpointExecution);
-            assert_eq!(
-                report.downcast_ref::<InternalError>().copied(),
-                Some(InternalError::LwcBuilderMisuse)
+            assert_eq!(report.current_context(), &FatalError::ThreadPoolTaskPanic);
+            let diagnostic = format!("{report:?}");
+            assert!(
+                diagnostic.contains("LWC encode contract violated"),
+                "{diagnostic}"
             );
+            assert!(diagnostic.contains("phase=await_encode"), "{diagnostic}");
+            assert!(engine.inner().poisoner.poison_error().is_some());
+            assert!(matches!(failed.try_take_result(), CompletionTake::Consumed));
             assert!(matches!(later.try_take_result(), CompletionTake::Consumed));
         });
     }
 
     /// Purpose: Protect error precedence when draining reveals a fatal encoder failure.
-    /// Expected: Fatal failure wins while earlier producer and encoder diagnostics remain
-    /// attached and completions are consumed.
+    /// Expected: Fatal failure wins while the earlier producer diagnostic remains attached,
+    /// successful pending buffers are discarded, and all completions are consumed.
     #[test]
     fn checkpoint_lwc_pipeline_fatal_drain_outranks_producer_error() {
         smol::block_on(async {
             let temp_dir = TempDir::new().unwrap();
             let engine = lightweight_test_engine(&temp_dir, "lwc-encode-fatal-drain").await;
             let (table_id, mut mutable_file) = test_lwc_pipeline_file(&engine).await;
+            let allocated_before = mutable_file.root().alloc_map.allocated();
             let mut pipeline = CheckpointLwcPipeline::new(
                 &mut mutable_file,
                 engine.inner().thread_pool.clone(),
@@ -3800,9 +3975,7 @@ mod tests {
             pipeline
                 .blocks
                 .push(Some(test_lwc_encoding_state(20, Arc::clone(&fatal))));
-            first.complete(Ok(Err(
-                Report::new(InternalError::LwcBuilderMisuse).attach("first encode failure")
-            )));
+            first.complete(Ok(DirectBuf::zeroed(COW_FILE_PAGE_SIZE)));
             fatal.complete(Err(CompletionErrorBridge::capture(
                 Report::new(FatalError::ThreadPoolTaskPanic).attach("fatal encode failure"),
             )));
@@ -3820,9 +3993,13 @@ mod tests {
             assert_eq!(report.current_context(), &FatalError::ThreadPoolTaskPanic);
             let diagnostic = format!("{report:?}");
             assert!(diagnostic.contains("producer page failure"), "{diagnostic}");
-            assert!(diagnostic.contains("first encode failure"), "{diagnostic}");
             assert!(matches!(first.try_take_result(), CompletionTake::Consumed));
             assert!(matches!(fatal.try_take_result(), CompletionTake::Consumed));
+            assert_eq!(
+                mutable_file.root().alloc_map.allocated(),
+                allocated_before,
+                "failed production must discard encoded buffers without allocating LWC blocks"
+            );
         });
     }
 
@@ -3886,7 +4063,15 @@ mod tests {
             let table = table_for_internal_assertion(&engine, table_id);
             let row_ids =
                 non_unique_disk_tree_prefix_scan(&table, &session.pool_guards(), &name_key).await;
-            assert_eq!(row_ids.len(), row_count as usize);
+            let mut expected_row_ids = Vec::new();
+            for key in 0..row_count {
+                let id = unique_disk_tree_lookup(&table, &session.pool_guards(), &single_key(key))
+                    .await
+                    .unwrap();
+                expected_row_ids.push(id);
+            }
+            expected_row_ids.sort_unstable();
+            assert_eq!(row_ids, expected_row_ids);
 
             let first_key = single_key(0i32);
             let last_key = single_key(row_count - 1);
@@ -4307,7 +4492,7 @@ mod tests {
                     ));
                 }
                 let binding = context.entry.block_binding_value() ^ u64::from(!wrong_count);
-                let replacement = builder.build(binding).unwrap();
+                let replacement = builder.finish(binding).encode();
                 rewrite_page_with_checksum(
                     engine.inner().table_fs.user_table_file_path(table_id),
                     context.entry.block_id(),

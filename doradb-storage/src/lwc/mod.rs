@@ -1,590 +1,30 @@
 //! This module contains definition and functions of LWC(Lightweight Compression) Block.
 
 pub(crate) mod block;
+mod builder;
+mod codec;
+mod reader;
+pub(crate) use builder::{AppendStop, LwcBuilder, LwcEncodeInput, LwcSourceCursor};
+#[cfg(test)]
+pub(crate) use codec::offset_validation_count;
+pub(crate) use reader::{LwcData, PreparedLwcData};
+#[cfg(test)]
+pub(crate) use tests::LwcNullBitmapSer;
 
-use crate::index::identity_set::IdentitySetSeed;
 pub(crate) use block::*;
 
-use crate::bitmap::Bitmap;
-use crate::catalog::TableColumnLayout;
-use crate::compression::*;
-use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
-use crate::file::block_integrity::{LWC_BLOCK_SPEC, write_block_checksum, write_block_header};
+use crate::error::{DataIntegrityError, DataIntegrityResult};
 use crate::file::cow_file::COW_FILE_PAGE_SIZE;
-use crate::id::RowID;
-use crate::io::DirectBuf;
-use crate::layout;
-use crate::row::vector_scan::{PageVectorView, ScanBuffer, ScanColumnValues, ValArrayRef};
-use crate::serde::{IntegerEncoding, IntegerEncodingPlan, Ser, Serde};
-use crate::value::{MemVar, Val, ValKind, ValType};
-use error_stack::{Report, ResultExt};
-use std::borrow::Cow;
+use crate::serde::Serde;
+use crate::value::{MemVar, ValType};
+use error_stack::Report;
 use std::mem;
-use std::slice::Iter;
-use std::sync::Arc;
-use zerocopy::{Immutable, IntoBytes};
 
 /// Physical row cap that guarantees inline identity and every deletion subset fit.
 pub(crate) const MAX_LWC_ROWS: usize = 15_360;
 
 const LWC_BLOCK_HEADER_SIZE: usize = mem::size_of::<LwcBlockHeader>();
 const LWC_BLOCK_BODY_SIZE: usize = LWC_BLOCK_PAYLOAD_SIZE - LWC_BLOCK_HEADER_SIZE;
-
-/// Lightweight compressed data.
-pub(crate) enum LwcData<'a> {
-    Primitive(LwcPrimitive<'a>),
-    Bytes(LwcBytes<'a>),
-}
-
-impl<'a> LwcData<'a> {
-    /// Parse input and create a reader to read compressed data.
-    /// The input format should be as below:
-    /// First byte must be compression code which indicates the
-    /// compression type of the data.
-    #[inline]
-    pub(crate) fn from_bytes(kind: ValKind, input: &'a [u8]) -> DataIntegrityResult<Self> {
-        let (code, input) = read_u8(input)?;
-        let c = LwcCode::decode(code)?;
-        let res = match c {
-            LwcCode::Flat => {
-                let (len, input) = read_le_u64(input)?;
-                let len = lwc_payload_len_from_u64(len, "LWC flat payload")?;
-                match kind {
-                    ValKind::I8 => {
-                        let input = flat_lwc_payload(input, len, 1, "LWC flat i8 payload")?;
-                        LwcData::Primitive(LwcPrimitive::FlatI8(FlatI8(input)))
-                    }
-                    ValKind::U8 => {
-                        let input = flat_lwc_payload(input, len, 1, "LWC flat u8 payload")?;
-                        LwcData::Primitive(LwcPrimitive::FlatU8(FlatU8(input)))
-                    }
-                    ValKind::I16 => {
-                        let input = flat_lwc_payload(input, len, 2, "LWC flat i16 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 2]>(input),
-                            "flat_i16_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatI16(FlatI16(input)))
-                    }
-                    ValKind::U16 => {
-                        let input = flat_lwc_payload(input, len, 2, "LWC flat u16 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 2]>(input),
-                            "flat_u16_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatU16(FlatU16(input)))
-                    }
-                    ValKind::I32 => {
-                        let input = flat_lwc_payload(input, len, 4, "LWC flat i32 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 4]>(input),
-                            "flat_i32_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatI32(FlatI32(input)))
-                    }
-                    ValKind::U32 => {
-                        let input = flat_lwc_payload(input, len, 4, "LWC flat u32 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 4]>(input),
-                            "flat_u32_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatU32(FlatU32(input)))
-                    }
-                    ValKind::F32 => {
-                        let input = flat_lwc_payload(input, len, 4, "LWC flat f32 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 4]>(input),
-                            "flat_f32_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatF32(FlatF32(input)))
-                    }
-                    ValKind::I64 => {
-                        let input = flat_lwc_payload(input, len, 8, "LWC flat i64 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 8]>(input),
-                            "flat_i64_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatI64(FlatI64(input)))
-                    }
-                    ValKind::U64 => {
-                        let input = flat_lwc_payload(input, len, 8, "LWC flat u64 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 8]>(input),
-                            "flat_u64_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatU64(FlatU64(input)))
-                    }
-                    ValKind::F64 => {
-                        let input = flat_lwc_payload(input, len, 8, "LWC flat f64 payload")?;
-                        let input = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 8]>(input),
-                            "flat_f64_payload",
-                        )?;
-                        LwcData::Primitive(LwcPrimitive::FlatF64(FlatF64(input)))
-                    }
-                    ValKind::VarByte => {
-                        let offset_count = len.checked_add(1).ok_or_else(|| {
-                            Report::new(DataIntegrityError::InvalidPayload)
-                                .attach("LWC varbyte offset table length overflows usize")
-                        })?;
-                        let offset_bytes_len = checked_lwc_payload_len(
-                            offset_count,
-                            mem::size_of::<u32>(),
-                            "LWC varbyte offset table",
-                        )?;
-                        if input.len() < offset_bytes_len {
-                            return Err(Report::new(DataIntegrityError::InvalidPayload)
-                                .attach("LWC varbyte payload is shorter than its offset table"));
-                        }
-                        let (offset_bytes, data) = input.split_at(offset_bytes_len);
-                        let offsets = persisted_lwc_layout(
-                            layout::try_slice_from_bytes::<[u8; 4]>(offset_bytes),
-                            "varbyte_offsets",
-                        )?;
-                        LwcData::Bytes(LwcBytes { offsets, data })
-                    }
-                }
-            }
-            LwcCode::ForBitpacking => {
-                // see `ForBitpackingDeser` for reference.
-                let (n_bits, input) = read_u8(input)?;
-                let (len, input) = read_le_u64(input)?;
-                let len = lwc_payload_len_from_u64(len, "LWC FOR bitpacking payload")?;
-                let n_bits = n_bits as usize;
-                let p = match kind {
-                    ValKind::I8 => {
-                        let (min, data) = read_i8(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1I8(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2I8(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4I8(ForBitpacking4 { len, min, data }),
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::U8 => {
-                        let (min, data) = read_u8(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1U8(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2U8(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4U8(ForBitpacking4 { len, min, data }),
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::I16 => {
-                        let (min, data) = read_le_i16(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1I16(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2I16(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4I16(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8I16(ForBitpacking8 { min, data }),
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::U16 => {
-                        let (min, data) = read_le_u16(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1U16(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2U16(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4U16(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8U16(ForBitpacking8 { min, data }),
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::I32 => {
-                        let (min, data) = read_le_i32(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1I32(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2I32(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4I32(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8I32(ForBitpacking8 { min, data }),
-                            16 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
-                                    "for_bitpacking_i32_u16_units",
-                                )?;
-                                LwcPrimitive::ForBp16I32(ForBitpacking16 { min, data })
-                            }
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::U32 => {
-                        let (min, data) = read_le_u32(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1U32(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2U32(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4U32(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8U32(ForBitpacking8 { min, data }),
-                            16 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
-                                    "for_bitpacking_u32_u16_units",
-                                )?;
-                                LwcPrimitive::ForBp16U32(ForBitpacking16 { min, data })
-                            }
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::I64 => {
-                        let (min, data) = read_le_i64(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1I64(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2I64(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4I64(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8I64(ForBitpacking8 { min, data }),
-                            16 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
-                                    "for_bitpacking_i64_u16_units",
-                                )?;
-                                LwcPrimitive::ForBp16I64(ForBitpacking16 { min, data })
-                            }
-                            32 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 4]>(data),
-                                    "for_bitpacking_i64_u32_units",
-                                )?;
-                                LwcPrimitive::ForBp32I64(ForBitpacking32 { min, data })
-                            }
-                            _ => {
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::U64 => {
-                        let (min, data) = read_le_u64(input)?;
-                        let data = for_bitpacking_lwc_payload(data, len, n_bits)?;
-                        match n_bits {
-                            1 => LwcPrimitive::ForBp1U64(ForBitpacking1 { len, min, data }),
-                            2 => LwcPrimitive::ForBp2U64(ForBitpacking2 { len, min, data }),
-                            4 => LwcPrimitive::ForBp4U64(ForBitpacking4 { len, min, data }),
-                            8 => LwcPrimitive::ForBp8U64(ForBitpacking8 { min, data }),
-                            16 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 2]>(data),
-                                    "for_bitpacking_u64_u16_units",
-                                )?;
-                                LwcPrimitive::ForBp16U64(ForBitpacking16 { min, data })
-                            }
-                            32 => {
-                                let data = persisted_lwc_layout(
-                                    layout::try_slice_from_bytes::<[u8; 4]>(data),
-                                    "for_bitpacking_u64_u32_units",
-                                )?;
-                                LwcPrimitive::ForBp32U64(ForBitpacking32 { min, data })
-                            }
-                            _ => {
-                                // any other number of bits are not supported.
-                                return Err(Report::new(DataIntegrityError::InvalidPayload).attach(
-                                    format!(
-                                        "unexpected packing bits: val_kind={kind:?}, n_bits={n_bits}"
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
-                        return Err(Report::new(DataIntegrityError::InvalidPayload)
-                            .attach(format!("unexpected type: val_kind={kind:?}")));
-                    }
-                };
-                LwcData::Primitive(p)
-            }
-        };
-        Ok(res)
-    }
-
-    /// Returns the length of Lwc Data.
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            LwcData::Primitive(p) => match p {
-                LwcPrimitive::FlatI8(f) => f.len(),
-                LwcPrimitive::FlatU8(f) => f.len(),
-                LwcPrimitive::FlatI16(f) => f.len(),
-                LwcPrimitive::FlatU16(f) => f.len(),
-                LwcPrimitive::FlatI32(f) => f.len(),
-                LwcPrimitive::FlatU32(f) => f.len(),
-                LwcPrimitive::FlatF32(f) => f.len(),
-                LwcPrimitive::FlatI64(f) => f.len(),
-                LwcPrimitive::FlatU64(f) => f.len(),
-                LwcPrimitive::FlatF64(f) => f.len(),
-                LwcPrimitive::ForBp1I8(f) => f.len(),
-                LwcPrimitive::ForBp2I8(f) => f.len(),
-                LwcPrimitive::ForBp4I8(f) => f.len(),
-                LwcPrimitive::ForBp1U8(f) => f.len(),
-                LwcPrimitive::ForBp2U8(f) => f.len(),
-                LwcPrimitive::ForBp4U8(f) => f.len(),
-                LwcPrimitive::ForBp1I16(f) => f.len(),
-                LwcPrimitive::ForBp2I16(f) => f.len(),
-                LwcPrimitive::ForBp4I16(f) => f.len(),
-                LwcPrimitive::ForBp8I16(f) => f.len(),
-                LwcPrimitive::ForBp1U16(f) => f.len(),
-                LwcPrimitive::ForBp2U16(f) => f.len(),
-                LwcPrimitive::ForBp4U16(f) => f.len(),
-                LwcPrimitive::ForBp8U16(f) => f.len(),
-                LwcPrimitive::ForBp1I32(f) => f.len(),
-                LwcPrimitive::ForBp2I32(f) => f.len(),
-                LwcPrimitive::ForBp4I32(f) => f.len(),
-                LwcPrimitive::ForBp8I32(f) => f.len(),
-                LwcPrimitive::ForBp16I32(f) => f.len(),
-                LwcPrimitive::ForBp1U32(f) => f.len(),
-                LwcPrimitive::ForBp2U32(f) => f.len(),
-                LwcPrimitive::ForBp4U32(f) => f.len(),
-                LwcPrimitive::ForBp8U32(f) => f.len(),
-                LwcPrimitive::ForBp16U32(f) => f.len(),
-                LwcPrimitive::ForBp1I64(f) => f.len(),
-                LwcPrimitive::ForBp2I64(f) => f.len(),
-                LwcPrimitive::ForBp4I64(f) => f.len(),
-                LwcPrimitive::ForBp8I64(f) => f.len(),
-                LwcPrimitive::ForBp16I64(f) => f.len(),
-                LwcPrimitive::ForBp32I64(f) => f.len(),
-                LwcPrimitive::ForBp1U64(f) => f.len(),
-                LwcPrimitive::ForBp2U64(f) => f.len(),
-                LwcPrimitive::ForBp4U64(f) => f.len(),
-                LwcPrimitive::ForBp8U64(f) => f.len(),
-                LwcPrimitive::ForBp16U64(f) => f.len(),
-                LwcPrimitive::ForBp32U64(f) => f.len(),
-                LwcPrimitive::Bytes(b) => b.len(),
-            },
-            LwcData::Bytes(b) => b.len(),
-        }
-    }
-
-    /// Returns value at given position.
-    #[inline]
-    pub(crate) fn value(&self, idx: usize) -> Option<Val> {
-        match self {
-            LwcData::Primitive(p) => p.value(idx),
-            LwcData::Bytes(b) => b.value(idx).map(Val::VarByte),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PreparedLwcMin {
-    Signed(i64),
-    Unsigned(u64),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PreparedLwcEncoding {
-    FlatPrimitive {
-        data_start: usize,
-        unit_len: usize,
-    },
-    FlatVarByte {
-        offsets_start: usize,
-        data_start: usize,
-    },
-    ForBitpacking {
-        data_start: usize,
-        n_bits: usize,
-        min: PreparedLwcMin,
-    },
-}
-
-/// Owned scalar metadata for one validated LWC value payload.
-///
-/// The representation stores offsets rather than references so a scan page can
-/// cache it beside, rather than inside, its readonly-buffer guard.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PreparedLwcData {
-    kind: ValKind,
-    len: usize,
-    input_len: usize,
-    encoding: PreparedLwcEncoding,
-}
-
-impl PreparedLwcData {
-    /// Validate one encoded value payload and retain only owned decoder state.
-    pub(crate) fn from_bytes(kind: ValKind, input: &[u8]) -> DataIntegrityResult<Self> {
-        // Keep the general reader as the single codec/type/length validator.
-        let parsed = LwcData::from_bytes(kind, input)?;
-        let len = parsed.len();
-        let code = input[0];
-        let encoding = match LwcCode::decode(code)? {
-            LwcCode::Flat => {
-                let data_start = mem::size_of::<u8>() + mem::size_of::<u64>();
-                if kind == ValKind::VarByte {
-                    let offsets_len = len
-                        .checked_add(1)
-                        .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
-                        .ok_or_else(|| {
-                            Report::new(DataIntegrityError::InvalidPayload)
-                                .attach("LWC varbyte offset table length overflows usize")
-                        })?;
-                    let values_start = data_start + offsets_len;
-                    validate_prepared_varbyte_offsets(
-                        &input[data_start..values_start],
-                        input.len() - values_start,
-                    )?;
-                    PreparedLwcEncoding::FlatVarByte {
-                        offsets_start: data_start,
-                        data_start: values_start,
-                    }
-                } else {
-                    PreparedLwcEncoding::FlatPrimitive {
-                        data_start,
-                        unit_len: kind.inline_len(),
-                    }
-                }
-            }
-            LwcCode::ForBitpacking => {
-                let n_bits = input[1] as usize;
-                let min_start = mem::size_of::<u8>() + mem::size_of::<u8>() + mem::size_of::<u64>();
-                let unit_len = kind.inline_len();
-                let min_bytes = &input[min_start..min_start + unit_len];
-                let min = match kind {
-                    ValKind::I8 => PreparedLwcMin::Signed(i64::from(min_bytes[0] as i8)),
-                    ValKind::U8 => PreparedLwcMin::Unsigned(u64::from(min_bytes[0])),
-                    ValKind::I16 => PreparedLwcMin::Signed(i64::from(i16::from_le_bytes(
-                        min_bytes.try_into().unwrap(),
-                    ))),
-                    ValKind::U16 => PreparedLwcMin::Unsigned(u64::from(u16::from_le_bytes(
-                        min_bytes.try_into().unwrap(),
-                    ))),
-                    ValKind::I32 => PreparedLwcMin::Signed(i64::from(i32::from_le_bytes(
-                        min_bytes.try_into().unwrap(),
-                    ))),
-                    ValKind::U32 => PreparedLwcMin::Unsigned(u64::from(u32::from_le_bytes(
-                        min_bytes.try_into().unwrap(),
-                    ))),
-                    ValKind::I64 => {
-                        PreparedLwcMin::Signed(i64::from_le_bytes(min_bytes.try_into().unwrap()))
-                    }
-                    ValKind::U64 => {
-                        PreparedLwcMin::Unsigned(u64::from_le_bytes(min_bytes.try_into().unwrap()))
-                    }
-                    ValKind::F32 | ValKind::F64 | ValKind::VarByte => {
-                        unreachable!("general LWC validation rejects this FOR value kind")
-                    }
-                };
-                PreparedLwcEncoding::ForBitpacking {
-                    data_start: min_start + unit_len,
-                    n_bits,
-                    min,
-                }
-            }
-        };
-        Ok(PreparedLwcData {
-            kind,
-            len,
-            input_len: input.len(),
-            encoding,
-        })
-    }
-
-    /// Returns the number of logical values represented by the payload.
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Decode one value by borrowing the same immutable bytes used to prepare.
-    pub(crate) fn value(&self, input: &[u8], idx: usize) -> Option<Val> {
-        debug_assert_eq!(input.len(), self.input_len);
-        if idx >= self.len {
-            return None;
-        }
-        match self.encoding {
-            PreparedLwcEncoding::FlatPrimitive {
-                data_start,
-                unit_len,
-            } => Some(decode_prepared_flat(
-                self.kind,
-                &input[data_start + idx * unit_len..data_start + (idx + 1) * unit_len],
-            )),
-            PreparedLwcEncoding::FlatVarByte {
-                offsets_start,
-                data_start,
-            } => {
-                let offset = |ordinal: usize| {
-                    let start = offsets_start + ordinal * mem::size_of::<u32>();
-                    u32::from_le_bytes(
-                        input[start..start + mem::size_of::<u32>()]
-                            .try_into()
-                            .unwrap(),
-                    ) as usize
-                };
-                let start = offset(idx);
-                let end = offset(idx + 1);
-                // Stored values obey the owned length limit; corruption violates that invariant.
-                Some(Val::VarByte(MemVar::from_bytes(
-                    &input[data_start + start..data_start + end],
-                )))
-            }
-            PreparedLwcEncoding::ForBitpacking {
-                data_start,
-                n_bits,
-                min,
-            } => {
-                let data = &input[data_start..];
-                let delta = match n_bits {
-                    1 | 2 | 4 => {
-                        let bit_idx = idx * n_bits;
-                        u64::from((data[bit_idx / 8] >> (bit_idx % 8)) & ((1 << n_bits) - 1))
-                    }
-                    8 => u64::from(data[idx]),
-                    16 => u64::from(u16::from_le_bytes(
-                        data[idx * 2..idx * 2 + 2].try_into().unwrap(),
-                    )),
-                    32 => u64::from(u32::from_le_bytes(
-                        data[idx * 4..idx * 4 + 4].try_into().unwrap(),
-                    )),
-                    _ => unreachable!("general LWC validation rejects unsupported bit widths"),
-                };
-                Some(decode_prepared_for(self.kind, min, delta))
-            }
-        }
-    }
-}
 
 /// Abstract of primitive data which are lightweight compressed.
 /// Provides methods for random access and batch access.
@@ -612,874 +52,6 @@ pub(crate) trait LwcPrimitiveData {
 
     /// Returns the iterator over all values.
     fn iter(&self) -> Self::Iter;
-}
-
-/// Serialized LWC compression code stored at the start of each column payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum LwcCode {
-    Flat = 1,
-    // Bitpacking = 2,
-    /// See `IntegerEncodingPlan::ser` for serialization details.
-    ForBitpacking = 3,
-    // todo: dict, fsst.
-}
-
-impl LwcCode {
-    /// Decodes one persisted compression tag without converting to the crate error.
-    #[inline]
-    fn decode(value: u8) -> DataIntegrityResult<Self> {
-        match value {
-            1 => Ok(LwcCode::Flat),
-            3 => Ok(LwcCode::ForBitpacking),
-            _ => Err(Report::new(DataIntegrityError::InvalidPayload)
-                .attach(format!("invalid LWC code {value}"))),
-        }
-    }
-}
-
-/// Borrowed primitive LWC payload reader.
-pub(crate) enum LwcPrimitive<'a> {
-    FlatI8(FlatI8<'a>),
-    FlatU8(FlatU8<'a>),
-    FlatI16(FlatI16<'a>),
-    FlatU16(FlatU16<'a>),
-    FlatI32(FlatI32<'a>),
-    FlatU32(FlatU32<'a>),
-    FlatF32(FlatF32<'a>),
-    FlatI64(FlatI64<'a>),
-    FlatU64(FlatU64<'a>),
-    FlatF64(FlatF64<'a>),
-    ForBp1I8(ForBitpacking1<'a, i8>),
-    ForBp2I8(ForBitpacking2<'a, i8>),
-    ForBp4I8(ForBitpacking4<'a, i8>),
-    ForBp1U8(ForBitpacking1<'a, u8>),
-    ForBp2U8(ForBitpacking2<'a, u8>),
-    ForBp4U8(ForBitpacking4<'a, u8>),
-    ForBp1I16(ForBitpacking1<'a, i16>),
-    ForBp2I16(ForBitpacking2<'a, i16>),
-    ForBp4I16(ForBitpacking4<'a, i16>),
-    ForBp8I16(ForBitpacking8<'a, i16>),
-    ForBp1U16(ForBitpacking1<'a, u16>),
-    ForBp2U16(ForBitpacking2<'a, u16>),
-    ForBp4U16(ForBitpacking4<'a, u16>),
-    ForBp8U16(ForBitpacking8<'a, u16>),
-    ForBp1I32(ForBitpacking1<'a, i32>),
-    ForBp2I32(ForBitpacking2<'a, i32>),
-    ForBp4I32(ForBitpacking4<'a, i32>),
-    ForBp8I32(ForBitpacking8<'a, i32>),
-    ForBp16I32(ForBitpacking16<'a, i32>),
-    ForBp1U32(ForBitpacking1<'a, u32>),
-    ForBp2U32(ForBitpacking2<'a, u32>),
-    ForBp4U32(ForBitpacking4<'a, u32>),
-    ForBp8U32(ForBitpacking8<'a, u32>),
-    ForBp16U32(ForBitpacking16<'a, u32>),
-    ForBp1I64(ForBitpacking1<'a, i64>),
-    ForBp2I64(ForBitpacking2<'a, i64>),
-    ForBp4I64(ForBitpacking4<'a, i64>),
-    ForBp8I64(ForBitpacking8<'a, i64>),
-    ForBp16I64(ForBitpacking16<'a, i64>),
-    ForBp32I64(ForBitpacking32<'a, i64>),
-    ForBp1U64(ForBitpacking1<'a, u64>),
-    ForBp2U64(ForBitpacking2<'a, u64>),
-    ForBp4U64(ForBitpacking4<'a, u64>),
-    ForBp8U64(ForBitpacking8<'a, u64>),
-    ForBp16U64(ForBitpacking16<'a, u64>),
-    ForBp32U64(ForBitpacking32<'a, u64>),
-    #[expect(dead_code, reason = "reserved Bytes")]
-    Bytes(LwcBytes<'a>),
-}
-
-impl LwcPrimitive<'_> {
-    /// Returns the decoded value at `idx`.
-    #[inline]
-    pub(crate) fn value(&self, idx: usize) -> Option<Val> {
-        match self {
-            LwcPrimitive::FlatI8(f) => f.value(idx).map(Val::I8),
-            LwcPrimitive::FlatU8(f) => f.value(idx).map(Val::U8),
-            LwcPrimitive::FlatI16(f) => f.value(idx).map(Val::I16),
-            LwcPrimitive::FlatU16(f) => f.value(idx).map(Val::U16),
-            LwcPrimitive::FlatI32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::FlatU32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::FlatF32(f) => f.value(idx).map(|v| Val::F32(v.into())),
-            LwcPrimitive::FlatI64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::FlatU64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::FlatF64(f) => f.value(idx).map(|v| Val::F64(v.into())),
-            LwcPrimitive::ForBp1I8(f) => f.value(idx).map(Val::I8),
-            LwcPrimitive::ForBp2I8(f) => f.value(idx).map(Val::I8),
-            LwcPrimitive::ForBp4I8(f) => f.value(idx).map(Val::I8),
-            LwcPrimitive::ForBp1U8(f) => f.value(idx).map(Val::U8),
-            LwcPrimitive::ForBp2U8(f) => f.value(idx).map(Val::U8),
-            LwcPrimitive::ForBp4U8(f) => f.value(idx).map(Val::U8),
-            LwcPrimitive::ForBp1I16(f) => f.value(idx).map(Val::I16),
-            LwcPrimitive::ForBp2I16(f) => f.value(idx).map(Val::I16),
-            LwcPrimitive::ForBp4I16(f) => f.value(idx).map(Val::I16),
-            LwcPrimitive::ForBp8I16(f) => f.value(idx).map(Val::I16),
-            LwcPrimitive::ForBp1U16(f) => f.value(idx).map(Val::U16),
-            LwcPrimitive::ForBp2U16(f) => f.value(idx).map(Val::U16),
-            LwcPrimitive::ForBp4U16(f) => f.value(idx).map(Val::U16),
-            LwcPrimitive::ForBp8U16(f) => f.value(idx).map(Val::U16),
-            LwcPrimitive::ForBp1I32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::ForBp2I32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::ForBp4I32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::ForBp8I32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::ForBp16I32(f) => f.value(idx).map(Val::I32),
-            LwcPrimitive::ForBp1U32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::ForBp2U32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::ForBp4U32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::ForBp8U32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::ForBp16U32(f) => f.value(idx).map(Val::U32),
-            LwcPrimitive::ForBp1I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp2I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp4I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp8I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp16I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp32I64(f) => f.value(idx).map(Val::I64),
-            LwcPrimitive::ForBp1U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::ForBp2U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::ForBp4U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::ForBp8U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::ForBp16U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::ForBp32U64(f) => f.value(idx).map(Val::U64),
-            LwcPrimitive::Bytes(b) => b.value(idx).map(Val::VarByte),
-        }
-    }
-}
-
-/// Serializer for flat floating-point and variable-byte LWC column payloads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum LwcPrimitiveSer<'a> {
-    FlatF32(Cow<'a, [[u8; 4]]>),
-    FlatF64(Cow<'a, [[u8; 8]]>),
-    Bytes(LwcBytesSer),
-}
-
-impl<'a> LwcPrimitiveSer<'a> {
-    /// Creates an f32 flat serializer.
-    #[inline]
-    pub(crate) fn new_f32(input: &'a [f32]) -> Self {
-        LwcPrimitiveSer::FlatF32(flat_f32_bytes(input))
-    }
-
-    /// Creates an f64 flat serializer.
-    #[inline]
-    pub(crate) fn new_f64(input: &'a [f64]) -> Self {
-        LwcPrimitiveSer::FlatF64(flat_f64_bytes(input))
-    }
-
-    /// Creates a borrowed varbyte flat serializer.
-    #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "reserved new_bytes"))]
-    pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> InternalResult<Self> {
-        if offsets.is_empty() || offsets[0] != 0 {
-            return Err(Report::new(InternalError::LwcBuilderMisuse)
-                .attach("LWC bytes offsets must be non-empty and start at zero"));
-        }
-        Ok(LwcPrimitiveSer::Bytes(LwcBytesSer {
-            offsets: offsets.to_vec(),
-            data: data.to_vec(),
-        }))
-    }
-
-    /// Creates an owned varbyte flat serializer.
-    #[inline]
-    pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> InternalResult<Self> {
-        if offsets.is_empty() || offsets[0] != 0 {
-            return Err(Report::new(InternalError::LwcBuilderMisuse)
-                .attach("LWC bytes offsets must be non-empty and start at zero"));
-        }
-        Ok(LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data }))
-    }
-}
-
-impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        1 + match self {
-            LwcPrimitiveSer::FlatF32(f) => f.ser_len(),
-            LwcPrimitiveSer::FlatF64(f) => f.ser_len(),
-            LwcPrimitiveSer::Bytes(b) => b.ser_len(),
-        }
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u8(start_idx, LwcCode::Flat as u8);
-        match self {
-            LwcPrimitiveSer::FlatF32(f) => f.ser(out, idx),
-            LwcPrimitiveSer::FlatF64(f) => f.ser(out, idx),
-            LwcPrimitiveSer::Bytes(b) => b.ser(out, idx),
-        }
-    }
-}
-
-// Uninitialized extrema stay zero, supplying the all-null integer plan.
-struct LwcColumnStats {
-    min_i64: i64,
-    max_i64: i64,
-    min_u64: u64,
-    max_u64: u64,
-    initialized: bool,
-}
-
-impl LwcColumnStats {
-    fn new() -> Self {
-        LwcColumnStats {
-            min_i64: 0,
-            max_i64: 0,
-            min_u64: 0,
-            max_u64: 0,
-            initialized: false,
-        }
-    }
-
-    fn update_i64(&mut self, value: i64) {
-        if !self.initialized {
-            self.min_i64 = value;
-            self.max_i64 = value;
-            self.initialized = true;
-        } else {
-            self.min_i64 = self.min_i64.min(value);
-            self.max_i64 = self.max_i64.max(value);
-        }
-    }
-
-    fn update_u64(&mut self, value: u64) {
-        if !self.initialized {
-            self.min_u64 = value;
-            self.max_u64 = value;
-            self.initialized = true;
-        } else {
-            self.min_u64 = self.min_u64.min(value);
-            self.max_u64 = self.max_u64.max(value);
-        }
-    }
-
-    fn snapshot(&self) -> LwcColumnSnapshot {
-        LwcColumnSnapshot {
-            initialized: self.initialized,
-            min_i64: self.min_i64,
-            max_i64: self.max_i64,
-            min_u64: self.min_u64,
-            max_u64: self.max_u64,
-        }
-    }
-
-    fn restore(&mut self, snapshot: LwcColumnSnapshot) {
-        self.initialized = snapshot.initialized;
-        self.min_i64 = snapshot.min_i64;
-        self.max_i64 = snapshot.max_i64;
-        self.min_u64 = snapshot.min_u64;
-        self.max_u64 = snapshot.max_u64;
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LwcColumnSnapshot {
-    initialized: bool,
-    min_i64: i64,
-    max_i64: i64,
-    min_u64: u64,
-    max_u64: u64,
-}
-
-struct LwcSnapshot {
-    row_count: usize,
-    row_ids_len: usize,
-    seeds_len: usize,
-    last_seed: Option<IdentitySetSeed>,
-    stats: Vec<LwcColumnSnapshot>,
-}
-
-/// Builder that accumulates row-page data into one persisted LWC block image.
-pub(crate) struct LwcBuilder {
-    col_layout: Arc<TableColumnLayout>,
-    buffer: ScanBuffer,
-    row_ids: Vec<RowID>,
-    row_set_seeds: Vec<IdentitySetSeed>,
-    stats: Vec<LwcColumnStats>,
-}
-
-impl LwcBuilder {
-    /// Creates an empty LWC builder for the provided column layout.
-    pub(crate) fn new(col_layout: Arc<TableColumnLayout>) -> Self {
-        let scan_set: Vec<_> = (0..col_layout.col_count()).collect();
-        let stats = (0..col_layout.col_count())
-            .map(|_| LwcColumnStats::new())
-            .collect();
-        let buffer = ScanBuffer::new(col_layout.as_ref(), &scan_set);
-        LwcBuilder {
-            col_layout,
-            buffer,
-            row_ids: Vec::new(),
-            row_set_seeds: Vec::new(),
-            stats,
-        }
-    }
-
-    /// Returns whether no rows have been appended.
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Returns the number of rows currently buffered.
-    #[inline]
-    pub(crate) fn row_count(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Returns the row ids represented by the buffered rows.
-    #[inline]
-    pub(crate) fn row_ids(&self) -> &[RowID] {
-        &self.row_ids
-    }
-
-    /// Returns accepted logical range statistics used for identity planning.
-    pub(crate) fn row_set_seeds(&self) -> &[IdentitySetSeed] {
-        &self.row_set_seeds
-    }
-
-    /// Appends one validated decoded row if the block still fits.
-    ///
-    /// Returns `false` and restores the previous builder state when the row
-    /// would exceed the block payload capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the row was not validated against the layout supplied to
-    /// [`Self::new`].
-    pub(crate) fn append_row_values(&mut self, row_id: RowID, vals: &[Val]) -> bool {
-        if self.row_count() == MAX_LWC_ROWS {
-            return false;
-        }
-        let snapshot = self.snapshot_state();
-        if self.append_row_values_inner(row_id, vals) {
-            true
-        } else {
-            self.rollback(snapshot);
-            false
-        }
-    }
-
-    /// Appends rows described by `view` if the block still fits.
-    ///
-    /// Returns `false` and restores the previous builder state when the view
-    /// would exceed the block payload capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the page view was not constructed from the layout supplied
-    /// to [`Self::new`].
-    pub(crate) fn append_view(
-        &mut self,
-        view: PageVectorView<'_, '_>,
-        start_row_id: RowID,
-    ) -> bool {
-        if view.rows_non_deleted() > MAX_LWC_ROWS - self.row_count() {
-            return false;
-        }
-        let snapshot = self.snapshot_state();
-        if self.append_view_inner(view, start_row_id) {
-            true
-        } else {
-            self.rollback(snapshot);
-            false
-        }
-    }
-
-    fn append_view_inner(&mut self, view: PageVectorView<'_, '_>, start_row_id: RowID) -> bool {
-        let mut new_row_ids = Vec::with_capacity(view.rows_non_deleted());
-        for (start_idx, end_idx) in view.range_non_deleted() {
-            for idx in start_idx..end_idx {
-                new_row_ids.push(start_row_id + idx as u64);
-            }
-        }
-        self.scan_page_stats(&view, &new_row_ids);
-        self.buffer.scan(view);
-        IdentitySetSeed::append_page(&mut self.row_set_seeds, &new_row_ids, self.row_ids.len());
-        self.row_ids.extend(new_row_ids);
-        self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
-    }
-
-    fn append_row_values_inner(&mut self, row_id: RowID, vals: &[Val]) -> bool {
-        self.scan_row_value_stats(vals);
-        self.buffer
-            .append_row_values(self.col_layout.as_ref(), vals);
-        IdentitySetSeed::append_window(&mut self.row_set_seeds, row_id, self.row_ids.len());
-        self.row_ids.push(row_id);
-        self.estimate_size() <= LWC_BLOCK_PAYLOAD_SIZE
-    }
-
-    /// Builds a persisted LWC block with the supplied block binding value.
-    pub(crate) fn build(self, block_binding_value: u64) -> InternalResult<DirectBuf> {
-        if self.buffer.is_empty() {
-            return Err(Report::new(InternalError::LwcBuilderMisuse)
-                .attach("cannot build an empty LWC block"));
-        }
-        let row_count = self.buffer.len();
-        if row_count > MAX_LWC_ROWS {
-            return Err(lwc_block_encoding_contract().attach(format!(
-                "field=row_count, actual={row_count}, maximum={MAX_LWC_ROWS}"
-            )));
-        }
-        let mut column_payloads = Vec::with_capacity(self.col_layout.col_count());
-        let mut col_offsets = Vec::with_capacity(self.col_layout.col_count());
-        let mut offset = self
-            .col_layout
-            .col_count()
-            .checked_mul(mem::size_of::<u16>())
-            .ok_or_else(|| {
-                lwc_block_encoding_contract().attach(format!(
-                    "field=column_offset_table, column_count={}, capacity={LWC_BLOCK_BODY_SIZE}",
-                    self.col_layout.col_count()
-                ))
-            })?;
-        if offset > LWC_BLOCK_BODY_SIZE || offset > u16::MAX as usize {
-            return Err(lwc_block_encoding_contract().attach(format!(
-                "field=column_offset_table, actual={offset}, capacity={LWC_BLOCK_BODY_SIZE}, maximum={}",
-                u16::MAX
-            )));
-        }
-
-        for col_idx in 0..self.col_layout.col_count() {
-            let column = self.buffer.column(col_idx).unwrap_or_else(|| {
-                panic!(
-                    "LWC builder scan buffer must contain column {col_idx} from its table layout"
-                )
-            });
-            let mut data = Vec::new();
-            if let Some(bitmap) = column.null_bitmap {
-                let bytes = bitmap_to_bytes(bitmap, row_count);
-                let bitmap_ser = LwcNullBitmapSer::new(&bytes)?;
-                let mut tmp = vec![0u8; bitmap_ser.ser_len()];
-                bitmap_ser.ser(&mut tmp[..], 0);
-                data.extend_from_slice(&tmp);
-            }
-            let stats = &self.stats[col_idx];
-            let expected_len = estimate_column_payload(
-                self.col_layout.val_kind(col_idx),
-                &column.values,
-                stats,
-                row_count,
-                col_idx,
-            ) + if column.null_bitmap.is_some() {
-                2 + row_count.div_ceil(8)
-            } else {
-                0
-            };
-            let payload = match column.values {
-                ScanColumnValues::I8(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_i64 as i8,
-                    stats.max_i64 as i8,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::U8(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_u64 as u8,
-                    stats.max_u64 as u8,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::I16(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_i64 as i16,
-                    stats.max_i64 as i16,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::U16(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_u64 as u16,
-                    stats.max_u64 as u16,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::I32(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_i64 as i32,
-                    stats.max_i64 as i32,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::U32(vals) => IntegerEncodingPlan::from_extrema(
-                    row_count,
-                    stats.min_u64 as u32,
-                    stats.max_u64 as u32,
-                )
-                .serialize_lwc(vals, column.null_bitmap),
-                ScanColumnValues::F32(vals) => {
-                    let ser = LwcPrimitiveSer::new_f32(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::I64(vals) => {
-                    IntegerEncodingPlan::from_extrema(row_count, stats.min_i64, stats.max_i64)
-                        .serialize_lwc(vals, column.null_bitmap)
-                }
-                ScanColumnValues::U64(vals) => {
-                    IntegerEncodingPlan::from_extrema(row_count, stats.min_u64, stats.max_u64)
-                        .serialize_lwc(vals, column.null_bitmap)
-                }
-                ScanColumnValues::F64(vals) => {
-                    let ser = LwcPrimitiveSer::new_f64(vals);
-                    serialize_primitive(&ser)
-                }
-                ScanColumnValues::VarByte {
-                    offsets,
-                    data: bytes,
-                } => {
-                    let mut lwc_offsets = Vec::with_capacity(offsets.len() + 1);
-                    lwc_offsets.push(0u32);
-                    for (_, end) in offsets.iter().copied() {
-                        lwc_offsets.push(end as u32);
-                    }
-                    let ser = LwcPrimitiveSer::new_bytes_owned(lwc_offsets, bytes.to_vec())?;
-                    serialize_primitive(&ser)
-                }
-            };
-            data.extend_from_slice(&payload);
-            if data.len() != expected_len {
-                return Err(lwc_block_encoding_contract().attach(format!(
-                    "field=column_length, column_no={col_idx}, expected={expected_len}, actual={}, capacity={LWC_BLOCK_BODY_SIZE}",
-                    data.len()
-                )));
-            }
-            offset = offset.checked_add(data.len()).ok_or_else(|| {
-                lwc_block_encoding_contract().attach(format!(
-                    "field=column_end_offset, column_no={col_idx}, start={offset}, length={}, capacity={LWC_BLOCK_BODY_SIZE}",
-                    data.len()
-                ))
-            })?;
-            if offset > LWC_BLOCK_BODY_SIZE || offset > u16::MAX as usize {
-                return Err(lwc_block_encoding_contract().attach(format!(
-                    "field=column_end_offset, column_no={col_idx}, actual={offset}, capacity={LWC_BLOCK_BODY_SIZE}, maximum={}",
-                    u16::MAX
-                )));
-            }
-            col_offsets.push(offset as u16);
-            column_payloads.push(data);
-        }
-
-        let actual_len = LWC_BLOCK_HEADER_SIZE + offset;
-        let expected_len = self.estimate_size();
-        if actual_len != expected_len || actual_len > LWC_BLOCK_PAYLOAD_SIZE {
-            return Err(lwc_block_encoding_contract().attach(format!(
-                "field=payload_length, expected={expected_len}, actual={actual_len}, capacity={LWC_BLOCK_PAYLOAD_SIZE}"
-            )));
-        }
-
-        let header = LwcBlockHeader::new(
-            block_binding_value,
-            row_count as u16,
-            self.col_layout.col_count() as u16,
-            0,
-        );
-
-        let mut buf = DirectBuf::zeroed(COW_FILE_PAGE_SIZE);
-        let payload_start = write_block_header(buf.data_mut(), LWC_BLOCK_SPEC);
-        let payload_end = payload_start + LWC_BLOCK_PAYLOAD_SIZE;
-        let page = LwcBlock::from_bytes_mut(&mut buf.data_mut()[payload_start..payload_end]);
-        page.header = header;
-        let mut body_idx = 0;
-        for offset in col_offsets {
-            body_idx = offset.ser(&mut page.body[..], body_idx);
-        }
-        for payload in column_payloads {
-            let end = body_idx + payload.len();
-            page.body[body_idx..end].copy_from_slice(&payload);
-            body_idx = end;
-        }
-        write_block_checksum(buf.data_mut());
-        Ok(buf)
-    }
-
-    fn snapshot_state(&self) -> LwcSnapshot {
-        LwcSnapshot {
-            row_count: self.buffer.len(),
-            row_ids_len: self.row_ids.len(),
-            seeds_len: self.row_set_seeds.len(),
-            last_seed: self.row_set_seeds.last().copied(),
-            stats: self.stats.iter().map(|s| s.snapshot()).collect(),
-        }
-    }
-
-    fn rollback(&mut self, snapshot: LwcSnapshot) {
-        self.buffer.truncate(snapshot.row_count);
-        self.row_ids.truncate(snapshot.row_ids_len);
-        self.row_set_seeds.truncate(snapshot.seeds_len);
-        if let Some(last) = snapshot.last_seed {
-            *self
-                .row_set_seeds
-                .last_mut()
-                .expect("snapshot retained its last seed") = last;
-        }
-        for (stat, snap) in self.stats.iter_mut().zip(snapshot.stats) {
-            stat.restore(snap);
-        }
-    }
-
-    fn scan_page_stats(&mut self, view: &PageVectorView<'_, '_>, row_ids: &[RowID]) {
-        assert_eq!(
-            row_ids.len(),
-            view.rows_non_deleted(),
-            "LWC page statistics row ids must match the page view's visible rows"
-        );
-        if row_ids.is_empty() {
-            return;
-        }
-        for col_idx in 0..self.col_layout.col_count() {
-            let (null_bitmap, values) = view.col(col_idx);
-            let null_bitmap = null_bitmap.as_deref();
-            match values {
-                ValArrayRef::I8(vals) => {
-                    self.update_stats_i64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v as i64,
-                    );
-                }
-                ValArrayRef::U8(vals) => {
-                    self.update_stats_u64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v as u64,
-                    );
-                }
-                ValArrayRef::I16(vals) => {
-                    self.update_stats_i64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get() as i64,
-                    );
-                }
-                ValArrayRef::U16(vals) => {
-                    self.update_stats_u64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get() as u64,
-                    );
-                }
-                ValArrayRef::I32(vals) => {
-                    self.update_stats_i64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get() as i64,
-                    );
-                }
-                ValArrayRef::U32(vals) => {
-                    self.update_stats_u64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get() as u64,
-                    );
-                }
-                ValArrayRef::I64(vals) => {
-                    self.update_stats_i64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get(),
-                    );
-                }
-                ValArrayRef::U64(vals) => {
-                    self.update_stats_u64(
-                        col_idx,
-                        null_bitmap,
-                        vals,
-                        view.range_non_deleted(),
-                        |v| v.get(),
-                    );
-                }
-                ValArrayRef::F32(_) | ValArrayRef::F64(_) | ValArrayRef::VarByte(_, _) => {}
-            }
-        }
-    }
-
-    fn scan_row_value_stats(&mut self, vals: &[Val]) {
-        assert_eq!(
-            vals.len(),
-            self.col_layout.col_count(),
-            "LWC statistics require a complete row validated against the builder layout"
-        );
-        for (col_idx, val) in vals.iter().enumerate() {
-            if val.is_null() {
-                continue;
-            }
-            match (self.col_layout.val_kind(col_idx), val) {
-                (ValKind::I8, Val::I8(value)) => self.stats[col_idx].update_i64(*value as i64),
-                (ValKind::U8, Val::U8(value)) => self.stats[col_idx].update_u64(*value as u64),
-                (ValKind::I16, Val::I16(value)) => self.stats[col_idx].update_i64(*value as i64),
-                (ValKind::U16, Val::U16(value)) => self.stats[col_idx].update_u64(*value as u64),
-                (ValKind::I32, Val::I32(value)) => self.stats[col_idx].update_i64(*value as i64),
-                (ValKind::U32, Val::U32(value)) => self.stats[col_idx].update_u64(*value as u64),
-                (ValKind::I64, Val::I64(value)) => self.stats[col_idx].update_i64(*value),
-                (ValKind::U64, Val::U64(value)) => self.stats[col_idx].update_u64(*value),
-                (ValKind::F32, Val::F32(_))
-                | (ValKind::F64, Val::F64(_))
-                | (ValKind::VarByte, Val::VarByte(_)) => {}
-                _ => unreachable!(
-                    "LWC statistics value kind for column {col_idx} must match the validated row layout"
-                ),
-            }
-        }
-    }
-
-    fn update_stats_i64<T: Copy, R: Iterator<Item = (usize, usize)>>(
-        &mut self,
-        col_idx: usize,
-        null_bitmap: Option<&[u64]>,
-        values: &[T],
-        ranges: R,
-        decode: impl Fn(T) -> i64,
-    ) {
-        for (start_idx, end_idx) in ranges {
-            for idx in start_idx..end_idx {
-                if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
-                    continue;
-                }
-                let value = values.get(idx).unwrap_or_else(|| {
-                    panic!(
-                        "LWC page statistics column {col_idx} is missing visible row index {idx}"
-                    )
-                });
-                self.stats[col_idx].update_i64(decode(*value));
-            }
-        }
-    }
-
-    fn update_stats_u64<T: Copy, R: Iterator<Item = (usize, usize)>>(
-        &mut self,
-        col_idx: usize,
-        null_bitmap: Option<&[u64]>,
-        values: &[T],
-        ranges: R,
-        decode: impl Fn(T) -> u64,
-    ) {
-        for (start_idx, end_idx) in ranges {
-            for idx in start_idx..end_idx {
-                if null_bitmap.map(|bm| bm.bitmap_get(idx)).unwrap_or(false) {
-                    continue;
-                }
-                let value = values.get(idx).unwrap_or_else(|| {
-                    panic!(
-                        "LWC page statistics column {col_idx} is missing visible row index {idx}"
-                    )
-                });
-                self.stats[col_idx].update_u64(decode(*value));
-            }
-        }
-    }
-
-    fn estimate_size(&self) -> usize {
-        let row_count = self.buffer.len();
-        let mut total = LWC_BLOCK_HEADER_SIZE;
-        total += mem::size_of::<u16>() * self.col_layout.col_count();
-        total += estimate_columns_size(
-            self.col_layout.as_ref(),
-            &self.buffer,
-            &self.stats,
-            row_count,
-        );
-        total
-    }
-}
-
-/// Flat borrowed i8 payload.
-pub(crate) struct FlatI8<'a>(&'a [u8]);
-
-impl<'a> LwcPrimitiveData for FlatI8<'a> {
-    type Value = i8;
-    type Iter = FlatI8Iter<'a>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<Self::Value> {
-        if idx < self.0.len() {
-            let v = self.0[idx] as i8;
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        target.extend(self.iter())
-    }
-
-    #[inline]
-    fn iter(&self) -> FlatI8Iter<'a> {
-        FlatI8Iter(self.0.iter())
-    }
-}
-
-/// Iterator over a flat borrowed i8 payload.
-pub(crate) struct FlatI8Iter<'a>(Iter<'a, u8>);
-
-impl<'a> Iterator for FlatI8Iter<'a> {
-    type Item = i8;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|v| *v as i8)
-    }
-}
-
-/// Flat borrowed u8 payload.
-pub(crate) struct FlatU8<'a>(&'a [u8]);
-
-impl<'a> LwcPrimitiveData for FlatU8<'a> {
-    type Value = u8;
-    type Iter = FlatU8Iter<'a>;
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    fn value(&self, idx: usize) -> Option<Self::Value> {
-        if idx < self.0.len() {
-            let v = self.0[idx];
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-        target.extend(self.iter())
-    }
-
-    #[inline]
-    fn iter(&self) -> FlatU8Iter<'a> {
-        FlatU8Iter(self.0.iter())
-    }
-}
-
-/// Iterator over a flat borrowed u8 payload.
-pub(crate) struct FlatU8Iter<'a>(Iter<'a, u8>);
-
-impl<'a> Iterator for FlatU8Iter<'a> {
-    type Item = u8;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().copied()
-    }
 }
 
 /// Borrowed flat varbyte payload.
@@ -1561,30 +133,6 @@ impl<'a> Iterator for LwcBytesIter<'a> {
     }
 }
 
-/// Owned serializer for flat varbyte payloads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LwcBytesSer {
-    offsets: Vec<u32>,
-    data: Vec<u8>,
-}
-
-impl Ser<'_> for LwcBytesSer {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u64>() + self.offsets.len() * mem::size_of::<u32>() + self.data.len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        debug_assert_ne!(self.offsets, []);
-        let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
-        for off in self.offsets.iter().copied() {
-            idx = out.ser_u32(idx, off);
-        }
-        out.ser_byte_slice(idx, &self.data)
-    }
-}
-
 /// Borrowed null bitmap payload.
 #[derive(Debug)]
 pub(crate) struct LwcNullBitmap<'a> {
@@ -1595,7 +143,8 @@ impl<'a> LwcNullBitmap<'a> {
     /// Parses a length-prefixed null bitmap and returns the remaining payload.
     #[inline]
     pub(crate) fn from_bytes(input: &'a [u8]) -> DataIntegrityResult<(Self, &'a [u8])> {
-        let (len, input) = read_le_u16(input)?;
+        let (pos, len) = input.deser_u16(0)?;
+        let input = &input[pos..];
         let len = len as usize;
         if input.len() < len {
             return Err(Report::new(DataIntegrityError::InvalidPayload)
@@ -1630,551 +179,223 @@ impl<'a> LwcNullBitmap<'a> {
     }
 }
 
-/// Serializer for length-prefixed null bitmap payloads.
-pub(crate) struct LwcNullBitmapSer<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> LwcNullBitmapSer<'a> {
-    /// Creates a null bitmap serializer after validating the length prefix fits.
-    #[inline]
-    pub(crate) fn new(bytes: &'a [u8]) -> InternalResult<Self> {
-        if bytes.len() > u16::MAX as usize {
-            return Err(lwc_block_encoding_contract().attach(format!(
-                "field=null_bitmap_byte_length, actual={}, maximum={}",
-                bytes.len(),
-                u16::MAX
-            )));
-        }
-        Ok(LwcNullBitmapSer { bytes })
-    }
-}
-
-impl Ser<'_> for LwcNullBitmapSer<'_> {
-    #[inline]
-    fn ser_len(&self) -> usize {
-        mem::size_of::<u16>() + self.bytes.len()
-    }
-
-    #[inline]
-    fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
-        let idx = out.ser_u16(start_idx, self.bytes.len() as u16);
-        out.ser_byte_slice(idx, self.bytes)
-    }
-}
-
-macro_rules! impl_lwc_flat {
-    ($t:ident, $v:ty, $unit:ty, $it:ident) => {
-        pub(crate) struct $t<'a>(&'a [$unit]);
-
-        impl<'a> LwcPrimitiveData for $t<'a> {
-            type Value = $v;
-            type Iter = $it<'a>;
-
-            #[inline]
-            fn len(&self) -> usize {
-                self.0.len()
-            }
-
-            #[inline]
-            fn value(&self, idx: usize) -> Option<Self::Value> {
-                if idx < self.0.len() {
-                    let u = self.0[idx];
-                    let v = <$v>::from_le_bytes(u);
-                    Some(v)
-                } else {
-                    None
-                }
-            }
-
-            #[inline]
-            fn extend_to<E: Extend<Self::Value>>(&self, target: &mut E) {
-                target.extend(self.iter())
-            }
-
-            #[inline]
-            fn iter(&self) -> Self::Iter {
-                $it(self.0.iter())
-            }
-        }
-
-        pub(crate) struct $it<'a>(std::slice::Iter<'a, $unit>);
-
-        impl<'a> Iterator for $it<'a> {
-            type Item = $v;
-            #[inline]
-            fn next(&mut self) -> Option<Self::Item> {
-                self.0.next().map(|v| <$v>::from_le_bytes(*v))
-            }
-        }
-    };
-}
-
-impl_lwc_flat!(FlatI16, i16, [u8; 2], FlatI16Iter);
-impl_lwc_flat!(FlatU16, u16, [u8; 2], FlatU16Iter);
-impl_lwc_flat!(FlatI32, i32, [u8; 4], FlatI32Iter);
-impl_lwc_flat!(FlatU32, u32, [u8; 4], FlatU32Iter);
-impl_lwc_flat!(FlatI64, i64, [u8; 8], FlatI64Iter);
-impl_lwc_flat!(FlatU64, u64, [u8; 8], FlatU64Iter);
-impl_lwc_flat!(FlatF32, f32, [u8; 4], FlatF32Iter);
-impl_lwc_flat!(FlatF64, f64, [u8; 8], FlatF64Iter);
-
 /// Complete singleton block size excluding variable payloads, using flat singleton encodings.
-pub(crate) fn singleton_base_bytes(columns: &[ValType]) -> Option<usize> {
-    let mut bytes = (COW_FILE_PAGE_SIZE - LWC_BLOCK_PAYLOAD_SIZE)
-        .checked_add(LWC_BLOCK_HEADER_SIZE)?
-        .checked_add(columns.len().checked_mul(mem::size_of::<u16>())?)?;
+pub(crate) fn singleton_base_bytes(columns: &[ValType]) -> usize {
+    // TableColumnLayout bounds columns by the u16 ordinal domain; each
+    // singleton contributes at most eight value bytes and fixed codec metadata.
+    let mut bytes = COW_FILE_PAGE_SIZE - LWC_BLOCK_PAYLOAD_SIZE
+        + LWC_BLOCK_HEADER_SIZE
+        + columns.len() * mem::size_of::<u16>();
     for column in columns {
         if column.nullable {
-            // Null bitmap byte count followed by one bitmap byte.
-            bytes = bytes.checked_add(mem::size_of::<u16>() + 1)?;
+            bytes += codec::null_prefix_len(1);
         }
-        // Compression tag and element count; bytes use two u32 offsets.
-        let value_bytes = if column.kind.is_fixed() {
-            column.kind.inline_len()
+        let values = if column.kind.is_fixed() {
+            codec::flat_primitive_len(1, column.kind.inline_len())
         } else {
-            2 * mem::size_of::<u32>()
+            codec::flat_bytes_len(1, 0)
         };
-        bytes = bytes.checked_add(mem::size_of::<u8>() + mem::size_of::<u64>() + value_bytes)?;
-    }
-    Some(bytes)
-}
-
-fn validate_prepared_varbyte_offsets(
-    offset_bytes: &[u8],
-    data_len: usize,
-) -> DataIntegrityResult<()> {
-    let mut previous = None;
-    for bytes in offset_bytes.as_chunks::<{ mem::size_of::<u32>() }>().0 {
-        let offset = u32::from_le_bytes(*bytes) as usize;
-        if previous.is_none() && offset != 0
-            || previous.is_some_and(|previous| offset < previous)
-            || offset > data_len
-        {
-            return Err(Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "invalid LWC varbyte offset: previous={previous:?}, current={offset}, data_len={data_len}"
-            )));
-        }
-        previous = Some(offset);
-    }
-    if previous != Some(data_len) {
-        return Err(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "LWC varbyte final offset {previous:?} does not match data length {data_len}"
-            )),
-        );
-    }
-    Ok(())
-}
-
-#[inline]
-fn decode_prepared_flat(kind: ValKind, bytes: &[u8]) -> Val {
-    match kind {
-        ValKind::I8 => Val::I8(bytes[0] as i8),
-        ValKind::U8 => Val::U8(bytes[0]),
-        ValKind::I16 => Val::I16(i16::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::U16 => Val::U16(u16::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::I32 => Val::I32(i32::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::U32 => Val::U32(u32::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::F32 => Val::from(f32::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::I64 => Val::I64(i64::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::U64 => Val::U64(u64::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::F64 => Val::from(f64::from_le_bytes(bytes.try_into().unwrap())),
-        ValKind::VarByte => unreachable!("varbyte uses its offset-aware prepared decoder"),
-    }
-}
-
-#[inline]
-fn decode_prepared_for(kind: ValKind, min: PreparedLwcMin, delta: u64) -> Val {
-    match (kind, min) {
-        (ValKind::I8, PreparedLwcMin::Signed(min)) => {
-            Val::I8((min as i8).wrapping_add(delta as i8))
-        }
-        (ValKind::U8, PreparedLwcMin::Unsigned(min)) => {
-            Val::U8((min as u8).wrapping_add(delta as u8))
-        }
-        (ValKind::I16, PreparedLwcMin::Signed(min)) => {
-            Val::I16((min as i16).wrapping_add(delta as i16))
-        }
-        (ValKind::U16, PreparedLwcMin::Unsigned(min)) => {
-            Val::U16((min as u16).wrapping_add(delta as u16))
-        }
-        (ValKind::I32, PreparedLwcMin::Signed(min)) => {
-            Val::I32((min as i32).wrapping_add(delta as i32))
-        }
-        (ValKind::U32, PreparedLwcMin::Unsigned(min)) => {
-            Val::U32((min as u32).wrapping_add(delta as u32))
-        }
-        (ValKind::I64, PreparedLwcMin::Signed(min)) => Val::I64(min.wrapping_add(delta as i64)),
-        (ValKind::U64, PreparedLwcMin::Unsigned(min)) => Val::U64(min.wrapping_add(delta)),
-        _ => unreachable!("general LWC validation binds FOR minima to integer value kinds"),
-    }
-}
-
-#[inline]
-fn persisted_lwc_layout<T>(
-    result: layout::LayoutResult<T>,
-    field: &'static str,
-) -> DataIntegrityResult<T> {
-    result
-        .change_context(DataIntegrityError::InvalidPayload)
-        .attach_with(|| format!("format=lwc_column_payload, field={field}"))
-}
-
-#[inline]
-fn lwc_block_encoding_contract() -> Report<InternalError> {
-    Report::new(InternalError::LwcBlockEncodingContract)
-}
-
-#[inline]
-fn lwc_payload_len_from_u64(len: u64, payload: &str) -> DataIntegrityResult<usize> {
-    usize::try_from(len).map_err(|_| {
-        Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!("{payload} length exceeds usize::MAX"))
-    })
-}
-
-#[inline]
-fn checked_lwc_payload_len(
-    len: usize,
-    unit_len: usize,
-    payload: &str,
-) -> DataIntegrityResult<usize> {
-    len.checked_mul(unit_len).ok_or_else(|| {
-        Report::new(DataIntegrityError::InvalidPayload)
-            .attach(format!("{payload} length overflows usize"))
-    })
-}
-
-#[inline]
-fn expect_exact_lwc_payload_len(
-    actual_len: usize,
-    expected_len: usize,
-    payload: &str,
-) -> DataIntegrityResult<()> {
-    if actual_len != expected_len {
-        return Err(
-            Report::new(DataIntegrityError::InvalidPayload).attach(format!(
-                "{payload} length mismatch: expected {expected_len}, actual {actual_len}"
-            )),
-        );
-    }
-    Ok(())
-}
-
-#[inline]
-fn flat_lwc_payload<'a>(
-    input: &'a [u8],
-    len: usize,
-    unit_len: usize,
-    payload: &str,
-) -> DataIntegrityResult<&'a [u8]> {
-    let expected_len = checked_lwc_payload_len(len, unit_len, payload)?;
-    expect_exact_lwc_payload_len(input.len(), expected_len, payload)?;
-    Ok(input)
-}
-
-#[inline]
-fn for_bitpacking_lwc_payload(
-    data: &[u8],
-    len: usize,
-    n_bits: usize,
-) -> DataIntegrityResult<&[u8]> {
-    let expected_bits = checked_lwc_payload_len(len, n_bits, "LWC FOR bitpacking payload")?;
-    let expected_len = expected_bits.div_ceil(8);
-    expect_exact_lwc_payload_len(data.len(), expected_len, "LWC FOR bitpacking payload")?;
-    Ok(data)
-}
-
-#[inline]
-fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
-where
-    [T]: IntoBytes + Immutable,
-{
-    Cow::Borrowed(layout::slice_from_bytes::<[u8; N]>(input.as_bytes()))
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[cfg(target_endian = "little")]
-#[inline]
-fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
-    flat_bytes_borrowed(input)
-}
-
-#[cfg(not(target_endian = "little"))]
-#[inline]
-fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
-    Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
-}
-
-#[inline]
-fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>) -> Vec<u8> {
-    let mut bytes = vec![0u8; ser.ser_len()];
-    ser.ser(&mut bytes[..], 0);
-    bytes
-}
-
-impl<T> IntegerEncodingPlan<T>
-where
-    T: BitPackable + IntoBytes + Immutable + for<'a> Ser<'a>,
-{
-    /// Serializes the planned LWC integer payload with canonical null slots.
-    /// Null-free columns borrow their values; other columns replace logical
-    /// null slots with the final minimum in a temporary copy before writing.
-    pub(crate) fn serialize_lwc(&self, values: &[T], nulls: Option<&[u64]>) -> Vec<u8> {
-        let mut values = Cow::Borrowed(values);
-        if let Some(nulls) = nulls {
-            for idx in 0..values.len() {
-                if nulls.bitmap_get(idx) {
-                    values.to_mut()[idx] = self.min();
-                }
-            }
-        }
-        let mut bytes = vec![0; 1 + self.ser_len()];
-        bytes[0] = match self.encoding() {
-            IntegerEncoding::Flat => LwcCode::Flat as u8,
-            IntegerEncoding::ForBitpacking { .. } => LwcCode::ForBitpacking as u8,
-        };
-        self.ser(&values, &mut bytes[..], 1);
-        bytes
-    }
-}
-
-fn bitmap_to_bytes(bitmap: &[u64], len: usize) -> Vec<u8> {
-    let units = len.div_ceil(64);
-    let mut bytes = vec![0u8; len.div_ceil(8)];
-    for (unit_idx, &unit) in bitmap.iter().take(units).enumerate() {
-        let start = unit_idx * 8;
-        let end = (start + 8).min(bytes.len());
-        bytes[start..end].copy_from_slice(&unit.to_le_bytes()[..end - start]);
-    }
-    if let Some(last) = bytes.last_mut() {
-        let rem = len % 8;
-        if rem != 0 {
-            let mask = (1u8 << rem) - 1;
-            *last &= mask;
-        }
+        bytes += values;
     }
     bytes
-}
-
-fn estimate_columns_size(
-    col_layout: &TableColumnLayout,
-    buffer: &ScanBuffer,
-    stats: &[LwcColumnStats],
-    row_count: usize,
-) -> usize {
-    let mut total = 0usize;
-    assert_eq!(
-        stats.len(),
-        col_layout.col_count(),
-        "LWC statistics columns must match the builder table layout"
-    );
-    for (col_idx, st) in stats.iter().enumerate() {
-        let column = buffer
-            .column(col_idx)
-            .unwrap_or_else(|| {
-                panic!(
-                    "LWC size estimation scan buffer must contain column {col_idx} from its table layout"
-                )
-            });
-        if column.null_bitmap.is_some() {
-            total += mem::size_of::<u16>() + row_count.div_ceil(8);
-        }
-        total += estimate_column_payload(
-            col_layout.val_kind(col_idx),
-            &column.values,
-            st,
-            row_count,
-            col_idx,
-        );
-    }
-    total
-}
-
-fn estimate_column_payload(
-    kind: ValKind,
-    values: &ScanColumnValues<'_>,
-    stats: &LwcColumnStats,
-    row_count: usize,
-    col_idx: usize,
-) -> usize {
-    match (kind, values) {
-        (ValKind::I8, ScanColumnValues::I8(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_i64 as i8,
-                stats.max_i64 as i8,
-            )
-            .ser_len()
-        }
-        (ValKind::U8, ScanColumnValues::U8(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_u64 as u8,
-                stats.max_u64 as u8,
-            )
-            .ser_len()
-        }
-        (ValKind::I16, ScanColumnValues::I16(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_i64 as i16,
-                stats.max_i64 as i16,
-            )
-            .ser_len()
-        }
-        (ValKind::U16, ScanColumnValues::U16(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_u64 as u16,
-                stats.max_u64 as u16,
-            )
-            .ser_len()
-        }
-        (ValKind::I32, ScanColumnValues::I32(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_i64 as i32,
-                stats.max_i64 as i32,
-            )
-            .ser_len()
-        }
-        (ValKind::U32, ScanColumnValues::U32(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(
-                row_count,
-                stats.min_u64 as u32,
-                stats.max_u64 as u32,
-            )
-            .ser_len()
-        }
-        (ValKind::I64, ScanColumnValues::I64(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(row_count, stats.min_i64, stats.max_i64).ser_len()
-        }
-        (ValKind::U64, ScanColumnValues::U64(_)) => {
-            1 + IntegerEncodingPlan::from_extrema(row_count, stats.min_u64, stats.max_u64).ser_len()
-        }
-        (ValKind::F32, ScanColumnValues::F32(_)) => {
-            mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * mem::size_of::<f32>()
-        }
-        (ValKind::F64, ScanColumnValues::F64(_)) => {
-            mem::size_of::<u8>() + mem::size_of::<u64>() + row_count * mem::size_of::<f64>()
-        }
-        (ValKind::VarByte, ScanColumnValues::VarByte { offsets, data }) => {
-            let count = offsets.len();
-            mem::size_of::<u8>()
-                + mem::size_of::<u64>()
-                + (count + 1) * mem::size_of::<u32>()
-                + data.len()
-        }
-        _ => unreachable!(
-            "LWC size estimation value kind for column {col_idx} must match its table layout"
-        ),
-    }
-}
-
-#[inline]
-fn read_le_u64(input: &[u8]) -> DataIntegrityResult<(u64, &[u8])> {
-    if input.len() < 8 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian u64"));
-    }
-    let u: [u8; 8] = input[..8].try_into().unwrap();
-    let v = u64::from_le_bytes(u);
-    Ok((v, &input[8..]))
-}
-
-#[inline]
-fn read_le_u32(input: &[u8]) -> DataIntegrityResult<(u32, &[u8])> {
-    if input.len() < 4 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian u32"));
-    }
-    let u: [u8; 4] = input[..4].try_into().unwrap();
-    Ok((u32::from_le_bytes(u), &input[4..]))
-}
-
-#[inline]
-fn read_le_i32(input: &[u8]) -> DataIntegrityResult<(i32, &[u8])> {
-    if input.len() < 4 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian i32"));
-    }
-    let u: [u8; 4] = input[..4].try_into().unwrap();
-    Ok((i32::from_le_bytes(u), &input[4..]))
-}
-
-#[inline]
-fn read_le_u16(input: &[u8]) -> DataIntegrityResult<(u16, &[u8])> {
-    if input.len() < 2 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian u16"));
-    }
-    let u: [u8; 2] = input[..2].try_into().unwrap();
-    Ok((u16::from_le_bytes(u), &input[2..]))
-}
-
-#[inline]
-fn read_le_i16(input: &[u8]) -> DataIntegrityResult<(i16, &[u8])> {
-    if input.len() < 2 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian i16"));
-    }
-    let u: [u8; 2] = input[..2].try_into().unwrap();
-    Ok((i16::from_le_bytes(u), &input[2..]))
-}
-
-#[inline]
-fn read_le_i64(input: &[u8]) -> DataIntegrityResult<(i64, &[u8])> {
-    if input.len() < 8 {
-        return Err(Report::new(DataIntegrityError::InvalidPayload)
-            .attach("expected LWC little-endian i64"));
-    }
-    let u: [u8; 8] = input[..8].try_into().unwrap();
-    Ok((i64::from_le_bytes(u), &input[8..]))
-}
-
-#[inline]
-fn read_u8(input: &[u8]) -> DataIntegrityResult<(u8, &[u8])> {
-    if input.is_empty() {
-        return Err(Report::new(DataIntegrityError::InvalidPayload).attach("expected LWC u8"));
-    }
-    let v = input[0];
-    Ok((v, &input[1..]))
-}
-
-#[inline]
-fn read_i8(input: &[u8]) -> DataIntegrityResult<(i8, &[u8])> {
-    if input.is_empty() {
-        return Err(Report::new(DataIntegrityError::InvalidPayload).attach("expected LWC i8"));
-    }
-    let v = input[0] as i8;
-    Ok((v, &input[1..]))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::codec::{IntegerEncoding, IntegerEncodingPlan, LwcCode};
     use super::*;
-    use crate::catalog::{StorageColumnFlags, StorageColumnSpec, TableMetadata};
-    use crate::error::{DataIntegrityError, DataIntegrityResult, InternalError, InternalResult};
-    use crate::file::{FileKind, test_block_id};
-    use crate::id::RowID;
-    use crate::io::IOBuf;
-    use crate::row::{Delete, InsertRow, RowPage};
-    use crate::value::{MemVar, Val};
-    use ordered_float::OrderedFloat;
+    use crate::bitmap::Bitmap;
+    use crate::component::panic_payload_description;
+    use crate::compression::*;
+    use crate::error::{DataIntegrityError, DataIntegrityResult};
+    use crate::layout;
+    use crate::primitive::Primitive;
+    use crate::serde::{Ser, Serde};
+    use crate::value::{Val, ValKind};
+    use std::borrow::Cow;
     use std::fmt::Debug;
+    use std::panic::catch_unwind;
+    use zerocopy::{Immutable, IntoBytes};
+
+    /// Serializer for flat floating-point and variable-byte LWC column payloads.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum LwcPrimitiveSer<'a> {
+        FlatF32(Cow<'a, [[u8; 4]]>),
+        FlatF64(Cow<'a, [[u8; 8]]>),
+        Bytes(LwcBytesSer),
+    }
+
+    impl<'a> LwcPrimitiveSer<'a> {
+        /// Creates an f32 flat serializer.
+        #[inline]
+        pub(crate) fn new_f32(input: &'a [f32]) -> Self {
+            LwcPrimitiveSer::FlatF32(flat_f32_bytes(input))
+        }
+
+        /// Creates an f64 flat serializer.
+        #[inline]
+        pub(crate) fn new_f64(input: &'a [f64]) -> Self {
+            LwcPrimitiveSer::FlatF64(flat_f64_bytes(input))
+        }
+
+        /// Creates a borrowed varbyte flat serializer.
+        #[inline]
+        pub(crate) fn new_bytes(offsets: &[u32], data: &[u8]) -> Self {
+            Self::new_bytes_owned(offsets.to_vec(), data.to_vec())
+        }
+
+        /// Creates an owned varbyte flat serializer.
+        #[inline]
+        pub(crate) fn new_bytes_owned(offsets: Vec<u32>, data: Vec<u8>) -> Self {
+            assert_eq!(
+                offsets.first(),
+                Some(&0),
+                "LwcPrimitiveSer requires an origin offset"
+            );
+            LwcPrimitiveSer::Bytes(LwcBytesSer { offsets, data })
+        }
+    }
+
+    impl<'a> Ser<'a> for LwcPrimitiveSer<'a> {
+        #[inline]
+        fn ser_len(&self) -> usize {
+            1 + match self {
+                LwcPrimitiveSer::FlatF32(f) => f.ser_len(),
+                LwcPrimitiveSer::FlatF64(f) => f.ser_len(),
+                LwcPrimitiveSer::Bytes(b) => b.ser_len(),
+            }
+        }
+
+        #[inline]
+        fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+            let idx = out.ser_u8(start_idx, LwcCode::Flat as u8);
+            match self {
+                LwcPrimitiveSer::FlatF32(f) => f.ser(out, idx),
+                LwcPrimitiveSer::FlatF64(f) => f.ser(out, idx),
+                LwcPrimitiveSer::Bytes(b) => b.ser(out, idx),
+            }
+        }
+    }
+
+    /// Owned serializer for flat varbyte payloads.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct LwcBytesSer {
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+    }
+
+    impl Ser<'_> for LwcBytesSer {
+        #[inline]
+        fn ser_len(&self) -> usize {
+            mem::size_of::<u64>() + self.offsets.len() * mem::size_of::<u32>() + self.data.len()
+        }
+
+        #[inline]
+        fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+            debug_assert_ne!(self.offsets, []);
+            let mut idx = out.ser_u64(start_idx, (self.offsets.len() - 1) as u64);
+            for off in self.offsets.iter().copied() {
+                idx = out.ser_u32(idx, off);
+            }
+            out.ser_byte_slice(idx, &self.data)
+        }
+    }
+
+    /// Serializer for length-prefixed null bitmap payloads.
+    pub(crate) struct LwcNullBitmapSer<'a> {
+        bytes: &'a [u8],
+    }
+
+    impl<'a> LwcNullBitmapSer<'a> {
+        /// Creates a null bitmap serializer after validating the length prefix fits.
+        #[inline]
+        pub(crate) fn new(bytes: &'a [u8]) -> Self {
+            assert!(
+                bytes.len() <= usize::from(u16::MAX),
+                "LwcNullBitmapSer bitmap length must fit u16: actual={}",
+                bytes.len()
+            );
+            LwcNullBitmapSer { bytes }
+        }
+    }
+
+    impl Ser<'_> for LwcNullBitmapSer<'_> {
+        #[inline]
+        fn ser_len(&self) -> usize {
+            mem::size_of::<u16>() + self.bytes.len()
+        }
+
+        #[inline]
+        fn ser<S: Serde + ?Sized>(&self, out: &mut S, start_idx: usize) -> usize {
+            let idx = out.ser_u16(start_idx, self.bytes.len() as u16);
+            out.ser_byte_slice(idx, self.bytes)
+        }
+    }
+
+    #[inline]
+    fn flat_bytes_borrowed<'a, T, const N: usize>(input: &'a [T]) -> Cow<'a, [[u8; N]]>
+    where
+        [T]: IntoBytes + Immutable,
+    {
+        Cow::Borrowed(layout::slice_from_bytes::<[u8; N]>(input.as_bytes()))
+    }
+
+    #[cfg(target_endian = "little")]
+    #[inline]
+    fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+        flat_bytes_borrowed(input)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    #[inline]
+    fn flat_f32_bytes(input: &[f32]) -> Cow<'_, [[u8; 4]]> {
+        Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+    }
+
+    #[cfg(target_endian = "little")]
+    #[inline]
+    fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+        flat_bytes_borrowed(input)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    #[inline]
+    fn flat_f64_bytes(input: &[f64]) -> Cow<'_, [[u8; 8]]> {
+        Cow::Owned(input.iter().map(|v| v.to_le_bytes()).collect())
+    }
+
+    #[inline]
+    fn serialize_primitive<'a>(ser: &LwcPrimitiveSer<'a>) -> Vec<u8> {
+        let mut bytes = vec![0u8; ser.ser_len()];
+        ser.ser(&mut bytes[..], 0);
+        bytes
+    }
+
+    impl<T> IntegerEncodingPlan<T>
+    where
+        T: BitPackable + Primitive,
+    {
+        /// Serializes the planned LWC integer payload with canonical null slots.
+        /// Null-free columns borrow their values; other columns replace logical
+        /// null slots with the final minimum in a temporary copy before writing.
+        pub(crate) fn serialize_lwc(&self, values: &[T], nulls: Option<&[u64]>) -> Vec<u8> {
+            let mut values = Cow::Borrowed(values);
+            if let Some(nulls) = nulls {
+                for idx in 0..values.len() {
+                    if nulls.bitmap_get(idx) {
+                        values.to_mut()[idx] = self.min();
+                    }
+                }
+            }
+            let mut bytes = vec![0; 1 + self.ser_len()];
+            bytes[0] = match self.encoding() {
+                IntegerEncoding::Flat => LwcCode::Flat as u8,
+                IntegerEncoding::ForBitpacking { .. } => LwcCode::ForBitpacking as u8,
+            };
+            self.ser(&values, &mut bytes[..], 1);
+            bytes
+        }
+    }
 
     #[track_caller]
     fn assert_invalid_payload<T>(case: &str, result: DataIntegrityResult<T>) {
@@ -2243,7 +464,7 @@ mod tests {
 
     fn encode_integer<T>(values: &[T]) -> Vec<u8>
     where
-        T: BitPackable + Ord + Into<i128> + IntoBytes + Immutable + for<'a> Ser<'a>,
+        T: BitPackable + Ord + Into<i128> + Primitive,
     {
         let min = values.iter().copied().min().unwrap_or(T::ZERO);
         let max = values.iter().copied().max().unwrap_or(T::ZERO);
@@ -2262,138 +483,6 @@ mod tests {
             .collect();
         let case = format!("{kind:?}, input={expected:?}");
         assert_decoded_values(&case, kind, bytes, &expected);
-    }
-
-    fn row_page_with_rows(
-        metadata: &TableMetadata,
-        first_row_id: RowID,
-        rows: &[Vec<Val>],
-    ) -> RowPage {
-        let mut page = RowPage::new_test_page();
-        page.init(first_row_id, rows.len(), metadata.col.as_ref());
-        for (offset, row) in rows.iter().enumerate() {
-            assert!(
-                matches!(
-                    page.insert(metadata.col.as_ref(), row),
-                    InsertRow::Ok(row_id) if row_id == first_row_id + offset as u64
-                ),
-                "row={offset}"
-            );
-        }
-        page
-    }
-
-    fn assert_persisted_rows(bytes: &[u8], col_layout: &TableColumnLayout, expected: &[Vec<Val>]) {
-        let block =
-            LwcBlock::try_from_persisted_bytes(bytes, FileKind::TableFile, test_block_id(1))
-                .unwrap();
-        assert_eq!(block.row_count(), expected.len());
-        assert_eq!(block.header.col_count() as usize, col_layout.col_count());
-        for col_idx in 0..col_layout.col_count() {
-            let column = block.column(col_layout, col_idx).unwrap();
-            assert_eq!(
-                column.data().unwrap().len(),
-                expected.len(),
-                "column={col_idx}"
-            );
-        }
-        let mut prepared = PreparedLwcBlock::new(block, col_layout).unwrap();
-        for (row_idx, row) in expected.iter().enumerate() {
-            let decoded = block.decode_full_row_values(col_layout, row_idx).unwrap();
-            assert_eq!(&decoded, row, "row={row_idx}");
-            for (col_idx, expected_value) in row.iter().enumerate() {
-                assert_eq!(
-                    decoded[col_idx].kind(),
-                    expected_value.kind(),
-                    "row={row_idx}, column={col_idx}"
-                );
-                assert_eq!(
-                    &prepared
-                        .decode_value(block, col_layout, row_idx, col_idx)
-                        .unwrap(),
-                    expected_value,
-                    "prepared row={row_idx}, column={col_idx}"
-                );
-            }
-        }
-    }
-
-    fn assert_built_rows(builder: LwcBuilder, expected: &[Vec<Val>]) {
-        let col_layout = Arc::clone(&builder.col_layout);
-        let buf = build_with_size_check(builder);
-        assert_persisted_rows(buf.as_bytes(), col_layout.as_ref(), expected);
-    }
-
-    fn used_payload_size(buf: &DirectBuf) -> usize {
-        let block = LwcBlock::try_from_persisted_bytes(
-            buf.as_bytes(),
-            FileKind::TableFile,
-            test_block_id(1),
-        )
-        .unwrap();
-        let end = block.header.col_count() as usize * 2;
-        let used_body = u16::from_le_bytes(block.body[end - 2..end].try_into().unwrap()) as usize;
-        assert!(block.body[used_body..].iter().all(|&byte| byte == 0));
-        24 + used_body
-    }
-
-    fn build_with_size_check(builder: LwcBuilder) -> DirectBuf {
-        let planned = builder.estimate_size();
-        let buf = builder.build(0x0807_0605_0403_0201).unwrap();
-        assert_eq!(used_payload_size(&buf), planned);
-        assert!(planned <= LWC_BLOCK_PAYLOAD_SIZE);
-        buf
-    }
-
-    fn append_stale_pages(
-        builder: &mut LwcBuilder,
-        metadata: &TableMetadata,
-        rows: &[Vec<Val>],
-        stale: &[Val],
-    ) {
-        for (chunk, rows) in rows.chunks(512).enumerate() {
-            let physical: Vec<Vec<Val>> = rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .enumerate()
-                        .map(|(col, value)| {
-                            if matches!(value, Val::Null) {
-                                stale[col].clone()
-                            } else {
-                                value.clone()
-                            }
-                        })
-                        .collect()
-                })
-                .collect();
-            let mut page =
-                row_page_with_rows(metadata, RowID::new((chunk * 512) as u64), &physical);
-            for (row_idx, row) in rows.iter().enumerate() {
-                for (col_idx, value) in row.iter().enumerate() {
-                    if matches!(value, Val::Null) {
-                        page.set_null_exclusive(&metadata.col, row_idx, col_idx, true);
-                    }
-                }
-            }
-            assert!(builder.append_view(page.vector_view(&metadata.col), page.header.start_row_id));
-        }
-    }
-
-    fn integer_stats(builder: &LwcBuilder) -> Vec<(bool, i64, i64, u64, u64)> {
-        builder
-            .stats
-            .iter()
-            .map(|stat| {
-                (
-                    stat.initialized,
-                    stat.min_i64,
-                    stat.max_i64,
-                    stat.min_u64,
-                    stat.max_u64,
-                )
-            })
-            .collect()
     }
 
     /// Purpose: Select integer encodings by full wire cost for every supported type.
@@ -2491,384 +580,49 @@ mod tests {
         }
     }
 
-    /// Purpose: Encode the formerly overflowing nullable U64 fixtures and all-null columns through both ingestion paths.
-    /// Expected: Both paths produce identical canonical blocks, exact wire sizes, and all logical rows through the row cap.
+    /// Purpose: Separate point-local offset checks from complete variable-byte validation.
+    /// Expected: Both readers reject invalid endpoints; point reads check only their pair while preparation rejects malformed interior offsets.
     #[test]
-    fn nullable_integer_capacity_regressions() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::U64,
-                StorageColumnFlags::NULLABLE,
-            )],
-            vec![],
-        )
-        .unwrap();
-        for (count, all_null, expected_size) in [
-            (8_060, false, 2_062),
-            (9_000, false, 2_296),
-            (MAX_LWC_ROWS, true, 3_886),
-        ] {
-            let rows: Vec<_> = (0..count)
-                .map(|i| {
-                    vec![if all_null || i % 2 == 1 {
-                        Val::Null
-                    } else {
-                        Val::U64(1 << 40)
-                    }]
-                })
-                .collect();
-            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
-            for (idx, row) in rows.iter().enumerate() {
-                assert!(
-                    direct.append_row_values(RowID::new(idx as u64), row),
-                    "row={idx}"
-                );
-            }
-            if all_null {
-                let seeds = direct.row_set_seeds().to_vec();
-                assert!(!direct.append_row_values(RowID::new(count as u64), &[Val::Null]));
-                assert_eq!(direct.row_set_seeds(), seeds);
-                assert_eq!(integer_stats(&direct), vec![(false, 0, 0, 0, 0)]);
-            }
-            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
-            append_stale_pages(&mut pages, &metadata, &rows, &[Val::U64(u64::MAX)]);
-            assert_eq!(pages.row_ids(), direct.row_ids());
-            let direct = build_with_size_check(direct);
-            let pages = build_with_size_check(pages);
-            assert_eq!(used_payload_size(&direct), expected_size);
-            assert_eq!(direct.as_bytes(), pages.as_bytes());
-            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
-        }
-    }
-
-    /// Purpose: Canonicalize every integer type against the final minimum for flat and packed nullable columns.
-    /// Expected: Stale extremes and deleted rows do not affect canonical bytes, logical nulls, or row order.
-    #[test]
-    fn integer_null_slots_use_final_minimum() {
-        let kinds = [
-            ValKind::I8,
-            ValKind::U8,
-            ValKind::I16,
-            ValKind::U16,
-            ValKind::I32,
-            ValKind::U32,
-            ValKind::I64,
-            ValKind::U64,
-        ];
-        let metadata = TableMetadata::try_new(
-            kinds
-                .into_iter()
-                .map(|kind| StorageColumnSpec::new(kind, StorageColumnFlags::NULLABLE))
-                .collect(),
-            vec![],
-        )
-        .unwrap();
-        let stale = vec![
-            Val::I8(i8::MAX),
-            Val::U8(u8::MAX),
-            Val::I16(i16::MAX),
-            Val::U16(u16::MAX),
-            Val::I32(i32::MAX),
-            Val::U32(u32::MAX),
-            Val::I64(i64::MAX),
-            Val::U64(u64::MAX),
-        ];
-        let low = vec![
-            Val::I8(-100),
-            Val::U8(100),
-            Val::I16(-1000),
-            Val::U16(1000),
-            Val::I32(-100_000),
-            Val::U32(100_000),
-            Val::I64(-(1 << 41)),
-            Val::U64(1 << 40),
-        ];
-        for count in [2, 19] {
-            let mut rows = vec![vec![Val::Null; 8]; count];
-            rows[count - 1] = low.clone();
-            if count > 2 {
-                rows[3] = vec![
-                    Val::I8(-99),
-                    Val::U8(101),
-                    Val::I16(-999),
-                    Val::U16(1001),
-                    Val::I32(-99_999),
-                    Val::U32(100_001),
-                    Val::I64(-(1 << 41) + 1),
-                    Val::U64((1 << 40) + 1),
-                ];
-            }
-            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
-            for (idx, row) in rows.iter().enumerate() {
-                assert!(direct.append_row_values(RowID::new(idx as u64), row));
-            }
-            let mut physical = vec![stale.clone(); count + 1];
-            physical[count - 1] = low.clone();
-            if count > 2 {
-                physical[3] = rows[3].clone();
-            }
-            let mut page = row_page_with_rows(&metadata, RowID::new(0), &physical);
-            for (row_idx, row) in rows.iter().enumerate().take(count - 1) {
-                for (col_idx, value) in row.iter().enumerate() {
-                    page.set_null_exclusive(
-                        &metadata.col,
-                        row_idx,
-                        col_idx,
-                        matches!(value, Val::Null),
-                    );
-                }
-            }
-            assert!(matches!(page.delete(RowID::new(count as u64)), Delete::Ok));
-            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
-            assert!(pages.append_view(page.vector_view(&metadata.col), RowID::new(0)));
-            assert_eq!(pages.row_ids(), direct.row_ids());
-            let direct = build_with_size_check(direct);
-            let pages = build_with_size_check(pages);
-            assert_eq!(direct.as_bytes(), pages.as_bytes());
-            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
-            let block = LwcBlock::try_from_persisted_bytes(
-                direct.as_bytes(),
-                FileKind::TableFile,
-                test_block_id(1),
-            )
-            .unwrap();
-            for (col_idx, expected) in low.iter().enumerate() {
-                let column = block.column(&metadata.col, col_idx).unwrap();
-                let data = column.data().unwrap();
-                for (row_idx, row) in rows.iter().enumerate() {
-                    let expected = if matches!(row[col_idx], Val::Null) {
-                        expected
-                    } else {
-                        &row[col_idx]
-                    };
-                    assert_eq!(
-                        data.value(row_idx).as_ref(),
-                        Some(expected),
-                        "physical row={row_idx}, col={col_idx}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Purpose: Admit an exact-fit mixed block while rejecting one extra byte and defending bypassed admission.
-    /// Expected: The singleton uses flat, rejected appends restore state, and both body and offset overflow return typed errors.
-    #[test]
-    fn integer_singleton_exact_fit_and_final_capacity_guard() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .unwrap();
-        let row = vec![Val::U64(17), Val::try_from(vec![7; 65_442]).unwrap()];
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let too_large = vec![Val::U64(u64::MAX), Val::try_from(vec![7; 65_443]).unwrap()];
-        assert!(!builder.append_row_values(RowID::new(0), &too_large));
-        assert!(builder.is_empty());
-        assert_eq!(builder.row_ids(), &[]);
-        assert_eq!(builder.row_set_seeds(), &[]);
-        assert!(integer_stats(&builder).iter().all(|stat| !stat.0));
-        assert!(builder.append_row_values(RowID::new(0), &row));
-        let buf = build_with_size_check(builder);
-        assert_eq!(used_payload_size(&buf), 65_504);
-        assert_persisted_rows(buf.as_bytes(), &metadata.col, &[row]);
-
-        for length in [65_443, 65_500] {
-            let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-            assert!(!builder.append_row_values_inner(
-                RowID::new(0),
-                &[Val::U64(17), Val::try_from(vec![7; length]).unwrap(),]
-            ));
-            let err = builder
-                .build(0)
-                .err()
-                .expect("oversized internal state must fail");
-            assert_eq!(
-                err.current_context(),
-                &InternalError::LwcBlockEncodingContract
-            );
-            let report = format!("{err:?}");
-            for detail in [
-                "field=column_end_offset",
-                "column_no=1",
-                "capacity=65480",
-                "actual=",
-            ] {
-                assert!(report.contains(detail), "{report}");
-            }
-        }
-    }
-
-    /// Purpose: Roll back direct and page-view capacity failures across bitmap growth and changed integer extrema.
-    /// Expected: Identities, seeds, sizes, and statistics stay exact, and subsequent mixed-column rows round trip.
-    #[test]
-    fn mixed_column_capacity_rollback() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
-            ],
-            vec![],
-        )
-        .unwrap();
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let mut rows: Vec<_> = (0..8)
-            .map(|i| {
-                vec![
-                    if i % 2 == 0 {
-                        Val::Null
-                    } else {
-                        Val::I64(1 << 40)
-                    },
-                    Val::F64(OrderedFloat(i as f64)),
-                    if i == 0 {
-                        Val::try_from(vec![42; 64_900]).unwrap()
-                    } else {
-                        Val::Null
-                    },
-                ]
-            })
-            .collect();
-        for (idx, row) in rows.iter().enumerate() {
-            assert!(builder.append_row_values(RowID::new(idx as u64), row));
-        }
-        let ids = builder.row_ids().to_vec();
-        let seeds = builder.row_set_seeds().to_vec();
-        let stats = integer_stats(&builder);
-        let size = builder.estimate_size();
-        for value in [Val::I64(i64::MIN), Val::Null] {
-            let oversized = vec![
-                value,
-                Val::F64(OrderedFloat(-123.0)),
-                Val::try_from(vec![5; 1_024]).unwrap(),
-            ];
-            assert!(!builder.append_row_values(RowID::new(8), &oversized));
-            assert_eq!(builder.row_ids(), ids);
-            assert_eq!(builder.row_set_seeds(), seeds);
-            assert_eq!(integer_stats(&builder), stats);
-            assert_eq!(builder.estimate_size(), size);
-            let page = row_page_with_rows(&metadata, RowID::new(8), &[oversized]);
-            assert!(!builder.append_view(page.vector_view(&metadata.col), RowID::new(8)));
-            assert_eq!(builder.row_ids(), ids);
-            assert_eq!(builder.row_set_seeds(), seeds);
-            assert_eq!(integer_stats(&builder), stats);
-            assert_eq!(builder.estimate_size(), size);
-        }
-        let last = vec![
-            Val::I64(-(1 << 40)),
-            Val::F64(OrderedFloat(0.5)),
-            Val::try_from("tail").unwrap(),
-        ];
-        assert!(builder.append_row_values(RowID::new(8), &last));
-        rows.push(last);
-        assert_built_rows(builder, &rows);
-    }
-
-    /// Purpose: Compare planned sizes with persisted offsets for reproducible mixed nullable values.
-    /// Expected: Both ingestion paths encode identical logical rows and every accepted block has the exact planned used length.
-    #[test]
-    fn seeded_mixed_column_size_invariant() {
-        use rand::rngs::StdRng;
-        use rand::{RngExt, SeedableRng};
-
-        let mut rng = StdRng::seed_from_u64(337);
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .unwrap();
-        for case in 0..32 {
-            let count = rng.random_range(1..256);
-            let rows: Vec<_> = (0..count)
-                .map(|row| {
-                    let signed = if case % 2 == 0 {
-                        -(1 << 40) + rng.random_range(0..4)
-                    } else {
-                        rng.random::<i64>()
-                    };
-                    let unsigned = if case % 2 == 0 {
-                        u64::MAX - rng.random_range(0..256)
-                    } else {
-                        rng.random::<u64>()
-                    };
-                    vec![
-                        if case != 0 && rng.random_bool(0.3) {
-                            Val::Null
-                        } else {
-                            Val::I64(signed)
-                        },
-                        if case != 0 && rng.random_bool(0.3) {
-                            Val::Null
-                        } else {
-                            Val::U64(unsigned)
-                        },
-                        Val::F32(OrderedFloat(row as f32 / 4.0)),
-                        Val::try_from(vec![row as u8; rng.random_range(0..32)]).unwrap(),
-                    ]
-                })
-                .collect();
-            let mut direct = LwcBuilder::new(Arc::clone(&metadata.col));
-            for (idx, row) in rows.iter().enumerate() {
-                assert!(
-                    direct.append_row_values(RowID::new(idx as u64), row),
-                    "seed=337 case={case} row={idx}"
-                );
-            }
-            let mut pages = LwcBuilder::new(Arc::clone(&metadata.col));
-            append_stale_pages(
-                &mut pages,
-                &metadata,
-                &rows,
-                &[
-                    Val::I64(i64::MAX),
-                    Val::U64(0),
-                    Val::F32(OrderedFloat(0.0)),
-                    Val::try_from("").unwrap(),
-                ],
-            );
-            let direct = build_with_size_check(direct);
-            let pages = build_with_size_check(pages);
-            assert_eq!(direct.as_bytes(), pages.as_bytes(), "seed=337 case={case}");
-            assert_persisted_rows(direct.as_bytes(), &metadata.col, &rows);
-        }
-    }
-
-    /// Purpose: Validate variable-byte offset origins, ordering, and payload boundaries.
-    /// Expected: Preparing malformed offsets reports an invalid payload.
-    #[test]
-    fn prepared_lwc_data_rejects_malformed_varbyte_offsets() {
-        for (case, offsets) in [
-            ("nonzero origin", vec![1u32, 1, 3]),
-            ("descending offsets", vec![0, 2, 1, 3]),
-            ("offset past backing data", vec![0, 4, 3]),
-            ("unreferenced trailing data", vec![0, 1, 2]),
+    fn lwc_readers_reject_malformed_varbyte_offsets() {
+        for (case, offsets, expected) in [
+            ("nonzero origin", vec![1u32, 1, 3], None),
+            ("unreferenced trailing data", vec![0, 1, 2], None),
+            ("terminal past backing data", vec![0, 1, 4], None),
+            (
+                "descending offsets",
+                vec![0, 2, 1, 3],
+                Some(vec![Some("ab"), None, Some("bc")]),
+            ),
+            (
+                "offset past backing data",
+                vec![0, 4, 2, 3],
+                Some(vec![None, None, Some("c")]),
+            ),
         ] {
             let mut bytes = flat_payload((offsets.len() - 1) as u64, &[]);
             for offset in offsets {
                 bytes.extend_from_slice(&offset.to_le_bytes());
             }
             bytes.extend_from_slice(b"abc");
+            let before = offset_validation_count();
+            let ordinary = LwcData::from_bytes(ValKind::VarByte, &bytes);
+            if let Some(expected) = expected {
+                let ordinary = ordinary.unwrap();
+                assert_eq!(ordinary.len(), expected.len(), "{case}");
+                for (row, value) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        ordinary.value(row),
+                        value.map(|value| Val::try_from(value).unwrap()),
+                        "{case}: row={row}"
+                    );
+                }
+                assert_eq!(ordinary.value(ordinary.len()), None, "{case}");
+            } else {
+                assert_invalid_payload(case, ordinary);
+            }
+            assert_eq!(offset_validation_count(), before, "{case}: point access");
             assert_invalid_payload(case, PreparedLwcData::from_bytes(ValKind::VarByte, &bytes));
         }
-    }
-
-    /// Purpose: Keep LWC encoding inputs and results transferable to worker threads.
-    /// Expected: Builder and result types satisfy the thread-transfer and lifetime bounds.
-    #[test]
-    fn lwc_encode_task_types_are_send_and_static() {
-        fn assert_send_static<T: Send + 'static>() {}
-
-        assert_send_static::<LwcBuilder>();
-        assert_send_static::<InternalResult<DirectBuf>>();
     }
 
     /// Purpose: Round-trip ordinary and prepared columns across value kinds and compression ranges.
@@ -3014,7 +768,7 @@ mod tests {
         ] {
             assert_payload_roundtrip(
                 ValKind::VarByte,
-                &serialize_primitive(&LwcPrimitiveSer::new_bytes(&offsets, bytes).unwrap()),
+                &serialize_primitive(&LwcPrimitiveSer::new_bytes(&offsets, bytes)),
                 &expected,
             );
         }
@@ -3072,12 +826,142 @@ mod tests {
         }
     }
 
+    /// Purpose: Preserve every supported integer-type and packed-width combination independently of writer selection.
+    /// Expected: Both readers recover extreme bases and maximal deltas from manually packed fixtures, and reject widths that cannot compress their source type.
+    #[test]
+    fn all_integer_reader_widths_match_wire_fixtures() {
+        macro_rules! check {
+            ($ty:ty, $kind:ident) => {
+                for bits in [1usize, 2, 4, 8, 16, 32, 64] {
+                    let base = <$ty>::MIN;
+                    let delta = if bits == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << bits) - 1
+                    };
+                    let deltas = [0, 1, delta];
+                    let mut packed = vec![0u8; (3 * bits).div_ceil(8)];
+                    for (idx, delta) in deltas.iter().enumerate() {
+                        for bit in 0..bits {
+                            let pos = idx * bits + bit;
+                            packed[pos / 8] |= (((delta >> bit) & 1) as u8) << (pos % 8);
+                        }
+                    }
+                    let bytes = bitpacked_payload(bits as u8, 3, &base.to_le_bytes(), &packed);
+                    let case = format!("{} bits={bits}", stringify!($ty));
+                    if bits >= mem::size_of::<$ty>() * 8 {
+                        assert_invalid_payload(&case, LwcData::from_bytes(ValKind::$kind, &bytes));
+                        assert_invalid_payload(
+                            &case,
+                            PreparedLwcData::from_bytes(ValKind::$kind, &bytes),
+                        );
+                    } else {
+                        let expected: Vec<_> = deltas
+                            .iter()
+                            .map(|&delta| Val::from((base as i128 + i128::from(delta)) as $ty))
+                            .collect();
+                        assert_decoded_values(&case, ValKind::$kind, &bytes, &expected);
+                    }
+                }
+            };
+        }
+        check!(i8, I8);
+        check!(u8, U8);
+        check!(i16, I16);
+        check!(u16, U16);
+        check!(i32, I32);
+        check!(u32, U32);
+        check!(i64, I64);
+        check!(u64, U64);
+    }
+
+    /// Purpose: Bound persisted column counts by the block header's representation before sizing payloads.
+    /// Expected: Both readers accept the maximum u16 count and reject a complete payload one row beyond it for every codec layout.
+    #[test]
+    fn lwc_readers_enforce_block_row_count_domain() {
+        let max_rows = usize::from(u16::MAX);
+        for rows in [max_rows, max_rows + 1] {
+            for (case, kind, bytes, expected) in [
+                (
+                    "flat",
+                    ValKind::U8,
+                    flat_payload(rows as u64, &vec![7; rows]),
+                    Val::U8(7),
+                ),
+                (
+                    "bytes",
+                    ValKind::VarByte,
+                    flat_payload(rows as u64, &vec![0; (rows + 1) * 4]),
+                    Val::try_from("").unwrap(),
+                ),
+                (
+                    "FOR",
+                    ValKind::U8,
+                    bitpacked_payload(1, rows as u64, &[7], &vec![0; rows.div_ceil(8)]),
+                    Val::U8(7),
+                ),
+            ] {
+                let ordinary = LwcData::from_bytes(kind, &bytes);
+                let prepared = PreparedLwcData::from_bytes(kind, &bytes);
+                if rows > max_rows {
+                    assert_invalid_payload(&format!("{case}: ordinary"), ordinary);
+                    assert_invalid_payload(&format!("{case}: prepared"), prepared);
+                    continue;
+                }
+                let ordinary = ordinary.unwrap();
+                let prepared = prepared.unwrap();
+                assert_eq!(ordinary.len(), rows, "{case}: ordinary count");
+                assert_eq!(prepared.len(), rows, "{case}: prepared count");
+                for row in [0, rows - 1] {
+                    assert_eq!(
+                        ordinary.value(row).as_ref(),
+                        Some(&expected),
+                        "{case}: ordinary row={row}"
+                    );
+                    assert_eq!(
+                        prepared.value(&bytes, row).as_ref(),
+                        Some(&expected),
+                        "{case}: prepared row={row}"
+                    );
+                }
+                assert_eq!(ordinary.value(rows), None, "{case}: ordinary end");
+                assert_eq!(prepared.value(&bytes, rows), None, "{case}: prepared end");
+            }
+        }
+    }
+
     /// Purpose: Reject malformed column headers, lengths, typed elements, and packing widths.
     /// Expected: Both readers report invalid payloads without truncating counts or ignoring excess bytes.
     #[test]
     fn test_lwc_decoders_reject_malformed_payloads() {
         for (case, kind, bytes) in [
             ("empty payload", ValKind::U8, vec![]),
+            ("unknown codec", ValKind::U8, vec![255; 9]),
+            (
+                "FOR on float",
+                ValKind::F32,
+                bitpacked_payload(1, 1, &[0; 4], &[0]),
+            ),
+            (
+                "FOR on bytes",
+                ValKind::VarByte,
+                bitpacked_payload(1, 1, &[0; 8], &[0]),
+            ),
+            (
+                "flat maximum persisted count",
+                ValKind::U64,
+                flat_payload(u64::MAX, &[]),
+            ),
+            (
+                "byte maximum persisted count",
+                ValKind::VarByte,
+                flat_payload(u64::MAX, &[]),
+            ),
+            (
+                "FOR maximum persisted count",
+                ValKind::U64,
+                bitpacked_payload(32, u64::MAX, &[0; 8], &[]),
+            ),
             ("flat truncated data", ValKind::U8, flat_payload(2, &[7])),
             ("flat excess data", ValKind::U8, flat_payload(1, &[7, 8])),
             (
@@ -3128,7 +1012,7 @@ mod tests {
     }
 
     /// Purpose: Reject variable-byte builder offsets with no origin or a nonzero origin.
-    /// Expected: Both borrowed and owned construction report builder misuse.
+    /// Expected: Both borrowed and owned fixture construction assert the origin-offset contract.
     #[test]
     fn test_lwc_bytes_rejects_invalid_builder_offsets() {
         for (case, offsets, data) in [
@@ -3136,20 +1020,23 @@ mod tests {
             ("nonzero origin", vec![1, 2], vec![0]),
         ] {
             for (mode, result) in [
-                ("borrowed", LwcPrimitiveSer::new_bytes(&offsets, &data)),
+                (
+                    "borrowed",
+                    catch_unwind(|| LwcPrimitiveSer::new_bytes(&offsets, &data)),
+                ),
                 (
                     "owned",
-                    LwcPrimitiveSer::new_bytes_owned(offsets.clone(), data.clone()),
+                    catch_unwind(|| {
+                        LwcPrimitiveSer::new_bytes_owned(offsets.clone(), data.clone())
+                    }),
                 ),
             ] {
-                let err = match result {
-                    Ok(_) => panic!("{case}: {mode} builder accepted invalid offsets"),
-                    Err(err) => err,
-                };
-                assert_eq!(
-                    err.current_context(),
-                    &InternalError::LwcBuilderMisuse,
-                    "{case}: {mode}: {err:?}"
+                let panic = result
+                    .expect_err("invalid fixture offsets must violate the constructor contract");
+                let message = panic_payload_description(panic.as_ref());
+                assert!(
+                    message.contains("LwcPrimitiveSer requires an origin offset"),
+                    "{case}: {mode}: {message}"
                 );
             }
         }
@@ -3183,7 +1070,7 @@ mod tests {
     #[test]
     fn test_lwc_null_bitmap_serde() {
         let bytes = [0b0000_1010u8, 0b0000_0001];
-        let ser = LwcNullBitmapSer::new(&bytes).unwrap();
+        let ser = LwcNullBitmapSer::new(&bytes);
         let mut out = vec![0u8; ser.ser_len()];
         let idx = ser.ser(&mut out[..], 0);
         assert_eq!(idx, out.len());
@@ -3196,457 +1083,5 @@ mod tests {
         assert!(bitmap.is_null(8));
         assert!(!bitmap.is_null(0));
         assert!(!bitmap.is_null(2));
-    }
-
-    /// Purpose: Build a persisted block from a row page containing nulls and deleted rows.
-    /// Expected: Live rows retain their values and nulls with the supplied block binding value.
-    #[test]
-    fn test_lwc_builder_from_row_page() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(100), 20, metadata.col.as_ref());
-
-        let mut expected_rows = Vec::new();
-        for offset in 0..10u64 {
-            let row_id = 100 + offset;
-            let c0 = Val::U8(offset as u8);
-            let c1 = if offset % 2 == 0 {
-                Val::Null
-            } else {
-                Val::I16(offset as i16)
-            };
-            let res = page.insert(metadata.col.as_ref(), &[c0, c1]);
-            assert!(matches!(res, InsertRow::Ok(_)));
-            expected_rows.push((
-                row_id,
-                offset as u8,
-                if offset % 2 == 0 {
-                    None
-                } else {
-                    Some(offset as i16)
-                },
-            ));
-        }
-
-        assert!(matches!(page.delete(RowID::new(102)), Delete::Ok));
-        assert!(matches!(page.delete(RowID::new(105)), Delete::Ok));
-        expected_rows.retain(|(row_id, _, _)| *row_id != 102 && *row_id != 105);
-
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        assert!(builder.is_empty());
-        assert_eq!(builder.row_count(), 0);
-        let view = page.vector_view(metadata.col.as_ref());
-        let appended = builder.append_view(view, page.header.start_row_id);
-        assert!(appended);
-        let expected_ids: Vec<_> = expected_rows
-            .iter()
-            .map(|(row_id, _, _)| RowID::new(*row_id))
-            .collect();
-        assert_eq!(builder.row_ids(), expected_ids);
-        let expected_binding_value = 0x0807_0605_0403_0201;
-        let buf = builder.build(expected_binding_value).unwrap();
-
-        let lwc_block = LwcBlock::try_from_persisted_bytes(
-            buf.as_bytes(),
-            FileKind::TableFile,
-            test_block_id(1),
-        )
-        .unwrap();
-        assert_eq!(lwc_block.header.row_count() as usize, expected_rows.len());
-        assert_eq!(
-            lwc_block.header.block_binding_value(),
-            expected_binding_value
-        );
-
-        let column0 = lwc_block.column(metadata.col.as_ref(), 0).unwrap();
-        let column1 = lwc_block.column(metadata.col.as_ref(), 1).unwrap();
-        let data0 = column0.data().unwrap();
-        let data1 = column1.data().unwrap();
-        assert_eq!(data0.len(), expected_rows.len());
-        assert_eq!(data1.len(), expected_rows.len());
-        for (idx, (_row_id, c0, c1)) in expected_rows.iter().enumerate() {
-            assert_eq!(data0.value(idx).unwrap().as_u8().unwrap(), *c0);
-            if let Some(value) = c1 {
-                assert!(!column1.is_null(idx));
-                assert_eq!(data1.value(idx).unwrap().as_i16().unwrap(), *value);
-            } else {
-                assert!(column1.is_null(idx));
-            }
-        }
-    }
-
-    /// Purpose: Compare direct row appends with row-page ingestion for mixed nullable values.
-    /// Expected: Both ingestion paths produce the same row identities and persisted bytes.
-    #[test]
-    fn test_lwc_builder_append_row_values_matches_row_page() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let rows = vec![
-            vec![
-                Val::Null,
-                Val::U64(10),
-                Val::try_from(Vec::from(&b"alpha"[..])).unwrap(),
-                Val::F32(OrderedFloat(1.25)),
-            ],
-            vec![
-                Val::I16(-5),
-                Val::U64(11),
-                Val::Null,
-                Val::F32(OrderedFloat(2.5)),
-            ],
-            vec![
-                Val::I16(9),
-                Val::U64(12),
-                Val::try_from(Vec::from(&b"beta"[..])).unwrap(),
-                Val::F32(OrderedFloat(3.75)),
-            ],
-        ];
-        let page = row_page_with_rows(&metadata, RowID::new(10), &rows);
-
-        let mut page_builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let view = page.vector_view(metadata.col.as_ref());
-        assert!(page_builder.append_view(view, page.header.start_row_id));
-        let mut direct_builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        for (offset, vals) in rows.iter().enumerate() {
-            assert!(direct_builder.append_row_values(RowID::new(10 + offset as u64), vals));
-        }
-
-        let expected_ids = [RowID::new(10), RowID::new(11), RowID::new(12)];
-        assert_eq!(direct_builder.row_ids(), expected_ids);
-        assert_eq!(page_builder.row_ids(), expected_ids);
-        let binding_value = 0x0807_0605_0403_0201;
-        let page_buf = page_builder.build(binding_value).unwrap();
-        let direct_buf = direct_builder.build(binding_value).unwrap();
-        assert_eq!(direct_buf.as_bytes(), page_buf.as_bytes());
-        assert_persisted_rows(direct_buf.as_bytes(), metadata.col.as_ref(), &rows);
-    }
-
-    /// Purpose: Recover a mixed nullable builder after a direct append exceeds block capacity.
-    /// Expected: Rejection restores identities, values, nulls, and statistics, and subsequent appends succeed.
-    #[test]
-    fn test_lwc_builder_append_row_values_rolls_back_on_capacity() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::NULLABLE),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::NULLABLE),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let first_row = vec![Val::I16(5), Val::try_from("ok").unwrap()];
-        assert!(builder.append_row_values(RowID::new(1), &first_row));
-        let expected_stats = vec![(true, 5, 5, 0, 0), (false, 0, 0, 0, 0)];
-        assert_eq!(integer_stats(&builder), expected_stats);
-
-        for value in [Val::I16(1000), Val::Null] {
-            let oversized = Val::try_from(vec![0; LWC_BLOCK_PAYLOAD_SIZE]).unwrap();
-            assert!(!builder.append_row_values(RowID::new(2), &[value, oversized]));
-            assert_eq!(builder.row_count(), 1);
-            assert_eq!(builder.row_ids(), &[RowID::new(1)]);
-            assert_eq!(integer_stats(&builder), expected_stats);
-        }
-
-        let next_row = vec![Val::I16(8), Val::Null];
-        assert!(builder.append_row_values(RowID::new(2), &next_row));
-        assert_eq!(builder.row_ids(), &[RowID::new(1), RowID::new(2)]);
-        assert_eq!(
-            integer_stats(&builder),
-            vec![(true, 5, 8, 0, 0), (false, 0, 0, 0, 0)]
-        );
-        assert_built_rows(builder, &[first_row, next_row]);
-    }
-
-    /// Purpose: Account for the complete persisted header when admitting rows near capacity.
-    /// Expected: Admission stops before overflow and the accepted rows form a valid block.
-    #[test]
-    fn test_lwc_builder_capacity_includes_complete_persisted_header() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid descriptor-like metadata");
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let mut expected_rows = Vec::new();
-        for row_no in 0..100 {
-            let vals = [
-                Val::U64(row_no),
-                Val::U64(0),
-                Val::U64(0),
-                Val::try_from(vec![0u8; 32]).unwrap(),
-                Val::try_from(vec![row_no as u8; 6_718]).unwrap(),
-            ];
-            if !builder.append_row_values(RowID::new(row_no), &vals) {
-                break;
-            }
-            expected_rows.push(vals.to_vec());
-        }
-        assert!(expected_rows.len() > 1);
-        assert!(expected_rows.len() < 100);
-        assert_built_rows(builder, &expected_rows);
-    }
-
-    /// Purpose: Reject cap-plus-one direct and vector appends without changing accepted builder state.
-    /// Expected: RowIDs, seeds, nullable values, and extrema remain exact after rejection and a final successful append.
-    #[test]
-    fn row_cap_rejection_preserves_builder_state() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::U8,
-                StorageColumnFlags::NULLABLE,
-            )],
-            vec![],
-        )
-        .unwrap();
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let expected: Vec<_> = (0..MAX_LWC_ROWS)
-            .map(|i| vec![if i % 3 == 0 { Val::Null } else { Val::U8(7) }])
-            .collect();
-        for (i, row) in expected[..MAX_LWC_ROWS - 1].iter().enumerate() {
-            assert!(builder.append_row_values(RowID::new(i as u64), row));
-        }
-        let rows = builder.row_ids().to_vec();
-        let seeds = builder.row_set_seeds().to_vec();
-        let stats = integer_stats(&builder);
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(MAX_LWC_ROWS as u64 - 1), 2, &metadata.col);
-        assert!(page.insert(&metadata.col, &[Val::U8(255)]).is_ok());
-        assert!(page.insert(&metadata.col, &[Val::U8(0)]).is_ok());
-        assert!(!builder.append_view(page.vector_view(&metadata.col), page.header.start_row_id));
-        assert_eq!(builder.row_ids(), rows);
-        assert_eq!(builder.row_set_seeds(), seeds);
-        assert_eq!(integer_stats(&builder), stats);
-        assert!(builder.append_row_values(
-            RowID::new(MAX_LWC_ROWS as u64 - 1),
-            &expected[MAX_LWC_ROWS - 1]
-        ));
-        let seeds = builder.row_set_seeds().to_vec();
-        assert!(!builder.append_row_values(RowID::new(MAX_LWC_ROWS as u64), &[Val::U8(255)]));
-        assert_eq!(builder.row_count(), MAX_LWC_ROWS);
-        assert_eq!(builder.row_set_seeds(), seeds);
-        assert_eq!(integer_stats(&builder), stats);
-        assert_built_rows(builder, &expected);
-    }
-
-    /// Purpose: Defend final serialization against internal state bypassing row-cap admission.
-    /// Expected: Building fails with an encoding-contract error identifying the field limit.
-    #[test]
-    fn test_lwc_builder_reports_reachable_row_count_encoding_contract() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::U8,
-                StorageColumnFlags::empty(),
-            )],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-
-        for row_no in 0..=MAX_LWC_ROWS {
-            assert!(builder.append_row_values_inner(RowID::new(row_no as u64), &[Val::U8(0)]));
-        }
-        assert_eq!(builder.row_count(), MAX_LWC_ROWS + 1);
-
-        let err = match builder.build(0) {
-            Ok(_) => panic!("row count above the cap must fail encoding"),
-            Err(err) => err,
-        };
-        assert_eq!(
-            err.current_context(),
-            &InternalError::LwcBlockEncodingContract
-        );
-        let report = format!("{err:?}");
-        assert!(report.contains("field=row_count"), "{report}");
-        assert!(report.contains("maximum=15360"), "{report}");
-    }
-
-    /// Purpose: Collect nullable integer statistics from live non-null row values.
-    /// Expected: Nulls and deleted rows do not affect the recorded extrema.
-    #[test]
-    fn test_lwc_builder_nullable_integer_stats_skip_nulls_and_deleted_rows() {
-        let metadata = TableMetadata::try_new(
-            vec![StorageColumnSpec::new(
-                ValKind::I16,
-                StorageColumnFlags::NULLABLE,
-            )],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let mut page = RowPage::new_test_page();
-        page.init(RowID::new(0), 8, metadata.col.as_ref());
-
-        for (row_id, value) in [
-            Val::Null,
-            Val::I16(5),
-            Val::I16(10),
-            Val::Null,
-            Val::I16(1000),
-            Val::I16(8),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert!(matches!(
-                page.insert(metadata.col.as_ref(), &[value]),
-                InsertRow::Ok(inserted) if inserted == RowID::new(row_id as u64)
-            ));
-        }
-        assert!(matches!(page.delete(RowID::new(4)), Delete::Ok));
-
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id));
-
-        let stats = &builder.stats[0];
-        assert!(stats.initialized);
-        assert_eq!(stats.min_i64, 5);
-        assert_eq!(stats.max_i64, 10);
-    }
-
-    /// Purpose: Restore a builder snapshot after appending additional row-page data.
-    /// Expected: Rollback restores row identities, column values, and statistics.
-    #[test]
-    fn test_lwc_builder_rollback() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let rows = [
-            vec![Val::U8(10), Val::I16(20)],
-            vec![Val::U8(11), Val::I16(21)],
-        ];
-        let page = row_page_with_rows(&metadata, RowID::new(1), &rows);
-
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id));
-
-        let snapshot = builder.snapshot_state();
-        let expected_seeds = builder.row_set_seeds().to_vec();
-        let expected_stats = vec![(true, 0, 0, 10, 11), (true, 20, 21, 0, 0)];
-        assert_eq!(integer_stats(&builder), expected_stats);
-
-        let extra_rows = [
-            vec![Val::U8(30), Val::I16(40)],
-            vec![Val::U8(31), Val::I16(41)],
-        ];
-        let extra_page = row_page_with_rows(&metadata, RowID::new(3), &extra_rows);
-        let view = extra_page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, extra_page.header.start_row_id));
-
-        assert_eq!(builder.row_count(), 4);
-        assert_ne!(integer_stats(&builder), expected_stats);
-        builder.rollback(snapshot);
-
-        assert_eq!(builder.row_count(), 2);
-        assert_eq!(builder.row_set_seeds(), expected_seeds);
-        // A direct append extends the final window; rollback must restore its statistics.
-        let snapshot = builder.snapshot_state();
-        assert!(builder.append_row_values(RowID::new(3), &extra_rows[0]));
-        builder.rollback(snapshot);
-        assert_eq!(builder.row_set_seeds(), expected_seeds);
-        assert_eq!(builder.row_ids(), &[RowID::new(1), RowID::new(2)]);
-        assert_eq!(integer_stats(&builder), expected_stats);
-        assert_built_rows(builder, &rows);
-    }
-
-    /// Purpose: Build and decode a row page containing every supported column value kind.
-    /// Expected: Persisted columns retain their lengths, value kinds, and original values.
-    #[test]
-    fn test_lwc_builder_all_column_types() {
-        let metadata = TableMetadata::try_new(
-            vec![
-                StorageColumnSpec::new(ValKind::I8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U8, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I16, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U16, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::I64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::U64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::F32, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::F64, StorageColumnFlags::empty()),
-                StorageColumnSpec::new(ValKind::VarByte, StorageColumnFlags::empty()),
-            ],
-            vec![],
-        )
-        .expect("valid table metadata");
-        let rows = vec![
-            vec![
-                Val::I8(-1),
-                Val::U8(1),
-                Val::I16(-10),
-                Val::U16(10),
-                Val::I32(-100),
-                Val::U32(100),
-                Val::I64(-1000),
-                Val::U64(1000),
-                Val::F32(OrderedFloat(1.25)),
-                Val::F64(OrderedFloat(2.5)),
-                Val::VarByte(MemVar::inline(b"alpha")),
-            ],
-            vec![
-                Val::I8(2),
-                Val::U8(3),
-                Val::I16(20),
-                Val::U16(30),
-                Val::I32(200),
-                Val::U32(300),
-                Val::I64(2000),
-                Val::U64(3000),
-                Val::F32(OrderedFloat(-4.5)),
-                Val::F64(OrderedFloat(6.75)),
-                Val::VarByte(MemVar::inline(b"beta")),
-            ],
-            vec![
-                Val::I8(4),
-                Val::U8(5),
-                Val::I16(40),
-                Val::U16(50),
-                Val::I32(400),
-                Val::U32(500),
-                Val::I64(4000),
-                Val::U64(5000),
-                Val::F32(OrderedFloat(7.75)),
-                Val::F64(OrderedFloat(-8.125)),
-                Val::VarByte(MemVar::inline(b"gamma")),
-            ],
-        ];
-
-        let page = row_page_with_rows(&metadata, RowID::new(10), &rows);
-
-        let mut builder = LwcBuilder::new(Arc::clone(&metadata.col));
-        let view = page.vector_view(metadata.col.as_ref());
-        assert!(builder.append_view(view, page.header.start_row_id));
-        assert_eq!(
-            builder.row_ids(),
-            &[RowID::new(10), RowID::new(11), RowID::new(12)]
-        );
-        assert_built_rows(builder, &rows);
     }
 }
